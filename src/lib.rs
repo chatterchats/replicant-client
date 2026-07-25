@@ -6,11 +6,10 @@
 //! machine-readable operation inventory it was derived from lives under
 //! `policy/`.
 //!
-//! Phase 2 implements [`raw`]: an unmanaged transport layer over the current,
-//! non-deprecated, non-admin contract. It returns transport DTOs and response
-//! metadata only — it never hydrates, persists, publishes, journals
-//! operations, or reconciles state. Those are managed-client concerns built
-//! on top of this transport in a later phase.
+//! [`Client`] is the managed entry point: its gateways return normalized domain
+//! values and commit successful observations before returning. [`raw`] is the
+//! explicit escape hatch for transport DTOs and metadata; it never hydrates,
+//! persists, publishes, journals operations, or reconciles state.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -46,6 +45,7 @@ pub mod managed {
     pub use crate::domain;
 
     mod client;
+    mod gateways;
     mod state;
     mod store;
 
@@ -53,12 +53,17 @@ pub mod managed {
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
         ReconciliationPolicy, StartupPolicy,
     };
+    pub use gateways::{
+        AccountGateway, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
+        ReplicantHandle, ReplicantsGateway,
+    };
 }
 
 #[cfg(feature = "managed")]
 pub use managed::{
-    Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
-    ReconciliationPolicy, StartupPolicy,
+    AccountGateway, Client, ClientBuilder, ClientDegradation, ClientStatus, DeviceHandle,
+    DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway, EventStreamOptions,
+    ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy,
 };
 
 #[cfg(feature = "raw")]

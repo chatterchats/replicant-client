@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 
-use crate::domain::{Device, DeviceKey, Observation};
+use crate::domain::{Account, Device, DeviceKey, Observation, Replicant, ReplicantKey};
 
 use super::store::{Store, StoreError, StoreHandle};
 
@@ -14,6 +14,8 @@ use super::store::{Store, StoreError, StoreHandle};
 pub(crate) struct StateSnapshot {
     revision: u64,
     devices: BTreeMap<DeviceKey, Observation<Device>>,
+    account: Option<Observation<Account>>,
+    replicants: BTreeMap<ReplicantKey, Observation<Replicant>>,
 }
 
 impl StateSnapshot {
@@ -53,6 +55,8 @@ impl StateEngine {
             snapshot: RwLock::new(Arc::new(StateSnapshot {
                 revision: 0,
                 devices,
+                account: None,
+                replicants: BTreeMap::new(),
             })),
             subscribers: Mutex::new(Vec::new()),
         })
@@ -60,6 +64,57 @@ impl StateEngine {
 
     pub(crate) fn snapshot(&self) -> Arc<StateSnapshot> {
         Arc::clone(&self.snapshot.read().expect("state snapshot lock poisoned"))
+    }
+
+    pub(crate) fn device(&self, key: &DeviceKey) -> Option<Observation<Device>> {
+        self.snapshot().devices.get(key).cloned()
+    }
+
+    pub(crate) fn devices(&self) -> Vec<Observation<Device>> {
+        self.snapshot().devices.values().cloned().collect()
+    }
+
+    pub(crate) fn replicant(&self, key: &ReplicantKey) -> Option<Observation<Replicant>> {
+        self.snapshot().replicants.get(key).cloned()
+    }
+
+    pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_account(&account)?;
+        let previous = self.snapshot();
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: Some(account),
+            replicants: previous.replicants.clone(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn persist_replicant(
+        &self,
+        replicant: Observation<Replicant>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_replicant(&replicant)?;
+        let previous = self.snapshot();
+        let mut replicants = previous.replicants.clone();
+        replicants.insert(replicant.value.key.clone(), replicant);
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: previous.account.clone(),
+            replicants,
+        });
+        Ok(())
     }
 
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<Arc<StateSnapshot>> {
@@ -90,6 +145,8 @@ impl StateEngine {
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: next_devices,
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
         }))
     }
 

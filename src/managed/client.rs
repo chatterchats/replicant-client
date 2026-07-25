@@ -463,6 +463,46 @@ impl Client {
         self.inner.raw.clone()
     }
 
+    /// Managed account observations commit before this gateway returns.
+    #[must_use]
+    pub fn account(&self) -> super::gateways::AccountGateway {
+        super::gateways::AccountGateway::new(self.clone())
+    }
+
+    /// Managed device observations commit and publish before this gateway returns.
+    #[must_use]
+    pub fn devices(&self) -> super::gateways::DevicesGateway {
+        super::gateways::DevicesGateway::new(self.clone())
+    }
+
+    /// Managed owned-replicant observations are separate from public-directory reads.
+    #[must_use]
+    pub fn replicants(&self) -> super::gateways::ReplicantsGateway {
+        super::gateways::ReplicantsGateway::new(self.clone())
+    }
+
+    /// Public-directory reads deliberately remain distinct from owned-replicant reads.
+    #[must_use]
+    pub fn directory(&self) -> super::gateways::DirectoryGateway {
+        super::gateways::DirectoryGateway::new(self.clone())
+    }
+
+    pub(crate) fn managed_state(&self) -> &StateEngine {
+        &self.inner.state
+    }
+
+    pub(crate) fn managed_raw(&self) -> &RawClient {
+        &self.inner.raw
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        if self.inner.lifecycle.closed.load(Ordering::Acquire) {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Returns the latest lifecycle state.
     #[must_use]
     pub fn status(&self) -> ClientStatus {

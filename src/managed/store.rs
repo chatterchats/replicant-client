@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
-use crate::domain::{AccountId, Device, DeviceKey, Event, Observation, ObservationMetadata, Realm};
+use crate::domain::{
+    Account, AccountId, Device, DeviceKey, Event, Observation, ObservationMetadata, Realm,
+    Replicant,
+};
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
 
@@ -139,6 +142,26 @@ impl Store {
             devices.insert(observation.value.key.clone(), observation);
         }
         Ok(devices)
+    }
+
+    pub(crate) fn persist_account(
+        &mut self,
+        account: &Observation<Account>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute("INSERT INTO accounts(realm, account_id, observation_json) VALUES ('live', ?1, ?2) ON CONFLICT(realm, account_id) DO UPDATE SET observation_json = excluded.observation_json", params![account.value.id.as_str(), serde_json::to_string(account)?])?;
+        Self::commit(transaction, fail_commit)
+    }
+
+    pub(crate) fn persist_replicant(
+        &mut self,
+        replicant: &Observation<Replicant>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute("INSERT INTO replicants(realm, replicant_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, replicant_id) DO UPDATE SET observation_json = excluded.observation_json", params![realm_key(&replicant.value.key.realm), replicant.value.key.id.as_str(), serde_json::to_string(replicant)?])?;
+        Self::commit(transaction, fail_commit)
     }
 
     pub(crate) fn persist_devices(
