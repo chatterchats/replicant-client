@@ -25,6 +25,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "scripts"))
 from generate_operation_inventory import build_inventory  # noqa: E402
 
@@ -143,6 +144,20 @@ def check_normalization_aliases() -> None:
             )
 
 
+def check_contract_mismatches(metadata: dict) -> None:
+    scopes = {
+        entry["scope"]
+        for entry in metadata.get("openapi_documentation_mismatches", [])
+    }
+    required = {
+        "GET /v1/events/stream",
+        "GET /v1/devices/{device_code}/audit and GET/POST/DELETE /v1/devices/{device_code}/permissions",
+        "Five current trading operations",
+    }
+    if not required.issubset(scopes):
+        fail("policy/contract-metadata.json is missing raw transport contract mismatches")
+
+
 def check_no_old_crate_name() -> None:
     exclude_dirs = {".git", "target", "node_modules", "reference"}
     # This checker's own source and the authoritative rewrite guide discuss
@@ -223,6 +238,7 @@ def main() -> None:
     check_package_identity()
     metadata = json.loads((POLICY / "contract-metadata.json").read_text())
     spec = check_openapi_checksum(metadata)
+    check_contract_mismatches(metadata)
     check_operation_inventory(spec)
     check_excluded_fields()
     check_normalization_aliases()

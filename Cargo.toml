@@ -65,6 +65,14 @@ uuid = { version = "1", features = ["serde", "v4"], optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 
+[[example]]
+name = "raw_read"
+required-features = ["raw"]
+
+[[example]]
+name = "raw_events"
+required-features = ["events"]
+
 [lints.rust]
 missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }

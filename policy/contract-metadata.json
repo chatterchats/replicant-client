@@ -8,6 +8,26 @@
   "openapi_operation_count": 84,
   "openapi_path_count": 70,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
+  "openapi_documentation_mismatches": [
+    {
+      "scope": "GET /v1/events/stream",
+      "difference": "Rendered documentation defines the cursor query parameter and text/event-stream framing; OpenAPI declares neither a parameter nor a success response.",
+      "raw_policy": "Implement the documented cursor and standard SSE framing while preserving event names and JSON payloads as open values.",
+      "evidence": "api/events/stream/index.md"
+    },
+    {
+      "scope": "GET /v1/devices/{device_code}/audit and GET/POST/DELETE /v1/devices/{device_code}/permissions",
+      "difference": "OpenAPI declares no success-body schemas, and permission mutations declare no request-body schemas.",
+      "raw_policy": "Expose these current operations with opaque JSON request/response values; do not invent fields.",
+      "evidence": "openapi.json"
+    },
+    {
+      "scope": "Five current trading operations",
+      "difference": "OpenAPI declares no request or success-response schemas for device trades or replicant-visible traders.",
+      "raw_policy": "Expose opaque JSON request/response values; do not invent fields from prose examples.",
+      "evidence": "openapi.json"
+    }
+  ],
   "notes": [
     "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
     "reference/replicant-space/openapi.json sha256 is verified by scripts/contract_policy_check.py on every run."
