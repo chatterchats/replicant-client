@@ -222,7 +222,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Stores reconciliation options for Phase 7; no reconciliation runs yet.
+    /// Stores reconciliation options for the durable synchronization engine.
     #[must_use]
     pub fn reconciliation_policy(mut self, policy: ReconciliationPolicy) -> Self {
         self.reconciliation_policy = policy;
@@ -487,6 +487,12 @@ impl Client {
         super::gateways::DirectoryGateway::new(self.clone())
     }
 
+    /// Builds a synchronization request using this managed client.
+    #[must_use]
+    pub fn sync(&self) -> super::sync::SyncClient {
+        super::sync::SyncClient::new(self.clone())
+    }
+
     pub(crate) fn managed_state(&self) -> &StateEngine {
         &self.inner.state
     }
@@ -552,7 +558,7 @@ impl Client {
         result
     }
 
-    fn set_status(&self, status: ClientStatus) {
+    pub(crate) fn set_status(&self, status: ClientStatus) {
         self.inner.status.send_replace(status);
     }
 

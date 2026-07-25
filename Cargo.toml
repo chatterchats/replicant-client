@@ -74,6 +74,10 @@ required-features = ["raw"]
 name = "raw_events"
 required-features = ["events"]
 
+[[example]]
+name = "managed_sync"
+required-features = ["managed"]
+
 [[bench]]
 name = "state_snapshot"
 harness = false

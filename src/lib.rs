@@ -48,6 +48,7 @@ pub mod managed {
     mod gateways;
     mod state;
     mod store;
+    mod sync;
 
     pub use client::{
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
@@ -57,13 +58,19 @@ pub mod managed {
         AccountGateway, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
         ReplicantHandle, ReplicantsGateway,
     };
+    pub use sync::{
+        SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
+        SyncProgress, SyncReadiness, SyncReport,
+    };
 }
 
 #[cfg(feature = "managed")]
 pub use managed::{
     AccountGateway, Client, ClientBuilder, ClientDegradation, ClientStatus, DeviceHandle,
     DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway, EventStreamOptions,
-    ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy,
+    ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy, SyncCancellation,
+    SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness,
+    SyncReport,
 };
 
 #[cfg(feature = "raw")]

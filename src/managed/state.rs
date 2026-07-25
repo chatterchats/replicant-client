@@ -2,11 +2,11 @@
 
 #![allow(dead_code)] // Phase 5 owns the engine; public state queries arrive later.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 
-use crate::domain::{Account, Device, DeviceKey, Observation, Replicant, ReplicantKey};
+use crate::domain::{Account, Device, DeviceKey, Location, Observation, Replicant, ReplicantKey};
 
 use super::store::{Store, StoreError, StoreHandle};
 
@@ -117,6 +117,27 @@ impl StateEngine {
         Ok(())
     }
 
+    /// Commits a targeted location observation before publishing a new revision.
+    pub(crate) fn persist_location(
+        &self,
+        location: Observation<Location>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_location(&location)?;
+        let previous = self.snapshot();
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+        });
+        Ok(())
+    }
+
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<Arc<StateSnapshot>> {
         let (sender, receiver) = mpsc::channel();
         self.subscribers
@@ -145,6 +166,37 @@ impl StateEngine {
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: next_devices,
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+        }))
+    }
+
+    /// Applies absence reconciliation after a complete unfiltered owned-device
+    /// traversal. Inaccessible historical observations remain cached.
+    pub(crate) fn reconcile_owned_devices(
+        &self,
+        present: &BTreeSet<DeviceKey>,
+    ) -> Result<Arc<StateSnapshot>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .reconcile_owned_devices(present)?;
+        let previous = self.snapshot();
+        let devices = previous
+            .devices
+            .iter()
+            .filter(|(key, observation)| {
+                present.contains(*key)
+                    || observation.metadata.reachability != crate::domain::Reachability::Reachable
+                    || observation.metadata.access != crate::domain::AccessScope::Owned
+            })
+            .map(|(key, observation)| (key.clone(), observation.clone()))
+            .collect();
+        Ok(self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
         }))

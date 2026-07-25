@@ -2,7 +2,7 @@
 
 #![allow(dead_code)] // Later managed engines own the remaining journals.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::domain::{
-    Account, AccountId, Device, DeviceKey, Event, Observation, ObservationMetadata, Realm,
-    Replicant,
+    Account, AccountId, Device, DeviceKey, Event, Location, Observation, ObservationMetadata,
+    Realm, Replicant,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -48,6 +48,16 @@ pub(crate) struct OperationJournalEntry {
     pub(crate) state: String,
     pub(crate) intent: Value,
     pub(crate) projection: Option<Value>,
+}
+
+/// Durable, coalesced reconciliation work restored after a client restart.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReconciliationWork {
+    pub(crate) work_id: String,
+    pub(crate) realm: Realm,
+    pub(crate) kind: String,
+    pub(crate) payload: Value,
+    pub(crate) attempts: u32,
 }
 
 impl Store {
@@ -90,6 +100,12 @@ impl Store {
             )?;
             transaction.commit()?;
         }
+        // A process may stop after claiming work but before reporting its
+        // outcome. Requeue it on open so durable reconciliation is recoverable.
+        connection.execute(
+            "UPDATE reconciliation_queue SET state = 'queued' WHERE state = 'running'",
+            [],
+        )?;
         Ok(Self {
             connection,
             #[cfg(test)]
@@ -164,6 +180,19 @@ impl Store {
         Self::commit(transaction, fail_commit)
     }
 
+    pub(crate) fn persist_location(
+        &mut self,
+        location: &Observation<Location>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO locations(realm, location_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, location_id) DO UPDATE SET observation_json = excluded.observation_json",
+            params![realm_key(&location.value.key.realm), location.value.key.id.as_str(), serde_json::to_string(location)?],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
+
     pub(crate) fn persist_devices(
         &mut self,
         devices: &[Observation<Device>],
@@ -172,6 +201,48 @@ impl Store {
         let transaction = self.connection.transaction()?;
         for device in devices {
             persist_device(&transaction, device)?;
+        }
+        Self::commit(transaction, fail_commit)
+    }
+
+    /// Removes only reachable owned devices proven absent by a completed full
+    /// traversal; historical and inaccessible observations are not absence evidence.
+    pub(crate) fn reconcile_owned_devices(
+        &mut self,
+        present: &BTreeSet<DeviceKey>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT realm, device_id, observation_json FROM devices WHERE access_scope = 'owned'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut missing = Vec::new();
+        for row in rows {
+            let (realm, id, serialized) = row?;
+            let observation = serde_json::from_str::<Observation<Device>>(&serialized)?;
+            if observation.metadata.reachability == crate::domain::Reachability::Reachable
+                && !present.contains(&observation.value.key)
+            {
+                missing.push((realm, id));
+            }
+        }
+        drop(statement);
+        for (realm, id) in missing {
+            transaction.execute(
+                "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
+                params![realm, id],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, 'device', ?2, datetime('now'), 'complete-unfiltered-device-traversal')",
+                params![realm, id],
+            )?;
         }
         Self::commit(transaction, fail_commit)
     }
@@ -278,8 +349,58 @@ impl Store {
         payload: &Value,
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT OR REPLACE INTO reconciliation_queue(work_id, realm, kind, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO reconciliation_queue(work_id, realm, kind, payload_json, not_before, attempts, state) VALUES (?1, ?2, ?3, ?4, NULL, 0, 'queued') ON CONFLICT(work_id) DO UPDATE SET realm = excluded.realm, kind = excluded.kind, payload_json = excluded.payload_json, not_before = NULL, attempts = 0, state = 'queued'",
             params![work_id, realm_key(realm), kind, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    /// Claims due work atomically enough for this single-store client and
+    /// marks it running before the network request begins.
+    pub(crate) fn claim_reconciliation_work(
+        &mut self,
+    ) -> Result<Option<ReconciliationWork>, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let row = transaction
+            .query_row(
+                "SELECT work_id, realm, kind, payload_json, attempts FROM reconciliation_queue WHERE state = 'queued' AND (not_before IS NULL OR CAST(not_before AS INTEGER) <= CAST(strftime('%s','now') AS INTEGER)) ORDER BY rowid LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, u32>(4)?)),
+            )
+            .optional()?;
+        let Some((work_id, realm, kind, payload, attempts)) = row else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE reconciliation_queue SET state = 'running' WHERE work_id = ?1",
+            [&work_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(ReconciliationWork {
+            work_id,
+            realm: realm_from_key(&realm),
+            kind,
+            payload: serde_json::from_str(&payload)?,
+            attempts,
+        }))
+    }
+
+    /// Completes successfully claimed work.
+    pub(crate) fn complete_reconciliation_work(&mut self, work_id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM reconciliation_queue WHERE work_id = ?1",
+            [work_id],
+        )?;
+        Ok(())
+    }
+
+    /// Requeues failed work with bounded exponential backoff. `running` rows
+    /// are also returned to `queued` on open, so a crash cannot lose work.
+    pub(crate) fn retry_reconciliation_work(&mut self, work_id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE reconciliation_queue SET state = 'queued', attempts = attempts + 1, not_before = CAST(strftime('%s','now') AS INTEGER) + MIN(300, (1 << MIN(16, attempts + 1))) WHERE work_id = ?1",
+            [work_id],
         )?;
         Ok(())
     }
@@ -446,6 +567,15 @@ fn realm_key(realm: &Realm) -> String {
         Realm::Live => "live".to_owned(),
         Realm::Simulation(id) => format!("simulation:{}", id.get()),
     }
+}
+
+fn realm_from_key(value: &str) -> Realm {
+    value
+        .strip_prefix("simulation:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .map(crate::domain::SimulationId::new)
+        .map(Realm::Simulation)
+        .unwrap_or(Realm::Live)
 }
 
 fn access_key(access: &crate::domain::AccessScope) -> &'static str {
@@ -652,5 +782,44 @@ mod tests {
         assert_eq!(entry.state, "registered");
         assert_eq!(entry.intent, json!({"kind": "activate"}));
         assert_eq!(entry.projection, Some(json!({"device": "d1"})));
+    }
+
+    #[test]
+    fn reconciliation_queue_coalesces_and_recovers_running_work() {
+        let path = test_path("queue");
+        let mut store = Store::open_file(&path).expect("open file store");
+        store
+            .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
+            .expect("enqueue");
+        store
+            .enqueue_reconciliation(
+                "device:d1",
+                &Realm::Live,
+                "device",
+                &json!({"id": "d1-new"}),
+            )
+            .expect("coalesce");
+        let claimed = store
+            .claim_reconciliation_work()
+            .expect("claim")
+            .expect("work exists");
+        assert_eq!(claimed.payload, json!({"id": "d1-new"}));
+        drop(store);
+
+        let mut restored = Store::open_file(&path).expect("restart store");
+        let recovered = restored
+            .claim_reconciliation_work()
+            .expect("claim recovered")
+            .expect("running work requeued");
+        restored
+            .retry_reconciliation_work(&recovered.work_id)
+            .expect("backoff");
+        assert!(
+            restored
+                .claim_reconciliation_work()
+                .expect("not due")
+                .is_none()
+        );
+        fs::remove_file(path).expect("remove test database");
     }
 }
