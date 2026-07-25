@@ -1,6 +1,6 @@
 //! Immutable, crate-private state snapshots published after durable commits.
 
-#![allow(dead_code)] // Wired into the managed Client in the following phase.
+#![allow(dead_code)] // Phase 5 owns the engine; public state queries arrive later.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use crate::domain::{Device, DeviceKey, Observation};
 
-use super::store::{Store, StoreError};
+use super::store::{Store, StoreError, StoreHandle};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StateSnapshot {
@@ -27,24 +27,29 @@ impl StateSnapshot {
 }
 
 pub(crate) struct StateEngine {
-    store: Mutex<Store>,
+    store: StoreHandle,
     snapshot: RwLock<Arc<StateSnapshot>>,
     subscribers: Mutex<Vec<mpsc::Sender<Arc<StateSnapshot>>>>,
 }
 
 impl StateEngine {
     pub(crate) fn open_memory() -> Result<Self, StoreError> {
-        Self::from_store(Store::open_memory()?)
+        Self::from_store(Arc::new(Mutex::new(Some(Store::open_memory()?))))
     }
 
     pub(crate) fn open_file(path: &Path) -> Result<Self, StoreError> {
-        Self::from_store(Store::open_file(path)?)
+        Self::from_store(Arc::new(Mutex::new(Some(Store::open_file(path)?))))
     }
 
-    fn from_store(store: Store) -> Result<Self, StoreError> {
-        let devices = store.restore_devices()?;
+    pub(crate) fn from_store(store: StoreHandle) -> Result<Self, StoreError> {
+        let devices = store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .restore_devices()?;
         Ok(Self {
-            store: Mutex::new(store),
+            store,
             snapshot: RwLock::new(Arc::new(StateSnapshot {
                 revision: 0,
                 devices,
@@ -74,6 +79,8 @@ impl StateEngine {
         self.store
             .lock()
             .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
             .persist_devices(devices)?;
         let previous = self.snapshot();
         let mut next_devices = previous.devices.clone();
@@ -101,6 +108,8 @@ impl StateEngine {
         self.store
             .lock()
             .expect("state store lock poisoned")
+            .as_mut()
+            .expect("state store is open during this test")
             .fail_next_commit();
     }
 }

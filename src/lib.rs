@@ -45,9 +45,24 @@ pub mod domain;
 pub mod managed {
     pub use crate::domain;
 
+    mod client;
     mod state;
     mod store;
+
+    pub use client::{
+        Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
+        ReconciliationPolicy, StartupPolicy,
+    };
 }
+
+#[cfg(feature = "managed")]
+pub use managed::{
+    Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
+    ReconciliationPolicy, StartupPolicy,
+};
+
+#[cfg(feature = "raw")]
+pub use raw::SecretString;
 
 #[cfg(feature = "managed")]
 pub use domain::{

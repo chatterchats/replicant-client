@@ -1,9 +1,10 @@
 //! Crate-private SQLite persistence for normalized managed state.
 
-#![allow(dead_code)] // Wired into the managed Client in the following phase.
+#![allow(dead_code)] // Later managed engines own the remaining journals.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
@@ -25,6 +26,8 @@ pub(crate) enum StoreError {
     },
     #[error("injected commit failure")]
     InjectedCommitFailure,
+    #[error("store is closed")]
+    Closed,
 }
 
 /// Internal durable store. No database handle crosses the crate boundary.
@@ -33,6 +36,9 @@ pub(crate) struct Store {
     #[cfg(test)]
     fail_next_commit: bool,
 }
+
+/// Shared ownership of the one durable store used by a managed client.
+pub(crate) type StoreHandle = Arc<Mutex<Option<Store>>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OperationJournalEntry {
@@ -111,6 +117,13 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    /// Forces file-backed SQLite state to durable storage before shutdown.
+    pub(crate) fn flush(&mut self) -> Result<(), StoreError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     pub(crate) fn restore_devices(

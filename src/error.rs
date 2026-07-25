@@ -34,7 +34,6 @@ pub struct ErrorDetails {
 
 /// Failures produced by raw client construction or request execution.
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum Error {
     /// Client configuration was invalid.
     Configuration {
@@ -90,6 +89,53 @@ pub enum Error {
         /// Account identifier presented by the current authentication.
         supplied_account_id: String,
     },
+    /// The managed client has completed shutdown.
+    Closed,
+}
+
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration { message } => f
+                .debug_struct("Error::Configuration")
+                .field("message", message)
+                .finish(),
+            Self::Authentication { details } => f
+                .debug_struct("Error::Authentication")
+                .field("details", details)
+                .finish(),
+            Self::RateLimited {
+                retry_after,
+                details,
+            } => f
+                .debug_struct("Error::RateLimited")
+                .field("retry_after", retry_after)
+                .field("details", details)
+                .finish(),
+            Self::Transport { message } => f
+                .debug_struct("Error::Transport")
+                .field("message", message)
+                .finish(),
+            Self::Decode { message, status } => f
+                .debug_struct("Error::Decode")
+                .field("message", message)
+                .field("status", status)
+                .finish(),
+            Self::Contract { status, details } => f
+                .debug_struct("Error::Contract")
+                .field("status", status)
+                .field("details", details)
+                .finish(),
+            Self::Persistence { message } => f
+                .debug_struct("Error::Persistence")
+                .field("message", message)
+                .finish(),
+            Self::AccountStoreMismatch { .. } => {
+                f.write_str("Error::AccountStoreMismatch(<redacted>)")
+            }
+            Self::Closed => f.write_str("Error::Closed"),
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -113,6 +159,7 @@ impl std::fmt::Display for Error {
             Self::AccountStoreMismatch { .. } => {
                 write!(f, "authenticated account does not match the durable store")
             }
+            Self::Closed => write!(f, "client is closed"),
         }
     }
 }
@@ -134,7 +181,8 @@ impl Error {
             Self::Configuration { .. }
             | Self::Transport { .. }
             | Self::Persistence { .. }
-            | Self::AccountStoreMismatch { .. } => None,
+            | Self::AccountStoreMismatch { .. }
+            | Self::Closed => None,
         }
     }
 
@@ -158,7 +206,8 @@ impl Error {
             | Self::Transport { .. }
             | Self::Decode { .. }
             | Self::Persistence { .. }
-            | Self::AccountStoreMismatch { .. } => None,
+            | Self::AccountStoreMismatch { .. }
+            | Self::Closed => None,
         }
     }
 
