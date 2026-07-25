@@ -34,10 +34,22 @@ pub mod raw;
 #[cfg(feature = "events")]
 pub mod events;
 
-/// Durable local state, synchronization, durable operations, and the
-/// managed `Client` entry point.
-///
-/// Not yet implemented; this module is a compilation placeholder for the
-/// `managed` feature.
+/// Normalized domain types and pure authority rules used by the managed
+/// client.
 #[cfg(feature = "managed")]
-pub mod managed {}
+pub mod domain;
+
+#[cfg(feature = "managed")]
+pub mod managed {
+    pub use crate::domain;
+
+    mod state;
+    mod store;
+}
+
+#[cfg(feature = "managed")]
+pub use domain::{
+    Account, AccountId, Device, DeviceCommand, DeviceId, DeviceKey, DeviceStatus, DeviceType,
+    Event, EventId, Location, LocationId, LocationKey, Realm, Replicant, ReplicantId, ReplicantKey,
+    SimulationId, StarId, TradeId, WorldKey,
+};
