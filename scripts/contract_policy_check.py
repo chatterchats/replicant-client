@@ -164,6 +164,8 @@ def check_no_old_crate_name() -> None:
     # the old crate name as history/instructions, not as a live reference.
     allowed_files = {
         "scripts/contract_policy_check.py",
+        "CLAUDE.md",
+        "AGENTS.md",
         "docs/implementation/rewrite-guide.md",
     }
     matches = []

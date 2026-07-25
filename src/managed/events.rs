@@ -70,7 +70,7 @@ impl EventEngine {
         receiver
     }
 
-    fn notify(&self, event: Event) {
+    pub(crate) fn notify(&self, event: Event) {
         self.subscribers
             .lock()
             .expect("event subscribers lock poisoned")
@@ -160,8 +160,54 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
         schedule_narrow_reconciliation(client, &event)?;
     }
     super::operation::resolve_awaiting_evidence(client, &event);
+    schedule_trade_completion_reconciliation(client, &event)?;
+    apply_simulation_lifecycle(client, &event);
     client.managed_events().notify(event);
     Ok(())
+}
+
+/// `trade.completed` cross-domain reconciliation: the buyer/seller device
+/// and replicant named on the event envelope are already covered by
+/// [`schedule_narrow_reconciliation`]; this additionally targets any device
+/// codes the payload names directly (2.3.1's `new_device_codes`, for
+/// device-typed trade rewards), which the envelope's own device/replicant
+/// fields never carry.
+fn schedule_trade_completion_reconciliation(client: &Client, event: &Event) -> Result<()> {
+    if event.name != domain::EventName::TradeCompleted {
+        return Ok(());
+    }
+    let Some(Value::Array(codes)) = event.payload.get("new_device_codes") else {
+        return Ok(());
+    };
+    let realm = event.realm.clone().unwrap_or_default();
+    for code in codes.iter().filter_map(Value::as_str) {
+        client
+            .managed_state()
+            .enqueue_reconciliation(
+                &format!("device:{code}"),
+                &realm,
+                "device",
+                &serde_json::json!({ "id": code }),
+            )
+            .map_err(persistence_error)?;
+    }
+    Ok(())
+}
+
+/// A simulation ended server-side (completed, expired, or the player
+/// abandoned it from another session) rather than through
+/// [`super::simulations::SimulationsGateway::abandon`] on this client: clean
+/// up its realm the same way either path does.
+fn apply_simulation_lifecycle(client: &Client, event: &Event) {
+    if !matches!(
+        event.name.as_str(),
+        "simulation.completed" | "simulation.expired" | "simulation.abandoned"
+    ) {
+        return;
+    }
+    if let Some(id) = event.payload.get("simulation_id").and_then(Value::as_i64) {
+        super::simulations::cleanup_realm(client, crate::domain::SimulationId::new(id));
+    }
 }
 
 /// Enqueues durable, coalesced reconciliation work for the narrowest entity
@@ -508,6 +554,36 @@ mod tests {
     };
     use crate::raw::{SecretString, Url};
 
+    fn device_in_realm(realm: Realm, id: &str) -> Observation<Device> {
+        Observation {
+            value: Device {
+                key: DeviceKey::in_realm(realm, DeviceId::from(id)),
+                device_type: Some(DeviceType::from("miner")),
+                status: Some(DeviceStatus::from("idle")),
+                location: None,
+                features: Vec::new(),
+                available_commands: Vec::new(),
+                available_directives: Vec::new(),
+                tags: Vec::new(),
+                relationships: DeviceRelationships::default(),
+                access: AccessScope::Owned,
+            },
+            metadata: ObservationMetadata {
+                source: ObservationSource::RestDetail,
+                authority: ObservationAuthority::EntitySnapshot,
+                observed_at: "2026-07-25T00:00:00Z".into(),
+                access: AccessScope::Owned,
+                reachability: Reachability::Reachable,
+                stale: false,
+                source_document: SourceDocument {
+                    operation: "GET /v1/devices/{device_code}".into(),
+                    request_id: None,
+                    document_id: None,
+                },
+            },
+        }
+    }
+
     fn device(id: &str) -> Observation<Device> {
         Observation {
             value: Device {
@@ -647,6 +723,73 @@ mod tests {
                 .claim_reconciliation_work()
                 .expect("claim")
                 .is_none()
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn trade_completed_schedules_reconciliation_for_new_device_codes() {
+        let client = restore_only_client().await;
+        let mut event = game_event("4-0", "trade.completed", Some("TC1"));
+        event.payload.insert(
+            "new_device_codes".into(),
+            serde_json::json!(["NEW1", "NEW2"]),
+        );
+
+        apply_event(&client, &event).expect("apply trade completion");
+
+        // The controller device named on the envelope, plus both newly
+        // created/transferred device codes from the payload, are all
+        // scheduled: cross-domain reconciliation, not just the envelope's
+        // own device.
+        let mut scheduled = Vec::new();
+        while let Some(work) = client
+            .managed_state()
+            .claim_reconciliation_work()
+            .expect("claim")
+        {
+            scheduled.push(work.payload["id"].as_str().unwrap().to_string());
+        }
+        assert!(scheduled.contains(&"TC1".to_string()));
+        assert!(scheduled.contains(&"NEW1".to_string()));
+        assert!(scheduled.contains(&"NEW2".to_string()));
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn simulation_completed_event_purges_that_simulation_realm() {
+        let client = restore_only_client().await;
+        let simulation_realm = Realm::Simulation(crate::domain::SimulationId::new(9));
+        client
+            .managed_state()
+            .persist_devices(&[device_in_realm(simulation_realm.clone(), "SIM1")])
+            .expect("seed simulation device");
+        client
+            .managed_state()
+            .persist_devices(&[device("LIVE1")])
+            .expect("seed live device");
+
+        let mut event = game_event("5-0", "simulation.completed", None);
+        event
+            .payload
+            .insert("simulation_id".into(), serde_json::json!(9));
+        apply_event(&client, &event).expect("apply simulation completion");
+
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::in_realm(
+                    simulation_realm,
+                    DeviceId::from("SIM1")
+                ))
+                .is_none()
+        );
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live(DeviceId::from("LIVE1")))
+                .is_some(),
+            "live devices are never touched by simulation realm cleanup"
         );
         client.close().await.expect("close");
     }

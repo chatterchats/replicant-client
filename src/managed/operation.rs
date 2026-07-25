@@ -506,6 +506,26 @@ impl LocationEventsGateway {
         Self { client }
     }
 
+    /// Lists location events at `location_code` that the account has
+    /// discovered. Authoritative within discovered-event scope only:
+    /// undiscovered events are never implied by absence here. Distinct from
+    /// account events (`client.events()`) and device logs (`device.logs()`).
+    pub async fn list(
+        &self,
+        location_code: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<raw::events::LocationEvent>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .location_events()
+            .list(location_code, status)
+            .await?
+            .value
+            .events)
+    }
+
     /// Resolves a single discovered location event for the caller.
     pub async fn resolve(&self, location_code: &str, designation: &str) -> Result<Operation> {
         create(
@@ -1478,6 +1498,150 @@ mod tests {
 
         client.close().await.expect("close");
         std::fs::remove_file(&path_buf).expect("remove test database");
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_representative_travel_trade_and_simulation_operations() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "replicant-client-phase10-restart-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let mut store = super::super::store::Store::open_file(&path_buf).expect("open store");
+            store
+                .record_operation(
+                    "op-travel",
+                    "prepared",
+                    Some("live"),
+                    Some("replicant"),
+                    Some("R1"),
+                    &serde_json::json!({"kind": "replicant_travel", "path": {"replicant_code":"R1"}, "body": {"destination":"SOL"}, "expects_evidence": true}),
+                )
+                .expect("record travel");
+            store
+                .record_operation(
+                    "op-trade",
+                    "prepared",
+                    Some("live"),
+                    Some("device"),
+                    Some("TC1"),
+                    &serde_json::json!({"kind": "device_create_trade", "path": {"device_code":"TC1"}, "body": {"name": "sample"}, "expects_evidence": false}),
+                )
+                .expect("record trade");
+            store
+                .record_operation(
+                    "op-simulate",
+                    "prepared",
+                    Some("live"),
+                    Some("device"),
+                    Some("SIMDEV1"),
+                    &serde_json::json!({"kind": "device_enter_simulation", "path": {"device_code":"SIMDEV1"}, "body": {"replicant_code": "R1", "scenario": "mining_rush"}, "expects_evidence": false}),
+                )
+                .expect("record simulate");
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/accounts/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"email": "a@b.test"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"devices": [], "next_cursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"events": [], "next_cursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/replicants/R1/travel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/TC1/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/SIMDEV1/simulate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .sqlite(&path_buf)
+            .startup_policy(StartupPolicy::Essential)
+            .start()
+            .await
+            .expect("start client");
+
+        for id in ["op-travel", "op-trade", "op-simulate"] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = client
+                        .operations()
+                        .get(OperationId::new(id))
+                        .status()
+                        .await
+                        .expect("status");
+                    if status.is_terminal() || status == OperationStatus::AwaitingEvidence {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("`{id}` is retried exactly once after restart"));
+        }
+
+        client.close().await.expect("close");
+        std::fs::remove_file(&path_buf).expect("remove test database");
+    }
+
+    #[tokio::test]
+    async fn location_event_discovery_is_a_distinct_endpoint_from_account_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/SOL-4/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{"designation": "SOL-4-EVT-001", "event_type": "mineral_shortage"}],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No mock for the account-wide event log: a request there would
+        // fail this test outright, proving location events never fall back
+        // to it.
+        let client = client_at(&server.uri()).await;
+
+        let events = client
+            .location_events()
+            .list("SOL-4", None)
+            .await
+            .expect("location events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].designation.as_deref(), Some("SOL-4-EVT-001"));
+
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[tokio::test]

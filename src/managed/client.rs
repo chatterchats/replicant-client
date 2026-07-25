@@ -606,6 +606,31 @@ impl Client {
         super::operation::LocationEventsGateway::new(self.clone())
     }
 
+    /// Resource inventory across locations and replicants.
+    #[must_use]
+    pub fn inventory(&self) -> super::gateways::InventoryGateway {
+        super::gateways::InventoryGateway::new(self.clone())
+    }
+
+    /// BobNet channel discovery, relay history, sending, and `bobnet.new`
+    /// observation.
+    #[must_use]
+    pub fn bobnet(&self) -> super::bobnet::BobnetGateway {
+        super::bobnet::BobnetGateway::new(self.clone())
+    }
+
+    /// Trade controller listing and durable trade mutations.
+    #[must_use]
+    pub fn trading(&self) -> super::trading::TradingGateway {
+        super::trading::TradingGateway::new(self.clone())
+    }
+
+    /// Simulation scenarios, active runs, start/abandon, and history.
+    #[must_use]
+    pub fn simulations(&self) -> super::simulations::SimulationsGateway {
+        super::simulations::SimulationsGateway::new(self.clone())
+    }
+
     pub(crate) fn managed_state(&self) -> &StateEngine {
         &self.inner.state
     }

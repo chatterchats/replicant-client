@@ -44,14 +44,24 @@ pub mod domain;
 pub mod managed {
     pub use crate::domain;
 
+    mod ami;
+    mod bobnet;
     mod client;
     mod events;
     mod gateways;
     mod operation;
+    mod simulations;
     mod state;
     mod store;
     mod sync;
+    mod trading;
+    mod travel;
 
+    pub use ami::{
+        FleetController, MiningController, MiningDirective, SurveyController, SurveyDirective,
+        TransportController, TransportDirective,
+    };
+    pub use bobnet::{BobnetGateway, BobnetWatch, RelayHistoryQuery};
     pub use client::{
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
         ReconciliationPolicy, StartupPolicy,
@@ -59,28 +69,34 @@ pub mod managed {
     pub use events::{EventWatch, EventsGateway};
     pub use gateways::{
         AccountGateway, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
-        ReplicantHandle, ReplicantsGateway,
+        InventoryGateway, ReplicantHandle, ReplicantsGateway,
     };
     pub use operation::{
         ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationsGateway,
         MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
         OperationsGateway,
     };
+    pub use simulations::SimulationsGateway;
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
         SyncProgress, SyncReadiness, SyncReport,
     };
+    pub use trading::{TradeControllerHandle, TradingGateway};
+    pub use travel::{TravelBuilder, TravelPreview, TravelVia};
 }
 
 #[cfg(feature = "managed")]
 pub use managed::{
-    AccountGateway, Client, ClientBuilder, ClientDegradation, ClientStatus, ConfirmAccountWipe,
-    DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway, DynamicCommand,
-    EventStreamOptions, EventWatch, EventsGateway, LocationEventsGateway, LocationsGateway,
-    MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
-    OperationsGateway, ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy,
+    AccountGateway, BobnetGateway, BobnetWatch, Client, ClientBuilder, ClientDegradation,
+    ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway,
+    DirectoryGateway, DynamicCommand, EventStreamOptions, EventWatch, EventsGateway,
+    FleetController, InventoryGateway, LocationEventsGateway, LocationsGateway, MessagesGateway,
+    MiningController, MiningDirective, Operation, OperationOutcome, OperationStatus,
+    OperationWatch, OperationsGateway, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle,
+    ReplicantsGateway, SimulationsGateway, StartupPolicy, SurveyController, SurveyDirective,
     SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
-    SyncProgress, SyncReadiness, SyncReport,
+    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
+    TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
 };
 
 #[cfg(feature = "raw")]

@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::domain::{
-    Account, AccountId, Device, DeviceKey, Event, Location, Observation, ObservationMetadata,
-    Realm, Replicant,
+    Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
+    Observation, ObservationMetadata, Realm, Replicant, Simulation, SimulationId,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -634,6 +634,76 @@ impl Store {
         Ok(())
     }
 
+    /// Removes every device observation in `realm` (simulation cleanup on
+    /// abandonment/completion/expiry), returning the removed keys so the
+    /// in-memory snapshot can be pruned identically.
+    pub(crate) fn purge_realm_devices(
+        &mut self,
+        realm: &Realm,
+    ) -> Result<Vec<DeviceKey>, StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        let key = realm_key(realm);
+        let mut statement =
+            transaction.prepare("SELECT device_id FROM devices WHERE realm = ?1")?;
+        let rows = statement.query_map([&key], |row| row.get::<_, String>(0))?;
+        let mut removed = Vec::new();
+        for row in rows {
+            removed.push(row?);
+        }
+        drop(statement);
+        transaction.execute("DELETE FROM devices WHERE realm = ?1", [&key])?;
+        Self::commit(transaction, fail_commit)?;
+        Ok(removed
+            .into_iter()
+            .map(|id| DeviceKey::in_realm(realm.clone(), DeviceId::new(id)))
+            .collect())
+    }
+
+    /// Upserts a simulation run's current observation (start, then later its
+    /// archived result). Simulation rows are never deleted: they are the
+    /// account's simulation history, distinct from the simulation realm's
+    /// ephemeral device projections.
+    pub(crate) fn persist_simulation(
+        &mut self,
+        simulation: &Observation<Simulation>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO simulations(simulation_id, payload_json) VALUES (?1, ?2) ON CONFLICT(simulation_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![simulation.value.id.get(), serde_json::to_string(simulation)?],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_simulations(
+        &self,
+    ) -> Result<BTreeMap<SimulationId, Observation<Simulation>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM simulations ORDER BY simulation_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut simulations = BTreeMap::new();
+        for row in rows {
+            let observation: Observation<Simulation> = serde_json::from_str(&row?)?;
+            simulations.insert(observation.value.id, observation);
+        }
+        Ok(simulations)
+    }
+
+    /// Commits a targeted inventory observation. Location and replicant
+    /// inventory reads share this; account-level ownership is always `live`.
+    pub(crate) fn persist_inventory(
+        &mut self,
+        inventory: &Observation<Inventory>,
+    ) -> Result<(), StoreError> {
+        let (realm, owner_kind, owner_id) = inventory_owner_key(&inventory.value.owner);
+        self.connection.execute(
+            "INSERT INTO inventories(realm, owner_kind, owner_id, inventory_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(realm, owner_kind, owner_id) DO UPDATE SET inventory_json = excluded.inventory_json",
+            params![realm, owner_kind, owner_id, serde_json::to_string(inventory)?],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.connection
             .query_row(
@@ -805,6 +875,22 @@ fn realm_from_key(value: &str) -> Realm {
         .map(crate::domain::SimulationId::new)
         .map(Realm::Simulation)
         .unwrap_or(Realm::Live)
+}
+
+fn inventory_owner_key(owner: &InventoryOwner) -> (String, &'static str, String) {
+    match owner {
+        InventoryOwner::Account(id) => ("live".to_owned(), "account", id.as_str().to_owned()),
+        InventoryOwner::Replicant(key) => (
+            realm_key(&key.realm),
+            "replicant",
+            key.id.as_str().to_owned(),
+        ),
+        InventoryOwner::Location(key) => (
+            realm_key(&key.realm),
+            "location",
+            key.id.as_str().to_owned(),
+        ),
+    }
 }
 
 fn access_key(access: &crate::domain::AccessScope) -> &'static str {

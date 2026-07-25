@@ -12,7 +12,9 @@ use crate::domain::{
 use crate::raw;
 use crate::{Client, Error, Result};
 
+use super::ami::{FleetController, MiningController, SurveyController, TransportController};
 use super::operation::{self, ConfirmAccountWipe, DynamicCommand, Operation};
+use super::travel::TravelBuilder;
 
 /// A local device-update stream. It never polls or otherwise issues network requests.
 pub struct DeviceWatch {
@@ -116,6 +118,10 @@ pub struct DeviceHandle {
 impl DeviceHandle {
     fn new(client: Client, key: DeviceKey) -> Self {
         Self { client, key }
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(client: Client, key: DeviceKey) -> Self {
+        Self::new(client, key)
     }
     #[must_use]
     pub fn id(&self) -> &DeviceId {
@@ -246,6 +252,124 @@ impl DeviceHandle {
     /// Fulfills one unit of a trade on this device as a buyer.
     pub async fn fulfill_trade(&self, trade_code: &str) -> Result<Operation> {
         operation::device_fulfill_trade(&self.client, self.id().as_str(), trade_code).await
+    }
+
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub(crate) fn key(&self) -> &DeviceKey {
+        &self.key
+    }
+
+    /// Views this device as an AMI mining controller. Rejected only when the
+    /// latest cached snapshot names a different known device type; the
+    /// server remains authoritative for command dispatch either way.
+    pub fn as_mining_controller(&self) -> Result<MiningController> {
+        MiningController::new(self.clone())
+    }
+
+    /// Views this device as an AMI survey controller.
+    pub fn as_survey_controller(&self) -> Result<SurveyController> {
+        SurveyController::new(self.clone())
+    }
+
+    /// Views this device as an AMI transport controller.
+    pub fn as_transport_controller(&self) -> Result<TransportController> {
+        TransportController::new(self.clone())
+    }
+
+    /// Views this device as an AMI fleet controller.
+    pub fn as_fleet_controller(&self) -> Result<FleetController> {
+        FleetController::new(self.clone())
+    }
+
+    /// Lists this device's event log. Diagnostic/append-only history,
+    /// distinct from account events (`client.events()`) and location events
+    /// (`client.location_events()`).
+    pub async fn logs(
+        &self,
+        query: &raw::devices::DeviceLogsQuery,
+    ) -> Result<raw::devices::DeviceLogsResponse> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .devices()
+            .logs(self.id().as_str(), query)
+            .await?
+            .value)
+    }
+
+    /// Lists ownership/configuration audit entries for this device. The
+    /// contract documents no response schema for this endpoint.
+    pub async fn audit(&self, query: &raw::devices::DeviceAuditQuery) -> Result<serde_json::Value> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .devices()
+            .audit(self.id().as_str(), query)
+            .await?
+            .value)
+    }
+
+    /// Lists permissions granted on this device. Volatile/diagnostic, not a
+    /// durably reconciled collection: the contract documents no response
+    /// schema for this endpoint.
+    pub async fn permissions(&self) -> Result<serde_json::Value> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .devices()
+            .list_permissions(self.id().as_str())
+            .await?
+            .value)
+    }
+
+    /// Fetches this device's relay network topology. Volatile: it is never
+    /// durably reconciled.
+    pub async fn network(&self) -> Result<raw::devices::DeviceNetwork> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .devices()
+            .network(self.id().as_str())
+            .await?
+            .value)
+    }
+
+    /// Lists distinct BobNet channels this relay-capable device has
+    /// observed. See [`Client::bobnet`](crate::Client::bobnet) for sending
+    /// and account-wide BobNet event observation.
+    pub async fn channels(&self) -> Result<raw::bobnet::DeviceChannelsResponse> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .bobnet()
+            .channels(self.id().as_str())
+            .await?
+            .value)
+    }
+
+    /// Lists recent BobNet messages visible from this relay-capable device.
+    /// Bounded diagnostic/catch-up history, distinct from the account-wide
+    /// inbox (`client.messages()`).
+    pub async fn relay_history(
+        &self,
+        query: &raw::bobnet::DeviceMessagesQuery,
+    ) -> Result<raw::bobnet::DeviceMessagesResponse> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_raw()
+            .bobnet()
+            .messages(self.id().as_str(), query)
+            .await?
+            .value)
     }
 }
 
@@ -505,9 +629,12 @@ impl ReplicantHandle {
         operation::replicant_transfer(&self.client, self.id().as_str(), request).await
     }
 
-    /// Begins travel to a destination.
-    pub async fn travel(&self, request: raw::replicants::TravelRequest) -> Result<Operation> {
-        operation::replicant_travel(&self.client, self.id().as_str(), request).await
+    /// Starts building a travel request: `.to(destination).preview()` to
+    /// compute the route without departing, or `.depart()` to register a
+    /// durable departure operation.
+    #[must_use]
+    pub fn travel(&self) -> TravelBuilder {
+        TravelBuilder::new(self.client.clone(), self.id().as_str().to_string())
     }
 
     /// Cancels this replicant's current travel.
@@ -550,5 +677,119 @@ impl DirectoryGateway {
                     .map_err(normalization)
             })
             .collect()
+    }
+}
+
+/// Gateway for resource inventory (`GET /v1/inventory`,
+/// `GET /v1/replicants/{code}/inventory`). Reads commit before returning.
+#[derive(Clone, Debug)]
+pub struct InventoryGateway {
+    client: Client,
+}
+impl InventoryGateway {
+    pub(crate) fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Fetches a replicant's current-system inventory: its current location
+    /// plus every other location in that star system.
+    pub async fn for_replicant(&self, replicant_code: &str) -> Result<Vec<domain::Inventory>> {
+        self.client.ensure_open()?;
+        let response = self
+            .client
+            .managed_raw()
+            .inventory()
+            .for_replicant(replicant_code, None)
+            .await?;
+        let owner = domain::InventoryOwner::Replicant(ReplicantKey::live(ReplicantId::from(
+            replicant_code,
+        )));
+        let mut raw_locations = vec![raw::inventory::LocationInventory {
+            items: response.value.items.clone(),
+            location: response.value.location.clone(),
+            location_name: response.value.location_name.clone(),
+        }];
+        raw_locations.extend(response.value.locations.iter().cloned());
+
+        let mut inventories = Vec::with_capacity(raw_locations.len());
+        for raw_location in &raw_locations {
+            if raw_location.location.is_none() {
+                continue;
+            }
+            let observation =
+                domain::location_inventory(raw_location, owner.clone(), Realm::Live, observed_at())
+                    .map_err(normalization)?;
+            let value = observation.value.clone();
+            self.client
+                .managed_state()
+                .persist_inventory(observation)
+                .map_err(|_| Error::Persistence {
+                    message: "SQLite store operation failed".into(),
+                })?;
+            inventories.push(value);
+        }
+        Ok(inventories)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    use super::*;
+    use crate::managed::client::StartupPolicy;
+    use crate::raw::{SecretString, Url};
+
+    async fn client_at(base_url: &str) -> Client {
+        Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(base_url).expect("mock URL"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only client")
+    }
+
+    #[tokio::test]
+    async fn for_replicant_normalizes_current_and_system_locations_and_commits_before_returning() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/R1/inventory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "SOL-4",
+                "location_name": "Earth",
+                "items": [{"resource_type": "structural", "quantity": 50}],
+                "locations": [
+                    {"location": "SOL-BELT-1", "location_name": "Sol Belt", "items": [{"resource_type": "rares", "quantity": 5}]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let inventories = client
+            .inventory()
+            .for_replicant("R1")
+            .await
+            .expect("inventory");
+        assert_eq!(inventories.len(), 2);
+        assert!(
+            inventories
+                .iter()
+                .any(|inventory| inventory.location.as_ref().unwrap().id.as_str() == "SOL-4")
+        );
+        assert!(
+            inventories
+                .iter()
+                .any(|inventory| inventory.location.as_ref().unwrap().id.as_str() == "SOL-BELT-1")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close");
     }
 }

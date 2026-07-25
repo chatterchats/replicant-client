@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use crate::domain::{
     Account, Device, DeviceKey, Event, Location, Observation, Realm, Replicant, ReplicantKey,
+    Simulation, SimulationId,
 };
 
 use super::store::{OperationJournalEntry, ReconciliationWork, Store, StoreError, StoreHandle};
@@ -18,6 +19,7 @@ pub(crate) struct StateSnapshot {
     devices: BTreeMap<DeviceKey, Observation<Device>>,
     account: Option<Observation<Account>>,
     replicants: BTreeMap<ReplicantKey, Observation<Replicant>>,
+    simulations: BTreeMap<SimulationId, Observation<Simulation>>,
 }
 
 impl StateSnapshot {
@@ -46,12 +48,11 @@ impl StateEngine {
     }
 
     pub(crate) fn from_store(store: StoreHandle) -> Result<Self, StoreError> {
-        let devices = store
-            .lock()
-            .expect("state store lock poisoned")
-            .as_ref()
-            .ok_or(StoreError::Closed)?
-            .restore_devices()?;
+        let locked = store.lock().expect("state store lock poisoned");
+        let opened = locked.as_ref().ok_or(StoreError::Closed)?;
+        let devices = opened.restore_devices()?;
+        let simulations = opened.restore_simulations()?;
+        drop(locked);
         Ok(Self {
             store,
             snapshot: RwLock::new(Arc::new(StateSnapshot {
@@ -59,6 +60,7 @@ impl StateEngine {
                 devices,
                 account: None,
                 replicants: BTreeMap::new(),
+                simulations,
             })),
             subscribers: Mutex::new(Vec::new()),
         })
@@ -93,6 +95,7 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: Some(account),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         });
         Ok(())
     }
@@ -110,13 +113,87 @@ impl StateEngine {
         let previous = self.snapshot();
         let mut replicants = previous.replicants.clone();
         replicants.insert(replicant.value.key.clone(), replicant);
+        let simulations = previous.simulations.clone();
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants,
+            simulations,
         });
         Ok(())
+    }
+
+    pub(crate) fn simulation(&self, id: SimulationId) -> Option<Observation<Simulation>> {
+        self.snapshot().simulations.get(&id).cloned()
+    }
+
+    /// Commits a simulation run's current observation (start, then later its
+    /// archived result). Never removed: simulation rows are account history.
+    pub(crate) fn persist_simulation(
+        &self,
+        simulation: Observation<Simulation>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_simulation(&simulation)?;
+        let previous = self.snapshot();
+        let mut simulations = previous.simulations.clone();
+        simulations.insert(simulation.value.id, simulation);
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+            simulations,
+        });
+        Ok(())
+    }
+
+    /// Removes every device observation in `realm`: simulation cleanup on
+    /// abandonment, completion, or expiry. Live devices are never affected.
+    pub(crate) fn purge_realm_devices(&self, realm: &Realm) -> Result<(), StoreError> {
+        let removed = self
+            .store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .purge_realm_devices(realm)?;
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let previous = self.snapshot();
+        let mut devices = previous.devices.clone();
+        for key in &removed {
+            devices.remove(key);
+        }
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices,
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
+        });
+        Ok(())
+    }
+
+    /// Commits a targeted inventory observation before publishing a new
+    /// revision. Inventory is not (yet) part of the queryable in-memory
+    /// snapshot; Phase 11 owns finishing the local query surface.
+    pub(crate) fn persist_inventory(
+        &self,
+        inventory: Observation<crate::domain::Inventory>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_inventory(&inventory)
     }
 
     /// Commits a targeted location observation before publishing a new revision.
@@ -136,6 +213,7 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         });
         Ok(())
     }
@@ -213,6 +291,7 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         }))
     }
 
@@ -240,6 +319,7 @@ impl StateEngine {
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         }))
     }
 
@@ -450,6 +530,7 @@ impl StateEngine {
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         }))
     }
 
@@ -481,6 +562,7 @@ impl StateEngine {
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            simulations: previous.simulations.clone(),
         }))
     }
 
