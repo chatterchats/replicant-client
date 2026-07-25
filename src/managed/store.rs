@@ -46,9 +46,17 @@ pub(crate) type StoreHandle = Arc<Mutex<Option<Store>>>;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OperationJournalEntry {
     pub(crate) state: String,
+    pub(crate) target_realm: Option<String>,
+    pub(crate) target_kind: Option<String>,
+    pub(crate) target_id: Option<String>,
     pub(crate) intent: Value,
     pub(crate) projection: Option<Value>,
 }
+
+/// States an operation can never automatically leave without external
+/// evidence, a caller-requested reconciliation, or a fresh restart-recovery
+/// decision. Used to scope both restart recovery and evidence-matching scans.
+const OPERATION_TERMINAL_STATES: [&str; 4] = ["completed", "cancelled", "rejected", "failed"];
 
 /// Durable, coalesced reconciliation work restored after a client restart.
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +144,18 @@ impl Store {
                 Ok(())
             }
         }
+    }
+
+    /// The account ID bound to this store, if any account has bound yet.
+    pub(crate) fn bound_account_id(&self) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT account_id FROM account_binding WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// Forces file-backed SQLite state to durable storage before shutdown.
@@ -269,18 +289,136 @@ impl Store {
         Self::commit(transaction, fail_commit)
     }
 
+    /// Same atomic guarantee as [`Store::append_event_and_project`], but also
+    /// tombstones devices proven decommissioned by this event (an explicit
+    /// removal signal, unlike a filtered/visibility-scoped collection page).
+    pub(crate) fn append_event_and_decommission(
+        &mut self,
+        event: &Event,
+        cursor: &str,
+        decommissioned: &[DeviceKey],
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
+            params![event.id.as_str(), event.realm.as_ref().map(realm_key), serde_json::to_string(event)?],
+        )?;
+        for key in decommissioned {
+            transaction.execute(
+                "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
+                params![realm_key(&key.realm), key.id.as_str()],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, 'device', ?2, datetime('now'), 'explicit-decommission-event')",
+                params![realm_key(&key.realm), key.id.as_str()],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+            [cursor],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
+
+    /// Durable dedup check: reports whether this event ID was already
+    /// journaled, regardless of whether it arrived through the unfiltered log
+    /// or the filtered SSE stream.
+    pub(crate) fn has_event(&self, event_id: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM event_journal WHERE event_id = ?1",
+                [event_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(StoreError::from)
+    }
+
+    /// Persists a baseline watermark cursor with no accompanying event, used
+    /// when a first-start account has no applied cursor yet.
+    pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+            [cursor],
+        )?;
+        Ok(())
+    }
+
+    /// Reports whether the applied cursor is old enough that continuity
+    /// cannot be assumed, without relying on any explicit server rejection.
+    /// A missing cursor is conservatively treated as stale.
+    pub(crate) fn event_cursor_is_stale(&self, threshold_secs: i64) -> Result<bool, StoreError> {
+        let fresh: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN updated_at > datetime('now', ?1) THEN 1 ELSE 0 END FROM event_cursors WHERE stream = 'account'",
+                params![format!("-{threshold_secs} seconds")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(fresh != Some(1))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_event_cursor(&mut self, seconds: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE event_cursors SET updated_at = datetime('now', ?1) WHERE stream = 'account'",
+            params![format!("-{seconds} seconds")],
+        )?;
+        Ok(())
+    }
+
+    /// Persists a durable operation's initial intent, before any unsafe
+    /// network transmission is attempted. `target_*` are `None` for
+    /// operations with no single affected entity (for example, marking
+    /// messages read).
+    pub(crate) fn record_operation(
+        &mut self,
+        operation_id: &str,
+        state: &str,
+        target_realm: Option<&str>,
+        target_kind: Option<&str>,
+        target_id: Option<&str>,
+        intent: &Value,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO operation_journal(operation_id, state, target_realm, target_kind, target_id, intent_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) ON CONFLICT(operation_id) DO UPDATE SET state = excluded.state, target_realm = excluded.target_realm, target_kind = excluded.target_kind, target_id = excluded.target_id, intent_json = excluded.intent_json, updated_at = excluded.updated_at",
+            params![operation_id, state, target_realm, target_kind, target_id, serde_json::to_string(intent)?],
+        )?;
+        Ok(())
+    }
+
+    /// Advances an operation's state with no projection change (for example,
+    /// `prepared` -> `submitted` immediately before the one automatic
+    /// transmission attempt).
+    pub(crate) fn set_operation_state(
+        &mut self,
+        operation_id: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE operation_journal SET state = ?2, updated_at = datetime('now') WHERE operation_id = ?1",
+            params![operation_id, state],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically commits a device projection produced by an operation's
+    /// response alongside the operation's resolved state, so a crash between
+    /// the two is impossible.
     pub(crate) fn record_operation_and_project(
         &mut self,
         operation_id: &str,
         state: &str,
-        intent: &Value,
         devices: &[Observation<Device>],
     ) -> Result<(), StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO operation_journal(operation_id, state, intent_json, updated_at) VALUES (?1, ?2, ?3, datetime('now')) ON CONFLICT(operation_id) DO UPDATE SET state = excluded.state, intent_json = excluded.intent_json, updated_at = excluded.updated_at",
-            params![operation_id, state, serde_json::to_string(intent)?],
+            "UPDATE operation_journal SET state = ?2, updated_at = datetime('now') WHERE operation_id = ?1",
+            params![operation_id, state],
         )?;
         for device in devices {
             persist_device(&transaction, device)?;
@@ -291,13 +429,96 @@ impl Store {
     pub(crate) fn append_operation_projection(
         &mut self,
         operation_id: &str,
+        state: &str,
         projection: &Value,
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "UPDATE operation_journal SET projection_json = ?2, updated_at = datetime('now') WHERE operation_id = ?1",
-            params![operation_id, serde_json::to_string(projection)?],
+            "UPDATE operation_journal SET state = ?2, projection_json = ?3, updated_at = datetime('now') WHERE operation_id = ?1",
+            params![operation_id, state, serde_json::to_string(projection)?],
         )?;
         Ok(())
+    }
+
+    /// Restart recovery: promotes any operation caught mid-transmission
+    /// (`submitted`) to `ambiguous`. A process can only observe `submitted`
+    /// without ever reaching a later state if it crashed during or just after
+    /// the one automatic send attempt, which is definitionally ambiguous —
+    /// never safe to blindly resubmit. Returns the number of rows promoted.
+    pub(crate) fn promote_crashed_submissions(&mut self) -> Result<usize, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE operation_journal SET state = 'ambiguous', updated_at = datetime('now') WHERE state = 'submitted'",
+            [],
+        )?)
+    }
+
+    /// Every operation not yet in a terminal state, for restart recovery and
+    /// caller-visible unresolved-operation listings.
+    pub(crate) fn list_unresolved_operations(
+        &self,
+    ) -> Result<Vec<(String, OperationJournalEntry)>, StoreError> {
+        let placeholders = OPERATION_TERMINAL_STATES
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT operation_id, state, target_realm, target_kind, target_id, intent_json, projection_json FROM operation_journal WHERE state NOT IN ({placeholders}) ORDER BY updated_at"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(OPERATION_TERMINAL_STATES.iter()),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let mut operations = Vec::new();
+        for row in rows {
+            let (operation_id, state, target_realm, target_kind, target_id, intent, projection) =
+                row?;
+            operations.push((
+                operation_id,
+                OperationJournalEntry {
+                    state,
+                    target_realm,
+                    target_kind,
+                    target_id,
+                    intent: serde_json::from_str(&intent)?,
+                    projection: projection
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                },
+            ));
+        }
+        Ok(operations)
+    }
+
+    /// Operation IDs awaiting event evidence for a specific target entity,
+    /// used to resolve operations when a matching account event arrives.
+    pub(crate) fn find_operations_awaiting_evidence(
+        &self,
+        target_realm: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id FROM operation_journal WHERE state = 'awaiting_evidence' AND target_realm = ?1 AND target_kind = ?2 AND target_id = ?3",
+        )?;
+        let rows = statement.query_map(params![target_realm, target_kind, target_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
     }
 
     pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
@@ -318,26 +539,34 @@ impl Store {
     ) -> Result<Option<OperationJournalEntry>, StoreError> {
         self.connection
             .query_row(
-                "SELECT state, intent_json, projection_json FROM operation_journal WHERE operation_id = ?1",
+                "SELECT state, target_realm, target_kind, target_id, intent_json, projection_json FROM operation_journal WHERE operation_id = ?1",
                 [operation_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()?
-            .map(|(state, intent, projection)| {
-                Ok(OperationJournalEntry {
-                    state,
-                    intent: serde_json::from_str(&intent)?,
-                    projection: projection
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                })
-            })
+            .map(
+                |(state, target_realm, target_kind, target_id, intent, projection)| {
+                    Ok(OperationJournalEntry {
+                        state,
+                        target_realm,
+                        target_kind,
+                        target_id,
+                        intent: serde_json::from_str(&intent)?,
+                        projection: projection
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                    })
+                },
+            )
             .transpose()
     }
 
@@ -736,25 +965,33 @@ mod tests {
     }
 
     #[test]
-    fn operation_intent_and_projection_are_atomic() {
+    fn operation_projection_and_device_commit_are_atomic() {
         let mut store = Store::open_memory().expect("open memory store");
+        store
+            .record_operation(
+                "operation-1",
+                "prepared",
+                Some("live"),
+                Some("device"),
+                Some("d1"),
+                &json!({"kind": "activate"}),
+            )
+            .expect("record intent");
         store.fail_next_commit();
         assert!(matches!(
             store.record_operation_and_project(
                 "operation-1",
-                "registered",
-                &json!({"kind": "activate"}),
+                "completed",
                 &[device(Realm::Live, "d1")]
             ),
             Err(StoreError::InjectedCommitFailure)
         ));
         assert_eq!(store.device_count().expect("device count"), 0);
-        assert!(
-            store
-                .read_operation("operation-1")
-                .expect("operation journal")
-                .is_none()
-        );
+        let entry = store
+            .read_operation("operation-1")
+            .expect("operation journal")
+            .expect("operation still recorded");
+        assert_eq!(entry.state, "prepared");
     }
 
     #[test]
@@ -765,23 +1002,187 @@ mod tests {
             .expect("append event");
         assert_eq!(store.read_events().expect("read events"), vec![event()]);
         store
-            .record_operation_and_project(
+            .record_operation(
                 "operation-1",
-                "registered",
+                "prepared",
+                Some("live"),
+                Some("device"),
+                Some("d1"),
                 &json!({"kind": "activate"}),
-                &[],
             )
             .expect("register operation");
         store
-            .append_operation_projection("operation-1", &json!({"device": "d1"}))
+            .append_operation_projection("operation-1", "completed", &json!({"device": "d1"}))
             .expect("append projection");
         let entry = store
             .read_operation("operation-1")
             .expect("read operation")
             .expect("operation exists");
-        assert_eq!(entry.state, "registered");
+        assert_eq!(entry.state, "completed");
+        assert_eq!(entry.target_kind.as_deref(), Some("device"));
         assert_eq!(entry.intent, json!({"kind": "activate"}));
         assert_eq!(entry.projection, Some(json!({"device": "d1"})));
+    }
+
+    #[test]
+    fn promote_crashed_submissions_marks_only_submitted_rows_ambiguous() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .record_operation("op-submitted", "submitted", None, None, None, &json!({}))
+            .expect("record submitted");
+        store
+            .record_operation("op-prepared", "prepared", None, None, None, &json!({}))
+            .expect("record prepared");
+        let promoted = store
+            .promote_crashed_submissions()
+            .expect("promote crashed submissions");
+        assert_eq!(promoted, 1);
+        assert_eq!(
+            store
+                .read_operation("op-submitted")
+                .expect("read")
+                .expect("exists")
+                .state,
+            "ambiguous"
+        );
+        assert_eq!(
+            store
+                .read_operation("op-prepared")
+                .expect("read")
+                .expect("exists")
+                .state,
+            "prepared"
+        );
+    }
+
+    #[test]
+    fn list_unresolved_operations_excludes_terminal_states() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .record_operation("op-open", "awaiting_evidence", None, None, None, &json!({}))
+            .expect("record open");
+        store
+            .record_operation("op-done", "completed", None, None, None, &json!({}))
+            .expect("record done");
+        let unresolved = store.list_unresolved_operations().expect("list unresolved");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].0, "op-open");
+    }
+
+    #[test]
+    fn find_operations_awaiting_evidence_matches_target() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .record_operation(
+                "op-1",
+                "awaiting_evidence",
+                Some("live"),
+                Some("device"),
+                Some("d1"),
+                &json!({}),
+            )
+            .expect("record");
+        let found = store
+            .find_operations_awaiting_evidence("live", "device", "d1")
+            .expect("find");
+        assert_eq!(found, vec!["op-1".to_string()]);
+        assert!(
+            store
+                .find_operations_awaiting_evidence("live", "device", "d2")
+                .expect("find other")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn has_event_detects_journaled_ids_regardless_of_source() {
+        let mut store = Store::open_memory().expect("open memory store");
+        assert!(!store.has_event("event-1").expect("has_event before append"));
+        store
+            .append_event_and_project(&event(), "event-1", &[])
+            .expect("append event");
+        assert!(store.has_event("event-1").expect("has_event after append"));
+        assert!(!store.has_event("event-2").expect("has_event for unseen id"));
+    }
+
+    #[test]
+    fn append_event_and_decommission_removes_device_and_tombstones_atomically() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .persist_devices(&[device(Realm::Live, "d1")])
+            .expect("seed device");
+        let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
+
+        let mut decommission_event = event();
+        decommission_event.name = EventName::from("device.decommissioned");
+        decommission_event.device = Some(key.clone());
+        store
+            .append_event_and_decommission(
+                &decommission_event,
+                "cursor-decom",
+                std::slice::from_ref(&key),
+            )
+            .expect("decommission");
+
+        assert_eq!(store.device_count().expect("device count"), 0);
+        assert_eq!(
+            store.event_cursor().expect("cursor").as_deref(),
+            Some("cursor-decom")
+        );
+        let restored = store.restore_devices().expect("restore devices");
+        assert!(!restored.contains_key(&key));
+    }
+
+    #[test]
+    fn decommission_failure_leaves_device_event_and_cursor_untouched() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .persist_devices(&[device(Realm::Live, "d1")])
+            .expect("seed device");
+        let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
+        store.fail_next_commit();
+        assert!(matches!(
+            store.append_event_and_decommission(
+                &event(),
+                "cursor-decom",
+                std::slice::from_ref(&key)
+            ),
+            Err(StoreError::InjectedCommitFailure)
+        ));
+        assert_eq!(store.device_count().expect("device count"), 1);
+        assert_eq!(store.event_cursor().expect("cursor"), None);
+        assert!(store.read_events().expect("event journal").is_empty());
+    }
+
+    #[test]
+    fn event_cursor_is_stale_after_the_configured_threshold() {
+        let mut store = Store::open_memory().expect("open memory store");
+        // No cursor at all is conservatively treated as stale.
+        assert!(store.event_cursor_is_stale(3600).expect("stale check"));
+        store.set_event_cursor("1-0").expect("set cursor");
+        assert!(!store.event_cursor_is_stale(3600).expect("fresh cursor"));
+        store.backdate_event_cursor(7200).expect("backdate");
+        assert!(store.event_cursor_is_stale(3600).expect("stale cursor"));
+    }
+
+    #[test]
+    fn crash_before_commit_leaves_no_trace_and_replay_remains_safe() {
+        let path = test_path("crash-resume");
+        {
+            let mut store = Store::open_file(&path).expect("open file store");
+            // Simulate a process that decoded an event ("received" it) but
+            // crashed before the atomic store-and-advance-cursor commit.
+            store.fail_next_commit();
+            assert!(matches!(
+                store.append_event_and_project(&event(), "cursor-1", &[]),
+                Err(StoreError::InjectedCommitFailure)
+            ));
+        }
+        let restored = Store::open_file(&path).expect("reopen after crash");
+        assert!(!restored.has_event("event-1").expect("event not journaled"));
+        assert_eq!(restored.event_cursor().expect("cursor"), None);
+        drop(restored);
+        fs::remove_file(&path).expect("remove test database");
     }
 
     #[test]

@@ -89,6 +89,14 @@ pub enum Error {
         /// Account identifier presented by the current authentication.
         supplied_account_id: String,
     },
+    /// A durable operation could not be created, located, or resolved as
+    /// requested (for example: an unknown operation ID, a destructive
+    /// confirmation mismatch, or a request that would persist material this
+    /// client never accepts into the operation journal).
+    Operation {
+        /// Description of the operation failure.
+        message: String,
+    },
     /// The managed client has completed shutdown.
     Closed,
 }
@@ -133,6 +141,10 @@ impl std::fmt::Debug for Error {
             Self::AccountStoreMismatch { .. } => {
                 f.write_str("Error::AccountStoreMismatch(<redacted>)")
             }
+            Self::Operation { message } => f
+                .debug_struct("Error::Operation")
+                .field("message", message)
+                .finish(),
             Self::Closed => f.write_str("Error::Closed"),
         }
     }
@@ -159,6 +171,7 @@ impl std::fmt::Display for Error {
             Self::AccountStoreMismatch { .. } => {
                 write!(f, "authenticated account does not match the durable store")
             }
+            Self::Operation { message } => write!(f, "durable operation failure: {message}"),
             Self::Closed => write!(f, "client is closed"),
         }
     }
@@ -182,6 +195,7 @@ impl Error {
             | Self::Transport { .. }
             | Self::Persistence { .. }
             | Self::AccountStoreMismatch { .. }
+            | Self::Operation { .. }
             | Self::Closed => None,
         }
     }
@@ -207,6 +221,7 @@ impl Error {
             | Self::Decode { .. }
             | Self::Persistence { .. }
             | Self::AccountStoreMismatch { .. }
+            | Self::Operation { .. }
             | Self::Closed => None,
         }
     }

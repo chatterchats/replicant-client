@@ -45,7 +45,9 @@ pub mod managed {
     pub use crate::domain;
 
     mod client;
+    mod events;
     mod gateways;
+    mod operation;
     mod state;
     mod store;
     mod sync;
@@ -54,9 +56,15 @@ pub mod managed {
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
         ReconciliationPolicy, StartupPolicy,
     };
+    pub use events::{EventWatch, EventsGateway};
     pub use gateways::{
         AccountGateway, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
         ReplicantHandle, ReplicantsGateway,
+    };
+    pub use operation::{
+        ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationsGateway,
+        MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
+        OperationsGateway,
     };
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
@@ -66,11 +74,13 @@ pub mod managed {
 
 #[cfg(feature = "managed")]
 pub use managed::{
-    AccountGateway, Client, ClientBuilder, ClientDegradation, ClientStatus, DeviceHandle,
-    DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway, EventStreamOptions,
-    ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy, SyncCancellation,
-    SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness,
-    SyncReport,
+    AccountGateway, Client, ClientBuilder, ClientDegradation, ClientStatus, ConfirmAccountWipe,
+    DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway, DynamicCommand,
+    EventStreamOptions, EventWatch, EventsGateway, LocationEventsGateway, LocationsGateway,
+    MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
+    OperationsGateway, ReconciliationPolicy, ReplicantHandle, ReplicantsGateway, StartupPolicy,
+    SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
+    SyncProgress, SyncReadiness, SyncReport,
 };
 
 #[cfg(feature = "raw")]
@@ -79,6 +89,6 @@ pub use raw::SecretString;
 #[cfg(feature = "managed")]
 pub use domain::{
     Account, AccountId, Device, DeviceCommand, DeviceId, DeviceKey, DeviceStatus, DeviceType,
-    Event, EventId, Location, LocationId, LocationKey, Realm, Replicant, ReplicantId, ReplicantKey,
-    SimulationId, StarId, TradeId, WorldKey,
+    Event, EventId, Location, LocationId, LocationKey, OperationId, Realm, Replicant, ReplicantId,
+    ReplicantKey, SimulationId, StarId, TradeId, WorldKey,
 };

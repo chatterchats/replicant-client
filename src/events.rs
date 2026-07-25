@@ -22,6 +22,11 @@ use crate::{
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct GameEvent {
     /// Opaque event ID, also used as the history and reconnect cursor.
+    ///
+    /// The SSE `data:` payload never repeats the frame's own `id:` line (see
+    /// the event stream documentation), so this must deserialize even when
+    /// absent; [`EventsClient::stream`] then fills it in from the SSE frame.
+    #[serde(default)]
     pub id: String,
     /// Envelope version.
     pub version: i64,

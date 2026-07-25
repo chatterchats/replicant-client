@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 
-use crate::domain::{Account, Device, DeviceKey, Location, Observation, Replicant, ReplicantKey};
+use crate::domain::{
+    Account, Device, DeviceKey, Event, Location, Observation, Realm, Replicant, ReplicantKey,
+};
 
-use super::store::{Store, StoreError, StoreHandle};
+use super::store::{OperationJournalEntry, ReconciliationWork, Store, StoreError, StoreHandle};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StateSnapshot {
@@ -136,6 +138,286 @@ impl StateEngine {
             replicants: previous.replicants.clone(),
         });
         Ok(())
+    }
+
+    /// Durable dedup check shared by log catch-up and SSE delivery.
+    pub(crate) fn has_event(&self, event_id: &str) -> Result<bool, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .has_event(event_id)
+    }
+
+    /// The last durably applied event cursor, restored across restarts.
+    pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .event_cursor()
+    }
+
+    /// Persists a baseline watermark with no accompanying event.
+    pub(crate) fn set_event_cursor(&self, cursor: &str) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .set_event_cursor(cursor)
+    }
+
+    /// Whether the applied cursor is old enough that continuity cannot be
+    /// assumed. Never relies on an explicit server cursor rejection.
+    pub(crate) fn event_cursor_is_stale(
+        &self,
+        threshold: std::time::Duration,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .event_cursor_is_stale(threshold.as_secs() as i64)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_event_cursor(&self, seconds: i64) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .backdate_event_cursor(seconds)
+    }
+
+    /// Commits an event and advances the applied cursor atomically, then
+    /// publishes a new state revision.
+    pub(crate) fn apply_event(
+        &self,
+        event: &Event,
+        cursor: &str,
+    ) -> Result<Arc<StateSnapshot>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .append_event_and_project(event, cursor, &[])?;
+        let previous = self.snapshot();
+        Ok(self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+        }))
+    }
+
+    /// Commits an event, tombstones explicitly decommissioned devices, and
+    /// advances the applied cursor atomically, then publishes a new revision.
+    pub(crate) fn apply_event_with_decommission(
+        &self,
+        event: &Event,
+        cursor: &str,
+        decommissioned: &[DeviceKey],
+    ) -> Result<Arc<StateSnapshot>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .append_event_and_decommission(event, cursor, decommissioned)?;
+        let previous = self.snapshot();
+        let mut devices = previous.devices.clone();
+        for key in decommissioned {
+            devices.remove(key);
+        }
+        Ok(self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices,
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+        }))
+    }
+
+    /// Enqueues (or coalesces) durable reconciliation work keyed by `work_id`.
+    pub(crate) fn enqueue_reconciliation(
+        &self,
+        work_id: &str,
+        realm: &Realm,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .enqueue_reconciliation(work_id, realm, kind, payload)
+    }
+
+    /// Claims the next due reconciliation work item, if any.
+    pub(crate) fn claim_reconciliation_work(
+        &self,
+    ) -> Result<Option<ReconciliationWork>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .claim_reconciliation_work()
+    }
+
+    /// Completes successfully claimed reconciliation work.
+    pub(crate) fn complete_reconciliation_work(&self, work_id: &str) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .complete_reconciliation_work(work_id)
+    }
+
+    /// Requeues failed reconciliation work with bounded exponential backoff.
+    pub(crate) fn retry_reconciliation_work(&self, work_id: &str) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .retry_reconciliation_work(work_id)
+    }
+
+    /// The account ID bound to this store, if any account has bound yet.
+    pub(crate) fn bound_account_id(&self) -> Result<Option<String>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .bound_account_id()
+    }
+
+    /// Persists a durable operation's initial intent, before any unsafe
+    /// network transmission is attempted.
+    pub(crate) fn record_operation(
+        &self,
+        operation_id: &str,
+        state: &str,
+        target_realm: Option<&str>,
+        target_kind: Option<&str>,
+        target_id: Option<&str>,
+        intent: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .record_operation(
+                operation_id,
+                state,
+                target_realm,
+                target_kind,
+                target_id,
+                intent,
+            )
+    }
+
+    /// Advances an operation's state with no accompanying projection.
+    pub(crate) fn set_operation_state(
+        &self,
+        operation_id: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .set_operation_state(operation_id, state)
+    }
+
+    /// Atomically commits a device projection produced by an operation's
+    /// response alongside the operation's resolved state.
+    pub(crate) fn record_operation_and_project(
+        &self,
+        operation_id: &str,
+        state: &str,
+        devices: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .record_operation_and_project(operation_id, state, devices)
+    }
+
+    /// Resolves an operation with a sanitized outcome projection.
+    pub(crate) fn append_operation_projection(
+        &self,
+        operation_id: &str,
+        state: &str,
+        projection: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .append_operation_projection(operation_id, state, projection)
+    }
+
+    pub(crate) fn read_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<OperationJournalEntry>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .read_operation(operation_id)
+    }
+
+    /// Restart recovery: promotes any operation caught mid-transmission to
+    /// `ambiguous`, never blindly resubmitting it.
+    pub(crate) fn promote_crashed_submissions(&self) -> Result<usize, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .promote_crashed_submissions()
+    }
+
+    pub(crate) fn list_unresolved_operations(
+        &self,
+    ) -> Result<Vec<(String, OperationJournalEntry)>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .list_unresolved_operations()
+    }
+
+    pub(crate) fn find_operations_awaiting_evidence(
+        &self,
+        target_realm: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .find_operations_awaiting_evidence(target_realm, target_kind, target_id)
     }
 
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<Arc<StateSnapshot>> {

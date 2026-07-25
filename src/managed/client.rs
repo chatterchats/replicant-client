@@ -39,18 +39,85 @@ pub enum StartupPolicy {
     Full,
 }
 
-/// Event-stream configuration reserved for the event engine introduced in Phase 8.
+/// Tuning for the durable event-journal catch-up and filtered SSE engine.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventStreamOptions {
-    _private: (),
+    pub(crate) log_poll_interval: Duration,
+    pub(crate) reconnect_min_backoff: Duration,
+    pub(crate) reconnect_max_backoff: Duration,
+    pub(crate) max_catchup_pages: usize,
 }
 
-/// Reconciliation configuration reserved for the synchronization engine in Phase 7.
+impl Default for EventStreamOptions {
+    fn default() -> Self {
+        Self {
+            log_poll_interval: Duration::from_secs(120),
+            reconnect_min_backoff: Duration::from_secs(1),
+            reconnect_max_backoff: Duration::from_secs(60),
+            max_catchup_pages: 500,
+        }
+    }
+}
+
+impl EventStreamOptions {
+    /// Sets how often the periodic unfiltered log poll runs, so muted events
+    /// (which never arrive over SSE) still reach durable state.
+    #[must_use]
+    pub fn log_poll_interval(mut self, interval: Duration) -> Self {
+        self.log_poll_interval = interval;
+        self
+    }
+
+    /// Bounds the SSE reconnect backoff.
+    #[must_use]
+    pub fn reconnect_backoff(mut self, min: Duration, max: Duration) -> Self {
+        self.reconnect_min_backoff = min;
+        self.reconnect_max_backoff = max;
+        self
+    }
+
+    /// Bounds the number of pages accepted from one log catch-up traversal
+    /// before continuity is treated as uncertain.
+    #[must_use]
+    pub fn max_catchup_pages(mut self, pages: usize) -> Self {
+        self.max_catchup_pages = pages.max(1);
+        self
+    }
+}
+
+/// Tuning for uncertain-continuity detection and durable reconciliation drain.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconciliationPolicy {
-    _private: (),
+    pub(crate) staleness_threshold: Duration,
+    pub(crate) queue_idle_interval: Duration,
+}
+
+impl Default for ReconciliationPolicy {
+    fn default() -> Self {
+        Self {
+            staleness_threshold: Duration::from_secs(1800),
+            queue_idle_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+impl ReconciliationPolicy {
+    /// An applied cursor older than this is treated as uncertain continuity,
+    /// without assuming any explicit server cursor rejection.
+    #[must_use]
+    pub fn staleness_threshold(mut self, threshold: Duration) -> Self {
+        self.staleness_threshold = threshold;
+        self
+    }
+
+    /// How often the durable reconciliation queue is polled when idle.
+    #[must_use]
+    pub fn queue_idle_interval(mut self, interval: Duration) -> Self {
+        self.queue_idle_interval = interval;
+        self
+    }
 }
 
 /// A reason a client may be usable but not fully healthy.
@@ -276,6 +343,14 @@ impl ClientBuilder {
             }
         }
 
+        // Restart recovery, pure-local half: an operation caught mid-transmission
+        // (`submitted`) cannot be distinguished from a lost response, so it is
+        // promoted to `ambiguous` unconditionally, even under `RestoreOnly`
+        // (no network access is required). The network half — retrying
+        // operations left at `prepared`, never actually attempted — runs from
+        // `events::spawn` once the account and its store binding are settled.
+        let _ = state.promote_crashed_submissions();
+
         let scheduler = SchedulerHooks {
             rate_limits: raw.rate_limits().clone(),
         };
@@ -284,9 +359,9 @@ impl ClientBuilder {
             scheduler,
             store,
             state,
-            events: EventEngine,
+            events: super::events::EventEngine::new(),
             sync: SyncEngine,
-            operations: OperationEngine,
+            operations: super::operation::OperationEngine::new(),
             lifecycle: Lifecycle::new(),
             status,
         });
@@ -295,6 +370,14 @@ impl ClientBuilder {
             StartupPolicy::RestoreOnly => client.set_status(ClientStatus::Ready),
             StartupPolicy::Essential => client.set_status(ClientStatus::CatchingUp),
             StartupPolicy::Full => client.set_status(ClientStatus::Synchronizing),
+        }
+        if self.startup_policy != StartupPolicy::RestoreOnly {
+            super::events::spawn(
+                &client,
+                self.startup_policy,
+                self.event_stream_options.clone(),
+                self.reconciliation_policy.clone(),
+            );
         }
         Ok(client)
     }
@@ -346,9 +429,7 @@ struct SchedulerHooks {
     #[allow(dead_code)] // Phase 6 gateways and Phase 7–8 workers share this coordinator.
     rate_limits: RateLimitCoordinator,
 }
-struct EventEngine;
 struct SyncEngine;
-struct OperationEngine;
 
 #[derive(Default)]
 struct Lifecycle {
@@ -411,12 +492,10 @@ struct ClientInner {
     store: StoreHandle,
     #[allow(dead_code)] // Public state queries arrive in a later phase.
     state: StateEngine,
-    #[allow(dead_code)]
-    events: EventEngine,
+    events: super::events::EventEngine,
     #[allow(dead_code)]
     sync: SyncEngine,
-    #[allow(dead_code)]
-    operations: OperationEngine,
+    operations: super::operation::OperationEngine,
     lifecycle: Lifecycle,
     status: watch::Sender<ClientStatus>,
 }
@@ -493,12 +572,60 @@ impl Client {
         super::sync::SyncClient::new(self.clone())
     }
 
+    /// Deduplicated managed event observation, combining unfiltered log
+    /// catch-up and filtered SSE delivery. `client.raw().events().stream()`
+    /// remains the unmanaged escape hatch and never mutates managed state.
+    #[must_use]
+    pub fn events(&self) -> super::events::EventsGateway {
+        super::events::EventsGateway::new(self.clone())
+    }
+
+    /// Durable operations previously created through this client, most
+    /// useful for recovering unresolved operations after a restart.
+    #[must_use]
+    pub fn operations(&self) -> super::operation::OperationsGateway {
+        super::operation::OperationsGateway::new(self.clone())
+    }
+
+    /// The account-wide inbox's only mutation: marking messages read.
+    #[must_use]
+    pub fn messages(&self) -> super::operation::MessagesGateway {
+        super::operation::MessagesGateway::new(self.clone())
+    }
+
+    /// Location-scoped mutations (megastructure/location-event contribution).
+    #[must_use]
+    pub fn locations(&self) -> super::operation::LocationsGateway {
+        super::operation::LocationsGateway::new(self.clone())
+    }
+
+    /// Location-scoped civilisation event resolution, distinct from account
+    /// events and device logs.
+    #[must_use]
+    pub fn location_events(&self) -> super::operation::LocationEventsGateway {
+        super::operation::LocationEventsGateway::new(self.clone())
+    }
+
     pub(crate) fn managed_state(&self) -> &StateEngine {
         &self.inner.state
     }
 
+    pub(crate) fn managed_events(&self) -> &super::events::EventEngine {
+        &self.inner.events
+    }
+
+    pub(crate) fn managed_operations(&self) -> &super::operation::OperationEngine {
+        &self.inner.operations
+    }
+
     pub(crate) fn managed_raw(&self) -> &RawClient {
         &self.inner.raw
+    }
+
+    /// A non-owning reference used by background lifecycle tasks so they
+    /// never keep `ClientInner` alive by themselves.
+    pub(crate) fn downgrade(&self) -> WeakClient {
+        WeakClient(Arc::downgrade(&self.inner))
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -522,12 +649,17 @@ impl Client {
     }
 
     /// Waits until the configured startup policy has completed.
+    ///
+    /// A [`ClientStatus::Degraded`] client is usable with a recoverable
+    /// limitation (for example, the live event connection has not opened
+    /// yet), so `ready()` resolves successfully for it rather than blocking
+    /// forever; `watch_status` remains available to observe recovery.
     pub async fn ready(&self) -> Result<()> {
         let mut status = self.watch_status();
         loop {
             let current = status.borrow().clone();
             match current {
-                ClientStatus::Ready => return Ok(()),
+                ClientStatus::Ready | ClientStatus::Degraded(_) => return Ok(()),
                 ClientStatus::Closing | ClientStatus::Closed => return Err(Error::Closed),
                 _ => status.changed().await.map_err(|_| Error::Closed)?,
             }
@@ -562,9 +694,28 @@ impl Client {
         self.inner.status.send_replace(status);
     }
 
-    #[cfg(test)]
-    fn register_task(&self, task: JoinHandle<()>) -> Result<()> {
+    /// Registers a background lifecycle task (event catch-up, SSE, durable
+    /// reconciliation drain) so `close()` cancels and joins it.
+    pub(crate) fn register_task(&self, task: JoinHandle<()>) -> Result<()> {
         self.inner.lifecycle.register(task)
+    }
+}
+
+/// A non-owning reference to a managed client's shared state.
+///
+/// Long-running background tasks (event catch-up, SSE, reconciliation drain)
+/// hold this instead of a [`Client`] clone. Holding a strong `Client` for the
+/// task's entire lifetime would keep `ClientInner` alive even after every
+/// application-visible clone is dropped, and would defeat the drop-based
+/// cancellation safety net described on [`Client`].
+#[derive(Clone)]
+pub(crate) struct WeakClient(std::sync::Weak<ClientInner>);
+
+impl WeakClient {
+    /// Upgrades to a live [`Client`], or `None` once every real clone (and
+    /// thus the managed client itself) has been dropped.
+    pub(crate) fn upgrade(&self) -> Option<Client> {
+        self.0.upgrade().map(|inner| Client { inner })
     }
 }
 

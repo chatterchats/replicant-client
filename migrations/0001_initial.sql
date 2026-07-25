@@ -176,6 +176,9 @@ CREATE TABLE event_cursors (
 CREATE TABLE operation_journal (
     operation_id TEXT PRIMARY KEY NOT NULL,
     state TEXT NOT NULL,
+    target_realm TEXT,
+    target_kind TEXT,
+    target_id TEXT,
     intent_json TEXT NOT NULL,
     projection_json TEXT,
     updated_at TEXT NOT NULL
@@ -219,3 +222,5 @@ CREATE INDEX inventories_realm_owner ON inventories(realm, owner_kind, owner_id)
 CREATE INDEX device_relationship_targets ON device_relationships(target_realm, target_id);
 CREATE INDEX event_journal_realm ON event_journal(realm, appended_at);
 CREATE INDEX reconciliation_ready ON reconciliation_queue(state, not_before);
+CREATE INDEX operation_journal_target ON operation_journal(target_realm, target_kind, target_id, state);
+CREATE INDEX operation_journal_state ON operation_journal(state);
