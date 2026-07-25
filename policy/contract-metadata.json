@@ -1,0 +1,15 @@
+{
+  "$schema_note": "Provenance and authority metadata for the corrected Replicant Space 2.3.1 contract corpus checked in at reference/replicant-space/.",
+  "replicant_space_version": "2.3.1",
+  "crawl_timestamp": "2026-07-24T18:16:35.649754+00:00",
+  "openapi_fetched_at": "2026-07-22T03:29:15.141566+00:00",
+  "documentation_archive_sha256": "a6b02569b17fcfccf29b4f439777df9864c04b91f89d43f2da464b3c28f65e8d",
+  "openapi_sha256": "ca018a938541f23c4838e8fe58f78889d9ca4b9ab81b488112f90589dd83c2f4",
+  "openapi_operation_count": 84,
+  "openapi_path_count": 70,
+  "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
+  "notes": [
+    "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
+    "reference/replicant-space/openapi.json sha256 is verified by scripts/contract_policy_check.py on every run."
+  ]
+}

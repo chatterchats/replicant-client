@@ -1,0 +1,9 @@
+[build]
+incremental = true
+
+[future-incompat-report]
+frequency = "always"
+
+[alias]
+t = "test --all-features"
+cl = "clippy --all-targets --all-features -- -D warnings"

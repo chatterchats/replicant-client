@@ -1,0 +1,11 @@
+{
+  "$schema_note": "Fields present in the corrected Replicant Space 2.3.1 contract that must not be exposed as normal managed account settings.",
+  "excluded_fields": [
+    {
+      "field": "message_notify",
+      "scope": "PATCH /v1/accounts/me account settings",
+      "reason": "Deprecated webhook and email notification block; superseded by the account event stream and message subscriptions.",
+      "evidence": "api/accounts/index.md"
+    }
+  ]
+}

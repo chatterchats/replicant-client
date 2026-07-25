@@ -1,0 +1,17 @@
+{
+  "$schema_note": "Deprecated mining response field aliases that the raw DTO layer may deserialize, but which the normalized public domain model must not expose under their old names.",
+  "aliases": [
+    {
+      "deprecated_field": "belt",
+      "normalized_field": "location",
+      "reason": "Legacy mining response field name for the current location field.",
+      "evidence": "openapi.json#/components/schemas/app_schemas_mining_ReplicantMineResponseSchema"
+    },
+    {
+      "deprecated_field": "designation",
+      "normalized_field": "site",
+      "reason": "Legacy mining response field name for the current resource site field.",
+      "evidence": "openapi.json#/components/schemas/app_schemas_mining_ReplicantMineResponseSchema"
+    }
+  ]
+}
