@@ -78,6 +78,18 @@ pub enum Error {
         /// Sanitized server error details.
         details: Box<ErrorDetails>,
     },
+    /// The durable store could not be opened or committed.
+    Persistence {
+        /// Sanitized description of the storage failure.
+        message: String,
+    },
+    /// The authenticated account does not match the account bound to this store.
+    AccountStoreMismatch {
+        /// Account identifier already bound to the database.
+        stored_account_id: String,
+        /// Account identifier presented by the current authentication.
+        supplied_account_id: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -97,6 +109,10 @@ impl std::fmt::Display for Error {
                 }
                 Ok(())
             }
+            Self::Persistence { message } => write!(f, "durable store failure: {message}"),
+            Self::AccountStoreMismatch { .. } => {
+                write!(f, "authenticated account does not match the durable store")
+            }
         }
     }
 }
@@ -115,7 +131,10 @@ impl Error {
                 .code
                 .and_then(|code| u16::try_from(code).ok())
                 .or(Some(429)),
-            Self::Configuration { .. } | Self::Transport { .. } => None,
+            Self::Configuration { .. }
+            | Self::Transport { .. }
+            | Self::Persistence { .. }
+            | Self::AccountStoreMismatch { .. } => None,
         }
     }
 
@@ -135,7 +154,11 @@ impl Error {
             Self::Authentication { details }
             | Self::RateLimited { details, .. }
             | Self::Contract { details, .. } => Some(details.as_ref()),
-            Self::Configuration { .. } | Self::Transport { .. } | Self::Decode { .. } => None,
+            Self::Configuration { .. }
+            | Self::Transport { .. }
+            | Self::Decode { .. }
+            | Self::Persistence { .. }
+            | Self::AccountStoreMismatch { .. } => None,
         }
     }
 

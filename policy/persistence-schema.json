@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "migration": "migrations/0001_initial.sql",
+  "required_tables": [
+    "schema_metadata", "account_binding", "source_documents", "accounts", "replicants",
+    "public_directory_profiles", "devices", "device_relationships", "locations", "inventories",
+    "discovery_data", "stars", "resource_sites", "location_events", "messages", "bobnet_messages",
+    "blueprints", "achievements", "reputation", "species", "trades", "simulations", "event_journal",
+    "event_cursors", "operation_journal", "reconciliation_queue", "reconciliation_runs",
+    "freshness", "tombstones"
+  ],
+  "required_indexes": ["devices_realm_type_status", "devices_realm_location", "devices_realm_access"]
+}

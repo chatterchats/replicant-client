@@ -1,0 +1,545 @@
+{
+  "version": 1,
+  "contract": "Replicant Space 2.3.1",
+  "operations": [
+    {
+      "method": "POST",
+      "path": "/v1/accounts",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/achievements",
+      "authority": "complete_collection",
+      "completeness": "complete_collection",
+      "tombstone": "additive"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/events",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/accounts/me",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/me",
+      "authority": "entity_snapshot",
+      "completeness": "complete_entity",
+      "tombstone": "never"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/accounts/me",
+      "authority": "operation_result",
+      "completeness": "complete_entity",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/accounts/recover",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/reputation",
+      "authority": "entity_snapshot",
+      "completeness": "complete_entity",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/simulations",
+      "authority": "entity_snapshot",
+      "completeness": "complete_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/accounts/verify/{token}",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/achievements",
+      "authority": "complete_collection",
+      "completeness": "reference_collection",
+      "tombstone": "atomic_replace"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/achievements/{achievement_key}",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/blueprints",
+      "authority": "complete_collection",
+      "completeness": "reference_collection",
+      "tombstone": "atomic_replace"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices",
+      "authority": "collection_member",
+      "completeness": "unfiltered_traversal_only",
+      "tombstone": "full_unfiltered_only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/tags/{tag}",
+      "authority": "collection_member",
+      "completeness": "filtered",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}",
+      "authority": "entity_snapshot",
+      "completeness": "complete_entity",
+      "tombstone": "never"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/devices/{device_code}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/audit",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/channels",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/logs",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/messages",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/network",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/devices/{device_code}/permissions",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/permissions",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}/permissions",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/simulate",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}/simulate",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/simulate/active",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/devices/{device_code}/simulate/{sim_id}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/devices/{device_code}/trades",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}/trades",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/devices/{device_code}/trades/{trade_code}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}/trades/{trade_code}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/events",
+      "authority": "event_delta",
+      "completeness": "append_only_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/events/stream",
+      "authority": "event_delta",
+      "completeness": "filtered_low_latency",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/feedback",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/health",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/inventory",
+      "authority": "entity_snapshot",
+      "completeness": "account_visible",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/distance",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/fleet",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/megastructure",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/reputation",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/simulations",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/simulations/{scenario_code}",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/trades",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/xp",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/locations",
+      "authority": "discovery",
+      "completeness": "visibility_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/locations/{designation}",
+      "authority": "entity_snapshot",
+      "completeness": "discoverable_fields",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locations/{designation}/contribute",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/locations/{location_code}/events",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/locations/{location_code}/events/{designation}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/locations/{star_designation}/stars",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/messages",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages/read",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants",
+      "authority": "public_profile",
+      "completeness": "public_directory",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}",
+      "authority": "authorization_dependent",
+      "completeness": "owned_or_public_entity",
+      "tombstone": "never"
+    },
+    {
+      "method": "PATCH",
+      "path": "/v1/replicants/{replicant_code}",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/devices",
+      "authority": "collection_member",
+      "completeness": "range_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/inventory",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/message",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/replicants/{replicant_code}/mine",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/mine",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/print",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/reputation",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/scan",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/scan/devices",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/stars",
+      "authority": "discovery",
+      "completeness": "known_stars",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/stars/{star_designation}",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/teleport",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/replicants/{replicant_code}/traders",
+      "authority": "collection_member",
+      "completeness": "endpoint_scoped",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/transfer",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/replicants/{replicant_code}/travel",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "explicit_response_only"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/replicants/{replicant_code}/travel",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/species",
+      "authority": "complete_collection",
+      "completeness": "reference_collection",
+      "tombstone": "atomic_replace"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/stars",
+      "authority": "complete_collection",
+      "completeness": "complete_catalogue",
+      "tombstone": "atomic_replace"
+    }
+  ]
+}

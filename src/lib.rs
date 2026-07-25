@@ -40,6 +40,8 @@ pub mod events;
 pub mod domain;
 
 #[cfg(feature = "managed")]
+/// Managed-client implementation details. Only normalized domain types are
+/// public until the managed client is introduced.
 pub mod managed {
     pub use crate::domain;
 

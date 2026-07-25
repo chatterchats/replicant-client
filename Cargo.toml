@@ -74,6 +74,10 @@ required-features = ["raw"]
 name = "raw_events"
 required-features = ["events"]
 
+[[bench]]
+name = "state_snapshot"
+harness = false
+
 [lints.rust]
 missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
