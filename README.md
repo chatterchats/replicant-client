@@ -68,12 +68,3 @@ make contract-policy-check
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## History
-
-`replicant-client` is a new product informed by the experimental
-[`replicant-sdk`](https://github.com/chatterchats/replicant-space-rust-sdk)
-project, but it makes no API compatibility promise with it. `replicant-sdk`
-required consumers to assemble a transport client, runtime, state actor, and
-persistence layer themselves; `replicant-client` presents that as one
-coherent `Client` instead.

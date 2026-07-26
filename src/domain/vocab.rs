@@ -30,7 +30,7 @@ open_value!(DeviceCommand {
 open_value!(DeviceFeature {
     Mining => "mining", Printing => "printing", Scanning => "scanning", Travel => "travel"
 });
-open_value!(DeviceStatus { Active => "active", Deactivated => "deactivated", Offline => "offline" });
+open_value!(DeviceStatus { Active => "active", Deactivated => "deactivated", Idle => "idle", Offline => "offline" });
 // AMI controller wire values are confirmed against
 // `reference/replicant-space/api/replicants/events/index.md` (`ami_mining_controller`);
 // the survey/transport/fleet siblings follow the same `ami_<kind>_controller`

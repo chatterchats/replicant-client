@@ -2,7 +2,7 @@ SHELL := /bin/sh
 CARGO ?= cargo
 PYTHON ?= python3
 
-.PHONY: help fmt fmt-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check ci
+.PHONY: help fmt fmt-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check policy-checks remediation-policy-check ci
 
 help:
 	@printf '%s\n' \
@@ -17,6 +17,8 @@ help:
 	  'doc                    Build docs with warnings denied' \
 	  'feature-checks         cargo check across the supported feature combinations' \
 	  'contract-policy-check  Verify the Replicant Space 2.3.1 operation inventory and exclusions' \
+	  'policy-checks          Run all checked-in policy gates' \
+	  'remediation-policy-check Verify the Phase 11.5 remediation ledger' \
 	  'ci                     Run the full local CI-equivalent suite'
 
 fmt:
@@ -51,4 +53,15 @@ feature-checks: check check-raw check-events check-all-features
 contract-policy-check:
 	$(PYTHON) scripts/contract_policy_check.py
 
-ci: fmt-check lint test feature-checks doc contract-policy-check
+remediation-policy-check:
+	$(PYTHON) scripts/phase_11_5_remediation_check.py
+	$(PYTHON) scripts/phase_11_5_remediation_check.py --self-test
+
+policy-checks: contract-policy-check
+	$(PYTHON) scripts/forward_compatibility_policy_check.py
+	$(PYTHON) scripts/raw_transport_policy_check.py
+	$(PYTHON) scripts/schema_policy_check.py
+	$(PYTHON) scripts/authority_matrix_check.py
+	$(MAKE) remediation-policy-check
+
+ci: fmt-check lint test feature-checks doc policy-checks

@@ -3,11 +3,15 @@
 
 #![allow(missing_docs)] // Gateway module documentation explains the common contract.
 
-use std::sync::mpsc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, mpsc},
+};
 
 use crate::domain::{
-    self, AccessScope, Account, AccountId, Device, DeviceId, DeviceKey, DeviceStatus, DeviceType,
-    Realm, Replicant, ReplicantId, ReplicantKey,
+    self, AccessScope, Account, AccountId, Device, DeviceCommand, DeviceFeature, DeviceId,
+    DeviceKey, DeviceStatus, DeviceType, Realm, Replicant, ReplicantId, ReplicantKey,
+    ReplicantStatus,
 };
 use crate::raw;
 use crate::{Client, Error, Result};
@@ -373,71 +377,319 @@ impl DeviceHandle {
     }
 }
 
-/// Local-only device query. It cannot perform network I/O.
+#[derive(Clone, Debug, Default)]
+enum DeviceLinkFilter<T> {
+    #[default]
+    Any,
+    Is(T),
+    None,
+}
+
+/// Local-only device query. It reads one immutable committed snapshot and
+/// cannot perform network I/O.
 #[derive(Clone, Debug)]
 pub struct DeviceQuery {
     client: Client,
-    device_type: Option<DeviceType>,
-    status: Option<DeviceStatus>,
-    location: Option<String>,
+    predicate: domain::DevicePredicate,
+    tags: Vec<String>,
+    system: Option<String>,
+    attached_to: DeviceLinkFilter<DeviceKey>,
+    controller: DeviceLinkFilter<DeviceKey>,
+    hosted_by: DeviceLinkFilter<ReplicantKey>,
+    without_adopted_devices: bool,
 }
+
 impl DeviceQuery {
     fn new(client: Client) -> Self {
         Self {
             client,
-            device_type: None,
-            status: None,
-            location: None,
+            predicate: domain::DevicePredicate::default(),
+            tags: Vec::new(),
+            system: None,
+            attached_to: DeviceLinkFilter::Any,
+            controller: DeviceLinkFilter::Any,
+            hosted_by: DeviceLinkFilter::Any,
+            without_adopted_devices: false,
         }
     }
+
+    #[must_use]
+    pub fn in_realm(mut self, realm: Realm) -> Self {
+        self.predicate = self.predicate.in_realm(realm);
+        self
+    }
+
     #[must_use]
     pub fn of_type(mut self, value: DeviceType) -> Self {
-        self.device_type = Some(value);
+        self.predicate = self.predicate.of_type(value);
         self
     }
+
     #[must_use]
     pub fn with_status(mut self, value: DeviceStatus) -> Self {
-        self.status = Some(value);
+        self.predicate = self.predicate.with_status(value);
         self
     }
+
+    #[must_use]
+    pub fn with_access(mut self, value: AccessScope) -> Self {
+        self.predicate = self.predicate.with_access(value);
+        self
+    }
+
+    #[must_use]
+    pub fn owned(self) -> Self {
+        self.with_access(AccessScope::Owned)
+    }
+
+    #[must_use]
+    pub fn with_feature(mut self, value: DeviceFeature) -> Self {
+        self.predicate = self.predicate.with_feature(value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_command(mut self, value: DeviceCommand) -> Self {
+        self.predicate = self.predicate.with_command(value);
+        self
+    }
+
     #[must_use]
     pub fn miners(self) -> Self {
         self.of_type(DeviceType::MiningDrone)
     }
+
     #[must_use]
     pub fn idle(self) -> Self {
         self.with_status(DeviceStatus::from("idle"))
     }
+
+    /// Matches this exact location ID in every realm. Combine with
+    /// [`Self::in_realm`] when a location name is ambiguous.
     #[must_use]
     pub fn at(mut self, location: impl Into<String>) -> Self {
-        self.location = Some(location.into());
+        self.predicate = self.predicate.at(location.into());
         self
     }
-    pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
-        self.client.ensure_open()?;
-        Ok(self
-            .client
-            .managed_state()
-            .devices()
-            .into_iter()
+
+    /// Matches locations in a system by its canonical code prefix (for
+    /// example, `SOL` matches `SOL-1`).
+    #[must_use]
+    pub fn in_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    /// Requires every supplied tag to be present on the device.
+    #[must_use]
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    #[must_use]
+    pub fn attached_to(mut self, device: DeviceKey) -> Self {
+        self.attached_to = DeviceLinkFilter::Is(device);
+        self
+    }
+
+    #[must_use]
+    pub fn unattached(mut self) -> Self {
+        self.attached_to = DeviceLinkFilter::None;
+        self
+    }
+
+    /// Alias for the attachment relationship used by the stow command.
+    #[must_use]
+    pub fn stowed_in(self, device: DeviceKey) -> Self {
+        self.attached_to(device)
+    }
+
+    #[must_use]
+    pub fn controlled_by(mut self, controller: DeviceKey) -> Self {
+        self.controller = DeviceLinkFilter::Is(controller);
+        self
+    }
+
+    #[must_use]
+    pub fn without_controller(mut self) -> Self {
+        self.controller = DeviceLinkFilter::None;
+        self
+    }
+
+    #[must_use]
+    pub fn hosted_by(mut self, replicant: ReplicantKey) -> Self {
+        self.hosted_by = DeviceLinkFilter::Is(replicant);
+        self
+    }
+
+    /// Keeps controller devices which currently control no other cached
+    /// device. A device is adopted when its `controller` relationship points
+    /// at that controller.
+    #[must_use]
+    pub fn without_adopted_devices(mut self) -> Self {
+        self.without_adopted_devices = true;
+        self
+    }
+
+    fn matching_entries(
+        &self,
+        devices: impl IntoIterator<Item = domain::Observation<Device>>,
+    ) -> BTreeMap<DeviceKey, Device> {
+        let devices: Vec<_> = devices.into_iter().collect();
+        devices
+            .iter()
+            .filter(|entry| self.predicate.matches(&entry.value))
+            .filter(|entry| self.tags.iter().all(|tag| entry.value.tags.contains(tag)))
             .filter(|entry| {
-                self.device_type
-                    .as_ref()
-                    .is_none_or(|value| entry.value.device_type.as_ref() == Some(value))
-                    && self
-                        .status
-                        .as_ref()
-                        .is_none_or(|value| entry.value.status.as_ref() == Some(value))
-                    && self.location.as_ref().is_none_or(|value| {
-                        entry
-                            .value
-                            .location
-                            .as_ref()
-                            .is_some_and(|location| location.id.as_str() == value)
+                self.system.as_ref().is_none_or(|system| {
+                    entry.value.location.as_ref().is_some_and(|location| {
+                        let id = location.id.as_str();
+                        id == system
+                            || id
+                                .strip_prefix(system)
+                                .is_some_and(|suffix| suffix.starts_with('-'))
+                    })
+                })
+            })
+            .filter(|entry| {
+                matches_link(
+                    &self.attached_to,
+                    entry.value.relationships.attached_to.as_ref(),
+                )
+            })
+            .filter(|entry| {
+                matches_link(
+                    &self.controller,
+                    entry.value.relationships.controller.as_ref(),
+                )
+            })
+            .filter(|entry| {
+                matches_link(
+                    &self.hosted_by,
+                    entry.value.relationships.hosted_by.as_ref(),
+                )
+            })
+            .filter(|entry| {
+                !self.without_adopted_devices
+                    || !devices.iter().any(|other| {
+                        other.value.relationships.controller.as_ref() == Some(&entry.value.key)
                     })
             })
-            .map(|entry| DeviceHandle::new(self.client.clone(), entry.value.key))
-            .collect())
+            .map(|entry| (entry.value.key.clone(), entry.value.clone()))
+            .collect()
+    }
+
+    fn handles(&self, entries: &BTreeMap<DeviceKey, Device>) -> Vec<DeviceHandle> {
+        entries
+            .keys()
+            .cloned()
+            .map(|key| DeviceHandle::new(self.client.clone(), key))
+            .collect()
+    }
+
+    /// Collects a stable, key-sorted view from the current committed snapshot.
+    pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
+        self.client.ensure_open()?;
+        let entries = self.matching_entries(self.client.managed_state().devices());
+        Ok(self.handles(&entries))
+    }
+
+    /// Subscribes to meaningful changes to this local result set. The first
+    /// [`DeviceQuerySubscription::try_next`] returns an initial result; later
+    /// calls coalesce all pending revisions into their newest distinct result.
+    pub async fn subscribe(self) -> Result<DeviceQuerySubscription> {
+        self.client.ensure_open()?;
+        let receiver = self.client.managed_state().subscribe();
+        let initial = self.matching_entries(self.client.managed_state().devices());
+        Ok(DeviceQuerySubscription {
+            query: self,
+            receiver,
+            previous: Mutex::new(initial.clone()),
+            initial: Mutex::new(Some(initial)),
+        })
+    }
+}
+
+fn matches_link<T: PartialEq>(filter: &DeviceLinkFilter<T>, value: Option<&T>) -> bool {
+    match filter {
+        DeviceLinkFilter::Any => true,
+        DeviceLinkFilter::Is(expected) => value == Some(expected),
+        DeviceLinkFilter::None => value.is_none(),
+    }
+}
+
+/// A coalescing local result-set subscription. It never performs network I/O.
+pub struct DeviceQuerySubscription {
+    query: DeviceQuery,
+    receiver: mpsc::Receiver<Arc<super::state::StateSnapshot>>,
+    previous: Mutex<BTreeMap<DeviceKey, Device>>,
+    initial: Mutex<Option<BTreeMap<DeviceKey, Device>>>,
+}
+
+/// A meaningful change to a device query result set.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum DeviceQueryChange {
+    Initial {
+        results: Vec<DeviceHandle>,
+    },
+    Updated {
+        revision: u64,
+        added: Vec<DeviceHandle>,
+        removed: Vec<DeviceHandle>,
+        changed: Vec<DeviceHandle>,
+        results: Vec<DeviceHandle>,
+    },
+}
+
+impl DeviceQuerySubscription {
+    /// Returns the initial results once, then the newest distinct pending
+    /// committed result-set change. This is intentionally non-blocking.
+    pub fn try_next(&self) -> Option<DeviceQueryChange> {
+        if let Some(initial) = self
+            .initial
+            .lock()
+            .expect("query initial lock poisoned")
+            .take()
+        {
+            return Some(DeviceQueryChange::Initial {
+                results: self.query.handles(&initial),
+            });
+        }
+        let snapshot = self.receiver.try_iter().last()?;
+        let next = self
+            .query
+            .matching_entries(snapshot.devices().values().cloned());
+        let mut previous = self.previous.lock().expect("query result lock poisoned");
+        if *previous == next {
+            return None;
+        }
+        let added = next
+            .keys()
+            .filter(|key| !previous.contains_key(*key))
+            .cloned()
+            .map(|key| DeviceHandle::new(self.query.client.clone(), key))
+            .collect();
+        let removed = previous
+            .keys()
+            .filter(|key| !next.contains_key(*key))
+            .cloned()
+            .map(|key| DeviceHandle::new(self.query.client.clone(), key))
+            .collect();
+        let changed = next
+            .iter()
+            .filter(|(key, value)| previous.get(*key).is_some_and(|old| old != *value))
+            .map(|(key, _)| DeviceHandle::new(self.query.client.clone(), key.clone()))
+            .collect();
+        *previous = next.clone();
+        Some(DeviceQueryChange::Updated {
+            revision: snapshot.revision(),
+            added,
+            removed,
+            changed,
+            results: self.query.handles(&next),
+        })
     }
 }
 
@@ -465,6 +717,11 @@ impl DevicesGateway {
     #[must_use]
     pub fn miners(&self) -> DeviceQuery {
         self.find().miners()
+    }
+    /// Starts a local query for devices of a controller type.
+    #[must_use]
+    pub fn controllers(&self, controller_type: DeviceType) -> DeviceQuery {
+        self.find().of_type(controller_type)
     }
     pub async fn get(&self, code: &str) -> Result<DeviceHandle> {
         self.client.ensure_open()?;
@@ -525,6 +782,93 @@ fn query_is_unfiltered(query: &raw::devices::DeviceListQuery) -> bool {
 pub struct ReplicantsGateway {
     client: Client,
 }
+
+/// Local-only query over cached replicants.
+#[derive(Clone, Debug)]
+pub struct ReplicantQuery {
+    client: Client,
+    realm: Option<Realm>,
+    access: Option<AccessScope>,
+    status: Option<ReplicantStatus>,
+    location: Option<String>,
+}
+
+impl ReplicantQuery {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            realm: None,
+            access: None,
+            status: None,
+            location: None,
+        }
+    }
+
+    #[must_use]
+    pub fn in_realm(mut self, realm: Realm) -> Self {
+        self.realm = Some(realm);
+        self
+    }
+    #[must_use]
+    pub fn with_access(mut self, access: AccessScope) -> Self {
+        self.access = Some(access);
+        self
+    }
+    #[must_use]
+    pub fn owned(self) -> Self {
+        self.with_access(AccessScope::Owned)
+    }
+    #[must_use]
+    pub fn with_status(mut self, status: ReplicantStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+    #[must_use]
+    pub fn at(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
+        self
+    }
+
+    /// Collects a stable, key-sorted view from the current committed snapshot.
+    pub async fn collect(self) -> Result<Vec<ReplicantHandle>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_state()
+            .replicants()
+            .into_iter()
+            .filter(|entry| {
+                self.realm
+                    .as_ref()
+                    .is_none_or(|realm| realm == &entry.value.key.realm)
+            })
+            .filter(|entry| {
+                self.access
+                    .as_ref()
+                    .is_none_or(|access| access == &entry.value.access)
+            })
+            .filter(|entry| {
+                self.status
+                    .as_ref()
+                    .is_none_or(|status| entry.value.status.as_ref() == Some(status))
+            })
+            .filter(|entry| {
+                self.location.as_ref().is_none_or(|location| {
+                    entry
+                        .value
+                        .location
+                        .as_ref()
+                        .is_some_and(|key| key.id.as_str() == location)
+                })
+            })
+            .map(|entry| ReplicantHandle {
+                client: self.client.clone(),
+                key: entry.value.key,
+            })
+            .collect())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReplicantHandle {
     client: Client,
@@ -533,6 +877,11 @@ pub struct ReplicantHandle {
 impl ReplicantsGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+    /// Starts a local query over committed replicant snapshots.
+    #[must_use]
+    pub fn find(&self) -> ReplicantQuery {
+        ReplicantQuery::new(self.client.clone())
     }
     pub async fn get_owned(&self, code: &str) -> Result<ReplicantHandle> {
         self.client.ensure_open()?;
@@ -743,6 +1092,40 @@ mod tests {
     use crate::managed::client::StartupPolicy;
     use crate::raw::{SecretString, Url};
 
+    fn cached_device(
+        id: &str,
+        device_type: DeviceType,
+        status: DeviceStatus,
+    ) -> domain::Observation<Device> {
+        domain::Observation {
+            value: Device {
+                key: DeviceKey::live(DeviceId::from(id)),
+                device_type: Some(device_type),
+                status: Some(status),
+                location: None,
+                features: Vec::new(),
+                available_commands: Vec::new(),
+                available_directives: Vec::new(),
+                tags: Vec::new(),
+                relationships: domain::DeviceRelationships::default(),
+                access: AccessScope::Owned,
+            },
+            metadata: domain::ObservationMetadata {
+                source: domain::ObservationSource::RestDetail,
+                authority: domain::ObservationAuthority::EntitySnapshot,
+                observed_at: "2026-07-25T00:00:00Z".into(),
+                access: AccessScope::Owned,
+                reachability: domain::Reachability::Reachable,
+                stale: false,
+                source_document: domain::SourceDocument {
+                    operation: "test".into(),
+                    request_id: None,
+                    document_id: None,
+                },
+            },
+        }
+    }
+
     async fn client_at(base_url: &str) -> Client {
         Client::builder()
             .authentication_token(SecretString::from("token".to_string()))
@@ -791,5 +1174,143 @@ mod tests {
 
         server.verify().await;
         client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn local_device_queries_filter_relationships_and_never_use_the_network() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let controller = cached_device("CTRL", DeviceType::MiningController, DeviceStatus::Idle);
+        let mut drone = cached_device("DRONE", DeviceType::MiningDrone, DeviceStatus::Idle);
+        drone.value.location = Some(domain::LocationKey::live("SOL-1".into()));
+        drone.value.tags.push("ore".into());
+        drone.value.features.push(DeviceFeature::Mining);
+        drone.value.relationships.controller = Some(controller.value.key.clone());
+        let mut public = cached_device("PUBLIC", DeviceType::MiningDrone, DeviceStatus::Idle);
+        public.value.access = AccessScope::Public;
+        public.metadata.access = AccessScope::Public;
+        public.value.location = Some(domain::LocationKey::live("SOL-2".into()));
+        client
+            .managed_state()
+            .persist_devices(&[controller, drone, public])
+            .expect("persist");
+
+        let miner_ids: Vec<_> = client
+            .devices()
+            .miners()
+            .idle()
+            .in_system("SOL")
+            .with_tag("ore")
+            .with_feature(DeviceFeature::Mining)
+            .owned()
+            .collect()
+            .await
+            .expect("query")
+            .into_iter()
+            .map(|device| device.id().as_str().to_owned())
+            .collect();
+        assert_eq!(miner_ids, ["DRONE"]);
+
+        let snapshot = client
+            .devices()
+            .miners()
+            .idle()
+            .owned()
+            .collect()
+            .await
+            .expect("snapshot");
+        client
+            .managed_state()
+            .persist_devices(&[cached_device(
+                "LATER",
+                DeviceType::MiningDrone,
+                DeviceStatus::Idle,
+            )])
+            .expect("later revision");
+        assert_eq!(snapshot.len(), 1, "collected views are immutable snapshots");
+
+        let controllers = client
+            .devices()
+            .controllers(DeviceType::MiningController)
+            .idle()
+            .without_adopted_devices()
+            .collect()
+            .await
+            .expect("query");
+        assert!(controllers.is_empty());
+
+        // No mock is mounted: every successful assertion above proves that
+        // local query evaluation made no HTTP request.
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn query_subscription_is_initial_stable_and_coalesces_revisions() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let subscription = client
+            .devices()
+            .miners()
+            .idle()
+            .subscribe()
+            .await
+            .expect("subscription");
+        assert!(matches!(
+            subscription.try_next(),
+            Some(DeviceQueryChange::Initial { results }) if results.is_empty()
+        ));
+
+        let first = cached_device("B", DeviceType::MiningDrone, DeviceStatus::Idle);
+        let second = cached_device("A", DeviceType::MiningDrone, DeviceStatus::Idle);
+        client
+            .managed_state()
+            .persist_devices(&[first])
+            .expect("first revision");
+        client
+            .managed_state()
+            .persist_devices(&[second])
+            .expect("second revision");
+        match subscription.try_next().expect("coalesced update") {
+            DeviceQueryChange::Updated { added, results, .. } => {
+                assert_eq!(added.len(), 2);
+                let ids: Vec<_> = results.iter().map(|device| device.id().as_str()).collect();
+                assert_eq!(ids, ["A", "B"]);
+            }
+            DeviceQueryChange::Initial { .. } => panic!("initial already consumed"),
+        }
+        assert!(subscription.try_next().is_none());
+
+        let mut changed = cached_device("B", DeviceType::MiningDrone, DeviceStatus::Idle);
+        changed.value.tags.push("changed".into());
+        client
+            .managed_state()
+            .persist_devices(&[changed])
+            .expect("changed revision");
+        match subscription.try_next().expect("changed result") {
+            DeviceQueryChange::Updated { changed, .. } => {
+                assert_eq!(changed[0].id().as_str(), "B");
+            }
+            DeviceQueryChange::Initial { .. } => panic!("initial already consumed"),
+        }
+
+        let inactive = cached_device("A", DeviceType::MiningDrone, DeviceStatus::Active);
+        client
+            .managed_state()
+            .persist_devices(&[inactive])
+            .expect("third revision");
+        match subscription.try_next().expect("removal") {
+            DeviceQueryChange::Updated {
+                removed, results, ..
+            } => {
+                assert_eq!(removed[0].id().as_str(), "A");
+                assert_eq!(results[0].id().as_str(), "B");
+            }
+            DeviceQueryChange::Initial { .. } => panic!("initial already consumed"),
+        }
+
+        client.close().await.expect("close");
+        assert!(subscription.try_next().is_none());
+        server.verify().await;
     }
 }

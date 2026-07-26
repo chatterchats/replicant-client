@@ -78,6 +78,10 @@ required-features = ["events"]
 name = "managed_sync"
 required-features = ["managed"]
 
+[[example]]
+name = "fluent_queries"
+required-features = ["managed"]
+
 [[bench]]
 name = "state_snapshot"
 harness = false

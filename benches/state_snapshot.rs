@@ -1,4 +1,8 @@
 //! Manual benchmark: 10,000 device snapshot rows and 1,000 indexed predicates.
+//!
+//! Regression target: the release build should complete this workload in under
+//! one second on the CI baseline. It intentionally reports rather than asserts
+//! a wall-clock limit, because the benchmark is also useful on slower laptops.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -32,7 +36,7 @@ fn main() {
         black_box(count);
     }
     println!(
-        "{DEVICE_COUNT} snapshot rows; {QUERY_COUNT} indexed predicates in {:?}",
+        "{DEVICE_COUNT} snapshot rows; {QUERY_COUNT} indexed predicates in {:?} (target: < 1s)",
         started.elapsed()
     );
 }

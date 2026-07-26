@@ -82,6 +82,10 @@ impl StateEngine {
         self.snapshot().replicants.get(key).cloned()
     }
 
+    pub(crate) fn replicants(&self) -> Vec<Observation<Replicant>> {
+        self.snapshot().replicants.values().cloned().collect()
+    }
+
     pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {
         self.store
             .lock()
@@ -126,6 +130,10 @@ impl StateEngine {
 
     pub(crate) fn simulation(&self, id: SimulationId) -> Option<Observation<Simulation>> {
         self.snapshot().simulations.get(&id).cloned()
+    }
+
+    pub(crate) fn simulations(&self) -> Vec<Observation<Simulation>> {
+        self.snapshot().simulations.values().cloned().collect()
     }
 
     /// Commits a simulation run's current observation (start, then later its

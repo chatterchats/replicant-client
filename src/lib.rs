@@ -68,15 +68,16 @@ pub mod managed {
     };
     pub use events::{EventWatch, EventsGateway};
     pub use gateways::{
-        AccountGateway, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
-        InventoryGateway, ReplicantHandle, ReplicantsGateway,
+        AccountGateway, DeviceHandle, DeviceQuery, DeviceQueryChange, DeviceQuerySubscription,
+        DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway, ReplicantHandle,
+        ReplicantQuery, ReplicantsGateway,
     };
     pub use operation::{
         ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationsGateway,
         MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
         OperationsGateway,
     };
-    pub use simulations::SimulationsGateway;
+    pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
         SyncProgress, SyncReadiness, SyncReport,
@@ -88,12 +89,13 @@ pub mod managed {
 #[cfg(feature = "managed")]
 pub use managed::{
     AccountGateway, BobnetGateway, BobnetWatch, Client, ClientBuilder, ClientDegradation,
-    ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery, DeviceWatch, DevicesGateway,
-    DirectoryGateway, DynamicCommand, EventStreamOptions, EventWatch, EventsGateway,
-    FleetController, InventoryGateway, LocationEventsGateway, LocationsGateway, MessagesGateway,
-    MiningController, MiningDirective, Operation, OperationOutcome, OperationStatus,
-    OperationWatch, OperationsGateway, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle,
-    ReplicantsGateway, SimulationsGateway, StartupPolicy, SurveyController, SurveyDirective,
+    ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery, DeviceQueryChange,
+    DeviceQuerySubscription, DeviceWatch, DevicesGateway, DirectoryGateway, DynamicCommand,
+    EventStreamOptions, EventWatch, EventsGateway, FleetController, InventoryGateway,
+    LocationEventsGateway, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
+    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
+    ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery, ReplicantsGateway,
+    SimulationQuery, SimulationsGateway, StartupPolicy, SurveyController, SurveyDirective,
     SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
     SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
     TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,

@@ -42,9 +42,80 @@ pub struct SimulationsGateway {
     client: Client,
 }
 
+/// Local-only query over committed simulation history.
+#[derive(Clone, Debug)]
+pub struct SimulationQuery {
+    client: Client,
+    mine: Option<bool>,
+    scenario: Option<String>,
+    completed: Option<bool>,
+}
+
+impl SimulationQuery {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            mine: None,
+            scenario: None,
+            completed: None,
+        }
+    }
+    /// Restricts results to this account's simulations.
+    #[must_use]
+    pub fn mine(mut self) -> Self {
+        self.mine = Some(true);
+        self
+    }
+    /// Restricts results to a scenario code.
+    #[must_use]
+    pub fn scenario(mut self, code: impl Into<String>) -> Self {
+        self.scenario = Some(code.into());
+        self
+    }
+    /// Restricts results to archived, completed simulations.
+    #[must_use]
+    pub fn completed(mut self) -> Self {
+        self.completed = Some(true);
+        self
+    }
+    /// Restricts results to simulations without a completion time.
+    #[must_use]
+    pub fn active(mut self) -> Self {
+        self.completed = Some(false);
+        self
+    }
+    /// Collects a stable, ID-sorted view from the current committed snapshot.
+    pub async fn collect(self) -> Result<Vec<domain::Simulation>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_state()
+            .simulations()
+            .into_iter()
+            .filter(|entry| self.mine.is_none_or(|mine| entry.value.is_mine == mine))
+            .filter(|entry| {
+                self.scenario
+                    .as_ref()
+                    .is_none_or(|scenario| entry.value.scenario_code.as_ref() == Some(scenario))
+            })
+            .filter(|entry| {
+                self.completed
+                    .is_none_or(|completed| entry.value.completed_at.is_some() == completed)
+            })
+            .map(|entry| entry.value)
+            .collect())
+    }
+}
+
 impl SimulationsGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Starts a local query over committed simulation history.
+    #[must_use]
+    pub fn find(&self) -> SimulationQuery {
+        SimulationQuery::new(self.client.clone())
     }
 
     /// Lists simulation scenarios available on a simulator interface device.
