@@ -1,9 +1,7 @@
 //! Crate-wide error type.
 //!
-//! One [`Error`] is shared by every feature tier. Phase 2 (the raw transport)
-//! populates `Configuration`, `Authentication`, `RateLimited`, `Transport`,
-//! `Decode`, and `Contract`. Later phases add further categories to this same
-//! non-exhaustive enum rather than introducing a parallel error type.
+//! One [`Error`] is shared by every feature tier so callers can classify
+//! failures consistently across raw transport and managed durability work.
 
 use std::time::Duration;
 
@@ -60,6 +58,12 @@ pub enum Error {
     Transport {
         /// Generic, non-sensitive description of the transport failure.
         message: String,
+        /// The underlying transport failure, when retaining it is safe.
+        ///
+        /// This cause is available through [`std::error::Error::source`], but
+        /// is deliberately omitted from [`std::fmt::Display`] and [`Debug`]
+        /// because transport libraries can include request details.
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     /// A success response could not be decoded into the expected shape.
     Decode {
@@ -67,6 +71,11 @@ pub enum Error {
         message: String,
         /// HTTP status of the response that failed to decode, when available.
         status: Option<u16>,
+        /// The underlying decoder failure, when one is available.
+        ///
+        /// It is exposed only through [`std::error::Error::source`] to keep
+        /// display output free of response content.
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     /// The server returned an HTTP error status not covered by a more
     /// specific category (403, 404, 409, 410, 422, 5xx, or any other
@@ -120,11 +129,13 @@ impl std::fmt::Debug for Error {
                 .field("retry_after", retry_after)
                 .field("details", details)
                 .finish(),
-            Self::Transport { message } => f
+            Self::Transport { message, .. } => f
                 .debug_struct("Error::Transport")
                 .field("message", message)
                 .finish(),
-            Self::Decode { message, status } => f
+            Self::Decode {
+                message, status, ..
+            } => f
                 .debug_struct("Error::Decode")
                 .field("message", message)
                 .field("status", status)
@@ -156,8 +167,10 @@ impl std::fmt::Display for Error {
             Self::Configuration { message } => write!(f, "invalid client configuration: {message}"),
             Self::Authentication { .. } => write!(f, "authentication failed"),
             Self::RateLimited { .. } => write!(f, "rate limited"),
-            Self::Transport { message } => write!(f, "transport failure: {message}"),
-            Self::Decode { message, status } => {
+            Self::Transport { message, .. } => write!(f, "transport failure: {message}"),
+            Self::Decode {
+                message, status, ..
+            } => {
                 write!(f, "response decoding failed ({status:?}): {message}")
             }
             Self::Contract { status, details } => {
@@ -177,7 +190,21 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport {
+                source: Some(source),
+                ..
+            }
+            | Self::Decode {
+                source: Some(source),
+                ..
+            } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl Error {
     /// Returns the HTTP status when the failure originated from a response.
@@ -237,3 +264,23 @@ impl Error {
 
 /// Convenience alias for results produced by the raw transport.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::Error;
+
+    #[test]
+    fn source_is_available_without_leaking_through_display() {
+        let error = Error::Transport {
+            message: "network request failed".into(),
+            source: Some(Box::new(std::io::Error::other("Bearer secret-token"))),
+        };
+
+        assert!(error.source().is_some());
+        assert!(error.source().unwrap().to_string().contains("secret-token"));
+        assert!(!error.to_string().contains("secret-token"));
+        assert!(!format!("{error:?}").contains("secret-token"));
+    }
+}

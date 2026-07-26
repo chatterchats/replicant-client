@@ -10,14 +10,27 @@ use std::{
 };
 
 use replicant_client::raw::{
-    Client, RetryPolicy, SecretString, Url, devices::DeviceListQuery,
-    feedback::FeedbackSubmitRequest, inventory::AccountInventoryQuery, messages::MessageListQuery,
+    Client, RetryPolicy, SecretString, Url,
+    accounts::AccountUpdateRequest,
+    devices::{DeviceListQuery, DeviceLogsQuery, DynamicDeviceCommand},
+    feedback::FeedbackSubmitRequest,
+    inventory::AccountInventoryQuery,
+    messages::MessageListQuery,
     replicants::ReplicantListQuery,
 };
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
     matchers::{any, header, method, path},
 };
+
+fn limited_client(url: Url, limit: usize) -> Client {
+    Client::builder()
+        .base_url(url)
+        .authentication_token(SecretString::from("test-token".to_string()))
+        .max_response_body_bytes(limit)
+        .build()
+        .unwrap()
+}
 
 fn client(server: &MockServer, retry: RetryPolicy) -> Client {
     Client::builder()
@@ -35,6 +48,103 @@ fn fast_retry() -> RetryPolicy {
         max_backoff: Duration::from_millis(2),
         jitter: Duration::ZERO,
     }
+}
+
+#[test]
+fn unknown_device_command_round_trips_without_a_client_upgrade() {
+    let payload = serde_json::json!({
+        "command": "unreleased_command",
+        "target": "device-42",
+    });
+    let command: DynamicDeviceCommand = serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(command.name, "unreleased_command");
+    assert_eq!(serde_json::to_value(command).unwrap(), payload);
+}
+
+#[test]
+fn account_update_never_serializes_the_deprecated_message_notify_field() {
+    let payload = serde_json::to_value(AccountUpdateRequest::default()).unwrap();
+
+    assert!(payload.get("message_notify").is_none());
+}
+
+#[tokio::test]
+async fn response_content_length_over_the_cap_is_rejected_early() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/health"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("0123456789"))
+        .mount(&server)
+        .await;
+
+    let error = limited_client(Url::parse(&server.uri()).unwrap(), 4)
+        .health()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds 4 bytes"));
+}
+
+#[tokio::test]
+async fn oversized_chunked_response_is_rejected_while_streaming() {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n4\r\n1234\r\n5\r\n56789\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let error = limited_client(Url::parse(&format!("http://{address}")).unwrap(), 4)
+        .health()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds 4 bytes"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn account_wipe_uses_its_documented_typed_success_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/accounts/me"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_body_json(serde_json::json!({"message": "wipe accepted"})),
+        )
+        .mount(&server)
+        .await;
+
+    let response = client(&server, fast_retry())
+        .accounts()
+        .request_destructive_wipe()
+        .await
+        .unwrap();
+    assert_eq!(response.value.message.as_deref(), Some("wipe accepted"));
+}
+
+#[tokio::test]
+async fn documented_page_limits_fail_locally_before_a_request() {
+    let server = MockServer::start().await;
+    let error = client(&server, fast_retry())
+        .devices()
+        .logs(
+            "device-42",
+            &DeviceLogsQuery {
+                limit: Some(101),
+                ..DeviceLogsQuery::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("between 1 and 100"));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

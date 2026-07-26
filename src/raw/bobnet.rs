@@ -2,7 +2,7 @@
 //! `GET /v1/devices/{device_code}/messages`).
 //!
 //! Sending a message, and the account-wide inbox, live elsewhere
-//! ([`crate::raw::replicants::ReplicantsClient::send_message`],
+//! ([`crate::raw::replicants::ReplicantsClient::message`],
 //! [`crate::raw::messages::MessagesClient`]); this client only covers what a
 //! specific device can currently see on the network.
 

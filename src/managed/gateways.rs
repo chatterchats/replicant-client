@@ -1,12 +1,12 @@
 //! Managed read gateways. They normalize the one response they fetch, commit it,
 //! publish the resulting revision, and only then return a domain value.
 
-#![allow(missing_docs)] // Gateway module documentation explains the common contract.
-
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, mpsc},
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
 };
+
+use tokio::sync::watch;
 
 use crate::domain::{
     self, AccessScope, Account, AccountId, Device, DeviceCommand, DeviceFeature, DeviceId,
@@ -22,17 +22,35 @@ use super::travel::TravelBuilder;
 
 /// A local device-update stream. It never polls or otherwise issues network requests.
 pub struct DeviceWatch {
-    receiver: mpsc::Receiver<std::sync::Arc<super::state::StateSnapshot>>,
+    receiver: watch::Receiver<std::sync::Arc<super::state::StateSnapshot>>,
     key: DeviceKey,
 }
 
 impl DeviceWatch {
     /// Returns the latest published snapshot for this device, if one is available now.
-    pub fn try_next(&self) -> Option<Device> {
+    pub fn try_next(&mut self) -> Option<Device> {
         self.receiver
-            .try_iter()
-            .filter_map(|snapshot| snapshot.devices().get(&self.key).cloned())
-            .last()
+            .has_changed()
+            .ok()
+            .filter(|changed| *changed)
+            .and_then(|_| {
+                self.receiver
+                    .borrow_and_update()
+                    .devices()
+                    .get(&self.key)
+                    .cloned()
+            })
+            .map(|observation| observation.value)
+    }
+
+    /// Waits for the newest committed value. Intermediate revisions coalesce.
+    pub async fn next(&mut self) -> Option<Device> {
+        self.receiver.changed().await.ok()?;
+        self.receiver
+            .borrow_and_update()
+            .devices()
+            .get(&self.key)
+            .cloned()
             .map(|observation| observation.value)
     }
 }
@@ -41,14 +59,12 @@ fn normalization(error: domain::NormalizeError) -> Error {
     Error::Decode {
         message: error.to_string(),
         status: None,
+        source: None,
     }
 }
 
-fn observed_at() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_default()
+fn observed_at() -> crate::domain::ObservationTime {
+    crate::domain::ObservationTime::now()
 }
 
 /// Gateway for the authenticated account. `get` is explicit remote I/O.
@@ -73,6 +89,7 @@ impl AccountGateway {
             .ok_or_else(|| Error::Decode {
                 message: "response omitted required identity `email`".into(),
                 status: None,
+                source: None,
             })?;
         let observation = domain::account_me(&response.value, id, observed_at());
         let value = observation.value.clone();
@@ -87,6 +104,38 @@ impl AccountGateway {
 
     pub async fn refresh(&self) -> Result<Account> {
         self.get().await
+    }
+
+    /// Rebinds this store after a requested email change has been verified.
+    /// The ordinary startup path still rejects a different account.
+    pub async fn rebind_after_verified_email(&self, previous_email: &str) -> Result<Account> {
+        self.client.ensure_open()?;
+        let response = self.client.managed_raw().accounts().me().await?;
+        if response.value.email_verified != Some(true) {
+            return Err(Error::Configuration {
+                message: "the replacement email is not verified".into(),
+            });
+        }
+        let id = response
+            .value
+            .email
+            .clone()
+            .filter(|email| !email.is_empty())
+            .map(AccountId::from)
+            .ok_or_else(|| Error::Decode {
+                message: "response omitted required identity `email`".into(),
+                status: None,
+                source: None,
+            })?;
+        let observation = domain::account_me(&response.value, id, observed_at());
+        let value = observation.value.clone();
+        self.client
+            .managed_state()
+            .rebind_account_and_persist(&AccountId::from(previous_email), observation)
+            .map_err(|_| Error::Persistence {
+                message: "SQLite store operation failed".into(),
+            })?;
+        Ok(value)
     }
 
     /// Updates the authenticated account's profile as a durable operation.
@@ -537,6 +586,12 @@ impl DeviceQuery {
         devices: impl IntoIterator<Item = domain::Observation<Device>>,
     ) -> BTreeMap<DeviceKey, Device> {
         let devices: Vec<_> = devices.into_iter().collect();
+        let adopted = self.without_adopted_devices.then(|| {
+            devices
+                .iter()
+                .filter_map(|entry| entry.value.relationships.controller.clone())
+                .collect::<BTreeSet<_>>()
+        });
         devices
             .iter()
             .filter(|entry| self.predicate.matches(&entry.value))
@@ -571,10 +626,9 @@ impl DeviceQuery {
                 )
             })
             .filter(|entry| {
-                !self.without_adopted_devices
-                    || !devices.iter().any(|other| {
-                        other.value.relationships.controller.as_ref() == Some(&entry.value.key)
-                    })
+                adopted
+                    .as_ref()
+                    .is_none_or(|adopted| !adopted.contains(&entry.value.key))
             })
             .map(|entry| (entry.value.key.clone(), entry.value.clone()))
             .collect()
@@ -622,7 +676,7 @@ fn matches_link<T: PartialEq>(filter: &DeviceLinkFilter<T>, value: Option<&T>) -
 /// A coalescing local result-set subscription. It never performs network I/O.
 pub struct DeviceQuerySubscription {
     query: DeviceQuery,
-    receiver: mpsc::Receiver<Arc<super::state::StateSnapshot>>,
+    receiver: watch::Receiver<Arc<super::state::StateSnapshot>>,
     previous: Mutex<BTreeMap<DeviceKey, Device>>,
     initial: Mutex<Option<BTreeMap<DeviceKey, Device>>>,
 }
@@ -646,22 +700,54 @@ pub enum DeviceQueryChange {
 impl DeviceQuerySubscription {
     /// Returns the initial results once, then the newest distinct pending
     /// committed result-set change. This is intentionally non-blocking.
-    pub fn try_next(&self) -> Option<DeviceQueryChange> {
+    pub fn try_next(&mut self) -> Option<DeviceQueryChange> {
         if let Some(initial) = self
             .initial
             .lock()
-            .expect("query initial lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
             return Some(DeviceQueryChange::Initial {
                 results: self.query.handles(&initial),
             });
         }
-        let snapshot = self.receiver.try_iter().last()?;
+        if !self.receiver.has_changed().ok()? {
+            return None;
+        }
+        let snapshot = Arc::clone(&self.receiver.borrow_and_update());
+        self.change(snapshot)
+    }
+
+    /// Waits for the next distinct local result set. Intermediate revisions
+    /// coalesce to the latest committed snapshot.
+    pub async fn next(&mut self) -> Option<DeviceQueryChange> {
+        if let Some(initial) = self
+            .initial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Some(DeviceQueryChange::Initial {
+                results: self.query.handles(&initial),
+            });
+        }
+        loop {
+            self.receiver.changed().await.ok()?;
+            let snapshot = Arc::clone(&self.receiver.borrow_and_update());
+            if let Some(change) = self.change(snapshot) {
+                return Some(change);
+            }
+        }
+    }
+
+    fn change(&self, snapshot: Arc<super::state::StateSnapshot>) -> Option<DeviceQueryChange> {
         let next = self
             .query
             .matching_entries(snapshot.devices().values().cloned());
-        let mut previous = self.previous.lock().expect("query result lock poisoned");
+        let mut previous = self
+            .previous
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *previous == next {
             return None;
         }
@@ -1004,11 +1090,17 @@ impl DirectoryGateway {
     pub async fn replicant(&self, code: &str) -> Result<Replicant> {
         self.client.ensure_open()?;
         let response = self.client.managed_raw().replicants().get(code).await?;
-        Ok(
+        let observation =
             domain::public_replicant_detail(&response.value, Realm::Live, observed_at())
-                .map_err(normalization)?
-                .value,
-        )
+                .map_err(normalization)?;
+        let value = observation.value.clone();
+        self.client
+            .managed_state()
+            .persist_replicant(observation)
+            .map_err(|_| Error::Persistence {
+                message: "SQLite store operation failed".into(),
+            })?;
+        Ok(value)
     }
     pub async fn search(
         &self,
@@ -1249,7 +1341,7 @@ mod tests {
     async fn query_subscription_is_initial_stable_and_coalesces_revisions() {
         let server = MockServer::start().await;
         let client = client_at(&server.uri()).await;
-        let subscription = client
+        let mut subscription = client
             .devices()
             .miners()
             .idle()

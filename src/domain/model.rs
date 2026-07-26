@@ -81,7 +81,7 @@ pub struct LocationOverview {
     pub replicant_count: i64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum InventoryOwner {
     Account(AccountId),
@@ -133,6 +133,24 @@ pub struct Simulation {
     pub is_mine: bool,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub lifecycle: SimulationLifecycle,
+    #[serde(default)]
+    pub seed_failures: Vec<String>,
+    #[serde(default)]
+    pub replicant_code: Option<String>,
+}
+
+/// Durable local lifecycle for an owned simulation realm.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimulationLifecycle {
+    #[default]
+    Synchronizing,
+    Active,
+    AbandonPending,
+    AbandonAmbiguous,
+    Ended,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

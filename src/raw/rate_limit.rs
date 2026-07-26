@@ -6,7 +6,11 @@
 //! `X-RateLimit-*`/`Retry-After` state, which always wins over the local
 //! estimate.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -61,6 +65,56 @@ impl RateLimitPolicy {
     }
 }
 
+/// A server-mandated relative delay from `Retry-After`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryAfter(Duration);
+
+impl RetryAfter {
+    /// Creates a relative delay.
+    #[must_use]
+    pub const fn new(delay: Duration) -> Self {
+        Self(delay)
+    }
+
+    /// Returns the delay.
+    #[must_use]
+    pub const fn delay(self) -> Duration {
+        self.0
+    }
+}
+
+/// An absolute Unix-epoch rate-limit reset observed from the server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateLimitReset {
+    epoch_seconds: u64,
+    delay: Duration,
+}
+
+impl RateLimitReset {
+    /// Converts epoch seconds to a delay from the captured observation time.
+    /// Past values are immediately eligible.
+    #[must_use]
+    pub fn from_epoch_seconds(epoch_seconds: u64, observed_at: SystemTime) -> Option<Self> {
+        let reset_at = UNIX_EPOCH.checked_add(Duration::from_secs(epoch_seconds))?;
+        Some(Self {
+            epoch_seconds,
+            delay: reset_at.duration_since(observed_at).unwrap_or_default(),
+        })
+    }
+
+    /// Returns the server-provided Unix epoch seconds.
+    #[must_use]
+    pub const fn epoch_seconds(self) -> u64 {
+        self.epoch_seconds
+    }
+
+    /// Returns the nonnegative delay calculated at observation time.
+    #[must_use]
+    pub const fn delay(self) -> Duration {
+        self.delay
+    }
+}
+
 /// Most recent rate-limit information observed from the server for a bucket.
 #[derive(Clone, Debug)]
 pub struct RateLimitSnapshot {
@@ -68,10 +122,21 @@ pub struct RateLimitSnapshot {
     pub limit: Option<u32>,
     /// Permits remaining in the current window, as reported by the server.
     pub remaining: Option<u32>,
-    /// Time until the server's window resets.
-    pub reset_after: Option<Duration>,
+    /// Absolute server reset time and its delay from the captured observation.
+    pub reset: Option<RateLimitReset>,
     /// Server-mandated delay before the next request, if given.
-    pub retry_after: Option<Duration>,
+    pub retry_after: Option<RetryAfter>,
+}
+
+impl RateLimitSnapshot {
+    /// Returns the effective delay. HTTP's explicit `Retry-After` wins over
+    /// the rate-window reset estimate.
+    #[must_use]
+    pub fn delay(&self) -> Option<Duration> {
+        self.retry_after
+            .map(RetryAfter::delay)
+            .or_else(|| self.reset.map(RateLimitReset::delay))
+    }
 }
 
 #[derive(Debug)]
@@ -159,7 +224,7 @@ impl RateLimitCoordinator {
     pub async fn observe(&self, kind: RateLimitBucket, snapshot: RateLimitSnapshot) {
         let mut all = self.buckets.lock().await;
         if let Some(bucket) = all.get_mut(&kind) {
-            if let Some(delay) = snapshot.retry_after.or(snapshot.reset_after) {
+            if let Some(delay) = snapshot.delay() {
                 bucket.next = Instant::now() + delay;
             }
             bucket.server = Some(snapshot);
@@ -206,7 +271,9 @@ mod tests {
 
     use tokio::task::yield_now;
 
-    use super::{RateLimitBucket, RateLimitCoordinator, RateLimitPolicy, RateLimitSnapshot};
+    use super::{
+        RateLimitBucket, RateLimitCoordinator, RateLimitPolicy, RateLimitReset, RateLimitSnapshot,
+    };
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_wait_does_not_consume_a_future_permit() {
@@ -252,7 +319,10 @@ mod tests {
                 RateLimitSnapshot {
                     limit: Some(1),
                     remaining: Some(0),
-                    reset_after: Some(Duration::from_secs(5)),
+                    reset: Some(RateLimitReset {
+                        epoch_seconds: 0,
+                        delay: Duration::from_secs(5),
+                    }),
                     retry_after: None,
                 },
             )

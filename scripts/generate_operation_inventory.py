@@ -64,6 +64,25 @@ ADMIN = {
 METHODS = {"get", "post", "put", "patch", "delete"}
 
 
+def schema_type(schema: dict | None) -> str:
+    if not schema:
+        return "none"
+    if reference := schema.get("$ref"):
+        return reference.rsplit("/", 1)[-1]
+    return schema.get("type", "inline")
+
+
+def content_schema(content: dict | None) -> dict | None:
+    return (content or {}).get("application/json", {}).get("schema")
+
+
+def response_type(responses: dict) -> str:
+    for status, response in responses.items():
+        if status.startswith("2"):
+            return schema_type(content_schema(response.get("content")))
+    return "none"
+
+
 def build_inventory(spec: dict) -> dict:
     paths = spec["paths"]
 
@@ -77,6 +96,10 @@ def build_inventory(spec: dict) -> dict:
                 "method": key[0],
                 "path": key[1],
                 "operation_id": op.get("operationId"),
+                "auth_required": bool(op.get("security", spec.get("security", []))),
+                "safety": "safe_read" if key[0] in {"GET", "HEAD"} else "mutating",
+                "request_type": schema_type(content_schema(op.get("requestBody", {}).get("content"))),
+                "response_type": response_type(op.get("responses", {})),
             }
             if key in DEPRECATED:
                 reason, evidence = DEPRECATED[key]

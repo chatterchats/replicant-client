@@ -13,7 +13,7 @@ macro_rules! open_vocab {
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
         #[non_exhaustive]
         pub enum $name {
-            $(#[allow(missing_docs)] $variant,)+
+            $(#[doc = concat!("The `", $text, "` wire value.")] $variant,)+
             /// A value not recognized by this build of the client. The original wire text is preserved.
             Unknown(String),
         }

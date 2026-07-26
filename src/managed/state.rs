@@ -1,14 +1,16 @@
 //! Immutable, crate-private state snapshots published after durable commits.
 
-#![allow(dead_code)] // Phase 5 owns the engine; public state queries arrive later.
+#![allow(dead_code)] // Internal state is shared by gateways and background workers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock};
+
+use tokio::sync::watch;
 
 use crate::domain::{
-    Account, Device, DeviceKey, Event, Location, Observation, Realm, Replicant, ReplicantKey,
-    Simulation, SimulationId,
+    Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location, LocationKey,
+    Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId,
 };
 
 use super::store::{OperationJournalEntry, ReconciliationWork, Store, StoreError, StoreHandle};
@@ -19,6 +21,8 @@ pub(crate) struct StateSnapshot {
     devices: BTreeMap<DeviceKey, Observation<Device>>,
     account: Option<Observation<Account>>,
     replicants: BTreeMap<ReplicantKey, Observation<Replicant>>,
+    locations: BTreeMap<LocationKey, Observation<Location>>,
+    inventories: BTreeMap<InventoryOwner, Observation<Inventory>>,
     simulations: BTreeMap<SimulationId, Observation<Simulation>>,
 }
 
@@ -35,7 +39,7 @@ impl StateSnapshot {
 pub(crate) struct StateEngine {
     store: StoreHandle,
     snapshot: RwLock<Arc<StateSnapshot>>,
-    subscribers: Mutex<Vec<mpsc::Sender<Arc<StateSnapshot>>>>,
+    snapshots: watch::Sender<Arc<StateSnapshot>>,
 }
 
 impl StateEngine {
@@ -51,18 +55,26 @@ impl StateEngine {
         let locked = store.lock().expect("state store lock poisoned");
         let opened = locked.as_ref().ok_or(StoreError::Closed)?;
         let devices = opened.restore_devices()?;
+        let account = opened.restore_account()?;
+        let replicants = opened.restore_replicants()?;
+        let locations = opened.restore_locations()?;
+        let inventories = opened.restore_inventories()?;
         let simulations = opened.restore_simulations()?;
         drop(locked);
+        let snapshot = Arc::new(StateSnapshot {
+            revision: 0,
+            devices,
+            account,
+            replicants,
+            locations,
+            inventories,
+            simulations,
+        });
+        let (snapshots, _) = watch::channel(Arc::clone(&snapshot));
         Ok(Self {
             store,
-            snapshot: RwLock::new(Arc::new(StateSnapshot {
-                revision: 0,
-                devices,
-                account: None,
-                replicants: BTreeMap::new(),
-                simulations,
-            })),
-            subscribers: Mutex::new(Vec::new()),
+            snapshot: RwLock::new(snapshot),
+            snapshots,
         })
     }
 
@@ -86,6 +98,14 @@ impl StateEngine {
         self.snapshot().replicants.values().cloned().collect()
     }
 
+    pub(crate) fn location(&self, key: &LocationKey) -> Option<Observation<Location>> {
+        self.snapshot().locations.get(key).cloned()
+    }
+
+    pub(crate) fn inventory(&self, owner: &InventoryOwner) -> Option<Observation<Inventory>> {
+        self.snapshot().inventories.get(owner).cloned()
+    }
+
     pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {
         self.store
             .lock()
@@ -99,6 +119,8 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: Some(account),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         });
         Ok(())
@@ -123,6 +145,8 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants,
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations,
         });
         Ok(())
@@ -156,6 +180,40 @@ impl StateEngine {
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
+            simulations,
+        });
+        Ok(())
+    }
+
+    /// Publishes a simulation seed only after its run record and every
+    /// successfully fetched initial device committed together.
+    pub(crate) fn persist_simulation_and_devices(
+        &self,
+        simulation: Observation<Simulation>,
+        devices: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_simulation_and_devices(&simulation, devices)?;
+        let previous = self.snapshot();
+        let mut next_devices = previous.devices.clone();
+        for device in devices {
+            next_devices.insert(device.value.key.clone(), device.clone());
+        }
+        let mut simulations = previous.simulations.clone();
+        simulations.insert(simulation.value.id, simulation);
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: next_devices,
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations,
         });
         Ok(())
@@ -184,24 +242,37 @@ impl StateEngine {
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         });
         Ok(())
     }
 
-    /// Commits a targeted inventory observation before publishing a new
-    /// revision. Inventory is not (yet) part of the queryable in-memory
-    /// snapshot; Phase 11 owns finishing the local query surface.
+    /// Commits a targeted inventory observation before publishing a new revision.
     pub(crate) fn persist_inventory(
         &self,
-        inventory: Observation<crate::domain::Inventory>,
+        inventory: Observation<Inventory>,
     ) -> Result<(), StoreError> {
         self.store
             .lock()
             .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .persist_inventory(&inventory)
+            .persist_inventory(&inventory)?;
+        let previous = self.snapshot();
+        let mut inventories = previous.inventories.clone();
+        inventories.insert(inventory.value.owner.clone(), inventory);
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            devices: previous.devices.clone(),
+            account: previous.account.clone(),
+            replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories,
+            simulations: previous.simulations.clone(),
+        });
+        Ok(())
     }
 
     /// Commits a targeted location observation before publishing a new revision.
@@ -216,11 +287,15 @@ impl StateEngine {
             .ok_or(StoreError::Closed)?
             .persist_location(&location)?;
         let previous = self.snapshot();
+        let mut locations = previous.locations.clone();
+        locations.insert(location.value.key.clone(), location);
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations,
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         });
         Ok(())
@@ -282,25 +357,28 @@ impl StateEngine {
 
     /// Commits an event and advances the applied cursor atomically, then
     /// publishes a new state revision.
-    pub(crate) fn apply_event(
-        &self,
-        event: &Event,
-        cursor: &str,
-    ) -> Result<Arc<StateSnapshot>, StoreError> {
-        self.store
+    pub(crate) fn apply_event(&self, event: &Event, cursor: &str) -> Result<bool, StoreError> {
+        let inserted = self
+            .store
             .lock()
             .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .append_event_and_project(event, cursor, &[])?;
+        if !inserted {
+            return Ok(false);
+        }
         let previous = self.snapshot();
-        Ok(self.publish(StateSnapshot {
+        self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
-        }))
+        });
+        Ok(true)
     }
 
     /// Commits an event, tombstones explicitly decommissioned devices, and
@@ -310,25 +388,32 @@ impl StateEngine {
         event: &Event,
         cursor: &str,
         decommissioned: &[DeviceKey],
-    ) -> Result<Arc<StateSnapshot>, StoreError> {
-        self.store
+    ) -> Result<bool, StoreError> {
+        let inserted = self
+            .store
             .lock()
             .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .append_event_and_decommission(event, cursor, decommissioned)?;
+        if !inserted {
+            return Ok(false);
+        }
         let previous = self.snapshot();
         let mut devices = previous.devices.clone();
         for key in decommissioned {
             devices.remove(key);
         }
-        Ok(self.publish(StateSnapshot {
+        self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
-        }))
+        });
+        Ok(true)
     }
 
     /// Enqueues (or coalesces) durable reconciliation work keyed by `work_id`.
@@ -389,6 +474,26 @@ impl StateEngine {
             .bound_account_id()
     }
 
+    pub(crate) fn rebind_account_and_persist(
+        &self,
+        previous: &crate::domain::AccountId,
+        account: Observation<Account>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .rebind_account_and_persist(previous, &account)?;
+        let previous = self.snapshot();
+        self.publish(StateSnapshot {
+            revision: previous.revision + 1,
+            account: Some(account),
+            ..(*previous).clone()
+        });
+        Ok(())
+    }
+
     /// Persists a durable operation's initial intent, before any unsafe
     /// network transmission is attempted.
     pub(crate) fn record_operation(
@@ -427,6 +532,29 @@ impl StateEngine {
             .as_mut()
             .ok_or(StoreError::Closed)?
             .set_operation_state(operation_id, state)
+    }
+
+    pub(crate) fn claim_operation_submission(
+        &self,
+        operation_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .claim_operation_submission(operation_id, attempt_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_operation_commit(&self) {
+        self.store
+            .lock()
+            .expect("state store lock poisoned")
+            .as_mut()
+            .expect("state store open")
+            .fail_next_commit();
     }
 
     /// Atomically commits a device projection produced by an operation's
@@ -508,13 +636,8 @@ impl StateEngine {
             .find_operations_awaiting_evidence(target_realm, target_kind, target_id)
     }
 
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<Arc<StateSnapshot>> {
-        let (sender, receiver) = mpsc::channel();
-        self.subscribers
-            .lock()
-            .expect("state subscribers lock poisoned")
-            .push(sender);
-        receiver
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<StateSnapshot>> {
+        self.snapshots.subscribe()
     }
 
     /// Commits every projection before replacing or broadcasting the snapshot.
@@ -538,6 +661,8 @@ impl StateEngine {
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         }))
     }
@@ -570,17 +695,19 @@ impl StateEngine {
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
+            locations: previous.locations.clone(),
+            inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         }))
     }
 
     fn publish(&self, next: StateSnapshot) -> Arc<StateSnapshot> {
         let next = Arc::new(next);
-        *self.snapshot.write().expect("state snapshot lock poisoned") = Arc::clone(&next);
-        self.subscribers
-            .lock()
-            .expect("state subscribers lock poisoned")
-            .retain(|sender| sender.send(Arc::clone(&next)).is_ok());
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&next);
+        self.snapshots.send_replace(Arc::clone(&next));
         next
     }
 
@@ -598,7 +725,6 @@ impl StateEngine {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::mpsc::TryRecvError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -652,7 +778,7 @@ mod tests {
         engine.fail_next_commit();
         assert!(engine.persist_devices(&[device("d1")]).is_err());
         assert_eq!(engine.snapshot().revision(), 0);
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!receiver.has_changed().expect("watch is open"));
     }
 
     #[test]

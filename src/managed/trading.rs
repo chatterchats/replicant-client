@@ -6,7 +6,7 @@
 //! (`src/raw/trading.rs` is deliberately untyped for the same reason). This
 //! gateway stays equally untyped rather than inventing a schema; the
 //! durable-operation coverage (`device_create_trade`, `device_fulfill_trade`,
-//! `device_delete_trade`, already registered in Phase 9) is what makes
+//! `device_delete_trade`, already registered as durable operations) is what makes
 //! `create`/`execute`/`delete` safe managed mutations.
 
 use serde_json::Value;
@@ -187,7 +187,7 @@ mod tests {
             .expect("execute");
         assert_eq!(
             operation.status().await.expect("status"),
-            crate::managed::OperationStatus::Completed
+            crate::managed::OperationStatus::ReconciliationRequired
         );
 
         let requests = server.received_requests().await.expect("recorded requests");

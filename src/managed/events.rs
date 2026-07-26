@@ -15,10 +15,9 @@
 //! of whether it arrived through the log or SSE, and is stored, reduced, and
 //! cursor-advanced in one atomic commit before publication.
 
-use std::{
-    sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Mutex, time::Duration};
+
+use tokio::sync::broadcast;
 
 use futures::StreamExt as _;
 use serde_json::Value;
@@ -34,11 +33,16 @@ use super::client::{
 };
 use super::store::{ReconciliationWork, StoreError};
 
-fn observed_at() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_default()
+/// A bounded queue deliberately applies backpressure to both input lanes: log
+/// catch-up and SSE await durable application instead of growing memory or
+/// acknowledging events that have not committed.
+const APPLIER_QUEUE_CAPACITY: usize = 256;
+/// Slow event subscribers receive a lag error once they fall this many events
+/// behind; delivery never grows an unbounded queue.
+const EVENT_SUBSCRIPTION_CAPACITY: usize = 256;
+
+fn observed_at() -> crate::domain::ObservationTime {
+    crate::domain::ObservationTime::now()
 }
 
 fn persistence_error(_: StoreError) -> Error {
@@ -51,30 +55,54 @@ fn persistence_error(_: StoreError) -> Error {
 /// `ClientInner`; the background tasks that feed it hold only a
 /// [`WeakClient`], never a strong reference to the client they publish into.
 pub(crate) struct EventEngine {
-    subscribers: Mutex<Vec<std::sync::mpsc::Sender<Event>>>,
+    subscribers: broadcast::Sender<Event>,
+    applier_sender: tokio::sync::mpsc::Sender<ApplyRequest>,
+    applier_receiver: Mutex<Option<tokio::sync::mpsc::Receiver<ApplyRequest>>>,
+}
+
+struct ApplyRequest {
+    event: GameEvent,
+    completed: tokio::sync::oneshot::Sender<Result<()>>,
 }
 
 impl EventEngine {
     pub(crate) fn new() -> Self {
+        let (applier_sender, applier_receiver) = tokio::sync::mpsc::channel(APPLIER_QUEUE_CAPACITY);
+        let (subscribers, _) = broadcast::channel(EVENT_SUBSCRIPTION_CAPACITY);
         Self {
-            subscribers: Mutex::new(Vec::new()),
+            subscribers,
+            applier_sender,
+            applier_receiver: Mutex::new(Some(applier_receiver)),
         }
     }
 
-    pub(crate) fn subscribe(&self) -> std::sync::mpsc::Receiver<Event> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        self.subscribers
-            .lock()
-            .expect("event subscribers lock poisoned")
-            .push(sender);
-        receiver
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.subscribers.subscribe()
     }
 
     pub(crate) fn notify(&self, event: Event) {
-        self.subscribers
+        let _ = self.subscribers.send(event);
+    }
+
+    async fn enqueue(&self, event: GameEvent) -> Result<()> {
+        let (completed, result) = tokio::sync::oneshot::channel();
+        self.applier_sender
+            .send(ApplyRequest { event, completed })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    fn start_applier(&self, weak: WeakClient) -> Result<tokio::task::JoinHandle<()>> {
+        let receiver = self
+            .applier_receiver
             .lock()
-            .expect("event subscribers lock poisoned")
-            .retain(|sender| sender.send(event.clone()).is_ok());
+            .expect("event applier lock poisoned")
+            .take()
+            .ok_or_else(|| Error::Configuration {
+                message: "event applier already started".into(),
+            })?;
+        Ok(tokio::spawn(run_applier(weak, receiver)))
     }
 }
 
@@ -103,14 +131,43 @@ impl EventsGateway {
 /// A local, deduplicated event stream. It never polls or otherwise issues
 /// network requests.
 pub struct EventWatch {
-    receiver: std::sync::mpsc::Receiver<Event>,
+    receiver: broadcast::Receiver<Event>,
 }
 
 impl EventWatch {
-    /// Returns every event published since the last call, if any are
-    /// available now.
-    pub fn try_next(&self) -> Vec<Event> {
-        self.receiver.try_iter().collect()
+    /// Returns every currently buffered event. A slow watcher receives an
+    /// error instead of silently losing events; use durable event history to
+    /// recover the gap.
+    pub fn try_next(&mut self) -> Result<Vec<Event>> {
+        let mut events = Vec::new();
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) => events.push(event),
+                Err(broadcast::error::TryRecvError::Empty) => return Ok(events),
+                Err(broadcast::error::TryRecvError::Closed) => return Err(Error::Closed),
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    return Err(Error::Transport {
+                        message: format!(
+                            "event watcher lagged by {count} events; recover from history"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Waits for one event. A lag error reports deliberate bounded-buffer
+    /// loss; it never causes producer backpressure or unbounded allocation.
+    pub async fn next(&mut self) -> Result<Event> {
+        match self.receiver.recv().await {
+            Ok(event) => Ok(event),
+            Err(broadcast::error::RecvError::Closed) => Err(Error::Closed),
+            Err(broadcast::error::RecvError::Lagged(count)) => Err(Error::Transport {
+                message: format!("event watcher lagged by {count} events; recover from history"),
+                source: None,
+            }),
+        }
     }
 }
 
@@ -129,41 +186,132 @@ enum CatchUpOutcome {
 /// commits the event and applied cursor atomically, publishes a state
 /// revision, notifies subscribers, and schedules narrow reconciliation for
 /// anything this client cannot yet reduce itself.
-fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
-    if client
-        .managed_state()
-        .has_event(&raw_event.id)
-        .map_err(persistence_error)?
-    {
-        // Already journaled by the other lane (log vs. SSE): apply once.
-        return Ok(());
+fn resolve_realm(client: &Client, raw_event: &GameEvent) -> Option<Realm> {
+    let simulation_id = raw_event
+        .payload
+        .get("simulation_id")
+        .or_else(|| raw_event.extra.get("simulation_id"))
+        .and_then(Value::as_i64);
+    if let Some(id) = simulation_id {
+        return Some(Realm::Simulation(crate::domain::SimulationId::new(id)));
     }
-    let event = domain::account_event(raw_event, Some(Realm::Live), observed_at()).value;
+    if let Some(code) = raw_event.device_code.as_deref() {
+        let mut realms: Vec<_> = client
+            .managed_state()
+            .devices()
+            .into_iter()
+            .filter(|device| device.value.key.id.as_str() == code)
+            .map(|device| device.value.key.realm)
+            .collect();
+        realms.sort();
+        realms.dedup();
+        if realms.len() == 1 {
+            return realms.pop();
+        }
+    }
+    if let Some(code) = raw_event.replicant_code.as_deref() {
+        let mut realms: Vec<_> = client
+            .managed_state()
+            .simulations()
+            .into_iter()
+            .filter(|simulation| {
+                simulation.value.replicant_code.as_deref() == Some(code)
+                    && !matches!(
+                        simulation.value.lifecycle,
+                        crate::domain::SimulationLifecycle::Ended
+                    )
+            })
+            .map(|simulation| Realm::Simulation(simulation.value.id))
+            .collect();
+        realms.sort();
+        realms.dedup();
+        if realms.len() == 1 {
+            return realms.pop();
+        }
+    }
+    None
+}
+
+fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
+    let event =
+        domain::account_event(raw_event, resolve_realm(client, raw_event), observed_at()).value;
     let cursor = raw_event.id.clone();
-    if event.name == domain::EventName::DeviceDecommissioned {
+    let inserted = if event.name == domain::EventName::DeviceDecommissioned {
         // Device decommissioning is an explicit removal signal (unlike a
         // filtered or visibility-scoped collection page).
         let decommissioned: Vec<DeviceKey> = event.device.iter().cloned().collect();
         client
             .managed_state()
             .apply_event_with_decommission(&event, &cursor, &decommissioned)
-            .map_err(persistence_error)?;
+            .map_err(persistence_error)?
     } else {
         client
             .managed_state()
             .apply_event(&event, &cursor)
-            .map_err(persistence_error)?;
+            .map_err(persistence_error)?
+    };
+    if !inserted {
+        // The transaction's insert-if-absent claim was lost to the other
+        // lane, so no reducer, publisher, evidence, or reconciliation side
+        // effect may run here.
+        return Ok(());
+    }
+    if event.realm.is_some() && event.name != domain::EventName::DeviceDecommissioned {
         // This client does not (yet) reduce every documented event type into
         // a domain projection. Schedule the narrowest safe reconciliation
         // inferred from the envelope rather than silently trusting the event
         // payload for anything beyond what was just journaled.
         schedule_narrow_reconciliation(client, &event)?;
     }
-    super::operation::resolve_awaiting_evidence(client, &event);
-    schedule_trade_completion_reconciliation(client, &event)?;
-    apply_simulation_lifecycle(client, &event);
+    if event.realm.is_some() {
+        super::operation::resolve_awaiting_evidence(client, &event)?;
+        schedule_trade_completion_reconciliation(client, &event)?;
+        apply_simulation_lifecycle(client, &event)?;
+    }
     client.managed_events().notify(event);
     Ok(())
+}
+
+/// The sole ordered event-applier. Producers wait for this task's reply, so
+/// queue capacity is real backpressure rather than an unbounded memory buffer.
+async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver<ApplyRequest>) {
+    while let Some(request) = receiver.recv().await {
+        let result = weak.upgrade().ok_or(Error::Closed).and_then(|client| {
+            let result = apply_event(&client, &request.event);
+            if result.is_err() {
+                mark_event_continuity_degraded(&client);
+                if schedule_continuity_reconciliation(&client).is_err() {
+                    mark_event_continuity_degraded(&client);
+                }
+            }
+            result
+        });
+        if request.completed.send(result).is_err() {
+            // The producer stopped awaiting while work was in flight; the
+            // durable outcome has already been committed or retained for log
+            // replay, so there is no caller left to notify.
+        }
+    }
+}
+
+fn mark_event_continuity_degraded(client: &Client) {
+    // A successful SSE connection is transport health, not proof that an
+    // earlier baseline or durable application failure recovered.
+    if !matches!(client.status(), ClientStatus::Degraded(_)) {
+        client.set_status(ClientStatus::Degraded(ClientDegradation::EventContinuity));
+    }
+}
+
+fn schedule_continuity_reconciliation(client: &Client) -> Result<()> {
+    client
+        .managed_state()
+        .enqueue_reconciliation(
+            "account:event-continuity",
+            &Realm::Live,
+            "account",
+            &serde_json::json!({ "id": "account" }),
+        )
+        .map_err(persistence_error)
 }
 
 /// `trade.completed` cross-domain reconciliation: the buyer/seller device
@@ -198,21 +346,23 @@ fn schedule_trade_completion_reconciliation(client: &Client, event: &Event) -> R
 /// abandoned it from another session) rather than through
 /// [`super::simulations::SimulationsGateway::abandon`] on this client: clean
 /// up its realm the same way either path does.
-fn apply_simulation_lifecycle(client: &Client, event: &Event) {
+fn apply_simulation_lifecycle(client: &Client, event: &Event) -> Result<()> {
     if !matches!(
         event.name.as_str(),
         "simulation.completed" | "simulation.expired" | "simulation.abandoned"
     ) {
-        return;
+        return Ok(());
     }
     if let Some(id) = event.payload.get("simulation_id").and_then(Value::as_i64) {
-        super::simulations::cleanup_realm(client, crate::domain::SimulationId::new(id));
+        super::simulations::cleanup_realm(client, crate::domain::SimulationId::new(id))?;
     }
+    Ok(())
 }
 
 /// Enqueues durable, coalesced reconciliation work for the narrowest entity
-/// named by the event envelope. Does nothing when no entity is named: a
-/// blanket account-wide reconciliation on every event would not be "narrow".
+/// named by the event envelope. An event with no scoped entity falls back to
+/// account reconciliation; that is the narrowest safe recovery for unknown
+/// server events.
 fn schedule_narrow_reconciliation(client: &Client, event: &Event) -> Result<()> {
     let (work_id, kind, payload) = if let Some(device) = &event.device {
         (
@@ -233,7 +383,11 @@ fn schedule_narrow_reconciliation(client: &Client, event: &Event) -> Result<()> 
             serde_json::json!({ "id": location.id.as_str() }),
         )
     } else {
-        return Ok(());
+        (
+            "account:event".to_owned(),
+            "account",
+            serde_json::json!({ "id": "account" }),
+        )
     };
     let realm = event.realm.clone().unwrap_or_default();
     client
@@ -271,8 +425,8 @@ async fn catch_up_unfiltered(
             ..Default::default()
         };
         let response = client.managed_raw().events().list(&query).await?;
-        for event in &response.value.events {
-            apply_event(client, event)?;
+        for event in response.value.events {
+            client.managed_events().enqueue(event).await?;
         }
         pages += 1;
         match response.value.next_cursor {
@@ -289,6 +443,38 @@ async fn catch_up_unfiltered(
 
 /// Claims and processes one durable reconciliation work item, if any is due.
 async fn process_reconciliation_work(client: &Client, work: &ReconciliationWork) -> Result<()> {
+    if work.kind == "simulation" {
+        let id = work
+            .payload
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::Configuration {
+                message: "simulation reconciliation payload missing `id`".into(),
+            })?;
+        let interface_code = work
+            .payload
+            .get("interface_code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Configuration {
+                message: "simulation reconciliation payload missing `interface_code`".into(),
+            })?;
+        let active = client
+            .managed_raw()
+            .simulations()
+            .active(interface_code)
+            .await?;
+        if active
+            .value
+            .simulations
+            .iter()
+            .any(|run| run.simulation_id == Some(id) && run.is_mine == Some(true))
+        {
+            return Err(Error::Operation {
+                message: "simulation is still active".into(),
+            });
+        }
+        return super::simulations::cleanup_realm(client, crate::domain::SimulationId::new(id));
+    }
     let id = work
         .payload
         .get("id")
@@ -298,7 +484,22 @@ async fn process_reconciliation_work(client: &Client, work: &ReconciliationWork)
         })?;
     match work.kind.as_str() {
         "device" => {
-            client.sync().device(id).await?;
+            let response = client.managed_raw().devices().get(id).await?;
+            let device = domain::device_detail(
+                &response.value,
+                work.realm.clone(),
+                crate::domain::AccessScope::Owned,
+                observed_at(),
+            )
+            .map_err(|error| Error::Decode {
+                message: error.to_string(),
+                status: Some(200),
+                source: None,
+            })?;
+            client
+                .managed_state()
+                .persist_devices(&[device])
+                .map_err(persistence_error)?;
         }
         "replicant" => {
             client.sync().replicant(id).await?;
@@ -352,8 +553,22 @@ async fn run_log_poll_loop(weak: WeakClient, interval: Duration, max_pages: usiz
         let Some(client) = weak.upgrade() else {
             return;
         };
-        let cursor = client.managed_state().event_cursor().ok().flatten();
-        let _ = catch_up_unfiltered(&client, cursor, max_pages).await;
+        let cursor = match client.managed_state().event_cursor() {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                mark_event_continuity_degraded(&client);
+                None
+            }
+        };
+        match catch_up_unfiltered(&client, cursor, max_pages).await {
+            Ok(CatchUpOutcome::Complete) => {}
+            Ok(CatchUpOutcome::BoundHit) | Err(_) => {
+                mark_event_continuity_degraded(&client);
+                if schedule_continuity_reconciliation(&client).is_err() {
+                    mark_event_continuity_degraded(&client);
+                }
+            }
+        }
     }
 }
 
@@ -387,15 +602,25 @@ async fn run_sse_loop(
         let Some(client) = weak.upgrade() else {
             return;
         };
-        let cursor = client.managed_state().event_cursor().ok().flatten();
-        client.set_status(ClientStatus::Connecting);
+        let cursor = match client.managed_state().event_cursor() {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                mark_event_continuity_degraded(&client);
+                None
+            }
+        };
+        if !matches!(client.status(), ClientStatus::Degraded(_)) {
+            client.set_status(ClientStatus::Connecting);
+        }
         drop(client);
 
         if let Ok(mut stream) = raw_client.events().stream(cursor.as_deref()).await {
             let Some(client) = weak.upgrade() else {
                 return;
             };
-            client.set_status(ClientStatus::Ready);
+            if !matches!(client.status(), ClientStatus::Degraded(_)) {
+                client.set_status(ClientStatus::Ready);
+            }
             ever_ready = true;
             drop(client);
             backoff = min_backoff;
@@ -407,7 +632,10 @@ async fn run_sse_loop(
                 };
                 match next {
                     Some(Ok(event)) => {
-                        let _ = apply_event(&client, &event);
+                        if client.managed_events().enqueue(event).await.is_err() {
+                            mark_event_continuity_degraded(&client);
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -417,7 +645,9 @@ async fn run_sse_loop(
         let Some(client) = weak.upgrade() else {
             return;
         };
-        client.set_status(disconnect_status(ever_ready));
+        if !matches!(client.status(), ClientStatus::Degraded(_)) {
+            client.set_status(disconnect_status(ever_ready));
+        }
         drop(client);
         tokio::time::sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(max_backoff);
@@ -448,92 +678,107 @@ async fn run_startup(
     // automatic submission attempt, so it is retried exactly once now.
     // Every other unresolved state is left untouched (see
     // `operation::recover`).
-    super::operation::recover(&client).await;
-
-    let sync_result = if policy == StartupPolicy::Full {
-        client.sync().full().await
-    } else {
-        client.sync().essential().await
-    };
-    if sync_result.is_err() {
+    let max_pages = event_options.max_catchup_pages;
+    if super::operation::recover(&client).await.is_err() {
         client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
     }
-    client.set_status(ClientStatus::CatchingUp);
 
-    let max_pages = event_options.max_catchup_pages;
     match client.managed_state().event_cursor() {
         Ok(Some(applied)) => {
+            // Restart: the durable applied cursor is the sole continuity
+            // point. Catch up before any optional REST reconciliation.
+            if !matches!(client.status(), ClientStatus::Degraded(_)) {
+                client.set_status(ClientStatus::CatchingUp);
+            }
             let outcome = catch_up_unfiltered(&client, Some(applied), max_pages).await;
             let stale = client
                 .managed_state()
                 .event_cursor_is_stale(reconciliation_policy.staleness_threshold)
                 .unwrap_or(true);
-            let bound_hit = matches!(outcome, Ok(CatchUpOutcome::BoundHit));
-            if stale || bound_hit || outcome.is_err() {
-                let _ = client.sync().essential().await;
+            if stale || !matches!(outcome, Ok(CatchUpOutcome::Complete)) {
+                mark_event_continuity_degraded(&client);
+                if schedule_continuity_reconciliation(&client).is_err() {
+                    mark_event_continuity_degraded(&client);
+                }
+                if client.sync().essential().await.is_err() {
+                    mark_event_continuity_degraded(&client);
+                }
             }
         }
         Ok(None) => {
-            if let Ok(watermark) = fetch_baseline_watermark(&client).await {
-                if let Some(watermark) = &watermark {
-                    let _ = client.managed_state().set_event_cursor(watermark);
+            // First start: capture an unfiltered watermark *before* the REST
+            // baseline. It is intentionally not written as an applied cursor:
+            // only a journaled, reduced event may advance that durable value.
+            let watermark = match fetch_baseline_watermark(&client).await {
+                Ok(watermark) => watermark,
+                Err(_) => {
+                    mark_event_continuity_degraded(&client);
+                    None
                 }
-                let _ = catch_up_unfiltered(&client, watermark, max_pages).await;
+            };
+            let baseline = if policy == StartupPolicy::Full {
+                client.sync().full().await
+            } else {
+                client.sync().essential().await
+            };
+            if baseline.is_err() {
+                client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
+            }
+            if !matches!(client.status(), ClientStatus::Degraded(_)) {
+                client.set_status(ClientStatus::CatchingUp);
+            }
+            if !matches!(
+                catch_up_unfiltered(&client, watermark, max_pages).await,
+                Ok(CatchUpOutcome::Complete)
+            ) {
+                mark_event_continuity_degraded(&client);
+                if schedule_continuity_reconciliation(&client).is_err() {
+                    mark_event_continuity_degraded(&client);
+                }
             }
         }
-        Err(_) => {}
+        Err(_) => {
+            mark_event_continuity_degraded(&client);
+            if schedule_continuity_reconciliation(&client).is_err() {
+                mark_event_continuity_degraded(&client);
+            }
+        }
     }
 
     let raw_client = client.managed_raw().clone();
     drop(client);
 
-    let sse_task = tokio::spawn(run_sse_loop(
+    let sse = run_sse_loop(
         weak.clone(),
         raw_client,
         event_options.reconnect_min_backoff,
         event_options.reconnect_max_backoff,
-    ));
-    let poll_task = tokio::spawn(run_log_poll_loop(
-        weak.clone(),
-        event_options.log_poll_interval,
-        max_pages,
-    ));
-    let reconciliation_task = tokio::spawn(run_reconciliation_worker(
-        weak.clone(),
-        reconciliation_policy.queue_idle_interval,
-    ));
-
-    match weak.upgrade() {
-        Some(client) => {
-            let _ = client.register_task(sse_task);
-            let _ = client.register_task(poll_task);
-            let _ = client.register_task(reconciliation_task);
-        }
-        None => {
-            sse_task.abort();
-            poll_task.abort();
-            reconciliation_task.abort();
-        }
-    }
+    );
+    let poll = run_log_poll_loop(weak.clone(), event_options.log_poll_interval, max_pages);
+    let reconciliation =
+        run_reconciliation_worker(weak.clone(), reconciliation_policy.queue_idle_interval);
+    tokio::join!(sse, poll, reconciliation);
 }
 
 /// Starts the event engine's background lifecycle task for a freshly built
 /// client. Not called for [`StartupPolicy::RestoreOnly`], which makes no
 /// required initial remote sweep.
-pub(crate) fn spawn(
+pub(crate) async fn spawn(
     client: &Client,
     policy: StartupPolicy,
     event_options: EventStreamOptions,
     reconciliation_policy: ReconciliationPolicy,
-) {
+) -> Result<()> {
     let weak = client.downgrade();
+    let applier = client.managed_events().start_applier(weak.clone())?;
+    client.register_task(applier).await?;
     let task = tokio::spawn(run_startup(
         weak,
         policy,
         event_options,
         reconciliation_policy,
     ));
-    let _ = client.register_task(task);
+    client.register_task(task).await
 }
 
 #[cfg(test)]
@@ -543,7 +788,7 @@ mod tests {
     use tokio::time::timeout;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, query_param},
     };
 
     use super::*;
@@ -640,6 +885,19 @@ mod tests {
             .expect("restore-only client")
     }
 
+    async fn applier_client() -> Client {
+        let client = restore_only_client().await;
+        let task = client
+            .managed_events()
+            .start_applier(client.downgrade())
+            .expect("start event applier");
+        client
+            .register_task(task)
+            .await
+            .expect("register event applier");
+        client
+    }
+
     fn fast_rate_limit_policy() -> crate::raw::rate_limit::RateLimitPolicy {
         crate::raw::rate_limit::RateLimitPolicy {
             capacity: 1000,
@@ -660,12 +918,17 @@ mod tests {
 
     #[tokio::test]
     async fn same_event_from_log_and_sse_applies_once() {
-        let client = restore_only_client().await;
-        let watch = client.events().watch().await.expect("watch");
+        let client = applier_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
         let event = game_event("1-0", "mining.started", Some("D1"));
+        let revision = client.managed_state().snapshot().revision();
 
-        apply_event(&client, &event).expect("first apply (simulated log)");
-        apply_event(&client, &event).expect("second apply (simulated sse)");
+        let (log, sse) = tokio::join!(
+            client.managed_events().enqueue(event.clone()),
+            client.managed_events().enqueue(event),
+        );
+        log.expect("log event applied");
+        sse.expect("SSE event deduplicated");
 
         assert_eq!(
             client
@@ -675,19 +938,85 @@ mod tests {
                 .as_deref(),
             Some("1-0")
         );
-        assert_eq!(watch.try_next().len(), 1, "event notified exactly once");
+        assert_eq!(client.managed_state().snapshot().revision(), revision + 1);
+        assert_eq!(
+            watch.try_next().expect("watch").len(),
+            1,
+            "event notified exactly once"
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn older_event_never_regresses_the_applied_cursor() {
+        let client = applier_client().await;
+
+        client
+            .managed_events()
+            .enqueue(game_event("10-0", "mining.started", Some("D10")))
+            .await
+            .expect("newer event");
+        client
+            .managed_events()
+            .enqueue(game_event("9-999", "mining.started", Some("D9")))
+            .await
+            .expect("older unique event remains journaled");
+
+        assert_eq!(
+            client
+                .managed_state()
+                .event_cursor()
+                .expect("cursor")
+                .as_deref(),
+            Some("10-0")
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn failed_event_commit_never_advances_cursor_or_notifies() {
+        let client = applier_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
+        client.managed_state().fail_next_commit();
+
+        assert!(
+            client
+                .managed_events()
+                .enqueue(game_event("3-0", "mining.started", Some("D3")))
+                .await
+                .is_err()
+        );
+        assert_eq!(client.managed_state().event_cursor().expect("cursor"), None);
+        assert!(watch.try_next().expect("watch").is_empty());
+        assert!(matches!(
+            client.status(),
+            ClientStatus::Degraded(ClientDegradation::EventContinuity)
+        ));
+        assert_eq!(
+            client
+                .managed_state()
+                .claim_reconciliation_work()
+                .expect("claim retained recovery work")
+                .expect("continuity recovery work")
+                .kind,
+            "account"
+        );
         client.close().await.expect("close");
     }
 
     #[tokio::test]
     async fn unknown_event_persists_reaches_subscribers_and_schedules_reconciliation() {
-        let client = restore_only_client().await;
-        let watch = client.events().watch().await.expect("watch");
+        let client = applier_client().await;
+        client
+            .managed_state()
+            .persist_devices(&[device("D2")])
+            .expect("seed known live device");
+        let mut watch = client.events().watch().await.expect("watch");
         let event = game_event("2-0", "some.future.event", Some("D2"));
 
         apply_event(&client, &event).expect("apply forward-compatible event");
 
-        let notified = watch.try_next();
+        let notified = watch.try_next().expect("watch");
         assert_eq!(notified.len(), 1);
         assert_eq!(notified[0].id.as_str(), "2-0");
 
@@ -698,6 +1027,22 @@ mod tests {
             .expect("narrow reconciliation was scheduled");
         assert_eq!(work.kind, "device");
         assert_eq!(work.payload["id"], "D2");
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn unscoped_unknown_event_stays_unresolved() {
+        let client = restore_only_client().await;
+        apply_event(&client, &game_event("2-1", "some.future.event", None))
+            .expect("persist unknown event");
+
+        assert!(
+            client
+                .managed_state()
+                .claim_reconciliation_work()
+                .expect("claim")
+                .is_none()
+        );
         client.close().await.expect("close");
     }
 
@@ -730,6 +1075,10 @@ mod tests {
     #[tokio::test]
     async fn trade_completed_schedules_reconciliation_for_new_device_codes() {
         let client = restore_only_client().await;
+        client
+            .managed_state()
+            .persist_devices(&[device("TC1")])
+            .expect("seed known live controller");
         let mut event = game_event("4-0", "trade.completed", Some("TC1"));
         event.payload.insert(
             "new_device_codes".into(),
@@ -753,6 +1102,62 @@ mod tests {
         assert!(scheduled.contains(&"TC1".to_string()));
         assert!(scheduled.contains(&"NEW1".to_string()));
         assert!(scheduled.contains(&"NEW2".to_string()));
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn explicit_simulation_id_isolated_from_a_same_code_live_device() {
+        let client = restore_only_client().await;
+        let simulation = Realm::Simulation(crate::domain::SimulationId::new(7));
+        client
+            .managed_state()
+            .persist_devices(&[device("SAME"), device_in_realm(simulation.clone(), "SAME")])
+            .expect("seed both realms");
+
+        let mut event = game_event("4-9", "device.decommissioned", Some("SAME"));
+        event
+            .payload
+            .insert("simulation_id".into(), serde_json::json!(7));
+        apply_event(&client, &event).expect("apply simulation device event");
+
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::in_realm(simulation, DeviceId::from("SAME")))
+                .is_none()
+        );
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live(DeviceId::from("SAME")))
+                .is_some(),
+            "simulation evidence must never decommission a same-code live device"
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn unresolved_realm_event_is_journaled_without_live_side_effects() {
+        let client = restore_only_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
+        apply_event(
+            &client,
+            &game_event("4-10", "future.event", Some("UNKNOWN")),
+        )
+        .expect("journal unresolved event");
+
+        let notified = watch.try_next().expect("watch");
+        assert_eq!(notified.len(), 1);
+        assert_eq!(notified[0].realm, None);
+        assert!(notified[0].device.is_none());
+        assert!(
+            client
+                .managed_state()
+                .claim_reconciliation_work()
+                .expect("claim")
+                .is_none(),
+            "unresolved evidence is not allowed to reconcile Live by default"
+        );
         client.close().await.expect("close");
     }
 
@@ -814,6 +1219,14 @@ mod tests {
             .mount(&server)
             .await;
         let client = restore_only_client_at(&server.uri()).await;
+        let task = client
+            .managed_events()
+            .start_applier(client.downgrade())
+            .expect("start event applier");
+        client
+            .register_task(task)
+            .await
+            .expect("register event applier");
 
         let outcome = catch_up_unfiltered(&client, None, 10)
             .await
@@ -828,7 +1241,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cursor_is_flagged_uncertain_without_any_server_rejection() {
-        let client = restore_only_client().await;
+        let client = applier_client().await;
         client
             .managed_state()
             .set_event_cursor("1-0")
@@ -870,8 +1283,8 @@ mod tests {
             .base_url(Url::parse(&server.uri()).expect("mock URL"))
             .build()
             .expect("raw client");
-        let client = restore_only_client().await;
-        let watch = client.events().watch().await.expect("watch");
+        let client = applier_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
         let weak = client.downgrade();
 
         let task = tokio::spawn(run_sse_loop(
@@ -883,7 +1296,7 @@ mod tests {
 
         timeout(Duration::from_secs(2), async {
             loop {
-                if !watch.try_next().is_empty() {
+                if !watch.try_next().expect("watch").is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -892,6 +1305,41 @@ mod tests {
         .await
         .expect("event delivered over SSE within the timeout");
 
+        task.abort();
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn sse_connectivity_cannot_replace_a_baseline_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(":"),
+            )
+            .mount(&server)
+            .await;
+        let raw_client = raw::Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .build()
+            .expect("raw client");
+        let client = applier_client().await;
+        client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
+
+        let task = tokio::spawn(run_sse_loop(
+            client.downgrade(),
+            raw_client,
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            client.status(),
+            ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
+        );
         task.abort();
         client.close().await.expect("close");
     }
@@ -947,6 +1395,86 @@ mod tests {
         assert_eq!(client.status(), ClientStatus::Closed);
     }
 
+    #[tokio::test]
+    async fn first_start_captures_watermark_before_blocked_baseline_and_catches_up_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/accounts/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"email": "a@b.test"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(75))
+                    .set_body_json(serde_json::json!({"devices": [], "next_cursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{"id":"1-0", "version":1, "category":"mining", "event":"mining.started", "created_at":"2026-07-25T00:00:00Z"}],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("cursor", "1-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{"id":"2-0", "version":1, "category":"mining", "event":"mining.started", "device_code":"D2", "created_at":"2026-07-25T00:00:01Z"}],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .in_memory()
+            .startup_policy(StartupPolicy::Essential)
+            .read_rate_limit_policy(fast_rate_limit_policy())
+            .event_stream_options(
+                EventStreamOptions::default()
+                    .log_poll_interval(Duration::from_secs(60))
+                    .reconnect_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+            )
+            .start()
+            .await
+            .expect("start client");
+        let mut watch = client.events().watch().await.expect("watch");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !watch.try_next().expect("watch").is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-watermark event is applied");
+        assert_eq!(
+            client
+                .managed_state()
+                .event_cursor()
+                .expect("cursor")
+                .as_deref(),
+            Some("2-0")
+        );
+        client.close().await.expect("close");
+    }
+
     #[test]
     fn disconnect_status_distinguishes_never_ready_from_a_lost_connection() {
         // A `tokio::sync::watch` status channel only ever exposes the latest
@@ -987,8 +1515,8 @@ mod tests {
             .await;
         // No mock for /v1/events/stream: every connection attempt fails, so
         // the client can never reach `Ready`. `Essential` still requires the
-        // live event connection, but `Degraded` is a usable, recoverable
-        // state, so `ready()` must resolve rather than block forever.
+        // live event connection. `Degraded` remains usable, but it is not
+        // ready; callers use `wait_until_usable()` for that weaker barrier.
         Mock::given(method("GET"))
             .and(path("/v1/events/stream"))
             .respond_with(ResponseTemplate::new(503))
@@ -1010,10 +1538,24 @@ mod tests {
             .await
             .expect("start client");
 
-        timeout(Duration::from_secs(2), client.ready())
+        timeout(Duration::from_secs(2), client.wait_until_usable())
             .await
-            .expect("readiness resolves instead of hanging")
-            .expect("ready succeeds in a degraded state");
+            .expect("usable-state wait resolves instead of hanging")
+            .expect("degraded client remains usable");
+        let mut status = client.watch_status();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    *status.borrow(),
+                    ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
+                ) {
+                    return;
+                }
+                status.changed().await.expect("status channel remains open");
+            }
+        })
+        .await
+        .expect("SSE failure reaches degraded status");
         assert_eq!(
             client.status(),
             ClientStatus::Degraded(ClientDegradation::StartupIncomplete)

@@ -4,7 +4,7 @@
 use futures::StreamExt as _;
 use replicant_client::{
     events::EventLogQuery,
-    raw::{Client, SecretString, Url},
+    raw::{Client, SecretString, Url, rate_limit::RateLimitBucket},
 };
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -58,6 +58,8 @@ async fn sse_parses_frames_and_sends_reconnect_cursor() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ratelimit-limit", "60")
+                .insert_header("x-ratelimit-remaining", "59")
                 .set_body_string(
                     ": keepalive\n\nid: 1752681620000-0\nevent: future.arrived\ndata: {\"id\":\"1752681620000-0\",\"version\":1,\"category\":\"future\",\"event\":\"future.arrived\",\"replicant_code\":null,\"device_code\":null,\"device_type\":null,\"star\":null,\"location\":null,\"payload\":{\"unknown\":true},\"created_at\":\"2026-07-16T10:03:20Z\"}\n\n",
                 ),
@@ -65,7 +67,8 @@ async fn sse_parses_frames_and_sends_reconnect_cursor() {
         .mount(&server)
         .await;
 
-    let mut stream = client(&server)
+    let client = client(&server);
+    let mut stream = client
         .events()
         .stream(Some("1752681600000-0"))
         .await
@@ -73,4 +76,19 @@ async fn sse_parses_frames_and_sends_reconnect_cursor() {
     let event = stream.next().await.unwrap().unwrap();
     assert_eq!(event.event, "future.arrived");
     assert_eq!(event.payload["unknown"], true);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.headers.get("x-request-id").is_some())
+    );
+    let snapshot = client
+        .rate_limits()
+        .snapshot(RateLimitBucket::Sse)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.limit, Some(60));
+    assert_eq!(snapshot.remaining, Some(59));
 }

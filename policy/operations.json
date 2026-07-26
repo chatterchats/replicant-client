@@ -12,66 +12,110 @@
       "method": "POST",
       "path": "/v1/accounts",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_accounts_RegisterRequestSchema",
+      "response_type": "app_schemas_accounts_AccountResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/achievements",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_achievements_AchievementListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/events",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_location_events_LocationEventListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/accounts/me",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "app_schemas_accounts_AccountWipeRequestedSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/me",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_accounts_AccountMeResponseSchema",
       "classification": "supported"
     },
     {
       "method": "PATCH",
       "path": "/v1/accounts/me",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_accounts_AccountUpdateRequestSchema",
+      "response_type": "app_schemas_accounts_AccountUpdateResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/accounts/recover",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_accounts_RecoverRequestSchema",
+      "response_type": "app_schemas_accounts_RecoverResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/reputation",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_species_AccountReputationResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/simulations",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_simulations_SimulationHistoryResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/accounts/verify/{token}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_accounts_VerificationResponseSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/accounts/webhook",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "app_schemas_accounts_WebhookRemovedSchema",
       "classification": "deprecated",
       "reason": "Webhook system is deprecated in favour of the account event stream and message subscriptions; existing webhooks continue to work but are phased out.",
       "evidence": "api/accounts/webhook/index.md"
@@ -80,6 +124,10 @@
       "method": "GET",
       "path": "/v1/accounts/webhook",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_accounts_WebhookInfoSchema",
       "classification": "deprecated",
       "reason": "Webhook system is deprecated in favour of the account event stream and message subscriptions; existing webhooks continue to work but are phased out.",
       "evidence": "api/accounts/webhook/index.md"
@@ -88,6 +136,10 @@
       "method": "POST",
       "path": "/v1/accounts/webhook",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_accounts_WebhookRegisterSchema",
+      "response_type": "app_schemas_accounts_WebhookResponseSchema",
       "classification": "deprecated",
       "reason": "Webhook system is deprecated in favour of the account event stream and message subscriptions; existing webhooks continue to work but are phased out.",
       "evidence": "api/accounts/webhook/index.md"
@@ -96,18 +148,30 @@
       "method": "GET",
       "path": "/v1/achievements",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_achievements_public_AchievementIndexResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/achievements/{achievement_key}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_achievements_public_AchievementDetailResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/admin/message",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_admin_AdminMessageRequestSchema",
+      "response_type": "app_schemas_admin_AdminMessageResponseSchema",
       "classification": "admin",
       "reason": "Administrative broadcast endpoint under /v1/admin; excluded from a player-facing client.",
       "evidence": "openapi.json"
@@ -116,6 +180,10 @@
       "method": "POST",
       "path": "/v1/admin/story/advance",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_admin_StoryAdvanceRequestSchema",
+      "response_type": "app_schemas_admin_StoryAdvanceResponseSchema",
       "classification": "admin",
       "reason": "Administrative story-advancement endpoint under /v1/admin; excluded from a player-facing client.",
       "evidence": "openapi.json"
@@ -124,240 +192,400 @@
       "method": "GET",
       "path": "/v1/blueprints",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_blueprints_BlueprintListSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_AccountDeviceListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/tags/{tag}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceTagListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceStatusSchema",
       "classification": "supported"
     },
     {
       "method": "PATCH",
       "path": "/v1/devices/{device_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_devices_DeviceConfigurationRequestSchema",
+      "response_type": "app_schemas_devices_DeviceConfigurationResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "inline",
+      "response_type": "app_schemas_devices_DeviceCommandResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/audit",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/channels",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceChannelsResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/logs",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_events_EventListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/messages",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceMessagesResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/network",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceNetworkSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/devices/{device_code}/permissions",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/permissions",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}/permissions",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/simulate",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_simulations_ScenarioListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}/simulate",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_simulations_SimulationEnterSchema",
+      "response_type": "app_schemas_simulations_SimulationEnterResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/simulate/active",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_simulations_SimulationActiveResponseSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/devices/{device_code}/simulate/{sim_id}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/devices/{device_code}/trades",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}/trades",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/devices/{device_code}/trades/{trade_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}/trades/{trade_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/events",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_events_GameEventsResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/events/stream",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/feedback",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_feedback_FeedbackSubmitRequestSchema",
+      "response_type": "app_schemas_feedback_FeedbackSubmitResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/health",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/inventory",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_inventory_AccountInventoryResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardIndexResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/distance",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/fleet",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/megastructure",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/reputation",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/simulations",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_SimLeaderboardIndexResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/simulations/{scenario_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_SimLeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/trades",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/leaderboards/xp",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_leaderboards_LeaderboardResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/locations",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_locations_LocationSystemMapSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/locations/{designation}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_locations_LocationResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/locations/{designation}/contribute",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_locations_LocationContributionRequestSchema",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/locations/{designation}/inventory",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_inventory_InventoryLookupSchema",
       "classification": "deprecated",
       "reason": "Legacy per-location inventory endpoint is deprecated in favour of the account-wide GET /v1/inventory endpoint.",
       "evidence": "api/locations/inventory/index.md"
@@ -366,60 +594,100 @@
       "method": "GET",
       "path": "/v1/locations/{location_code}/events",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/locations/{location_code}/events/{designation}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/locations/{star_designation}/stars",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_stars_StarListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/messages",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_messages_MessageListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/messages/read",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_messages_MessagesReadRequestSchema",
+      "response_type": "app_schemas_messages_MessagesReadResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_replicants_ReplicantSearchResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_replicants_ReplicantStatusSchema",
       "classification": "supported"
     },
     {
       "method": "PATCH",
       "path": "/v1/replicants/{replicant_code}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_replicants_ReplicantUpdateRequestSchema",
+      "response_type": "app_schemas_replicants_ReplicantUpdateResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/devices",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_devices_DeviceListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/events",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_events_EventListResponseSchema",
       "classification": "deprecated",
       "reason": "Per-replicant event log is deprecated in favour of the unified account event stream, which covers all replicants in real time.",
       "evidence": "api/replicants/events/index.md"
@@ -428,102 +696,170 @@
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/inventory",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_inventory_SystemInventorySchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/message",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_replicants_ReplicantMessageRequestSchema",
+      "response_type": "app_schemas_replicants_ReplicantMessageResponseSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/replicants/{replicant_code}/mine",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/mine",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_mining_ReplicantMineRequestSchema",
+      "response_type": "app_schemas_mining_ReplicantMineResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/print",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_printing_PrintRequestSchema",
+      "response_type": "app_schemas_printing_PrintResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/reputation",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_species_ReplicantReputationResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/scan",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "app_schemas_scanning_SystemScanResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/scan/devices",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/stars",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_stars_StarListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/stars/{star_designation}",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_stars_StarDetailResponseSchema",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/teleport",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_replicants_TeleportRequestSchema",
+      "response_type": "app_schemas_replicants_TeleportResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/replicants/{replicant_code}/traders",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/transfer",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_replicants_TransferRequestSchema",
+      "response_type": "app_schemas_replicants_TransferResponseSchema",
       "classification": "supported"
     },
     {
       "method": "DELETE",
       "path": "/v1/replicants/{replicant_code}/travel",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "none",
+      "response_type": "none",
       "classification": "supported"
     },
     {
       "method": "POST",
       "path": "/v1/replicants/{replicant_code}/travel",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "mutating",
+      "request_type": "app_schemas_travel_TravelRequestSchema",
+      "response_type": "app_schemas_travel_TravelResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/species",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_species_SpeciesListResponseSchema",
       "classification": "supported"
     },
     {
       "method": "GET",
       "path": "/v1/stars",
       "operation_id": null,
+      "auth_required": true,
+      "safety": "safe_read",
+      "request_type": "none",
+      "response_type": "app_schemas_stars_CatalogueResponseSchema",
       "classification": "supported"
     }
   ]

@@ -257,13 +257,17 @@ impl Operation {
     /// Waits up to `timeout` for a terminal status, returning the latest
     /// outcome either way.
     pub async fn wait_timeout(&self, timeout: Duration) -> Result<OperationOutcome> {
+        // Subscribe before the durable read so a transition between the two
+        // cannot be missed. The read is still authoritative after reconnect.
+        let mut watch = self.watch().await?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let outcome = self.outcome().await?;
             if outcome.status.is_terminal() || tokio::time::Instant::now() >= deadline {
                 return Ok(outcome);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            watch.wait_for_change(remaining).await;
         }
     }
 
@@ -274,19 +278,44 @@ impl Operation {
     pub async fn reconcile(&self) -> Result<OperationOutcome> {
         self.client.ensure_open()?;
         let entry = load(&self.client, &self.id)?;
-        let refreshed = match (entry.target_kind.as_deref(), entry.target_id.as_deref()) {
-            (Some("device"), Some(code)) => self.client.sync().device(code).await.is_ok(),
-            (Some("replicant"), Some(code)) => self.client.sync().replicant(code).await.is_ok(),
-            (Some("location"), Some(code)) => self.client.sync().location(code).await.is_ok(),
-            (Some("account"), _) => self.client.account().refresh().await.is_ok(),
-            _ => false,
-        };
-        if refreshed && !OperationStatus::parse(&entry.state).is_terminal() {
-            let _ = self
+        let snapshot = match (entry.target_kind.as_deref(), entry.target_id.as_deref()) {
+            (Some("device"), Some(code)) if self.client.sync().device(code).await.is_ok() => self
                 .client
                 .managed_state()
-                .set_operation_state(self.id.as_str(), OperationStatus::Completed.as_str());
-            notify(&self.client, &self.id, OperationStatus::Completed);
+                .device(&DeviceKey::live(DeviceId::from(code)))
+                .and_then(|observation| to_value(observation.value).ok()),
+            (Some("replicant"), Some(code)) if self.client.sync().replicant(code).await.is_ok() => {
+                self.client
+                    .managed_state()
+                    .replicant(&domain::ReplicantKey::live(domain::ReplicantId::from(code)))
+                    .and_then(|observation| to_value(observation.value).ok())
+            }
+            (Some("location"), Some(code)) if self.client.sync().location(code).await.is_ok() => {
+                None
+            }
+            (Some("account"), _) if self.client.account().refresh().await.is_ok() => None,
+            _ => None,
+        };
+        if !OperationStatus::parse(&entry.state).is_terminal() {
+            let matches = snapshot.as_ref().is_some_and(|snapshot| {
+                entry
+                    .intent
+                    .get("evidence")
+                    .and_then(|evidence| evidence.get("expected_state"))
+                    .is_some_and(|expected| {
+                        !expected.is_null() && value_contains(snapshot, expected)
+                    })
+            });
+            let state = if matches {
+                OperationStatus::Completed
+            } else {
+                OperationStatus::ReconciliationRequired
+            };
+            self.client
+                .managed_state()
+                .set_operation_state(self.id.as_str(), state.as_str())
+                .map_err(persistence_error)?;
+            notify(&self.client, &self.id, state);
         }
         self.outcome().await
     }
@@ -305,49 +334,64 @@ fn load(client: &Client, id: &OperationId) -> Result<super::store::OperationJour
 /// A local, deduplicated operation-status stream. Never itself issues a
 /// network request.
 pub struct OperationWatch {
-    receiver: std::sync::mpsc::Receiver<(OperationId, OperationStatus)>,
+    receiver: tokio::sync::broadcast::Receiver<(OperationId, OperationStatus)>,
     id: OperationId,
 }
 
 impl OperationWatch {
     /// Returns the latest status published for this operation since the last
     /// call, if any is available now.
-    pub fn try_next(&self) -> Option<OperationStatus> {
-        self.receiver
-            .try_iter()
-            .filter(|(id, _)| *id == self.id)
-            .map(|(_, status)| status)
-            .last()
+    pub fn try_next(&mut self) -> Result<Option<OperationStatus>> {
+        let mut latest = None;
+        loop {
+            match self.receiver.try_recv() {
+                Ok((id, status)) if id == self.id => latest = Some(status),
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    return Ok(latest);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return Err(Error::Closed);
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => return Ok(latest),
+            }
+        }
+    }
+
+    async fn wait_for_change(&mut self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                match self.receiver.recv().await {
+                    Ok((id, _)) if id == self.id => return,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
+        .await;
     }
 }
 
 /// Subscriber registry for durable operation status changes. Owned by
 /// `ClientInner`.
 pub(crate) struct OperationEngine {
-    subscribers: std::sync::Mutex<Vec<std::sync::mpsc::Sender<(OperationId, OperationStatus)>>>,
+    subscribers: tokio::sync::broadcast::Sender<(OperationId, OperationStatus)>,
 }
 
 impl OperationEngine {
     pub(crate) fn new() -> Self {
         Self {
-            subscribers: std::sync::Mutex::new(Vec::new()),
+            subscribers: tokio::sync::broadcast::channel(256).0,
         }
     }
 
-    pub(crate) fn subscribe(&self) -> std::sync::mpsc::Receiver<(OperationId, OperationStatus)> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        self.subscribers
-            .lock()
-            .expect("operation subscribers lock poisoned")
-            .push(sender);
-        receiver
+    pub(crate) fn subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<(OperationId, OperationStatus)> {
+        self.subscribers.subscribe()
     }
 
     fn notify(&self, id: OperationId, status: OperationStatus) {
-        self.subscribers
-            .lock()
-            .expect("operation subscribers lock poisoned")
-            .retain(|sender| sender.send((id.clone(), status)).is_ok());
+        let _ = self.subscribers.send((id, status));
     }
 }
 
@@ -688,15 +732,25 @@ pub(crate) async fn device_abandon_simulation(
     device_code: &str,
     simulation_id: i64,
 ) -> Result<Operation> {
-    create(
+    let operation = create(
         client,
         "device_abandon_simulation",
-        Some(("device", device_code.to_string())),
+        Some(("simulation", simulation_id.to_string())),
         serde_json::json!({ "device_code": device_code, "simulation_id": simulation_id }),
         Value::Null,
         false,
     )
-    .await
+    .await?;
+    client
+        .managed_state()
+        .enqueue_reconciliation(
+            &format!("simulation:{simulation_id}:active"),
+            &domain::Realm::Simulation(crate::domain::SimulationId::new(simulation_id)),
+            "simulation",
+            &serde_json::json!({ "id": simulation_id, "interface_code": device_code }),
+        )
+        .map_err(persistence_error)?;
+    Ok(operation)
 }
 
 pub(crate) async fn device_create_trade(
@@ -961,10 +1015,21 @@ async fn create(
         "path": path,
         "body": body,
         "expects_evidence": expects_evidence,
+        // Empty means that this operation has no contract-specific event
+        // proof. It therefore remains reconciliation-required rather than
+        // accepting an arbitrary event on the same entity as completion.
+        "evidence": { "event_names": [], "payload": {}, "expected_state": null },
     });
-    let (target_realm, target_kind, target_id): (Option<&str>, Option<&str>, Option<String>) =
+    let (target_realm, target_kind, target_id): (Option<String>, Option<&str>, Option<String>) =
         match &target {
-            Some((kind, id)) => (Some("live"), Some(*kind), Some(id.clone())),
+            Some((kind, id)) => {
+                let realm = if kind == &"simulation" {
+                    format!("simulation:{id}")
+                } else {
+                    "live".to_owned()
+                };
+                (Some(realm), Some(*kind), Some(id.clone()))
+            }
             None => (None, None, None),
         };
     client
@@ -972,13 +1037,13 @@ async fn create(
         .record_operation(
             id.as_str(),
             OperationStatus::Prepared.as_str(),
-            target_realm,
+            target_realm.as_deref(),
             target_kind,
             target_id.as_deref(),
             &intent,
         )
         .map_err(persistence_error)?;
-    attempt(client, &id).await;
+    attempt(client, &id).await?;
     Ok(Operation {
         client: client.clone(),
         id,
@@ -990,12 +1055,18 @@ async fn create(
 /// operation that is not `prepared`: it simply reloads and re-dispatches
 /// nothing further in that case, since `dispatch` is only ever reached from
 /// here immediately after a `prepared` state is confirmed durable.
-async fn attempt(client: &Client, id: &OperationId) {
-    let Ok(Some(entry)) = client.managed_state().read_operation(id.as_str()) else {
-        return;
+async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
+    let Some(entry) = client
+        .managed_state()
+        .read_operation(id.as_str())
+        .map_err(persistence_error)?
+    else {
+        return Err(Error::Operation {
+            message: "operation disappeared before submission".into(),
+        });
     };
     if entry.state != OperationStatus::Prepared.as_str() {
-        return;
+        return Ok(());
     }
     let kind = entry
         .intent
@@ -1011,91 +1082,200 @@ async fn attempt(client: &Client, id: &OperationId) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let _ = client
+    let claimed = client
         .managed_state()
-        .set_operation_state(id.as_str(), OperationStatus::Submitted.as_str());
+        .claim_operation_submission(id.as_str(), &Uuid::new_v4().to_string())
+        .map_err(persistence_error)?;
+    if !claimed {
+        return Ok(());
+    }
     notify(client, id, OperationStatus::Submitted);
 
     match dispatch(client, &kind, &path, &body).await {
         Err(error) if error.is_ambiguous_transport_failure() => {
-            let _ = client
+            client
                 .managed_state()
-                .set_operation_state(id.as_str(), OperationStatus::Ambiguous.as_str());
+                .set_operation_state(id.as_str(), OperationStatus::Ambiguous.as_str())
+                .map_err(persistence_error)?;
             notify(client, id, OperationStatus::Ambiguous);
         }
         Err(error) => {
-            let _ = client.managed_state().append_operation_projection(
-                id.as_str(),
-                OperationStatus::Rejected.as_str(),
-                &sanitize_error(&error),
-            );
+            client
+                .managed_state()
+                .append_operation_projection(
+                    id.as_str(),
+                    OperationStatus::Rejected.as_str(),
+                    &sanitize_error(&error),
+                )
+                .map_err(persistence_error)?;
             notify(client, id, OperationStatus::Rejected);
         }
         Ok(response) => {
+            // A response is not completion until a normalized authoritative
+            // observation satisfies this operation's evidence plan.
             let next = if expects_evidence {
                 OperationStatus::AwaitingEvidence
             } else {
-                OperationStatus::Completed
+                OperationStatus::ReconciliationRequired
             };
-            let _ = client.managed_state().append_operation_projection(
-                id.as_str(),
-                next.as_str(),
-                &response,
-            );
+            client
+                .managed_state()
+                .append_operation_projection(id.as_str(), next.as_str(), &response)
+                .map_err(persistence_error)?;
             notify(client, id, next);
-            if let (Some(target_kind), Some(target_id)) =
-                (entry.target_kind.as_deref(), entry.target_id.as_deref())
-            {
-                schedule_target_reconciliation(client, target_kind, target_id);
+            if let (Some(target_realm), Some(target_kind), Some(target_id)) = (
+                entry.target_realm.as_deref(),
+                entry.target_kind.as_deref(),
+                entry.target_id.as_deref(),
+            ) {
+                schedule_target_reconciliation(client, target_realm, target_kind, target_id)?;
             }
         }
     }
+    Ok(())
 }
 
-fn schedule_target_reconciliation(client: &Client, target_kind: &str, target_id: &str) {
+fn schedule_target_reconciliation(
+    client: &Client,
+    target_realm: &str,
+    target_kind: &str,
+    target_id: &str,
+) -> Result<()> {
+    let realm = target_realm
+        .strip_prefix("simulation:")
+        .and_then(|id| id.parse().ok())
+        .map(crate::domain::SimulationId::new)
+        .map(domain::Realm::Simulation)
+        .unwrap_or(domain::Realm::Live);
     let work_id = format!("operation:{target_kind}:{target_id}");
-    let _ = client.managed_state().enqueue_reconciliation(
-        &work_id,
-        &domain::Realm::Live,
-        target_kind,
-        &serde_json::json!({ "id": target_id }),
-    );
+    client
+        .managed_state()
+        .enqueue_reconciliation(
+            &work_id,
+            &realm,
+            target_kind,
+            &serde_json::json!({ "id": target_id }),
+        )
+        .map_err(persistence_error)
 }
 
-/// Called by the event engine for every applied event: resolves any
-/// operation awaiting evidence on the event's device/replicant/location key.
-/// Matching is intentionally name-agnostic (any subsequent event on the same
-/// target counts as evidence), the same forward-compatible principle already
-/// used for narrow reconciliation scheduling.
-pub(crate) fn resolve_awaiting_evidence(client: &Client, event: &domain::Event) {
+/// Called by the event engine for every applied event. Target identity only
+/// narrows candidates; completion still requires the durable evidence plan.
+pub(crate) fn resolve_awaiting_evidence(client: &Client, event: &domain::Event) -> Result<()> {
+    let Some(realm) = event.realm.as_ref() else {
+        return Ok(());
+    };
+    let target_realm = match realm {
+        domain::Realm::Live => "live".to_owned(),
+        domain::Realm::Simulation(id) => format!("simulation:{}", id.get()),
+    };
     if let Some(device) = &event.device {
-        mark_resolved(client, "device", device.id.as_str());
+        mark_resolved(client, &target_realm, "device", device.id.as_str(), event)?;
     }
     if let Some(replicant) = &event.replicant {
-        mark_resolved(client, "replicant", replicant.id.as_str());
+        mark_resolved(
+            client,
+            &target_realm,
+            "replicant",
+            replicant.id.as_str(),
+            event,
+        )?;
     }
     if let Some(location) = &event.location {
-        mark_resolved(client, "location", location.id.as_str());
+        mark_resolved(
+            client,
+            &target_realm,
+            "location",
+            location.id.as_str(),
+            event,
+        )?;
     }
+    if let Some(id) = event.payload.get("simulation_id").and_then(Value::as_i64) {
+        mark_resolved(client, &target_realm, "simulation", &id.to_string(), event)?;
+    }
+    Ok(())
 }
 
-fn mark_resolved(client: &Client, target_kind: &str, target_id: &str) {
-    let Ok(ids) =
+fn mark_resolved(
+    client: &Client,
+    target_realm: &str,
+    target_kind: &str,
+    target_id: &str,
+    event: &domain::Event,
+) -> Result<()> {
+    let ids = client
+        .managed_state()
+        .find_operations_awaiting_evidence(target_realm, target_kind, target_id)
+        .map_err(persistence_error)?;
+    for operation_id in ids {
+        let entry = client
+            .managed_state()
+            .read_operation(&operation_id)
+            .map_err(persistence_error)?;
+        let Some(entry) = entry else { continue };
+        if !event_evidence_matches(&entry, event) {
+            continue;
+        }
         client
             .managed_state()
-            .find_operations_awaiting_evidence("live", target_kind, target_id)
-    else {
-        return;
-    };
-    for operation_id in ids {
-        let _ = client
-            .managed_state()
-            .set_operation_state(&operation_id, OperationStatus::Completed.as_str());
+            .set_operation_state(&operation_id, OperationStatus::Completed.as_str())
+            .map_err(persistence_error)?;
         notify(
             client,
             &OperationId::new(operation_id),
             OperationStatus::Completed,
         );
+    }
+    Ok(())
+}
+
+fn event_evidence_matches(
+    entry: &super::store::OperationJournalEntry,
+    event: &domain::Event,
+) -> bool {
+    let Some(cursor) = entry.submission_cursor.as_deref() else {
+        // Without a durable cursor lower bound, an event cannot prove that it
+        // followed this submission.
+        return false;
+    };
+    if event.id.as_str() <= cursor {
+        return false;
+    }
+    let evidence = entry.intent.get("evidence").unwrap_or(&Value::Null);
+    let Some(names) = evidence.get("event_names").and_then(Value::as_array) else {
+        return false;
+    };
+    if !names
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|name| name == event.name.as_str())
+    {
+        return false;
+    }
+    evidence.get("payload").is_none_or(|predicate| {
+        let payload = event
+            .payload
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        value_contains(&Value::Object(payload), predicate)
+    })
+}
+
+fn value_contains(actual: &Value, predicate: &Value) -> bool {
+    match (actual, predicate) {
+        (_, Value::Null) => true,
+        (Value::Object(actual), Value::Object(predicate)) => {
+            predicate.iter().all(|(key, value)| {
+                actual
+                    .get(key)
+                    .is_some_and(|actual| value_contains(actual, value))
+            })
+        }
+        (Value::Array(actual), Value::Array(predicate)) => predicate
+            .iter()
+            .all(|value| actual.iter().any(|actual| value_contains(actual, value))),
+        _ => actual == predicate,
     }
 }
 
@@ -1105,15 +1285,17 @@ fn mark_resolved(client: &Client, target_kind: &str, target_id: &str) {
 /// attempt it now. Every other non-terminal state (`ambiguous`, `accepted`,
 /// `awaiting_evidence`, ...) is left untouched — recoverable via evidence or
 /// [`Operation::reconcile`], never blindly resubmitted.
-pub(crate) async fn recover(client: &Client) {
-    let Ok(rows) = client.managed_state().list_unresolved_operations() else {
-        return;
-    };
+pub(crate) async fn recover(client: &Client) -> Result<()> {
+    let rows = client
+        .managed_state()
+        .list_unresolved_operations()
+        .map_err(persistence_error)?;
     for (id, entry) in rows {
         if entry.state == OperationStatus::Prepared.as_str() {
-            attempt(client, &OperationId::new(id)).await;
+            attempt(client, &OperationId::new(id)).await?;
         }
     }
+    Ok(())
 }
 
 /// Resolves a durable operation kind to the exact `/v1` request this client
@@ -1331,7 +1513,7 @@ mod tests {
         .expect("operation created");
         assert_eq!(
             operation.status().await.expect("status"),
-            OperationStatus::Completed
+            OperationStatus::ReconciliationRequired
         );
 
         client.close().await.expect("close");
@@ -1365,6 +1547,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_submission_claim_never_transmits_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        client.managed_state().fail_next_operation_commit();
+
+        let error = device_configure(
+            &client,
+            "D1",
+            raw::devices::DeviceConfigurationRequest::default(),
+        )
+        .await
+        .expect_err("a failed durable claim prevents transmission");
+        assert!(matches!(error, Error::Persistence { .. }));
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
     async fn ambiguous_operations_are_resolved_by_explicit_reconciliation_not_resubmission() {
         let server = MockServer::start().await;
         let client = client_at(&server.uri()).await;
@@ -1394,7 +1600,7 @@ mod tests {
 
         let operation = client.operations().get(OperationId::new("op-ambiguous"));
         let outcome = operation.reconcile().await.expect("reconcile");
-        assert_eq!(outcome.status, OperationStatus::Completed);
+        assert_eq!(outcome.status, OperationStatus::ReconciliationRequired);
         server.verify().await;
         client.close().await.expect("close");
     }
@@ -1487,7 +1693,7 @@ mod tests {
                     .status()
                     .await
                     .expect("status");
-                if status == OperationStatus::Completed {
+                if status == OperationStatus::ReconciliationRequired {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1601,7 +1807,9 @@ mod tests {
                         .status()
                         .await
                         .expect("status");
-                    if status.is_terminal() || status == OperationStatus::AwaitingEvidence {
+                    if status == OperationStatus::ReconciliationRequired
+                        || status == OperationStatus::AwaitingEvidence
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1660,7 +1868,7 @@ mod tests {
             .expect("record awaiting-evidence operation");
 
         let event = domain::Event {
-            id: crate::domain::EventId::new("evt-1"),
+            id: crate::domain::EventId::new("1-0"),
             realm: Some(Realm::Live),
             name: domain::EventName::from("device.travel_arrived"),
             category: domain::EventCategory::from("device"),
@@ -1671,13 +1879,38 @@ mod tests {
             occurred_at: "2026-07-25T00:00:00Z".into(),
             payload: Default::default(),
         };
-        resolve_awaiting_evidence(&client, &event);
+        resolve_awaiting_evidence(&client, &event).expect("event application");
 
         let operation = client.operations().get(OperationId::new("op-travel"));
         assert_eq!(
             operation.status().await.expect("status"),
-            OperationStatus::Completed
+            OperationStatus::AwaitingEvidence
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn simulation_evidence_is_never_matched_to_a_same_code_live_operation() {
+        let client = client_at(&MockServer::start().await.uri()).await;
+        for (id, realm) in [("live", "live"), ("simulation", "simulation:7")] {
+            client
+                .managed_state()
+                .record_operation(
+                    id,
+                    OperationStatus::AwaitingEvidence.as_str(),
+                    Some(realm),
+                    Some("device"),
+                    Some("D1"),
+                    &serde_json::json!({"kind": "device_command"}),
+                )
+                .expect("record operation");
+        }
+
+        let matching = client
+            .managed_state()
+            .find_operations_awaiting_evidence("simulation:7", "device", "D1")
+            .expect("find simulation evidence candidates");
+        assert_eq!(matching, vec!["simulation"]);
         client.close().await.expect("close");
     }
 
@@ -1757,7 +1990,7 @@ mod tests {
             .expect("matching confirmation proceeds");
         assert_eq!(
             operation.status().await.expect("status"),
-            OperationStatus::Completed
+            OperationStatus::ReconciliationRequired
         );
 
         client.close().await.expect("close");

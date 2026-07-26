@@ -25,7 +25,7 @@ impl std::error::Error for NormalizeError {}
 
 fn metadata(
     operation: &str,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
     source: ObservationSource,
     authority: ObservationAuthority,
     access: AccessScope,
@@ -53,7 +53,7 @@ fn required(value: Option<&String>, field: &'static str) -> Result<String, Norma
 pub fn account_me(
     raw: &raw::accounts::AccountMeResponse,
     id: AccountId,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Observation<Account> {
     Observation {
         value: Account {
@@ -131,7 +131,7 @@ pub fn device_detail(
     raw: &raw::devices::DeviceStatus,
     realm: Realm,
     access: AccessScope,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Device>, NormalizeError> {
     let value = device(raw, realm, access.clone())?;
     Ok(Observation {
@@ -151,7 +151,7 @@ pub fn device_list_member(
     raw: &raw::devices::DeviceStatus,
     realm: Realm,
     access: AccessScope,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Device>, NormalizeError> {
     let value = device(raw, realm, access.clone())?;
     Ok(Observation {
@@ -172,20 +172,13 @@ pub fn device_collection(
     realm: Realm,
     filtered: bool,
     fully_traversed: bool,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<CollectionObservation<Device>, NormalizeError> {
     let observed_at = observed_at.into();
     let members = raw
         .devices
         .iter()
-        .map(|device| {
-            device_list_member(
-                device,
-                realm.clone(),
-                AccessScope::Owned,
-                observed_at.clone(),
-            )
-        })
+        .map(|device| device_list_member(device, realm.clone(), AccessScope::Owned, observed_at))
         .collect::<Result<Vec<_>, _>>()?;
     let completeness = if !filtered && fully_traversed {
         CollectionCompleteness::Complete
@@ -217,15 +210,13 @@ pub fn replicant_device_collection(
     raw: &raw::devices::DeviceListResponse,
     realm: Realm,
     access: AccessScope,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<CollectionObservation<Device>, NormalizeError> {
     let observed_at = observed_at.into();
     let members = raw
         .devices
         .iter()
-        .map(|device| {
-            device_list_member(device, realm.clone(), access.clone(), observed_at.clone())
-        })
+        .map(|device| device_list_member(device, realm.clone(), access.clone(), observed_at))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(CollectionObservation {
         members,
@@ -281,7 +272,7 @@ fn replicant(
 pub fn owned_replicant_detail(
     raw: &raw::replicants::ReplicantStatus,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Replicant>, NormalizeError> {
     Ok(Observation {
         value: replicant(raw, realm, AccessScope::Owned, true)?,
@@ -299,7 +290,7 @@ pub fn owned_replicant_detail(
 pub fn public_replicant_detail(
     raw: &raw::replicants::ReplicantStatus,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Replicant>, NormalizeError> {
     Ok(Observation {
         value: replicant(raw, realm, AccessScope::Public, false)?,
@@ -316,7 +307,7 @@ pub fn public_replicant_detail(
 
 pub fn directory_profile(
     raw: &raw::replicants::ReplicantSearchItem,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<DirectoryProfile>, NormalizeError> {
     let value = DirectoryProfile {
         id: ReplicantId::new(required(raw.replicant_code.as_ref(), "replicant_code")?),
@@ -340,7 +331,7 @@ pub fn directory_profile(
 pub fn location_detail(
     raw: &raw::locations::Location,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Location>, NormalizeError> {
     let value = Location {
         key: WorldKey::in_realm(
@@ -368,7 +359,7 @@ pub fn location_detail(
 pub fn location_overview(
     raw: &raw::locations::LocationSystemMap,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> CollectionObservation<LocationOverview> {
     let observed_at = observed_at.into();
     let members = raw
@@ -382,7 +373,7 @@ pub fn location_overview(
             },
             metadata: metadata(
                 "GET /v1/locations",
-                observed_at.clone(),
+                observed_at,
                 ObservationSource::RestCollection,
                 ObservationAuthority::Discovery,
                 AccessScope::Owned,
@@ -408,7 +399,7 @@ pub fn location_inventory(
     raw: &raw::inventory::LocationInventory,
     owner: InventoryOwner,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Inventory>, NormalizeError> {
     let location = WorldKey::in_realm(
         realm,
@@ -444,7 +435,7 @@ pub fn location_inventory(
 pub fn catalogue_star(
     raw: &raw::galaxy::CatalogueStar,
     realm: Realm,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Star>, NormalizeError> {
     let value = Star {
         key: WorldKey::in_realm(
@@ -474,24 +465,26 @@ pub fn catalogue_star(
 pub fn account_event(
     raw: &GameEvent,
     realm: Option<Realm>,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Observation<Event> {
-    let device = raw
-        .device_code
+    // An unknown realm is deliberately not Live: entity keys would otherwise
+    // let an unresolved simulation event mutate a same-code live projection.
+    let device = realm
         .as_ref()
-        .map(|id| WorldKey::in_realm(realm.clone().unwrap_or_default(), DeviceId::new(id)));
-    let replicant = raw
-        .replicant_code
+        .zip(raw.device_code.as_ref())
+        .map(|(realm, id)| WorldKey::in_realm(realm.clone(), DeviceId::new(id)));
+    let replicant = realm
         .as_ref()
-        .map(|id| WorldKey::in_realm(realm.clone().unwrap_or_default(), ReplicantId::new(id)));
-    let location = raw
-        .location
+        .zip(raw.replicant_code.as_ref())
+        .map(|(realm, id)| WorldKey::in_realm(realm.clone(), ReplicantId::new(id)));
+    let location = realm
         .as_ref()
-        .map(|id| WorldKey::in_realm(realm.clone().unwrap_or_default(), LocationId::new(id)));
-    let star = raw
-        .star
+        .zip(raw.location.as_ref())
+        .map(|(realm, id)| WorldKey::in_realm(realm.clone(), LocationId::new(id)));
+    let star = realm
         .as_ref()
-        .map(|id| WorldKey::in_realm(realm.clone().unwrap_or_default(), StarId::new(id)));
+        .zip(raw.star.as_ref())
+        .map(|(realm, id)| WorldKey::in_realm(realm.clone(), StarId::new(id)));
     let value = Event {
         id: EventId::new(&raw.id),
         realm,
@@ -523,7 +516,7 @@ pub fn account_event(
 
 pub fn simulation_start(
     raw: &raw::simulations::SimulationEnterResponse,
-    observed_at: impl Into<String>,
+    observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Simulation>, NormalizeError> {
     let id = raw
         .simulation_id
@@ -545,6 +538,9 @@ pub fn simulation_start(
         is_mine: true,
         started_at: None,
         completed_at: None,
+        lifecycle: SimulationLifecycle::Synchronizing,
+        seed_failures: Vec::new(),
+        replicant_code: None,
     };
     Ok(Observation {
         value,

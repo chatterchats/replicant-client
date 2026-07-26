@@ -20,5 +20,7 @@ ehthumbs.db
 *.swo
 *.pyc
 __pycache__/
+/.claude/
+/.tokensave/
 /reference/replicant-space/.source-html/
 /reference/replicant-space/.crawl-cache.json

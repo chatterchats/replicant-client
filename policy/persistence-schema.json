@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "migration": "migrations/0001_initial.sql",
+  "observation_time": "unix_milliseconds (INTEGER)",
+  "sqlite_durability": "foreign_keys=ON; WAL for file databases; busy_timeout=5000ms; synchronous=FULL",
   "required_tables": [
     "schema_metadata", "account_binding", "source_documents", "accounts", "replicants",
     "public_directory_profiles", "devices", "device_relationships", "locations", "inventories",

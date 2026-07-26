@@ -3,7 +3,7 @@
 //! `raw::Client` exposes exactly the 77 current, non-deprecated,
 //! non-administrative operations recorded as `"supported"` in
 //! `policy/operations.json`. It returns transport DTOs and
-//! [`ResponseMetadata`] only; it never hydrates, persists, publishes,
+//! [`crate::raw::ResponseMetadata`] only; it never hydrates, persists, publishes,
 //! journals operations, or reconciles state against a local store. Those are
 //! managed-client concerns built on top of this transport in a later phase.
 //!
@@ -64,7 +64,8 @@ pub mod trading;
 
 pub use client::{
     Client, ClientBuilder, ClientConfig, MutableTokenProvider, RawResponse, RequestId,
-    RequestSafety, RetryPolicy, SecretString, StatusCode, TlsBackend, TokenProvider, Url,
+    RequestSafety, ResponseMetadata, RetryPolicy, SecretString, StatusCode, TlsBackend,
+    TokenProvider, Url,
 };
 pub use common::{JsonObject, Position};
 

@@ -5,10 +5,6 @@
 //! also have a thematic sibling client elsewhere (`achievements`,
 //! `reputation`, `simulations`) — matching the server's own route grouping
 //! rather than re-deriving family boundaries from response schema names.
-//! `message_notify` is carried as an opaque [`JsonObject`] only: it is a
-//! deprecated webhook/email notification block superseded by the account
-//! event stream and message subscriptions, and must never grow a typed,
-//! managed helper (see `policy/excluded-fields.json`).
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -175,9 +171,6 @@ pub struct AccountMeResponse {
     pub events: Option<EventSettings>,
     /// Message notification settings.
     pub messages: Option<MessageSettings>,
-    /// Deprecated webhook/email notification block; opaque, never a typed
-    /// managed helper (see `policy/excluded-fields.json`).
-    pub message_notify: Option<JsonObject>,
     /// This account's replicants.
     #[serde(default)]
     pub replicants: Vec<AccountReplicantSummary>,
@@ -211,11 +204,6 @@ pub struct AccountUpdateRequest {
     /// New message notification settings.
     #[serde(skip_serializing_if = "UpdateField::is_omitted")]
     pub messages: UpdateField<MessageSettings>,
-    /// New value for the deprecated `message_notify` block. Exposed only
-    /// because the contract still accepts it; new code should not populate
-    /// this (see `policy/excluded-fields.json`).
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
-    pub message_notify: UpdateField<JsonObject>,
 }
 
 /// Response body for `PATCH /v1/accounts/me`.
@@ -237,9 +225,14 @@ pub struct AccountUpdateResponse {
     pub events: Option<EventSettings>,
     /// Message notification settings after the update.
     pub messages: Option<MessageSettings>,
-    /// Deprecated webhook/email notification block after the update; opaque
-    /// (see `policy/excluded-fields.json`).
-    pub message_notify: Option<JsonObject>,
+}
+
+/// Response body for `DELETE /v1/accounts/me`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct AccountWipeRequestedResponse {
+    /// Server confirmation that the destructive wipe request was accepted.
+    pub message: Option<String>,
 }
 
 /// One achievement earned by the authenticated account.
@@ -362,7 +355,9 @@ impl AccountsClient {
 
     /// Requests destructive, irreversible deletion of the authenticated
     /// account.
-    pub async fn request_destructive_wipe(&self) -> Result<RawResponse<serde_json::Value>, Error> {
+    pub async fn request_destructive_wipe(
+        &self,
+    ) -> Result<RawResponse<AccountWipeRequestedResponse>, Error> {
         self.client
             .execute(
                 Method::DELETE,

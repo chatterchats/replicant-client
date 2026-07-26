@@ -25,15 +25,30 @@ fn authority_rank(authority: &ObservationAuthority) -> u8 {
     }
 }
 
+fn source_rank(source: &ObservationSource) -> u8 {
+    match source {
+        ObservationSource::CommandResponse => 6,
+        ObservationSource::RestDetail => 5,
+        ObservationSource::Reconciliation => 4,
+        ObservationSource::RestCollection => 3,
+        ObservationSource::EventLog => 2,
+        ObservationSource::Sse => 1,
+    }
+}
+
+fn metadata_order(left: &ObservationMetadata, right: &ObservationMetadata) -> core::cmp::Ordering {
+    left.observed_at
+        .cmp(&right.observed_at)
+        .then_with(|| authority_rank(&left.authority).cmp(&authority_rank(&right.authority)))
+        .then_with(|| source_rank(&left.source).cmp(&source_rank(&right.source)))
+}
+
 pub fn merge_snapshot<T: Clone>(
     existing: Observation<T>,
     incoming: Observation<T>,
 ) -> MergeOutcome<Observation<T>> {
-    if incoming.metadata.observed_at < existing.metadata.observed_at {
+    if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
         return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
-    }
-    if authority_rank(&incoming.metadata.authority) < authority_rank(&existing.metadata.authority) {
-        return MergeOutcome::Retained(existing, MergeRejection::InsufficientAuthority);
     }
     MergeOutcome::Replaced(incoming)
 }
@@ -42,7 +57,7 @@ pub fn merge_replicant(
     existing: Observation<Replicant>,
     mut incoming: Observation<Replicant>,
 ) -> MergeOutcome<Observation<Replicant>> {
-    if incoming.metadata.observed_at < existing.metadata.observed_at {
+    if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
         return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
     }
     if matches!(incoming.metadata.access, AccessScope::Public) {

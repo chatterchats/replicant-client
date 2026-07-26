@@ -1,6 +1,6 @@
 //! The raw, unmanaged HTTP client and its shared request execution pipeline.
 //!
-//! [`Client`] returns transport DTOs and [`ResponseMetadata`] only. It never
+//! [`Client`] returns transport DTOs and [`crate::raw::ResponseMetadata`] only. It never
 //! hydrates, persists, publishes, journals operations, or reconciles state —
 //! those are managed-client concerns built on top of this transport in a
 //! later phase.
@@ -24,7 +24,8 @@ pub use secrecy::SecretString;
 
 use crate::error::{Error, ErrorDetails};
 use crate::raw::rate_limit::{
-    RateLimitBucket, RateLimitCoordinator, RateLimitSnapshot, bucket_for,
+    RateLimitBucket, RateLimitCoordinator, RateLimitReset, RateLimitSnapshot, RetryAfter,
+    bucket_for,
 };
 
 /// Opaque local request correlation identifier.
@@ -481,44 +482,22 @@ impl Client {
             "v1/events/stream",
             &[("cursor", cursor.map(ToOwned::to_owned))],
         );
-        let url = request_url(&self.inner.base_url, &path)?;
-        let token = self
-            .inner
-            .tokens
-            .token()
-            .ok_or_else(|| Error::Configuration {
-                message: "authentication token is required for this endpoint".into(),
-            })?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-            .map_err(|_| Error::Configuration {
-                message: "bearer token contains invalid header bytes".into(),
-            })?;
+        let request_id = RequestId::new();
         self.inner.rate_limits.acquire(RateLimitBucket::Sse).await;
         let response = self
-            .inner
-            .http
-            .get(url)
-            .header(USER_AGENT, &self.inner.config.user_agent)
-            .header(AUTHORIZATION, authorization)
+            .prepare_request(Method::GET, &path, true, &request_id)?
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .await
             .map_err(map_reqwest_error)?;
+        let metadata = self
+            .observe_response(RateLimitBucket::Sse, &response, request_id)
+            .await;
         if response.status().is_success() {
             return Ok(response);
         }
-        let status = response.status();
-        let headers = response.headers().clone();
-        let request_id = RequestId::new();
-        let metadata = ResponseMetadata {
-            status,
-            request_id: header_string(&headers, "x-request-id")
-                .or_else(|| header_string(&headers, "request-id")),
-            local_request_id: request_id,
-            rate_limit: parse_rate_limit(&headers),
-        };
         let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
-        Err(map_status(status, &bytes, &metadata))
+        Err(map_status(metadata.status, &bytes, &metadata))
     }
 
     async fn execute_bytes<T: DeserializeOwned>(
@@ -588,11 +567,41 @@ impl Client {
         bucket: RateLimitBucket,
         body: Option<Vec<u8>>,
     ) -> Result<RawResponse<T>, Error> {
+        let mut request = self.prepare_request(method.clone(), path, authenticated, request_id)?;
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let response = request.send().await.map_err(map_reqwest_error)?;
+        let metadata = self
+            .observe_response(bucket, &response, request_id.clone())
+            .await;
+        let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
+        if !metadata.status.is_success() {
+            return Err(map_status(metadata.status, &bytes, &metadata));
+        }
+        let value = serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
+            .map_err(|error| Error::Decode {
+                message: error.to_string(),
+                status: Some(metadata.status.as_u16()),
+                source: Some(Box::new(error)),
+            })?;
+        Ok(RawResponse { value, metadata })
+    }
+
+    fn prepare_request(
+        &self,
+        method: Method,
+        path: &str,
+        authenticated: bool,
+        request_id: &RequestId,
+    ) -> Result<reqwest::RequestBuilder, Error> {
         let url = request_url(&self.inner.base_url, path)?;
         let mut request = self
             .inner
             .http
-            .request(method.clone(), url)
+            .request(method, url)
             .header(USER_AGENT, &self.inner.config.user_agent);
         if self.inner.config.send_request_id {
             request = request.header("x-request-id", request_id.to_string());
@@ -611,35 +620,27 @@ impl Client {
                 })?;
             request = request.header(AUTHORIZATION, value);
         }
-        if let Some(body) = body {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
-        }
-        let response = request.send().await.map_err(map_reqwest_error)?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let rate_limit = parse_rate_limit(&headers);
+        Ok(request)
+    }
+
+    async fn observe_response(
+        &self,
+        bucket: RateLimitBucket,
+        response: &reqwest::Response,
+        local_request_id: RequestId,
+    ) -> ResponseMetadata {
+        let headers = response.headers();
+        let rate_limit = parse_rate_limit(headers, SystemTime::now());
         if let Some(snapshot) = rate_limit.clone() {
             self.inner.rate_limits.observe(bucket, snapshot).await;
         }
-        let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
-        let metadata = ResponseMetadata {
-            status,
-            request_id: header_string(&headers, "x-request-id")
-                .or_else(|| header_string(&headers, "request-id")),
-            local_request_id: request_id.clone(),
+        ResponseMetadata {
+            status: response.status(),
+            request_id: header_string(headers, "x-request-id")
+                .or_else(|| header_string(headers, "request-id")),
+            local_request_id,
             rate_limit,
-        };
-        if !status.is_success() {
-            return Err(map_status(status, &bytes, &metadata));
         }
-        let value = serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
-            .map_err(|error| Error::Decode {
-                message: error.to_string(),
-                status: Some(status.as_u16()),
-            })?;
-        Ok(RawResponse { value, metadata })
     }
 }
 
@@ -701,10 +702,12 @@ fn map_reqwest_error(error: reqwest::Error) -> Error {
     if error.is_timeout() {
         Error::Transport {
             message: "request timed out".into(),
+            source: Some(Box::new(error)),
         }
     } else {
         Error::Transport {
             message: "network request failed".into(),
+            source: Some(Box::new(error)),
         }
     }
 }
@@ -717,34 +720,52 @@ async fn read_bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u
         return Err(Error::Decode {
             message: format!("response body exceeds {limit} bytes"),
             status: Some(response.status().as_u16()),
+            source: None,
         });
     }
     let status = response.status();
-    let bytes = response.bytes().await.map_err(map_reqwest_error)?;
-    if bytes.len() > limit {
-        return Err(Error::Decode {
-            message: format!("response body exceeds {limit} bytes"),
-            status: Some(status.as_u16()),
-        });
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| Error::Decode {
+                message: format!("response body exceeds {limit} bytes"),
+                status: Some(status.as_u16()),
+                source: None,
+            })?;
+        if length > limit {
+            return Err(Error::Decode {
+                message: format!("response body exceeds {limit} bytes"),
+                status: Some(status.as_u16()),
+                source: None,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
-fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
-    let retry_after =
-        header_string(headers, "retry-after").and_then(|value| parse_retry_after(&value));
+fn parse_rate_limit(headers: &HeaderMap, observed_at: SystemTime) -> Option<RateLimitSnapshot> {
+    let retry_after = header_string(headers, "retry-after")
+        .and_then(|value| parse_retry_after(&value).map(RetryAfter::new));
     let limit = header_string(headers, "x-ratelimit-limit").and_then(|value| value.parse().ok());
     let remaining =
         header_string(headers, "x-ratelimit-remaining").and_then(|value| value.parse().ok());
-    let reset_after = header_string(headers, "x-ratelimit-reset")
-        .and_then(|value| value.parse::<u64>().ok().map(Duration::from_secs));
-    if retry_after.is_none() && limit.is_none() && remaining.is_none() && reset_after.is_none() {
+    let reset = header_string(headers, "x-ratelimit-reset").and_then(|value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .and_then(|epoch| RateLimitReset::from_epoch_seconds(epoch, observed_at))
+    });
+    if retry_after.is_none() && limit.is_none() && remaining.is_none() && reset.is_none() {
         None
     } else {
         Some(RateLimitSnapshot {
             limit,
             remaining,
-            reset_after,
+            reset,
             retry_after,
         })
     }
@@ -829,7 +850,7 @@ fn map_status(status: StatusCode, bytes: &[u8], metadata: &ResponseMetadata) -> 
         let retry_after = metadata
             .rate_limit
             .as_ref()
-            .and_then(|value| value.retry_after);
+            .and_then(RateLimitSnapshot::delay);
         return Error::RateLimited {
             retry_after,
             details: Box::new(details),
@@ -951,5 +972,47 @@ mod tests {
         assert_eq!(value["webhook_secret"], "<redacted>");
         assert_eq!(value["note"], "<redacted>");
         assert_eq!(value["message"], "failed");
+    }
+
+    #[test]
+    fn reset_epoch_is_converted_relative_to_observation_time() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset", "1779087998".parse().unwrap());
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_779_087_900);
+
+        let snapshot = parse_rate_limit(&headers, observed_at).unwrap();
+        assert_eq!(snapshot.reset.unwrap().delay(), Duration::from_secs(98));
+    }
+
+    #[test]
+    fn past_or_malformed_reset_never_blocks_or_panics() {
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut past = HeaderMap::new();
+        past.insert("x-ratelimit-reset", "99".parse().unwrap());
+        assert_eq!(
+            parse_rate_limit(&past, observed_at)
+                .unwrap()
+                .reset
+                .unwrap()
+                .delay(),
+            Duration::ZERO
+        );
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert("x-ratelimit-reset", "not-an-epoch".parse().unwrap());
+        assert!(parse_rate_limit(&malformed, observed_at).is_none());
+    }
+
+    #[test]
+    fn retry_after_takes_precedence_over_reset() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "47".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1779087998".parse().unwrap());
+        let observed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_779_087_900);
+
+        assert_eq!(
+            parse_rate_limit(&headers, observed_at).unwrap().delay(),
+            Some(Duration::from_secs(47))
+        );
     }
 }

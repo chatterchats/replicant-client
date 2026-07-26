@@ -45,7 +45,7 @@ CREATE TABLE devices (
     location_realm TEXT,
     location_id TEXT,
     access_scope TEXT NOT NULL,
-    observed_at TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
     observation_json TEXT NOT NULL,
     source_document_id TEXT,
     PRIMARY KEY (realm, device_id),
@@ -181,6 +181,9 @@ CREATE TABLE operation_journal (
     target_id TEXT,
     intent_json TEXT NOT NULL,
     projection_json TEXT,
+    submission_attempt_id TEXT,
+    submitted_at TEXT,
+    submission_cursor TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE reconciliation_queue (

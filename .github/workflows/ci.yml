@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
@@ -31,24 +31,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo test --all-features
 
   feature-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo check
-      - run: cargo check --no-default-features --features raw
-      - run: cargo check --no-default-features --features events
-      - run: cargo check --all-features
+      - run: cargo check --no-default-features --features raw,rustls-tls
+      - run: cargo check --no-default-features --features raw,native-tls
+      - run: cargo check --no-default-features --features events,rustls-tls
+      - run: cargo check --no-default-features --features events,native-tls
+      - run: cargo check --features managed,rustls-tls
+      - run: cargo check --no-default-features --features managed,native-tls
 
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
   contract-policy:
@@ -56,3 +59,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/contract_policy_check.py
+      - run: python3 scripts/forward_compatibility_policy_check.py
+      - run: python3 scripts/raw_transport_policy_check.py
+      - run: python3 scripts/schema_policy_check.py
+      - run: python3 scripts/authority_matrix_check.py
+      - run: python3 scripts/phase_11_5_remediation_check.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - run: python3 scripts/package_contents_check.py
+      - run: cargo package
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - run: cargo check --all-targets --features managed,rustls-tls
+      - run: cargo test --all-features

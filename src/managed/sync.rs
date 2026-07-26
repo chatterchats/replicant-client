@@ -6,7 +6,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -52,6 +51,45 @@ pub struct SyncDiagnostic {
     pub domain: SyncDomain,
     /// Its final progress state.
     pub progress: SyncProgress,
+    /// Pages that committed before this domain finished.
+    pub pages: usize,
+    /// Items that committed before this domain finished.
+    pub items: usize,
+    /// Whether this traversal had complete collection authority.
+    pub complete: bool,
+    /// A safe, structured description of a failed domain.
+    pub failure: Option<SyncFailure>,
+}
+
+/// A sanitized sync failure retained in a partial-success report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncFailure {
+    /// HTTP status, when the server supplied one.
+    pub status: Option<u16>,
+    /// Whether a later synchronization may retry the domain.
+    pub retryable: bool,
+    /// Secret-safe failure category.
+    pub kind: SyncFailureKind,
+}
+
+/// Stable categories for [`SyncFailure`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncFailureKind {
+    /// Authentication must be repaired before retrying.
+    Authentication,
+    /// The remote or local rate limit deferred the work.
+    RateLimited,
+    /// The request did not complete at the transport layer.
+    Transport,
+    /// The response was invalid or rejected by the contract.
+    Response,
+    /// Durable state could not be updated.
+    Persistence,
+    /// The requested synchronization was invalid locally.
+    Configuration,
+    /// A future error category not represented above.
+    Other,
 }
 
 /// Readiness established by a completed synchronization report.
@@ -79,12 +117,62 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
-    fn record(&mut self, domain: SyncDomain, progress: SyncProgress) {
+    fn record(&mut self, domain: SyncDomain, progress: SyncProgress, outcome: SyncOutcome) {
         if progress == SyncProgress::Complete {
             self.completed.push(domain);
         }
-        self.diagnostics.push(SyncDiagnostic { domain, progress });
+        self.diagnostics.push(SyncDiagnostic {
+            domain,
+            progress,
+            pages: outcome.pages,
+            items: outcome.items,
+            complete: outcome.complete,
+            failure: None,
+        });
     }
+
+    fn failed(&mut self, domain: SyncDomain, outcome: SyncOutcome, error: &Error) {
+        self.diagnostics.push(SyncDiagnostic {
+            domain,
+            progress: SyncProgress::Failed,
+            pages: outcome.pages,
+            items: outcome.items,
+            complete: outcome.complete,
+            failure: Some(SyncFailure::from(error)),
+        });
+    }
+}
+
+impl From<&Error> for SyncFailure {
+    fn from(error: &Error) -> Self {
+        let kind = match error {
+            Error::Authentication { .. } => SyncFailureKind::Authentication,
+            Error::RateLimited { .. } => SyncFailureKind::RateLimited,
+            Error::Transport { .. } => SyncFailureKind::Transport,
+            Error::Decode { .. } | Error::Contract { .. } => SyncFailureKind::Response,
+            Error::Persistence { .. } | Error::AccountStoreMismatch { .. } => {
+                SyncFailureKind::Persistence
+            }
+            Error::Configuration { .. } => SyncFailureKind::Configuration,
+            _ => SyncFailureKind::Other,
+        };
+        let retryable = matches!(
+            kind,
+            SyncFailureKind::RateLimited | SyncFailureKind::Transport
+        ) || error.status().is_some_and(|status| status >= 500);
+        Self {
+            status: error.status(),
+            retryable,
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SyncOutcome {
+    pages: usize,
+    items: usize,
+    complete: bool,
 }
 
 /// A cancellation handle checked between paginated requests and dependencies.
@@ -190,7 +278,13 @@ impl SyncPlan {
     /// event surfaces are intentionally excluded.
     #[must_use]
     pub fn full() -> Self {
-        Self::essential()
+        let mut plan = Self::essential();
+        plan.include(SyncDomain::Replicants)
+            .include(SyncDomain::Locations)
+            .depends_on(SyncDomain::Replicants, SyncDomain::Devices)
+            .depends_on(SyncDomain::Locations, SyncDomain::Devices)
+            .depends_on(SyncDomain::Locations, SyncDomain::Replicants);
+        plan
     }
 }
 
@@ -267,6 +361,7 @@ impl SyncClient {
             .map_err(|_| Error::Decode {
                 message: "location synchronization response is invalid".into(),
                 status: None,
+                source: None,
             })?;
         self.client
             .managed_state()
@@ -288,7 +383,7 @@ impl SyncClient {
         let mut completed = BTreeSet::new();
         for domain in plan.ordered().expect("validated plan") {
             if self.cancellation.is_cancelled() {
-                report.record(domain, SyncProgress::Cancelled);
+                report.record(domain, SyncProgress::Cancelled, SyncOutcome::default());
                 continue;
             }
             if plan
@@ -296,54 +391,62 @@ impl SyncClient {
                 .get(&domain)
                 .is_some_and(|required| !required.is_subset(&completed))
             {
-                report.record(domain, SyncProgress::Blocked);
+                report.record(domain, SyncProgress::Blocked, SyncOutcome::default());
                 continue;
             }
             match self.sync_domain(domain).await {
-                Ok(()) => {
+                Ok(outcome) => {
                     completed.insert(domain);
-                    report.record(domain, SyncProgress::Complete);
+                    report.record(domain, SyncProgress::Complete, outcome);
                 }
-                Err(_) => report.record(domain, SyncProgress::Failed),
+                Err(_) if self.cancellation.is_cancelled() => {
+                    report.record(domain, SyncProgress::Cancelled, SyncOutcome::default());
+                }
+                Err(error) => report.failed(domain, SyncOutcome::default(), &error),
             }
         }
         let essentials_complete = plan.essential.is_subset(&completed);
-        report.readiness = if essentials_complete {
-            SyncReadiness::RestBaseline
-        } else if completed.len() == plan.domains.len() {
+        report.readiness = if completed.len() == plan.domains.len() {
             SyncReadiness::Complete
+        } else if essentials_complete {
+            SyncReadiness::RestBaseline
         } else {
             SyncReadiness::Unavailable
         };
         if essentials_complete {
-            // Phase 8 owns catch-up and live-event connectivity; never claim it here.
+            // Connectivity is established separately; synchronization alone is not ready.
             self.client.set_status(ClientStatus::CatchingUp);
         }
         Ok(report)
     }
 
-    async fn sync_domain(&self, domain: SyncDomain) -> Result<()> {
+    async fn sync_domain(&self, domain: SyncDomain) -> Result<SyncOutcome> {
         match domain {
             SyncDomain::Account => {
                 self.client.account().refresh().await?;
-                Ok(())
+                Ok(SyncOutcome {
+                    pages: 1,
+                    items: 1,
+                    complete: true,
+                })
             }
             SyncDomain::Devices => self.sync_devices().await,
-            SyncDomain::Replicants | SyncDomain::Locations => Err(Error::Configuration {
-                message: "managed synchronization for this domain is not implemented".into(),
-            }),
+            SyncDomain::Replicants => self.sync_replicants().await,
+            SyncDomain::Locations => self.sync_locations().await,
         }
     }
 
-    async fn sync_devices(&self) -> Result<()> {
+    async fn sync_devices(&self) -> Result<SyncOutcome> {
         let mut query = raw::devices::DeviceListQuery {
             limit: Some(100),
             ..Default::default()
         };
         let mut present = BTreeSet::<DeviceKey>::new();
-        for _ in 0..self.max_pages {
+        for (page, _) in (0..self.max_pages).enumerate() {
             if self.cancellation.is_cancelled() {
-                return Err(Error::Closed);
+                return Err(Error::Configuration {
+                    message: "synchronization cancelled".into(),
+                });
             }
             let response = self.client.managed_raw().devices().list(&query).await?;
             let next_cursor = response.value.next_cursor;
@@ -357,6 +460,7 @@ impl SyncClient {
             .map_err(|_| Error::Decode {
                 message: "device synchronization response is invalid".into(),
                 status: None,
+                source: None,
             })?;
             for device in &collection.members {
                 present.insert(device.value.key.clone());
@@ -378,12 +482,87 @@ impl SyncClient {
                         .map_err(|_| Error::Persistence {
                             message: "SQLite store operation failed".into(),
                         })?;
-                    return Ok(());
+                    return Ok(SyncOutcome {
+                        pages: page + 1,
+                        items: present.len(),
+                        complete: true,
+                    });
                 }
             }
         }
         Err(Error::Configuration {
             message: "device synchronization exceeded configured page bound".into(),
+        })
+    }
+
+    async fn sync_replicants(&self) -> Result<SyncOutcome> {
+        let mut codes = BTreeSet::new();
+        for replicant in self.client.managed_state().replicants() {
+            if replicant.value.private.is_some() {
+                codes.insert(replicant.value.key.id.as_str().to_owned());
+            }
+        }
+        for device in self.client.managed_state().devices() {
+            if let Some(replicant) = device.value.relationships.hosted_by {
+                codes.insert(replicant.id.as_str().to_owned());
+            }
+        }
+        for code in &codes {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Configuration {
+                    message: "synchronization cancelled".into(),
+                });
+            }
+            self.client.replicants().get_owned(code).await?;
+        }
+        Ok(SyncOutcome {
+            pages: usize::from(!codes.is_empty()),
+            items: codes.len(),
+            complete: true,
+        })
+    }
+
+    async fn sync_locations(&self) -> Result<SyncOutcome> {
+        let mut designations = BTreeSet::new();
+        for device in self.client.managed_state().devices() {
+            if let Some(location) = device.value.location {
+                designations.insert(location.id.as_str().to_owned());
+            }
+        }
+        for replicant in self.client.managed_state().replicants() {
+            if let Some(location) = replicant.value.location {
+                designations.insert(location.id.as_str().to_owned());
+            }
+        }
+        for designation in &designations {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Configuration {
+                    message: "synchronization cancelled".into(),
+                });
+            }
+            let response = self
+                .client
+                .managed_raw()
+                .locations()
+                .get(designation, None)
+                .await?;
+            let observation = domain::location_detail(&response.value, Realm::Live, observed_at())
+                .map_err(|_| Error::Decode {
+                    message: "location synchronization response is invalid".into(),
+                    status: None,
+                    source: None,
+                })?;
+            self.client
+                .managed_state()
+                .persist_location(observation)
+                .map_err(|_| Error::Persistence {
+                    message: "SQLite store operation failed".into(),
+                })?;
+        }
+        Ok(SyncOutcome {
+            pages: usize::from(!designations.is_empty()),
+            items: designations.len(),
+            complete: true,
         })
     }
 }
@@ -394,16 +573,17 @@ fn completed_report(domain: SyncDomain) -> SyncReport {
         diagnostics: vec![SyncDiagnostic {
             domain,
             progress: SyncProgress::Complete,
+            pages: 1,
+            items: 1,
+            complete: true,
+            failure: None,
         }],
         readiness: SyncReadiness::Complete,
     }
 }
 
-fn observed_at() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|time| time.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into())
+fn observed_at() -> crate::domain::ObservationTime {
+    crate::domain::ObservationTime::now()
 }
 
 #[cfg(test)]
@@ -419,6 +599,19 @@ mod tests {
         assert_eq!(
             plan.ordered().expect("valid plan"),
             vec![SyncDomain::Account, SyncDomain::Devices]
+        );
+    }
+
+    #[test]
+    fn full_plan_contains_every_bounded_managed_domain() {
+        assert_eq!(
+            SyncPlan::full().ordered().expect("valid full plan"),
+            vec![
+                SyncDomain::Account,
+                SyncDomain::Devices,
+                SyncDomain::Replicants,
+                SyncDomain::Locations,
+            ]
         );
     }
 

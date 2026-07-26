@@ -9,18 +9,15 @@
 
 use serde_json::Value;
 
-use crate::domain::{self, AccessScope, Realm, SimulationId};
+use crate::domain::{self, AccessScope, Realm, SimulationId, SimulationLifecycle};
 use crate::raw;
 use crate::{Client, Error, Result};
 
 use super::operation::{self, Operation};
 use super::store::StoreError;
 
-fn observed_at() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_default()
+fn observed_at() -> crate::domain::ObservationTime {
+    crate::domain::ObservationTime::now()
 }
 
 fn persistence_error(_: StoreError) -> Error {
@@ -33,6 +30,7 @@ fn normalization(error: domain::NormalizeError) -> Error {
     Error::Decode {
         message: error.to_string(),
         status: None,
+        source: None,
     }
 }
 
@@ -171,40 +169,77 @@ impl SimulationsGateway {
             },
         )
         .await?;
-        if let Ok(outcome) = operation.outcome().await
-            && let Some(response) = &outcome.response
-            && let Ok(entered) = serde_json::from_value::<raw::simulations::SimulationEnterResponse>(
-                response.clone(),
-            )
-        {
-            let _ = self.seed_realm(&entered).await;
-        }
+        let outcome = operation.outcome().await?;
+        let response = outcome.response.ok_or_else(|| Error::Operation {
+            message: "simulation enter did not return an authoritative response".into(),
+        })?;
+        let entered = serde_json::from_value::<raw::simulations::SimulationEnterResponse>(response)
+            .map_err(|error| Error::Decode {
+                message: format!("simulation enter response decode failed: {error}"),
+                status: Some(200),
+                source: Some(Box::new(error)),
+            })?;
+        self.seed_realm(&entered, replicant_code).await?;
         Ok(operation)
     }
 
-    async fn seed_realm(&self, entered: &raw::simulations::SimulationEnterResponse) -> Result<()> {
-        let observation =
+    async fn seed_realm(
+        &self,
+        entered: &raw::simulations::SimulationEnterResponse,
+        replicant_code: &str,
+    ) -> Result<()> {
+        let mut observation =
             domain::simulation_start(entered, observed_at()).map_err(normalization)?;
         let realm = Realm::Simulation(observation.value.id);
-        self.client
-            .managed_state()
-            .persist_simulation(observation)
-            .map_err(persistence_error)?;
+        observation.value.replicant_code = Some(replicant_code.to_owned());
+        let mut devices = Vec::with_capacity(entered.devices.len());
+        let mut failures = Vec::new();
         for summary in &entered.devices {
             let Some(code) = summary.get("device_code").and_then(Value::as_str) else {
+                failures.push("missing device_code".to_owned());
                 continue;
             };
-            let Ok(response) = self.client.managed_raw().devices().get(code).await else {
-                continue;
-            };
-            if let Ok(device) = domain::device_detail(
-                &response.value,
-                realm.clone(),
-                AccessScope::Owned,
-                observed_at(),
-            ) {
-                let _ = self.client.managed_state().persist_devices(&[device]);
+            match self.client.managed_raw().devices().get(code).await {
+                Ok(response) => match domain::device_detail(
+                    &response.value,
+                    realm.clone(),
+                    AccessScope::Owned,
+                    observed_at(),
+                ) {
+                    Ok(device) => devices.push(device),
+                    Err(_) => failures.push(code.to_owned()),
+                },
+                Err(_) => failures.push(code.to_owned()),
             }
+        }
+        observation.value.seed_failures = failures.clone();
+        observation.value.lifecycle = if failures.is_empty() {
+            SimulationLifecycle::Active
+        } else {
+            SimulationLifecycle::Synchronizing
+        };
+        self.client
+            .managed_state()
+            .persist_simulation_and_devices(observation, &devices)
+            .map_err(persistence_error)?;
+        for code in &failures {
+            if code == "missing device_code" {
+                continue;
+            }
+            self.client
+                .managed_state()
+                .enqueue_reconciliation(
+                    &format!("simulation:{}:device:{code}", realm_id(&realm)),
+                    &realm,
+                    "device",
+                    &serde_json::json!({ "id": code }),
+                )
+                .map_err(persistence_error)?;
+        }
+        if !failures.is_empty() {
+            return Err(Error::Operation {
+                message: "simulation seed is incomplete; durable reconciliation was queued".into(),
+            });
         }
         Ok(())
     }
@@ -218,7 +253,21 @@ impl SimulationsGateway {
         let operation =
             operation::device_abandon_simulation(&self.client, interface_code, simulation_id)
                 .await?;
-        cleanup_realm(&self.client, SimulationId::new(simulation_id));
+        if let Some(mut simulation) = self
+            .client
+            .managed_state()
+            .simulation(SimulationId::new(simulation_id))
+        {
+            simulation.value.lifecycle = match operation.status().await? {
+                operation::OperationStatus::Ambiguous => SimulationLifecycle::AbandonAmbiguous,
+                operation::OperationStatus::Rejected => return Ok(operation),
+                _ => SimulationLifecycle::AbandonPending,
+            };
+            self.client
+                .managed_state()
+                .persist_simulation(simulation)
+                .map_err(persistence_error)?;
+        }
         Ok(operation)
     }
 
@@ -241,10 +290,29 @@ impl SimulationsGateway {
 /// observes `simulation.completed`/`simulation.expired`/`simulation.abandoned`
 /// account events (`super::events`), since a timed-out or otherwise
 /// server-ended run is not something this client itself requested.
-pub(crate) fn cleanup_realm(client: &Client, id: SimulationId) {
-    let _ = client
+pub(crate) fn cleanup_realm(client: &Client, id: SimulationId) -> Result<()> {
+    if let Some(mut simulation) = client.managed_state().simulation(id) {
+        if !simulation.value.is_mine {
+            return Ok(());
+        }
+        simulation.value.lifecycle = SimulationLifecycle::Ended;
+        simulation.value.seed_failures.clear();
+        client
+            .managed_state()
+            .persist_simulation(simulation)
+            .map_err(persistence_error)?;
+    }
+    client
         .managed_state()
-        .purge_realm_devices(&Realm::Simulation(id));
+        .purge_realm_devices(&Realm::Simulation(id))
+        .map_err(persistence_error)
+}
+
+fn realm_id(realm: &Realm) -> String {
+    match realm {
+        Realm::Live => "live".into(),
+        Realm::Simulation(id) => format!("simulation:{}", id.get()),
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +454,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandon_purges_only_that_simulation_realm_leaving_live_devices_intact() {
+    async fn missing_seed_detail_is_persisted_as_synchronizing_work() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/SIMDEV1/simulate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "simulation_id": 43,
+                "devices": [{"device_code": "MISSING"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        assert!(
+            client
+                .simulations()
+                .start("SIMDEV1", "R1", "mining_rush")
+                .await
+                .is_err(),
+            "the accepted operation cannot report a silently partial seed"
+        );
+        let simulation = client
+            .managed_state()
+            .simulation(SimulationId::new(43))
+            .expect("persisted synchronizing run");
+        assert_eq!(
+            simulation.value.lifecycle,
+            SimulationLifecycle::Synchronizing
+        );
+        assert_eq!(simulation.value.seed_failures, vec!["MISSING"]);
+
+        let mut queued = false;
+        while let Some(work) = client
+            .managed_state()
+            .claim_reconciliation_work()
+            .expect("claim durable work")
+        {
+            if work.kind == "device" && work.realm == Realm::Simulation(SimulationId::new(43)) {
+                queued = true;
+            }
+        }
+        assert!(queued, "missing detail has realm-qualified durable work");
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn abandon_retains_the_realm_until_authoritative_end_evidence() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/v1/devices/SIMDEV1/simulate/7"))
@@ -414,8 +527,8 @@ mod tests {
             client
                 .managed_state()
                 .device(&DeviceKey::in_realm(realm, DeviceId::from("SIM1")))
-                .is_none(),
-            "abandoned realm's device is purged"
+                .is_some(),
+            "a successful DELETE alone is not proof the run ended"
         );
         assert!(
             client
@@ -425,6 +538,28 @@ mod tests {
             "live device is never touched by simulation cleanup"
         );
 
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn active_other_player_run_does_not_create_an_owned_realm() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/SIMDEV1/simulate/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "simulations": [{"simulation_id": 69, "is_mine": false}]
+            })))
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        client
+            .simulations()
+            .active("SIMDEV1")
+            .await
+            .expect("active simulations");
+
+        assert!(client.managed_state().simulations().is_empty());
         client.close().await.expect("close");
     }
 }

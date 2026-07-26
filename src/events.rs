@@ -3,7 +3,7 @@
 //! Event names and payloads are intentionally open strings/JSON objects:
 //! servers may add events without requiring a client release. The SSE
 //! endpoint always applies account mute patterns; history applies them only
-//! when [`EventLogQuery::filtered`] is `Some(true)`.
+//! when [`crate::events::EventLogQuery::filtered`] is `Some(true)`.
 
 use std::pin::Pin;
 
@@ -133,12 +133,14 @@ impl EventsClient {
             |frame| {
                 let frame = frame.map_err(|error| Error::Transport {
                     message: format!("event stream failed: {error}"),
+                    source: Some(Box::new(error)),
                 })?;
                 let mut event =
                     serde_json::from_str::<GameEvent>(&frame.data).map_err(|error| {
                         Error::Decode {
                             message: format!("event stream JSON failed: {error}"),
                             status: Some(200),
+                            source: Some(Box::new(error)),
                         }
                     })?;
                 if event.id.is_empty() {

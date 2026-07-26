@@ -11,7 +11,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{Notify, watch},
+    sync::{Mutex as TokioMutex, watch},
     task::JoinHandle,
 };
 
@@ -126,6 +126,9 @@ impl ReconciliationPolicy {
 pub enum ClientDegradation {
     /// A later engine reported a recoverable startup limitation.
     StartupIncomplete,
+    /// Event persistence or continuity could not be proven; durable log
+    /// replay and reconciliation remain scheduled.
+    EventContinuity,
 }
 
 /// The observable lifecycle state of a managed [`Client`].
@@ -152,6 +155,33 @@ pub enum ClientStatus {
     Closing,
     /// All owned tasks and the durable store have been closed.
     Closed,
+}
+
+/// One independently observable part of remote readiness.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessComponent {
+    /// Work for this component has not yet completed.
+    Pending,
+    /// This component satisfies its configured readiness requirement.
+    Ready,
+    /// This component failed or is currently unavailable.
+    Degraded,
+}
+
+/// A detailed, non-blocking view of managed-client readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Readiness {
+    /// Durable local state has been restored.
+    pub local_restoration: ReadinessComponent,
+    /// The essential REST baseline has committed.
+    pub essential_rest: ReadinessComponent,
+    /// Event-log continuity has been caught up.
+    pub event_catchup: ReadinessComponent,
+    /// The filtered SSE stream is connected.
+    pub sse_connectivity: ReadinessComponent,
+    /// Background reconciliation is running without a known failure.
+    pub background_reconciliation: ReadinessComponent,
 }
 
 enum Storage {
@@ -282,7 +312,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Stores event-engine options for Phase 8; no event engine is started yet.
+    /// Stores options used when the client starts its event engine.
     #[must_use]
     pub fn event_stream_options(mut self, options: EventStreamOptions) -> Self {
         self.event_stream_options = options;
@@ -300,7 +330,7 @@ impl ClientBuilder {
     ///
     /// `RestoreOnly` reaches [`ClientStatus::Ready`] after local restoration.
     /// `Essential` and `Full` bind the authenticated account, then remain
-    /// non-ready until their Phase 6–8 engines exist.
+    /// non-ready until their remote synchronization and event engines complete.
     pub async fn start(self) -> Result<Client> {
         let raw = self.raw.build()?;
         if let Some(policy) = self.read_rate_limit_policy {
@@ -320,7 +350,7 @@ impl ClientBuilder {
         let state = match StateEngine::from_store(Arc::clone(&store)) {
             Ok(state) => state,
             Err(error) => {
-                close_store(&store);
+                close_store(Arc::clone(&store)).await;
                 return Err(store_error(error));
             }
         };
@@ -329,7 +359,7 @@ impl ClientBuilder {
             let account = match account_identity(&raw).await {
                 Ok(account) => account,
                 Err(error) => {
-                    close_store(&store);
+                    close_store(Arc::clone(&store)).await;
                     return Err(error);
                 }
             };
@@ -338,7 +368,7 @@ impl ClientBuilder {
                 store.as_mut().ok_or(Error::Closed)?.bind_account(&account)
             };
             if let Err(error) = binding {
-                close_store(&store);
+                close_store(Arc::clone(&store)).await;
                 return Err(store_error(error));
             }
         }
@@ -377,7 +407,8 @@ impl ClientBuilder {
                 self.startup_policy,
                 self.event_stream_options.clone(),
                 self.reconciliation_policy.clone(),
-            );
+            )
+            .await?;
         }
         Ok(client)
     }
@@ -419,42 +450,57 @@ fn store_error(error: StoreError) -> Error {
     }
 }
 
-fn close_store(store: &StoreHandle) {
-    if let Some(mut store) = store.lock().expect("store lock poisoned").take() {
-        let _ = store.flush();
-    }
+async fn close_store(store: StoreHandle) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut store = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(mut store) = store.take() {
+            let _ = store.flush();
+        }
+    })
+    .await;
 }
 
 struct SchedulerHooks {
-    #[allow(dead_code)] // Phase 6 gateways and Phase 7–8 workers share this coordinator.
+    #[allow(dead_code)] // Gateways and background workers share this coordinator.
     rate_limits: RateLimitCoordinator,
 }
 struct SyncEngine;
 
-#[derive(Default)]
 struct Lifecycle {
     accepting: AtomicBool,
     closing: AtomicBool,
     closed: AtomicBool,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
-    completed: Notify,
+    tasks: TokioMutex<Vec<JoinHandle<()>>>,
+    completion: watch::Sender<Option<CloseCompletion>>,
+}
+
+#[derive(Clone)]
+enum CloseCompletion {
+    Complete,
+    Failed,
 }
 
 impl Lifecycle {
     fn new() -> Self {
+        let (completion, _) = watch::channel(None);
         Self {
             accepting: AtomicBool::new(true),
-            ..Self::default()
+            closing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            tasks: TokioMutex::new(Vec::new()),
+            completion,
         }
     }
 
-    #[allow(dead_code)] // Phase 6–8 producers register through this registry.
-    fn register(&self, task: JoinHandle<()>) -> Result<()> {
+    #[allow(dead_code)] // Producers register work here for orderly shutdown.
+    async fn register(&self, task: JoinHandle<()>) -> Result<()> {
         if !self.accepting.load(Ordering::Acquire) {
             task.abort();
             return Err(Error::Closed);
         }
-        let mut tasks = self.tasks.lock().expect("lifecycle task lock poisoned");
+        let mut tasks = self.tasks.lock().await;
         if !self.accepting.load(Ordering::Acquire) {
             task.abort();
             return Err(Error::Closed);
@@ -463,25 +509,54 @@ impl Lifecycle {
         Ok(())
     }
 
-    fn cancel(&self) {
+    fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Release);
-        for task in self
-            .tasks
-            .lock()
-            .expect("lifecycle task lock poisoned")
-            .iter()
-        {
-            task.abort();
+    }
+
+    fn cancel(&self) {
+        self.stop_accepting();
+        if let Ok(tasks) = self.tasks.try_lock() {
+            for task in tasks.iter() {
+                task.abort();
+            }
         }
     }
 
     async fn close(&self) {
-        self.cancel();
-        let tasks = std::mem::take(&mut *self.tasks.lock().expect("lifecycle task lock poisoned"));
-        for task in tasks {
-            task.abort();
-            let _ = task.await;
+        self.stop_accepting();
+        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        for mut task in tasks {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
+    }
+
+    async fn completion(&self) -> Result<()> {
+        let mut completion = self.completion.subscribe();
+        loop {
+            let current = completion.borrow().clone();
+            match current {
+                Some(CloseCompletion::Complete) => return Ok(()),
+                Some(CloseCompletion::Failed) => {
+                    return Err(Error::Persistence {
+                        message: "SQLite store operation failed during close".into(),
+                    });
+                }
+                None => completion.changed().await.map_err(|_| Error::Closed)?,
+            }
+        }
+    }
+
+    fn finish(&self, result: &Result<()>) {
+        self.closed.store(true, Ordering::Release);
+        self.completion.send_replace(Some(if result.is_ok() {
+            CloseCompletion::Complete
+        } else {
+            CloseCompletion::Failed
+        }));
     }
 }
 
@@ -654,7 +729,9 @@ impl Client {
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
-        if self.inner.lifecycle.closed.load(Ordering::Acquire) {
+        if !self.inner.lifecycle.accepting.load(Ordering::Acquire)
+            || self.inner.lifecycle.closed.load(Ordering::Acquire)
+        {
             Err(Error::Closed)
         } else {
             Ok(())
@@ -673,45 +750,112 @@ impl Client {
         self.inner.status.subscribe()
     }
 
+    /// Returns the components that currently make up the public status.
+    #[must_use]
+    pub fn readiness(&self) -> Readiness {
+        match self.status() {
+            ClientStatus::Starting | ClientStatus::Restoring => Readiness {
+                local_restoration: ReadinessComponent::Pending,
+                essential_rest: ReadinessComponent::Pending,
+                event_catchup: ReadinessComponent::Pending,
+                sse_connectivity: ReadinessComponent::Pending,
+                background_reconciliation: ReadinessComponent::Pending,
+            },
+            ClientStatus::Ready => Readiness {
+                local_restoration: ReadinessComponent::Ready,
+                essential_rest: ReadinessComponent::Ready,
+                event_catchup: ReadinessComponent::Ready,
+                sse_connectivity: ReadinessComponent::Ready,
+                background_reconciliation: ReadinessComponent::Ready,
+            },
+            ClientStatus::Degraded(ClientDegradation::StartupIncomplete) => Readiness {
+                local_restoration: ReadinessComponent::Ready,
+                essential_rest: ReadinessComponent::Degraded,
+                event_catchup: ReadinessComponent::Degraded,
+                sse_connectivity: ReadinessComponent::Degraded,
+                background_reconciliation: ReadinessComponent::Pending,
+            },
+            ClientStatus::Degraded(ClientDegradation::EventContinuity) => Readiness {
+                local_restoration: ReadinessComponent::Ready,
+                essential_rest: ReadinessComponent::Ready,
+                event_catchup: ReadinessComponent::Degraded,
+                sse_connectivity: ReadinessComponent::Pending,
+                background_reconciliation: ReadinessComponent::Pending,
+            },
+            ClientStatus::Closing | ClientStatus::Closed => Readiness {
+                local_restoration: ReadinessComponent::Degraded,
+                essential_rest: ReadinessComponent::Degraded,
+                event_catchup: ReadinessComponent::Degraded,
+                sse_connectivity: ReadinessComponent::Degraded,
+                background_reconciliation: ReadinessComponent::Degraded,
+            },
+            ClientStatus::CatchingUp
+            | ClientStatus::Synchronizing
+            | ClientStatus::Connecting
+            | ClientStatus::Offline => Readiness {
+                local_restoration: ReadinessComponent::Ready,
+                essential_rest: ReadinessComponent::Pending,
+                event_catchup: ReadinessComponent::Pending,
+                sse_connectivity: ReadinessComponent::Pending,
+                background_reconciliation: ReadinessComponent::Pending,
+            },
+        }
+    }
+
+    /// Waits until restored local state can be queried, even if remote work is degraded.
+    pub async fn wait_until_usable(&self) -> Result<()> {
+        let mut status = self.watch_status();
+        loop {
+            let current = status.borrow().clone();
+            match current {
+                ClientStatus::Starting | ClientStatus::Restoring => {
+                    status.changed().await.map_err(|_| Error::Closed)?;
+                }
+                ClientStatus::Closing | ClientStatus::Closed => return Err(Error::Closed),
+                _ => return Ok(()),
+            }
+        }
+    }
+
     /// Waits until the configured startup policy has completed.
-    ///
-    /// A [`ClientStatus::Degraded`] client is usable with a recoverable
-    /// limitation (for example, the live event connection has not opened
-    /// yet), so `ready()` resolves successfully for it rather than blocking
-    /// forever; `watch_status` remains available to observe recovery.
     pub async fn ready(&self) -> Result<()> {
         let mut status = self.watch_status();
         loop {
             let current = status.borrow().clone();
             match current {
-                ClientStatus::Ready | ClientStatus::Degraded(_) => return Ok(()),
+                ClientStatus::Ready => return Ok(()),
                 ClientStatus::Closing | ClientStatus::Closed => return Err(Error::Closed),
                 _ => status.changed().await.map_err(|_| Error::Closed)?,
             }
         }
     }
 
-    /// Cancels lifecycle tasks, joins them, flushes SQLite, and closes the store.
+    /// Stops new work, gives workers one second to finish, aborts stragglers,
+    /// then flushes SQLite and closes the store.
     pub async fn close(&self) -> Result<()> {
         if self.inner.lifecycle.closed.load(Ordering::Acquire) {
-            return Ok(());
+            return self.inner.lifecycle.completion().await;
         }
         if self.inner.lifecycle.closing.swap(true, Ordering::AcqRel) {
-            while !self.inner.lifecycle.closed.load(Ordering::Acquire) {
-                self.inner.lifecycle.completed.notified().await;
-            }
-            return Ok(());
+            return self.inner.lifecycle.completion().await;
         }
 
         self.set_status(ClientStatus::Closing);
         self.inner.lifecycle.close().await;
-        let result = match self.inner.store.lock().expect("store lock poisoned").take() {
-            Some(mut store) => store.flush().map_err(store_error),
-            None => Ok(()),
-        };
+        let store = Arc::clone(&self.inner.store);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut store = store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match store.take() {
+                Some(mut store) => store.flush().map_err(store_error),
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(|_| Error::Closed)?;
         self.set_status(ClientStatus::Closed);
-        self.inner.lifecycle.closed.store(true, Ordering::Release);
-        self.inner.lifecycle.completed.notify_waiters();
+        self.inner.lifecycle.finish(&result);
         result
     }
 
@@ -721,8 +865,8 @@ impl Client {
 
     /// Registers a background lifecycle task (event catch-up, SSE, durable
     /// reconciliation drain) so `close()` cancels and joins it.
-    pub(crate) fn register_task(&self, task: JoinHandle<()>) -> Result<()> {
-        self.inner.lifecycle.register(task)
+    pub(crate) async fn register_task(&self, task: JoinHandle<()>) -> Result<()> {
+        self.inner.lifecycle.register(task).await
     }
 }
 
@@ -842,6 +986,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_close_callers_share_one_completion() {
+        for _ in 0..5 {
+            let client = restored_client().await;
+            let mut callers = tokio::task::JoinSet::new();
+            for _ in 0..100 {
+                let clone = client.clone();
+                callers.spawn(async move { clone.close().await });
+            }
+            while let Some(result) = callers.join_next().await {
+                result
+                    .expect("close task")
+                    .expect("shared close completion");
+            }
+            assert_eq!(client.status(), ClientStatus::Closed);
+            client.close().await.expect("repeated close");
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_rejects_new_work_before_store_shutdown() {
+        let client = restored_client().await;
+        client.inner.lifecycle.stop_accepting();
+        assert!(matches!(client.ensure_open(), Err(Error::Closed)));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
     async fn final_drop_cancels_registered_tasks() {
         struct Signal(Option<oneshot::Sender<()>>);
         impl Drop for Signal {
@@ -860,6 +1031,7 @@ mod tests {
                 let _signal = signal;
                 pending::<()>().await;
             }))
+            .await
             .expect("register task");
         drop(client);
         timeout(Duration::from_secs(1), receiver)
@@ -879,7 +1051,7 @@ mod tests {
             .persist_devices(&[device("restored")])
             .expect("persist device");
         drop(state);
-        close_store(&store);
+        close_store(Arc::clone(&store)).await;
 
         let client = Client::builder()
             .sqlite(&path)

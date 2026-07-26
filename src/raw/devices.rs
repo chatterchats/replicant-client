@@ -19,6 +19,15 @@ use crate::error::Error;
 use crate::raw::common::{encode_path_segment, with_query};
 use crate::raw::{Client, JsonObject, RawResponse, RequestSafety};
 
+fn validate_page_limit(limit: Option<i64>) -> Result<(), Error> {
+    if limit.is_some_and(|value| !(1..=100).contains(&value)) {
+        return Err(Error::Configuration {
+            message: "page limit must be between 1 and 100".into(),
+        });
+    }
+    Ok(())
+}
+
 /// One resource stack carried by a device.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -372,9 +381,23 @@ pub struct TargetsCommand {
     pub targets: Option<serde_json::Value>,
 }
 
+/// A forward-compatible device command payload. Use this when the server
+/// advertises a command name newer than this crate's typed command enum.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DynamicDeviceCommand {
+    /// Server-defined command name, preserved verbatim.
+    #[serde(rename = "command")]
+    pub name: String,
+    /// Server-defined command parameters.
+    #[serde(flatten)]
+    pub parameters: JsonObject,
+}
+
 /// A device command, dispatched via `POST /v1/devices/{device_code}`.
 /// Internally tagged on the wire by a `command` field; each variant carries
 /// exactly the parameters its command accepts.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum DeviceCommand {
@@ -873,10 +896,10 @@ impl DevicesClient {
     /// Dispatches a command to a device. This is an unsafe mutation: if the
     /// response is lost after transmission, the command may already have
     /// executed. The raw client never retries it automatically.
-    pub async fn command(
+    pub async fn command<T: Serialize>(
         &self,
         device_code: &str,
-        command: &DeviceCommand,
+        command: &T,
     ) -> Result<RawResponse<DeviceCommandResponse>, Error> {
         let path = format!("v1/devices/{}", encode_path_segment(device_code));
         self.client
@@ -892,6 +915,7 @@ impl DevicesClient {
         device_code: &str,
         query: &DeviceAuditQuery,
     ) -> Result<RawResponse<serde_json::Value>, Error> {
+        validate_page_limit(query.limit)?;
         let base = format!("v1/devices/{}/audit", encode_path_segment(device_code));
         let path = with_query(
             &base,
@@ -914,6 +938,7 @@ impl DevicesClient {
         device_code: &str,
         query: &DeviceLogsQuery,
     ) -> Result<RawResponse<DeviceLogsResponse>, Error> {
+        validate_page_limit(query.limit)?;
         let base = format!("v1/devices/{}/logs", encode_path_segment(device_code));
         let path = with_query(
             &base,

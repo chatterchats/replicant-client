@@ -80,12 +80,13 @@ pub struct BobnetWatch {
 impl BobnetWatch {
     /// Returns every `bobnet.new` event published since the last call, if
     /// any are available now.
-    pub fn try_next(&self) -> Vec<Event> {
-        self.events
-            .try_next()
+    pub fn try_next(&mut self) -> Result<Vec<Event>> {
+        Ok(self
+            .events
+            .try_next()?
             .into_iter()
             .filter(|event| event.name == EventName::BobnetNew)
-            .collect()
+            .collect())
     }
 }
 
@@ -198,10 +199,10 @@ mod tests {
     #[tokio::test]
     async fn watch_surfaces_only_bobnet_new_events() {
         let client = client_at(&MockServer::start().await.uri()).await;
-        let watch = client.bobnet().watch().await.expect("watch");
+        let mut watch = client.bobnet().watch().await.expect("watch");
 
         let bobnet_event = Event {
-            id: EventId::new("evt-1"),
+            id: EventId::new("1-0"),
             realm: None,
             name: EventName::BobnetNew,
             category: EventCategory::from("bobnet"),
@@ -213,7 +214,7 @@ mod tests {
             payload: BTreeMap::new(),
         };
         let device_event = Event {
-            id: EventId::new("evt-2"),
+            id: EventId::new("2-0"),
             realm: None,
             name: EventName::from("device.attached"),
             category: EventCategory::from("device"),
@@ -226,18 +227,18 @@ mod tests {
         };
         client
             .managed_state()
-            .apply_event(&bobnet_event, "evt-1")
+            .apply_event(&bobnet_event, "1-0")
             .expect("apply bobnet event");
         client.managed_events().notify(bobnet_event);
         client
             .managed_state()
-            .apply_event(&device_event, "evt-2")
+            .apply_event(&device_event, "2-0")
             .expect("apply device event");
         client.managed_events().notify(device_event);
 
-        let observed = watch.try_next();
+        let observed = watch.try_next().expect("watch");
         assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].id.as_str(), "evt-1");
+        assert_eq!(observed[0].id.as_str(), "1-0");
 
         client.close().await.expect("close");
     }

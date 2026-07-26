@@ -2,19 +2,23 @@
 
 #![allow(dead_code)] // Later managed engines own the remaining journals.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::domain::{
     Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    Observation, ObservationMetadata, Realm, Replicant, Simulation, SimulationId,
+    LocationKey, Observation, ObservationMetadata, Realm, Replicant, ReplicantKey, Simulation,
+    SimulationId,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -31,6 +35,10 @@ pub(crate) enum StoreError {
     InjectedCommitFailure,
     #[error("store is closed")]
     Closed,
+    #[error("invalid Redis stream event ID: {0}")]
+    InvalidEventId(String),
+    #[error("database schema version {found} is newer than supported version {supported}")]
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
 }
 
 /// Internal durable store. No database handle crosses the crate boundary.
@@ -51,6 +59,9 @@ pub(crate) struct OperationJournalEntry {
     pub(crate) target_id: Option<String>,
     pub(crate) intent: Value,
     pub(crate) projection: Option<Value>,
+    pub(crate) submission_attempt_id: Option<String>,
+    pub(crate) submitted_at: Option<String>,
+    pub(crate) submission_cursor: Option<String>,
 }
 
 /// States an operation can never automatically leave without external
@@ -83,9 +94,11 @@ impl Store {
 
     fn configure(connection: &Connection, file_database: bool) -> Result<(), StoreError> {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         if file_database {
             connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
+        connection.execute_batch("PRAGMA synchronous = FULL;")?;
         Ok(())
     }
 
@@ -98,15 +111,24 @@ impl Store {
                 row.get(0)
             })
             .optional()?;
-        if version.is_none() {
+        if version.is_none() || version == Some(0) {
             let transaction = connection.transaction()?;
             transaction.execute_batch(INITIAL_SCHEMA)?;
-            transaction.execute("INSERT INTO schema_migrations(version) VALUES (1)", [])?;
             transaction.execute(
-                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '1')",
-                [],
+                "INSERT INTO schema_migrations(version) VALUES (?1) ON CONFLICT(version) DO NOTHING",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            transaction.execute("DELETE FROM schema_migrations WHERE version = 0", [])?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1)",
+                [CURRENT_SCHEMA_VERSION.to_string()],
             )?;
             transaction.commit()?;
+        } else if let Some(found) = version.filter(|version| *version != CURRENT_SCHEMA_VERSION) {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
         }
         // A process may stop after claiming work but before reporting its
         // outcome. Requeue it on open so durable reconciliation is recoverable.
@@ -158,6 +180,39 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Explicitly replaces the mutable email-derived binding after the server
+    /// has verified the new address. Normal startup never takes this path.
+    pub(crate) fn rebind_account_and_persist(
+        &mut self,
+        previous: &AccountId,
+        account: &Observation<Account>,
+    ) -> Result<(), StoreError> {
+        let stored = self
+            .bound_account_id()?
+            .ok_or_else(|| StoreError::AccountMismatch {
+                stored_account_id: String::new(),
+                supplied_account_id: previous.as_str().to_owned(),
+            })?;
+        if stored != previous.as_str() {
+            return Err(StoreError::AccountMismatch {
+                stored_account_id: stored,
+                supplied_account_id: previous.as_str().to_owned(),
+            });
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE account_binding SET account_id = ?1, bound_at = datetime('now') WHERE singleton = 1",
+            [account.value.id.as_str()],
+        )?;
+        transaction.execute("DELETE FROM accounts WHERE realm = 'live'", [])?;
+        transaction.execute(
+            "INSERT INTO accounts(realm, account_id, observation_json) VALUES ('live', ?1, ?2)",
+            params![account.value.id.as_str(), serde_json::to_string(account)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Forces file-backed SQLite state to durable storage before shutdown.
     pub(crate) fn flush(&mut self) -> Result<(), StoreError> {
         self.connection
@@ -178,6 +233,48 @@ impl Store {
             devices.insert(observation.value.key.clone(), observation);
         }
         Ok(devices)
+    }
+
+    pub(crate) fn restore_account(&self) -> Result<Option<Observation<Account>>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT observation_json FROM accounts WHERE realm = 'live' ORDER BY account_id LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub(crate) fn restore_replicants(
+        &self,
+    ) -> Result<BTreeMap<ReplicantKey, Observation<Replicant>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT observation_json FROM replicants ORDER BY realm, replicant_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut replicants = BTreeMap::new();
+        for row in rows {
+            let observation = serde_json::from_str::<Observation<Replicant>>(&row?)?;
+            replicants.insert(observation.value.key.clone(), observation);
+        }
+        Ok(replicants)
+    }
+
+    pub(crate) fn restore_locations(
+        &self,
+    ) -> Result<BTreeMap<LocationKey, Observation<Location>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT observation_json FROM locations ORDER BY realm, location_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut locations = BTreeMap::new();
+        for row in rows {
+            let observation = serde_json::from_str::<Observation<Location>>(&row?)?;
+            locations.insert(observation.value.key.clone(), observation);
+        }
+        Ok(locations)
     }
 
     pub(crate) fn persist_account(
@@ -219,6 +316,23 @@ impl Store {
     ) -> Result<(), StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
+        for device in devices {
+            persist_device(&transaction, device)?;
+        }
+        Self::commit(transaction, fail_commit)
+    }
+
+    pub(crate) fn persist_simulation_and_devices(
+        &mut self,
+        simulation: &Observation<Simulation>,
+        devices: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO simulations(simulation_id, payload_json) VALUES (?1, ?2) ON CONFLICT(simulation_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![simulation.value.id.get(), serde_json::to_string(simulation)?],
+        )?;
         for device in devices {
             persist_device(&transaction, device)?;
         }
@@ -272,21 +386,23 @@ impl Store {
         event: &Event,
         cursor: &str,
         devices: &[Observation<Device>],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT OR REPLACE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
             params![event.id.as_str(), event.realm.as_ref().map(realm_key), serde_json::to_string(event)?],
-        )?;
+        )? == 1;
+        if !inserted {
+            Self::commit(transaction, fail_commit)?;
+            return Ok(false);
+        }
         for device in devices {
             persist_device(&transaction, device)?;
         }
-        transaction.execute(
-            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-            [cursor],
-        )?;
-        Self::commit(transaction, fail_commit)
+        advance_event_cursor(&transaction, cursor)?;
+        Self::commit(transaction, fail_commit)?;
+        Ok(true)
     }
 
     /// Same atomic guarantee as [`Store::append_event_and_project`], but also
@@ -297,13 +413,17 @@ impl Store {
         event: &Event,
         cursor: &str,
         decommissioned: &[DeviceKey],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT OR REPLACE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
             params![event.id.as_str(), event.realm.as_ref().map(realm_key), serde_json::to_string(event)?],
-        )?;
+        )? == 1;
+        if !inserted {
+            Self::commit(transaction, fail_commit)?;
+            return Ok(false);
+        }
         for key in decommissioned {
             transaction.execute(
                 "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
@@ -314,11 +434,9 @@ impl Store {
                 params![realm_key(&key.realm), key.id.as_str()],
             )?;
         }
-        transaction.execute(
-            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-            [cursor],
-        )?;
-        Self::commit(transaction, fail_commit)
+        advance_event_cursor(&transaction, cursor)?;
+        Self::commit(transaction, fail_commit)?;
+        Ok(true)
     }
 
     /// Durable dedup check: reports whether this event ID was already
@@ -339,10 +457,9 @@ impl Store {
     /// Persists a baseline watermark cursor with no accompanying event, used
     /// when a first-start account has no applied cursor yet.
     pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
-            [cursor],
-        )?;
+        let transaction = self.connection.transaction()?;
+        advance_event_cursor(&transaction, cursor)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -405,6 +522,32 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically claims the single automatic send attempt.  The request must
+    /// not leave the process unless this returns `true`.
+    pub(crate) fn claim_operation_submission(
+        &mut self,
+        operation_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool, StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        let cursor: Option<String> = transaction
+            .query_row("SELECT cursor FROM event_cursors LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let changed = transaction.execute(
+            "UPDATE operation_journal
+             SET state = 'submitted', submission_attempt_id = ?2,
+                 submitted_at = datetime('now'), submission_cursor = ?3,
+                 updated_at = datetime('now')
+             WHERE operation_id = ?1 AND state = 'prepared'",
+            params![operation_id, attempt_id, cursor],
+        )?;
+        Self::commit(transaction, fail_commit)?;
+        Ok(changed == 1)
+    }
+
     /// Atomically commits a device projection produced by an operation's
     /// response alongside the operation's resolved state, so a crash between
     /// the two is impossible.
@@ -462,7 +605,7 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT operation_id, state, target_realm, target_kind, target_id, intent_json, projection_json FROM operation_journal WHERE state NOT IN ({placeholders}) ORDER BY updated_at"
+            "SELECT operation_id, state, target_realm, target_kind, target_id, intent_json, projection_json, submission_attempt_id, submitted_at, submission_cursor FROM operation_journal WHERE state NOT IN ({placeholders}) ORDER BY updated_at"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
@@ -476,13 +619,26 @@ impl Store {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )?;
         let mut operations = Vec::new();
         for row in rows {
-            let (operation_id, state, target_realm, target_kind, target_id, intent, projection) =
-                row?;
+            let (
+                operation_id,
+                state,
+                target_realm,
+                target_kind,
+                target_id,
+                intent,
+                projection,
+                submission_attempt_id,
+                submitted_at,
+                submission_cursor,
+            ) = row?;
             operations.push((
                 operation_id,
                 OperationJournalEntry {
@@ -494,6 +650,9 @@ impl Store {
                     projection: projection
                         .map(|value| serde_json::from_str(&value))
                         .transpose()?,
+                    submission_attempt_id,
+                    submitted_at,
+                    submission_cursor,
                 },
             ));
         }
@@ -539,7 +698,7 @@ impl Store {
     ) -> Result<Option<OperationJournalEntry>, StoreError> {
         self.connection
             .query_row(
-                "SELECT state, target_realm, target_kind, target_id, intent_json, projection_json FROM operation_journal WHERE operation_id = ?1",
+                "SELECT state, target_realm, target_kind, target_id, intent_json, projection_json, submission_attempt_id, submitted_at, submission_cursor FROM operation_journal WHERE operation_id = ?1",
                 [operation_id],
                 |row| {
                     Ok((
@@ -549,12 +708,15 @@ impl Store {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()?
             .map(
-                |(state, target_realm, target_kind, target_id, intent, projection)| {
+                |(state, target_realm, target_kind, target_id, intent, projection, submission_attempt_id, submitted_at, submission_cursor)| {
                     Ok(OperationJournalEntry {
                         state,
                         target_realm,
@@ -564,6 +726,9 @@ impl Store {
                         projection: projection
                             .map(|value| serde_json::from_str(&value))
                             .transpose()?,
+                        submission_attempt_id,
+                        submitted_at,
+                        submission_cursor,
                     })
                 },
             )
@@ -704,6 +869,21 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn restore_inventories(
+        &self,
+    ) -> Result<BTreeMap<InventoryOwner, Observation<Inventory>>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT inventory_json FROM inventories ORDER BY realm, owner_kind, owner_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut inventories = BTreeMap::new();
+        for row in rows {
+            let observation = serde_json::from_str::<Observation<Inventory>>(&row?)?;
+            inventories.insert(observation.value.owner.clone(), observation);
+        }
+        Ok(inventories)
+    }
+
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.connection
             .query_row(
@@ -753,6 +933,13 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn busy_timeout(&self) -> Result<i64, StoreError> {
+        self.connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .map_err(StoreError::from)
+    }
+
+    #[cfg(test)]
     pub(crate) fn device_count(&self) -> Result<i64, StoreError> {
         self.connection
             .query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))
@@ -765,6 +952,53 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM event_journal", [], |row| row.get(0))
             .map_err(StoreError::from)
     }
+}
+
+/// Redis stream IDs are `<milliseconds>-<sequence>` decimal pairs.  They are
+/// ordered numerically; lexical comparison misorders values such as `10-0`
+/// and `9-999`.
+fn compare_event_ids(left: &str, right: &str) -> Result<Ordering, StoreError> {
+    fn parse(value: &str) -> Result<(u64, u64), StoreError> {
+        let Some((milliseconds, sequence)) = value.split_once('-') else {
+            return Err(StoreError::InvalidEventId(value.into()));
+        };
+        if sequence.contains('-') {
+            return Err(StoreError::InvalidEventId(value.into()));
+        }
+        let milliseconds = milliseconds
+            .parse()
+            .map_err(|_| StoreError::InvalidEventId(value.into()))?;
+        let sequence = sequence
+            .parse()
+            .map_err(|_| StoreError::InvalidEventId(value.into()))?;
+        Ok((milliseconds, sequence))
+    }
+
+    Ok(parse(left)?.cmp(&parse(right)?))
+}
+
+/// Advances the applied account cursor only when `cursor` is numerically newer
+/// than the durable Redis stream ID already present in this transaction.
+fn advance_event_cursor(transaction: &Transaction<'_>, cursor: &str) -> Result<(), StoreError> {
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT cursor FROM event_cursors WHERE stream = 'account'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if previous
+        .as_deref()
+        .map(|previous| compare_event_ids(cursor, previous))
+        .transpose()?
+        .is_none_or(|ordering| ordering == Ordering::Greater)
+    {
+        transaction.execute(
+            "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+            [cursor],
+        )?;
+    }
+    Ok(())
 }
 
 fn persist_device(
@@ -788,7 +1022,7 @@ fn persist_device(
             location_realm,
             location_id,
             access_key(&observation.metadata.access),
-            observation.metadata.observed_at,
+            observation.metadata.observed_at.unix_millis(),
             serde_json::to_string(observation)?,
             source_document_id,
         ],
@@ -855,7 +1089,7 @@ fn persist_source_document(
     if let Some(id) = &id {
         transaction.execute(
             "INSERT OR IGNORE INTO source_documents(id, operation, request_id, captured_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, source.operation, source.request_id, metadata.observed_at],
+            params![id, source.operation, source.request_id, metadata.observed_at.unix_millis()],
         )?;
     }
     Ok(id)
@@ -956,7 +1190,7 @@ mod tests {
 
     fn event() -> Event {
         Event {
-            id: EventId::new("event-1"),
+            id: EventId::new("1-0"),
             realm: Some(Realm::Live),
             name: EventName::from("device.updated"),
             category: EventCategory::from("device"),
@@ -976,10 +1210,29 @@ mod tests {
             let store = Store::open_file(&path).expect("open fresh store");
             assert_eq!(store.foreign_keys_enabled().expect("foreign key pragma"), 1);
             assert_eq!(store.journal_mode().expect("journal mode"), "wal");
+            assert_eq!(store.busy_timeout().expect("busy timeout"), 5_000);
         }
         let store = Store::open_file(&path).expect("reopen migrated store");
         assert_eq!(store.device_count().expect("device count"), 0);
         drop(store);
+        fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let path = test_path("future-schema");
+        let connection = Connection::open(&path).expect("open database");
+        connection
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (2);")
+            .expect("seed future schema");
+        drop(connection);
+        assert!(matches!(
+            Store::open_file(&path),
+            Err(StoreError::UnsupportedSchemaVersion {
+                found: 2,
+                supported: 1
+            })
+        ));
         fs::remove_file(path).expect("remove test database");
     }
 
@@ -1183,12 +1436,12 @@ mod tests {
     #[test]
     fn has_event_detects_journaled_ids_regardless_of_source() {
         let mut store = Store::open_memory().expect("open memory store");
-        assert!(!store.has_event("event-1").expect("has_event before append"));
+        assert!(!store.has_event("1-0").expect("has_event before append"));
         store
-            .append_event_and_project(&event(), "event-1", &[])
+            .append_event_and_project(&event(), "1-0", &[])
             .expect("append event");
-        assert!(store.has_event("event-1").expect("has_event after append"));
-        assert!(!store.has_event("event-2").expect("has_event for unseen id"));
+        assert!(store.has_event("1-0").expect("has_event after append"));
+        assert!(!store.has_event("2-0").expect("has_event for unseen id"));
     }
 
     #[test]
@@ -1265,7 +1518,7 @@ mod tests {
             ));
         }
         let restored = Store::open_file(&path).expect("reopen after crash");
-        assert!(!restored.has_event("event-1").expect("event not journaled"));
+        assert!(!restored.has_event("1-0").expect("event not journaled"));
         assert_eq!(restored.event_cursor().expect("cursor"), None);
         drop(restored);
         fs::remove_file(&path).expect("remove test database");

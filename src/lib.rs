@@ -48,6 +48,7 @@ pub mod managed {
     mod bobnet;
     mod client;
     mod events;
+    #[allow(missing_docs)] // Gateway implementation details are re-exported below.
     mod gateways;
     mod operation;
     mod simulations;
@@ -63,8 +64,8 @@ pub mod managed {
     };
     pub use bobnet::{BobnetGateway, BobnetWatch, RelayHistoryQuery};
     pub use client::{
-        Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions,
-        ReconciliationPolicy, StartupPolicy,
+        Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions, Readiness,
+        ReadinessComponent, ReconciliationPolicy, StartupPolicy,
     };
     pub use events::{EventWatch, EventsGateway};
     pub use gateways::{
@@ -79,8 +80,8 @@ pub mod managed {
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use sync::{
-        SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
-        SyncProgress, SyncReadiness, SyncReport,
+        SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind,
+        SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
     };
     pub use trading::{TradeControllerHandle, TradingGateway};
     pub use travel::{TravelBuilder, TravelPreview, TravelVia};
@@ -93,12 +94,13 @@ pub use managed::{
     DeviceQuerySubscription, DeviceWatch, DevicesGateway, DirectoryGateway, DynamicCommand,
     EventStreamOptions, EventWatch, EventsGateway, FleetController, InventoryGateway,
     LocationEventsGateway, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
-    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
-    ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery, ReplicantsGateway,
-    SimulationQuery, SimulationsGateway, StartupPolicy, SurveyController, SurveyDirective,
-    SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncPlan, SyncPlanError,
-    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
-    TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
+    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
+    ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
+    ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy, SurveyController,
+    SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure,
+    SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
+    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
+    TravelPreview, TravelVia,
 };
 
 #[cfg(feature = "raw")]
