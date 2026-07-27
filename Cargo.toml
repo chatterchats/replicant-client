@@ -115,3 +115,7 @@ suspicious = { level = "deny", priority = 0 }
 [[example]]
 name = "explore_survey_route"
 required-features = ["managed"]
+
+[[example]]
+name = "bobnet_messages"
+required-features = ["managed"]
