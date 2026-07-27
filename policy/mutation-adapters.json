@@ -1,0 +1,34 @@
+{
+  "$schema_note": "Phase 11.6 typed managed mutation inventory. Every supported unsafe route is either exactly one managed typed adapter or an explicitly raw-only bootstrap endpoint.",
+  "raw_only": [
+    "POST /v1/accounts",
+    "POST /v1/accounts/recover",
+    "POST /v1/feedback"
+  ],
+  "managed": {
+    "DELETE /v1/accounts/me": "AccountWipe",
+    "PATCH /v1/accounts/me": "AccountUpdate",
+    "PATCH /v1/devices/{device_code}": "DeviceConfigure",
+    "POST /v1/devices/{device_code}": "DeviceCommand (DeviceDynamicCommand is the open-vocabulary form)",
+    "DELETE /v1/devices/{device_code}/permissions": "DeviceRevokePermission",
+    "POST /v1/devices/{device_code}/permissions": "DeviceGrantPermission",
+    "POST /v1/devices/{device_code}/simulate": "DeviceEnterSimulation",
+    "DELETE /v1/devices/{device_code}/simulate/{sim_id}": "DeviceAbandonSimulation",
+    "POST /v1/devices/{device_code}/trades": "DeviceCreateTrade",
+    "DELETE /v1/devices/{device_code}/trades/{trade_code}": "DeviceDeleteTrade",
+    "POST /v1/devices/{device_code}/trades/{trade_code}": "DeviceFulfillTrade",
+    "POST /v1/locations/{designation}/contribute": "LocationContribute",
+    "POST /v1/locations/{location_code}/events/{designation}": "LocationEventResolve",
+    "POST /v1/messages/read": "MessagesMarkRead",
+    "PATCH /v1/replicants/{replicant_code}": "ReplicantUpdate",
+    "POST /v1/replicants/{replicant_code}/message": "ReplicantMessage",
+    "DELETE /v1/replicants/{replicant_code}/mine": "ReplicantStopMining",
+    "POST /v1/replicants/{replicant_code}/mine": "ReplicantMine",
+    "POST /v1/replicants/{replicant_code}/print": "ReplicantPrint",
+    "POST /v1/replicants/{replicant_code}/scan": "ReplicantScan",
+    "POST /v1/replicants/{replicant_code}/teleport": "ReplicantTeleport",
+    "POST /v1/replicants/{replicant_code}/transfer": "ReplicantTransfer",
+    "DELETE /v1/replicants/{replicant_code}/travel": "ReplicantCancelTravel",
+    "POST /v1/replicants/{replicant_code}/travel": "ReplicantTravel"
+  }
+}

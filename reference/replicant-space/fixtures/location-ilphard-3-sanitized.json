@@ -1,0 +1,15 @@
+{
+  "location": "ILPHARD-3",
+  "location_type": "planet",
+  "surveyed": true,
+  "planet": {
+    "atmosphere": "dense",
+    "in_habitable_zone": true,
+    "life_stage": "intelligent",
+    "magnetic_field": false,
+    "surface_gravity": 2.06,
+    "surface_temp_c": 125,
+    "future_environment": {"kept": true}
+  },
+  "resource_sites": []
+}

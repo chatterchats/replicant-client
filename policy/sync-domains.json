@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "full_plan": [
+    {"domain":"account","depends_on":[],"endpoint":"GET /v1/accounts/me","bound":"one request","absence_reconciliation":"never"},
+    {"domain":"devices","depends_on":["account"],"endpoint":"GET /v1/devices","bound":"100 cursor pages","absence_reconciliation":"only final unfiltered page"},
+    {"domain":"replicants","depends_on":["devices"],"endpoint":"GET /v1/replicants/{code}","bound":"owned codes discovered from durable state","absence_reconciliation":"never"},
+    {"domain":"locations","depends_on":["devices","replicants"],"endpoint":"GET /v1/locations/{designation}","bound":"locations discovered from durable state","absence_reconciliation":"never"},
+    {"domain":"inventory","depends_on":["locations"],"endpoint":"GET /v1/inventory","bound":"100 cursor pages","absence_reconciliation":"never"},
+    {"domain":"simulations","depends_on":["account"],"endpoint":"GET /v1/accounts/simulations","bound":"one complete history response","absence_reconciliation":"never"}
+  ],
+  "readiness": {"complete":"all requested domains commit", "rest_baseline":"essential account and devices commit but another requested domain does not", "unavailable":"an essential domain does not commit", "event_continuity":"separate from REST readiness"}
+}

@@ -94,6 +94,17 @@ CREATE TABLE stars (
     PRIMARY KEY (realm, star_id),
     FOREIGN KEY (source_document_id) REFERENCES source_documents(id)
 );
+CREATE TABLE catalogue_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generated_at TEXT
+);
+CREATE TABLE replicant_star_knowledge (
+    realm TEXT NOT NULL,
+    replicant_id TEXT NOT NULL,
+    star_id TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    PRIMARY KEY (realm, replicant_id, star_id)
+);
 CREATE TABLE resource_sites (
     realm TEXT NOT NULL,
     site_id TEXT NOT NULL,
@@ -221,6 +232,7 @@ CREATE INDEX devices_realm_type_status ON devices(realm, device_type, status);
 CREATE INDEX devices_realm_location ON devices(realm, location_realm, location_id);
 CREATE INDEX devices_realm_access ON devices(realm, access_scope);
 CREATE INDEX replicants_realm ON replicants(realm, replicant_id);
+CREATE INDEX replicant_star_knowledge_star ON replicant_star_knowledge(realm, star_id);
 CREATE INDEX inventories_realm_owner ON inventories(realm, owner_kind, owner_id);
 CREATE INDEX device_relationship_targets ON device_relationships(target_realm, target_id);
 CREATE INDEX event_journal_realm ON event_journal(realm, appended_at);
