@@ -140,7 +140,13 @@ impl GalaxyClient {
     /// Downloads the full star catalogue as a single response.
     pub async fn catalogue(&self) -> Result<RawResponse<CatalogueResponse>, Error> {
         self.client
-            .execute(Method::GET, "v1/stars", true, RequestSafety::SafeRead)
+            .execute_with_response_limit(
+                Method::GET,
+                "v1/stars",
+                true,
+                RequestSafety::SafeRead,
+                self.client.max_star_catalogue_response_body_bytes(),
+            )
             .await
     }
 }

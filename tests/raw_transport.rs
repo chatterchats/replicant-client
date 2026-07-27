@@ -109,6 +109,62 @@ async fn oversized_chunked_response_is_rejected_while_streaming() {
     server.await.unwrap();
 }
 
+
+#[tokio::test]
+async fn star_catalogue_uses_its_dedicated_larger_response_limit() {
+    let server = MockServer::start().await;
+    let padding = "x".repeat(1024 * 1024);
+    let body = serde_json::json!({
+        "generated_at": "2026-07-27T00:00:00Z",
+        "stars": [],
+        "padding": padding,
+    })
+    .to_string();
+    assert!(body.len() > 1024 * 1024);
+
+    Mock::given(method("GET"))
+        .and(path("/v1/stars"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let response = client(&server, fast_retry())
+        .galaxy()
+        .catalogue()
+        .await
+        .unwrap();
+    assert!(response.value.stars.is_empty());
+}
+
+#[tokio::test]
+async fn star_catalogue_response_limit_remains_configurable_and_bounded() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "stars": [],
+        "padding": "x".repeat(2048),
+    })
+    .to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/v1/stars"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let error = Client::builder()
+        .base_url(Url::parse(&server.uri()).unwrap())
+        .authentication_token(SecretString::from("test-token".to_string()))
+        .max_star_catalogue_response_body_bytes(1024)
+        .build()
+        .unwrap()
+        .galaxy()
+        .catalogue()
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("exceeds 1024 bytes"));
+}
+
 #[tokio::test]
 async fn account_wipe_uses_its_documented_typed_success_response() {
     let server = MockServer::start().await;

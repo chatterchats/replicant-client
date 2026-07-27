@@ -102,6 +102,7 @@ struct RequestAttempt<'a> {
     bucket: RateLimitBucket,
     attempt: u32,
     body: Option<Vec<u8>>,
+    response_body_limit: usize,
 }
 
 /// Bounded-backoff retry policy applied to safe reads.
@@ -155,8 +156,11 @@ pub struct ClientConfig {
     pub retry: RetryPolicy,
     /// TLS backend for internally built HTTP clients.
     pub tls_backend: TlsBackend,
-    /// Maximum response body size accepted, in bytes.
+    /// Maximum response body size accepted for ordinary endpoints, in bytes.
     pub max_response_body_bytes: usize,
+    /// Maximum response body size accepted from the unpaginated global star
+    /// catalogue (`GET /v1/stars`), in bytes.
+    pub max_star_catalogue_response_body_bytes: usize,
     /// Send a generated `X-Request-ID` header with each request.
     pub send_request_id: bool,
     /// Emit sanitized `tracing` events for requests and retries.
@@ -173,6 +177,10 @@ impl fmt::Debug for ClientConfig {
             .field("retry", &self.retry)
             .field("tls_backend", &self.tls_backend)
             .field("max_response_body_bytes", &self.max_response_body_bytes)
+            .field(
+                "max_star_catalogue_response_body_bytes",
+                &self.max_star_catalogue_response_body_bytes,
+            )
             .field("send_request_id", &self.send_request_id)
             .field("emit_tracing", &self.emit_tracing)
             .finish()
@@ -189,6 +197,7 @@ impl Default for ClientConfig {
             retry: RetryPolicy::default(),
             tls_backend: TlsBackend::Automatic,
             max_response_body_bytes: 1024 * 1024,
+            max_star_catalogue_response_body_bytes: 32 * 1024 * 1024,
             send_request_id: true,
             emit_tracing: true,
         }
@@ -322,6 +331,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the maximum accepted response body size for the unpaginated global
+    /// star catalogue (`GET /v1/stars`). This is separate from the ordinary
+    /// endpoint limit because the complete catalogue is intentionally much
+    /// larger than typical API responses.
+    #[must_use]
+    pub fn max_star_catalogue_response_body_bytes(mut self, bytes: usize) -> Self {
+        self.config.max_star_catalogue_response_body_bytes = bytes;
+        self
+    }
+
     /// Disables the locally generated `X-Request-ID` header.
     #[must_use]
     pub fn send_request_id(mut self, enabled: bool) -> Self {
@@ -441,6 +460,10 @@ impl Client {
         ClientBuilder::new()
     }
 
+    pub(crate) fn max_star_catalogue_response_body_bytes(&self) -> usize {
+        self.inner.config.max_star_catalogue_response_body_bytes
+    }
+
     /// Returns the shared rate-limit coordinator, for callers (including the
     /// future managed scheduler) that want to observe or share budgets.
     #[must_use]
@@ -466,8 +489,37 @@ impl Client {
         authenticated: bool,
         safety: RequestSafety,
     ) -> Result<RawResponse<T>, Error> {
-        self.execute_bytes(method, path, authenticated, safety, None)
-            .await
+        self.execute_bytes(
+            method,
+            path,
+            authenticated,
+            safety,
+            None,
+            self.inner.config.max_response_body_bytes,
+        )
+        .await
+    }
+
+    /// Executes a bodiless typed request with an explicit bounded response
+    /// body limit. Used by exceptional unpaginated endpoints such as the full
+    /// global star catalogue while ordinary endpoints retain the default cap.
+    pub(crate) async fn execute_with_response_limit<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        authenticated: bool,
+        safety: RequestSafety,
+        response_body_limit: usize,
+    ) -> Result<RawResponse<T>, Error> {
+        self.execute_bytes(
+            method,
+            path,
+            authenticated,
+            safety,
+            None,
+            response_body_limit,
+        )
+        .await
     }
 
     /// Executes a typed JSON-body request through the shared pipeline.
@@ -482,8 +534,15 @@ impl Client {
         let bytes = serde_json::to_vec(body).map_err(|error| Error::Configuration {
             message: format!("request serialization failed: {error}"),
         })?;
-        self.execute_bytes(method, path, authenticated, safety, Some(bytes))
-            .await
+        self.execute_bytes(
+            method,
+            path,
+            authenticated,
+            safety,
+            Some(bytes),
+            self.inner.config.max_response_body_bytes,
+        )
+        .await
     }
 
     #[cfg(feature = "events")]
@@ -554,6 +613,7 @@ impl Client {
         authenticated: bool,
         safety: RequestSafety,
         body: Option<Vec<u8>>,
+        response_body_limit: usize,
     ) -> Result<RawResponse<T>, Error> {
         let request_id = RequestId::new();
         let bucket = bucket_for(&method, path);
@@ -576,6 +636,7 @@ impl Client {
                     ?bucket,
                     ?safety,
                     authenticated,
+                    response_body_limit_bytes = response_body_limit,
                     rate_limit_wait_ms = permit_wait.as_millis() as u64,
                     "sending raw HTTP request"
                 );
@@ -589,6 +650,7 @@ impl Client {
                     bucket,
                     attempt: attempts,
                     body: body.clone(),
+                    response_body_limit,
                 })
                 .await;
             let attempt_elapsed = attempt_started.elapsed();
@@ -673,6 +735,7 @@ impl Client {
             bucket,
             attempt,
             body,
+            response_body_limit,
         } = request;
         let total_started = Instant::now();
         let prepare_started = Instant::now();
@@ -695,7 +758,7 @@ impl Client {
         let metadata_elapsed = metadata_started.elapsed();
 
         let body_started = Instant::now();
-        let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
+        let bytes = read_bounded(response, response_body_limit).await?;
         let body_elapsed = body_started.elapsed();
         if !metadata.status.is_success() {
             if self.inner.config.emit_tracing {
@@ -708,6 +771,7 @@ impl Client {
                     attempt,
                     status = status.as_u16(),
                     response_bytes = bytes.len(),
+                    response_body_limit_bytes = response_body_limit,
                     request_prepare_ms = prepare_elapsed.as_millis() as u64,
                     time_to_headers_ms = time_to_headers.as_millis() as u64,
                     metadata_ms = metadata_elapsed.as_millis() as u64,
@@ -737,6 +801,7 @@ impl Client {
                 attempt,
                 status = status.as_u16(),
                 response_bytes = bytes.len(),
+                response_body_limit_bytes = response_body_limit,
                 request_prepare_ms = prepare_elapsed.as_millis() as u64,
                 time_to_headers_ms = time_to_headers.as_millis() as u64,
                 metadata_ms = metadata_elapsed.as_millis() as u64,
@@ -1049,6 +1114,13 @@ fn validate_client_config(config: &ClientConfig) -> Result<(), Error> {
     if config.max_response_body_bytes == 0 || config.max_response_body_bytes > 64 * 1024 * 1024 {
         return Err(invalid(
             "response body limit must be between 1 byte and 64 MiB",
+        ));
+    }
+    if config.max_star_catalogue_response_body_bytes == 0
+        || config.max_star_catalogue_response_body_bytes > 64 * 1024 * 1024
+    {
+        return Err(invalid(
+            "star catalogue response body limit must be between 1 byte and 64 MiB",
         ));
     }
     if config.retry.initial_backoff > config.retry.max_backoff

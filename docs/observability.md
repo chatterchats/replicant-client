@@ -207,3 +207,15 @@ tracing_subscriber::fmt()
 
 Install the subscriber once, near process startup, before constructing the
 client.
+
+## Response-body limits
+
+Ordinary endpoints retain the raw client's conservative default response cap
+(1 MiB). The complete unpaginated `GET /v1/stars` catalogue has a separate
+bounded default of 32 MiB because its legitimate payload is substantially
+larger. HTTP trace events include `response_body_limit_bytes`, so a cap failure
+can be distinguished from network, server, or decoding latency.
+
+Applications may tune only the catalogue cap through
+`ClientBuilder::max_star_catalogue_response_body_bytes`. The initializer also
+accepts `REPLICANT_INIT_STAR_CATALOGUE_LIMIT_BYTES`.

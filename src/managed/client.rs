@@ -373,6 +373,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the bounded response size accepted from the complete global star
+    /// catalogue. Ordinary endpoints retain their smaller default body cap.
+    #[must_use]
+    pub fn max_star_catalogue_response_body_bytes(mut self, bytes: usize) -> Self {
+        self.raw = self.raw.max_star_catalogue_response_body_bytes(bytes);
+        self
+    }
+
     /// Selects the TLS backend. Feature validation remains owned by `raw`.
     #[must_use]
     pub fn tls_backend(mut self, backend: TlsBackend) -> Self {

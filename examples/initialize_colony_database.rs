@@ -14,6 +14,8 @@
 //!   defaults to `14096`.
 //! - `REPLICANT_INIT_CONCURRENCY` — bounded location-detail concurrency;
 //!   defaults to `4`.
+//! - `REPLICANT_INIT_STAR_CATALOGUE_LIMIT_BYTES` — bounded response size for
+//!   the unpaginated global star catalogue; defaults to `33554432` (32 MiB).
 //! - `RUST_LOG` — tracing filter. The default enables detailed request and
 //!   synchronization timing without exposing credentials.
 //!
@@ -76,6 +78,7 @@ struct Config {
     system_limit: Option<usize>,
     object_limit: usize,
     concurrency: usize,
+    star_catalogue_response_limit_bytes: usize,
 }
 
 impl Config {
@@ -97,6 +100,10 @@ impl Config {
             system_limit: optional_usize("REPLICANT_INIT_SYSTEM_LIMIT")?,
             object_limit: env_usize("REPLICANT_INIT_OBJECT_LIMIT", 14096)?,
             concurrency: env_usize("REPLICANT_INIT_CONCURRENCY", 4)?.max(1),
+            star_catalogue_response_limit_bytes: env_usize(
+                "REPLICANT_INIT_STAR_CATALOGUE_LIMIT_BYTES",
+                32 * 1024 * 1024,
+            )?,
         })
     }
 }
@@ -131,6 +138,7 @@ async fn main() -> Result<(), AnyError> {
         system_limit = ?config.system_limit,
         object_limit = config.object_limit,
         concurrency = config.concurrency,
+        star_catalogue_response_limit_bytes = config.star_catalogue_response_limit_bytes,
         "starting colony database initializer"
     );
 
@@ -138,6 +146,7 @@ async fn main() -> Result<(), AnyError> {
     let client = Client::builder()
         .authentication_token(SecretString::from(config.token.clone()))
         .sqlite(&config.database)
+        .max_star_catalogue_response_body_bytes(config.star_catalogue_response_limit_bytes)
         .startup_policy(StartupPolicy::Essential)
         .start()
         .instrument(info_span!(

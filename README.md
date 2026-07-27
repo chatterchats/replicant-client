@@ -87,3 +87,8 @@ and export. The `initialize_colony_database` example includes a timestamped
 
 See `docs/observability.md` for targets, duration fields, and a workflow for
 locating initializer and synchronization bottlenecks.
+
+The colony database initializer accepts
+`REPLICANT_INIT_STAR_CATALOGUE_LIMIT_BYTES` to override the dedicated bounded
+`GET /v1/stars` response cap (32 MiB by default). Ordinary API endpoints keep
+their smaller default response limit.

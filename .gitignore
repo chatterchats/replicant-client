@@ -6,6 +6,8 @@ target/
 *.db-shm
 *.db-wal
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.sqlite3
 /logs/
 .vscode/
@@ -25,3 +27,4 @@ __pycache__/
 /reference/replicant-space/.source-html/
 /reference/replicant-space/.crawl-cache.json
 patches/
+logs/
