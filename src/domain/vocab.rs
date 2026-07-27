@@ -55,5 +55,26 @@ open_value!(DeviceDirective {
 open_value!(ReplicantStatus { Active => "active", Offline => "offline", Traveling => "traveling" });
 open_value!(SpeciesKind { Human => "human" });
 open_value!(LocationType { Planet => "planet", Moon => "moon", Belt => "belt", Station => "station" });
+open_value!(Atmosphere { Breathable => "breathable", None => "none" });
+open_value!(LifeStage {
+    Prebiotic => "prebiotic", Microbial => "microbial", Complex => "complex",
+    Intelligent => "intelligent", Spacefaring => "spacefaring"
+});
+
+impl LifeStage {
+    /// Canonical documented life-stage rank. Future values deliberately have
+    /// no order until the contract defines one.
+    #[must_use]
+    pub fn canonical_rank(&self) -> Option<u8> {
+        match self {
+            Self::Prebiotic => Some(0),
+            Self::Microbial => Some(1),
+            Self::Complex => Some(2),
+            Self::Intelligent => Some(3),
+            Self::Spacefaring => Some(4),
+            Self::Unknown(_) => None,
+        }
+    }
+}
 open_value!(TradeStatus { Open => "open", Completed => "completed", Cancelled => "cancelled" });
 open_value!(EventCategory { Account => "account", Device => "device", Replicant => "replicant" });

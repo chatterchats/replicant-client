@@ -10,6 +10,17 @@
 //! values and commit successful observations before returning. [`raw`] is the
 //! explicit escape hatch for transport DTOs and metadata; it never hydrates,
 //! persists, publishes, journals operations, or reconciles state.
+//!
+//! # Observability
+//!
+//! The client emits structured [`tracing`](https://docs.rs/tracing) events but
+//! never installs a global subscriber. Applications choose their own
+//! subscriber and filtering policy. Important targets include
+//! `replicant_client::raw::http`, `replicant_client::sync`,
+//! `replicant_client::events`, `replicant_client::locations`,
+//! `replicant_client::galaxy`, `replicant_client::store`, and
+//! `replicant_client::state`. Duration fields use milliseconds and secret
+//! values, authorization headers, and request bodies are never recorded.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -48,6 +59,7 @@ pub mod managed {
     mod bobnet;
     mod client;
     mod events;
+    mod galaxy;
     #[allow(missing_docs)] // Gateway implementation details are re-exported below.
     mod gateways;
     mod operation;
@@ -68,15 +80,17 @@ pub mod managed {
         ReadinessComponent, ReconciliationPolicy, StartupPolicy,
     };
     pub use events::{EventWatch, EventsGateway};
+    pub use galaxy::{CatalogueReport, GalaxyGateway, ReplicantStarSyncReport};
     pub use gateways::{
         AccountGateway, DeviceHandle, DeviceQuery, DeviceQueryChange, DeviceQuerySubscription,
-        DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway, ReplicantHandle,
-        ReplicantQuery, ReplicantsGateway,
+        DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway, LocationDiagnostic,
+        LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
+        LocationQueryDiagnostics, ReplicantHandle, ReplicantQuery, ReplicantsGateway,
     };
     pub use operation::{
-        ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationsGateway,
-        MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
-        OperationsGateway,
+        ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationHydration,
+        LocationHydrationFailure, LocationHydrationReport, LocationsGateway, MessagesGateway,
+        Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use sync::{
@@ -89,16 +103,19 @@ pub mod managed {
 
 #[cfg(feature = "managed")]
 pub use managed::{
-    AccountGateway, BobnetGateway, BobnetWatch, Client, ClientBuilder, ClientDegradation,
-    ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery, DeviceQueryChange,
-    DeviceQuerySubscription, DeviceWatch, DevicesGateway, DirectoryGateway, DynamicCommand,
-    EventStreamOptions, EventWatch, EventsGateway, FleetController, InventoryGateway,
-    LocationEventsGateway, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
-    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
-    ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
-    ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy, SurveyController,
-    SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure,
-    SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
+    AccountGateway, BobnetGateway, BobnetWatch, CatalogueReport, Client, ClientBuilder,
+    ClientDegradation, ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery,
+    DeviceQueryChange, DeviceQuerySubscription, DeviceWatch, DevicesGateway, DirectoryGateway,
+    DynamicCommand, EventStreamOptions, EventWatch, EventsGateway, FleetController, GalaxyGateway,
+    InventoryGateway, LocationDiagnostic, LocationEventsGateway, LocationHydration,
+    LocationHydrationFailure, LocationHydrationReport, LocationPredicateDiagnostic,
+    LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, LocationsGateway,
+    MessagesGateway, MiningController, MiningDirective, Operation, OperationOutcome,
+    OperationStatus, OperationWatch, OperationsGateway, Readiness, ReadinessComponent,
+    ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
+    ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
+    SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
+    SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
     TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
     TravelPreview, TravelVia,
 };
@@ -108,7 +125,8 @@ pub use raw::SecretString;
 
 #[cfg(feature = "managed")]
 pub use domain::{
-    Account, AccountId, Device, DeviceCommand, DeviceId, DeviceKey, DeviceStatus, DeviceType,
-    Event, EventId, Location, LocationId, LocationKey, OperationId, Realm, Replicant, ReplicantId,
-    ReplicantKey, SimulationId, StarId, TradeId, WorldKey,
+    Account, AccountId, Atmosphere, Device, DeviceCommand, DeviceId, DeviceKey, DeviceStatus,
+    DeviceType, Event, EventId, Knowledge, LifeStage, Location, LocationId, LocationKey,
+    OperationId, Realm, Replicant, ReplicantId, ReplicantKey, SimulationId, Star, StarId,
+    StarKnowledge, TradeId, WorldKey,
 };

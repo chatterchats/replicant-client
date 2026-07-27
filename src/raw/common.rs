@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// An open JSON object, used for fields the contract declares as untyped
 /// (`{}`), and for opaque server-declared-but-unschema'd request/response
@@ -52,6 +52,12 @@ impl<T> UpdateField<T> {
     #[must_use]
     pub fn is_omitted(&self) -> bool {
         matches!(self, Self::Omitted)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for UpdateField<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Option::<T>::deserialize(deserializer)?.map_or(Self::Null, Self::Value))
     }
 }
 

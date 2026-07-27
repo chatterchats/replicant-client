@@ -8,7 +8,7 @@
 use std::{
     fmt,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use reqwest::{
@@ -17,6 +17,7 @@ use reqwest::{
 };
 use secrecy::ExposeSecret;
 use serde::{Serialize, de::DeserializeOwned};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub use reqwest::{StatusCode, Url};
@@ -89,6 +90,18 @@ pub enum RequestSafety {
     SafeRead,
     /// A state-changing request. Never retried automatically once sent.
     Mutating,
+}
+
+/// One fully described HTTP request attempt. Grouping these fields keeps the
+/// executor API cohesive and avoids an error-prone positional argument list.
+struct RequestAttempt<'a> {
+    method: &'a Method,
+    path: &'a str,
+    authenticated: bool,
+    request_id: &'a RequestId,
+    bucket: RateLimitBucket,
+    attempt: u32,
+    body: Option<Vec<u8>>,
 }
 
 /// Bounded-backoff retry policy applied to safe reads.
@@ -483,20 +496,54 @@ impl Client {
             &[("cursor", cursor.map(ToOwned::to_owned))],
         );
         let request_id = RequestId::new();
+        let overall_started = Instant::now();
+        let permit_started = Instant::now();
         self.inner.rate_limits.acquire(RateLimitBucket::Sse).await;
+        let permit_wait = permit_started.elapsed();
+        let connect_started = Instant::now();
         let response = self
             .prepare_request(Method::GET, &path, true, &request_id)?
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .await
             .map_err(map_reqwest_error)?;
+        let time_to_headers = connect_started.elapsed();
         let metadata = self
-            .observe_response(RateLimitBucket::Sse, &response, request_id)
+            .observe_response(RateLimitBucket::Sse, &response, request_id.clone())
             .await;
+        if self.inner.config.emit_tracing {
+            debug!(
+                target: "replicant_client::raw::http",
+                event = "http.sse_connected",
+                method = "GET",
+                path = %path,
+                local_request_id = %request_id,
+                status = metadata.status.as_u16(),
+                rate_limit_wait_ms = permit_wait.as_millis() as u64,
+                time_to_headers_ms = time_to_headers.as_millis() as u64,
+                elapsed_ms = overall_started.elapsed().as_millis() as u64,
+                "SSE request received response headers"
+            );
+        }
         if response.status().is_success() {
             return Ok(response);
         }
+        let body_started = Instant::now();
         let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
+        if self.inner.config.emit_tracing {
+            warn!(
+                target: "replicant_client::raw::http",
+                event = "http.sse_rejected",
+                method = "GET",
+                path = %path,
+                local_request_id = %request_id,
+                status = metadata.status.as_u16(),
+                response_bytes = bytes.len(),
+                body_read_ms = body_started.elapsed().as_millis() as u64,
+                elapsed_ms = overall_started.elapsed().as_millis() as u64,
+                "SSE request was rejected"
+            );
+        }
         Err(map_status(metadata.status, &bytes, &metadata))
     }
 
@@ -510,39 +557,95 @@ impl Client {
     ) -> Result<RawResponse<T>, Error> {
         let request_id = RequestId::new();
         let bucket = bucket_for(&method, path);
+        let overall_started = Instant::now();
         let mut attempts: u32 = 0;
         loop {
+            let permit_started = Instant::now();
             self.inner.rate_limits.acquire(bucket).await;
+            let permit_wait = permit_started.elapsed();
             attempts += 1;
+            let attempt_started = Instant::now();
+            if self.inner.config.emit_tracing {
+                debug!(
+                    target: "replicant_client::raw::http",
+                    event = "http.request_started",
+                    method = %method,
+                    path,
+                    local_request_id = %request_id,
+                    attempt = attempts,
+                    ?bucket,
+                    ?safety,
+                    authenticated,
+                    rate_limit_wait_ms = permit_wait.as_millis() as u64,
+                    "sending raw HTTP request"
+                );
+            }
             let result = self
-                .send_once::<T>(
-                    &method,
+                .send_once::<T>(RequestAttempt {
+                    method: &method,
                     path,
                     authenticated,
-                    &request_id,
+                    request_id: &request_id,
                     bucket,
-                    body.clone(),
-                )
+                    attempt: attempts,
+                    body: body.clone(),
+                })
                 .await;
+            let attempt_elapsed = attempt_started.elapsed();
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if self.inner.config.emit_tracing {
+                        debug!(
+                            target: "replicant_client::raw::http",
+                            event = "http.request_completed",
+                            method = %method,
+                            path,
+                            local_request_id = %request_id,
+                            server_request_id = response.metadata.request_id.as_deref().unwrap_or(""),
+                            attempt = attempts,
+                            status = response.metadata.status.as_u16(),
+                            attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            elapsed_ms = overall_started.elapsed().as_millis() as u64,
+                            "raw HTTP request completed"
+                        );
+                    }
+                    return Ok(response);
+                }
                 Err(error) if self.should_retry(&error, safety, attempts) => {
                     let delay =
                         retry_delay(&self.inner.config.retry, attempts, error.retry_after());
                     if self.inner.config.emit_tracing {
-                        tracing::debug!(
+                        warn!(
+                            target: "replicant_client::raw::http",
+                            event = "http.request_retry",
+                            method = %method,
                             path,
                             local_request_id = %request_id,
-                            attempts,
-                            delay_ms = delay.as_millis(),
-                            "retrying raw request"
+                            attempt = attempts,
+                            attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            elapsed_ms = overall_started.elapsed().as_millis() as u64,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %error,
+                            "retrying safe raw HTTP request"
                         );
                     }
                     tokio::time::sleep(delay).await;
                 }
                 Err(error) => {
                     if self.inner.config.emit_tracing {
-                        tracing::debug!(path, local_request_id = %request_id, error = %error, "raw request failed");
+                        warn!(
+                            target: "replicant_client::raw::http",
+                            event = "http.request_failed",
+                            method = %method,
+                            path,
+                            local_request_id = %request_id,
+                            attempt = attempts,
+                            attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            elapsed_ms = overall_started.elapsed().as_millis() as u64,
+                            error = %error,
+                            ambiguous = error.is_ambiguous_transport_failure(),
+                            "raw HTTP request failed"
+                        );
                     }
                     return Err(error);
                 }
@@ -560,33 +663,89 @@ impl Client {
 
     async fn send_once<T: DeserializeOwned>(
         &self,
-        method: &Method,
-        path: &str,
-        authenticated: bool,
-        request_id: &RequestId,
-        bucket: RateLimitBucket,
-        body: Option<Vec<u8>>,
+        request: RequestAttempt<'_>,
     ) -> Result<RawResponse<T>, Error> {
+        let RequestAttempt {
+            method,
+            path,
+            authenticated,
+            request_id,
+            bucket,
+            attempt,
+            body,
+        } = request;
+        let total_started = Instant::now();
+        let prepare_started = Instant::now();
         let mut request = self.prepare_request(method.clone(), path, authenticated, request_id)?;
         if let Some(body) = body {
             request = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body);
         }
+        let prepare_elapsed = prepare_started.elapsed();
+
+        let send_started = Instant::now();
         let response = request.send().await.map_err(map_reqwest_error)?;
+        let time_to_headers = send_started.elapsed();
+        let status = response.status();
+        let metadata_started = Instant::now();
         let metadata = self
             .observe_response(bucket, &response, request_id.clone())
             .await;
+        let metadata_elapsed = metadata_started.elapsed();
+
+        let body_started = Instant::now();
         let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
+        let body_elapsed = body_started.elapsed();
         if !metadata.status.is_success() {
+            if self.inner.config.emit_tracing {
+                debug!(
+                    target: "replicant_client::raw::http",
+                    event = "http.response_received",
+                    method = %method,
+                    path,
+                    local_request_id = %request_id,
+                    attempt,
+                    status = status.as_u16(),
+                    response_bytes = bytes.len(),
+                    request_prepare_ms = prepare_elapsed.as_millis() as u64,
+                    time_to_headers_ms = time_to_headers.as_millis() as u64,
+                    metadata_ms = metadata_elapsed.as_millis() as u64,
+                    body_read_ms = body_elapsed.as_millis() as u64,
+                    elapsed_ms = total_started.elapsed().as_millis() as u64,
+                    "received non-success HTTP response"
+                );
+            }
             return Err(map_status(metadata.status, &bytes, &metadata));
         }
+
+        let decode_started = Instant::now();
         let value = serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
             .map_err(|error| Error::Decode {
                 message: error.to_string(),
                 status: Some(metadata.status.as_u16()),
                 source: Some(Box::new(error)),
             })?;
+        let decode_elapsed = decode_started.elapsed();
+        if self.inner.config.emit_tracing {
+            debug!(
+                target: "replicant_client::raw::http",
+                event = "http.response_decoded",
+                method = %method,
+                path,
+                local_request_id = %request_id,
+                attempt,
+                status = status.as_u16(),
+                response_bytes = bytes.len(),
+                request_prepare_ms = prepare_elapsed.as_millis() as u64,
+                time_to_headers_ms = time_to_headers.as_millis() as u64,
+                metadata_ms = metadata_elapsed.as_millis() as u64,
+                body_read_ms = body_elapsed.as_millis() as u64,
+                decode_ms = decode_elapsed.as_millis() as u64,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                "decoded successful HTTP response"
+            );
+        }
         Ok(RawResponse { value, metadata })
     }
 
@@ -632,7 +791,25 @@ impl Client {
         let headers = response.headers();
         let rate_limit = parse_rate_limit(headers, SystemTime::now());
         if let Some(snapshot) = rate_limit.clone() {
-            self.inner.rate_limits.observe(bucket, snapshot).await;
+            if self.inner.config.emit_tracing {
+                debug!(
+                    target: "replicant_client::raw::rate_limit",
+                    event = "rate_limit.observed",
+                    ?bucket,
+                    status = response.status().as_u16(),
+                    local_request_id = %local_request_id,
+                    limit = ?snapshot.limit,
+                    remaining = ?snapshot.remaining,
+                    retry_after_ms = ?snapshot.retry_after.map(|value| value.delay().as_millis() as u64),
+                    reset_delay_ms = ?snapshot.reset.map(|value| value.delay().as_millis() as u64),
+                    delay_enforced = response.status() == StatusCode::TOO_MANY_REQUESTS || snapshot.remaining == Some(0),
+                    "observed server rate-limit metadata"
+                );
+            }
+            self.inner
+                .rate_limits
+                .observe_response(bucket, response.status(), snapshot)
+                .await;
         }
         ResponseMetadata {
             status: response.status(),

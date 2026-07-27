@@ -271,17 +271,30 @@ impl SimulationsGateway {
         Ok(operation)
     }
 
-    /// The account's simulation run history: completed, abandoned, and
-    /// expired runs. Distinct from the live realm's current state.
-    pub async fn history(&self) -> Result<raw::simulations::SimulationHistoryResponse> {
+    /// Refreshes the account's simulation run history. Each returned run is
+    /// committed before this method returns; history is additive and never
+    /// reconciles absence into deletion.
+    pub async fn history(&self) -> Result<Vec<domain::Simulation>> {
         self.client.ensure_open()?;
-        Ok(self
+        let response = self
             .client
             .managed_raw()
             .accounts()
             .simulations()
             .await?
-            .value)
+            .value;
+        let mut simulations = Vec::with_capacity(response.simulations.len());
+        for entry in &response.simulations {
+            let observation =
+                domain::simulation_history(entry, observed_at()).map_err(normalization)?;
+            let value = observation.value.clone();
+            self.client
+                .managed_state()
+                .persist_simulation(observation)
+                .map_err(persistence_error)?;
+            simulations.push(value);
+        }
+        Ok(simulations)
     }
 }
 

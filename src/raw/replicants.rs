@@ -195,7 +195,7 @@ pub struct ReplicantStatus {
 }
 
 /// Request body for `PATCH /v1/replicants/{replicant_code}`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ReplicantUpdateRequest {
     /// New cohort permission level.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +258,7 @@ pub struct ReplicantDevicesQuery {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/message`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct ReplicantMessageRequest {
     /// The channel to broadcast on.
     pub channel: String,
@@ -291,7 +291,7 @@ pub struct ReplicantMessageResponse {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/mine`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct MineRequest {
     /// Notification preferences for this mining operation, open-shaped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,7 +340,7 @@ pub struct MineResponse {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/print`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct PrintRequest {
     /// The print sub-command, if the server requires one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -585,7 +585,7 @@ pub struct StarDetailResponse {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/teleport`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TeleportRequest {
     /// The destination matrix code.
     pub target: String,
@@ -614,7 +614,7 @@ pub struct TeleportResponse {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/transfer`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TransferRequest {
     /// The receiving account or replicant code.
     pub target: String,
@@ -635,7 +635,7 @@ pub struct TransferResponse {
 }
 
 /// Request body for `POST /v1/replicants/{replicant_code}/travel`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TravelRequest {
     /// The destination location or star designation.
     #[serde(skip_serializing_if = "Option::is_none")]

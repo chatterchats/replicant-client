@@ -4,16 +4,20 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use tokio::{
     sync::{Mutex as TokioMutex, watch},
     task::JoinHandle,
 };
+use tracing::{debug, info, warn};
 
 use crate::raw::rate_limit::{RateLimitBucket, RateLimitCoordinator, RateLimitPolicy};
 use crate::{
@@ -23,7 +27,7 @@ use crate::{
 
 use super::{
     state::StateEngine,
-    store::{Store, StoreError, StoreHandle},
+    store::{StoreError, StoreHandle},
 };
 
 /// Controls how much remote work is required before [`Client::ready`] succeeds.
@@ -174,14 +178,99 @@ pub enum ReadinessComponent {
 pub struct Readiness {
     /// Durable local state has been restored.
     pub local_restoration: ReadinessComponent,
+    /// The authenticated account is bound to this durable store.
+    pub account_binding: ReadinessComponent,
     /// The essential REST baseline has committed.
     pub essential_rest: ReadinessComponent,
+    /// The full bounded REST baseline has committed.
+    pub full_rest: ReadinessComponent,
     /// Event-log continuity has been caught up.
     pub event_catchup: ReadinessComponent,
     /// The filtered SSE stream is connected.
     pub sse_connectivity: ReadinessComponent,
     /// Background reconciliation is running without a known failure.
     pub background_reconciliation: ReadinessComponent,
+    /// The durable store is accepting and committing work.
+    pub store_health: ReadinessComponent,
+}
+
+impl Readiness {
+    fn pending() -> Self {
+        Self {
+            local_restoration: ReadinessComponent::Pending,
+            account_binding: ReadinessComponent::Pending,
+            essential_rest: ReadinessComponent::Pending,
+            full_rest: ReadinessComponent::Pending,
+            event_catchup: ReadinessComponent::Pending,
+            sse_connectivity: ReadinessComponent::Pending,
+            background_reconciliation: ReadinessComponent::Pending,
+            store_health: ReadinessComponent::Pending,
+        }
+    }
+
+    /// Returns whether local, durable state can be queried without network I/O.
+    #[must_use]
+    pub fn locally_usable(self) -> bool {
+        matches!(self.local_restoration, ReadinessComponent::Ready)
+            && matches!(self.store_health, ReadinessComponent::Ready)
+    }
+
+    /// Returns whether a component has reported a known limitation.
+    #[must_use]
+    pub fn is_degraded(self) -> bool {
+        [
+            self.local_restoration,
+            self.account_binding,
+            self.essential_rest,
+            self.full_rest,
+            self.event_catchup,
+            self.sse_connectivity,
+            self.background_reconciliation,
+            self.store_health,
+        ]
+        .contains(&ReadinessComponent::Degraded)
+    }
+
+    fn policy_satisfied(self, policy: StartupPolicy) -> bool {
+        self.locally_usable()
+            && match policy {
+                StartupPolicy::RestoreOnly => true,
+                StartupPolicy::Essential => {
+                    matches!(
+                        (
+                            self.account_binding,
+                            self.essential_rest,
+                            self.event_catchup,
+                            self.sse_connectivity
+                        ),
+                        (
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready
+                        )
+                    )
+                }
+                StartupPolicy::Full => {
+                    matches!(
+                        (
+                            self.account_binding,
+                            self.essential_rest,
+                            self.full_rest,
+                            self.event_catchup,
+                            self.sse_connectivity
+                        ),
+                        (
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready,
+                            ReadinessComponent::Ready
+                        )
+                    )
+                }
+            }
+    }
 }
 
 enum Storage {
@@ -332,7 +421,21 @@ impl ClientBuilder {
     /// `Essential` and `Full` bind the authenticated account, then remain
     /// non-ready until their remote synchronization and event engines complete.
     pub async fn start(self) -> Result<Client> {
+        let total_started = Instant::now();
+        info!(
+            target: "replicant_client::client",
+            event = "client.start_started",
+            startup_policy = ?self.startup_policy,
+            "starting managed client"
+        );
+        let raw_started = Instant::now();
         let raw = self.raw.build()?;
+        debug!(
+            target: "replicant_client::client",
+            event = "client.raw_built",
+            elapsed_ms = raw_started.elapsed().as_millis() as u64,
+            "built raw transport"
+        );
         if let Some(policy) = self.read_rate_limit_policy {
             raw.rate_limits()
                 .set_policy(RateLimitBucket::Read, policy)
@@ -345,32 +448,61 @@ impl ClientBuilder {
         }
 
         let (status, _) = watch::channel(ClientStatus::Starting);
+        let (readiness, _) = watch::channel(Readiness::pending());
         status.send_replace(ClientStatus::Restoring);
-        let store = Arc::new(Mutex::new(Some(open_store(&self.storage)?)));
-        let state = match StateEngine::from_store(Arc::clone(&store)) {
+        let store_started = Instant::now();
+        let store = open_store(&self.storage).await?;
+        info!(
+            target: "replicant_client::client",
+            event = "client.store_opened",
+            elapsed_ms = store_started.elapsed().as_millis() as u64,
+            "opened managed SQLite store"
+        );
+        let restore_started = Instant::now();
+        let state = match StateEngine::from_store(store.clone()) {
             Ok(state) => state,
             Err(error) => {
-                close_store(Arc::clone(&store)).await;
+                close_store(store.clone()).await;
                 return Err(store_error(error));
             }
         };
+        info!(
+            target: "replicant_client::client",
+            event = "client.state_restored",
+            elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            "restored durable managed state"
+        );
 
         if self.startup_policy != StartupPolicy::RestoreOnly {
+            let identity_started = Instant::now();
             let account = match account_identity(&raw).await {
                 Ok(account) => account,
                 Err(error) => {
-                    close_store(Arc::clone(&store)).await;
+                    close_store(store.clone()).await;
                     return Err(error);
                 }
             };
+            info!(
+                target: "replicant_client::client",
+                event = "client.account_identity_loaded",
+                elapsed_ms = identity_started.elapsed().as_millis() as u64,
+                "loaded authenticated account identity"
+            );
+            let binding_started = Instant::now();
             let binding = {
-                let mut store = store.lock().expect("store lock poisoned");
+                let mut store = store.lock();
                 store.as_mut().ok_or(Error::Closed)?.bind_account(&account)
             };
             if let Err(error) = binding {
-                close_store(Arc::clone(&store)).await;
+                close_store(store.clone()).await;
                 return Err(store_error(error));
             }
+            info!(
+                target: "replicant_client::client",
+                event = "client.account_bound",
+                elapsed_ms = binding_started.elapsed().as_millis() as u64,
+                "bound durable store to authenticated account"
+            );
         }
 
         // Restart recovery, pure-local half: an operation caught mid-transmission
@@ -379,7 +511,23 @@ impl ClientBuilder {
         // (no network access is required). The network half — retrying
         // operations left at `prepared`, never actually attempted — runs from
         // `events::spawn` once the account and its store binding are settled.
-        let _ = state.promote_crashed_submissions();
+        let recovery_started = Instant::now();
+        if let Err(error) = state.promote_crashed_submissions() {
+            warn!(
+                target: "replicant_client::client",
+                event = "client.crashed_submission_promotion_failed",
+                elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+                error = %error,
+                "could not promote interrupted operation submissions"
+            );
+        } else {
+            debug!(
+                target: "replicant_client::client",
+                event = "client.crashed_submissions_promoted",
+                elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+                "promoted interrupted operation submissions"
+            );
+        }
 
         let scheduler = SchedulerHooks {
             rate_limits: raw.rate_limits().clone(),
@@ -393,15 +541,19 @@ impl ClientBuilder {
             sync: SyncEngine,
             operations: super::operation::OperationEngine::new(),
             lifecycle: Lifecycle::new(),
+            startup_policy: self.startup_policy,
             status,
+            readiness,
         });
         let client = Client { inner };
-        match self.startup_policy {
-            StartupPolicy::RestoreOnly => client.set_status(ClientStatus::Ready),
-            StartupPolicy::Essential => client.set_status(ClientStatus::CatchingUp),
-            StartupPolicy::Full => client.set_status(ClientStatus::Synchronizing),
-        }
+        client.set_readiness(|readiness| {
+            readiness.local_restoration = ReadinessComponent::Ready;
+            readiness.store_health = ReadinessComponent::Ready;
+            readiness.background_reconciliation = ReadinessComponent::Pending;
+            readiness.account_binding = ReadinessComponent::Ready;
+        });
         if self.startup_policy != StartupPolicy::RestoreOnly {
+            let event_spawn_started = Instant::now();
             super::events::spawn(
                 &client,
                 self.startup_policy,
@@ -409,15 +561,30 @@ impl ClientBuilder {
                 self.reconciliation_policy.clone(),
             )
             .await?;
+            debug!(
+                target: "replicant_client::client",
+                event = "client.background_engines_spawned",
+                elapsed_ms = event_spawn_started.elapsed().as_millis() as u64,
+                "spawned managed event and reconciliation engines"
+            );
         }
+        info!(
+            target: "replicant_client::client",
+            event = "client.start_completed",
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            startup_policy = ?self.startup_policy,
+            "managed client started"
+        );
         Ok(client)
     }
 }
 
-fn open_store(storage: &Storage) -> Result<Store> {
+async fn open_store(storage: &Storage) -> Result<StoreHandle> {
     match storage {
-        Storage::File(path) => Store::open_file(path).map_err(store_error),
-        Storage::Memory => Store::open_memory().map_err(store_error),
+        Storage::File(path) => StoreHandle::open_file(path.clone())
+            .await
+            .map_err(store_error),
+        Storage::Memory => StoreHandle::open_memory().await.map_err(store_error),
     }
 }
 
@@ -451,15 +618,7 @@ fn store_error(error: StoreError) -> Error {
 }
 
 async fn close_store(store: StoreHandle) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut store = store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(mut store) = store.take() {
-            let _ = store.flush();
-        }
-    })
-    .await;
+    let _ = store.close().await;
 }
 
 struct SchedulerHooks {
@@ -474,6 +633,10 @@ struct Lifecycle {
     closed: AtomicBool,
     tasks: TokioMutex<Vec<JoinHandle<()>>>,
     completion: watch::Sender<Option<CloseCompletion>>,
+    #[cfg(test)]
+    close_timeout_millis: AtomicU64,
+    #[cfg(test)]
+    shutdown_timeouts: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -491,6 +654,10 @@ impl Lifecycle {
             closed: AtomicBool::new(false),
             tasks: TokioMutex::new(Vec::new()),
             completion,
+            #[cfg(test)]
+            close_timeout_millis: AtomicU64::new(1_000),
+            #[cfg(test)]
+            shutdown_timeouts: AtomicUsize::new(0),
         }
     }
 
@@ -522,16 +689,38 @@ impl Lifecycle {
         }
     }
 
-    async fn close(&self) {
+    async fn close(&self) -> bool {
         self.stop_accepting();
         let tasks = std::mem::take(&mut *self.tasks.lock().await);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        #[cfg(test)]
+        let timeout = Duration::from_millis(self.close_timeout_millis.load(Ordering::Acquire));
+        #[cfg(not(test))]
+        let timeout = Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut timed_out = false;
         for mut task in tasks {
             if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                timed_out = true;
+                #[cfg(test)]
+                self.shutdown_timeouts.fetch_add(1, Ordering::AcqRel);
                 task.abort();
                 let _ = task.await;
             }
         }
+        timed_out
+    }
+
+    #[cfg(test)]
+    fn set_close_timeout_for_test(&self, timeout: Duration) {
+        self.close_timeout_millis.store(
+            timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    fn shutdown_timeouts_for_test(&self) -> usize {
+        self.shutdown_timeouts.load(Ordering::Acquire)
     }
 
     async fn completion(&self) -> Result<()> {
@@ -572,7 +761,9 @@ struct ClientInner {
     sync: SyncEngine,
     operations: super::operation::OperationEngine,
     lifecycle: Lifecycle,
+    startup_policy: StartupPolicy,
     status: watch::Sender<ClientStatus>,
+    readiness: watch::Sender<Readiness>,
 }
 
 /// Cheaply cloneable managed client. Every clone owns the same lifecycle.
@@ -639,6 +830,12 @@ impl Client {
     #[must_use]
     pub fn directory(&self) -> super::gateways::DirectoryGateway {
         super::gateways::DirectoryGateway::new(self.clone())
+    }
+
+    /// Durable global catalogue and per-replicant star-knowledge reads.
+    #[must_use]
+    pub fn galaxy(&self) -> super::galaxy::GalaxyGateway {
+        super::galaxy::GalaxyGateway::new(self.clone())
     }
 
     /// Builds a synchronization request using this managed client.
@@ -744,6 +941,22 @@ impl Client {
         self.inner.status.borrow().clone()
     }
 
+    /// Returns whether the configured startup policy has completed.
+    #[must_use]
+    pub fn startup_policy_satisfied(&self) -> bool {
+        self.readiness().policy_satisfied(self.inner.startup_policy)
+    }
+
+    /// Returns whether every currently tracked health component is ready.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.startup_policy_satisfied()
+            && matches!(
+                self.readiness().background_reconciliation,
+                ReadinessComponent::Ready
+            )
+    }
+
     /// Watches lifecycle changes shared by all clones.
     #[must_use]
     pub fn watch_status(&self) -> watch::Receiver<ClientStatus> {
@@ -753,53 +966,7 @@ impl Client {
     /// Returns the components that currently make up the public status.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
-        match self.status() {
-            ClientStatus::Starting | ClientStatus::Restoring => Readiness {
-                local_restoration: ReadinessComponent::Pending,
-                essential_rest: ReadinessComponent::Pending,
-                event_catchup: ReadinessComponent::Pending,
-                sse_connectivity: ReadinessComponent::Pending,
-                background_reconciliation: ReadinessComponent::Pending,
-            },
-            ClientStatus::Ready => Readiness {
-                local_restoration: ReadinessComponent::Ready,
-                essential_rest: ReadinessComponent::Ready,
-                event_catchup: ReadinessComponent::Ready,
-                sse_connectivity: ReadinessComponent::Ready,
-                background_reconciliation: ReadinessComponent::Ready,
-            },
-            ClientStatus::Degraded(ClientDegradation::StartupIncomplete) => Readiness {
-                local_restoration: ReadinessComponent::Ready,
-                essential_rest: ReadinessComponent::Degraded,
-                event_catchup: ReadinessComponent::Degraded,
-                sse_connectivity: ReadinessComponent::Degraded,
-                background_reconciliation: ReadinessComponent::Pending,
-            },
-            ClientStatus::Degraded(ClientDegradation::EventContinuity) => Readiness {
-                local_restoration: ReadinessComponent::Ready,
-                essential_rest: ReadinessComponent::Ready,
-                event_catchup: ReadinessComponent::Degraded,
-                sse_connectivity: ReadinessComponent::Pending,
-                background_reconciliation: ReadinessComponent::Pending,
-            },
-            ClientStatus::Closing | ClientStatus::Closed => Readiness {
-                local_restoration: ReadinessComponent::Degraded,
-                essential_rest: ReadinessComponent::Degraded,
-                event_catchup: ReadinessComponent::Degraded,
-                sse_connectivity: ReadinessComponent::Degraded,
-                background_reconciliation: ReadinessComponent::Degraded,
-            },
-            ClientStatus::CatchingUp
-            | ClientStatus::Synchronizing
-            | ClientStatus::Connecting
-            | ClientStatus::Offline => Readiness {
-                local_restoration: ReadinessComponent::Ready,
-                essential_rest: ReadinessComponent::Pending,
-                event_catchup: ReadinessComponent::Pending,
-                sse_connectivity: ReadinessComponent::Pending,
-                background_reconciliation: ReadinessComponent::Pending,
-            },
-        }
+        *self.inner.readiness.borrow()
     }
 
     /// Waits until restored local state can be queried, even if remote work is degraded.
@@ -840,27 +1007,91 @@ impl Client {
             return self.inner.lifecycle.completion().await;
         }
 
+        let close_started = Instant::now();
         self.set_status(ClientStatus::Closing);
-        self.inner.lifecycle.close().await;
-        let store = Arc::clone(&self.inner.store);
-        let result = tokio::task::spawn_blocking(move || {
-            let mut store = store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match store.take() {
-                Some(mut store) => store.flush().map_err(store_error),
-                None => Ok(()),
-            }
-        })
-        .await
-        .map_err(|_| Error::Closed)?;
+        info!(
+            target: "replicant_client::client",
+            event = "client.close_started",
+            "closing managed client"
+        );
+        let workers_started = Instant::now();
+        let timed_out = self.inner.lifecycle.close().await;
+        info!(
+            target: "replicant_client::client",
+            event = "client.workers_stopped",
+            elapsed_ms = workers_started.elapsed().as_millis() as u64,
+            timed_out,
+            "managed background workers stopped"
+        );
+        let store_started = Instant::now();
+        let result = self.inner.store.close().await.map_err(store_error);
         self.set_status(ClientStatus::Closed);
         self.inner.lifecycle.finish(&result);
+        info!(
+            target: "replicant_client::client",
+            event = "client.close_completed",
+            elapsed_ms = close_started.elapsed().as_millis() as u64,
+            store_close_ms = store_started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "managed client closed"
+        );
         result
     }
 
     pub(crate) fn set_status(&self, status: ClientStatus) {
+        debug!(
+            target: "replicant_client::client",
+            event = "client.status_changed",
+            ?status,
+            "managed client status changed"
+        );
         self.inner.status.send_replace(status);
+    }
+
+    pub(crate) fn set_readiness(&self, update: impl FnOnce(&mut Readiness)) {
+        let had_live_connection =
+            matches!(self.status(), ClientStatus::Ready | ClientStatus::Offline);
+        self.inner.readiness.send_modify(update);
+        if !matches!(self.status(), ClientStatus::Closing | ClientStatus::Closed) {
+            self.set_status(self.derived_status(had_live_connection));
+        }
+    }
+
+    fn derived_status(&self, had_live_connection: bool) -> ClientStatus {
+        let readiness = self.readiness();
+        if !readiness.locally_usable()
+            || matches!(readiness.account_binding, ReadinessComponent::Degraded)
+            || matches!(readiness.essential_rest, ReadinessComponent::Degraded)
+            || matches!(readiness.full_rest, ReadinessComponent::Degraded)
+        {
+            return ClientStatus::Degraded(ClientDegradation::StartupIncomplete);
+        }
+        if matches!(readiness.event_catchup, ReadinessComponent::Degraded) {
+            return ClientStatus::Degraded(ClientDegradation::EventContinuity);
+        }
+        if matches!(readiness.sse_connectivity, ReadinessComponent::Degraded) {
+            return if had_live_connection {
+                ClientStatus::Offline
+            } else {
+                ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
+            };
+        }
+        if readiness.policy_satisfied(self.inner.startup_policy) {
+            return ClientStatus::Ready;
+        }
+        match self.inner.startup_policy {
+            StartupPolicy::RestoreOnly => ClientStatus::Ready,
+            StartupPolicy::Essential => ClientStatus::CatchingUp,
+            StartupPolicy::Full => {
+                if matches!(readiness.full_rest, ReadinessComponent::Pending) {
+                    ClientStatus::Synchronizing
+                } else if matches!(readiness.event_catchup, ReadinessComponent::Pending) {
+                    ClientStatus::CatchingUp
+                } else {
+                    ClientStatus::Connecting
+                }
+            }
+        }
     }
 
     /// Registers a background lifecycle task (event catch-up, SSE, durable
@@ -906,6 +1137,7 @@ mod tests {
         AccessScope, Device, DeviceKey, DeviceRelationships, DeviceStatus, DeviceType, Observation,
         ObservationAuthority, ObservationMetadata, ObservationSource, Reachability, SourceDocument,
     };
+    use crate::managed::store::Store;
 
     async fn restored_client() -> Client {
         Client::builder()
@@ -914,6 +1146,40 @@ mod tests {
             .start()
             .await
             .expect("restore-only startup")
+    }
+
+    #[tokio::test]
+    async fn readiness_components_prevent_sse_from_erasing_a_failed_baseline() {
+        let client = restored_client().await;
+        client.set_readiness(|readiness| {
+            readiness.essential_rest = ReadinessComponent::Degraded;
+            readiness.sse_connectivity = ReadinessComponent::Ready;
+        });
+
+        assert_eq!(
+            client.status(),
+            ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
+        );
+        client.close().await.expect("close");
+    }
+
+    #[test]
+    fn startup_policies_have_distinct_completion_requirements() {
+        let mut readiness = Readiness::pending();
+        readiness.local_restoration = ReadinessComponent::Ready;
+        readiness.store_health = ReadinessComponent::Ready;
+        assert!(readiness.policy_satisfied(StartupPolicy::RestoreOnly));
+        assert!(!readiness.policy_satisfied(StartupPolicy::Essential));
+
+        readiness.account_binding = ReadinessComponent::Ready;
+        readiness.essential_rest = ReadinessComponent::Ready;
+        readiness.event_catchup = ReadinessComponent::Ready;
+        readiness.sse_connectivity = ReadinessComponent::Ready;
+        assert!(readiness.policy_satisfied(StartupPolicy::Essential));
+        assert!(!readiness.policy_satisfied(StartupPolicy::Full));
+
+        readiness.full_rest = ReadinessComponent::Ready;
+        assert!(readiness.policy_satisfied(StartupPolicy::Full));
     }
 
     fn test_path() -> PathBuf {
@@ -1005,6 +1271,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_timeout_aborts_only_the_stuck_task_and_closes_the_store() {
+        let client = restored_client().await;
+        let (graceful_sender, graceful_receiver) = oneshot::channel();
+        client
+            .register_task(tokio::spawn(async move {
+                let _ = graceful_sender.send(());
+            }))
+            .await
+            .expect("register graceful worker");
+        client
+            .register_task(tokio::spawn(pending::<()>()))
+            .await
+            .expect("register stuck worker");
+        client
+            .inner
+            .lifecycle
+            .set_close_timeout_for_test(Duration::ZERO);
+
+        client.close().await.expect("timeout shutdown");
+        assert_eq!(client.inner.lifecycle.shutdown_timeouts_for_test(), 1);
+        graceful_receiver.await.expect("graceful worker completed");
+        assert!(matches!(
+            client
+                .inner
+                .store
+                .execute(|_| Ok::<_, StoreError>(()))
+                .await,
+            Err(StoreError::Closed)
+        ));
+        assert_eq!(client.status(), ClientStatus::Closed);
+    }
+
+    #[tokio::test]
     async fn closing_rejects_new_work_before_store_shutdown() {
         let client = restored_client().await;
         client.inner.lifecycle.stop_accepting();
@@ -1043,15 +1342,15 @@ mod tests {
     #[tokio::test]
     async fn restoration_completes_before_restore_only_readiness() {
         let path = test_path();
-        let store = Arc::new(Mutex::new(Some(
-            Store::open_file(&path).expect("open store"),
-        )));
-        let state = StateEngine::from_store(Arc::clone(&store)).expect("restore state engine");
+        let store = StoreHandle::open_file(path.clone())
+            .await
+            .expect("open store");
+        let state = StateEngine::from_store(store.clone()).expect("restore state engine");
         state
             .persist_devices(&[device("restored")])
             .expect("persist device");
         drop(state);
-        close_store(Arc::clone(&store)).await;
+        close_store(store.clone()).await;
 
         let client = Client::builder()
             .sqlite(&path)

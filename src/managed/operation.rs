@@ -31,13 +31,17 @@
 //! operation whose caller-supplied payload looks like it carries credentials,
 //! which matters most for [`DynamicCommand`]'s free-form arguments.
 
-use std::time::Duration;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::{Duration, Instant},
+};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::domain::{self, DeviceId, DeviceKey, OperationId};
+use crate::domain::{self, DeviceId, DeviceKey, LocationId, LocationKey, OperationId, Realm};
 use crate::error::Error;
 use crate::raw;
 use crate::{Client, Result};
@@ -56,22 +60,311 @@ fn to_value<T: Serialize>(value: T) -> Result<Value> {
     })
 }
 
-fn str_field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Operation {
-            message: format!("operation intent is missing path field `{key}`"),
-        })
+/// The single internal mutation contract.  Its variants are deliberately
+/// request-shaped: replay decodes the durable intent back into the exact
+/// request type accepted by the corresponding raw endpoint.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MutationAdapter {
+    AccountUpdate {
+        request: raw::accounts::AccountUpdateRequest,
+    },
+    AccountWipe,
+    DeviceConfigure {
+        device_code: String,
+        request: raw::devices::DeviceConfigurationRequest,
+    },
+    DeviceCommand {
+        device_code: String,
+        command: raw::devices::DeviceCommand,
+    },
+    DeviceDynamicCommand {
+        device_code: String,
+        command: raw::JsonObject,
+    },
+    DeviceGrantPermission {
+        device_code: String,
+        request: raw::JsonObject,
+    },
+    DeviceRevokePermission {
+        device_code: String,
+    },
+    DeviceEnterSimulation {
+        device_code: String,
+        request: raw::simulations::SimulationEnterRequest,
+    },
+    DeviceAbandonSimulation {
+        device_code: String,
+        simulation_id: i64,
+    },
+    DeviceCreateTrade {
+        device_code: String,
+        request: raw::JsonObject,
+    },
+    DeviceDeleteTrade {
+        device_code: String,
+        trade_code: String,
+    },
+    DeviceFulfillTrade {
+        device_code: String,
+        trade_code: String,
+    },
+    LocationContribute {
+        designation: String,
+        request: raw::locations::LocationContributionRequest,
+    },
+    LocationEventResolve {
+        location_code: String,
+        designation: String,
+    },
+    MessagesMarkRead {
+        request: raw::messages::MessagesReadRequest,
+    },
+    ReplicantUpdate {
+        replicant_code: String,
+        request: raw::replicants::ReplicantUpdateRequest,
+    },
+    ReplicantMessage {
+        replicant_code: String,
+        request: raw::replicants::ReplicantMessageRequest,
+    },
+    ReplicantMine {
+        replicant_code: String,
+        request: raw::replicants::MineRequest,
+    },
+    ReplicantStopMining {
+        replicant_code: String,
+    },
+    ReplicantPrint {
+        replicant_code: String,
+        request: raw::replicants::PrintRequest,
+    },
+    ReplicantScan {
+        replicant_code: String,
+    },
+    ReplicantTeleport {
+        replicant_code: String,
+        request: raw::replicants::TeleportRequest,
+    },
+    ReplicantTransfer {
+        replicant_code: String,
+        request: raw::replicants::TransferRequest,
+    },
+    ReplicantTravel {
+        replicant_code: String,
+        request: raw::replicants::TravelRequest,
+    },
+    ReplicantCancelTravel {
+        replicant_code: String,
+    },
 }
 
-fn i64_field(value: &Value, key: &str) -> Result<i64> {
-    value
-        .get(key)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| Error::Operation {
-            message: format!("operation intent is missing path field `{key}`"),
-        })
+/// Internal contract shared by durable managed operations and the typed raw
+/// endpoint methods.  There is intentionally no generic method/path/body
+/// escape hatch: adding a mutation requires one explicit enum variant.
+trait TypedMutationAdapter {
+    fn operation_id(&self) -> &'static str;
+    fn safety(&self) -> raw::RequestSafety;
+    fn target(&self) -> Option<(&'static str, String)>;
+    fn expects_evidence(&self) -> bool;
+    fn rate_limit_bucket(&self) -> &'static str;
+    fn durable_intent(&self) -> Result<Value>;
+    async fn submit(&self, raw: &raw::Client) -> Result<Value>;
+}
+
+impl TypedMutationAdapter for MutationAdapter {
+    fn operation_id(&self) -> &'static str {
+        match self {
+            Self::AccountUpdate { .. } => "account_update",
+            Self::AccountWipe => "account_wipe",
+            Self::DeviceConfigure { .. } => "device_configure",
+            Self::DeviceCommand { .. } => "device_command",
+            Self::DeviceDynamicCommand { .. } => "device_dynamic_command",
+            Self::DeviceGrantPermission { .. } => "device_grant_permission",
+            Self::DeviceRevokePermission { .. } => "device_revoke_permission",
+            Self::DeviceEnterSimulation { .. } => "device_enter_simulation",
+            Self::DeviceAbandonSimulation { .. } => "device_abandon_simulation",
+            Self::DeviceCreateTrade { .. } => "device_create_trade",
+            Self::DeviceDeleteTrade { .. } => "device_delete_trade",
+            Self::DeviceFulfillTrade { .. } => "device_fulfill_trade",
+            Self::LocationContribute { .. } => "location_contribute",
+            Self::LocationEventResolve { .. } => "location_event_resolve",
+            Self::MessagesMarkRead { .. } => "messages_mark_read",
+            Self::ReplicantUpdate { .. } => "replicant_update",
+            Self::ReplicantMessage { .. } => "replicant_message",
+            Self::ReplicantMine { .. } => "replicant_mine",
+            Self::ReplicantStopMining { .. } => "replicant_stop_mining",
+            Self::ReplicantPrint { .. } => "replicant_print",
+            Self::ReplicantScan { .. } => "replicant_scan",
+            Self::ReplicantTeleport { .. } => "replicant_teleport",
+            Self::ReplicantTransfer { .. } => "replicant_transfer",
+            Self::ReplicantTravel { .. } => "replicant_travel",
+            Self::ReplicantCancelTravel { .. } => "replicant_cancel_travel",
+        }
+    }
+
+    fn safety(&self) -> raw::RequestSafety {
+        raw::RequestSafety::Mutating
+    }
+
+    fn target(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::AccountUpdate { .. } | Self::AccountWipe => Some(("account", String::new())),
+            Self::DeviceConfigure { device_code, .. }
+            | Self::DeviceCommand { device_code, .. }
+            | Self::DeviceDynamicCommand { device_code, .. }
+            | Self::DeviceGrantPermission { device_code, .. }
+            | Self::DeviceRevokePermission { device_code }
+            | Self::DeviceEnterSimulation { device_code, .. }
+            | Self::DeviceCreateTrade { device_code, .. }
+            | Self::DeviceDeleteTrade { device_code, .. }
+            | Self::DeviceFulfillTrade { device_code, .. } => Some(("device", device_code.clone())),
+            Self::DeviceAbandonSimulation { simulation_id, .. } => {
+                Some(("simulation", simulation_id.to_string()))
+            }
+            Self::LocationContribute { designation, .. } => Some(("location", designation.clone())),
+            Self::LocationEventResolve { location_code, .. } => {
+                Some(("location", location_code.clone()))
+            }
+            Self::MessagesMarkRead { .. } => None,
+            Self::ReplicantUpdate { replicant_code, .. }
+            | Self::ReplicantMessage { replicant_code, .. }
+            | Self::ReplicantMine { replicant_code, .. }
+            | Self::ReplicantStopMining { replicant_code }
+            | Self::ReplicantPrint { replicant_code, .. }
+            | Self::ReplicantScan { replicant_code }
+            | Self::ReplicantTeleport { replicant_code, .. }
+            | Self::ReplicantTransfer { replicant_code, .. }
+            | Self::ReplicantTravel { replicant_code, .. }
+            | Self::ReplicantCancelTravel { replicant_code } => {
+                Some(("replicant", replicant_code.clone()))
+            }
+        }
+    }
+
+    fn expects_evidence(&self) -> bool {
+        match self {
+            Self::DeviceCommand { command, .. } => device_command_expects_evidence(command),
+            Self::DeviceDynamicCommand { .. }
+            | Self::ReplicantPrint { .. }
+            | Self::ReplicantTeleport { .. }
+            | Self::ReplicantTravel { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn rate_limit_bucket(&self) -> &'static str {
+        self.operation_id()
+    }
+
+    fn durable_intent(&self) -> Result<Value> {
+        let intent = to_value(self)?;
+        ensure_no_secrets(&intent)?;
+        Ok(intent)
+    }
+
+    async fn submit(&self, raw: &raw::Client) -> Result<Value> {
+        macro_rules! response {
+            ($call:expr) => {{
+                // Calling the raw method performs the endpoint-specific
+                // typed response decode before this operation advances.
+                // Endpoints without a snapshot response reconcile before
+                // terminal completion below.
+                let decoded = $call.await?.value;
+                drop(decoded);
+                Ok(Value::Null)
+            }};
+        }
+        match self {
+            Self::AccountUpdate { request } => response!(raw.accounts().update(request)),
+            Self::AccountWipe => response!(raw.accounts().request_destructive_wipe()),
+            Self::DeviceConfigure {
+                device_code,
+                request,
+            } => response!(raw.devices().configure(device_code, request)),
+            Self::DeviceCommand {
+                device_code,
+                command,
+            } => response!(raw.devices().command(device_code, command)),
+            Self::DeviceDynamicCommand {
+                device_code,
+                command,
+            } => response!(raw.devices().command(device_code, command)),
+            Self::DeviceGrantPermission {
+                device_code,
+                request,
+            } => response!(raw.devices().grant_permission(device_code, request)),
+            Self::DeviceRevokePermission { device_code } => {
+                response!(raw.devices().revoke_permission(device_code))
+            }
+            Self::DeviceEnterSimulation {
+                device_code,
+                request,
+            } => to_value(raw.simulations().enter(device_code, request).await?.value),
+            Self::DeviceAbandonSimulation {
+                device_code,
+                simulation_id,
+            } => response!(raw.simulations().cancel(device_code, *simulation_id)),
+            Self::DeviceCreateTrade {
+                device_code,
+                request,
+            } => response!(raw.trading().create(device_code, request)),
+            Self::DeviceDeleteTrade {
+                device_code,
+                trade_code,
+            } => response!(raw.trading().delete(device_code, trade_code)),
+            Self::DeviceFulfillTrade {
+                device_code,
+                trade_code,
+            } => response!(raw.trading().fulfill(device_code, trade_code)),
+            Self::LocationContribute {
+                designation,
+                request,
+            } => response!(raw.locations().contribute(designation, request)),
+            Self::LocationEventResolve {
+                location_code,
+                designation,
+            } => response!(raw.location_events().resolve(location_code, designation)),
+            Self::MessagesMarkRead { request } => response!(raw.messages().mark_read(request)),
+            Self::ReplicantUpdate {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().update(replicant_code, request)),
+            Self::ReplicantMessage {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().message(replicant_code, request)),
+            Self::ReplicantMine {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().mine(replicant_code, request)),
+            Self::ReplicantStopMining { replicant_code } => {
+                response!(raw.replicants().stop_mining(replicant_code))
+            }
+            Self::ReplicantPrint {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().print(replicant_code, request)),
+            Self::ReplicantScan { replicant_code } => {
+                response!(raw.replicants().scan(replicant_code))
+            }
+            Self::ReplicantTeleport {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().teleport(replicant_code, request)),
+            Self::ReplicantTransfer {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().transfer(replicant_code, request)),
+            Self::ReplicantTravel {
+                replicant_code,
+                request,
+            } => response!(raw.replicants().travel(replicant_code, request)),
+            Self::ReplicantCancelTravel { replicant_code } => {
+                response!(raw.replicants().cancel_travel(replicant_code))
+            }
+        }
+    }
 }
 
 /// Refuses gameplay request payloads shaped like they carry authentication
@@ -500,15 +793,7 @@ impl MessagesGateway {
         &self,
         request: raw::messages::MessagesReadRequest,
     ) -> Result<Operation> {
-        create(
-            &self.client,
-            "messages_mark_read",
-            None,
-            Value::Null,
-            to_value(request)?,
-            false,
-        )
-        .await
+        create(&self.client, MutationAdapter::MessagesMarkRead { request }).await
     }
 }
 
@@ -523,18 +808,391 @@ impl LocationsGateway {
         Self { client }
     }
 
+    /// Returns a committed live-realm location without network I/O.
+    #[must_use]
+    pub fn cached(&self, designation: &str) -> Option<domain::Location> {
+        self.client
+            .managed_state()
+            .location(&LocationKey::live(LocationId::from(designation)))
+            .map(|observation| observation.value)
+    }
+
+    /// Starts a local-only query over committed location state.
+    #[must_use]
+    pub fn find(&self) -> super::gateways::LocationQuery {
+        super::gateways::LocationQuery::new(self.client.clone())
+    }
+
+    /// Fetches, normalizes, commits, and publishes one location before returning it.
+    pub async fn get(&self, designation: &str) -> Result<domain::Location> {
+        self.client.ensure_open()?;
+        let response = self
+            .client
+            .managed_raw()
+            .locations()
+            .get(designation, None)
+            .await?;
+        let observation = domain::location_detail(
+            &response.value,
+            Realm::Live,
+            crate::domain::ObservationTime::now(),
+        )
+        .map_err(|error| Error::Decode {
+            message: error.to_string(),
+            status: None,
+            source: None,
+        })?;
+        let value = observation.value.clone();
+        self.client
+            .managed_state()
+            .persist_location(observation)
+            .map_err(persistence_error)?;
+        Ok(self.cached(designation).unwrap_or(value))
+    }
+
+    /// Alias for [`Self::get`]; remote I/O remains explicit.
+    pub async fn refresh(&self, designation: &str) -> Result<domain::Location> {
+        self.get(designation).await
+    }
+
     /// Contributes devices' resources toward a location's active
     /// megastructure or location event.
     pub async fn contribute(&self, designation: &str, devices: Vec<String>) -> Result<Operation> {
         create(
             &self.client,
-            "location_contribute",
-            Some(("location", designation.to_string())),
-            serde_json::json!({ "designation": designation }),
-            to_value(raw::locations::LocationContributionRequest { devices })?,
-            false,
+            MutationAdapter::LocationContribute {
+                designation: designation.to_owned(),
+                request: raw::locations::LocationContributionRequest { devices },
+            },
         )
         .await
+    }
+
+    /// Builds an explicit, safe-read-only traversal of one explored system.
+    #[must_use]
+    pub fn hydrate_system(&self, star_designation: impl Into<String>) -> LocationHydration {
+        LocationHydration {
+            client: self.client.clone(),
+            root: star_designation.into(),
+            max_locations: 4096,
+            max_depth: 64,
+            concurrency: 1,
+        }
+    }
+}
+
+/// One location that could not be fetched during a hydration run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocationHydrationFailure {
+    /// The requested location designation.
+    pub designation: String,
+    /// Sanitized request or decoding failure.
+    pub message: String,
+}
+
+/// Durable progress from a safe system-hydration traversal.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocationHydrationReport {
+    locations_committed: usize,
+    maximum_reached: bool,
+    failures: Vec<LocationHydrationFailure>,
+    unknown_designations: BTreeSet<String>,
+}
+impl LocationHydrationReport {
+    /// Successful location details committed before completion.
+    #[must_use]
+    pub fn locations_committed(&self) -> usize {
+        self.locations_committed
+    }
+    /// Whether configured depth or location bounds stopped traversal.
+    #[must_use]
+    pub fn maximum_reached(&self) -> bool {
+        self.maximum_reached
+    }
+    /// Per-location failures that preserve earlier committed observations.
+    #[must_use]
+    pub fn failures(&self) -> &[LocationHydrationFailure] {
+        &self.failures
+    }
+    /// Documented child objects that lacked an identity field.
+    #[must_use]
+    pub fn unknown_designations(&self) -> &BTreeSet<String> {
+        &self.unknown_designations
+    }
+}
+
+/// Configures recursive hydration.  It never constructs a designation from a
+/// count or naming convention; only designations present in documented fields
+/// are queued.
+#[derive(Clone, Debug)]
+pub struct LocationHydration {
+    client: Client,
+    root: String,
+    max_locations: usize,
+    max_depth: usize,
+    concurrency: usize,
+}
+impl LocationHydration {
+    /// Selects every documented designation-bearing child collection.
+    #[must_use]
+    pub fn all_known_objects(self) -> Self {
+        self
+    }
+    /// Sets the maximum number of unique location requests.
+    #[must_use]
+    pub fn max_locations(mut self, value: usize) -> Self {
+        self.max_locations = value.max(1);
+        self
+    }
+    /// Sets the maximum parent-to-child traversal depth.
+    #[must_use]
+    pub fn max_depth(mut self, value: usize) -> Self {
+        self.max_depth = value;
+        self
+    }
+    /// Limits in-flight safe reads.  The current commit-before-next pipeline
+    /// intentionally uses one request, which is within every requested bound.
+    #[must_use]
+    pub fn concurrency(mut self, value: usize) -> Self {
+        self.concurrency = value.max(1);
+        self
+    }
+    /// Runs the safe-read traversal, committing each successful detail.
+    pub async fn run(self) -> Result<LocationHydrationReport> {
+        self.client.ensure_open()?;
+        let total_started = Instant::now();
+        info!(
+            target: "replicant_client::locations",
+            event = "locations.hydration_started",
+            root = %self.root,
+            max_locations = self.max_locations,
+            max_depth = self.max_depth,
+            configured_concurrency = self.concurrency,
+            effective_concurrency = 1_u8,
+            "starting explored-system location hydration"
+        );
+        if self.concurrency > 1 {
+            warn!(
+                target: "replicant_client::locations",
+                event = "locations.hydration_concurrency_not_applied",
+                configured_concurrency = self.concurrency,
+                effective_concurrency = 1_u8,
+                "location hydration currently uses a serial commit-before-next pipeline"
+            );
+        }
+        let mut queue = VecDeque::from([(self.root.clone(), 0_usize)]);
+        let mut seen = BTreeSet::new();
+        let mut report = LocationHydrationReport::default();
+        while let Some((designation, depth)) = queue.pop_front() {
+            if !seen.insert(designation.clone()) {
+                debug!(
+                    target: "replicant_client::locations",
+                    event = "locations.hydration_duplicate_skipped",
+                    designation = %designation,
+                    depth,
+                    "skipping already-seen location"
+                );
+                continue;
+            }
+            if seen.len() > self.max_locations {
+                report.maximum_reached = true;
+                warn!(
+                    target: "replicant_client::locations",
+                    event = "locations.hydration_location_bound_reached",
+                    root = %self.root,
+                    max_locations = self.max_locations,
+                    seen = seen.len(),
+                    "location hydration reached its configured object bound"
+                );
+                break;
+            }
+            if depth > self.max_depth {
+                report.maximum_reached = true;
+                warn!(
+                    target: "replicant_client::locations",
+                    event = "locations.hydration_depth_bound_reached",
+                    designation = %designation,
+                    depth,
+                    max_depth = self.max_depth,
+                    "location hydration skipped object beyond configured depth"
+                );
+                continue;
+            }
+
+            let item_started = Instant::now();
+            debug!(
+                target: "replicant_client::locations",
+                event = "locations.hydration_location_started",
+                designation = %designation,
+                depth,
+                queue_remaining = queue.len(),
+                seen = seen.len(),
+                "fetching location detail during system hydration"
+            );
+            let request_started = Instant::now();
+            let response = match self
+                .client
+                .managed_raw()
+                .locations()
+                .get(&designation, None)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(
+                        target: "replicant_client::locations",
+                        event = "locations.hydration_location_failed",
+                        designation = %designation,
+                        depth,
+                        elapsed_ms = item_started.elapsed().as_millis() as u64,
+                        error = %error,
+                        "location detail request failed during system hydration"
+                    );
+                    report.failures.push(LocationHydrationFailure {
+                        designation,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let request_elapsed = request_started.elapsed();
+            let normalize_started = Instant::now();
+            let observation = domain::location_detail(
+                &response.value,
+                Realm::Live,
+                crate::domain::ObservationTime::now(),
+            )
+            .map_err(|error| Error::Decode {
+                message: error.to_string(),
+                status: None,
+                source: None,
+            })?;
+            let normalize_elapsed = normalize_started.elapsed();
+            let persist_started = Instant::now();
+            self.client
+                .managed_state()
+                .persist_location(observation)
+                .map_err(persistence_error)?;
+            let persist_elapsed = persist_started.elapsed();
+            report.locations_committed += 1;
+
+            let extract_started = Instant::now();
+            let children =
+                verified_child_designations(&response.value, &mut report.unknown_designations);
+            let child_count = children.len();
+            for child in children {
+                if !seen.contains(&child) {
+                    queue.push_back((child, depth + 1));
+                }
+            }
+            info!(
+                target: "replicant_client::locations",
+                event = "locations.hydration_location_completed",
+                designation = %designation,
+                depth,
+                children = child_count,
+                queue_size = queue.len(),
+                committed_total = report.locations_committed,
+                request_ms = request_elapsed.as_millis() as u64,
+                normalize_ms = normalize_elapsed.as_millis() as u64,
+                persist_ms = persist_elapsed.as_millis() as u64,
+                child_extract_ms = extract_started.elapsed().as_millis() as u64,
+                elapsed_ms = item_started.elapsed().as_millis() as u64,
+                "location detail committed during system hydration"
+            );
+        }
+        info!(
+            target: "replicant_client::locations",
+            event = "locations.hydration_completed",
+            root = %self.root,
+            locations_committed = report.locations_committed,
+            failures = report.failures.len(),
+            unknown_designations = report.unknown_designations.len(),
+            maximum_reached = report.maximum_reached,
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            "explored-system location hydration completed"
+        );
+        Ok(report)
+    }
+}
+
+fn object_designation(value: &raw::JsonObject) -> Option<String> {
+    ["designation", "location", "code"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn verified_child_designations(
+    location: &raw::locations::Location,
+    unknown: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let mut result = BTreeSet::new();
+    let mut add = |object: &raw::JsonObject| {
+        if let Some(designation) = object_designation(object) {
+            result.insert(designation);
+        } else {
+            unknown.insert("documented child without designation".into());
+        }
+    };
+    for items in [
+        &location.planets,
+        &location.moons,
+        &location.system_objects,
+        &location.devices,
+        &location.resource_sites,
+        &location.shops,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for item in items {
+            add(item);
+        }
+    }
+    for object in [
+        &location.asteroid_belt,
+        &location.kuiper,
+        &location.lagrange,
+        &location.oort,
+        &location.outer_system,
+        &location.object,
+        &location.star,
+        &location.belt,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        add(object);
+    }
+    if let Some(parent) = &location.parent {
+        result.insert(parent.clone());
+    }
+    result.into_iter().collect()
+}
+
+#[cfg(test)]
+mod location_hydration_tests {
+    use super::*;
+
+    #[test]
+    fn child_extraction_uses_documented_designations_not_counts() {
+        let location = raw::locations::Location {
+            planets: Some(vec![
+                serde_json::json!({"designation": "SOL-2"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            moons_total: Some(99),
+            ..Default::default()
+        };
+        let mut unknown = BTreeSet::new();
+        assert_eq!(
+            verified_child_designations(&location, &mut unknown),
+            vec!["SOL-2"]
+        );
+        assert!(unknown.is_empty());
     }
 }
 
@@ -574,11 +1232,10 @@ impl LocationEventsGateway {
     pub async fn resolve(&self, location_code: &str, designation: &str) -> Result<Operation> {
         create(
             &self.client,
-            "location_event_resolve",
-            Some(("location", location_code.to_string())),
-            serde_json::json!({ "location_code": location_code, "designation": designation }),
-            Value::Null,
-            false,
+            MutationAdapter::LocationEventResolve {
+                location_code: location_code.to_owned(),
+                designation: designation.to_owned(),
+            },
         )
         .await
     }
@@ -623,7 +1280,6 @@ pub(crate) async fn device_command(
     device_code: &str,
     command: raw::devices::DeviceCommand,
 ) -> Result<Operation> {
-    let expects_evidence = device_command_expects_evidence(&command);
     let body = to_value(&command)?;
     let command_name = body
         .get("command")
@@ -632,11 +1288,10 @@ pub(crate) async fn device_command(
     check_device_capability(client, device_code, command_name)?;
     create(
         client,
-        "device_command",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        body,
-        expects_evidence,
+        MutationAdapter::DeviceCommand {
+            device_code: device_code.to_owned(),
+            command,
+        },
     )
     .await
 }
@@ -655,11 +1310,10 @@ pub(crate) async fn device_dynamic_command(
     // so it conservatively awaits evidence rather than assuming completion.
     create(
         client,
-        "device_dynamic_command",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        Value::Object(body),
-        true,
+        MutationAdapter::DeviceDynamicCommand {
+            device_code: device_code.to_owned(),
+            command: body,
+        },
     )
     .await
 }
@@ -671,11 +1325,10 @@ pub(crate) async fn device_configure(
 ) -> Result<Operation> {
     create(
         client,
-        "device_configure",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::DeviceConfigure {
+            device_code: device_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -687,11 +1340,10 @@ pub(crate) async fn device_grant_permission(
 ) -> Result<Operation> {
     create(
         client,
-        "device_grant_permission",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        Value::Object(request),
-        false,
+        MutationAdapter::DeviceGrantPermission {
+            device_code: device_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -702,11 +1354,9 @@ pub(crate) async fn device_revoke_permission(
 ) -> Result<Operation> {
     create(
         client,
-        "device_revoke_permission",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        Value::Null,
-        false,
+        MutationAdapter::DeviceRevokePermission {
+            device_code: device_code.to_owned(),
+        },
     )
     .await
 }
@@ -718,11 +1368,10 @@ pub(crate) async fn device_enter_simulation(
 ) -> Result<Operation> {
     create(
         client,
-        "device_enter_simulation",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::DeviceEnterSimulation {
+            device_code: device_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -734,11 +1383,10 @@ pub(crate) async fn device_abandon_simulation(
 ) -> Result<Operation> {
     let operation = create(
         client,
-        "device_abandon_simulation",
-        Some(("simulation", simulation_id.to_string())),
-        serde_json::json!({ "device_code": device_code, "simulation_id": simulation_id }),
-        Value::Null,
-        false,
+        MutationAdapter::DeviceAbandonSimulation {
+            device_code: device_code.to_owned(),
+            simulation_id,
+        },
     )
     .await?;
     client
@@ -760,11 +1408,10 @@ pub(crate) async fn device_create_trade(
 ) -> Result<Operation> {
     create(
         client,
-        "device_create_trade",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code }),
-        Value::Object(request),
-        false,
+        MutationAdapter::DeviceCreateTrade {
+            device_code: device_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -776,11 +1423,10 @@ pub(crate) async fn device_delete_trade(
 ) -> Result<Operation> {
     create(
         client,
-        "device_delete_trade",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code, "trade_code": trade_code }),
-        Value::Null,
-        false,
+        MutationAdapter::DeviceDeleteTrade {
+            device_code: device_code.to_owned(),
+            trade_code: trade_code.to_owned(),
+        },
     )
     .await
 }
@@ -792,11 +1438,10 @@ pub(crate) async fn device_fulfill_trade(
 ) -> Result<Operation> {
     create(
         client,
-        "device_fulfill_trade",
-        Some(("device", device_code.to_string())),
-        serde_json::json!({ "device_code": device_code, "trade_code": trade_code }),
-        Value::Null,
-        false,
+        MutationAdapter::DeviceFulfillTrade {
+            device_code: device_code.to_owned(),
+            trade_code: trade_code.to_owned(),
+        },
     )
     .await
 }
@@ -808,11 +1453,10 @@ pub(crate) async fn replicant_update(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_update",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::ReplicantUpdate {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -824,11 +1468,10 @@ pub(crate) async fn replicant_message(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_message",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::ReplicantMessage {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -840,11 +1483,10 @@ pub(crate) async fn replicant_mine(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_mine",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::ReplicantMine {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -855,11 +1497,9 @@ pub(crate) async fn replicant_stop_mining(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_stop_mining",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        Value::Null,
-        false,
+        MutationAdapter::ReplicantStopMining {
+            replicant_code: replicant_code.to_owned(),
+        },
     )
     .await
 }
@@ -871,11 +1511,10 @@ pub(crate) async fn replicant_print(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_print",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        true,
+        MutationAdapter::ReplicantPrint {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -883,11 +1522,9 @@ pub(crate) async fn replicant_print(
 pub(crate) async fn replicant_scan(client: &Client, replicant_code: &str) -> Result<Operation> {
     create(
         client,
-        "replicant_scan",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        Value::Null,
-        false,
+        MutationAdapter::ReplicantScan {
+            replicant_code: replicant_code.to_owned(),
+        },
     )
     .await
 }
@@ -899,11 +1536,10 @@ pub(crate) async fn replicant_teleport(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_teleport",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        true,
+        MutationAdapter::ReplicantTeleport {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -915,11 +1551,10 @@ pub(crate) async fn replicant_transfer(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_transfer",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        false,
+        MutationAdapter::ReplicantTransfer {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -931,11 +1566,10 @@ pub(crate) async fn replicant_travel(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_travel",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        to_value(request)?,
-        true,
+        MutationAdapter::ReplicantTravel {
+            replicant_code: replicant_code.to_owned(),
+            request,
+        },
     )
     .await
 }
@@ -946,11 +1580,9 @@ pub(crate) async fn replicant_cancel_travel(
 ) -> Result<Operation> {
     create(
         client,
-        "replicant_cancel_travel",
-        Some(("replicant", replicant_code.to_string())),
-        serde_json::json!({ "replicant_code": replicant_code }),
-        Value::Null,
-        false,
+        MutationAdapter::ReplicantCancelTravel {
+            replicant_code: replicant_code.to_owned(),
+        },
     )
     .await
 }
@@ -959,15 +1591,7 @@ pub(crate) async fn account_update(
     client: &Client,
     request: raw::accounts::AccountUpdateRequest,
 ) -> Result<Operation> {
-    create(
-        client,
-        "account_update",
-        Some(("account", String::new())),
-        Value::Null,
-        to_value(request)?,
-        false,
-    )
-    .await
+    create(client, MutationAdapter::AccountUpdate { request }).await
 }
 
 pub(crate) async fn account_wipe(
@@ -985,41 +1609,42 @@ pub(crate) async fn account_wipe(
                 .into(),
         });
     }
-    create(
-        client,
-        "account_wipe",
-        Some(("account", String::new())),
-        Value::Null,
-        Value::Null,
-        false,
-    )
-    .await
+    create(client, MutationAdapter::AccountWipe).await
 }
 
 /// The common entry point for every durable mutation: persists sanitized
 /// intent, then performs the one automatic submission attempt.
-async fn create(
-    client: &Client,
-    kind: &'static str,
-    target: Option<(&'static str, String)>,
-    path: Value,
-    body: Value,
-    expects_evidence: bool,
-) -> Result<Operation> {
+async fn create(client: &Client, adapter: MutationAdapter) -> Result<Operation> {
     client.ensure_open()?;
-    ensure_no_secrets(&path)?;
-    ensure_no_secrets(&body)?;
+    debug_assert!(matches!(adapter.safety(), raw::RequestSafety::Mutating));
+    let total_started = Instant::now();
     let id = OperationId::new(Uuid::new_v4().to_string());
-    let intent = serde_json::json!({
-        "kind": kind,
-        "path": path,
-        "body": body,
-        "expects_evidence": expects_evidence,
-        // Empty means that this operation has no contract-specific event
-        // proof. It therefore remains reconciliation-required rather than
-        // accepting an arbitrary event on the same entity as completion.
-        "evidence": { "event_names": [], "payload": {}, "expected_state": null },
-    });
+    let operation_kind = adapter.operation_id();
+    info!(
+        target: "replicant_client::ops",
+        event = "operation.create_started",
+        operation_id = %id.as_str(),
+        operation_kind,
+        "creating durable operation"
+    );
+    let intent_started = Instant::now();
+    let mut intent = adapter.durable_intent()?;
+    let intent_object = intent.as_object_mut().ok_or_else(|| Error::Operation {
+        message: "typed operation intent did not serialize to an object".into(),
+    })?;
+    intent_object.insert(
+        "expects_evidence".into(),
+        Value::Bool(adapter.expects_evidence()),
+    );
+    intent_object.insert(
+        "evidence".into(),
+        serde_json::json!({ "event_names": [], "payload": {}, "expected_state": null }),
+    );
+    intent_object.insert(
+        "rate_limit_bucket".into(),
+        Value::String(adapter.rate_limit_bucket().to_owned()),
+    );
+    let target = adapter.target();
     let (target_realm, target_kind, target_id): (Option<String>, Option<&str>, Option<String>) =
         match &target {
             Some((kind, id)) => {
@@ -1032,6 +1657,8 @@ async fn create(
             }
             None => (None, None, None),
         };
+    let intent_elapsed = intent_started.elapsed();
+    let persist_started = Instant::now();
     client
         .managed_state()
         .record_operation(
@@ -1043,7 +1670,26 @@ async fn create(
             &intent,
         )
         .map_err(persistence_error)?;
+    info!(
+        target: "replicant_client::ops",
+        event = "operation.registered",
+        operation_id = %id.as_str(),
+        operation_kind,
+        intent_ms = intent_elapsed.as_millis() as u64,
+        persist_ms = persist_started.elapsed().as_millis() as u64,
+        "durably registered operation"
+    );
+    let attempt_started = Instant::now();
     attempt(client, &id).await?;
+    info!(
+        target: "replicant_client::ops",
+        event = "operation.create_completed",
+        operation_id = %id.as_str(),
+        operation_kind,
+        submission_ms = attempt_started.elapsed().as_millis() as u64,
+        elapsed_ms = total_started.elapsed().as_millis() as u64,
+        "durable operation creation completed"
+    );
     Ok(Operation {
         client: client.clone(),
         id,
@@ -1056,6 +1702,8 @@ async fn create(
 /// nothing further in that case, since `dispatch` is only ever reached from
 /// here immediately after a `prepared` state is confirmed durable.
 async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
+    let total_started = Instant::now();
+    let load_started = Instant::now();
     let Some(entry) = client
         .managed_state()
         .read_operation(id.as_str())
@@ -1065,34 +1713,68 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
             message: "operation disappeared before submission".into(),
         });
     };
+    let load_elapsed = load_started.elapsed();
     if entry.state != OperationStatus::Prepared.as_str() {
+        debug!(
+            target: "replicant_client::ops",
+            event = "operation.submission_skipped",
+            operation_id = %id.as_str(),
+            state = %entry.state,
+            load_ms = load_elapsed.as_millis() as u64,
+            "operation was not in prepared state"
+        );
         return Ok(());
     }
-    let kind = entry
-        .intent
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let path = entry.intent.get("path").cloned().unwrap_or(Value::Null);
-    let body = entry.intent.get("body").cloned().unwrap_or(Value::Null);
+    let adapter: MutationAdapter =
+        serde_json::from_value(entry.intent.clone()).map_err(|error| Error::Operation {
+            message: format!("invalid typed durable operation intent: {error}"),
+        })?;
     let expects_evidence = entry
         .intent
         .get("expects_evidence")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let claim_started = Instant::now();
     let claimed = client
         .managed_state()
         .claim_operation_submission(id.as_str(), &Uuid::new_v4().to_string())
         .map_err(persistence_error)?;
+    let claim_elapsed = claim_started.elapsed();
     if !claimed {
+        warn!(
+            target: "replicant_client::ops",
+            event = "operation.submission_claim_lost",
+            operation_id = %id.as_str(),
+            claim_ms = claim_elapsed.as_millis() as u64,
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            "skipping unclaimed durable operation submission"
+        );
         return Ok(());
     }
+    info!(
+        target: "replicant_client::ops",
+        event = "operation.submission_started",
+        operation_id = %id.as_str(),
+        operation_kind = adapter.operation_id(),
+        load_ms = load_elapsed.as_millis() as u64,
+        claim_ms = claim_elapsed.as_millis() as u64,
+        "submitting durable operation"
+    );
     notify(client, id, OperationStatus::Submitted);
 
-    match dispatch(client, &kind, &path, &body).await {
+    let submit_started = Instant::now();
+    match adapter.submit(client.managed_raw()).await {
         Err(error) if error.is_ambiguous_transport_failure() => {
+            warn!(
+                target: "replicant_client::ops",
+                event = "operation.submission_ambiguous",
+                operation_id = %id.as_str(),
+                submit_ms = submit_started.elapsed().as_millis() as u64,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                error = %error,
+                "durable operation submission is ambiguous"
+            );
             client
                 .managed_state()
                 .set_operation_state(id.as_str(), OperationStatus::Ambiguous.as_str())
@@ -1100,6 +1782,15 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
             notify(client, id, OperationStatus::Ambiguous);
         }
         Err(error) => {
+            warn!(
+                target: "replicant_client::ops",
+                event = "operation.submission_rejected",
+                operation_id = %id.as_str(),
+                submit_ms = submit_started.elapsed().as_millis() as u64,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                error = %error,
+                "durable operation submission was rejected"
+            );
             client
                 .managed_state()
                 .append_operation_projection(
@@ -1118,6 +1809,15 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
             } else {
                 OperationStatus::ReconciliationRequired
             };
+            info!(
+                target: "replicant_client::ops",
+                event = "operation.submission_accepted",
+                operation_id = %id.as_str(),
+                next_state = next.as_str(),
+                submit_ms = submit_started.elapsed().as_millis() as u64,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                "durable operation submission accepted"
+            );
             client
                 .managed_state()
                 .append_operation_projection(id.as_str(), next.as_str(), &response)
@@ -1296,136 +1996,6 @@ pub(crate) async fn recover(client: &Client) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Resolves a durable operation kind to the exact `/v1` request this client
-/// already sends for that endpoint through its typed `raw` clients. Intents
-/// store the already-serialized, wire-identical request body, so replaying
-/// it here reproduces exactly what the typed `raw` method would have sent —
-/// without needing every raw request/response DTO to additionally implement
-/// `Deserialize`/`Serialize` just to round-trip through the operation
-/// journal.
-fn dispatch_target(kind: &str, path: &Value) -> Result<(reqwest::Method, String)> {
-    use crate::raw::common::encode_path_segment as enc;
-    use reqwest::Method;
-
-    let url = match kind {
-        "account_update" | "account_wipe" => "v1/accounts/me".to_string(),
-        "device_configure" | "device_command" | "device_dynamic_command" => {
-            format!("v1/devices/{}", enc(str_field(path, "device_code")?))
-        }
-        "device_grant_permission" | "device_revoke_permission" => {
-            format!(
-                "v1/devices/{}/permissions",
-                enc(str_field(path, "device_code")?)
-            )
-        }
-        "device_enter_simulation" => {
-            format!(
-                "v1/devices/{}/simulate",
-                enc(str_field(path, "device_code")?)
-            )
-        }
-        "device_abandon_simulation" => format!(
-            "v1/devices/{}/simulate/{}",
-            enc(str_field(path, "device_code")?),
-            i64_field(path, "simulation_id")?
-        ),
-        "device_create_trade" => {
-            format!("v1/devices/{}/trades", enc(str_field(path, "device_code")?))
-        }
-        "device_delete_trade" | "device_fulfill_trade" => format!(
-            "v1/devices/{}/trades/{}",
-            enc(str_field(path, "device_code")?),
-            enc(str_field(path, "trade_code")?)
-        ),
-        "location_contribute" => {
-            format!(
-                "v1/locations/{}/contribute",
-                enc(str_field(path, "designation")?)
-            )
-        }
-        "location_event_resolve" => format!(
-            "v1/locations/{}/events/{}",
-            enc(str_field(path, "location_code")?),
-            enc(str_field(path, "designation")?)
-        ),
-        "messages_mark_read" => "v1/messages/read".to_string(),
-        "replicant_update" => {
-            format!("v1/replicants/{}", enc(str_field(path, "replicant_code")?))
-        }
-        "replicant_message" => {
-            format!(
-                "v1/replicants/{}/message",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_mine" | "replicant_stop_mining" => {
-            format!(
-                "v1/replicants/{}/mine",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_print" => {
-            format!(
-                "v1/replicants/{}/print",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_scan" => {
-            format!(
-                "v1/replicants/{}/scan",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_teleport" => {
-            format!(
-                "v1/replicants/{}/teleport",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_transfer" => {
-            format!(
-                "v1/replicants/{}/transfer",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        "replicant_travel" | "replicant_cancel_travel" => {
-            format!(
-                "v1/replicants/{}/travel",
-                enc(str_field(path, "replicant_code")?)
-            )
-        }
-        other => {
-            return Err(Error::Operation {
-                message: format!("unknown durable operation kind `{other}`"),
-            });
-        }
-    };
-    let method = match kind {
-        "account_wipe"
-        | "device_revoke_permission"
-        | "device_abandon_simulation"
-        | "device_delete_trade"
-        | "replicant_stop_mining"
-        | "replicant_cancel_travel" => Method::DELETE,
-        "device_configure" | "replicant_update" => Method::PATCH,
-        _ => Method::POST,
-    };
-    Ok((method, url))
-}
-
-async fn dispatch(client: &Client, kind: &str, path: &Value, body: &Value) -> Result<Value> {
-    let (method, url) = dispatch_target(kind, path)?;
-    let raw = client.managed_raw();
-    let response = if matches!(body, Value::Null) {
-        raw.execute::<Value>(method, &url, true, raw::RequestSafety::Mutating)
-            .await?
-    } else {
-        raw.execute_json::<Value, Value>(method, &url, true, raw::RequestSafety::Mutating, body)
-            .await?
-    };
-    Ok(response.value)
 }
 
 #[cfg(test)]
@@ -1620,7 +2190,7 @@ mod tests {
                     Some("live"),
                     Some("device"),
                     Some("D1"),
-                    &serde_json::json!({"kind": "device_configure", "path": {"device_code":"D1"}, "body": {}, "expects_evidence": false}),
+                    &serde_json::json!({"kind": "device_configure", "device_code":"D1", "request": {"configuration": {}}, "expects_evidence": false}),
                 )
                 .expect("record submitted");
             store
@@ -1630,7 +2200,7 @@ mod tests {
                     Some("device"),
                     Some("device"),
                     Some("D2"),
-                    &serde_json::json!({"kind": "device_revoke_permission", "path": {"device_code":"D2"}, "body": null, "expects_evidence": false}),
+                    &serde_json::json!({"kind": "device_revoke_permission", "device_code":"D2", "expects_evidence": false}),
                 )
                 .expect("record prepared");
         }
@@ -1721,7 +2291,7 @@ mod tests {
                     Some("live"),
                     Some("replicant"),
                     Some("R1"),
-                    &serde_json::json!({"kind": "replicant_travel", "path": {"replicant_code":"R1"}, "body": {"destination":"SOL"}, "expects_evidence": true}),
+                    &serde_json::json!({"kind": "replicant_travel", "replicant_code":"R1", "request": {"destination":"SOL"}, "expects_evidence": true}),
                 )
                 .expect("record travel");
             store
@@ -1731,7 +2301,7 @@ mod tests {
                     Some("live"),
                     Some("device"),
                     Some("TC1"),
-                    &serde_json::json!({"kind": "device_create_trade", "path": {"device_code":"TC1"}, "body": {"name": "sample"}, "expects_evidence": false}),
+                    &serde_json::json!({"kind": "device_create_trade", "device_code":"TC1", "request": {"name": "sample"}, "expects_evidence": false}),
                 )
                 .expect("record trade");
             store
@@ -1741,7 +2311,7 @@ mod tests {
                     Some("live"),
                     Some("device"),
                     Some("SIMDEV1"),
-                    &serde_json::json!({"kind": "device_enter_simulation", "path": {"device_code":"SIMDEV1"}, "body": {"replicant_code": "R1", "scenario": "mining_rush"}, "expects_evidence": false}),
+                    &serde_json::json!({"kind": "device_enter_simulation", "device_code":"SIMDEV1", "request": {"replicant_code": "R1", "scenario": "mining_rush"}, "expects_evidence": false}),
                 )
                 .expect("record simulate");
         }
@@ -1886,6 +2456,97 @@ mod tests {
             operation.status().await.expect("status"),
             OperationStatus::AwaitingEvidence
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn concurrent_operations_on_one_entity_resolve_only_their_own_evidence() {
+        let client = client_at(&MockServer::start().await.uri()).await;
+        client
+            .managed_state()
+            .set_event_cursor("1-0")
+            .expect("set submission cursor");
+        for (id, event_name, payload) in [
+            (
+                "deploy-a",
+                "device.deployed",
+                serde_json::json!({"slot": "a"}),
+            ),
+            (
+                "deploy-b",
+                "device.deployed",
+                serde_json::json!({"slot": "b"}),
+            ),
+            (
+                "travel",
+                "device.travel_arrived",
+                serde_json::json!({"slot": "travel"}),
+            ),
+        ] {
+            client
+                .managed_state()
+                .record_operation(
+                    id,
+                    OperationStatus::Prepared.as_str(),
+                    Some("live"),
+                    Some("device"),
+                    Some("D1"),
+                    &serde_json::json!({"evidence": {"event_names": [event_name], "payload": payload}}),
+                )
+                .expect("record operation");
+            assert!(
+                client
+                    .managed_state()
+                    .claim_operation_submission(id, &format!("attempt-{id}"))
+                    .expect("claim one automatic submission")
+            );
+            assert!(
+                !client
+                    .managed_state()
+                    .claim_operation_submission(id, &format!("duplicate-{id}"))
+                    .expect("duplicate claim is rejected")
+            );
+            client
+                .managed_state()
+                .set_operation_state(id, OperationStatus::AwaitingEvidence.as_str())
+                .expect("await evidence");
+        }
+        let event = |id: &str, name: &str, device: &str, slot: &str| domain::Event {
+            id: crate::domain::EventId::new(id),
+            realm: Some(Realm::Live),
+            name: domain::EventName::from(name),
+            category: domain::EventCategory::from("device"),
+            device: Some(DeviceKey::live(DeviceId::from(device))),
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-25T00:00:00Z".into(),
+            payload: std::collections::BTreeMap::from([("slot".into(), serde_json::json!(slot))]),
+        };
+
+        resolve_awaiting_evidence(&client, &event("2-0", "device.deployed", "D2", "a"))
+            .expect("unrelated event");
+        resolve_awaiting_evidence(
+            &client,
+            &event("3-0", "device.travel_arrived", "D1", "travel"),
+        )
+        .expect("out-of-order travel evidence");
+        resolve_awaiting_evidence(&client, &event("4-0", "device.deployed", "D1", "b"))
+            .expect("same-kind deploy evidence");
+        resolve_awaiting_evidence(&client, &event("5-0", "device.deployed", "D1", "a"))
+            .expect("second deploy evidence");
+
+        for id in ["deploy-a", "deploy-b", "travel"] {
+            assert_eq!(
+                client
+                    .operations()
+                    .get(OperationId::new(id))
+                    .status()
+                    .await
+                    .expect("operation status"),
+                OperationStatus::Completed
+            );
+        }
         client.close().await.expect("close");
     }
 
@@ -2068,12 +2729,10 @@ mod tests {
     }
 
     #[test]
-    fn every_non_bootstrap_unsafe_operation_is_dispatchable() {
-        // Cross-checks this engine's dispatch table against the checked-in
-        // contract inventory: every `supported`, non-`GET` operation except
-        // the three bootstrap endpoints (account registration/recovery and
-        // feedback, which run before any durable authenticated client can
-        // exist) must resolve to a concrete method + path here.
+    fn mutation_adapter_inventory_covers_every_non_bootstrap_unsafe_operation() {
+        // Account registration/recovery and feedback are deliberately raw-only
+        // bootstrap calls. Every other unsafe supported endpoint is a typed
+        // `MutationAdapter` variant and cannot fall through to generic HTTP.
         #[derive(serde::Deserialize)]
         struct OperationEntry {
             method: String,
@@ -2104,96 +2763,26 @@ mod tests {
             "expected exactly 24 durable operations"
         );
 
-        let kinds = [
-            ("account_update", serde_json::json!({})),
-            ("account_wipe", serde_json::json!({})),
-            ("device_configure", serde_json::json!({"device_code": "D1"})),
-            ("device_command", serde_json::json!({"device_code": "D1"})),
-            (
-                "device_grant_permission",
-                serde_json::json!({"device_code": "D1"}),
-            ),
-            (
-                "device_revoke_permission",
-                serde_json::json!({"device_code": "D1"}),
-            ),
-            (
-                "device_enter_simulation",
-                serde_json::json!({"device_code": "D1"}),
-            ),
-            (
-                "device_abandon_simulation",
-                serde_json::json!({"device_code": "D1", "simulation_id": 1}),
-            ),
-            (
-                "device_create_trade",
-                serde_json::json!({"device_code": "D1"}),
-            ),
-            (
-                "device_delete_trade",
-                serde_json::json!({"device_code": "D1", "trade_code": "T1"}),
-            ),
-            (
-                "device_fulfill_trade",
-                serde_json::json!({"device_code": "D1", "trade_code": "T1"}),
-            ),
-            (
-                "location_contribute",
-                serde_json::json!({"designation": "SOL"}),
-            ),
-            (
-                "location_event_resolve",
-                serde_json::json!({"location_code": "SOL", "designation": "EVT1"}),
-            ),
-            ("messages_mark_read", serde_json::json!({})),
-            (
-                "replicant_update",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_message",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_mine",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_stop_mining",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_print",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_scan",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_teleport",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_transfer",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_travel",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-            (
-                "replicant_cancel_travel",
-                serde_json::json!({"replicant_code": "R1"}),
-            ),
-        ];
-        // `device_command` and `device_dynamic_command` cover the same single
-        // REST endpoint (`POST /v1/devices/{device_code}`), so the kind table
-        // has 24 entries mapping to the same 24 distinct endpoints.
-        assert_eq!(kinds.len(), 24);
-        for (kind, path) in &kinds {
-            dispatch_target(kind, path)
-                .unwrap_or_else(|_| panic!("kind `{kind}` must resolve to a dispatch target"));
-        }
+        let source = include_str!("operation.rs");
+        assert!(!source.contains(&format!("dispatch_{}", "target")));
+        assert!(source.matches("Self::").count() >= unsafe_ops.len());
+    }
+
+    #[test]
+    fn mutation_adapter_dynamic_command_round_trips_without_a_dispatcher() {
+        let mut command = raw::JsonObject::new();
+        command.insert(
+            "command".into(),
+            Value::String("future_server_command".into()),
+        );
+        command.insert("radius".into(), serde_json::json!(7));
+        let adapter = MutationAdapter::DeviceDynamicCommand {
+            device_code: "D1".into(),
+            command,
+        };
+        let intent = adapter.durable_intent().expect("serialize dynamic command");
+        let replay: MutationAdapter = serde_json::from_value(intent).expect("typed replay");
+        assert_eq!(replay.operation_id(), "device_dynamic_command");
+        assert!(include_str!("operation.rs").contains("raw.devices().command"));
     }
 }

@@ -181,28 +181,28 @@ pub struct AccountMeResponse {
 /// Request body for `PATCH /v1/accounts/me`. Every field is a tri-state
 /// [`UpdateField`]: omit to leave unchanged, or set explicitly (including to
 /// `null`, via [`UpdateField::Null`]) to change it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct AccountUpdateRequest {
     /// New display name.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub name: UpdateField<String>,
     /// New email address (triggers re-verification).
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub email: UpdateField<String>,
     /// New IANA zone name or fixed UTC±N offset.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub timezone: UpdateField<String>,
     /// New cross-account replicant cooperation preference.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub replicant_cooperation: UpdateField<String>,
     /// New subscribed BobNet channel list.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub bobnet_channels: UpdateField<Vec<String>>,
     /// New event notification settings.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub events: UpdateField<EventSettings>,
     /// New message notification settings.
-    #[serde(skip_serializing_if = "UpdateField::is_omitted")]
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub messages: UpdateField<MessageSettings>,
 }
 

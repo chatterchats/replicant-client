@@ -2,18 +2,23 @@
 //!
 //! One coordinator is shared by every clone of a [`crate::raw::Client`] (and,
 //! later, by the managed scheduler built on top of it). It enforces the
-//! contract's documented budgets locally and folds in server-observed
-//! `X-RateLimit-*`/`Retry-After` state, which always wins over the local
-//! estimate.
+//! contract's documented budgets locally and retains server-observed
+//! `X-RateLimit-*`/`Retry-After` state. Server countdowns become mandatory
+//! only after an actual 429 response or when the reported window is exhausted;
+//! successful responses with remaining quota keep the normal local schedule.
 
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tracing::debug;
 
 /// Logical request budgets shared across every raw operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -32,6 +37,16 @@ pub enum RateLimitBucket {
     StarCatalogue,
     /// The SSE event stream connection.
     Sse,
+}
+
+/// Scheduling class for work sharing a rate-limit bucket.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestPriority {
+    /// User-initiated work.
+    #[default]
+    Foreground,
+    /// Synchronization and reconciliation work that yields to user work.
+    Background,
 }
 
 /// Local policy for one rate-limit bucket.
@@ -129,8 +144,9 @@ pub struct RateLimitSnapshot {
 }
 
 impl RateLimitSnapshot {
-    /// Returns the effective delay. HTTP's explicit `Retry-After` wins over
-    /// the rate-window reset estimate.
+    /// Returns the candidate delay to enforce when the response is actually
+    /// rate limited or the reported window has no remaining permits. HTTP's
+    /// explicit `Retry-After` wins over the rate-window reset estimate.
     #[must_use]
     pub fn delay(&self) -> Option<Duration> {
         self.retry_after
@@ -146,10 +162,26 @@ struct Bucket {
     server: Option<RateLimitSnapshot>,
 }
 
+#[derive(Debug, Default)]
+struct RequestQueue {
+    foreground: VecDeque<Arc<AtomicBool>>,
+    background: VecDeque<Arc<AtomicBool>>,
+    foreground_streak: u8,
+}
+
+struct QueueTicket(Arc<AtomicBool>);
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// In-process rate-limit coordinator shared by all clones of a raw client.
 #[derive(Clone, Debug)]
 pub struct RateLimitCoordinator {
     buckets: Arc<Mutex<HashMap<RateLimitBucket, Bucket>>>,
+    queues: Arc<Mutex<HashMap<RateLimitBucket, RequestQueue>>>,
 }
 
 const ALL_BUCKETS: [RateLimitBucket; 7] = [
@@ -183,6 +215,7 @@ impl RateLimitCoordinator {
             .collect();
         Self {
             buckets: Arc::new(Mutex::new(buckets)),
+            queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -196,7 +229,45 @@ impl RateLimitCoordinator {
     /// Waits for a permit. Dropping the future cancels waiting without
     /// consuming a future permit.
     pub async fn acquire(&self, kind: RateLimitBucket) {
+        self.acquire_with_priority(kind, RequestPriority::Foreground)
+            .await;
+    }
+
+    /// Waits for a permit. Queued foreground work runs first, except that a
+    /// background request gets one turn after eight foreground permits.
+    pub async fn acquire_with_priority(&self, kind: RateLimitBucket, priority: RequestPriority) {
+        let ticket = QueueTicket(Arc::new(AtomicBool::new(true)));
+        {
+            let mut queues = self.queues.lock().await;
+            let queue = queues.entry(kind).or_default();
+            match priority {
+                RequestPriority::Foreground => queue.foreground.push_back(ticket.0.clone()),
+                RequestPriority::Background => queue.background.push_back(ticket.0.clone()),
+            }
+        }
         loop {
+            let permitted = {
+                let mut queues = self.queues.lock().await;
+                let queue = queues.entry(kind).or_default();
+                queue
+                    .foreground
+                    .retain(|entry| entry.load(Ordering::Acquire));
+                queue
+                    .background
+                    .retain(|entry| entry.load(Ordering::Acquire));
+                let foreground_turn = !queue.foreground.is_empty()
+                    && (queue.background.is_empty() || queue.foreground_streak < 8);
+                let next = if foreground_turn {
+                    queue.foreground.front()
+                } else {
+                    queue.background.front()
+                };
+                next.is_some_and(|entry| Arc::ptr_eq(entry, &ticket.0))
+            };
+            if !permitted {
+                tokio::task::yield_now().await;
+                continue;
+            }
             let wait = {
                 let mut all = self.buckets.lock().await;
                 let Some(bucket) = all.get_mut(&kind) else {
@@ -206,27 +277,81 @@ impl RateLimitCoordinator {
                 if bucket.next <= now {
                     let spacing = bucket.policy.refill_every / bucket.policy.capacity.max(1);
                     bucket.next = now + spacing;
+                    drop(all);
+                    let mut queues = self.queues.lock().await;
+                    let queue = queues.entry(kind).or_default();
+                    let foreground_turn = !queue.foreground.is_empty()
+                        && (queue.background.is_empty() || queue.foreground_streak < 8);
+                    if foreground_turn {
+                        queue.foreground.pop_front();
+                        queue.foreground_streak = queue.foreground_streak.saturating_add(1);
+                    } else {
+                        queue.background.pop_front();
+                        queue.foreground_streak = 0;
+                    }
                     return;
                 }
                 bucket.next.saturating_duration_since(now)
             };
-            tracing::debug!(
+            debug!(
+                target: "replicant_client::raw::rate_limit",
+                event = "rate_limit.wait",
                 ?kind,
-                queue_wait_ms = wait.as_millis(),
+                delay_ms = wait.as_millis() as u64,
                 "waiting for rate-limit permit"
             );
             tokio::time::sleep(wait).await;
         }
     }
 
-    /// Records authoritative server limits; a server retry/reset delay wins
-    /// over the local estimate, including when it shortens it.
+    /// Records server rate-limit metadata from a successful response.
+    ///
+    /// Some Replicant Space success responses include `Retry-After` and reset
+    /// headers as informational countdowns for the current window. Those
+    /// values do not pause a bucket while permits remain. A successful
+    /// response delays future work only when the server reports zero permits.
     pub async fn observe(&self, kind: RateLimitBucket, snapshot: RateLimitSnapshot) {
+        self.observe_response(kind, reqwest::StatusCode::OK, snapshot)
+            .await;
+    }
+
+    pub(crate) async fn observe_response(
+        &self,
+        kind: RateLimitBucket,
+        status: reqwest::StatusCode,
+        snapshot: RateLimitSnapshot,
+    ) {
         let mut all = self.buckets.lock().await;
         if let Some(bucket) = all.get_mut(&kind) {
-            if let Some(delay) = snapshot.delay() {
-                bucket.next = Instant::now() + delay;
+            let exhausted = snapshot.remaining == Some(0);
+            let enforce_delay = status == reqwest::StatusCode::TOO_MANY_REQUESTS || exhausted;
+
+            if enforce_delay {
+                if let Some(delay) = snapshot.delay() {
+                    debug!(
+                        target: "replicant_client::raw::rate_limit",
+                        event = "rate_limit.schedule_updated",
+                        ?kind,
+                        status = status.as_u16(),
+                        remaining = ?snapshot.remaining,
+                        delay_ms = delay.as_millis() as u64,
+                        "enforced server rate-limit delay"
+                    );
+                    bucket.next = Instant::now() + delay;
+                }
+            } else if snapshot.delay().is_some() {
+                debug!(
+                    target: "replicant_client::raw::rate_limit",
+                    event = "rate_limit.delay_informational",
+                    ?kind,
+                    status = status.as_u16(),
+                    remaining = ?snapshot.remaining,
+                    retry_after_ms = ?snapshot.retry_after.map(|value| value.delay().as_millis() as u64),
+                    reset_delay_ms = ?snapshot.reset.map(|value| value.delay().as_millis() as u64),
+                    "retained informational rate-limit countdown without delaying requests"
+                );
             }
+
             bucket.server = Some(snapshot);
         }
     }
@@ -269,7 +394,7 @@ pub fn bucket_for(method: &reqwest::Method, path: &str) -> RateLimitBucket {
 mod tests {
     use std::time::Duration;
 
-    use tokio::task::yield_now;
+    use tokio::{sync::mpsc, task::yield_now};
 
     use super::{
         RateLimitBucket, RateLimitCoordinator, RateLimitPolicy, RateLimitReset, RateLimitSnapshot,
@@ -298,6 +423,42 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(10)).await;
         coordinator.acquire(RateLimitBucket::Read).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_foreground_request_precedes_background_work() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 1,
+                    refill_every: Duration::from_secs(10),
+                },
+            )
+            .await;
+        coordinator.acquire(RateLimitBucket::Read).await;
+
+        let (sent, mut received) = mpsc::unbounded_channel();
+        for (priority, name) in [
+            (super::RequestPriority::Background, "background"),
+            (super::RequestPriority::Foreground, "foreground"),
+        ] {
+            let coordinator = coordinator.clone();
+            let sent = sent.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .acquire_with_priority(RateLimitBucket::Read, priority)
+                    .await;
+                sent.send(name).expect("receiver remains open");
+            });
+            yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(received.recv().await, Some("foreground"));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(received.recv().await, Some("background"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -335,6 +496,108 @@ mod tests {
         yield_now().await;
         assert!(!permit.is_finished());
         tokio::time::advance(Duration::from_secs(5)).await;
+        yield_now().await;
+        assert!(permit.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_response_with_remaining_quota_does_not_wait_until_reset() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 120,
+                    refill_every: Duration::from_secs(60),
+                },
+            )
+            .await;
+        coordinator.acquire(RateLimitBucket::Read).await;
+
+        coordinator
+            .observe(
+                RateLimitBucket::Read,
+                RateLimitSnapshot {
+                    limit: Some(120),
+                    remaining: Some(117),
+                    reset: Some(RateLimitReset {
+                        epoch_seconds: 0,
+                        delay: Duration::from_secs(45),
+                    }),
+                    retry_after: Some(super::RetryAfter::new(Duration::from_secs(45))),
+                },
+            )
+            .await;
+
+        let permit = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire(RateLimitBucket::Read).await }
+        });
+        yield_now().await;
+        assert!(!permit.is_finished());
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        yield_now().await;
+        assert!(permit.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_response_with_no_remaining_quota_waits_until_reset() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .observe(
+                RateLimitBucket::Read,
+                RateLimitSnapshot {
+                    limit: Some(120),
+                    remaining: Some(0),
+                    reset: Some(RateLimitReset {
+                        epoch_seconds: 0,
+                        delay: Duration::from_secs(45),
+                    }),
+                    retry_after: Some(super::RetryAfter::new(Duration::from_secs(45))),
+                },
+            )
+            .await;
+
+        let permit = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire(RateLimitBucket::Read).await }
+        });
+        yield_now().await;
+        assert!(!permit.is_finished());
+
+        tokio::time::advance(Duration::from_secs(44)).await;
+        yield_now().await;
+        assert!(!permit.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        assert!(permit.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_response_enforces_retry_after_even_without_remaining_header() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .observe_response(
+                RateLimitBucket::Read,
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                RateLimitSnapshot {
+                    limit: Some(120),
+                    remaining: None,
+                    reset: None,
+                    retry_after: Some(super::RetryAfter::new(Duration::from_secs(30))),
+                },
+            )
+            .await;
+
+        let permit = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire(RateLimitBucket::Read).await }
+        });
+        yield_now().await;
+        assert!(!permit.is_finished());
+
+        tokio::time::advance(Duration::from_secs(30)).await;
         yield_now().await;
         assert!(permit.is_finished());
     }

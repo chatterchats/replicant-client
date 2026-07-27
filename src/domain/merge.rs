@@ -1,4 +1,5 @@
 use super::*;
+use tracing::trace;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -48,6 +49,7 @@ pub fn merge_snapshot<T: Clone>(
     incoming: Observation<T>,
 ) -> MergeOutcome<Observation<T>> {
     if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
+        trace!(target: "replicant_client::domain", "retaining snapshot because incoming observation is stale");
         return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
     }
     MergeOutcome::Replaced(incoming)
@@ -58,9 +60,11 @@ pub fn merge_replicant(
     mut incoming: Observation<Replicant>,
 ) -> MergeOutcome<Observation<Replicant>> {
     if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
+        trace!(target: "replicant_client::domain", "retaining replicant because incoming observation is stale");
         return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
     }
     if matches!(incoming.metadata.access, AccessScope::Public) {
+        trace!(target: "replicant_client::domain", "preserving private replicant fields from public observation");
         incoming.value.private = existing.value.private.clone();
         incoming.value.access = existing.value.access.clone();
     }
@@ -79,10 +83,12 @@ pub fn event_delta<T: Clone>(
 }
 
 pub fn collection_can_tombstone<T>(collection: &CollectionObservation<T>) -> bool {
-    collection.completeness.can_reconcile_membership()
+    let can_tombstone = collection.completeness.can_reconcile_membership()
         && matches!(
             collection.metadata.authority,
             ObservationAuthority::CompleteCollection
         )
-        && tombstone_eligible(&collection.metadata, &RemovalEvidence::CompleteCollection)
+        && tombstone_eligible(&collection.metadata, &RemovalEvidence::CompleteCollection);
+    trace!(target: "replicant_client::domain", "collection tombstone eligibility={can_tombstone}");
+    can_tombstone
 }

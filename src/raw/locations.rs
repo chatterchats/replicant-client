@@ -42,6 +42,33 @@ pub struct LocationSystemMap {
     pub locations: HashMap<String, LocationCounts>,
 }
 
+/// Surveyed environment details for a planet or moon.
+///
+/// The location contract leaves this object open, so only fields verified by
+/// the sanitized `ILPHARD-3` response are modeled here. Remaining fields are
+/// retained for forward compatibility.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct PlanetaryBody {
+    /// Reported atmospheric classification.
+    pub atmosphere: Option<String>,
+    /// Whether the body is inside the star's habitable zone.
+    pub in_habitable_zone: Option<bool>,
+    /// Highest life stage reported for the body.
+    pub life_stage: Option<String>,
+    /// Whether a magnetic field is reported.
+    pub magnetic_field: Option<bool>,
+    /// Axial tilt in degrees.
+    pub axial_tilt_deg: Option<f64>,
+    /// Earth gravities (`g`).
+    pub surface_gravity: Option<f64>,
+    /// Degrees Celsius.
+    pub surface_temp_c: Option<f64>,
+    /// Additional response fields retained without interpretation.
+    #[serde(flatten)]
+    pub unknown: JsonObject,
+}
+
 /// Response body for `GET /v1/locations/{designation}`. Most fields are
 /// open-shaped per the contract; only the scalars it actually types are
 /// modeled directly.
@@ -69,6 +96,7 @@ pub struct Location {
     /// Whether life has been detected here.
     pub life_detected: Option<bool>,
     /// This location's own designation.
+    #[serde(alias = "code")]
     pub location: Option<String>,
     /// The single most relevant active location event here, if any.
     pub location_event: Option<JsonObject>,
@@ -79,7 +107,7 @@ pub struct Location {
     /// Mining yield bonus percentage at this location.
     pub mining_bonus_pct: Option<f64>,
     /// Moon detail, if this location is a moon.
-    pub moon: Option<JsonObject>,
+    pub moon: Option<PlanetaryBody>,
     /// Moons orbiting this location.
     pub moons: Option<Vec<JsonObject>>,
     /// Moons scanned so far.
@@ -96,7 +124,7 @@ pub struct Location {
     /// Outer-system detail, if applicable.
     pub outer_system: Option<JsonObject>,
     /// Planet detail, if this location is a planet.
-    pub planet: Option<JsonObject>,
+    pub planet: Option<PlanetaryBody>,
     /// Planets in this system.
     pub planets: Option<Vec<JsonObject>>,
     /// Planets scanned so far.
@@ -106,7 +134,10 @@ pub struct Location {
     /// Resource extraction sites at this location.
     pub resource_sites: Option<Vec<JsonObject>>,
     /// Whether this location has been scanned.
+    #[serde(alias = "surveyed")]
     pub scanned: Option<bool>,
+    /// Parent location designation, when the response identifies one.
+    pub parent: Option<String>,
     /// Shops trading at this location.
     pub shops: Option<Vec<JsonObject>>,
     /// Parent star summary.
@@ -115,13 +146,18 @@ pub struct Location {
     pub system_objects: Option<Vec<JsonObject>>,
     /// Whether the whole system has been scanned.
     pub system_scanned: Option<bool>,
+    /// Parent system designation, when the response identifies one.
+    pub system: Option<String>,
     /// Descriptive system tags.
     #[serde(default)]
     pub system_tags: Vec<String>,
+    /// Verified and future top-level fields not yet modeled by this DTO.
+    #[serde(flatten)]
+    pub unknown: JsonObject,
 }
 
 /// Request body for `POST /v1/locations/{designation}/contribute`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct LocationContributionRequest {
     /// Device codes contributing resources toward this location's active
     /// megastructure or location event.

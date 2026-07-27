@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
+use tracing::{trace, warn};
 
 use super::*;
 use crate::{events::GameEvent, raw};
@@ -31,6 +32,10 @@ fn metadata(
     access: AccessScope,
     reachability: Reachability,
 ) -> ObservationMetadata {
+    trace!(
+        target: "replicant_client::domain",
+        "normalizing observation operation={operation} source={source:?} authority={authority:?} access={access:?} reachability={reachability:?}"
+    );
     ObservationMetadata {
         source,
         authority,
@@ -47,7 +52,17 @@ fn metadata(
 }
 
 fn required(value: Option<&String>, field: &'static str) -> Result<String, NormalizeError> {
-    value.cloned().ok_or(NormalizeError::MissingIdentity(field))
+    value.cloned().ok_or_else(|| {
+        warn!(
+            target: "replicant_client::domain",
+            "normalization rejected response missing_identity={field}"
+        );
+        NormalizeError::MissingIdentity(field)
+    })
+}
+
+fn knowledge<T>(value: Option<T>) -> Knowledge<T> {
+    value.map_or(Knowledge::Unknown, Knowledge::Present)
 }
 
 pub fn account_me(
@@ -333,15 +348,54 @@ pub fn location_detail(
     realm: Realm,
     observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Location>, NormalizeError> {
+    let body = match raw.location_type.as_deref() {
+        Some("planet") => raw.planet.as_ref(),
+        Some("moon") => raw.moon.as_ref(),
+        _ => raw.planet.as_ref().or(raw.moon.as_ref()),
+    };
+    let life_stage = body.and_then(|body| body.life_stage.clone());
+    let surveyed = raw.scanned == Some(true);
     let value = Location {
         key: WorldKey::in_realm(
-            realm,
+            realm.clone(),
             LocationId::new(required(raw.location.as_ref(), "location")?),
         ),
         location_type: raw.location_type.clone().map(LocationType::from),
         scanned: raw.scanned,
         system_scanned: raw.system_scanned,
         system_tags: raw.system_tags.clone(),
+        system: raw.system.clone(),
+        parent: raw
+            .parent
+            .as_ref()
+            .map(|parent| WorldKey::in_realm(realm.clone(), LocationId::new(parent))),
+        environment: LocationEnvironment {
+            atmosphere: knowledge(
+                body.and_then(|body| body.atmosphere.clone())
+                    .map(Atmosphere::from),
+            ),
+            magnetic_field: knowledge(body.and_then(|body| body.magnetic_field)),
+            gravity_g: knowledge(
+                body.and_then(|body| body.surface_gravity)
+                    .filter(|value| value.is_finite()),
+            ),
+            surface_temp_c: knowledge(
+                body.and_then(|body| body.surface_temp_c)
+                    .filter(|value| value.is_finite()),
+            ),
+            in_habitable_zone: knowledge(body.and_then(|body| body.in_habitable_zone)),
+            axial_tilt_deg: knowledge(
+                body.and_then(|body| body.axial_tilt_deg)
+                    .filter(|value| value.is_finite()),
+            ),
+            life_stage: match life_stage {
+                Some(stage) => Knowledge::Present(LifeStage::from(stage)),
+                None if surveyed && body.is_some() => Knowledge::Absent,
+                None => Knowledge::Unknown,
+            },
+            ..LocationEnvironment::default()
+        },
+        unknown: raw.unknown.clone().into_iter().collect(),
     };
     Ok(Observation {
         value,
@@ -448,6 +502,7 @@ pub fn catalogue_star(
             .entry_point
             .as_ref()
             .map(|id| WorldKey::in_realm(realm, LocationId::new(id))),
+        position: raw.position.and_then(position),
     };
     Ok(Observation {
         value,
@@ -456,6 +511,54 @@ pub fn catalogue_star(
             observed_at,
             ObservationSource::RestCollection,
             ObservationAuthority::CompleteCollection,
+            AccessScope::Owned,
+            Reachability::Historical,
+        ),
+    })
+}
+
+fn position(raw: raw::Position) -> Option<GalacticPosition> {
+    (raw.x.is_finite() && raw.y.is_finite() && raw.z.is_finite()).then_some(GalacticPosition {
+        x: raw.x,
+        y: raw.y,
+        z: raw.z,
+    })
+}
+
+/// Normalizes one paged star listing without claiming catalogue authority or
+/// membership completeness.
+pub fn replicant_star_knowledge(
+    raw: &raw::galaxy::StarItem,
+    replicant: ReplicantKey,
+    realm: Realm,
+    observed_at: impl Into<ObservationTime>,
+) -> Result<Observation<StarKnowledge>, NormalizeError> {
+    let star = WorldKey::in_realm(
+        realm.clone(),
+        StarId::new(required(raw.designation.as_ref(), "designation")?),
+    );
+    Ok(Observation {
+        value: StarKnowledge {
+            replicant,
+            star,
+            position: raw.position.and_then(position),
+            spectral_type: raw.spectral_type.clone(),
+            entry_point: raw
+                .entry_point
+                .as_ref()
+                .map(|id| WorldKey::in_realm(realm, LocationId::new(id))),
+            explored: raw.explored,
+            has_life: raw.has_life,
+            distance_from_replicant: raw
+                .distance_from_replicant
+                .filter(|value| value.is_finite()),
+            estimated_travel_time: raw.estimated_travel_time,
+        },
+        metadata: metadata(
+            "GET /v1/replicants/{replicant_code}/stars",
+            observed_at,
+            ObservationSource::RestCollection,
+            ObservationAuthority::Discovery,
             AccessScope::Owned,
             Reachability::Historical,
         ),
@@ -553,4 +656,76 @@ pub fn simulation_start(
             Reachability::Reachable,
         ),
     })
+}
+
+/// Normalizes one owned run from the complete account simulation history.
+/// History is additive: an absent entry is never evidence that a local run was
+/// deleted.
+pub fn simulation_history(
+    raw: &raw::simulations::SimulationHistoryEntry,
+    observed_at: impl Into<ObservationTime>,
+) -> Result<Observation<Simulation>, NormalizeError> {
+    let id = raw
+        .id
+        .map(SimulationId::new)
+        .ok_or(NormalizeError::MissingIdentity("id"))?;
+    let completed_at = raw
+        .completed_at
+        .clone()
+        .or_else(|| raw.abandoned_at.clone())
+        .or_else(|| raw.timed_out_at.clone());
+    Ok(Observation {
+        value: Simulation {
+            id,
+            scenario_code: raw.scenario_code.clone(),
+            scenario_name: raw.scenario_name.clone(),
+            starting_location: None,
+            starting_star: None,
+            is_mine: true,
+            started_at: raw.started_at.clone(),
+            completed_at,
+            lifecycle: SimulationLifecycle::Ended,
+            seed_failures: Vec::new(),
+            replicant_code: None,
+        },
+        metadata: metadata(
+            "GET /v1/accounts/simulations",
+            observed_at,
+            ObservationSource::RestCollection,
+            ObservationAuthority::EntitySnapshot,
+            AccessScope::Owned,
+            Reachability::Historical,
+        ),
+    })
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn nested_planet_environment_normalizes_without_losing_unknown_fields() {
+        let raw: raw::locations::Location = serde_json::from_str(include_str!(
+            "../../reference/replicant-space/fixtures/location-ilphard-3-sanitized.json"
+        ))
+        .expect("fixture decodes");
+        let observation =
+            location_detail(&raw, Realm::Live, ObservationTime::now()).expect("normalizes");
+        assert!(
+            matches!(observation.value.environment.gravity_g, Knowledge::Present(value) if value == 2.06)
+        );
+        assert!(
+            matches!(observation.value.environment.surface_temp_c, Knowledge::Present(value) if value == 125.0)
+        );
+        assert!(matches!(
+            observation.value.environment.life_stage,
+            Knowledge::Present(LifeStage::Intelligent)
+        ));
+        assert!(matches!(
+            raw.planet
+                .as_ref()
+                .and_then(|planet| planet.unknown.get("future_environment")),
+            Some(Value::Object(_))
+        ));
+    }
 }

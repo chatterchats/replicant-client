@@ -332,14 +332,14 @@ pub struct DeviceTagListQuery {
 }
 
 /// Request body for `PATCH /v1/devices/{device_code}`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeviceConfigurationRequest {
     /// The tag changes to apply.
     pub configuration: DeviceConfiguration,
 }
 
 /// Tag changes to apply to a device.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeviceConfiguration {
     /// Tags to add.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,7 +365,7 @@ pub struct DeviceConfigurationResponse {
 
 /// Shared payload for the `adopt`, `attach`, `detach`, and `release`
 /// commands, all of which accept the same single-or-batch target shape.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TargetsCommand {
     /// A single device code to target.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,7 +398,7 @@ pub struct DynamicDeviceCommand {
 /// Internally tagged on the wire by a `command` field; each variant carries
 /// exactly the parameters its command accepts.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum DeviceCommand {
     /// Activates a dormant device.

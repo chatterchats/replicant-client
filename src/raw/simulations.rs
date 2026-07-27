@@ -47,7 +47,7 @@ pub struct ScenarioListResponse {
 }
 
 /// Request body for `POST /v1/devices/{device_code}/simulate`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct SimulationEnterRequest {
     /// The replicant entering the simulation.
     pub replicant_code: String,
@@ -57,7 +57,7 @@ pub struct SimulationEnterRequest {
 
 /// Response body for `POST /v1/devices/{device_code}/simulate`.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct SimulationEnterResponse {
     /// Devices spawned into the simulation's starting scene.
     #[serde(default)]

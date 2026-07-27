@@ -3,15 +3,18 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::RangeInclusive,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use tokio::sync::watch;
+use tracing::{debug, info};
 
 use crate::domain::{
-    self, AccessScope, Account, AccountId, Device, DeviceCommand, DeviceFeature, DeviceId,
-    DeviceKey, DeviceStatus, DeviceType, Realm, Replicant, ReplicantId, ReplicantKey,
-    ReplicantStatus,
+    self, AccessScope, Account, AccountId, Atmosphere, Device, DeviceCommand, DeviceFeature,
+    DeviceId, DeviceKey, DeviceStatus, DeviceType, Knowledge, LifeStage, Location, LocationType,
+    Realm, Replicant, ReplicantId, ReplicantKey, ReplicantStatus,
 };
 use crate::raw;
 use crate::{Client, Error, Result};
@@ -67,6 +70,593 @@ fn observed_at() -> crate::domain::ObservationTime {
     crate::domain::ObservationTime::now()
 }
 
+/// The result of one local location predicate evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocationPredicateOutcome {
+    Matched,
+    Rejected,
+    Unknown,
+}
+
+/// Sanitized detail for one location predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocationPredicateDiagnostic {
+    pub predicate: String,
+    pub outcome: LocationPredicateOutcome,
+    pub observed: Option<String>,
+    pub reason: String,
+}
+
+/// The local predicate trace for one location.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocationDiagnostic {
+    pub location: Location,
+    pub predicates: Vec<LocationPredicateDiagnostic>,
+}
+
+/// Results and local predicate traces from [`LocationQuery::collect_with_diagnostics`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocationQueryDiagnostics {
+    pub matches: Vec<Location>,
+    pub evaluations: Vec<LocationDiagnostic>,
+}
+
+#[derive(Clone, Debug)]
+enum LocationPredicate {
+    Realm(Realm),
+    PlanetaryBody,
+    Surveyed,
+    HasAtmosphere,
+    Atmosphere(Atmosphere),
+    MagneticField,
+    HabitableZone,
+    LifeStageBelow(LifeStage),
+    GravityAbove(f64),
+    GravityBelow(f64),
+    GravityBetween(RangeInclusive<f64>),
+    TemperatureAbove(f64),
+    TemperatureBelow(f64),
+    TemperatureBetween(RangeInclusive<f64>),
+    System(String),
+    Location(String),
+}
+
+/// Fluent, local-only query over committed location observations.
+#[derive(Clone, Debug)]
+pub struct LocationQuery {
+    client: Client,
+    predicates: Vec<LocationPredicate>,
+}
+
+impl LocationQuery {
+    pub(crate) fn new(client: Client) -> Self {
+        Self {
+            client,
+            predicates: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn in_realm(mut self, realm: Realm) -> Self {
+        self.predicates.push(LocationPredicate::Realm(realm));
+        self
+    }
+    #[must_use]
+    pub fn planetary_bodies(mut self) -> Self {
+        self.predicates.push(LocationPredicate::PlanetaryBody);
+        self
+    }
+    #[must_use]
+    pub fn surveyed(mut self) -> Self {
+        self.predicates.push(LocationPredicate::Surveyed);
+        self
+    }
+    #[must_use]
+    pub fn has_atmosphere(mut self) -> Self {
+        self.predicates.push(LocationPredicate::HasAtmosphere);
+        self
+    }
+    #[must_use]
+    pub fn atmosphere_is(mut self, atmosphere: Atmosphere) -> Self {
+        self.predicates
+            .push(LocationPredicate::Atmosphere(atmosphere));
+        self
+    }
+    #[must_use]
+    pub fn has_magnetic_field(mut self) -> Self {
+        self.predicates.push(LocationPredicate::MagneticField);
+        self
+    }
+    #[must_use]
+    pub fn in_habitable_zone(mut self) -> Self {
+        self.predicates.push(LocationPredicate::HabitableZone);
+        self
+    }
+    #[must_use]
+    pub fn life_stage_below(mut self, stage: LifeStage) -> Self {
+        self.predicates
+            .push(LocationPredicate::LifeStageBelow(stage));
+        self
+    }
+    /// Excludes only locations whose known life stage is intelligent or later.
+    #[must_use]
+    pub fn without_advanced_civilisation(self) -> Self {
+        self.life_stage_below(LifeStage::Intelligent)
+    }
+    /// Strictly greater than `g` Earth gravities.
+    #[must_use]
+    pub fn gravity_g_above(mut self, g: f64) -> Self {
+        self.predicates.push(LocationPredicate::GravityAbove(g));
+        self
+    }
+    /// Strictly less than `g` Earth gravities.
+    #[must_use]
+    pub fn gravity_g_below(mut self, g: f64) -> Self {
+        self.predicates.push(LocationPredicate::GravityBelow(g));
+        self
+    }
+    /// Inclusive Earth-gravity range.
+    #[must_use]
+    pub fn gravity_g_between(mut self, range: RangeInclusive<f64>) -> Self {
+        self.predicates
+            .push(LocationPredicate::GravityBetween(range));
+        self
+    }
+    /// Strictly greater than `c` degrees Celsius.
+    #[must_use]
+    pub fn surface_temp_c_above(mut self, c: f64) -> Self {
+        self.predicates.push(LocationPredicate::TemperatureAbove(c));
+        self
+    }
+    /// Strictly less than `c` degrees Celsius.
+    #[must_use]
+    pub fn surface_temp_c_below(mut self, c: f64) -> Self {
+        self.predicates.push(LocationPredicate::TemperatureBelow(c));
+        self
+    }
+    /// Inclusive Celsius range.
+    #[must_use]
+    pub fn surface_temp_c_between(mut self, range: RangeInclusive<f64>) -> Self {
+        self.predicates
+            .push(LocationPredicate::TemperatureBetween(range));
+        self
+    }
+    #[must_use]
+    pub fn in_system(mut self, system: impl Into<String>) -> Self {
+        self.predicates
+            .push(LocationPredicate::System(system.into()));
+        self
+    }
+    #[must_use]
+    pub fn at(mut self, location: impl Into<String>) -> Self {
+        self.predicates
+            .push(LocationPredicate::Location(location.into()));
+        self
+    }
+
+    /// Returns a stable key-sorted local snapshot; it never performs network I/O.
+    pub async fn collect(self) -> Result<Vec<Location>> {
+        Ok(self.evaluate().matches)
+    }
+
+    /// Returns the same local evaluation as [`Self::collect`] plus predicate traces.
+    pub async fn collect_with_diagnostics(self) -> Result<LocationQueryDiagnostics> {
+        Ok(self.evaluate())
+    }
+
+    fn evaluate(&self) -> LocationQueryDiagnostics {
+        let started_at = Instant::now();
+        let observations = self.client.managed_state().locations();
+        let input_locations = observations.len();
+        let predicate_count = self.predicates.len();
+        let mut matches = Vec::new();
+        let mut matched_predicates = 0usize;
+        let mut rejected_predicates = 0usize;
+        let mut unknown_predicates = 0usize;
+
+        let evaluations = observations
+            .into_iter()
+            .map(|observation| {
+                let location = observation.value;
+                let predicates = self
+                    .predicates
+                    .iter()
+                    .map(|predicate| evaluate_location(predicate, &location))
+                    .inspect(|diagnostic| match diagnostic.outcome {
+                        LocationPredicateOutcome::Matched => matched_predicates += 1,
+                        LocationPredicateOutcome::Rejected => rejected_predicates += 1,
+                        LocationPredicateOutcome::Unknown => unknown_predicates += 1,
+                    })
+                    .collect::<Vec<_>>();
+                if predicates
+                    .iter()
+                    .all(|diagnostic| diagnostic.outcome == LocationPredicateOutcome::Matched)
+                {
+                    matches.push(location.clone());
+                }
+                LocationDiagnostic {
+                    location,
+                    predicates,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        info!(
+            target: "replicant_client::query::locations",
+            event = "location_query.evaluated",
+            input_locations,
+            predicate_count,
+            result_count = matches.len(),
+            matched_predicates,
+            rejected_predicates,
+            unknown_predicates,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "evaluated local location predicates"
+        );
+
+        LocationQueryDiagnostics {
+            matches,
+            evaluations,
+        }
+    }
+}
+
+fn result(
+    predicate: impl Into<String>,
+    outcome: LocationPredicateOutcome,
+    observed: Option<String>,
+    reason: impl Into<String>,
+) -> LocationPredicateDiagnostic {
+    LocationPredicateDiagnostic {
+        predicate: predicate.into(),
+        outcome,
+        observed,
+        reason: reason.into(),
+    }
+}
+
+fn known_bool(
+    predicate: &str,
+    value: &Knowledge<bool>,
+    expected: bool,
+) -> LocationPredicateDiagnostic {
+    match value {
+        Knowledge::Unknown => result(
+            predicate,
+            LocationPredicateOutcome::Unknown,
+            None,
+            "unknown field",
+        ),
+        Knowledge::Absent => result(
+            predicate,
+            LocationPredicateOutcome::Rejected,
+            Some("absent".into()),
+            "known absent",
+        ),
+        Knowledge::Present(value) if *value == expected => result(
+            predicate,
+            LocationPredicateOutcome::Matched,
+            Some(value.to_string()),
+            "matched",
+        ),
+        Knowledge::Present(value) => result(
+            predicate,
+            LocationPredicateOutcome::Rejected,
+            Some(value.to_string()),
+            "value did not match",
+        ),
+    }
+}
+
+fn known_number(
+    predicate: &str,
+    value: &Knowledge<f64>,
+    matches: impl FnOnce(f64) -> bool,
+) -> LocationPredicateDiagnostic {
+    match value {
+        Knowledge::Unknown => result(
+            predicate,
+            LocationPredicateOutcome::Unknown,
+            None,
+            "unknown field",
+        ),
+        Knowledge::Absent => result(
+            predicate,
+            LocationPredicateOutcome::Rejected,
+            Some("absent".into()),
+            "known absent",
+        ),
+        Knowledge::Present(value) if matches(*value) => result(
+            predicate,
+            LocationPredicateOutcome::Matched,
+            Some(value.to_string()),
+            "matched",
+        ),
+        Knowledge::Present(value) => result(
+            predicate,
+            LocationPredicateOutcome::Rejected,
+            Some(value.to_string()),
+            "numeric boundary failure",
+        ),
+    }
+}
+
+fn evaluate_location(
+    predicate: &LocationPredicate,
+    location: &Location,
+) -> LocationPredicateDiagnostic {
+    match predicate {
+        LocationPredicate::Realm(realm) => {
+            let matched = location.key.realm == *realm;
+            result(
+                "realm",
+                if matched {
+                    LocationPredicateOutcome::Matched
+                } else {
+                    LocationPredicateOutcome::Rejected
+                },
+                Some(format!("{:?}", location.key.realm)),
+                "realm filter",
+            )
+        }
+        LocationPredicate::PlanetaryBody => {
+            let matched = matches!(
+                location.location_type,
+                Some(LocationType::Planet | LocationType::Moon)
+            );
+            result(
+                "planetary_bodies",
+                if matched {
+                    LocationPredicateOutcome::Matched
+                } else {
+                    LocationPredicateOutcome::Rejected
+                },
+                location
+                    .location_type
+                    .as_ref()
+                    .map(|kind| kind.as_str().into()),
+                "location type",
+            )
+        }
+        LocationPredicate::Surveyed => match location.scanned {
+            Some(true) => result(
+                "surveyed",
+                LocationPredicateOutcome::Matched,
+                Some("true".into()),
+                "matched",
+            ),
+            Some(false) => result(
+                "surveyed",
+                LocationPredicateOutcome::Rejected,
+                Some("false".into()),
+                "not surveyed",
+            ),
+            None => result(
+                "surveyed",
+                LocationPredicateOutcome::Unknown,
+                None,
+                "unknown survey state",
+            ),
+        },
+        LocationPredicate::HasAtmosphere => match &location.environment.atmosphere {
+            Knowledge::Unknown => result(
+                "has_atmosphere",
+                LocationPredicateOutcome::Unknown,
+                None,
+                "unknown field",
+            ),
+            Knowledge::Absent => result(
+                "has_atmosphere",
+                LocationPredicateOutcome::Rejected,
+                Some("absent".into()),
+                "known absent",
+            ),
+            Knowledge::Present(value) => result(
+                "has_atmosphere",
+                LocationPredicateOutcome::Matched,
+                Some(value.as_str().into()),
+                "matched",
+            ),
+        },
+        LocationPredicate::Atmosphere(expected) => match &location.environment.atmosphere {
+            Knowledge::Unknown => result(
+                format!("atmosphere_is({})", expected.as_str()),
+                LocationPredicateOutcome::Unknown,
+                None,
+                "unknown field",
+            ),
+            Knowledge::Absent => result(
+                format!("atmosphere_is({})", expected.as_str()),
+                LocationPredicateOutcome::Rejected,
+                Some("absent".into()),
+                "known absent",
+            ),
+            Knowledge::Present(value) if value == expected => result(
+                format!("atmosphere_is({})", expected.as_str()),
+                LocationPredicateOutcome::Matched,
+                Some(value.as_str().into()),
+                "matched",
+            ),
+            Knowledge::Present(value) => result(
+                format!("atmosphere_is({})", expected.as_str()),
+                LocationPredicateOutcome::Rejected,
+                Some(value.as_str().into()),
+                "value did not match",
+            ),
+        },
+        LocationPredicate::MagneticField => known_bool(
+            "has_magnetic_field",
+            &location.environment.magnetic_field,
+            true,
+        ),
+        LocationPredicate::HabitableZone => known_bool(
+            "in_habitable_zone",
+            &location.environment.in_habitable_zone,
+            true,
+        ),
+        LocationPredicate::LifeStageBelow(expected) => match &location.environment.life_stage {
+            Knowledge::Unknown => result(
+                format!("life_stage_below({})", expected.as_str()),
+                LocationPredicateOutcome::Unknown,
+                None,
+                "unknown life knowledge",
+            ),
+            Knowledge::Absent => result(
+                format!("life_stage_below({})", expected.as_str()),
+                LocationPredicateOutcome::Matched,
+                Some("no_life".into()),
+                "known no life",
+            ),
+            Knowledge::Present(value) => {
+                match (value.canonical_rank(), expected.canonical_rank()) {
+                    (Some(rank), Some(threshold)) if rank < threshold => result(
+                        format!("life_stage_below({})", expected.as_str()),
+                        LocationPredicateOutcome::Matched,
+                        Some(value.as_str().into()),
+                        "matched",
+                    ),
+                    (Some(_), Some(_)) => result(
+                        format!("life_stage_below({})", expected.as_str()),
+                        LocationPredicateOutcome::Rejected,
+                        Some(value.as_str().into()),
+                        "life stage boundary failure",
+                    ),
+                    _ => result(
+                        format!("life_stage_below({})", expected.as_str()),
+                        LocationPredicateOutcome::Unknown,
+                        Some(value.as_str().into()),
+                        "unknown future life stage",
+                    ),
+                }
+            }
+        },
+        LocationPredicate::GravityAbove(value) => known_number(
+            "gravity_g_above",
+            &location.environment.gravity_g,
+            |actual| actual > *value,
+        ),
+        LocationPredicate::GravityBelow(value) => known_number(
+            "gravity_g_below",
+            &location.environment.gravity_g,
+            |actual| actual < *value,
+        ),
+        LocationPredicate::GravityBetween(range) => known_number(
+            "gravity_g_between",
+            &location.environment.gravity_g,
+            |actual| range.contains(&actual),
+        ),
+        LocationPredicate::TemperatureAbove(value) => known_number(
+            "surface_temp_c_above",
+            &location.environment.surface_temp_c,
+            |actual| actual > *value,
+        ),
+        LocationPredicate::TemperatureBelow(value) => known_number(
+            "surface_temp_c_below",
+            &location.environment.surface_temp_c,
+            |actual| actual < *value,
+        ),
+        LocationPredicate::TemperatureBetween(range) => known_number(
+            "surface_temp_c_between",
+            &location.environment.surface_temp_c,
+            |actual| range.contains(&actual),
+        ),
+        LocationPredicate::System(system) => {
+            let matched = location.system.as_deref() == Some(system);
+            result(
+                "in_system",
+                if matched {
+                    LocationPredicateOutcome::Matched
+                } else {
+                    LocationPredicateOutcome::Rejected
+                },
+                location.system.clone(),
+                "system filter",
+            )
+        }
+        LocationPredicate::Location(expected) => {
+            let matched = location.key.id.as_str() == expected;
+            result(
+                "at",
+                if matched {
+                    LocationPredicateOutcome::Matched
+                } else {
+                    LocationPredicateOutcome::Rejected
+                },
+                Some(location.key.id.as_str().into()),
+                "location filter",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod location_predicate_tests {
+    use super::*;
+    use crate::domain::{LocationEnvironment, LocationId, WorldKey};
+
+    fn location() -> Location {
+        Location {
+            key: WorldKey::in_realm(Realm::Live, LocationId::from("SOL-2")),
+            location_type: Some(LocationType::Planet),
+            scanned: Some(true),
+            system_scanned: Some(true),
+            system_tags: Vec::new(),
+            system: Some("SOL".into()),
+            parent: None,
+            environment: LocationEnvironment {
+                atmosphere: Knowledge::Present(Atmosphere::from("breathable")),
+                magnetic_field: Knowledge::Present(true),
+                gravity_g: Knowledge::Present(1.0),
+                surface_temp_c: Knowledge::Present(18.0),
+                in_habitable_zone: Knowledge::Present(true),
+                life_stage: Knowledge::Present(LifeStage::Microbial),
+                ..LocationEnvironment::default()
+            },
+            unknown: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn environment_predicates_use_documented_boundaries_and_unknown_is_not_a_match() {
+        let value = location();
+        assert_eq!(
+            evaluate_location(&LocationPredicate::GravityAbove(1.0), &value).outcome,
+            LocationPredicateOutcome::Rejected
+        );
+        assert_eq!(
+            evaluate_location(&LocationPredicate::GravityBetween(0.8..=1.0), &value).outcome,
+            LocationPredicateOutcome::Matched
+        );
+        assert_eq!(
+            evaluate_location(&LocationPredicate::TemperatureBelow(18.0), &value).outcome,
+            LocationPredicateOutcome::Rejected
+        );
+        assert_eq!(
+            evaluate_location(
+                &LocationPredicate::LifeStageBelow(LifeStage::Intelligent),
+                &value
+            )
+            .outcome,
+            LocationPredicateOutcome::Matched
+        );
+        let mut unknown = value;
+        unknown.environment.magnetic_field = Knowledge::Unknown;
+        assert_eq!(
+            evaluate_location(&LocationPredicate::MagneticField, &unknown).outcome,
+            LocationPredicateOutcome::Unknown
+        );
+        unknown.environment.life_stage = Knowledge::Present(LifeStage::from("post-singularity"));
+        assert_eq!(
+            evaluate_location(
+                &LocationPredicate::LifeStageBelow(LifeStage::Intelligent),
+                &unknown
+            )
+            .outcome,
+            LocationPredicateOutcome::Unknown
+        );
+    }
+}
+
 /// Gateway for the authenticated account. `get` is explicit remote I/O.
 #[derive(Clone, Debug)]
 pub struct AccountGateway {
@@ -78,8 +668,14 @@ impl AccountGateway {
     }
 
     pub async fn get(&self) -> Result<Account> {
+        let started_at = Instant::now();
         self.client.ensure_open()?;
+
+        let request_started_at = Instant::now();
         let response = self.client.managed_raw().accounts().me().await?;
+        let request_ms = request_started_at.elapsed().as_millis() as u64;
+
+        let normalize_started_at = Instant::now();
         let id = response
             .value
             .email
@@ -93,12 +689,26 @@ impl AccountGateway {
             })?;
         let observation = domain::account_me(&response.value, id, observed_at());
         let value = observation.value.clone();
+        let normalize_ms = normalize_started_at.elapsed().as_millis() as u64;
+
+        let persist_started_at = Instant::now();
         self.client
             .managed_state()
             .persist_account(observation)
             .map_err(|_| Error::Persistence {
                 message: "SQLite store operation failed".into(),
             })?;
+        let persist_ms = persist_started_at.elapsed().as_millis() as u64;
+
+        info!(
+            target: "replicant_client::gateway::account",
+            event = "account.get_completed",
+            request_ms,
+            normalize_ms,
+            persist_ms,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed account read"
+        );
         Ok(value)
     }
 
@@ -585,53 +1195,91 @@ impl DeviceQuery {
         &self,
         devices: impl IntoIterator<Item = domain::Observation<Device>>,
     ) -> BTreeMap<DeviceKey, Device> {
+        let started = Instant::now();
         let devices: Vec<_> = devices.into_iter().collect();
+        let input = devices.len();
         let adopted = self.without_adopted_devices.then(|| {
             devices
                 .iter()
                 .filter_map(|entry| entry.value.relationships.controller.clone())
                 .collect::<BTreeSet<_>>()
         });
-        devices
-            .iter()
-            .filter(|entry| self.predicate.matches(&entry.value))
-            .filter(|entry| self.tags.iter().all(|tag| entry.value.tags.contains(tag)))
-            .filter(|entry| {
-                self.system.as_ref().is_none_or(|system| {
-                    entry.value.location.as_ref().is_some_and(|location| {
-                        let id = location.id.as_str();
-                        id == system
-                            || id
-                                .strip_prefix(system)
-                                .is_some_and(|suffix| suffix.starts_with('-'))
-                    })
+        let adopted_relationships = adopted.as_ref().map_or(0, BTreeSet::len);
+
+        let mut predicate_matches = 0usize;
+        let mut tag_matches = 0usize;
+        let mut system_matches = 0usize;
+        let mut relationship_matches = 0usize;
+        let mut adoption_matches = 0usize;
+        let mut result = BTreeMap::new();
+
+        for entry in &devices {
+            if !self.predicate.matches(&entry.value) {
+                continue;
+            }
+            predicate_matches += 1;
+
+            if !self.tags.iter().all(|tag| entry.value.tags.contains(tag)) {
+                continue;
+            }
+            tag_matches += 1;
+
+            let matches_system = self.system.as_ref().is_none_or(|system| {
+                entry.value.location.as_ref().is_some_and(|location| {
+                    let id = location.id.as_str();
+                    id == system
+                        || id
+                            .strip_prefix(system)
+                            .is_some_and(|suffix| suffix.starts_with('-'))
                 })
-            })
-            .filter(|entry| {
-                matches_link(
-                    &self.attached_to,
-                    entry.value.relationships.attached_to.as_ref(),
-                )
-            })
-            .filter(|entry| {
-                matches_link(
-                    &self.controller,
-                    entry.value.relationships.controller.as_ref(),
-                )
-            })
-            .filter(|entry| {
-                matches_link(
-                    &self.hosted_by,
-                    entry.value.relationships.hosted_by.as_ref(),
-                )
-            })
-            .filter(|entry| {
-                adopted
-                    .as_ref()
-                    .is_none_or(|adopted| !adopted.contains(&entry.value.key))
-            })
-            .map(|entry| (entry.value.key.clone(), entry.value.clone()))
-            .collect()
+            });
+            if !matches_system {
+                continue;
+            }
+            system_matches += 1;
+
+            if !matches_link(
+                &self.attached_to,
+                entry.value.relationships.attached_to.as_ref(),
+            ) || !matches_link(
+                &self.controller,
+                entry.value.relationships.controller.as_ref(),
+            ) || !matches_link(
+                &self.hosted_by,
+                entry.value.relationships.hosted_by.as_ref(),
+            ) {
+                continue;
+            }
+            relationship_matches += 1;
+
+            if adopted
+                .as_ref()
+                .is_some_and(|adopted| adopted.contains(&entry.value.key))
+            {
+                continue;
+            }
+            adoption_matches += 1;
+            result.insert(entry.value.key.clone(), entry.value.clone());
+        }
+
+        debug!(
+            target: "replicant_client::query::devices",
+            event = "query.devices_evaluated",
+            input,
+            predicate_matches,
+            tag_matches,
+            system_matches,
+            relationship_matches,
+            adoption_matches,
+            adopted_relationships,
+            results = result.len(),
+            tags = self.tags.len(),
+            system = self.system.as_deref().unwrap_or(""),
+            without_adopted_devices = self.without_adopted_devices,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "evaluated local device query"
+        );
+        result
     }
 
     fn handles(&self, entries: &BTreeMap<DeviceKey, Device>) -> Vec<DeviceHandle> {
@@ -645,8 +1293,18 @@ impl DeviceQuery {
     /// Collects a stable, key-sorted view from the current committed snapshot.
     pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
         self.client.ensure_open()?;
+        let started = Instant::now();
         let entries = self.matching_entries(self.client.managed_state().devices());
-        Ok(self.handles(&entries))
+        let handles = self.handles(&entries);
+        info!(
+            target: "replicant_client::query::devices",
+            event = "query.devices_collected",
+            results = handles.len(),
+            without_adopted_devices = self.without_adopted_devices,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "collected local device query results"
+        );
+        Ok(handles)
     }
 
     /// Subscribes to meaningful changes to this local result set. The first
@@ -810,8 +1468,14 @@ impl DevicesGateway {
         self.find().of_type(controller_type)
     }
     pub async fn get(&self, code: &str) -> Result<DeviceHandle> {
+        let started_at = Instant::now();
         self.client.ensure_open()?;
+
+        let request_started_at = Instant::now();
         let response = self.client.managed_raw().devices().get(code).await?;
+        let request_ms = request_started_at.elapsed().as_millis() as u64;
+
+        let normalize_started_at = Instant::now();
         let observation = domain::device_detail(
             &response.value,
             Realm::Live,
@@ -820,20 +1484,41 @@ impl DevicesGateway {
         )
         .map_err(normalization)?;
         let key = observation.value.key.clone();
+        let normalize_ms = normalize_started_at.elapsed().as_millis() as u64;
+
+        let persist_started_at = Instant::now();
         self.client
             .managed_state()
             .persist_devices(&[observation])
             .map_err(|_| Error::Persistence {
                 message: "SQLite store operation failed".into(),
             })?;
+        let persist_ms = persist_started_at.elapsed().as_millis() as u64;
+
+        info!(
+            target: "replicant_client::gateway::devices",
+            event = "device.get_completed",
+            device_code = code,
+            request_ms,
+            normalize_ms,
+            persist_ms,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed device detail read"
+        );
         Ok(DeviceHandle::new(self.client.clone(), key))
     }
     pub async fn refresh(&self, code: &str) -> Result<DeviceHandle> {
         self.get(code).await
     }
     pub async fn list(&self, query: &raw::devices::DeviceListQuery) -> Result<Vec<DeviceHandle>> {
+        let started_at = Instant::now();
         self.client.ensure_open()?;
+
+        let request_started_at = Instant::now();
         let response = self.client.managed_raw().devices().list(query).await?;
+        let request_ms = request_started_at.elapsed().as_millis() as u64;
+
+        let normalize_started_at = Instant::now();
         let collection = domain::device_collection(
             &response.value,
             Realm::Live,
@@ -847,12 +1532,30 @@ impl DevicesGateway {
             .iter()
             .map(|item| item.value.key.clone())
             .collect::<Vec<_>>();
+        let item_count = keys.len();
+        let normalize_ms = normalize_started_at.elapsed().as_millis() as u64;
+
+        let persist_started_at = Instant::now();
         self.client
             .managed_state()
             .persist_devices(&collection.members)
             .map_err(|_| Error::Persistence {
                 message: "SQLite store operation failed".into(),
             })?;
+        let persist_ms = persist_started_at.elapsed().as_millis() as u64;
+
+        info!(
+            target: "replicant_client::gateway::devices",
+            event = "devices.list_completed",
+            item_count,
+            filtered = !query_is_unfiltered(query),
+            request_ms,
+            normalize_ms,
+            persist_ms,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed device collection read"
+        );
+
         Ok(keys
             .into_iter()
             .map(|key| DeviceHandle::new(self.client.clone(), key))
@@ -970,18 +1673,39 @@ impl ReplicantsGateway {
         ReplicantQuery::new(self.client.clone())
     }
     pub async fn get_owned(&self, code: &str) -> Result<ReplicantHandle> {
+        let started_at = Instant::now();
         self.client.ensure_open()?;
+
+        let request_started_at = Instant::now();
         let response = self.client.managed_raw().replicants().get(code).await?;
+        let request_ms = request_started_at.elapsed().as_millis() as u64;
+
+        let normalize_started_at = Instant::now();
         let observation =
             domain::owned_replicant_detail(&response.value, Realm::Live, observed_at())
                 .map_err(normalization)?;
         let key = observation.value.key.clone();
+        let normalize_ms = normalize_started_at.elapsed().as_millis() as u64;
+
+        let persist_started_at = Instant::now();
         self.client
             .managed_state()
             .persist_replicant(observation)
             .map_err(|_| Error::Persistence {
                 message: "SQLite store operation failed".into(),
             })?;
+        let persist_ms = persist_started_at.elapsed().as_millis() as u64;
+
+        info!(
+            target: "replicant_client::gateway::replicants",
+            event = "replicant.get_owned_completed",
+            replicant_code = code,
+            request_ms,
+            normalize_ms,
+            persist_ms,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed owned replicant read"
+        );
         Ok(ReplicantHandle {
             client: self.client.clone(),
             key,
@@ -1130,6 +1854,39 @@ pub struct InventoryGateway {
 impl InventoryGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Fetches one account-inventory page and commits every location before
+    /// returning.  Callers that need complete collection authority must
+    /// traverse `next_cursor` without adding a location filter.
+    pub async fn list(
+        &self,
+        query: &raw::inventory::AccountInventoryQuery,
+    ) -> Result<(Vec<domain::Inventory>, Option<String>)> {
+        self.client.ensure_open()?;
+        let response = self.client.managed_raw().inventory().list(query).await?;
+        let mut inventories = Vec::with_capacity(response.value.locations.len());
+        for raw_location in &response.value.locations {
+            let Some(location) = raw_location.location.as_deref() else {
+                continue;
+            };
+            let observation = domain::location_inventory(
+                raw_location,
+                domain::InventoryOwner::Location(domain::LocationKey::live(location.into())),
+                Realm::Live,
+                observed_at(),
+            )
+            .map_err(normalization)?;
+            let value = observation.value.clone();
+            self.client
+                .managed_state()
+                .persist_inventory(observation)
+                .map_err(|_| Error::Persistence {
+                    message: "SQLite store operation failed".into(),
+                })?;
+            inventories.push(value);
+        }
+        Ok((inventories, response.value.next_cursor))
     }
 
     /// Fetches a replicant's current-system inventory: its current location
@@ -1338,6 +2095,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn without_adopted_devices_matches_the_reference_relationship_filter() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let mut devices = (0..100)
+            .map(|index| {
+                cached_device(
+                    &format!("C{index}"),
+                    DeviceType::MiningController,
+                    DeviceStatus::Idle,
+                )
+            })
+            .collect::<Vec<_>>();
+        for index in (0..100).step_by(3) {
+            let mut adopted = cached_device(
+                &format!("D{index}"),
+                DeviceType::MiningDrone,
+                DeviceStatus::Idle,
+            );
+            adopted.value.relationships.controller = Some(devices[index].value.key.clone());
+            devices.push(adopted);
+        }
+
+        let reference = devices
+            .iter()
+            .filter(|candidate| {
+                !devices.iter().any(|device| {
+                    device.value.relationships.controller.as_ref() == Some(&candidate.value.key)
+                })
+            })
+            .map(|entry| (entry.value.key.clone(), entry.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let optimized = DeviceQuery::new(client.clone())
+            .without_adopted_devices()
+            .matching_entries(devices);
+
+        assert_eq!(optimized, reference);
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
     async fn query_subscription_is_initial_stable_and_coalesces_revisions() {
         let server = MockServer::start().await;
         let client = client_at(&server.uri()).await;
@@ -1404,5 +2201,66 @@ mod tests {
         client.close().await.expect("close");
         assert!(subscription.try_next().is_none());
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn location_queries_are_local_and_diagnostics_share_the_evaluator() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let observation = domain::Observation {
+            value: Location {
+                key: domain::LocationKey::live("SOL-2".into()),
+                location_type: Some(LocationType::Planet),
+                scanned: Some(true),
+                system_scanned: Some(true),
+                system_tags: Vec::new(),
+                system: Some("SOL".into()),
+                parent: None,
+                environment: domain::LocationEnvironment {
+                    atmosphere: Knowledge::Present(Atmosphere::Breathable),
+                    magnetic_field: Knowledge::Present(true),
+                    gravity_g: Knowledge::Present(1.0),
+                    surface_temp_c: Knowledge::Present(18.0),
+                    in_habitable_zone: Knowledge::Present(true),
+                    life_stage: Knowledge::Present(LifeStage::Microbial),
+                    ..domain::LocationEnvironment::default()
+                },
+                unknown: BTreeMap::new(),
+            },
+            metadata: domain::ObservationMetadata {
+                source: domain::ObservationSource::RestDetail,
+                authority: domain::ObservationAuthority::EntitySnapshot,
+                observed_at: "2026-07-25T00:00:00Z".into(),
+                access: AccessScope::Owned,
+                reachability: domain::Reachability::Reachable,
+                stale: false,
+                source_document: domain::SourceDocument {
+                    operation: "test".into(),
+                    request_id: None,
+                    document_id: None,
+                },
+            },
+        };
+        client
+            .managed_state()
+            .persist_location(observation)
+            .expect("persist");
+        let query = client
+            .locations()
+            .find()
+            .planetary_bodies()
+            .surveyed()
+            .atmosphere_is(Atmosphere::Breathable)
+            .has_magnetic_field()
+            .in_habitable_zone()
+            .life_stage_below(LifeStage::Intelligent)
+            .gravity_g_between(0.8..=1.3)
+            .surface_temp_c_between(10.0..=25.0);
+        let results = query.clone().collect().await.expect("local query");
+        let diagnostics = query.collect_with_diagnostics().await.expect("diagnostics");
+        assert_eq!(results, diagnostics.matches);
+        assert_eq!(results.len(), 1);
+        server.verify().await;
+        client.close().await.expect("close");
     }
 }

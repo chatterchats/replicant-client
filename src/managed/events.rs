@@ -15,12 +15,15 @@
 //! of whether it arrived through the log or SSE, and is stored, reduced, and
 //! cursor-advanced in one atomic commit before publication.
 
-use std::{sync::Mutex, time::Duration};
-
-use tokio::sync::broadcast;
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use futures::StreamExt as _;
 use serde_json::Value;
+use tokio::sync::broadcast;
+use tracing::{debug, info, warn};
 
 use crate::domain::{self, DeviceKey, Event, Realm};
 use crate::events::{EventLogQuery, GameEvent};
@@ -28,8 +31,7 @@ use crate::raw;
 use crate::{Error, Result};
 
 use super::client::{
-    Client, ClientDegradation, ClientStatus, EventStreamOptions, ReconciliationPolicy,
-    StartupPolicy, WeakClient,
+    Client, EventStreamOptions, ReadinessComponent, ReconciliationPolicy, StartupPolicy, WeakClient,
 };
 use super::store::{ReconciliationWork, StoreError};
 
@@ -233,6 +235,14 @@ fn resolve_realm(client: &Client, raw_event: &GameEvent) -> Option<Realm> {
 }
 
 fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
+    let started = Instant::now();
+    debug!(
+        target: "replicant_client::events",
+        event = "events.apply_started",
+        event_id = %raw_event.id,
+        event_name = %raw_event.event,
+        "applying account event"
+    );
     let event =
         domain::account_event(raw_event, resolve_realm(client, raw_event), observed_at()).value;
     let cursor = raw_event.id.clone();
@@ -251,6 +261,13 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
             .map_err(persistence_error)?
     };
     if !inserted {
+        debug!(
+            target: "replicant_client::events",
+            event = "events.duplicate_skipped",
+            event_id = %cursor,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "skipping duplicate account event"
+        );
         // The transaction's insert-if-absent claim was lost to the other
         // lane, so no reducer, publisher, evidence, or reconciliation side
         // effect may run here.
@@ -268,7 +285,18 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
         schedule_trade_completion_reconciliation(client, &event)?;
         apply_simulation_lifecycle(client, &event)?;
     }
+    let event_name = event.name.as_str().to_owned();
+    let realm = event.realm.clone();
     client.managed_events().notify(event);
+    debug!(
+        target: "replicant_client::events",
+        event = "events.apply_completed",
+        event_id = %cursor,
+        event_name = %event_name,
+        realm = ?realm,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "account event durably applied and published"
+    );
     Ok(())
 }
 
@@ -279,6 +307,7 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
         let result = weak.upgrade().ok_or(Error::Closed).and_then(|client| {
             let result = apply_event(&client, &request.event);
             if result.is_err() {
+                warn!(target: "replicant_client::events", "event application failed; marking continuity degraded");
                 mark_event_continuity_degraded(&client);
                 if schedule_continuity_reconciliation(&client).is_err() {
                     mark_event_continuity_degraded(&client);
@@ -295,11 +324,9 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
 }
 
 fn mark_event_continuity_degraded(client: &Client) {
-    // A successful SSE connection is transport health, not proof that an
-    // earlier baseline or durable application failure recovered.
-    if !matches!(client.status(), ClientStatus::Degraded(_)) {
-        client.set_status(ClientStatus::Degraded(ClientDegradation::EventContinuity));
-    }
+    client.set_readiness(|readiness| {
+        readiness.event_catchup = ReadinessComponent::Degraded;
+    });
 }
 
 fn schedule_continuity_reconciliation(client: &Client) -> Result<()> {
@@ -415,28 +442,92 @@ async fn catch_up_unfiltered(
     from_cursor: Option<String>,
     max_pages: usize,
 ) -> Result<CatchUpOutcome> {
+    let total_started = Instant::now();
     let mut cursor = from_cursor;
     let mut pages = 0usize;
+    info!(
+        target: "replicant_client::events",
+        event = "events.catchup_started",
+        cursor_present = cursor.is_some(),
+        max_pages,
+        "starting unfiltered event-log catch-up"
+    );
     loop {
+        let page_started = Instant::now();
+        debug!(
+            target: "replicant_client::events",
+            event = "events.catchup_page_started",
+            page = pages + 1,
+            cursor = cursor.as_deref().unwrap_or(""),
+            "fetching event-log catch-up page"
+        );
         let query = EventLogQuery {
             cursor: cursor.clone(),
             limit: Some(100),
             filtered: Some(false),
             ..Default::default()
         };
+        let request_started = Instant::now();
         let response = client.managed_raw().events().list(&query).await?;
-        for event in response.value.events {
+        let request_elapsed = request_started.elapsed();
+        let events = response.value.events;
+        let next_cursor = response.value.next_cursor;
+        let event_count = events.len();
+        let last_event_id = events.last().map(|event| event.id.clone());
+        let apply_started = Instant::now();
+        for event in events {
             client.managed_events().enqueue(event).await?;
         }
+        let apply_elapsed = apply_started.elapsed();
         pages += 1;
-        match response.value.next_cursor {
+        info!(
+            target: "replicant_client::events",
+            event = "events.catchup_page_completed",
+            page = pages,
+            events = event_count,
+            has_next = next_cursor.is_some(),
+            request_ms = request_elapsed.as_millis() as u64,
+            apply_ms = apply_elapsed.as_millis() as u64,
+            elapsed_ms = page_started.elapsed().as_millis() as u64,
+            "applied event-log catch-up page"
+        );
+        match next_cursor {
             Some(next) => {
+                if last_event_id.as_deref() == Some(next.as_str()) || cursor.as_ref() == Some(&next)
+                {
+                    info!(
+                        target: "replicant_client::events",
+                        event = "events.catchup_completed",
+                        pages,
+                        elapsed_ms = total_started.elapsed().as_millis() as u64,
+                        reason = "terminal_cursor",
+                        "event-log catch-up completed"
+                    );
+                    return Ok(CatchUpOutcome::Complete);
+                }
                 cursor = Some(next);
                 if pages >= max_pages.max(1) {
+                    warn!(
+                        target: "replicant_client::events",
+                        event = "events.catchup_bound_hit",
+                        pages,
+                        elapsed_ms = total_started.elapsed().as_millis() as u64,
+                        "event-log catch-up reached page bound"
+                    );
                     return Ok(CatchUpOutcome::BoundHit);
                 }
             }
-            None => return Ok(CatchUpOutcome::Complete),
+            None => {
+                info!(
+                    target: "replicant_client::events",
+                    event = "events.catchup_completed",
+                    pages,
+                    elapsed_ms = total_started.elapsed().as_millis() as u64,
+                    reason = "no_next_cursor",
+                    "event-log catch-up completed"
+                );
+                return Ok(CatchUpOutcome::Complete);
+            }
         }
     }
 }
@@ -578,14 +669,6 @@ async fn run_log_poll_loop(weak: WeakClient, interval: Duration, max_pages: usiz
 /// [`ClientStatus::Degraded`] — usable with a recoverable limitation, so
 /// [`Client::ready`] does not block on it forever. A connection that *was*
 /// live and was then lost is reported as [`ClientStatus::Offline`] instead.
-fn disconnect_status(ever_ready: bool) -> ClientStatus {
-    if ever_ready {
-        ClientStatus::Offline
-    } else {
-        ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
-    }
-}
-
 /// Connects the filtered SSE stream from the last durably applied cursor,
 /// reconnecting with bounded backoff. Holds only a cloned unmanaged
 /// [`raw::Client`] (never the managed [`Client`]) across the long-lived
@@ -597,7 +680,6 @@ async fn run_sse_loop(
     max_backoff: Duration,
 ) {
     let mut backoff = min_backoff;
-    let mut ever_ready = false;
     loop {
         let Some(client) = weak.upgrade() else {
             return;
@@ -609,45 +691,80 @@ async fn run_sse_loop(
                 None
             }
         };
-        if !matches!(client.status(), ClientStatus::Degraded(_)) {
-            client.set_status(ClientStatus::Connecting);
+        if !matches!(
+            client.readiness().sse_connectivity,
+            ReadinessComponent::Degraded
+        ) {
+            client.set_readiness(|readiness| {
+                readiness.sse_connectivity = ReadinessComponent::Pending;
+            });
         }
         drop(client);
 
-        if let Ok(mut stream) = raw_client.events().stream(cursor.as_deref()).await {
-            let Some(client) = weak.upgrade() else {
-                return;
-            };
-            if !matches!(client.status(), ClientStatus::Degraded(_)) {
-                client.set_status(ClientStatus::Ready);
-            }
-            ever_ready = true;
-            drop(client);
-            backoff = min_backoff;
-
-            loop {
-                let next = stream.next().await;
+        let connect_started = Instant::now();
+        debug!(
+            target: "replicant_client::events",
+            event = "events.sse_connect_started",
+            cursor = cursor.as_deref().unwrap_or(""),
+            backoff_ms = backoff.as_millis() as u64,
+            "connecting filtered event stream"
+        );
+        match raw_client.events().stream(cursor.as_deref()).await {
+            Ok(mut stream) => {
                 let Some(client) = weak.upgrade() else {
                     return;
                 };
-                match next {
-                    Some(Ok(event)) => {
-                        if client.managed_events().enqueue(event).await.is_err() {
-                            mark_event_continuity_degraded(&client);
-                            break;
+                info!(
+                    target: "replicant_client::events",
+                    event = "events.sse_connected",
+                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    "filtered event stream connected"
+                );
+                client.set_readiness(|readiness| {
+                    readiness.sse_connectivity = ReadinessComponent::Ready;
+                });
+                drop(client);
+                let mut received_event = false;
+
+                loop {
+                    let next = stream.next().await;
+                    let Some(client) = weak.upgrade() else {
+                        return;
+                    };
+                    match next {
+                        Some(Ok(event)) => {
+                            received_event = true;
+                            if client.managed_events().enqueue(event).await.is_err() {
+                                mark_event_continuity_degraded(&client);
+                                break;
+                            }
                         }
+                        _ => break,
                     }
-                    _ => break,
                 }
+                if received_event {
+                    backoff = min_backoff;
+                } else {
+                    debug!(target: "replicant_client::events", "event stream ended without an event");
+                }
+            }
+            Err(error) => {
+                warn!(
+                    target: "replicant_client::events",
+                    event = "events.sse_connect_failed",
+                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    error = %error,
+                    "filtered event stream connection failed"
+                )
             }
         }
 
         let Some(client) = weak.upgrade() else {
             return;
         };
-        if !matches!(client.status(), ClientStatus::Degraded(_)) {
-            client.set_status(disconnect_status(ever_ready));
-        }
+        client.set_readiness(|readiness| {
+            readiness.sse_connectivity = ReadinessComponent::Degraded;
+        });
         drop(client);
         tokio::time::sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(max_backoff);
@@ -672,6 +789,13 @@ async fn run_startup(
     let Some(client) = weak.upgrade() else {
         return;
     };
+    let startup_started = Instant::now();
+    info!(
+        target: "replicant_client::events",
+        event = "events.startup_started",
+        ?policy,
+        "running managed event startup"
+    );
 
     // Restart recovery, network half: an operation left at `prepared` was
     // durably registered but never confirmed to have even started its one
@@ -679,58 +803,119 @@ async fn run_startup(
     // Every other unresolved state is left untouched (see
     // `operation::recover`).
     let max_pages = event_options.max_catchup_pages;
-    if super::operation::recover(&client).await.is_err() {
-        client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
+    let recovery_started = Instant::now();
+    info!(
+        target: "replicant_client::events",
+        event = "events.operation_recovery_started",
+        "recovering durable operations"
+    );
+    match super::operation::recover(&client).await {
+        Ok(()) => {
+            info!(
+                target: "replicant_client::events",
+                event = "events.operation_recovery_completed",
+                elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+                "durable operation recovery completed"
+            )
+        }
+        Err(error) => {
+            warn!(
+                target: "replicant_client::events",
+                event = "events.operation_recovery_failed",
+                elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+                error = %error,
+                "durable operation recovery failed"
+            );
+            client.set_readiness(|readiness| {
+                readiness.background_reconciliation = ReadinessComponent::Degraded;
+            });
+        }
     }
 
     match client.managed_state().event_cursor() {
         Ok(Some(applied)) => {
             // Restart: the durable applied cursor is the sole continuity
             // point. Catch up before any optional REST reconciliation.
-            if !matches!(client.status(), ClientStatus::Degraded(_)) {
-                client.set_status(ClientStatus::CatchingUp);
-            }
-            let outcome = catch_up_unfiltered(&client, Some(applied), max_pages).await;
             let stale = client
                 .managed_state()
                 .event_cursor_is_stale(reconciliation_policy.staleness_threshold)
                 .unwrap_or(true);
-            if stale || !matches!(outcome, Ok(CatchUpOutcome::Complete)) {
+            let outcome = if stale {
+                warn!(target: "replicant_client::events", "durable event cursor is stale; skipping replay and reconciling authoritative state");
+                None
+            } else {
+                info!(target: "replicant_client::events", "catching up event log from durable cursor");
+                Some(catch_up_unfiltered(&client, Some(applied), max_pages).await)
+            };
+            let complete = matches!(outcome.as_ref(), Some(Ok(CatchUpOutcome::Complete)));
+            info!(
+                target: "replicant_client::events",
+                "event-log catch-up completed complete={} stale={stale}",
+                complete
+            );
+            if stale || !complete {
+                warn!(target: "replicant_client::events", "event continuity requires reconciliation");
                 mark_event_continuity_degraded(&client);
                 if schedule_continuity_reconciliation(&client).is_err() {
                     mark_event_continuity_degraded(&client);
                 }
-                if client.sync().essential().await.is_err() {
-                    mark_event_continuity_degraded(&client);
-                }
+            } else {
+                client.set_readiness(|readiness| {
+                    readiness.event_catchup = ReadinessComponent::Ready;
+                });
             }
-        }
-        Ok(None) => {
-            // First start: capture an unfiltered watermark *before* the REST
-            // baseline. It is intentionally not written as an applied cursor:
-            // only a journaled, reduced event may advance that durable value.
-            let watermark = match fetch_baseline_watermark(&client).await {
-                Ok(watermark) => watermark,
-                Err(_) => {
-                    mark_event_continuity_degraded(&client);
-                    None
-                }
-            };
+            info!(target: "replicant_client::events", "running restart REST baseline policy={policy:?}");
             let baseline = if policy == StartupPolicy::Full {
                 client.sync().full().await
             } else {
                 client.sync().essential().await
             };
             if baseline.is_err() {
-                client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
+                warn!(target: "replicant_client::events", "restart REST baseline failed");
+                client.set_readiness(|readiness| {
+                    readiness.essential_rest = ReadinessComponent::Degraded;
+                });
             }
-            if !matches!(client.status(), ClientStatus::Degraded(_)) {
-                client.set_status(ClientStatus::CatchingUp);
+        }
+        Ok(None) => {
+            // First start: capture an unfiltered watermark *before* the REST
+            // baseline. It is intentionally not written as an applied cursor:
+            // only a journaled, reduced event may advance that durable value.
+            info!(target: "replicant_client::events", "fetching initial event-log watermark");
+            let watermark = match fetch_baseline_watermark(&client).await {
+                Ok(watermark) => {
+                    info!(target: "replicant_client::events", "initial event-log watermark fetched present={}", watermark.is_some());
+                    watermark
+                }
+                Err(error) => {
+                    warn!(target: "replicant_client::events", "initial event-log watermark failed error={error}");
+                    mark_event_continuity_degraded(&client);
+                    None
+                }
+            };
+            info!(target: "replicant_client::events", "running initial REST baseline policy={policy:?}");
+            let baseline = if policy == StartupPolicy::Full {
+                client.sync().full().await
+            } else {
+                client.sync().essential().await
+            };
+            if baseline.is_err() {
+                warn!(target: "replicant_client::events", "initial REST baseline failed");
+                client.set_readiness(|readiness| {
+                    readiness.essential_rest = ReadinessComponent::Degraded;
+                });
             }
-            if !matches!(
+            info!(target: "replicant_client::events", "catching up event log after initial REST baseline");
+            if matches!(
                 catch_up_unfiltered(&client, watermark, max_pages).await,
                 Ok(CatchUpOutcome::Complete)
             ) {
+                info!(target: "replicant_client::events", "initial event-log catch-up completed");
+                client.set_readiness(|readiness| {
+                    readiness.event_catchup = ReadinessComponent::Ready;
+                });
+            } else {
+                warn!(target: "replicant_client::events", "initial event-log catch-up requires reconciliation");
                 mark_event_continuity_degraded(&client);
                 if schedule_continuity_reconciliation(&client).is_err() {
                     mark_event_continuity_degraded(&client);
@@ -738,6 +923,7 @@ async fn run_startup(
             }
         }
         Err(_) => {
+            warn!(target: "replicant_client::events", "could not read durable event cursor");
             mark_event_continuity_degraded(&client);
             if schedule_continuity_reconciliation(&client).is_err() {
                 mark_event_continuity_degraded(&client);
@@ -746,6 +932,12 @@ async fn run_startup(
     }
 
     let raw_client = client.managed_raw().clone();
+    info!(
+        target: "replicant_client::events",
+        event = "events.startup_background_workers",
+        elapsed_ms = startup_started.elapsed().as_millis() as u64,
+        "starting managed event background workers"
+    );
     drop(client);
 
     let sse = run_sse_loop(
@@ -769,6 +961,7 @@ pub(crate) async fn spawn(
     event_options: EventStreamOptions,
     reconciliation_policy: ReconciliationPolicy,
 ) -> Result<()> {
+    info!(target: "replicant_client::events", "starting managed event engine policy={policy:?}");
     let weak = client.downgrade();
     let applier = client.managed_events().start_applier(weak.clone())?;
     client.register_task(applier).await?;
@@ -797,6 +990,7 @@ mod tests {
         Observation, ObservationAuthority, ObservationMetadata, ObservationSource, Reachability,
         SourceDocument,
     };
+    use crate::managed::{ClientDegradation, ClientStatus};
     use crate::raw::{SecretString, Url};
 
     fn device_in_realm(realm: Realm, id: &str) -> Observation<Device> {
@@ -943,6 +1137,61 @@ mod tests {
             watch.try_next().expect("watch").len(),
             1,
             "event notified exactly once"
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn duplicate_event_producers_keep_the_cursor_monotonic() {
+        let client = applier_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
+        for sequence in 1..=32 {
+            let event = game_event(&format!("{sequence}-0"), "mining.started", Some("D1"));
+            let (log, sse) = tokio::join!(
+                client.managed_events().enqueue(event.clone()),
+                client.managed_events().enqueue(event),
+            );
+            log.expect("log event applied");
+            sse.expect("SSE duplicate handled");
+        }
+        assert_eq!(
+            client
+                .managed_state()
+                .event_cursor()
+                .expect("cursor")
+                .as_deref(),
+            Some("32-0")
+        );
+        assert_eq!(watch.try_next().expect("deduplicated watch").len(), 32);
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn slow_event_subscriber_is_bounded_and_reports_lag() {
+        let client = applier_client().await;
+        let mut watch = client.events().watch().await.expect("watch");
+        for sequence in 1..=(EVENT_SUBSCRIPTION_CAPACITY + 1) {
+            client
+                .managed_events()
+                .enqueue(game_event(
+                    &format!("{sequence}-0"),
+                    "mining.started",
+                    Some("D1"),
+                ))
+                .await
+                .expect("event applied");
+        }
+        assert!(matches!(
+            watch.try_next(),
+            Err(Error::Transport { message, .. }) if message.contains("lagged")
+        ));
+        assert_eq!(
+            client
+                .managed_state()
+                .event_cursor()
+                .expect("cursor")
+                .as_deref(),
+            Some("257-0")
         );
         client.close().await.expect("close");
     }
@@ -1240,6 +1489,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catch_up_treats_a_repeated_next_cursor_as_terminal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("cursor", "1-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [],
+                "next_cursor": "1-0"
+            })))
+            .mount(&server)
+            .await;
+        let client = restore_only_client_at(&server.uri()).await;
+
+        let outcome = catch_up_unfiltered(&client, Some("1-0".to_owned()), 10)
+            .await
+            .expect("catch-up");
+
+        assert_eq!(outcome, CatchUpOutcome::Complete);
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn catch_up_treats_the_last_event_cursor_as_terminal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("cursor", "1-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{
+                    "id": "2-0", "version": 1, "category": "mining", "event": "mining.started",
+                    "device_code": "D1", "created_at": "2026-07-25T00:00:00Z"
+                }],
+                "next_cursor": "2-0"
+            })))
+            .mount(&server)
+            .await;
+        let client = restore_only_client_at(&server.uri()).await;
+        let task = client
+            .managed_events()
+            .start_applier(client.downgrade())
+            .expect("start event applier");
+        client
+            .register_task(task)
+            .await
+            .expect("register event applier");
+
+        let outcome = catch_up_unfiltered(&client, Some("1-0".to_owned()), 10)
+            .await
+            .expect("catch-up");
+
+        assert_eq!(outcome, CatchUpOutcome::Complete);
+        assert_eq!(
+            client.managed_state().event_cursor().expect("cursor"),
+            Some("2-0".to_owned())
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
     async fn stale_cursor_is_flagged_uncertain_without_any_server_rejection() {
         let client = applier_client().await;
         client
@@ -1327,7 +1635,9 @@ mod tests {
             .build()
             .expect("raw client");
         let client = applier_client().await;
-        client.set_status(ClientStatus::Degraded(ClientDegradation::StartupIncomplete));
+        client.set_readiness(|readiness| {
+            readiness.essential_rest = ReadinessComponent::Degraded;
+        });
 
         let task = tokio::spawn(run_sse_loop(
             client.downgrade(),
@@ -1473,20 +1783,6 @@ mod tests {
             Some("2-0")
         );
         client.close().await.expect("close");
-    }
-
-    #[test]
-    fn disconnect_status_distinguishes_never_ready_from_a_lost_connection() {
-        // A `tokio::sync::watch` status channel only ever exposes the latest
-        // value, so a connect-then-immediately-drop cycle (as a canned mock
-        // response produces) can race past any observer between polls. The
-        // Offline-vs-Degraded choice is exercised directly here instead of
-        // through a timing-sensitive end-to-end status watch.
-        assert_eq!(
-            disconnect_status(false),
-            ClientStatus::Degraded(ClientDegradation::StartupIncomplete)
-        );
-        assert_eq!(disconnect_status(true), ClientStatus::Offline);
     }
 
     #[tokio::test]

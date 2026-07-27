@@ -63,7 +63,7 @@ pub struct MessageListResponse {
 }
 
 /// Request body for `POST /v1/messages/read`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct MessagesReadRequest {
     /// Specific message IDs to mark read.
     #[serde(skip_serializing_if = "Option::is_none")]

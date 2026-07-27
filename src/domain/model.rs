@@ -65,13 +65,168 @@ pub struct DirectoryProfile {
     pub is_npc: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// A field's knowledge state. `Absent` is materially different from an
+/// unobserved field and survives persistence.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Knowledge<T> {
+    #[default]
+    Unknown,
+    Absent,
+    Present(T),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocationEnvironment {
+    pub atmosphere: Knowledge<Atmosphere>,
+    pub magnetic_field: Knowledge<bool>,
+    /// Earth gravities (`g`).
+    pub gravity_g: Knowledge<f64>,
+    /// Degrees Celsius.
+    pub surface_temp_c: Knowledge<f64>,
+    pub in_habitable_zone: Knowledge<bool>,
+    pub life_stage: Knowledge<LifeStage>,
+    /// Axial tilt in degrees.
+    pub axial_tilt_deg: Knowledge<f64>,
+    /// Forward-compatible observed rotation classification, when supplied.
+    pub rotation_state: Knowledge<String>,
+    /// Forward-compatible host-star spectral classification, when supplied.
+    pub star_spectral_type: Knowledge<String>,
+    /// Forward-compatible nearby-belt richness, when supplied.
+    pub nearby_belt_richness: Knowledge<String>,
+    /// Light years from SOL, when the durable star catalogue can supply it.
+    pub distance_from_sol_ly: Knowledge<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     pub key: LocationKey,
     pub location_type: Option<LocationType>,
     pub scanned: Option<bool>,
     pub system_scanned: Option<bool>,
     pub system_tags: Vec<String>,
+    pub system: Option<String>,
+    pub parent: Option<LocationKey>,
+    pub environment: LocationEnvironment,
+    /// Sanitized, untyped response fields retained for a later contract update.
+    #[serde(default)]
+    pub unknown: BTreeMap<String, Value>,
+}
+
+impl Location {
+    #[must_use]
+    pub fn id(&self) -> &LocationId {
+        &self.key.id
+    }
+    #[must_use]
+    pub fn atmosphere(&self) -> &Knowledge<Atmosphere> {
+        &self.environment.atmosphere
+    }
+    #[must_use]
+    pub fn gravity_g(&self) -> &Knowledge<f64> {
+        &self.environment.gravity_g
+    }
+    #[must_use]
+    pub fn surface_temp_c(&self) -> &Knowledge<f64> {
+        &self.environment.surface_temp_c
+    }
+    #[must_use]
+    pub fn magnetic_field_present(&self) -> &Knowledge<bool> {
+        &self.environment.magnetic_field
+    }
+    #[must_use]
+    pub fn in_habitable_zone(&self) -> &Knowledge<bool> {
+        &self.environment.in_habitable_zone
+    }
+    #[must_use]
+    pub fn life_stage(&self) -> &Knowledge<LifeStage> {
+        &self.environment.life_stage
+    }
+    #[must_use]
+    pub fn axial_tilt_deg(&self) -> &Knowledge<f64> {
+        &self.environment.axial_tilt_deg
+    }
+    #[must_use]
+    pub fn rotation_state(&self) -> &Knowledge<String> {
+        &self.environment.rotation_state
+    }
+    #[must_use]
+    pub fn star_spectral_type(&self) -> &Knowledge<String> {
+        &self.environment.star_spectral_type
+    }
+    #[must_use]
+    pub fn nearby_belt_richness(&self) -> &Knowledge<String> {
+        &self.environment.nearby_belt_richness
+    }
+    #[must_use]
+    pub fn distance_from_sol_ly(&self) -> &Knowledge<f64> {
+        &self.environment.distance_from_sol_ly
+    }
+
+    pub(crate) fn merge_from(&mut self, newer: &Self) {
+        self.location_type = newer
+            .location_type
+            .clone()
+            .or_else(|| self.location_type.clone());
+        self.scanned = newer.scanned.or(self.scanned);
+        self.system_scanned = newer.system_scanned.or(self.system_scanned);
+        if !newer.system_tags.is_empty() {
+            self.system_tags = newer.system_tags.clone();
+        }
+        self.system = newer.system.clone().or_else(|| self.system.clone());
+        self.parent = newer.parent.clone().or_else(|| self.parent.clone());
+        merge_knowledge(
+            &mut self.environment.atmosphere,
+            &newer.environment.atmosphere,
+        );
+        merge_knowledge(
+            &mut self.environment.magnetic_field,
+            &newer.environment.magnetic_field,
+        );
+        merge_knowledge(
+            &mut self.environment.gravity_g,
+            &newer.environment.gravity_g,
+        );
+        merge_knowledge(
+            &mut self.environment.surface_temp_c,
+            &newer.environment.surface_temp_c,
+        );
+        merge_knowledge(
+            &mut self.environment.in_habitable_zone,
+            &newer.environment.in_habitable_zone,
+        );
+        merge_knowledge(
+            &mut self.environment.life_stage,
+            &newer.environment.life_stage,
+        );
+        merge_knowledge(
+            &mut self.environment.axial_tilt_deg,
+            &newer.environment.axial_tilt_deg,
+        );
+        merge_knowledge(
+            &mut self.environment.rotation_state,
+            &newer.environment.rotation_state,
+        );
+        merge_knowledge(
+            &mut self.environment.star_spectral_type,
+            &newer.environment.star_spectral_type,
+        );
+        merge_knowledge(
+            &mut self.environment.nearby_belt_richness,
+            &newer.environment.nearby_belt_richness,
+        );
+        merge_knowledge(
+            &mut self.environment.distance_from_sol_ly,
+            &newer.environment.distance_from_sol_ly,
+        );
+        self.unknown.extend(newer.unknown.clone());
+    }
+}
+
+fn merge_knowledge<T: Clone>(current: &mut Knowledge<T>, newer: &Knowledge<T>) {
+    if !matches!(newer, Knowledge::Unknown) {
+        *current = newer.clone();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,10 +341,33 @@ pub struct Species {
     pub description: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GalacticPosition {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Star {
     pub key: StarKey,
     pub name: Option<String>,
     pub spectral_type: Option<String>,
     pub entry_point: Option<LocationKey>,
+    pub position: Option<GalacticPosition>,
+}
+
+/// A star observation from one owned replicant's perspective.  It is not a
+/// catalogue replacement: different replicants can know different facts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StarKnowledge {
+    pub replicant: ReplicantKey,
+    pub star: StarKey,
+    pub position: Option<GalacticPosition>,
+    pub spectral_type: Option<String>,
+    pub entry_point: Option<LocationKey>,
+    pub explored: Option<bool>,
+    pub has_life: Option<bool>,
+    pub distance_from_replicant: Option<f64>,
+    pub estimated_travel_time: Option<i64>,
 }

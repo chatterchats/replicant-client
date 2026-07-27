@@ -4,16 +4,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use tokio::sync::watch;
+use tracing::{debug, info};
 
 use crate::domain::{
     Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location, LocationKey,
-    Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId,
+    Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId, Star, StarKey,
+    StarKnowledge,
 };
 
-use super::store::{OperationJournalEntry, ReconciliationWork, Store, StoreError, StoreHandle};
+use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StateSnapshot {
@@ -24,6 +27,13 @@ pub(crate) struct StateSnapshot {
     locations: BTreeMap<LocationKey, Observation<Location>>,
     inventories: BTreeMap<InventoryOwner, Observation<Inventory>>,
     simulations: BTreeMap<SimulationId, Observation<Simulation>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GalaxySnapshot {
+    catalogue: BTreeMap<StarKey, Observation<Star>>,
+    generated_at: Option<String>,
+    knowledge: BTreeMap<(ReplicantKey, StarKey), Observation<StarKnowledge>>,
 }
 
 impl StateSnapshot {
@@ -40,27 +50,41 @@ pub(crate) struct StateEngine {
     store: StoreHandle,
     snapshot: RwLock<Arc<StateSnapshot>>,
     snapshots: watch::Sender<Arc<StateSnapshot>>,
+    galaxy: RwLock<Arc<GalaxySnapshot>>,
 }
 
 impl StateEngine {
     pub(crate) fn open_memory() -> Result<Self, StoreError> {
-        Self::from_store(Arc::new(Mutex::new(Some(Store::open_memory()?))))
+        Self::from_store(StoreHandle::open_memory_blocking()?)
     }
 
     pub(crate) fn open_file(path: &Path) -> Result<Self, StoreError> {
-        Self::from_store(Arc::new(Mutex::new(Some(Store::open_file(path)?))))
+        Self::from_store(StoreHandle::open_file_blocking(path.into())?)
     }
 
     pub(crate) fn from_store(store: StoreHandle) -> Result<Self, StoreError> {
-        let locked = store.lock().expect("state store lock poisoned");
-        let opened = locked.as_ref().ok_or(StoreError::Closed)?;
-        let devices = opened.restore_devices()?;
-        let account = opened.restore_account()?;
-        let replicants = opened.restore_replicants()?;
-        let locations = opened.restore_locations()?;
-        let inventories = opened.restore_inventories()?;
-        let simulations = opened.restore_simulations()?;
-        drop(locked);
+        let restore_started = Instant::now();
+        let (
+            devices,
+            account,
+            replicants,
+            locations,
+            inventories,
+            simulations,
+            catalogue,
+            knowledge,
+        ) = store.execute_blocking(|opened| {
+            Ok((
+                opened.restore_devices()?,
+                opened.restore_account()?,
+                opened.restore_replicants()?,
+                opened.restore_locations()?,
+                opened.restore_inventories()?,
+                opened.restore_simulations()?,
+                opened.restore_catalogue()?,
+                opened.restore_star_knowledge()?,
+            ))
+        })?;
         let snapshot = Arc::new(StateSnapshot {
             revision: 0,
             devices,
@@ -71,10 +95,29 @@ impl StateEngine {
             simulations,
         });
         let (snapshots, _) = watch::channel(Arc::clone(&snapshot));
+        info!(
+            target: "replicant_client::state",
+            event = "state.restored",
+            elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            account_present = snapshot.account.is_some(),
+            devices = snapshot.devices.len(),
+            replicants = snapshot.replicants.len(),
+            locations = snapshot.locations.len(),
+            inventories = snapshot.inventories.len(),
+            simulations = snapshot.simulations.len(),
+            catalogue = catalogue.0.len(),
+            star_knowledge = knowledge.len(),
+            "restored durable managed state"
+        );
         Ok(Self {
             store,
             snapshot: RwLock::new(snapshot),
             snapshots,
+            galaxy: RwLock::new(Arc::new(GalaxySnapshot {
+                catalogue: catalogue.0,
+                generated_at: catalogue.1,
+                knowledge,
+            })),
         })
     }
 
@@ -90,6 +133,10 @@ impl StateEngine {
         self.snapshot().devices.values().cloned().collect()
     }
 
+    pub(crate) fn account(&self) -> Option<Observation<Account>> {
+        self.snapshot().account.clone()
+    }
+
     pub(crate) fn replicant(&self, key: &ReplicantKey) -> Option<Observation<Replicant>> {
         self.snapshot().replicants.get(key).cloned()
     }
@@ -102,6 +149,93 @@ impl StateEngine {
         self.snapshot().locations.get(key).cloned()
     }
 
+    pub(crate) fn locations(&self) -> Vec<Observation<Location>> {
+        self.snapshot().locations.values().cloned().collect()
+    }
+
+    pub(crate) fn catalogue(&self) -> Vec<Observation<Star>> {
+        self.galaxy
+            .read()
+            .expect("galaxy snapshot lock poisoned")
+            .catalogue
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn catalogue_generated_at(&self) -> Option<String> {
+        self.galaxy
+            .read()
+            .expect("galaxy snapshot lock poisoned")
+            .generated_at
+            .clone()
+    }
+
+    pub(crate) fn star_knowledge(
+        &self,
+        replicant: &ReplicantKey,
+    ) -> Vec<Observation<StarKnowledge>> {
+        self.galaxy
+            .read()
+            .expect("galaxy snapshot lock poisoned")
+            .knowledge
+            .iter()
+            .filter(|((known_by, _), _)| known_by == replicant)
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    pub(crate) fn replace_catalogue(
+        &self,
+        stars: Vec<Observation<Star>>,
+        generated_at: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .replace_catalogue(&stars, generated_at.as_deref())?;
+        let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
+            .as_ref()
+            .clone();
+        galaxy.catalogue = stars
+            .into_iter()
+            .map(|star| (star.value.key.clone(), star))
+            .collect();
+        galaxy.generated_at = generated_at;
+        *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
+        let mut snapshot = (*self.snapshot()).clone();
+        snapshot.revision += 1;
+        self.publish(snapshot);
+        Ok(())
+    }
+
+    pub(crate) fn persist_star_knowledge(
+        &self,
+        knowledge: Observation<StarKnowledge>,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .persist_star_knowledge(&knowledge)?;
+        let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
+            .as_ref()
+            .clone();
+        galaxy.knowledge.insert(
+            (
+                knowledge.value.replicant.clone(),
+                knowledge.value.star.clone(),
+            ),
+            knowledge,
+        );
+        *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
+        let mut snapshot = (*self.snapshot()).clone();
+        snapshot.revision += 1;
+        self.publish(snapshot);
+        Ok(())
+    }
+
     pub(crate) fn inventory(&self, owner: &InventoryOwner) -> Option<Observation<Inventory>> {
         self.snapshot().inventories.get(owner).cloned()
     }
@@ -109,7 +243,6 @@ impl StateEngine {
     pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_account(&account)?;
@@ -132,7 +265,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_replicant(&replicant)?;
@@ -168,7 +300,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_simulation(&simulation)?;
@@ -196,7 +327,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_simulation_and_devices(&simulation, devices)?;
@@ -225,7 +355,6 @@ impl StateEngine {
         let removed = self
             .store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .purge_realm_devices(realm)?;
@@ -256,7 +385,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_inventory(&inventory)?;
@@ -278,15 +406,19 @@ impl StateEngine {
     /// Commits a targeted location observation before publishing a new revision.
     pub(crate) fn persist_location(
         &self,
-        location: Observation<Location>,
+        mut location: Observation<Location>,
     ) -> Result<(), StoreError> {
+        let previous = self.snapshot();
+        if let Some(existing) = previous.locations.get(&location.value.key) {
+            let mut merged = existing.value.clone();
+            merged.merge_from(&location.value);
+            location.value = merged;
+        }
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_location(&location)?;
-        let previous = self.snapshot();
         let mut locations = previous.locations.clone();
         locations.insert(location.value.key.clone(), location);
         self.publish(StateSnapshot {
@@ -305,7 +437,6 @@ impl StateEngine {
     pub(crate) fn has_event(&self, event_id: &str) -> Result<bool, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .has_event(event_id)
@@ -315,7 +446,6 @@ impl StateEngine {
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .event_cursor()
@@ -325,7 +455,6 @@ impl StateEngine {
     pub(crate) fn set_event_cursor(&self, cursor: &str) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .set_event_cursor(cursor)
@@ -339,7 +468,6 @@ impl StateEngine {
     ) -> Result<bool, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .event_cursor_is_stale(threshold.as_secs() as i64)
@@ -349,7 +477,6 @@ impl StateEngine {
     pub(crate) fn backdate_event_cursor(&self, seconds: i64) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .backdate_event_cursor(seconds)
@@ -361,7 +488,6 @@ impl StateEngine {
         let inserted = self
             .store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .append_event_and_project(event, cursor, &[])?;
@@ -392,7 +518,6 @@ impl StateEngine {
         let inserted = self
             .store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .append_event_and_decommission(event, cursor, decommissioned)?;
@@ -426,7 +551,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .enqueue_reconciliation(work_id, realm, kind, payload)
@@ -438,7 +562,6 @@ impl StateEngine {
     ) -> Result<Option<ReconciliationWork>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .claim_reconciliation_work()
@@ -448,7 +571,6 @@ impl StateEngine {
     pub(crate) fn complete_reconciliation_work(&self, work_id: &str) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .complete_reconciliation_work(work_id)
@@ -458,7 +580,6 @@ impl StateEngine {
     pub(crate) fn retry_reconciliation_work(&self, work_id: &str) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .retry_reconciliation_work(work_id)
@@ -468,7 +589,6 @@ impl StateEngine {
     pub(crate) fn bound_account_id(&self) -> Result<Option<String>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .bound_account_id()
@@ -481,7 +601,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .rebind_account_and_persist(previous, &account)?;
@@ -507,7 +626,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .record_operation(
@@ -528,7 +646,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .set_operation_state(operation_id, state)
@@ -541,7 +658,6 @@ impl StateEngine {
     ) -> Result<bool, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .claim_operation_submission(operation_id, attempt_id)
@@ -551,7 +667,6 @@ impl StateEngine {
     pub(crate) fn fail_next_operation_commit(&self) {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .expect("state store open")
             .fail_next_commit();
@@ -567,7 +682,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .record_operation_and_project(operation_id, state, devices)
@@ -582,7 +696,6 @@ impl StateEngine {
     ) -> Result<(), StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .append_operation_projection(operation_id, state, projection)
@@ -594,7 +707,6 @@ impl StateEngine {
     ) -> Result<Option<OperationJournalEntry>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .read_operation(operation_id)
@@ -605,7 +717,6 @@ impl StateEngine {
     pub(crate) fn promote_crashed_submissions(&self) -> Result<usize, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .promote_crashed_submissions()
@@ -616,7 +727,6 @@ impl StateEngine {
     ) -> Result<Vec<(String, OperationJournalEntry)>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .list_unresolved_operations()
@@ -630,7 +740,6 @@ impl StateEngine {
     ) -> Result<Vec<String>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_ref()
             .ok_or(StoreError::Closed)?
             .find_operations_awaiting_evidence(target_realm, target_kind, target_id)
@@ -647,7 +756,6 @@ impl StateEngine {
     ) -> Result<Arc<StateSnapshot>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .persist_devices(devices)?;
@@ -675,7 +783,6 @@ impl StateEngine {
     ) -> Result<Arc<StateSnapshot>, StoreError> {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .ok_or(StoreError::Closed)?
             .reconcile_owned_devices(present)?;
@@ -702,12 +809,31 @@ impl StateEngine {
     }
 
     fn publish(&self, next: StateSnapshot) -> Arc<StateSnapshot> {
+        let publish_started = Instant::now();
+        let revision = next.revision;
+        let devices = next.devices.len();
+        let replicants = next.replicants.len();
+        let locations = next.locations.len();
+        let inventories = next.inventories.len();
+        let simulations = next.simulations.len();
         let next = Arc::new(next);
         *self
             .snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&next);
         self.snapshots.send_replace(Arc::clone(&next));
+        debug!(
+            target: "replicant_client::state",
+            event = "state.snapshot_published",
+            revision,
+            devices,
+            replicants,
+            locations,
+            inventories,
+            simulations,
+            elapsed_ms = publish_started.elapsed().as_millis() as u64,
+            "published managed state snapshot"
+        );
         next
     }
 
@@ -715,7 +841,6 @@ impl StateEngine {
     pub(crate) fn fail_next_commit(&self) {
         self.store
             .lock()
-            .expect("state store lock poisoned")
             .as_mut()
             .expect("state store is open during this test")
             .fail_next_commit();
@@ -799,6 +924,83 @@ mod tests {
                 .snapshot()
                 .devices()
                 .contains_key(&DeviceKey::live("durable".into()))
+        );
+        drop(restored);
+        fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn location_environment_restores_and_incomplete_detail_cannot_erase_it() {
+        let path = test_path();
+        let engine = StateEngine::open_file(&path).expect("open engine");
+        let metadata = || ObservationMetadata {
+            source: ObservationSource::RestDetail,
+            authority: ObservationAuthority::EntitySnapshot,
+            observed_at: "2026-07-26T00:00:00Z".into(),
+            access: AccessScope::Owned,
+            reachability: Reachability::Reachable,
+            stale: false,
+            source_document: SourceDocument {
+                operation: "test".into(),
+                request_id: None,
+                document_id: None,
+            },
+        };
+        let key = LocationKey::live("SOL-2".into());
+        let complete = Observation {
+            value: Location {
+                key: key.clone(),
+                location_type: Some(crate::domain::LocationType::Planet),
+                scanned: Some(true),
+                system_scanned: None,
+                system_tags: Vec::new(),
+                system: Some("SOL".into()),
+                parent: None,
+                environment: crate::domain::LocationEnvironment {
+                    atmosphere: crate::domain::Knowledge::Present(crate::domain::Atmosphere::from(
+                        "thin",
+                    )),
+                    magnetic_field: crate::domain::Knowledge::Present(false),
+                    gravity_g: crate::domain::Knowledge::Present(1.0),
+                    surface_temp_c: crate::domain::Knowledge::Present(18.0),
+                    in_habitable_zone: crate::domain::Knowledge::Present(true),
+                    life_stage: crate::domain::Knowledge::Absent,
+                    ..crate::domain::LocationEnvironment::default()
+                },
+                unknown: BTreeMap::new(),
+            },
+            metadata: metadata(),
+        };
+        engine
+            .persist_location(complete)
+            .expect("complete observation");
+        let incomplete = Observation {
+            value: Location {
+                key: key.clone(),
+                location_type: Some(crate::domain::LocationType::Planet),
+                scanned: None,
+                system_scanned: None,
+                system_tags: Vec::new(),
+                system: None,
+                parent: None,
+                environment: crate::domain::LocationEnvironment::default(),
+                unknown: BTreeMap::new(),
+            },
+            metadata: metadata(),
+        };
+        engine
+            .persist_location(incomplete)
+            .expect("partial observation");
+        drop(engine);
+
+        let restored = StateEngine::open_file(&path).expect("restore engine");
+        let location = restored.location(&key).expect("restored location").value;
+        assert!(matches!(
+            location.environment.life_stage,
+            crate::domain::Knowledge::Absent
+        ));
+        assert!(
+            matches!(location.environment.gravity_g, crate::domain::Knowledge::Present(value) if value == 1.0)
         );
         drop(restored);
         fs::remove_file(path).expect("remove test database");

@@ -5,16 +5,28 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    mpsc,
+};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+std::thread_local! {
+    static INTERRUPT_NEXT_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
+use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
+use tracing::{debug, info, warn};
 
 use crate::domain::{
     Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
     LocationKey, Observation, ObservationMetadata, Realm, Replicant, ReplicantKey, Simulation,
-    SimulationId,
+    SimulationId, Star, StarKey, StarKnowledge,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -33,8 +45,14 @@ pub(crate) enum StoreError {
     },
     #[error("injected commit failure")]
     InjectedCommitFailure,
+    #[error("injected migration interruption")]
+    InjectedMigrationInterruption,
     #[error("store is closed")]
     Closed,
+    #[error("store worker queue is full")]
+    Backpressure,
+    #[error("store worker could not start: {0}")]
+    WorkerStart(#[source] std::io::Error),
     #[error("invalid Redis stream event ID: {0}")]
     InvalidEventId(String),
     #[error("database schema version {found} is newer than supported version {supported}")]
@@ -48,8 +66,518 @@ pub(crate) struct Store {
     fail_next_commit: bool,
 }
 
-/// Shared ownership of the one durable store used by a managed client.
-pub(crate) type StoreHandle = Arc<Mutex<Option<Store>>>;
+/// The one serialized, bounded execution path to SQLite. The connection is
+/// created, used, flushed, and dropped only by its dedicated OS thread.
+#[derive(Clone)]
+pub(crate) struct StoreHandle {
+    sender: tokio_mpsc::Sender<StoreCommand>,
+    accepting: Arc<AtomicBool>,
+    close: Arc<TokioMutex<Option<CloseResponse>>>,
+}
+
+/// Compatibility facade for the remaining synchronous state methods. It is
+/// intentionally not a database guard: each method sends its work to the
+/// dedicated worker and waits for that worker's response.
+pub(crate) struct StoreProxy(StoreHandle);
+
+const STORE_QUEUE_CAPACITY: usize = 64;
+type CloseResponse = oneshot::Receiver<Result<(), StoreError>>;
+type CatalogueRows = (BTreeMap<StarKey, Observation<Star>>, Option<String>);
+
+enum StoreCommand {
+    Execute {
+        id: u64,
+        operation_type: &'static str,
+        queued_at: Instant,
+        command: Box<dyn FnOnce(&mut Store) + Send + 'static>,
+    },
+    Close(oneshot::Sender<Result<(), StoreError>>),
+}
+
+static NEXT_STORE_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+
+impl StoreHandle {
+    pub(crate) fn lock(&self) -> StoreProxy {
+        StoreProxy(self.clone())
+    }
+    pub(crate) async fn open_memory() -> Result<Self, StoreError> {
+        tokio::task::spawn_blocking(|| Self::start(None))
+            .await
+            .map_err(|_| StoreError::Closed)?
+    }
+
+    pub(crate) async fn open_file(path: PathBuf) -> Result<Self, StoreError> {
+        tokio::task::spawn_blocking(move || Self::start(Some(path)))
+            .await
+            .map_err(|_| StoreError::Closed)?
+    }
+
+    pub(crate) fn open_memory_blocking() -> Result<Self, StoreError> {
+        Self::start(None)
+    }
+
+    pub(crate) fn open_file_blocking(path: PathBuf) -> Result<Self, StoreError> {
+        Self::start(Some(path))
+    }
+
+    fn start(path: Option<PathBuf>) -> Result<Self, StoreError> {
+        let storage = path
+            .as_ref()
+            .map_or_else(|| "memory".to_owned(), |path| path.display().to_string());
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (sender, mut receiver) = tokio_mpsc::channel(STORE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("replicant-store".into())
+            .spawn(move || {
+                let open_started = Instant::now();
+                info!(
+                    target: "replicant_client::store",
+                    event = "store.open_started",
+                    storage = %storage,
+                    queue_capacity = STORE_QUEUE_CAPACITY,
+                    "opening SQLite store worker"
+                );
+                let opened = match path {
+                    Some(path) => Store::open_file(&path),
+                    None => Store::open_memory(),
+                };
+                let mut store = match opened {
+                    Ok(store) => {
+                        info!(
+                            target: "replicant_client::store",
+                            event = "store.open_completed",
+                            storage = %storage,
+                            elapsed_ms = open_started.elapsed().as_millis() as u64,
+                            "SQLite store worker opened"
+                        );
+                        store
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "replicant_client::store",
+                            event = "store.open_failed",
+                            storage = %storage,
+                            elapsed_ms = open_started.elapsed().as_millis() as u64,
+                            error = %error,
+                            "SQLite store worker failed to open"
+                        );
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready_sender.send(Ok(()));
+                while let Some(command) = receiver.blocking_recv() {
+                    match command {
+                        StoreCommand::Execute {
+                            id,
+                            operation_type,
+                            queued_at,
+                            command,
+                        } => {
+                            let queue_wait = queued_at.elapsed();
+                            let execute_started = Instant::now();
+                            command(&mut store);
+                            debug!(
+                                target: "replicant_client::store",
+                                event = "store.command_completed",
+                                command_id = id,
+                                operation_type,
+                                queue_wait_ms = queue_wait.as_millis() as u64,
+                                execute_ms = execute_started.elapsed().as_millis() as u64,
+                                elapsed_ms = queued_at.elapsed().as_millis() as u64,
+                                "SQLite store command completed"
+                            );
+                        }
+                        StoreCommand::Close(response) => {
+                            let close_started = Instant::now();
+                            let result = store.flush();
+                            info!(
+                                target: "replicant_client::store",
+                                event = "store.close_completed",
+                                elapsed_ms = close_started.elapsed().as_millis() as u64,
+                                success = result.is_ok(),
+                                "SQLite store worker flushed and closed"
+                            );
+                            let _ = response.send(result);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(StoreError::WorkerStart)?;
+        ready_receiver.recv().map_err(|_| StoreError::Closed)??;
+        Ok(Self {
+            sender,
+            accepting: Arc::new(AtomicBool::new(true)),
+            close: Arc::new(TokioMutex::new(None)),
+        })
+    }
+
+    pub(crate) async fn execute<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        if !self.accepting.load(AtomicOrdering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        let id = NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let operation_type = std::any::type_name::<F>();
+        let queued_at = Instant::now();
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::Execute {
+                id,
+                operation_type,
+                queued_at,
+                command: Box::new(move |store| {
+                    let _ = response_sender.send(operation(store));
+                }),
+            })
+            .await
+            .map_err(|_| StoreError::Closed)?;
+        response_receiver.await.map_err(|_| StoreError::Closed)?
+    }
+
+    /// Synchronous compatibility bridge for startup and test-only callers.
+    /// Async managed flows use [`Self::execute`]; this never touches SQLite or
+    /// a store mutex on the caller thread.
+    pub(crate) fn execute_blocking<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
+    {
+        if !self.accepting.load(AtomicOrdering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        let id = NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let operation_type = std::any::type_name::<F>();
+        let queued_at = Instant::now();
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(StoreCommand::Execute {
+                id,
+                operation_type,
+                queued_at,
+                command: Box::new(move |store| {
+                    let _ = response_sender.send(operation(store));
+                }),
+            })
+            .map_err(|error| match error {
+                tokio_mpsc::error::TrySendError::Full(_) => StoreError::Backpressure,
+                tokio_mpsc::error::TrySendError::Closed(_) => StoreError::Closed,
+            })?;
+        response_receiver.recv().map_err(|_| StoreError::Closed)?
+    }
+
+    pub(crate) async fn close(&self) -> Result<(), StoreError> {
+        self.accepting.store(false, AtomicOrdering::Release);
+        let mut close = self.close.lock().await;
+        if close.is_none() {
+            let (response_sender, response_receiver) = oneshot::channel();
+            self.sender
+                .send(StoreCommand::Close(response_sender))
+                .await
+                .map_err(|_| StoreError::Closed)?;
+            *close = Some(response_receiver);
+        }
+        if let Some(response) = close.take() {
+            return response.await.map_err(|_| StoreError::Closed)?;
+        }
+        Err(StoreError::Closed)
+    }
+}
+
+impl StoreProxy {
+    pub(crate) fn as_ref(&self) -> Option<&Self> {
+        Some(self)
+    }
+    pub(crate) fn as_mut(&mut self) -> Option<&mut Self> {
+        Some(self)
+    }
+
+    pub(crate) fn bind_account(&mut self, account_id: &AccountId) -> Result<(), StoreError> {
+        let account_id = account_id.clone();
+        self.0
+            .execute_blocking(move |store| store.bind_account(&account_id))
+    }
+    pub(crate) fn bound_account_id(&self) -> Result<Option<String>, StoreError> {
+        self.0.execute_blocking(|store| store.bound_account_id())
+    }
+    pub(crate) fn rebind_account_and_persist(
+        &mut self,
+        previous: &AccountId,
+        account: &Observation<Account>,
+    ) -> Result<(), StoreError> {
+        let previous = previous.clone();
+        let account = account.clone();
+        self.0
+            .execute_blocking(move |store| store.rebind_account_and_persist(&previous, &account))
+    }
+    pub(crate) fn persist_account(
+        &mut self,
+        value: &Observation<Account>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0.execute_blocking(move |s| s.persist_account(&value))
+    }
+    pub(crate) fn persist_replicant(
+        &mut self,
+        value: &Observation<Replicant>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0
+            .execute_blocking(move |s| s.persist_replicant(&value))
+    }
+    pub(crate) fn replace_catalogue(
+        &mut self,
+        stars: &[Observation<Star>],
+        generated_at: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let stars = stars.to_vec();
+        let generated_at = generated_at.map(str::to_owned);
+        self.0
+            .execute_blocking(move |s| s.replace_catalogue(&stars, generated_at.as_deref()))
+    }
+    pub(crate) fn persist_star_knowledge(
+        &mut self,
+        value: &Observation<StarKnowledge>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0
+            .execute_blocking(move |s| s.persist_star_knowledge(&value))
+    }
+    pub(crate) fn persist_location(
+        &mut self,
+        value: &Observation<Location>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0.execute_blocking(move |s| s.persist_location(&value))
+    }
+    pub(crate) fn persist_devices(
+        &mut self,
+        values: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        let values = values.to_vec();
+        self.0.execute_blocking(move |s| s.persist_devices(&values))
+    }
+    pub(crate) fn persist_simulation_and_devices(
+        &mut self,
+        simulation: &Observation<Simulation>,
+        devices: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        let simulation = simulation.clone();
+        let devices = devices.to_vec();
+        self.0
+            .execute_blocking(move |s| s.persist_simulation_and_devices(&simulation, &devices))
+    }
+    pub(crate) fn reconcile_owned_devices(
+        &mut self,
+        values: &BTreeSet<DeviceKey>,
+    ) -> Result<(), StoreError> {
+        let values = values.clone();
+        self.0
+            .execute_blocking(move |s| s.reconcile_owned_devices(&values))
+    }
+    pub(crate) fn purge_realm_devices(
+        &mut self,
+        realm: &Realm,
+    ) -> Result<Vec<DeviceKey>, StoreError> {
+        let realm = realm.clone();
+        self.0
+            .execute_blocking(move |s| s.purge_realm_devices(&realm))
+    }
+    pub(crate) fn persist_simulation(
+        &mut self,
+        value: &Observation<Simulation>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0
+            .execute_blocking(move |s| s.persist_simulation(&value))
+    }
+    pub(crate) fn persist_inventory(
+        &mut self,
+        value: &Observation<Inventory>,
+    ) -> Result<(), StoreError> {
+        let value = value.clone();
+        self.0
+            .execute_blocking(move |s| s.persist_inventory(&value))
+    }
+    pub(crate) fn has_event(&self, id: &str) -> Result<bool, StoreError> {
+        let id = id.to_owned();
+        self.0.execute_blocking(move |s| s.has_event(&id))
+    }
+    pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
+        self.0.execute_blocking(|s| s.event_cursor())
+    }
+    pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
+        let cursor = cursor.to_owned();
+        self.0
+            .execute_blocking(move |s| s.set_event_cursor(&cursor))
+    }
+    pub(crate) fn event_cursor_is_stale(&self, threshold: i64) -> Result<bool, StoreError> {
+        self.0
+            .execute_blocking(move |s| s.event_cursor_is_stale(threshold))
+    }
+    #[cfg(test)]
+    pub(crate) fn backdate_event_cursor(&mut self, seconds: i64) -> Result<(), StoreError> {
+        self.0
+            .execute_blocking(move |s| s.backdate_event_cursor(seconds))
+    }
+    pub(crate) fn append_event_and_project(
+        &mut self,
+        event: &Event,
+        cursor: &str,
+        devices: &[Observation<Device>],
+    ) -> Result<bool, StoreError> {
+        let event = event.clone();
+        let cursor = cursor.to_owned();
+        let devices = devices.to_vec();
+        self.0
+            .execute_blocking(move |s| s.append_event_and_project(&event, &cursor, &devices))
+    }
+    pub(crate) fn append_event_and_decommission(
+        &mut self,
+        event: &Event,
+        cursor: &str,
+        keys: &[DeviceKey],
+    ) -> Result<bool, StoreError> {
+        let event = event.clone();
+        let cursor = cursor.to_owned();
+        let keys = keys.to_vec();
+        self.0
+            .execute_blocking(move |s| s.append_event_and_decommission(&event, &cursor, &keys))
+    }
+    pub(crate) fn enqueue_reconciliation(
+        &mut self,
+        id: &str,
+        realm: &Realm,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let realm = realm.clone();
+        let kind = kind.to_owned();
+        let payload = payload.clone();
+        self.0
+            .execute_blocking(move |s| s.enqueue_reconciliation(&id, &realm, &kind, &payload))
+    }
+    pub(crate) fn claim_reconciliation_work(
+        &mut self,
+    ) -> Result<Option<ReconciliationWork>, StoreError> {
+        self.0.execute_blocking(|s| s.claim_reconciliation_work())
+    }
+    pub(crate) fn complete_reconciliation_work(&mut self, id: &str) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.0
+            .execute_blocking(move |s| s.complete_reconciliation_work(&id))
+    }
+    pub(crate) fn retry_reconciliation_work(&mut self, id: &str) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.0
+            .execute_blocking(move |s| s.retry_reconciliation_work(&id))
+    }
+    pub(crate) fn record_operation(
+        &mut self,
+        id: &str,
+        state: &str,
+        realm: Option<&str>,
+        kind: Option<&str>,
+        target: Option<&str>,
+        intent: &Value,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        let realm = realm.map(str::to_owned);
+        let kind = kind.map(str::to_owned);
+        let target = target.map(str::to_owned);
+        let intent = intent.clone();
+        self.0.execute_blocking(move |s| {
+            s.record_operation(
+                &id,
+                &state,
+                realm.as_deref(),
+                kind.as_deref(),
+                target.as_deref(),
+                &intent,
+            )
+        })
+    }
+    pub(crate) fn set_operation_state(&mut self, id: &str, state: &str) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        self.0
+            .execute_blocking(move |s| s.set_operation_state(&id, &state))
+    }
+    pub(crate) fn claim_operation_submission(
+        &mut self,
+        id: &str,
+        attempt: &str,
+    ) -> Result<bool, StoreError> {
+        let id = id.to_owned();
+        let attempt = attempt.to_owned();
+        self.0
+            .execute_blocking(move |s| s.claim_operation_submission(&id, &attempt))
+    }
+    pub(crate) fn record_operation_and_project(
+        &mut self,
+        id: &str,
+        state: &str,
+        devices: &[Observation<Device>],
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        let devices = devices.to_vec();
+        self.0
+            .execute_blocking(move |s| s.record_operation_and_project(&id, &state, &devices))
+    }
+    pub(crate) fn append_operation_projection(
+        &mut self,
+        id: &str,
+        state: &str,
+        value: &Value,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        let value = value.clone();
+        self.0
+            .execute_blocking(move |s| s.append_operation_projection(&id, &state, &value))
+    }
+    pub(crate) fn read_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<OperationJournalEntry>, StoreError> {
+        let id = id.to_owned();
+        self.0.execute_blocking(move |s| s.read_operation(&id))
+    }
+    pub(crate) fn promote_crashed_submissions(&mut self) -> Result<usize, StoreError> {
+        self.0.execute_blocking(|s| s.promote_crashed_submissions())
+    }
+    pub(crate) fn list_unresolved_operations(
+        &self,
+    ) -> Result<Vec<(String, OperationJournalEntry)>, StoreError> {
+        self.0.execute_blocking(|s| s.list_unresolved_operations())
+    }
+    pub(crate) fn find_operations_awaiting_evidence(
+        &self,
+        realm: &str,
+        kind: &str,
+        target: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let realm = realm.to_owned();
+        let kind = kind.to_owned();
+        let target = target.to_owned();
+        self.0
+            .execute_blocking(move |s| s.find_operations_awaiting_evidence(&realm, &kind, &target))
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit(&mut self) {
+        let _ = self.0.execute_blocking(|s| {
+            s.fail_next_commit();
+            Ok(())
+        });
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OperationJournalEntry {
@@ -114,6 +642,10 @@ impl Store {
         if version.is_none() || version == Some(0) {
             let transaction = connection.transaction()?;
             transaction.execute_batch(INITIAL_SCHEMA)?;
+            #[cfg(test)]
+            if INTERRUPT_NEXT_MIGRATION.with(|interrupted| interrupted.replace(false)) {
+                return Err(StoreError::InjectedMigrationInterruption);
+            }
             transaction.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1) ON CONFLICT(version) DO NOTHING",
                 [CURRENT_SCHEMA_VERSION],
@@ -141,6 +673,11 @@ impl Store {
             #[cfg(test)]
             fail_next_commit: false,
         })
+    }
+
+    #[cfg(test)]
+    fn interrupt_next_migration_for_test() {
+        INTERRUPT_NEXT_MIGRATION.with(|interrupted| interrupted.set(true));
     }
 
     pub(crate) fn bind_account(&mut self, account_id: &AccountId) -> Result<(), StoreError> {
@@ -277,6 +814,46 @@ impl Store {
         Ok(locations)
     }
 
+    pub(crate) fn restore_catalogue(&self) -> Result<CatalogueRows, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM stars ORDER BY realm, star_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut stars = BTreeMap::new();
+        for row in rows {
+            let observation = serde_json::from_str::<Observation<Star>>(&row?)?;
+            stars.insert(observation.value.key.clone(), observation);
+        }
+        let generated_at = self
+            .connection
+            .query_row(
+                "SELECT generated_at FROM catalogue_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok((stars, generated_at))
+    }
+
+    pub(crate) fn restore_star_knowledge(
+        &self,
+    ) -> Result<BTreeMap<(ReplicantKey, StarKey), Observation<StarKnowledge>>, StoreError> {
+        let mut statement = self.connection.prepare("SELECT observation_json FROM replicant_star_knowledge ORDER BY realm, replicant_id, star_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut knowledge = BTreeMap::new();
+        for row in rows {
+            let observation = serde_json::from_str::<Observation<StarKnowledge>>(&row?)?;
+            knowledge.insert(
+                (
+                    observation.value.replicant.clone(),
+                    observation.value.star.clone(),
+                ),
+                observation,
+            );
+        }
+        Ok(knowledge)
+    }
+
     pub(crate) fn persist_account(
         &mut self,
         account: &Observation<Account>,
@@ -306,6 +883,44 @@ impl Store {
         transaction.execute(
             "INSERT INTO locations(realm, location_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, location_id) DO UPDATE SET observation_json = excluded.observation_json",
             params![realm_key(&location.value.key.realm), location.value.key.id.as_str(), serde_json::to_string(location)?],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
+
+    pub(crate) fn replace_catalogue(
+        &mut self,
+        stars: &[Observation<Star>],
+        generated_at: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM stars", [])?;
+        for star in stars {
+            transaction.execute(
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3)",
+                params![
+                    realm_key(&star.value.key.realm),
+                    star.value.key.id.as_str(),
+                    serde_json::to_string(star)?
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO catalogue_metadata(singleton, generated_at) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET generated_at = excluded.generated_at",
+            [generated_at],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
+
+    pub(crate) fn persist_star_knowledge(
+        &mut self,
+        knowledge: &Observation<StarKnowledge>,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO replicant_star_knowledge(realm, replicant_id, star_id, observation_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(realm, replicant_id, star_id) DO UPDATE SET observation_json = excluded.observation_json",
+            params![realm_key(&knowledge.value.star.realm), knowledge.value.replicant.id.as_str(), knowledge.value.star.id.as_str(), serde_json::to_string(knowledge)?],
         )?;
         Self::commit(transaction, fail_commit)
     }
@@ -1140,6 +1755,8 @@ fn access_key(access: &crate::domain::AccessScope) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -1214,6 +1831,53 @@ mod tests {
         }
         let store = Store::open_file(&path).expect("reopen migrated store");
         assert_eq!(store.device_count().expect("device count"), 0);
+        drop(store);
+        fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn interrupted_migration_rolls_back_and_retry_succeeds() {
+        let path = test_path("interrupted-migration");
+        let connection = Connection::open(&path).expect("open pre-migration database");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);\
+                 INSERT INTO schema_migrations(version) VALUES (0);\
+                 CREATE TABLE preserved_before_migration (value INTEGER NOT NULL);\
+                 INSERT INTO preserved_before_migration(value) VALUES (7);",
+            )
+            .expect("seed prior schema and data");
+        drop(connection);
+
+        Store::interrupt_next_migration_for_test();
+        assert!(matches!(
+            Store::open_file(&path),
+            Err(StoreError::InjectedMigrationInterruption)
+        ));
+
+        let connection = Connection::open(&path).expect("reopen rolled-back database");
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM preserved_before_migration", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("prior data remains readable"),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'devices'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inspect rolled-back schema"),
+            0
+        );
+        drop(connection);
+
+        let store = Store::open_file(&path).expect("migration retry succeeds");
+        assert_eq!(store.device_count().expect("new schema is usable"), 0);
         drop(store);
         fs::remove_file(path).expect("remove test database");
     }
@@ -1561,5 +2225,105 @@ mod tests {
                 .is_none()
         );
         fs::remove_file(path).expect("remove test database");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_executes_store_requests_off_the_caller_runtime_thread() {
+        let store = StoreHandle::open_memory().await.expect("open worker store");
+        let caller = std::thread::current().id();
+        let worker = store
+            .execute(|_| Ok::<_, StoreError>(std::thread::current().id()))
+            .await
+            .expect("worker response");
+        assert_ne!(caller, worker);
+        store.close().await.expect("close worker store");
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_requests_once_close_begins() {
+        let store = StoreHandle::open_memory().await.expect("open worker store");
+        store.close().await.expect("close worker store");
+        assert!(matches!(
+            store.execute(|_| Ok::<_, StoreError>(())).await,
+            Err(StoreError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_the_active_transaction_boundary() {
+        let store = StoreHandle::open_memory().await.expect("open worker store");
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let active_store = store.clone();
+        let active = tokio::spawn(async move {
+            active_store
+                .execute(move |_| {
+                    entered_sender.send(()).expect("entered");
+                    release_receiver.recv().expect("release");
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_receiver.recv())
+            .await
+            .expect("join entered wait")
+            .expect("worker is active");
+        let mut closing = tokio::spawn({
+            let store = store.clone();
+            async move { store.close().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut closing)
+                .await
+                .is_err()
+        );
+        release_sender.send(()).expect("release worker");
+        active
+            .await
+            .expect("active request joins")
+            .expect("active request succeeds");
+        closing.await.expect("close joins").expect("close succeeds");
+    }
+
+    #[test]
+    fn bounded_worker_queue_reports_backpressure() {
+        let store = StoreHandle::open_memory_blocking().expect("open worker store");
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let worker = store.clone();
+        let active = std::thread::spawn(move || {
+            worker.execute_blocking(move |_| {
+                entered_sender.send(()).expect("entered");
+                release_receiver.recv().expect("release");
+                Ok(())
+            })
+        });
+        entered_receiver.recv().expect("worker is occupied");
+        for _ in 0..STORE_QUEUE_CAPACITY {
+            store
+                .sender
+                .try_send(StoreCommand::Execute {
+                    id: NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                    operation_type: "test.queue_fill",
+                    queued_at: Instant::now(),
+                    command: Box::new(|_| {}),
+                })
+                .expect("fill bounded queue");
+        }
+        assert!(matches!(
+            store.sender.try_send(StoreCommand::Execute {
+                id: NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                operation_type: "test.queue_overflow",
+                queued_at: Instant::now(),
+                command: Box::new(|_| {}),
+            }),
+            Err(tokio_mpsc::error::TrySendError::Full(_))
+        ));
+        release_sender.send(()).expect("release worker");
+        active
+            .join()
+            .expect("active request joins")
+            .expect("active request succeeds");
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
