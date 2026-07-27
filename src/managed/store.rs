@@ -343,9 +343,16 @@ impl StoreProxy {
         &mut self,
         value: &Observation<StarKnowledge>,
     ) -> Result<(), StoreError> {
-        let value = value.clone();
+        self.persist_star_knowledge_batch(std::slice::from_ref(value))
+    }
+
+    pub(crate) fn persist_star_knowledge_batch(
+        &mut self,
+        values: &[Observation<StarKnowledge>],
+    ) -> Result<(), StoreError> {
+        let values = values.to_vec();
         self.0
-            .execute_blocking(move |s| s.persist_star_knowledge(&value))
+            .execute_blocking(move |s| s.persist_star_knowledge_batch(&values))
     }
     pub(crate) fn persist_location(
         &mut self,
@@ -916,12 +923,32 @@ impl Store {
         &mut self,
         knowledge: &Observation<StarKnowledge>,
     ) -> Result<(), StoreError> {
+        self.persist_star_knowledge_batch(std::slice::from_ref(knowledge))
+    }
+
+    pub(crate) fn persist_star_knowledge_batch(
+        &mut self,
+        knowledge: &[Observation<StarKnowledge>],
+    ) -> Result<(), StoreError> {
+        if knowledge.is_empty() {
+            return Ok(());
+        }
+
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO replicant_star_knowledge(realm, replicant_id, star_id, observation_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(realm, replicant_id, star_id) DO UPDATE SET observation_json = excluded.observation_json",
-            params![realm_key(&knowledge.value.star.realm), knowledge.value.replicant.id.as_str(), knowledge.value.star.id.as_str(), serde_json::to_string(knowledge)?],
-        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO replicant_star_knowledge(realm, replicant_id, star_id, observation_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(realm, replicant_id, star_id) DO UPDATE SET observation_json = excluded.observation_json",
+            )?;
+            for observation in knowledge {
+                statement.execute(params![
+                    realm_key(&observation.value.star.realm),
+                    observation.value.replicant.id.as_str(),
+                    observation.value.star.id.as_str(),
+                    serde_json::to_string(observation)?,
+                ])?;
+            }
+        }
         Self::commit(transaction, fail_commit)
     }
 

@@ -214,22 +214,40 @@ impl StateEngine {
         &self,
         knowledge: Observation<StarKnowledge>,
     ) -> Result<(), StoreError> {
+        self.persist_star_knowledge_batch(vec![knowledge])
+    }
+
+    /// Commits and publishes one complete star-knowledge batch.  Keeping the
+    /// SQLite transaction, galaxy-map clone, and snapshot publication at page
+    /// granularity avoids repeating all three for every row in a census page.
+    pub(crate) fn persist_star_knowledge_batch(
+        &self,
+        knowledge: Vec<Observation<StarKnowledge>>,
+    ) -> Result<(), StoreError> {
+        if knowledge.is_empty() {
+            return Ok(());
+        }
+
         self.store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .persist_star_knowledge(&knowledge)?;
+            .persist_star_knowledge_batch(&knowledge)?;
+
         let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
             .as_ref()
             .clone();
-        galaxy.knowledge.insert(
-            (
-                knowledge.value.replicant.clone(),
-                knowledge.value.star.clone(),
-            ),
-            knowledge,
-        );
+        for observation in knowledge {
+            galaxy.knowledge.insert(
+                (
+                    observation.value.replicant.clone(),
+                    observation.value.star.clone(),
+                ),
+                observation,
+            );
+        }
         *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
+
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
         self.publish(snapshot);

@@ -91,6 +91,69 @@ impl GalaxyGateway {
     pub fn catalogue_generated_at(&self) -> Option<String> {
         self.client.managed_state().catalogue_generated_at()
     }
+
+    /// Returns one replicant's locally committed star knowledge; no network I/O occurs.
+    #[must_use]
+    pub fn replicant_star_knowledge(&self, replicant_code: &str) -> Vec<domain::StarKnowledge> {
+        let replicant = ReplicantKey::live(ReplicantId::from(replicant_code));
+        self.client
+            .managed_state()
+            .star_knowledge(&replicant)
+            .into_iter()
+            .map(|observation| observation.value)
+            .collect()
+    }
+
+    /// Refreshes one star from a replicant's perspective, then persists and
+    /// publishes it before returning.  This is substantially cheaper than a
+    /// complete census traversal when a caller needs only a bounded shortlist.
+    pub async fn refresh_replicant_star(
+        &self,
+        replicant_code: &str,
+        star_designation: &str,
+    ) -> Result<domain::StarKnowledge> {
+        self.client.ensure_open()?;
+        let total_started = Instant::now();
+        let response = self
+            .client
+            .managed_raw()
+            .replicants()
+            .star(replicant_code, star_designation)
+            .await?;
+        let star = response.value.star.as_ref().ok_or_else(|| Error::Decode {
+            message: format!(
+                "replicant star detail for {star_designation} omitted the star object"
+            ),
+            status: Some(response.metadata.status.as_u16()),
+            source: None,
+        })?;
+        let observation = domain::replicant_star_knowledge(
+            star,
+            ReplicantKey::live(ReplicantId::from(replicant_code)),
+            Realm::Live,
+            domain::ObservationTime::now(),
+        )
+        .map_err(|error| Error::Decode {
+            message: error.to_string(),
+            status: Some(response.metadata.status.as_u16()),
+            source: None,
+        })?;
+        let value = observation.value.clone();
+        self.client
+            .managed_state()
+            .persist_star_knowledge(observation)
+            .map_err(persistence_error)?;
+        info!(
+            target: "replicant_client::galaxy",
+            event = "galaxy.replicant_star_refreshed",
+            replicant = replicant_code,
+            star = star_designation,
+            explored = value.explored,
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            "replicant star detail committed"
+        );
+        Ok(value)
+    }
     /// Replaces the catalogue atomically after its single safe-read response is normalized.
     pub async fn refresh_catalogue(&self) -> Result<CatalogueReport> {
         self.client.ensure_open()?;
@@ -191,28 +254,42 @@ impl GalaxyGateway {
                 });
             }
             let page_rows = response.value.stars.len();
-            let persist_started = Instant::now();
-            for star in &response.value.stars {
-                let observation = domain::replicant_star_knowledge(
-                    star,
-                    replicant.clone(),
-                    Realm::Live,
-                    domain::ObservationTime::now(),
-                )
-                .map_err(|error| Error::Decode {
-                    message: error.to_string(),
-                    status: None,
-                    source: None,
-                })?;
+            let observation_time = domain::ObservationTime::now();
+            let normalize_started = Instant::now();
+            let observations = response
+                .value
+                .stars
+                .iter()
+                .map(|star| {
+                    domain::replicant_star_knowledge(
+                        star,
+                        replicant.clone(),
+                        Realm::Live,
+                        observation_time,
+                    )
+                    .map_err(|error| Error::Decode {
+                        message: error.to_string(),
+                        status: None,
+                        source: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let normalize_elapsed = normalize_started.elapsed();
+
+            for observation in &observations {
                 if observation.value.explored == Some(true) {
                     explored_designations.insert(observation.value.star.id.clone());
                 }
-                self.client
-                    .managed_state()
-                    .persist_star_knowledge(observation)
-                    .map_err(persistence_error)?;
-                stars_seen += 1;
             }
+            stars_seen += observations.len();
+
+            let persist_started = Instant::now();
+            self.client
+                .managed_state()
+                .persist_star_knowledge_batch(observations)
+                .map_err(persistence_error)?;
+            let persist_elapsed = persist_started.elapsed();
+
             pages += 1;
             let total_pages = response.value.total_pages.unwrap_or(page);
             info!(
@@ -224,7 +301,8 @@ impl GalaxyGateway {
                 records = page_rows,
                 explored_total = explored_designations.len(),
                 request_ms = request_elapsed.as_millis() as u64,
-                normalize_and_persist_ms = persist_started.elapsed().as_millis() as u64,
+                normalize_ms = normalize_elapsed.as_millis() as u64,
+                persist_ms = persist_elapsed.as_millis() as u64,
                 elapsed_ms = page_started.elapsed().as_millis() as u64,
                 "replicant star page committed"
             );

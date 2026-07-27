@@ -34,6 +34,7 @@
 //! - `RS_EXPLORE_CENTER=SCEPTURUM`
 //! - `RS_EXPLORE_RADIUS_LY=10`
 //! - `RS_EXPLORE_SYSTEM_LIMIT=25`
+//! - `RS_EXPLORE_STAR_DETAIL_CONCURRENCY=8`
 //! - `RS_EXPLORE_PLAN=explore-survey-route.json`
 //! - `RS_EXPLORE_LOG=logs/explore-survey-route.log`
 //! - `REPLICANT_DB=replicant-client.sqlite`
@@ -60,14 +61,14 @@
 //! cargo run --example explore_survey_route
 //! ```
 //!
-//! A nearest-neighbor tour is used rather than Dijkstra. Dijkstra solves the
-//! shortest path between two nodes in a graph; this problem is choosing the
-//! order in which to visit many stars. The server's travel endpoint still
-//! chooses the actual route for each individual hop.
+//! A nearest-neighbor seed followed by bounded 2-opt improvement is used rather
+//! than Dijkstra. Dijkstra solves the shortest path between two graph nodes;
+//! this problem is choosing the order in which to visit many stars. The server's
+//! travel endpoint still chooses the actual route for each individual hop.
 
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error as StdError,
     fs::{self, File, OpenOptions},
@@ -77,6 +78,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use futures::{StreamExt, stream};
 use replicant_client::{
     Client, DeviceType, Event, Operation, OperationStatus, Realm, SecretString, StartupPolicy,
     SurveyDirective, domain::GalacticPosition, raw::devices::DeviceCommand,
@@ -150,6 +152,7 @@ struct Config {
     center: String,
     radius_ly: f64,
     system_limit: usize,
+    star_detail_concurrency: usize,
     plan_path: PathBuf,
     log_path: PathBuf,
     controller_override: Option<String>,
@@ -198,6 +201,8 @@ impl Config {
             center: env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase(),
             radius_ly: env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?,
             system_limit: env_usize("RS_EXPLORE_SYSTEM_LIMIT", 25)?.max(1),
+            star_detail_concurrency: env_usize("RS_EXPLORE_STAR_DETAIL_CONCURRENCY", 8)?
+                .clamp(1, 16),
             plan_path: env::var_os("RS_EXPLORE_PLAN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("explore-survey-route.json")),
@@ -389,7 +394,6 @@ struct CandidateStar {
     entry_point: Option<String>,
     position: GalacticPosition,
     distance_from_center_ly: f64,
-    survey_required: bool,
 }
 
 #[tokio::main]
@@ -405,6 +409,7 @@ async fn main() -> AnyResult<()> {
         center = %config.center,
         radius_ly = config.radius_ly,
         system_limit = config.system_limit,
+        star_detail_concurrency = config.star_detail_concurrency,
         plan = %config.plan_path.display(),
         log = %config.log_path.display(),
         execute = config.execute,
@@ -460,6 +465,17 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         prepare_fleet(client, config, &mut plan).await?;
         save_plan(&config.plan_path, &plan)?;
     } else {
+        if phase_requires_stowed_fleet(plan.phase) {
+            let controller = plan
+                .controller
+                .as_deref()
+                .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+            ensure_replicant_owns_device(client, controller, &config.replicant).await?;
+            for code in &plan.drones {
+                ensure_replicant_owns_device(client, code, &config.replicant).await?;
+            }
+            stow_fleet(client, config, &plan).await?;
+        }
         verify_fleet_plan(client, config, &plan).await?;
     }
 
@@ -507,16 +523,6 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         client.galaxy().refresh_catalogue().await?;
     }
 
-    let knowledge = client
-        .galaxy()
-        .sync_replicant_stars(&config.replicant)
-        .await?;
-    let explored = knowledge
-        .explored_designations()
-        .iter()
-        .map(|id| id.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-
     let catalogue = client.galaxy().catalogue();
     let center = catalogue
         .iter()
@@ -538,6 +544,10 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         )
     })?;
 
+    // Filter the complete catalogue locally first.  The earlier implementation
+    // downloaded every page of the replicant's ~14k-star census merely to learn
+    // whether a few nearby candidates were explored.  Resolve only this bounded
+    // shortlist through the single-star detail endpoint instead.
     let mut candidates = catalogue
         .into_iter()
         .filter_map(|star| {
@@ -550,23 +560,127 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
             if distance > config.radius_ly {
                 return None;
             }
-            let already_explored = explored.contains(&star_code);
-            if already_explored && !config.include_explored {
-                return None;
-            }
             Some(CandidateStar {
                 star: star_code,
                 entry_point: star.entry_point.map(|entry| entry.id.as_str().to_owned()),
                 position,
                 distance_from_center_ly: distance,
-                survey_required: !already_explored || config.include_explored,
             })
         })
         .collect::<Vec<_>>();
-
     candidates.sort_by(|left, right| left.star.cmp(&right.star));
 
-    let center_already_explored = explored.contains(&config.center);
+    let knowledge_started = Instant::now();
+    let mut explored_by_star = client
+        .galaxy()
+        .replicant_star_knowledge(&config.replicant)
+        .into_iter()
+        .filter_map(|knowledge| {
+            knowledge
+                .explored
+                .map(|explored| (knowledge.star.id.as_str().to_owned(), explored))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut required_stars = candidates
+        .iter()
+        .map(|candidate| candidate.star.clone())
+        .collect::<Vec<_>>();
+    required_stars.push(config.center.clone());
+    required_stars.sort();
+    required_stars.dedup();
+
+    let missing = required_stars
+        .iter()
+        .filter(|star| !explored_by_star.contains_key(*star))
+        .cloned()
+        .collect::<Vec<_>>();
+    let local_hits = required_stars.len() - missing.len();
+
+    let refreshed = stream::iter(missing.into_iter().map(|star| {
+        let galaxy = client.galaxy();
+        let replicant = config.replicant.clone();
+        async move {
+            let started = Instant::now();
+            let result = galaxy.refresh_replicant_star(&replicant, &star).await;
+            (star, started.elapsed(), result)
+        }
+    }))
+    .buffer_unordered(config.star_detail_concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut refreshed_count = 0_usize;
+    for (star, elapsed, result) in refreshed {
+        let knowledge = result?;
+        explored_by_star.insert(star.clone(), knowledge.explored.unwrap_or(false));
+        refreshed_count += 1;
+        debug!(
+            target: "replicant_client::explore",
+            event = "route.star_detail_resolved",
+            star,
+            explored = knowledge.explored,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "resolved targeted star knowledge"
+        );
+    }
+
+    info!(
+        target: "replicant_client::explore",
+        event = "route.star_knowledge_resolved",
+        candidates = required_stars.len(),
+        local_hits,
+        refreshed = refreshed_count,
+        concurrency = config.star_detail_concurrency,
+        elapsed_ms = knowledge_started.elapsed().as_millis() as u64,
+        "resolved only the star knowledge needed for route planning"
+    );
+
+    candidates.retain(|candidate| {
+        config.include_explored
+            || !explored_by_star
+                .get(&candidate.star)
+                .copied()
+                .unwrap_or(false)
+    });
+
+    // Build a deterministic nearest-neighbor seed, then run a bounded 2-opt
+    // improvement pass.  This remains cheap for the small route limit while
+    // avoiding obvious crossings and backtracking in the initial greedy tour.
+    let mut remaining = candidates;
+    let mut ordered = Vec::new();
+    let mut current = center_position;
+    while !remaining.is_empty() && ordered.len() + 1 < config.system_limit {
+        let (index, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, position_distance(current, candidate.position)))
+            .min_by(
+                |(left_index, left_distance), (right_index, right_distance)| {
+                    left_distance
+                        .partial_cmp(right_distance)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| {
+                            remaining[*left_index]
+                                .star
+                                .cmp(&remaining[*right_index].star)
+                        })
+                },
+            )
+            .expect("candidate list is non-empty");
+        let candidate = remaining.remove(index);
+        current = candidate.position;
+        ordered.push(candidate);
+    }
+
+    let nearest_neighbor_distance = candidate_route_distance(center_position, &ordered);
+    let two_opt_swaps = improve_candidate_route_2opt(center_position, &mut ordered, 8);
+    let optimized_distance = candidate_route_distance(center_position, &ordered);
+
+    let center_already_explored = explored_by_star
+        .get(&config.center)
+        .copied()
+        .unwrap_or(false);
     let mut route = vec![RouteStop {
         star: config.center.clone(),
         entry_point: center
@@ -581,36 +695,22 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         completed: false,
     }];
 
-    let mut current = center_position;
-    while !candidates.is_empty() && route.len() < config.system_limit {
-        let (index, leg_distance) = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| (index, position_distance(current, candidate.position)))
-            .min_by(
-                |(left_index, left_distance), (right_index, right_distance)| {
-                    left_distance
-                        .partial_cmp(right_distance)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| {
-                            candidates[*left_index]
-                                .star
-                                .cmp(&candidates[*right_index].star)
-                        })
-                },
-            )
-            .expect("candidate list is non-empty");
-
-        let candidate = candidates.remove(index);
-        current = candidate.position;
+    let mut previous = center_position;
+    for candidate in ordered {
+        let already_explored = explored_by_star
+            .get(&candidate.star)
+            .copied()
+            .unwrap_or(false);
+        let leg_distance = position_distance(previous, candidate.position);
+        previous = candidate.position;
         route.push(RouteStop {
             star: candidate.star,
             entry_point: candidate.entry_point,
             distance_from_center_ly: candidate.distance_from_center_ly,
             leg_distance_ly: leg_distance,
-            survey_required: candidate.survey_required,
-            system_scan_done: false,
-            survey_done: false,
+            survey_required: config.include_explored || !already_explored,
+            system_scan_done: already_explored,
+            survey_done: !config.include_explored && already_explored,
             completed: false,
         });
     }
@@ -641,9 +741,13 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         target: "replicant_client::explore",
         event = "route.plan_created",
         stops = plan.route.len(),
-        explored_known = explored.len(),
+        explored_known = explored_by_star.values().filter(|value| **value).count(),
+        nearest_neighbor_distance_ly = nearest_neighbor_distance,
+        optimized_distance_ly = optimized_distance,
+        distance_saved_ly = nearest_neighbor_distance - optimized_distance,
+        two_opt_swaps,
         elapsed_ms = planning_started.elapsed().as_millis() as u64,
-        "created and saved nearest-neighbor route"
+        "created and saved optimized nearest-neighbor route"
     );
     Ok(plan)
 }
@@ -719,8 +823,25 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
     })?;
     let location_id = location.id.as_str().to_owned();
 
+    let vessel_status = client.raw().devices().get(&config.vessel).await?.value;
+    ensure_device_replicant(&vessel_status, &config.vessel, &config.replicant)?;
+
+    let account_owned_devices = client
+        .devices()
+        .find()
+        .in_realm(Realm::Live)
+        .owned()
+        .collect()
+        .await?
+        .into_iter()
+        .map(|device| device.id().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+
     if plan.controller.is_none() {
         let controller_code = if let Some(code) = &config.controller_override {
+            ensure_account_owned(&account_owned_devices, code)?;
+            let status = client.raw().devices().get(code).await?.value;
+            validate_controller_candidate(&status, code, &location_id, &config.vessel)?;
             code.clone()
         } else {
             let controllers = client
@@ -732,14 +853,38 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
                 .without_adopted_devices()
                 .collect()
                 .await?;
-            controllers
-                .first()
-                .map(|controller| controller.id().as_str().to_owned())
+
+            let mut eligible = Vec::new();
+            for controller in controllers {
+                let code = controller.id().as_str().to_owned();
+                let status = client.raw().devices().get(&code).await?.value;
+                match validate_controller_candidate(&status, &code, &location_id, &config.vessel) {
+                    Ok(()) => eligible.push((
+                        status.replicant_code.as_deref() == Some(config.replicant.as_str()),
+                        code,
+                    )),
+                    Err(reason) => {
+                        debug!(
+                            target: "replicant_client::explore",
+                            event = "fleet.controller_rejected",
+                            device = code,
+                            reason = %reason,
+                            "survey controller is not eligible for the target vessel"
+                        );
+                    }
+                }
+            }
+            eligible.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+            eligible
+                .into_iter()
+                .next()
+                .map(|(_, code)| code)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
-                            "no idle survey controller without adopted devices exists at {location_id}"
+                            "no account-owned idle survey controller is available at {} or already stowed in vessel {}",
+                            location_id, config.vessel
                         ),
                     )
                 })?
@@ -749,7 +894,37 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
     }
 
     if plan.drones.is_empty() {
+        let controller_code = plan
+            .controller
+            .as_deref()
+            .ok_or_else(|| io::Error::other("route plan has no selected controller"))?;
         let drones = if let Some(codes) = &config.drone_overrides {
+            let unique = codes.iter().collect::<BTreeSet<_>>();
+            if unique.len() != DRONE_COUNT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RS_EXPLORE_DRONES must contain four distinct device codes",
+                )
+                .into());
+            }
+            if codes.iter().any(|code| code == controller_code) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the survey controller cannot also be selected as a survey drone",
+                )
+                .into());
+            }
+            for code in codes {
+                ensure_account_owned(&account_owned_devices, code)?;
+                let status = client.raw().devices().get(code).await?.value;
+                validate_drone_candidate(
+                    &status,
+                    code,
+                    controller_code,
+                    &location_id,
+                    &config.vessel,
+                )?;
+            }
             codes.clone()
         } else {
             let available = client
@@ -763,25 +938,62 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
                 .without_controller()
                 .collect()
                 .await?;
-            if available.len() < DRONE_COUNT {
+
+            let mut eligible = Vec::new();
+            for drone in available {
+                let code = drone.id().as_str().to_owned();
+                let status = client.raw().devices().get(&code).await?.value;
+                match validate_drone_candidate(
+                    &status,
+                    &code,
+                    controller_code,
+                    &location_id,
+                    &config.vessel,
+                ) {
+                    Ok(()) => eligible.push((
+                        status.replicant_code.as_deref() == Some(config.replicant.as_str()),
+                        code,
+                    )),
+                    Err(reason) => {
+                        debug!(
+                            target: "replicant_client::explore",
+                            event = "fleet.drone_rejected",
+                            device = code,
+                            reason = %reason,
+                            "survey drone is not eligible for the target vessel"
+                        );
+                    }
+                }
+            }
+            eligible.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+            let selected = eligible
+                .into_iter()
+                .take(DRONE_COUNT)
+                .map(|(_, code)| code)
+                .collect::<Vec<_>>();
+            if selected.len() < DRONE_COUNT {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "only {} idle, unadopted survey drones are available at {}; need {DRONE_COUNT}",
-                        available.len(),
-                        location_id
+                        "only {} eligible account-owned survey drones are available at {} or already stowed in vessel {}; need {DRONE_COUNT}",
+                        selected.len(), location_id, config.vessel
                     ),
                 )
                 .into());
             }
-            available
-                .into_iter()
-                .take(DRONE_COUNT)
-                .map(|drone| drone.id().as_str().to_owned())
-                .collect()
+            selected
         };
         plan.drones = drones;
         save_plan(&config.plan_path, plan)?;
+    }
+
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no selected controller"))?;
+    ensure_replicant_owns_device(client, controller_code, &config.replicant).await?;
+    for code in &plan.drones {
+        ensure_replicant_owns_device(client, code, &config.replicant).await?;
     }
 
     verify_fleet_plan(client, config, plan).await?;
@@ -898,6 +1110,13 @@ async fn verify_fleet_plan(client: &Client, config: &Config, plan: &RoutePlan) -
         )
         .into());
     }
+    ensure_device_replicant(&vessel_status, &config.vessel, &config.replicant)?;
+    ensure_device_replicant(&controller_status, controller, &config.replicant)?;
+
+    let fleet_must_be_stowed = phase_requires_stowed_fleet(plan.phase);
+    if fleet_must_be_stowed {
+        ensure_stowed_in_vessel(&controller_status, controller, &config.vessel)?;
+    }
 
     for code in &plan.drones {
         let status = client.raw().devices().get(code).await?.value;
@@ -907,6 +1126,10 @@ async fn verify_fleet_plan(client: &Client, config: &Config, plan: &RoutePlan) -
                 format!("planned drone {code} is not a survey_drone"),
             )
             .into());
+        }
+        ensure_device_replicant(&status, code, &config.replicant)?;
+        if fleet_must_be_stowed {
+            ensure_stowed_in_vessel(&status, code, &config.vessel)?;
         }
         if plan.fleet_prepared && status.controller_device_code.as_deref() != Some(controller) {
             return Err(io::Error::new(
@@ -926,6 +1149,216 @@ async fn verify_fleet_plan(client: &Client, config: &Config, plan: &RoutePlan) -
     }
 
     Ok(())
+}
+
+fn phase_requires_stowed_fleet(phase: RunPhase) -> bool {
+    matches!(
+        phase,
+        RunPhase::Ready | RunPhase::Traveling | RunPhase::SystemScanning | RunPhase::Complete
+    )
+}
+
+fn ensure_account_owned(account_owned: &BTreeSet<String>, code: &str) -> AnyResult<()> {
+    if account_owned.contains(code) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("device {code} is not present in the authenticated account's owned-device set"),
+    )
+    .into())
+}
+
+fn validate_controller_candidate(
+    status: &replicant_client::raw::devices::DeviceStatus,
+    code: &str,
+    vessel_location: &str,
+    vessel: &str,
+) -> AnyResult<()> {
+    if status.device_type.as_deref() != Some("ami_survey_controller") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("device {code} is not an ami_survey_controller"),
+        )
+        .into());
+    }
+    if status.status.as_deref() != Some("idle") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("survey controller {code} is not idle"),
+        )
+        .into());
+    }
+    if !status.controlled_devices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("survey controller {code} already controls one or more devices"),
+        )
+        .into());
+    }
+    validate_device_vessel_placement(status, code, vessel_location, vessel)
+}
+
+fn validate_drone_candidate(
+    status: &replicant_client::raw::devices::DeviceStatus,
+    code: &str,
+    controller: &str,
+    vessel_location: &str,
+    vessel: &str,
+) -> AnyResult<()> {
+    if status.device_type.as_deref() != Some("survey_drone") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("device {code} is not a survey_drone"),
+        )
+        .into());
+    }
+    if status.status.as_deref() != Some("idle") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("survey drone {code} is not idle"),
+        )
+        .into());
+    }
+    if let Some(actual) = status.controller_device_code.as_deref()
+        && actual != controller
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("survey drone {code} is already controlled by {actual}"),
+        )
+        .into());
+    }
+    validate_device_vessel_placement(status, code, vessel_location, vessel)
+}
+
+async fn ensure_replicant_owns_device(
+    client: &Client,
+    code: &str,
+    replicant: &str,
+) -> AnyResult<()> {
+    let status = client.raw().devices().get(code).await?.value;
+    if status.replicant_code.as_deref() == Some(replicant) {
+        debug!(
+            target: "replicant_client::explore",
+            event = "fleet.owner_verified",
+            device = code,
+            replicant,
+            "device is already assigned to the target replicant"
+        );
+        return Ok(());
+    }
+
+    if !status
+        .available_commands
+        .iter()
+        .any(|command| command == "change_owner")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "device {code} is assigned to {:?} and does not advertise change_owner",
+                status.replicant_code.as_deref()
+            ),
+        )
+        .into());
+    }
+
+    info!(
+        target: "replicant_client::explore",
+        event = "fleet.owner_change_started",
+        device = code,
+        previous_replicant = status.replicant_code.as_deref().unwrap_or("unassigned"),
+        target_replicant = replicant,
+        "transferring device to the target replicant"
+    );
+    let handle = client.devices().get(code).await?;
+    let operation = handle
+        .command(DeviceCommand::ChangeOwner {
+            target: replicant.to_owned(),
+        })
+        .await?;
+    wait_immediate_operation("change device owner", &operation).await?;
+
+    let refreshed = client.raw().devices().get(code).await?.value;
+    ensure_device_replicant(&refreshed, code, replicant)?;
+    info!(
+        target: "replicant_client::explore",
+        event = "fleet.owner_change_completed",
+        device = code,
+        replicant,
+        "verified device ownership transfer"
+    );
+    Ok(())
+}
+
+fn ensure_device_replicant(
+    status: &replicant_client::raw::devices::DeviceStatus,
+    code: &str,
+    expected_replicant: &str,
+) -> AnyResult<()> {
+    match status.replicant_code.as_deref() {
+        Some(actual) if actual == expected_replicant => Ok(()),
+        Some(actual) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "device {code} reports replicant_code={actual}, expected {expected_replicant}"
+            ),
+        )
+        .into()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "device {code} does not report replicant ownership/hosting; expected {expected_replicant}"
+            ),
+        )
+        .into()),
+    }
+}
+
+fn validate_device_vessel_placement(
+    status: &replicant_client::raw::devices::DeviceStatus,
+    code: &str,
+    vessel_location: &str,
+    vessel: &str,
+) -> AnyResult<()> {
+    match status.stowed_in_device_code.as_deref() {
+        Some(actual) if actual == vessel => Ok(()),
+        Some(actual) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "device {code} is stowed in vessel {actual}, not required vessel {vessel}"
+            ),
+        )
+        .into()),
+        None if status.location.as_deref() == Some(vessel_location) => Ok(()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "device {code} is not stowed in vessel {vessel} and is at {:?}, while the vessel is at {vessel_location}",
+                status.location.as_deref()
+            ),
+        )
+        .into()),
+    }
+}
+
+fn ensure_stowed_in_vessel(
+    status: &replicant_client::raw::devices::DeviceStatus,
+    code: &str,
+    vessel: &str,
+) -> AnyResult<()> {
+    if status.stowed_in_device_code.as_deref() == Some(vessel) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "device {code} is not stowed in required vessel {vessel}; reported stowed_in_device_code={:?}",
+            status.stowed_in_device_code.as_deref()
+        ),
+    )
+    .into())
 }
 
 fn has_survey_system_directive(directive: &Option<replicant_client::raw::JsonObject>) -> bool {
@@ -948,12 +1381,21 @@ async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyRe
     codes.push(controller.to_owned());
 
     let vessel = client.raw().devices().get(&config.vessel).await?.value;
+    ensure_device_replicant(&vessel, &config.vessel, &config.replicant)?;
+    let vessel_location = vessel.location.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("vessel {} has no current location", config.vessel),
+        )
+    })?;
     let capacity = vessel.stow_capacity.unwrap_or(5);
     let used = vessel.stow_used.unwrap_or(0);
     let mut missing = Vec::new();
 
     for code in &codes {
         let status = client.raw().devices().get(code).await?.value;
+        ensure_device_replicant(&status, code, &config.replicant)?;
+        validate_device_vessel_placement(&status, code, vessel_location, &config.vessel)?;
         if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
             missing.push(code.clone());
         }
@@ -984,14 +1426,24 @@ async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyRe
         wait_immediate_operation("stow fleet device", &operation).await?;
 
         let status = client.raw().devices().get(&code).await?.value;
-        if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
-            return Err(io::Error::other(format!(
-                "device {code} did not report stowed_in_device_code={} after stow",
-                config.vessel
-            ))
-            .into());
-        }
+        ensure_device_replicant(&status, &code, &config.replicant)?;
+        ensure_stowed_in_vessel(&status, &code, &config.vessel)?;
     }
+
+    for code in &codes {
+        let status = client.raw().devices().get(code).await?.value;
+        ensure_device_replicant(&status, code, &config.replicant)?;
+        ensure_stowed_in_vessel(&status, code, &config.vessel)?;
+    }
+
+    info!(
+        target: "replicant_client::explore",
+        event = "fleet.stow_verified",
+        replicant = %config.replicant,
+        vessel = %config.vessel,
+        devices = ?codes,
+        "verified that the complete survey fleet belongs to the target replicant and is stowed in the correct vessel"
+    );
 
     Ok(())
 }
@@ -1292,13 +1744,9 @@ async fn run_system_scan(
         if started.elapsed() >= config.scan_timeout {
             let knowledge = client
                 .galaxy()
-                .sync_replicant_stars(&config.replicant)
+                .refresh_replicant_star(&config.replicant, target)
                 .await?;
-            if knowledge
-                .explored_designations()
-                .iter()
-                .any(|star| star.as_str() == target)
-            {
+            if knowledge.explored == Some(true) {
                 warn!(
                     target: "replicant_client::explore",
                     event = "system_scan.completed_without_event",
@@ -1531,6 +1979,62 @@ fn designation_in_star(designation: &str, star: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('-'))
 }
 
+fn candidate_route_distance(start: GalacticPosition, route: &[CandidateStar]) -> f64 {
+    let mut total = 0.0;
+    let mut previous = start;
+    for candidate in route {
+        total += position_distance(previous, candidate.position);
+        previous = candidate.position;
+    }
+    total
+}
+
+fn improve_candidate_route_2opt(
+    start: GalacticPosition,
+    route: &mut [CandidateStar],
+    max_passes: usize,
+) -> usize {
+    if route.len() < 3 {
+        return 0;
+    }
+
+    let mut swaps = 0_usize;
+    for _ in 0..max_passes {
+        let mut improved = false;
+        for left in 0..route.len() - 1 {
+            for right in left + 1..route.len() {
+                let previous = if left == 0 {
+                    start
+                } else {
+                    route[left - 1].position
+                };
+                let old_before = position_distance(previous, route[left].position);
+                let new_before = position_distance(previous, route[right].position);
+
+                let (old_after, new_after) = if right + 1 < route.len() {
+                    let next = route[right + 1].position;
+                    (
+                        position_distance(route[right].position, next),
+                        position_distance(route[left].position, next),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+                if new_before + new_after + 1e-9 < old_before + old_after {
+                    route[left..=right].reverse();
+                    swaps += 1;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    swaps
+}
+
 fn position_distance(left: GalacticPosition, right: GalacticPosition) -> f64 {
     let dx = left.x - right.x;
     let dy = left.y - right.y;
@@ -1641,7 +2145,7 @@ mod tests {
     #[test]
     fn designation_matching_accepts_star_and_child_locations() {
         assert!(designation_in_star("SCEPTURUM", "SCEPTURUM"));
-        assert!(designation_in_star("SCEPTURUM-1-L4", "SCEPTURUM"));
+        assert!(designation_in_star("SCEPTURUM-2-L4", "SCEPTURUM"));
         assert!(!designation_in_star("SCEPTURUMA-2", "SCEPTURUM"));
     }
 
@@ -1658,6 +2162,50 @@ mod tests {
             z: 12.0,
         };
         assert!((position_distance(left, right) - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn two_opt_shortens_a_crossing_route() {
+        let start = GalacticPosition {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let mut route = vec![
+            CandidateStar {
+                star: "A".into(),
+                entry_point: None,
+                position: GalacticPosition {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                distance_from_center_ly: 10.0,
+            },
+            CandidateStar {
+                star: "B".into(),
+                entry_point: None,
+                position: GalacticPosition {
+                    x: 0.0,
+                    y: 10.0,
+                    z: 0.0,
+                },
+                distance_from_center_ly: 10.0,
+            },
+            CandidateStar {
+                star: "C".into(),
+                entry_point: None,
+                position: GalacticPosition {
+                    x: 10.0,
+                    y: 10.0,
+                    z: 0.0,
+                },
+                distance_from_center_ly: 14.142_135_623_7,
+            },
+        ];
+        let before = candidate_route_distance(start, &route);
+        assert!(improve_candidate_route_2opt(start, &mut route, 8) > 0);
+        assert!(candidate_route_distance(start, &route) < before);
     }
 
     #[test]
