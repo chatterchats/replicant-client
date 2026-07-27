@@ -1,5 +1,12 @@
 # replicant-client
 
+## Colony database initializer
+
+`cargo run --example initialize_colony_database` performs only managed safe
+reads and populates the durable survey database from knowledge the account has
+already discovered. It cannot discover unsurveyed worlds; use `REPLICANT_DB`
+to choose the SQLite path and `REPLICANT_INIT_*` bounds to cap the traversal.
+
 A durable, stateful Rust client for building [Replicant Space](https://replicant.space) applications.
 
 `replicant-client` targets the Replicant Space `2.3.1` contract. It is
@@ -68,3 +75,15 @@ make contract-policy-check
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Observability
+
+The client emits structured `tracing` events for HTTP requests, rate-limit
+waits, managed synchronization, event catch-up, durable operations, SQLite
+work, state publication, galaxy hydration, and location traversal. The library
+does not install a subscriber; applications remain in control of formatting
+and export. The `initialize_colony_database` example includes a timestamped
+`tracing-subscriber` setup and useful default filters.
+
+See `docs/observability.md` for targets, duration fields, and a workflow for
+locating initializer and synchronization bottlenecks.
