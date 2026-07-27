@@ -5,7 +5,7 @@ The bundled `reference/examples/rikers_colony_candidates.rs` is a required targe
 It uses two stages:
 
 1. **Hard eligibility query** using Riker's published requirements.
-2. **Explainable local ranking** using clues from his first two BobNet assessments.
+2. **Explainable local ranking** using clues from the currently collected BobNet assessments.
 
 The ranking is deliberately labeled a heuristic. It does not claim to reproduce the server's hidden scoring formula.
 
@@ -42,8 +42,10 @@ The observed feedback implies:
 
 - K-class stars are a bonus;
 - M dwarfs remain eligible;
-- near tidal locking is a caution, not a hard exclusion;
-- rich belts improve industrial viability;
+- near tidal locking is a modest caution, not a hard exclusion;
+- extremely slow rotation and explicit hemispheric thermal extremes deserve a larger penalty;
+- rich, heavy, and resource-diverse belts improve industrial viability;
+- distance has a broad middle-band preference balancing separation with connectivity;
 - complex ecosystems incur an ethical penalty rather than rejection.
 
 See `reference/riker-assessment-clues-2026-07-26.md`.
@@ -55,7 +57,7 @@ See `reference/riker-assessment-clues-2026-07-26.md`.
 - Unknown values do not pass hard predicates.
 - Unknown bonus values contribute neither a bonus nor a penalty.
 - The example prints suggestions but never sends BobNet messages.
-- Results are sorted by heuristic score, then distance from SOL, and capped at ten.
+- Results are sorted by heuristic score, then by closeness to the preferred distance band, and capped at ten.
 - The printed score is explicitly a local heuristic, not Riker's expected score.
 
 ## Required API exercised

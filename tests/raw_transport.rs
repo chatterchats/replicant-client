@@ -109,7 +109,6 @@ async fn oversized_chunked_response_is_rejected_while_streaming() {
     server.await.unwrap();
 }
 
-
 #[tokio::test]
 async fn star_catalogue_uses_its_dedicated_larger_response_limit() {
     let server = MockServer::start().await;

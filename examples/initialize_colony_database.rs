@@ -35,7 +35,7 @@ use std::{
     time::Instant,
 };
 
-use replicant_client::{Atmosphere, Client, LifeStage, Realm, SecretString, StartupPolicy};
+use replicant_client::{Client, LifeStage, Realm, SecretString, StartupPolicy};
 use tracing::{Instrument as _, error, info, info_span, warn};
 use tracing_subscriber::{
     EnvFilter,
@@ -445,7 +445,7 @@ async fn initialize(client: &Client, config: &Config) -> Result<(), AnyError> {
         .in_realm(Realm::Live)
         .planetary_bodies()
         .surveyed()
-        .atmosphere_is(Atmosphere::Breathable)
+        .breathable_atmosphere()
         .without_advanced_civilisation()
         .life_stage_below(LifeStage::Intelligent)
         .gravity_g_between(0.8..=1.3)

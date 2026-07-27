@@ -1,0 +1,1686 @@
+//! Resumable, intentionally simple survey-route automation.
+//!
+//! This example:
+//!
+//! 1. synchronizes managed state and star knowledge;
+//! 2. selects one idle AMI survey controller and four idle survey drones;
+//! 3. adopts the drones, configures `survey_system`, and stows all five devices
+//!    in the racing vessel;
+//! 4. pre-plans a deterministic nearest-neighbor route around a centre star;
+//! 5. travels one system at a time;
+//! 6. runs the vessel's `system_scan`;
+//! 7. launches the survey controller and waits for `ami.survey.digest` progress
+//!    to reach zero remaining bodies;
+//! 8. recalls and restows the fleet before the next hop.
+//!
+//! The plan is written atomically after every phase. Stop the process at any
+//! point and rerun it with the same plan path to resume.
+//!
+//! # Safety
+//!
+//! By default this example only synchronizes and creates the route plan. Set
+//! `RS_EXPLORE_EXECUTE=1` to permit mutations.
+//!
+//! # Environment
+//!
+//! Required:
+//!
+//! - `RS_API_TOKEN`
+//!
+//! Defaults matching the requested fleet:
+//!
+//! - `RS_EXPLORE_REPLICANT=B6BA399E`
+//! - `RS_EXPLORE_VESSEL=FD5EA802`
+//! - `RS_EXPLORE_CENTER=SCEPTURUM`
+//! - `RS_EXPLORE_RADIUS_LY=10`
+//! - `RS_EXPLORE_SYSTEM_LIMIT=25`
+//! - `RS_EXPLORE_PLAN=explore-survey-route.json`
+//! - `RS_EXPLORE_LOG=logs/explore-survey-route.log`
+//! - `REPLICANT_DB=replicant-client.sqlite`
+//!
+//! Optional fleet overrides:
+//!
+//! - `RS_EXPLORE_CONTROLLER=<device code>`
+//! - `RS_EXPLORE_DRONES=<code>,<code>,<code>,<code>`
+//!
+//! Other controls:
+//!
+//! - `RS_EXPLORE_EXECUTE=1` — permit gameplay mutations.
+//! - `RS_EXPLORE_REBUILD_PLAN=1` — replace an existing route plan.
+//! - `RS_EXPLORE_INCLUDE_EXPLORED=1` — include already explored systems.
+//! - `RS_EXPLORE_TRAVEL_TIMEOUT_SECS=21600`
+//! - `RS_EXPLORE_SCAN_TIMEOUT_SECS=3600`
+//! - `RS_EXPLORE_SURVEY_TIMEOUT_SECS=21600`
+//! - `RUST_LOG=replicant_client=info,replicant_client::explore=debug`
+//!
+//! Example:
+//!
+//! ```text
+//! RS_EXPLORE_EXECUTE=1 \
+//! cargo run --example explore_survey_route
+//! ```
+//!
+//! A nearest-neighbor tour is used rather than Dijkstra. Dijkstra solves the
+//! shortest path between two nodes in a graph; this problem is choosing the
+//! order in which to visit many stars. The server's travel endpoint still
+//! chooses the actual route for each individual hop.
+
+use std::{
+    cmp::Ordering,
+    collections::BTreeSet,
+    env,
+    error::Error as StdError,
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use replicant_client::{
+    Client, DeviceType, Event, Operation, OperationStatus, Realm, SecretString, StartupPolicy,
+    SurveyDirective, domain::GalacticPosition, raw::devices::DeviceCommand,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{MakeWriter, format::FmtSpan, time::SystemTime as TraceSystemTime},
+};
+
+type AnyError = Box<dyn StdError + Send + Sync + 'static>;
+type AnyResult<T> = Result<T, AnyError>;
+
+const PLAN_VERSION: u32 = 1;
+const DRONE_COUNT: usize = 4;
+const DEFAULT_FILTER: &str = concat!(
+    "replicant_client=info,",
+    "replicant_client::explore=debug,",
+    "replicant_client::raw::http=info,",
+    "replicant_client::raw::rate_limit=info,",
+    "replicant_client::events=info,",
+    "replicant_client::ops=info"
+);
+
+#[derive(Clone)]
+struct TeeMakeWriter {
+    file: Arc<Mutex<File>>,
+}
+
+struct TeeWriter {
+    file: Arc<Mutex<File>>,
+}
+
+impl<'a> MakeWriter<'a> for TeeMakeWriter {
+    type Writer = TeeWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter {
+            file: Arc::clone(&self.file),
+        }
+    }
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        io::stderr().lock().write_all(buffer)?;
+        self.file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write_all(buffer)?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().lock().flush()?;
+        self.file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush()
+    }
+}
+
+#[derive(Debug)]
+struct Config {
+    token: String,
+    database: PathBuf,
+    replicant: String,
+    vessel: String,
+    center: String,
+    radius_ly: f64,
+    system_limit: usize,
+    plan_path: PathBuf,
+    log_path: PathBuf,
+    controller_override: Option<String>,
+    drone_overrides: Option<Vec<String>>,
+    execute: bool,
+    rebuild_plan: bool,
+    include_explored: bool,
+    travel_timeout: Duration,
+    scan_timeout: Duration,
+    survey_timeout: Duration,
+}
+
+impl Config {
+    fn from_env() -> AnyResult<Self> {
+        let token = env::var("RS_API_TOKEN")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RS_API_TOKEN is required"))?;
+
+        let drone_overrides = env::var("RS_EXPLORE_DRONES").ok().map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+
+        if let Some(drones) = &drone_overrides
+            && drones.len() != DRONE_COUNT
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RS_EXPLORE_DRONES must contain exactly {DRONE_COUNT} comma-separated codes"
+                ),
+            )
+            .into());
+        }
+
+        Ok(Self {
+            token,
+            database: env::var_os("REPLICANT_DB")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite")),
+            replicant: env_string("RS_EXPLORE_REPLICANT", "B6BA399E"),
+            vessel: env_string("RS_EXPLORE_VESSEL", "FD5EA802"),
+            center: env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase(),
+            radius_ly: env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?,
+            system_limit: env_usize("RS_EXPLORE_SYSTEM_LIMIT", 25)?.max(1),
+            plan_path: env::var_os("RS_EXPLORE_PLAN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("explore-survey-route.json")),
+            log_path: env::var_os("RS_EXPLORE_LOG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("logs/explore-survey-route.log")),
+            controller_override: env::var("RS_EXPLORE_CONTROLLER").ok(),
+            drone_overrides,
+            execute: env_bool("RS_EXPLORE_EXECUTE", false)?,
+            rebuild_plan: env_bool("RS_EXPLORE_REBUILD_PLAN", false)?,
+            include_explored: env_bool("RS_EXPLORE_INCLUDE_EXPLORED", false)?,
+            travel_timeout: Duration::from_secs(env_u64(
+                "RS_EXPLORE_TRAVEL_TIMEOUT_SECS",
+                6 * 60 * 60,
+            )?),
+            scan_timeout: Duration::from_secs(env_u64("RS_EXPLORE_SCAN_TIMEOUT_SECS", 60 * 60)?),
+            survey_timeout: Duration::from_secs(env_u64(
+                "RS_EXPLORE_SURVEY_TIMEOUT_SECS",
+                6 * 60 * 60,
+            )?),
+        })
+    }
+}
+
+fn env_string(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn env_bool(name: &str, default: bool) -> AnyResult<bool> {
+    match env::var(name) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be 1/0, true/false, yes/no, or on/off"),
+            )
+            .into()),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> AnyResult<usize> {
+    match env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> AnyResult<u64> {
+    match env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> AnyResult<f64> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed: f64 = value.parse()?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive finite number"),
+                )
+                .into());
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_tracing(log_path: &Path) -> AnyResult<()> {
+    if let Some(parent) = log_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let writer = TeeMakeWriter {
+        file: Arc::new(Mutex::new(file)),
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_timer(TraceSystemTime)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_ansi(false)
+        .with_span_events(FmtSpan::CLOSE)
+        .try_init()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RunPhase {
+    PreparingFleet,
+    Ready,
+    Traveling,
+    SystemScanning,
+    Surveying,
+    Restowing,
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RouteStop {
+    star: String,
+    entry_point: Option<String>,
+    distance_from_center_ly: f64,
+    leg_distance_ly: f64,
+    survey_required: bool,
+    system_scan_done: bool,
+    survey_done: bool,
+    completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RoutePlan {
+    version: u32,
+    created_unix_seconds: u64,
+    replicant: String,
+    vessel: String,
+    center: String,
+    radius_ly: f64,
+    system_limit: usize,
+    include_explored: bool,
+    controller: Option<String>,
+    drones: Vec<String>,
+    fleet_prepared: bool,
+    route: Vec<RouteStop>,
+    next_index: usize,
+    phase: RunPhase,
+    last_event_id: Option<String>,
+}
+
+impl RoutePlan {
+    fn validate(&self, config: &Config) -> AnyResult<()> {
+        if self.version != PLAN_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported route plan version {}; expected {PLAN_VERSION}",
+                    self.version
+                ),
+            )
+            .into());
+        }
+        if self.replicant != config.replicant
+            || self.vessel != config.vessel
+            || self.center != config.center
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing route plan targets a different replicant, vessel, or centre; set RS_EXPLORE_REBUILD_PLAN=1 to replace it",
+            )
+            .into());
+        }
+        if self.next_index > self.route.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "route plan next_index exceeds route length",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CandidateStar {
+    star: String,
+    entry_point: Option<String>,
+    position: GalacticPosition,
+    distance_from_center_ly: f64,
+    survey_required: bool,
+}
+
+#[tokio::main]
+async fn main() -> AnyResult<()> {
+    let config = Config::from_env()?;
+    install_tracing(&config.log_path)?;
+
+    info!(
+        target: "replicant_client::explore",
+        event = "explore.started",
+        replicant = %config.replicant,
+        vessel = %config.vessel,
+        center = %config.center,
+        radius_ly = config.radius_ly,
+        system_limit = config.system_limit,
+        plan = %config.plan_path.display(),
+        log = %config.log_path.display(),
+        execute = config.execute,
+        "starting survey-route automation"
+    );
+
+    let client = Client::builder()
+        .authentication_token(SecretString::from(config.token.clone()))
+        .sqlite(&config.database)
+        .startup_policy(StartupPolicy::Essential)
+        .start()
+        .await?;
+
+    let result = run(&client, &config).await;
+    let close_result = client.close().await;
+
+    if let Err(error) = &result {
+        error!(
+            target: "replicant_client::explore",
+            event = "explore.failed",
+            error = %error,
+            "survey-route automation failed; rerun to resume from the saved plan"
+        );
+    }
+    close_result?;
+    result
+}
+
+async fn run(client: &Client, config: &Config) -> AnyResult<()> {
+    let sync_started = Instant::now();
+    let sync = client.sync().full().await?;
+    info!(
+        target: "replicant_client::explore",
+        event = "explore.full_sync_completed",
+        readiness = ?sync.readiness,
+        elapsed_ms = sync_started.elapsed().as_millis() as u64,
+        "full synchronization completed"
+    );
+
+    let mut plan = load_or_create_plan(client, config).await?;
+    log_route(&plan);
+
+    if !config.execute {
+        warn!(
+            target: "replicant_client::explore",
+            event = "explore.plan_only",
+            "route plan created/loaded; set RS_EXPLORE_EXECUTE=1 to permit mutations"
+        );
+        return Ok(());
+    }
+
+    if !plan.fleet_prepared {
+        prepare_fleet(client, config, &mut plan).await?;
+        save_plan(&config.plan_path, &plan)?;
+    } else {
+        verify_fleet_plan(client, config, &plan).await?;
+    }
+
+    execute_route(client, config, &mut plan).await
+}
+
+async fn load_or_create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
+    if config.rebuild_plan && config.plan_path.exists() {
+        info!(
+            target: "replicant_client::explore",
+            event = "route.plan_removed",
+            path = %config.plan_path.display(),
+            "removing existing route plan"
+        );
+        fs::remove_file(&config.plan_path)?;
+    }
+
+    if config.plan_path.exists() {
+        let bytes = fs::read(&config.plan_path)?;
+        let plan: RoutePlan = serde_json::from_slice(&bytes)?;
+        plan.validate(config)?;
+        info!(
+            target: "replicant_client::explore",
+            event = "route.plan_loaded",
+            stops = plan.route.len(),
+            next_index = plan.next_index,
+            phase = ?plan.phase,
+            "loaded resumable route plan"
+        );
+        return Ok(plan);
+    }
+
+    create_plan(client, config).await
+}
+
+async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
+    let planning_started = Instant::now();
+
+    if client.galaxy().catalogue().is_empty() {
+        info!(
+            target: "replicant_client::explore",
+            event = "route.catalogue_refresh_required",
+            "no durable star catalogue is available; refreshing it"
+        );
+        client.galaxy().refresh_catalogue().await?;
+    }
+
+    let knowledge = client
+        .galaxy()
+        .sync_replicant_stars(&config.replicant)
+        .await?;
+    let explored = knowledge
+        .explored_designations()
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+
+    let catalogue = client.galaxy().catalogue();
+    let center = catalogue
+        .iter()
+        .find(|star| star.key.id.as_str() == config.center)
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "centre star `{}` is absent from the catalogue",
+                    config.center
+                ),
+            )
+        })?;
+    let center_position = center.position.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("centre star `{}` has no catalogue position", config.center),
+        )
+    })?;
+
+    let mut candidates = catalogue
+        .into_iter()
+        .filter_map(|star| {
+            let position = star.position?;
+            let star_code = star.key.id.as_str().to_owned();
+            if star_code == config.center {
+                return None;
+            }
+            let distance = position_distance(center_position, position);
+            if distance > config.radius_ly {
+                return None;
+            }
+            let already_explored = explored.contains(&star_code);
+            if already_explored && !config.include_explored {
+                return None;
+            }
+            Some(CandidateStar {
+                star: star_code,
+                entry_point: star.entry_point.map(|entry| entry.id.as_str().to_owned()),
+                position,
+                distance_from_center_ly: distance,
+                survey_required: !already_explored || config.include_explored,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| left.star.cmp(&right.star));
+
+    let center_already_explored = explored.contains(&config.center);
+    let mut route = vec![RouteStop {
+        star: config.center.clone(),
+        entry_point: center
+            .entry_point
+            .as_ref()
+            .map(|entry| entry.id.as_str().to_owned()),
+        distance_from_center_ly: 0.0,
+        leg_distance_ly: 0.0,
+        survey_required: config.include_explored || !center_already_explored,
+        system_scan_done: center_already_explored,
+        survey_done: !config.include_explored && center_already_explored,
+        completed: false,
+    }];
+
+    let mut current = center_position;
+    while !candidates.is_empty() && route.len() < config.system_limit {
+        let (index, leg_distance) = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, position_distance(current, candidate.position)))
+            .min_by(
+                |(left_index, left_distance), (right_index, right_distance)| {
+                    left_distance
+                        .partial_cmp(right_distance)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| {
+                            candidates[*left_index]
+                                .star
+                                .cmp(&candidates[*right_index].star)
+                        })
+                },
+            )
+            .expect("candidate list is non-empty");
+
+        let candidate = candidates.remove(index);
+        current = candidate.position;
+        route.push(RouteStop {
+            star: candidate.star,
+            entry_point: candidate.entry_point,
+            distance_from_center_ly: candidate.distance_from_center_ly,
+            leg_distance_ly: leg_distance,
+            survey_required: candidate.survey_required,
+            system_scan_done: false,
+            survey_done: false,
+            completed: false,
+        });
+    }
+
+    let plan = RoutePlan {
+        version: PLAN_VERSION,
+        created_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        replicant: config.replicant.clone(),
+        vessel: config.vessel.clone(),
+        center: config.center.clone(),
+        radius_ly: config.radius_ly,
+        system_limit: config.system_limit,
+        include_explored: config.include_explored,
+        controller: None,
+        drones: Vec::new(),
+        fleet_prepared: false,
+        route,
+        next_index: 0,
+        phase: RunPhase::PreparingFleet,
+        last_event_id: None,
+    };
+    save_plan(&config.plan_path, &plan)?;
+
+    info!(
+        target: "replicant_client::explore",
+        event = "route.plan_created",
+        stops = plan.route.len(),
+        explored_known = explored.len(),
+        elapsed_ms = planning_started.elapsed().as_millis() as u64,
+        "created and saved nearest-neighbor route"
+    );
+    Ok(plan)
+}
+
+fn log_route(plan: &RoutePlan) {
+    let total_distance: f64 = plan.route.iter().map(|stop| stop.leg_distance_ly).sum();
+    info!(
+        target: "replicant_client::explore",
+        event = "route.summary",
+        stops = plan.route.len(),
+        next_index = plan.next_index,
+        phase = ?plan.phase,
+        total_distance_ly = total_distance,
+        "route summary"
+    );
+    for (index, stop) in plan.route.iter().enumerate() {
+        info!(
+            target: "replicant_client::explore",
+            event = "route.stop",
+            index,
+            star = %stop.star,
+            entry_point = stop.entry_point.as_deref().unwrap_or(""),
+            distance_from_center_ly = stop.distance_from_center_ly,
+            leg_distance_ly = stop.leg_distance_ly,
+            survey_required = stop.survey_required,
+            completed = stop.completed,
+            "planned route stop"
+        );
+    }
+}
+
+async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -> AnyResult<()> {
+    let started = Instant::now();
+    plan.phase = RunPhase::PreparingFleet;
+    save_plan(&config.plan_path, plan)?;
+
+    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let replicant_snapshot = replicant.snapshot().await?;
+    let hosted_vessel = replicant_snapshot
+        .hosted_device
+        .as_ref()
+        .map(|device| device.id.as_str());
+    if hosted_vessel != Some(config.vessel.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "replicant {} is hosted by {:?}, not vessel {}",
+                config.replicant, hosted_vessel, config.vessel
+            ),
+        )
+        .into());
+    }
+
+    let vessel = client.devices().get(&config.vessel).await?;
+    let vessel_snapshot = vessel.snapshot().await?;
+    if vessel_snapshot
+        .device_type
+        .as_ref()
+        .map(|value| value.as_str())
+        != Some("racing_vessel")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("device {} is not a racing_vessel", config.vessel),
+        )
+        .into());
+    }
+    let location = vessel_snapshot.location.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "racing vessel has no current location",
+        )
+    })?;
+    let location_id = location.id.as_str().to_owned();
+
+    if plan.controller.is_none() {
+        let controller_code = if let Some(code) = &config.controller_override {
+            code.clone()
+        } else {
+            let controllers = client
+                .devices()
+                .controllers(DeviceType::SurveyController)
+                .owned()
+                .idle()
+                .at(&location_id)
+                .without_adopted_devices()
+                .collect()
+                .await?;
+            controllers
+                .first()
+                .map(|controller| controller.id().as_str().to_owned())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no idle survey controller without adopted devices exists at {location_id}"
+                        ),
+                    )
+                })?
+        };
+        plan.controller = Some(controller_code);
+        save_plan(&config.plan_path, plan)?;
+    }
+
+    if plan.drones.is_empty() {
+        let drones = if let Some(codes) = &config.drone_overrides {
+            codes.clone()
+        } else {
+            let available = client
+                .devices()
+                .find()
+                .in_realm(Realm::Live)
+                .owned()
+                .of_type(DeviceType::from("survey_drone"))
+                .idle()
+                .at(&location_id)
+                .without_controller()
+                .collect()
+                .await?;
+            if available.len() < DRONE_COUNT {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "only {} idle, unadopted survey drones are available at {}; need {DRONE_COUNT}",
+                        available.len(),
+                        location_id
+                    ),
+                )
+                .into());
+            }
+            available
+                .into_iter()
+                .take(DRONE_COUNT)
+                .map(|drone| drone.id().as_str().to_owned())
+                .collect()
+        };
+        plan.drones = drones;
+        save_plan(&config.plan_path, plan)?;
+    }
+
+    verify_fleet_plan(client, config, plan).await?;
+
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no selected controller"))?;
+    let controller_handle = client.devices().get(controller_code).await?;
+    let controller = controller_handle.as_survey_controller()?;
+
+    let mut needs_adoption = Vec::new();
+    for code in &plan.drones {
+        let status = client.raw().devices().get(code).await?.value;
+        match status.controller_device_code.as_deref() {
+            Some(actual) if actual == controller_code => {}
+            Some(actual) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("drone {code} is already controlled by {actual}"),
+                )
+                .into());
+            }
+            None => needs_adoption.push(code.clone()),
+        }
+    }
+
+    if !needs_adoption.is_empty() {
+        info!(
+            target: "replicant_client::explore",
+            event = "fleet.adoption_started",
+            controller = controller_code,
+            drones = ?needs_adoption,
+            "adopting survey drones"
+        );
+        let operation = controller.adopt(needs_adoption.clone()).await?;
+        wait_immediate_operation("adopt survey drones", &operation).await?;
+        for code in &needs_adoption {
+            let refreshed = client.raw().devices().get(code).await?.value;
+            if refreshed.controller_device_code.as_deref() != Some(controller_code) {
+                return Err(io::Error::other(format!(
+                    "drone {code} did not report controller {controller_code} after adoption"
+                ))
+                .into());
+            }
+        }
+    }
+
+    let controller_status = client.raw().devices().get(controller_code).await?.value;
+    if !has_survey_system_directive(&controller_status.ami_directive) {
+        info!(
+            target: "replicant_client::explore",
+            event = "fleet.directive_started",
+            controller = controller_code,
+            "configuring survey_system directive"
+        );
+        let operation = controller
+            .set_directive(SurveyDirective::SurveySystem {
+                planets: "all".to_owned(),
+                moons: "all".to_owned(),
+                recall: true,
+            })
+            .await?;
+        wait_immediate_operation("configure survey_system", &operation).await?;
+    }
+
+    stow_fleet(client, config, plan).await?;
+
+    plan.fleet_prepared = true;
+    plan.phase = RunPhase::Ready;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        target: "replicant_client::explore",
+        event = "fleet.prepared",
+        controller = controller_code,
+        drones = ?plan.drones,
+        location = location_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "survey fleet is adopted, configured, and stowed"
+    );
+    Ok(())
+}
+
+async fn verify_fleet_plan(client: &Client, config: &Config, plan: &RoutePlan) -> AnyResult<()> {
+    let controller = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+    if plan.drones.len() != DRONE_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "route plan must contain exactly {DRONE_COUNT} survey drones; found {}",
+                plan.drones.len()
+            ),
+        )
+        .into());
+    }
+
+    let controller_status = client.raw().devices().get(controller).await?.value;
+    if controller_status.device_type.as_deref() != Some("ami_survey_controller") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("planned controller {controller} is not an ami_survey_controller"),
+        )
+        .into());
+    }
+
+    let vessel_status = client.raw().devices().get(&config.vessel).await?.value;
+    if vessel_status.device_type.as_deref() != Some("racing_vessel") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("planned vessel {} is not a racing_vessel", config.vessel),
+        )
+        .into());
+    }
+
+    for code in &plan.drones {
+        let status = client.raw().devices().get(code).await?.value;
+        if status.device_type.as_deref() != Some("survey_drone") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("planned drone {code} is not a survey_drone"),
+            )
+            .into());
+        }
+        if plan.fleet_prepared && status.controller_device_code.as_deref() != Some(controller) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("prepared drone {code} is no longer adopted by controller {controller}"),
+            )
+            .into());
+        }
+    }
+
+    if plan.fleet_prepared && !has_survey_system_directive(&controller_status.ami_directive) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("prepared controller {controller} no longer has survey_system configured"),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn has_survey_system_directive(directive: &Option<replicant_client::raw::JsonObject>) -> bool {
+    directive.as_ref().is_some_and(|directive| {
+        directive
+            .get("directive")
+            .or_else(|| directive.get("name"))
+            .and_then(Value::as_str)
+            == Some("survey_system")
+    })
+}
+
+async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyResult<()> {
+    let controller = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+
+    let mut codes = plan.drones.clone();
+    codes.push(controller.to_owned());
+
+    let vessel = client.raw().devices().get(&config.vessel).await?.value;
+    let capacity = vessel.stow_capacity.unwrap_or(5);
+    let used = vessel.stow_used.unwrap_or(0);
+    let mut missing = Vec::new();
+
+    for code in &codes {
+        let status = client.raw().devices().get(code).await?.value;
+        if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
+            missing.push(code.clone());
+        }
+    }
+
+    if used + i64::try_from(missing.len())? > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "vessel {} has stow capacity {capacity}, currently uses {used}, and needs {} more slots",
+                config.vessel,
+                missing.len()
+            ),
+        )
+        .into());
+    }
+
+    for code in missing {
+        info!(
+            target: "replicant_client::explore",
+            event = "fleet.stow_started",
+            device = code,
+            vessel = %config.vessel,
+            "stowing survey-fleet device"
+        );
+        let handle = client.devices().get(&code).await?;
+        let operation = handle.stow(Some(config.vessel.clone())).await?;
+        wait_immediate_operation("stow fleet device", &operation).await?;
+
+        let status = client.raw().devices().get(&code).await?.value;
+        if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
+            return Err(io::Error::other(format!(
+                "device {code} did not report stowed_in_device_code={} after stow",
+                config.vessel
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+async fn wait_immediate_operation(label: &str, operation: &Operation) -> AnyResult<()> {
+    let started = Instant::now();
+    let outcome = operation.wait_timeout(Duration::from_secs(60)).await?;
+    info!(
+        target: "replicant_client::explore",
+        event = "operation.observed",
+        label,
+        operation_id = %operation.id(),
+        status = ?outcome.status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "observed operation outcome"
+    );
+
+    match outcome.status {
+        OperationStatus::Completed => Ok(()),
+        OperationStatus::Rejected | OperationStatus::Cancelled | OperationStatus::Failed => {
+            Err(io::Error::other(format!("{label} ended with {:?}", outcome.status)).into())
+        }
+        _ => {
+            warn!(
+                target: "replicant_client::explore",
+                event = "operation.non_terminal",
+                label,
+                status = ?outcome.status,
+                "operation remains non-terminal; subsequent authoritative verification will decide whether to continue"
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -> AnyResult<()> {
+    while plan.next_index < plan.route.len() {
+        let index = plan.next_index;
+        let target = plan.route[index].star.clone();
+
+        info!(
+            target: "replicant_client::explore",
+            event = "route.stop_started",
+            index,
+            total = plan.route.len(),
+            star = %target,
+            phase = ?plan.phase,
+            "processing route stop"
+        );
+
+        match plan.phase {
+            RunPhase::PreparingFleet => {
+                prepare_fleet(client, config, plan).await?;
+            }
+            RunPhase::Ready => {
+                let current = current_star(client, &config.replicant).await?;
+                if current.as_deref() != Some(target.as_str()) {
+                    stow_fleet(client, config, plan).await?;
+                    plan.phase = RunPhase::Traveling;
+                    save_plan(&config.plan_path, plan)?;
+                    travel_to(client, config, plan, &target).await?;
+                }
+
+                if !plan.route[index].survey_required {
+                    plan.route[index].completed = true;
+                    plan.next_index += 1;
+                    plan.phase = if plan.next_index >= plan.route.len() {
+                        RunPhase::Complete
+                    } else {
+                        RunPhase::Ready
+                    };
+                    save_plan(&config.plan_path, plan)?;
+                    continue;
+                }
+
+                if !plan.route[index].system_scan_done {
+                    plan.phase = RunPhase::SystemScanning;
+                    save_plan(&config.plan_path, plan)?;
+                } else if !plan.route[index].survey_done {
+                    plan.phase = RunPhase::Surveying;
+                    save_plan(&config.plan_path, plan)?;
+                } else {
+                    plan.phase = RunPhase::Restowing;
+                    save_plan(&config.plan_path, plan)?;
+                }
+            }
+            RunPhase::Traveling => {
+                travel_to(client, config, plan, &target).await?;
+                plan.phase = if plan.route[index].system_scan_done {
+                    RunPhase::Surveying
+                } else {
+                    RunPhase::SystemScanning
+                };
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::SystemScanning => {
+                run_system_scan(client, config, plan, &target).await?;
+                plan.route[index].system_scan_done = true;
+                plan.phase = RunPhase::Surveying;
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::Surveying => {
+                run_survey(client, config, plan, &target).await?;
+                plan.route[index].survey_done = true;
+                plan.phase = RunPhase::Restowing;
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::Restowing => {
+                recall_and_stow(client, config, plan).await?;
+                plan.route[index].completed = true;
+                plan.next_index += 1;
+                plan.phase = if plan.next_index >= plan.route.len() {
+                    RunPhase::Complete
+                } else {
+                    RunPhase::Ready
+                };
+                save_plan(&config.plan_path, plan)?;
+                info!(
+                    target: "replicant_client::explore",
+                    event = "route.stop_completed",
+                    index,
+                    star = %target,
+                    next_index = plan.next_index,
+                    "route stop completed and saved"
+                );
+            }
+            RunPhase::Complete => break,
+        }
+    }
+
+    plan.phase = RunPhase::Complete;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        target: "replicant_client::explore",
+        event = "route.completed",
+        stops = plan.route.len(),
+        plan = %config.plan_path.display(),
+        "survey route completed"
+    );
+    Ok(())
+}
+
+async fn travel_to(
+    client: &Client,
+    config: &Config,
+    plan: &mut RoutePlan,
+    target: &str,
+) -> AnyResult<()> {
+    if current_star(client, &config.replicant).await?.as_deref() == Some(target) {
+        info!(
+            target: "replicant_client::explore",
+            event = "travel.already_arrived",
+            star = target,
+            "replicant is already at target star"
+        );
+        return Ok(());
+    }
+
+    let raw_replicant = client
+        .raw()
+        .replicants()
+        .get(&config.replicant)
+        .await?
+        .value;
+    let already_traveling_to_target = raw_replicant.travel.as_ref().is_some_and(|travel| {
+        travel
+            .destination
+            .as_deref()
+            .is_some_and(|destination| designation_in_star(destination, target))
+    });
+
+    let mut watch = client.events().watch().await?;
+    if !already_traveling_to_target {
+        info!(
+            target: "replicant_client::explore",
+            event = "travel.departure_requested",
+            replicant = %config.replicant,
+            vessel = %config.vessel,
+            destination = target,
+            "requesting interstellar travel"
+        );
+        let replicant = client.replicants().get_owned(&config.replicant).await?;
+        let operation = replicant.travel().to(target).depart().await?;
+        debug!(
+            target: "replicant_client::explore",
+            event = "travel.operation_registered",
+            operation_id = %operation.id(),
+            destination = target,
+            "durable travel operation registered"
+        );
+    } else {
+        info!(
+            target: "replicant_client::explore",
+            event = "travel.resumed",
+            destination = target,
+            "existing in-progress travel matches the saved route"
+        );
+    }
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= config.travel_timeout {
+            if current_star(client, &config.replicant).await?.as_deref() == Some(target) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("travel to {target} exceeded {:?}", config.travel_timeout),
+            )
+            .into());
+        }
+
+        let wait_for = (config.travel_timeout - started.elapsed()).min(Duration::from_secs(30));
+        match tokio::time::timeout(wait_for, watch.next()).await {
+            Ok(Ok(event)) => {
+                plan.last_event_id = Some(event.id.as_str().to_owned());
+                if is_travel_event_for(&event, config, target) {
+                    info!(
+                        target: "replicant_client::explore",
+                        event = "travel.event",
+                        event_id = %event.id,
+                        event_name = event.name.as_str(),
+                        destination = target,
+                        payload = ?event.payload,
+                        "observed relevant travel event"
+                    );
+                    if event.name.as_str() == "travel.arrived" {
+                        save_plan(&config.plan_path, plan)?;
+                        if current_star(client, &config.replicant).await?.as_deref() == Some(target)
+                        {
+                            info!(
+                                target: "replicant_client::explore",
+                                event = "travel.arrived",
+                                destination = target,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "arrived at target star"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                let current = current_star(client, &config.replicant).await?;
+                info!(
+                    target: "replicant_client::explore",
+                    event = "travel.waiting",
+                    destination = target,
+                    current_star = current.as_deref().unwrap_or("unknown"),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "still waiting for travel arrival"
+                );
+                if current.as_deref() == Some(target) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn run_system_scan(
+    client: &Client,
+    config: &Config,
+    plan: &mut RoutePlan,
+    target: &str,
+) -> AnyResult<()> {
+    let mut watch = client.events().watch().await?;
+    let vessel_status = client.raw().devices().get(&config.vessel).await?.value;
+    if vessel_status.scan.is_none() {
+        info!(
+            target: "replicant_client::explore",
+            event = "system_scan.started",
+            vessel = %config.vessel,
+            star = target,
+            "starting vessel system scan"
+        );
+        let vessel = client.devices().get(&config.vessel).await?;
+        let operation = vessel.command(DeviceCommand::SystemScan).await?;
+        debug!(
+            target: "replicant_client::explore",
+            event = "system_scan.operation_registered",
+            operation_id = %operation.id(),
+            star = target,
+            "durable system-scan operation registered"
+        );
+    } else {
+        info!(
+            target: "replicant_client::explore",
+            event = "system_scan.resumed",
+            star = target,
+            "vessel already reports an in-progress scan"
+        );
+    }
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= config.scan_timeout {
+            let knowledge = client
+                .galaxy()
+                .sync_replicant_stars(&config.replicant)
+                .await?;
+            if knowledge
+                .explored_designations()
+                .iter()
+                .any(|star| star.as_str() == target)
+            {
+                warn!(
+                    target: "replicant_client::explore",
+                    event = "system_scan.completed_without_event",
+                    star = target,
+                    "star knowledge confirms exploration despite missing completion event"
+                );
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("system scan at {target} exceeded {:?}", config.scan_timeout),
+            )
+            .into());
+        }
+
+        let wait_for = (config.scan_timeout - started.elapsed()).min(Duration::from_secs(30));
+        match tokio::time::timeout(wait_for, watch.next()).await {
+            Ok(Ok(event)) => {
+                plan.last_event_id = Some(event.id.as_str().to_owned());
+                if is_system_scan_completion(&event, config, target) {
+                    info!(
+                        target: "replicant_client::explore",
+                        event = "system_scan.completed",
+                        event_id = %event.id,
+                        event_name = event.name.as_str(),
+                        star = target,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        payload = ?event.payload,
+                        "system scan completed"
+                    );
+                    save_plan(&config.plan_path, plan)?;
+                    return Ok(());
+                }
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                info!(
+                    target: "replicant_client::explore",
+                    event = "system_scan.waiting",
+                    star = target,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "still waiting for system-scan completion"
+                );
+            }
+        }
+    }
+}
+
+async fn run_survey(
+    client: &Client,
+    config: &Config,
+    plan: &mut RoutePlan,
+    target: &str,
+) -> AnyResult<()> {
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+    let controller_handle = client.devices().get(controller_code).await?;
+    let controller = controller_handle.as_survey_controller()?;
+    let mut watch = client.events().watch().await?;
+
+    let status = client.raw().devices().get(controller_code).await?.value;
+    let active = status.status.as_deref() == Some("coordinating")
+        || status.ami_directive_status.as_deref().is_some_and(|value| {
+            !matches!(
+                value,
+                "idle" | "inactive" | "completed" | "paused" | "withdrawn"
+            )
+        });
+
+    if !active {
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.launch_started",
+            controller = controller_code,
+            star = target,
+            drones = ?plan.drones,
+            "launching survey controller"
+        );
+        let operation = controller.launch().await?;
+        wait_immediate_operation("launch survey controller", &operation).await?;
+    } else {
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.resumed",
+            controller = controller_code,
+            star = target,
+            status = status.ami_directive_status.as_deref().unwrap_or("unknown"),
+            "controller already reports an active directive"
+        );
+    }
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= config.survey_timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "survey at {target} exceeded {:?}; plan remains resumable",
+                    config.survey_timeout
+                ),
+            )
+            .into());
+        }
+
+        let wait_for = (config.survey_timeout - started.elapsed()).min(Duration::from_secs(30));
+        match tokio::time::timeout(wait_for, watch.next()).await {
+            Ok(Ok(event)) => {
+                plan.last_event_id = Some(event.id.as_str().to_owned());
+
+                if is_survey_digest_for(&event, controller_code, target) {
+                    let progress = survey_progress(&event);
+                    info!(
+                        target: "replicant_client::explore",
+                        event = "survey.digest",
+                        event_id = %event.id,
+                        controller = controller_code,
+                        star = target,
+                        progress_known = progress.is_some(),
+                        scanned = progress.map_or(0, |value| value.0),
+                        remaining = progress.map_or(0, |value| value.1),
+                        total = progress.map_or(0, |value| value.2),
+                        devices = ?event.payload.get("devices"),
+                        "observed survey digest"
+                    );
+                    save_plan(&config.plan_path, plan)?;
+
+                    if progress.is_some_and(|(_, remaining, _)| remaining == 0) {
+                        info!(
+                            target: "replicant_client::explore",
+                            event = "survey.completed",
+                            controller = controller_code,
+                            star = target,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "survey-system digest reports no remaining bodies"
+                        );
+                        return Ok(());
+                    }
+                }
+
+                if event.name.as_str() == "directive.completed"
+                    && event
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| device.id.as_str() == controller_code)
+                    && event_in_star(&event, target)
+                {
+                    info!(
+                        target: "replicant_client::explore",
+                        event = "survey.directive_completed",
+                        controller = controller_code,
+                        star = target,
+                        "controller emitted directive.completed"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                info!(
+                    target: "replicant_client::explore",
+                    event = "survey.waiting",
+                    controller = controller_code,
+                    star = target,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "still waiting for survey completion"
+                );
+            }
+        }
+    }
+}
+
+async fn recall_and_stow(client: &Client, config: &Config, plan: &RoutePlan) -> AnyResult<()> {
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+    let controller = client
+        .devices()
+        .get(controller_code)
+        .await?
+        .as_survey_controller()?;
+
+    let status = client.raw().devices().get(controller_code).await?.value;
+    if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
+        if status
+            .available_commands
+            .iter()
+            .any(|command| command == "withdraw")
+        {
+            info!(
+                target: "replicant_client::explore",
+                event = "survey.withdraw_started",
+                controller = controller_code,
+                "withdrawing survey fleet before travel"
+            );
+            let operation = controller.withdraw().await?;
+            wait_immediate_operation("withdraw survey controller", &operation).await?;
+        } else {
+            warn!(
+                target: "replicant_client::explore",
+                event = "survey.withdraw_unavailable",
+                controller = controller_code,
+                status = status.status.as_deref().unwrap_or("unknown"),
+                "withdraw is not currently advertised; attempting authoritative stow verification"
+            );
+        }
+    }
+    stow_fleet(client, config, plan).await
+}
+
+async fn current_star(client: &Client, replicant_code: &str) -> AnyResult<Option<String>> {
+    let status = client.raw().replicants().get(replicant_code).await?.value;
+    Ok(status
+        .location
+        .as_deref()
+        .map(star_from_designation)
+        .map(str::to_owned))
+}
+
+fn star_from_designation(designation: &str) -> &str {
+    designation.split('-').next().unwrap_or(designation)
+}
+
+fn designation_in_star(designation: &str, star: &str) -> bool {
+    designation == star
+        || designation
+            .strip_prefix(star)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn position_distance(left: GalacticPosition, right: GalacticPosition) -> f64 {
+    let dx = left.x - right.x;
+    let dy = left.y - right.y;
+    let dz = left.z - right.z;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn is_travel_event_for(event: &Event, config: &Config, target: &str) -> bool {
+    if !matches!(event.name.as_str(), "travel.departed" | "travel.arrived") {
+        return false;
+    }
+    let actor_matches = event
+        .replicant
+        .as_ref()
+        .is_some_and(|replicant| replicant.id.as_str() == config.replicant)
+        || event
+            .device
+            .as_ref()
+            .is_some_and(|device| device.id.as_str() == config.vessel);
+    actor_matches && event_in_star(event, target)
+}
+
+fn is_system_scan_completion(event: &Event, config: &Config, target: &str) -> bool {
+    let event_name = event.name.as_str();
+    let completion_name = matches!(
+        event_name,
+        "scan.completed" | "system_scan.completed" | "system.scan.completed"
+    );
+    let actor_matches = event
+        .device
+        .as_ref()
+        .is_some_and(|device| device.id.as_str() == config.vessel)
+        || event
+            .replicant
+            .as_ref()
+            .is_some_and(|replicant| replicant.id.as_str() == config.replicant);
+    completion_name && actor_matches && event_in_star(event, target)
+}
+
+fn is_survey_digest_for(event: &Event, controller: &str, target: &str) -> bool {
+    event.name.as_str() == "ami.survey.digest"
+        && event
+            .device
+            .as_ref()
+            .is_some_and(|device| device.id.as_str() == controller)
+        && event.payload.get("directive").and_then(Value::as_str) == Some("survey_system")
+        && event_in_star(event, target)
+}
+
+fn event_in_star(event: &Event, target: &str) -> bool {
+    event
+        .star
+        .as_ref()
+        .is_some_and(|star| star.id.as_str() == target)
+        || event
+            .location
+            .as_ref()
+            .is_some_and(|location| designation_in_star(location.id.as_str(), target))
+        || event
+            .payload
+            .get("destination")
+            .and_then(Value::as_str)
+            .is_some_and(|destination| designation_in_star(destination, target))
+        || event.payload.get("star").and_then(Value::as_str) == Some(target)
+}
+
+fn survey_progress(event: &Event) -> Option<(u64, u64, u64)> {
+    let progress = event.payload.get("report")?.get("progress")?.as_object()?;
+    Some((
+        progress.get("scanned")?.as_u64()?,
+        progress.get("remaining")?.as_u64()?,
+        progress.get("total")?.as_u64()?,
+    ))
+}
+
+fn save_plan(path: &Path, plan: &RoutePlan) -> AnyResult<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temporary = path.with_extension("json.tmp");
+    {
+        let file = File::create(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, plan)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+    fs::rename(&temporary, path)?;
+    debug!(
+        target: "replicant_client::explore",
+        event = "route.plan_saved",
+        path = %path.display(),
+        next_index = plan.next_index,
+        phase = ?plan.phase,
+        "saved route plan"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn designation_matching_accepts_star_and_child_locations() {
+        assert!(designation_in_star("SCEPTURUM", "SCEPTURUM"));
+        assert!(designation_in_star("SCEPTURUM-1-L4", "SCEPTURUM"));
+        assert!(!designation_in_star("SCEPTURUMA-2", "SCEPTURUM"));
+    }
+
+    #[test]
+    fn distance_is_euclidean_in_three_dimensions() {
+        let left = GalacticPosition {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let right = GalacticPosition {
+            x: 3.0,
+            y: 4.0,
+            z: 12.0,
+        };
+        assert!((position_distance(left, right) - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn survey_progress_reads_digest_shape() {
+        let event = Event {
+            id: replicant_client::EventId::from("1-0"),
+            realm: Some(Realm::Live),
+            name: replicant_client::domain::EventName::from("ami.survey.digest"),
+            category: replicant_client::domain::EventCategory::from("device"),
+            device: None,
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-27T00:00:00Z".into(),
+            payload: [(
+                "report".into(),
+                serde_json::json!({
+                    "progress": {"scanned": 28, "remaining": 8, "total": 36}
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(survey_progress(&event), Some((28, 8, 36)));
+    }
+}

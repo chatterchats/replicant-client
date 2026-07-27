@@ -1156,7 +1156,7 @@ mod tests {
                 .in_realm(Realm::Live)
                 .planetary_bodies()
                 .surveyed()
-                .atmosphere_is(domain::Atmosphere::Breathable)
+                .breathable_atmosphere()
                 .without_advanced_civilisation()
                 .life_stage_below(domain::LifeStage::Intelligent)
                 .gravity_g_between(0.8..=1.3)

@@ -107,6 +107,7 @@ enum LocationPredicate {
     PlanetaryBody,
     Surveyed,
     HasAtmosphere,
+    BreathableAtmosphere,
     Atmosphere(Atmosphere),
     MagneticField,
     HabitableZone,
@@ -154,6 +155,16 @@ impl LocationQuery {
     #[must_use]
     pub fn has_atmosphere(mut self) -> Self {
         self.predicates.push(LocationPredicate::HasAtmosphere);
+        self
+    }
+    /// Matches atmospheres known to support unassisted human breathing.
+    ///
+    /// Both the semantic `breathable` value and the live API's `standard`
+    /// classification are accepted.
+    #[must_use]
+    pub fn breathable_atmosphere(mut self) -> Self {
+        self.predicates
+            .push(LocationPredicate::BreathableAtmosphere);
         self
     }
     #[must_use]
@@ -423,13 +434,19 @@ fn evaluate_location(
                 "surveyed",
                 LocationPredicateOutcome::Matched,
                 Some("true".into()),
-                "matched",
+                "explicit survey flag",
             ),
             Some(false) => result(
                 "surveyed",
                 LocationPredicateOutcome::Rejected,
                 Some("false".into()),
-                "not surveyed",
+                "explicitly not surveyed",
+            ),
+            None if location.has_survey_environment_evidence() => result(
+                "surveyed",
+                LocationPredicateOutcome::Matched,
+                Some("inferred".into()),
+                "survey-only environment fields are present",
             ),
             None => result(
                 "surveyed",
@@ -456,6 +473,32 @@ fn evaluate_location(
                 LocationPredicateOutcome::Matched,
                 Some(value.as_str().into()),
                 "matched",
+            ),
+        },
+        LocationPredicate::BreathableAtmosphere => match &location.environment.atmosphere {
+            Knowledge::Unknown => result(
+                "breathable_atmosphere",
+                LocationPredicateOutcome::Unknown,
+                None,
+                "unknown field",
+            ),
+            Knowledge::Absent => result(
+                "breathable_atmosphere",
+                LocationPredicateOutcome::Rejected,
+                Some("absent".into()),
+                "known absent",
+            ),
+            Knowledge::Present(value) if value.is_breathable() => result(
+                "breathable_atmosphere",
+                LocationPredicateOutcome::Matched,
+                Some(value.as_str().into()),
+                "classification supports unassisted breathing",
+            ),
+            Knowledge::Present(value) => result(
+                "breathable_atmosphere",
+                LocationPredicateOutcome::Rejected,
+                Some(value.as_str().into()),
+                "classification is not breathable",
             ),
         },
         LocationPredicate::Atmosphere(expected) => match &location.environment.atmosphere {
@@ -598,13 +641,13 @@ mod location_predicate_tests {
         Location {
             key: WorldKey::in_realm(Realm::Live, LocationId::from("SOL-2")),
             location_type: Some(LocationType::Planet),
-            scanned: Some(true),
+            scanned: None,
             system_scanned: Some(true),
             system_tags: Vec::new(),
             system: Some("SOL".into()),
             parent: None,
             environment: LocationEnvironment {
-                atmosphere: Knowledge::Present(Atmosphere::from("breathable")),
+                atmosphere: Knowledge::Present(Atmosphere::Standard),
                 magnetic_field: Knowledge::Present(true),
                 gravity_g: Knowledge::Present(1.0),
                 surface_temp_c: Knowledge::Present(18.0),
@@ -637,6 +680,14 @@ mod location_predicate_tests {
                 &value
             )
             .outcome,
+            LocationPredicateOutcome::Matched
+        );
+        assert_eq!(
+            evaluate_location(&LocationPredicate::Surveyed, &value).outcome,
+            LocationPredicateOutcome::Matched
+        );
+        assert_eq!(
+            evaluate_location(&LocationPredicate::BreathableAtmosphere, &value).outcome,
             LocationPredicateOutcome::Matched
         );
         let mut unknown = value;
@@ -2211,13 +2262,13 @@ mod tests {
             value: Location {
                 key: domain::LocationKey::live("SOL-2".into()),
                 location_type: Some(LocationType::Planet),
-                scanned: Some(true),
+                scanned: None,
                 system_scanned: Some(true),
                 system_tags: Vec::new(),
                 system: Some("SOL".into()),
                 parent: None,
                 environment: domain::LocationEnvironment {
-                    atmosphere: Knowledge::Present(Atmosphere::Breathable),
+                    atmosphere: Knowledge::Present(Atmosphere::Standard),
                     magnetic_field: Knowledge::Present(true),
                     gravity_g: Knowledge::Present(1.0),
                     surface_temp_c: Knowledge::Present(18.0),
@@ -2250,7 +2301,7 @@ mod tests {
             .find()
             .planetary_bodies()
             .surveyed()
-            .atmosphere_is(Atmosphere::Breathable)
+            .breathable_atmosphere()
             .has_magnetic_field()
             .in_habitable_zone()
             .life_stage_below(LifeStage::Intelligent)

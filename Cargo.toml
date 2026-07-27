@@ -111,3 +111,7 @@ unused_imports = "warn"
 all = { level = "warn", priority = -1 }
 correctness = { level = "deny", priority = 0 }
 suspicious = { level = "deny", priority = 0 }
+
+[[example]]
+name = "explore_survey_route"
+required-features = ["managed"]

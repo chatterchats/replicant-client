@@ -163,6 +163,21 @@ impl Location {
         &self.environment.distance_from_sol_ly
     }
 
+    /// Returns whether survey-only environmental evidence has been observed.
+    ///
+    /// Some location-detail responses omit the top-level `scanned` flag even
+    /// though they contain atmosphere, magnetic-field, or axial-tilt results.
+    /// Those fields are emitted by survey-drone detail and provide conservative
+    /// evidence that the body has been surveyed. Habitable-zone, gravity,
+    /// temperature, and life fields are intentionally excluded because less
+    /// detailed system observations may provide them before a survey.
+    #[must_use]
+    pub fn has_survey_environment_evidence(&self) -> bool {
+        !matches!(&self.environment.atmosphere, Knowledge::Unknown)
+            || !matches!(&self.environment.magnetic_field, Knowledge::Unknown)
+            || !matches!(&self.environment.axial_tilt_deg, Knowledge::Unknown)
+    }
+
     pub(crate) fn merge_from(&mut self, newer: &Self) {
         self.location_type = newer
             .location_type

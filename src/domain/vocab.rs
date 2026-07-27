@@ -55,7 +55,26 @@ open_value!(DeviceDirective {
 open_value!(ReplicantStatus { Active => "active", Offline => "offline", Traveling => "traveling" });
 open_value!(SpeciesKind { Human => "human" });
 open_value!(LocationType { Planet => "planet", Moon => "moon", Belt => "belt", Station => "station" });
-open_value!(Atmosphere { Breathable => "breathable", None => "none" });
+open_value!(Atmosphere {
+    Breathable => "breathable",
+    Standard => "standard",
+    Thin => "thin",
+    Dense => "dense",
+    Crushing => "crushing",
+    None => "none"
+});
+
+impl Atmosphere {
+    /// Returns whether this atmosphere supports unassisted human breathing.
+    ///
+    /// The live API currently reports surveyed breathable worlds as
+    /// `standard`; `breathable` remains accepted for compatibility with the
+    /// earlier modeled vocabulary and future semantic responses.
+    #[must_use]
+    pub fn is_breathable(&self) -> bool {
+        matches!(self, Self::Breathable | Self::Standard)
+    }
+}
 open_value!(LifeStage {
     Prebiotic => "prebiotic", Microbial => "microbial", Complex => "complex",
     Intelligent => "intelligent", Spacefaring => "spacefaring"

@@ -354,14 +354,20 @@ pub fn location_detail(
         _ => raw.planet.as_ref().or(raw.moon.as_ref()),
     };
     let life_stage = body.and_then(|body| body.life_stage.clone());
-    let surveyed = raw.scanned == Some(true);
+    let survey_environment_evidence = body.is_some_and(|body| {
+        body.atmosphere.is_some() || body.magnetic_field.is_some() || body.axial_tilt_deg.is_some()
+    });
+    let scanned = raw
+        .scanned
+        .or_else(|| survey_environment_evidence.then_some(true));
+    let surveyed = scanned == Some(true);
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),
             LocationId::new(required(raw.location.as_ref(), "location")?),
         ),
         location_type: raw.location_type.clone().map(LocationType::from),
-        scanned: raw.scanned,
+        scanned,
         system_scanned: raw.system_scanned,
         system_tags: raw.system_tags.clone(),
         system: raw.system.clone(),
@@ -711,6 +717,11 @@ mod location_tests {
         .expect("fixture decodes");
         let observation =
             location_detail(&raw, Realm::Live, ObservationTime::now()).expect("normalizes");
+        assert_eq!(observation.value.scanned, Some(true));
+        assert!(matches!(
+            observation.value.environment.atmosphere,
+            Knowledge::Present(Atmosphere::Dense)
+        ));
         assert!(
             matches!(observation.value.environment.gravity_g, Knowledge::Present(value) if value == 2.06)
         );
