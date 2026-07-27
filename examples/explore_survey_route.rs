@@ -33,7 +33,7 @@
 //! - `RS_EXPLORE_VESSEL=FD5EA802`
 //! - `RS_EXPLORE_CENTER=SCEPTURUM`
 //! - `RS_EXPLORE_RADIUS_LY=10`
-//! - `RS_EXPLORE_SYSTEM_LIMIT=25`
+//! - `RS_EXPLORE_SYSTEM_LIMIT=80`
 //! - `RS_EXPLORE_STAR_DETAIL_CONCURRENCY=8`
 //! - `RS_EXPLORE_PLAN=explore-survey-route.json`
 //! - `RS_EXPLORE_LOG=logs/explore-survey-route.log`
@@ -95,7 +95,7 @@ type AnyError = Box<dyn StdError + Send + Sync + 'static>;
 type AnyResult<T> = Result<T, AnyError>;
 
 const PLAN_VERSION: u32 = 1;
-const DRONE_COUNT: usize = 4;
+const DRONE_COUNT: usize = 3;
 const DEFAULT_FILTER: &str = concat!(
     "replicant_client=info,",
     "replicant_client::explore=debug,",
@@ -200,7 +200,7 @@ impl Config {
             vessel: env_string("RS_EXPLORE_VESSEL", "FD5EA802"),
             center: env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase(),
             radius_ly: env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?,
-            system_limit: env_usize("RS_EXPLORE_SYSTEM_LIMIT", 25)?.max(1),
+            system_limit: env_usize("RS_EXPLORE_SYSTEM_LIMIT", 80)?.max(1),
             star_detail_concurrency: env_usize("RS_EXPLORE_STAR_DETAIL_CONCURRENCY", 8)?
                 .clamp(1, 16),
             plan_path: env::var_os("RS_EXPLORE_PLAN")
@@ -336,6 +336,12 @@ struct RouteStop {
     completed: bool,
 }
 
+impl RouteStop {
+    fn is_already_complete(&self) -> bool {
+        !self.survey_required && self.system_scan_done && self.survey_done
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RoutePlan {
     version: u32,
@@ -385,6 +391,37 @@ impl RoutePlan {
             .into());
         }
         Ok(())
+    }
+
+    fn normalize_progress(&mut self) -> bool {
+        let mut changed = false;
+
+        for stop in &mut self.route {
+            if stop.is_already_complete() && !stop.completed {
+                stop.completed = true;
+                changed = true;
+            }
+        }
+
+        let first_incomplete = self
+            .route
+            .iter()
+            .position(|stop| !stop.completed)
+            .unwrap_or(self.route.len());
+        if self.next_index != first_incomplete {
+            self.next_index = first_incomplete;
+            changed = true;
+        }
+
+        if self.next_index == self.route.len() && self.phase != RunPhase::Complete {
+            self.phase = RunPhase::Complete;
+            changed = true;
+        } else if self.next_index < self.route.len() && self.phase == RunPhase::Complete {
+            self.phase = RunPhase::Ready;
+            changed = true;
+        }
+
+        changed
     }
 }
 
@@ -495,8 +532,18 @@ async fn load_or_create_plan(client: &Client, config: &Config) -> AnyResult<Rout
 
     if config.plan_path.exists() {
         let bytes = fs::read(&config.plan_path)?;
-        let plan: RoutePlan = serde_json::from_slice(&bytes)?;
+        let mut plan: RoutePlan = serde_json::from_slice(&bytes)?;
         plan.validate(config)?;
+        if plan.normalize_progress() {
+            save_plan(&config.plan_path, &plan)?;
+            info!(
+                target: "replicant_client::explore",
+                event = "route.plan_normalized",
+                next_index = plan.next_index,
+                phase = ?plan.phase,
+                "normalized legacy or internally inconsistent route progress"
+            );
+        }
         info!(
             target: "replicant_client::explore",
             event = "route.plan_loaded",
@@ -681,6 +728,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         .get(&config.center)
         .copied()
         .unwrap_or(false);
+    let center_survey_required = config.include_explored || !center_already_explored;
     let mut route = vec![RouteStop {
         star: config.center.clone(),
         entry_point: center
@@ -689,10 +737,10 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
             .map(|entry| entry.id.as_str().to_owned()),
         distance_from_center_ly: 0.0,
         leg_distance_ly: 0.0,
-        survey_required: config.include_explored || !center_already_explored,
+        survey_required: center_survey_required,
         system_scan_done: center_already_explored,
-        survey_done: !config.include_explored && center_already_explored,
-        completed: false,
+        survey_done: !center_survey_required,
+        completed: !center_survey_required,
     }];
 
     let mut previous = center_position;
@@ -703,17 +751,28 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
             .unwrap_or(false);
         let leg_distance = position_distance(previous, candidate.position);
         previous = candidate.position;
+        let survey_required = config.include_explored || !already_explored;
         route.push(RouteStop {
             star: candidate.star,
             entry_point: candidate.entry_point,
             distance_from_center_ly: candidate.distance_from_center_ly,
             leg_distance_ly: leg_distance,
-            survey_required: config.include_explored || !already_explored,
+            survey_required,
             system_scan_done: already_explored,
-            survey_done: !config.include_explored && already_explored,
-            completed: false,
+            survey_done: !survey_required,
+            completed: !survey_required,
         });
     }
+
+    let next_index = route
+        .iter()
+        .position(|stop| !stop.completed)
+        .unwrap_or(route.len());
+    let phase = if next_index == route.len() {
+        RunPhase::Complete
+    } else {
+        RunPhase::PreparingFleet
+    };
 
     let plan = RoutePlan {
         version: PLAN_VERSION,
@@ -731,8 +790,8 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         drones: Vec::new(),
         fleet_prepared: false,
         route,
-        next_index: 0,
-        phase: RunPhase::PreparingFleet,
+        next_index,
+        phase,
         last_event_id: None,
     };
     save_plan(&config.plan_path, &plan)?;
@@ -1278,18 +1337,97 @@ async fn ensure_replicant_owns_device(
             target: replicant.to_owned(),
         })
         .await?;
-    wait_immediate_operation("change device owner", &operation).await?;
+    wait_for_device_owner(client, code, replicant, &operation).await
+}
 
-    let refreshed = client.raw().devices().get(code).await?.value;
-    ensure_device_replicant(&refreshed, code, replicant)?;
-    info!(
-        target: "replicant_client::explore",
-        event = "fleet.owner_change_completed",
-        device = code,
-        replicant,
-        "verified device ownership transfer"
-    );
-    Ok(())
+async fn wait_for_device_owner(
+    client: &Client,
+    code: &str,
+    replicant: &str,
+    operation: &Operation,
+) -> AnyResult<()> {
+    const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+    const INITIAL_DELAY: Duration = Duration::from_millis(250);
+    const MAX_DELAY: Duration = Duration::from_secs(2);
+
+    let started = Instant::now();
+    let mut delay = INITIAL_DELAY;
+    let mut attempts = 0_u32;
+    let mut last_replicant = None;
+
+    loop {
+        attempts += 1;
+        let refreshed = client.raw().devices().get(code).await?.value;
+        last_replicant.clone_from(&refreshed.replicant_code);
+
+        if refreshed.replicant_code.as_deref() == Some(replicant) {
+            let operation_status = match operation.reconcile().await {
+                Ok(outcome) => outcome.status,
+                Err(reconcile_error) => {
+                    warn!(
+                        target: "replicant_client::explore",
+                        event = "fleet.owner_change_reconcile_failed",
+                        device = code,
+                        operation_id = %operation.id(),
+                        error = %reconcile_error,
+                        "ownership is authoritative, but the durable operation could not be reconciled"
+                    );
+                    operation.status().await?
+                }
+            };
+            info!(
+                target: "replicant_client::explore",
+                event = "fleet.owner_change_completed",
+                device = code,
+                replicant,
+                attempts,
+                operation_id = %operation.id(),
+                operation_status = ?operation_status,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "verified device ownership transfer from authoritative device state"
+            );
+            return Ok(());
+        }
+
+        let operation_status = operation.status().await?;
+        match operation_status {
+            OperationStatus::Rejected | OperationStatus::Cancelled | OperationStatus::Failed => {
+                return Err(io::Error::other(format!(
+                    "change_owner for device {code} ended with {operation_status:?}; device still reports replicant_code={last_replicant:?}"
+                ))
+                .into());
+            }
+            _ => {}
+        }
+
+        if started.elapsed() >= VERIFY_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "device {code} did not report replicant_code={replicant} within {VERIFY_TIMEOUT:?}; last_replicant={last_replicant:?}, operation_status={operation_status:?}, operation_id={} (rerun is safe)",
+                    operation.id()
+                ),
+            )
+            .into());
+        }
+
+        debug!(
+            target: "replicant_client::explore",
+            event = "fleet.owner_change_pending",
+            device = code,
+            target_replicant = replicant,
+            current_replicant = last_replicant.as_deref().unwrap_or("unassigned"),
+            attempts,
+            operation_id = %operation.id(),
+            operation_status = ?operation_status,
+            next_poll_ms = delay.as_millis() as u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ownership transfer is accepted but not yet visible in authoritative device state"
+        );
+
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
 }
 
 fn ensure_device_replicant(
@@ -1711,6 +1849,39 @@ async fn run_system_scan(
     plan: &mut RoutePlan,
     target: &str,
 ) -> AnyResult<()> {
+    let locally_explored = client
+        .galaxy()
+        .replicant_star_knowledge(&config.replicant)
+        .into_iter()
+        .any(|knowledge| {
+            knowledge.star.id.as_str() == target && knowledge.explored == Some(true)
+        });
+    if locally_explored {
+        info!(
+            target: "replicant_client::explore",
+            event = "system_scan.already_completed",
+            star = target,
+            source = "local_star_knowledge",
+            "star is already explored; skipping duplicate system scan"
+        );
+        return Ok(());
+    }
+
+    let refreshed = client
+        .galaxy()
+        .refresh_replicant_star(&config.replicant, target)
+        .await?;
+    if refreshed.explored == Some(true) {
+        info!(
+            target: "replicant_client::explore",
+            event = "system_scan.already_completed",
+            star = target,
+            source = "targeted_refresh",
+            "authoritative star knowledge confirms the scan already completed"
+        );
+        return Ok(());
+    }
+
     let mut watch = client.events().watch().await?;
     let vessel_status = client.raw().devices().get(&config.vessel).await?.value;
     if vessel_status.scan.is_none() {
@@ -2206,6 +2377,68 @@ mod tests {
         let before = candidate_route_distance(start, &route);
         assert!(improve_candidate_route_2opt(start, &mut route, 8) > 0);
         assert!(candidate_route_distance(start, &route) < before);
+    }
+
+    #[test]
+    fn already_explored_stop_is_complete_without_execution() {
+        let stop = RouteStop {
+            star: "SCEPTURUM".into(),
+            entry_point: Some("SCEPTURUM-7-L4".into()),
+            distance_from_center_ly: 0.0,
+            leg_distance_ly: 0.0,
+            survey_required: false,
+            system_scan_done: true,
+            survey_done: true,
+            completed: false,
+        };
+        assert!(stop.is_already_complete());
+    }
+
+    #[test]
+    fn normalization_marks_skipped_stops_complete_and_advances_index() {
+        let mut plan = RoutePlan {
+            version: PLAN_VERSION,
+            created_unix_seconds: 0,
+            replicant: "B6BA399E".into(),
+            vessel: "FD5EA802".into(),
+            center: "SCEPTURUM".into(),
+            radius_ly: 10.0,
+            system_limit: 2,
+            include_explored: false,
+            controller: None,
+            drones: Vec::new(),
+            fleet_prepared: false,
+            route: vec![
+                RouteStop {
+                    star: "SCEPTURUM".into(),
+                    entry_point: Some("SCEPTURUM-7-L4".into()),
+                    distance_from_center_ly: 0.0,
+                    leg_distance_ly: 0.0,
+                    survey_required: false,
+                    system_scan_done: true,
+                    survey_done: true,
+                    completed: false,
+                },
+                RouteStop {
+                    star: "NEXT".into(),
+                    entry_point: None,
+                    distance_from_center_ly: 1.0,
+                    leg_distance_ly: 1.0,
+                    survey_required: true,
+                    system_scan_done: false,
+                    survey_done: false,
+                    completed: false,
+                },
+            ],
+            next_index: 0,
+            phase: RunPhase::PreparingFleet,
+            last_event_id: None,
+        };
+
+        assert!(plan.normalize_progress());
+        assert!(plan.route[0].completed);
+        assert_eq!(plan.next_index, 1);
+        assert_eq!(plan.phase, RunPhase::PreparingFleet);
     }
 
     #[test]

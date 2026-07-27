@@ -1,20 +1,19 @@
 {
   "version": 1,
-  "created_unix_seconds": 1785122722,
+  "created_unix_seconds": 1785123755,
   "replicant": "B6BA399E",
   "vessel": "FD5EA802",
   "center": "SCEPTURUM",
   "radius_ly": 30.0,
-  "system_limit": 25,
+  "system_limit": 75,
   "include_explored": false,
-  "controller": "4904D327",
+  "controller": "76C57506",
   "drones": [
-    "568170C3",
-    "5E8658EA",
-    "9660AA63",
-    "A2DF4C5B"
+    "A73A550B",
+    "C2347DD6",
+    "DBE6D922"
   ],
-  "fleet_prepared": false,
+  "fleet_prepared": true,
   "route": [
     {
       "star": "SCEPTURUM",
@@ -24,7 +23,7 @@
       "survey_required": false,
       "system_scan_done": true,
       "survey_done": true,
-      "completed": false
+      "completed": true
     },
     {
       "star": "KRAKXIKHU",
@@ -32,7 +31,7 @@
       "distance_from_center_ly": 5.7224141636201,
       "leg_distance_ly": 5.7224141636201,
       "survey_required": true,
-      "system_scan_done": false,
+      "system_scan_done": true,
       "survey_done": false,
       "completed": false
     },
@@ -265,9 +264,509 @@
       "system_scan_done": false,
       "survey_done": false,
       "completed": false
+    },
+    {
+      "star": "XUKHKI",
+      "entry_point": "XUKHKI-4-L4",
+      "distance_from_center_ly": 21.353510790734145,
+      "leg_distance_ly": 4.212124701382901,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHIKWU",
+      "entry_point": "XHIKWU-7-L4",
+      "distance_from_center_ly": 23.134510338885494,
+      "leg_distance_ly": 2.34959255403996,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRAKHUX",
+      "entry_point": "KRAKHUX-5-L4",
+      "distance_from_center_ly": 26.0092557407935,
+      "leg_distance_ly": 3.611143343873237,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WIHAX",
+      "entry_point": "WIHAX-3-L4",
+      "distance_from_center_ly": 22.18788538887832,
+      "leg_distance_ly": 6.5030213931679395,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WUHA",
+      "entry_point": "WUHA-5-L4",
+      "distance_from_center_ly": 20.802591174658986,
+      "leg_distance_ly": 2.2273982603028193,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHUXXWAK",
+      "entry_point": "KHUXXWAK-2-L4",
+      "distance_from_center_ly": 22.46915093611683,
+      "leg_distance_ly": 2.245437304847322,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHAKKWUKKXHU",
+      "entry_point": "XHAKKWUKKXHU-4-L4",
+      "distance_from_center_ly": 26.382254806593007,
+      "leg_distance_ly": 4.4238816925862725,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WUKHKAKIH",
+      "entry_point": "WUKHKAKIH-7-L4",
+      "distance_from_center_ly": 29.465116608966603,
+      "leg_distance_ly": 3.436131100525702,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WIXUKHHU",
+      "entry_point": "WIXUKHHU-5-L4",
+      "distance_from_center_ly": 28.844958742906865,
+      "leg_distance_ly": 5.542625293125994,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHAXUH",
+      "entry_point": "KHAXUH-3-L4",
+      "distance_from_center_ly": 27.324144371050295,
+      "leg_distance_ly": 6.253130381656853,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XIHHI",
+      "entry_point": "XIHHI-8-L4",
+      "distance_from_center_ly": 22.533166638091505,
+      "leg_distance_ly": 5.3017743228092895,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WAKIKRUX",
+      "entry_point": "WAKIKRUX-6-L4",
+      "distance_from_center_ly": 22.59762705706066,
+      "leg_distance_ly": 3.685027558920021,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XAKRIXXKI",
+      "entry_point": "XAKRIXXKI-6-L4",
+      "distance_from_center_ly": 18.276881877935296,
+      "leg_distance_ly": 4.784490565358035,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WAHHUKHHIH",
+      "entry_point": "WAHHUKHHIH-3-L4",
+      "distance_from_center_ly": 16.734347443506717,
+      "leg_distance_ly": 4.80449418565576,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRAKKHAKHIH",
+      "entry_point": "KRAKKHAKHIH-5-L4",
+      "distance_from_center_ly": 14.946601033345326,
+      "leg_distance_ly": 2.387340061658588,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WAKHUKHAX",
+      "entry_point": "WAKHUKHAX-1-L4",
+      "distance_from_center_ly": 15.425699827884626,
+      "leg_distance_ly": 4.361777294865023,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHAXIKKA",
+      "entry_point": "XHAXIKKA-9-L4",
+      "distance_from_center_ly": 18.863812544127956,
+      "leg_distance_ly": 3.57942822528961,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRIKKWUKH",
+      "entry_point": "KRIKKWUKH-2-L4",
+      "distance_from_center_ly": 21.728665769669327,
+      "leg_distance_ly": 3.9570655427981,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHUXKRIXX",
+      "entry_point": "KHUXKRIXX-4-L4",
+      "distance_from_center_ly": 20.568105551557245,
+      "leg_distance_ly": 5.234986512876618,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WAKHWUXHIX",
+      "entry_point": "WAKHWUXHIX-3-L4",
+      "distance_from_center_ly": 24.12098787798707,
+      "leg_distance_ly": 6.675287802784232,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XUKKKHU",
+      "entry_point": "XUKKKHU-4-L4",
+      "distance_from_center_ly": 22.109599875845785,
+      "leg_distance_ly": 3.612006996117236,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XAXIXHU",
+      "entry_point": "XAXIXHU-4-L4",
+      "distance_from_center_ly": 24.37134356185558,
+      "leg_distance_ly": 4.027262710576498,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHAXXKRU",
+      "entry_point": "KHAXXKRU-7-L4",
+      "distance_from_center_ly": 26.43222786410557,
+      "leg_distance_ly": 4.46522624846715,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHUWU",
+      "entry_point": "KHUWU-2-L4",
+      "distance_from_center_ly": 22.963475151204776,
+      "leg_distance_ly": 4.869114940109749,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHAKHAKHHI",
+      "entry_point": "XHAKHAKHHI-5-L4",
+      "distance_from_center_ly": 21.38697224901176,
+      "leg_distance_ly": 5.88790291530015,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KIKKHUKH",
+      "entry_point": "KIKKHUKH-5-L4",
+      "distance_from_center_ly": 23.72588082643087,
+      "leg_distance_ly": 4.076211590435426,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KUKRIXHI",
+      "entry_point": "KUKRIXHI-6-L4",
+      "distance_from_center_ly": 28.681871040955457,
+      "leg_distance_ly": 5.500697848455215,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRUXHA",
+      "entry_point": "KRUXHA-5-L4",
+      "distance_from_center_ly": 28.269667238932957,
+      "leg_distance_ly": 5.255953672741039,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WUKUXKHA",
+      "entry_point": "WUKUXKHA-8-L4",
+      "distance_from_center_ly": 23.172628077108563,
+      "leg_distance_ly": 5.936100959384018,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHIWIKKHIKK",
+      "entry_point": "XHIWIKKHIKK-4-L4",
+      "distance_from_center_ly": 22.976197794456755,
+      "leg_distance_ly": 5.491483556380735,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHAXXI",
+      "entry_point": "XHAXXI-6-L4",
+      "distance_from_center_ly": 25.149604088533863,
+      "leg_distance_ly": 5.086988167865146,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRAHIHXHU",
+      "entry_point": "KRAHIHXHU-5-L4",
+      "distance_from_center_ly": 27.542556724639773,
+      "leg_distance_ly": 3.6174894443522594,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHAXXI",
+      "entry_point": "KHAXXI-8-L4",
+      "distance_from_center_ly": 29.993776212574502,
+      "leg_distance_ly": 5.045428197883701,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHUKHKRAKU",
+      "entry_point": "KHUKHKRAKU-1-L4",
+      "distance_from_center_ly": 29.70131777228074,
+      "leg_distance_ly": 4.46683506075611,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KAKKXHAHXA",
+      "entry_point": "KAKKXHAHXA-6-L4",
+      "distance_from_center_ly": 27.956478842300577,
+      "leg_distance_ly": 2.7001596712046485,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRAXHUH",
+      "entry_point": "KRAXHUH-1-L4",
+      "distance_from_center_ly": 25.212423023977692,
+      "leg_distance_ly": 3.2684730165629174,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XAKHHU",
+      "entry_point": "XAKHHU-4-L4",
+      "distance_from_center_ly": 22.52740277129167,
+      "leg_distance_ly": 2.9269382057023545,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHIKRUHHIK",
+      "entry_point": "XHIKRUHHIK-4-L4",
+      "distance_from_center_ly": 22.340930491364947,
+      "leg_distance_ly": 2.8990632728521053,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XUHXHU",
+      "entry_point": "XUHXHU-4-L4",
+      "distance_from_center_ly": 22.193204117251753,
+      "leg_distance_ly": 2.7903120918635578,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRUXXKRUKKXA",
+      "entry_point": "KRUXXKRUKKXA-4-L4",
+      "distance_from_center_ly": 22.17451295271217,
+      "leg_distance_ly": 1.91191226263133,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRUXXHAXA",
+      "entry_point": "KRUXXHAXA-3-L4",
+      "distance_from_center_ly": 22.24778688521625,
+      "leg_distance_ly": 4.260367197789408,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XIXUKHKUX",
+      "entry_point": "XIXUKHKUX-3-L4",
+      "distance_from_center_ly": 22.614265504986008,
+      "leg_distance_ly": 2.578729012517604,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WAXXHAKHA",
+      "entry_point": "WAXXHAKHA-3-L4",
+      "distance_from_center_ly": 24.761964979581077,
+      "leg_distance_ly": 4.712618921576417,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRUHUK",
+      "entry_point": "KRUHUK-2-L4",
+      "distance_from_center_ly": 25.458108084851865,
+      "leg_distance_ly": 2.8257436277907457,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WUXXKUKHKHA",
+      "entry_point": "WUXXKUKHKHA-5-L4",
+      "distance_from_center_ly": 29.428755715456273,
+      "leg_distance_ly": 6.961559545101946,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "XHAKHIK",
+      "entry_point": "XHAKHIK-10-L4",
+      "distance_from_center_ly": 27.318656143192687,
+      "leg_distance_ly": 6.71741063431438,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "WUKKU",
+      "entry_point": "WUKKU-5-L4",
+      "distance_from_center_ly": 27.005302762976008,
+      "leg_distance_ly": 3.984549192819682,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KRIWUXWIH",
+      "entry_point": "KRIWUXWIH-1-L4",
+      "distance_from_center_ly": 28.0840999296755,
+      "leg_distance_ly": 5.970444799175353,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHAKIXXWI",
+      "entry_point": "KHAKIXXWI-4-L4",
+      "distance_from_center_ly": 29.0635243124436,
+      "leg_distance_ly": 5.154087653503782,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
+    },
+    {
+      "star": "KHIHI",
+      "entry_point": "KHIHI-5-L4",
+      "distance_from_center_ly": 29.117315546080135,
+      "leg_distance_ly": 2.0224992187884756,
+      "survey_required": true,
+      "system_scan_done": false,
+      "survey_done": false,
+      "completed": false
     }
   ],
-  "next_index": 0,
-  "phase": "preparing_fleet",
-  "last_event_id": null
+  "next_index": 1,
+  "phase": "surveying",
+  "last_event_id": "1785125947022-0"
 }

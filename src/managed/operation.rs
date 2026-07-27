@@ -18,7 +18,9 @@
 //! attempt is definitionally ambiguous (the request may or may not have
 //! reached the server) and is never retried automatically; a process that
 //! crashes mid-attempt is recovered the same way on restart (see
-//! [`recover`]). Any other failure is a definite rejection. A successful
+//! [`recover`]). A `2xx` response whose success body cannot be decoded is also
+//! ambiguous because the mutation may already have executed. Explicit
+//! non-success responses are definite rejections. A successfully decoded
 //! response is definite acceptance; whether the caller must keep watching for
 //! evidence depends on whether the dispatched action documents its own
 //! asynchronous completion (a `completes_at`/`eta_seconds`-shaped response) or
@@ -1765,7 +1767,7 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
 
     let submit_started = Instant::now();
     match adapter.submit(client.managed_raw()).await {
-        Err(error) if error.is_ambiguous_transport_failure() => {
+        Err(error) if error.is_ambiguous_mutation_outcome() => {
             warn!(
                 target: "replicant_client::ops",
                 event = "operation.submission_ambiguous",
@@ -1773,7 +1775,7 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
                 submit_ms = submit_started.elapsed().as_millis() as u64,
                 elapsed_ms = total_started.elapsed().as_millis() as u64,
                 error = %error,
-                "durable operation submission is ambiguous"
+                "durable operation submission outcome is ambiguous"
             );
             client
                 .managed_state()
@@ -2060,6 +2062,34 @@ mod tests {
         assert_eq!(entry.target_kind.as_deref(), Some("device"));
         assert_eq!(entry.target_id.as_deref(), Some("D1"));
         assert_eq!(entry.intent["kind"], "device_configure");
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn successful_mutation_with_undecodable_body_is_ambiguous() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": {"unexpected": true}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let operation = device_command(
+            &client,
+            "D1",
+            raw::devices::DeviceCommand::SystemScan,
+        )
+        .await
+        .expect("operation remains durable when a 2xx success body evolves");
+
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::Ambiguous
+        );
         client.close().await.expect("close");
     }
 

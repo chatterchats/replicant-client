@@ -13,11 +13,51 @@
 use std::collections::HashMap;
 
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use crate::error::Error;
 use crate::raw::common::{encode_path_segment, with_query};
 use crate::raw::{Client, JsonObject, RawResponse, RequestSafety};
+
+fn deserialize_optional_reference<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(Some(value)),
+        serde_json::Value::Object(object) => Ok([
+            "designation",
+            "device_code",
+            "location_code",
+            "star_code",
+            "code",
+            "id",
+            "name",
+            "status",
+            "type",
+        ]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)),
+        other => Err(D::Error::custom(format!(
+            "expected a string, object reference, or null; got {}",
+            match other {
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Null
+                | serde_json::Value::String(_)
+                | serde_json::Value::Object(_) => unreachable!(),
+            }
+        ))),
+    }
+}
 
 fn validate_page_limit(limit: Option<i64>) -> Result<(), Error> {
     if limit.is_some_and(|value| !(1..=100).contains(&value)) {
@@ -674,6 +714,7 @@ pub struct DeviceCommandResponse {
     /// Host device code after a `replicate` command.
     pub host_device_code: Option<String>,
     /// Location after the command.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub location: Option<String>,
     /// Matrix code assigned by a `replicate` command.
     pub matrix_code: Option<String>,
@@ -712,14 +753,18 @@ pub struct DeviceCommandResponse {
     #[serde(default)]
     pub route: Vec<JsonObject>,
     /// Scan target after a scan-related command.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub scan_target: Option<String>,
     /// Scan type after a scan-related command.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub scan_type: Option<String>,
     /// Star after the command.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub star: Option<String>,
     /// Start time for the triggered operation, RFC3339.
     pub started_at: Option<String>,
     /// Device status after the command.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub status: Option<String>,
     /// Device this device was stowed inside by a `stow` command.
     pub stowed_in: Option<String>,
@@ -1006,5 +1051,34 @@ impl DevicesClient {
         self.client
             .execute(Method::DELETE, &path, true, RequestSafety::Mutating)
             .await
+    }
+}
+
+#[cfg(test)]
+mod command_response_tests {
+    use super::DeviceCommandResponse;
+
+    #[test]
+    fn command_references_accept_strings_and_objects() {
+        let response: DeviceCommandResponse = serde_json::from_value(serde_json::json!({
+            "star": {"designation": "KRAKXIKHU", "spectral_type": "M"},
+            "location": {"code": "KRAKXIKHU-1"},
+            "scan_target": "KRAKXIKHU"
+        }))
+        .expect("object-shaped command references should deserialize");
+
+        assert_eq!(response.star.as_deref(), Some("KRAKXIKHU"));
+        assert_eq!(response.location.as_deref(), Some("KRAKXIKHU-1"));
+        assert_eq!(response.scan_target.as_deref(), Some("KRAKXIKHU"));
+    }
+
+    #[test]
+    fn unrecognized_reference_objects_remain_non_fatal() {
+        let response: DeviceCommandResponse = serde_json::from_value(serde_json::json!({
+            "star": {"spectral_type": "M"}
+        }))
+        .expect("unknown object details should not fail the entire command response");
+
+        assert_eq!(response.star, None);
     }
 }

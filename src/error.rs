@@ -260,6 +260,26 @@ impl Error {
     pub const fn is_ambiguous_transport_failure(&self) -> bool {
         matches!(self, Self::Transport { .. })
     }
+
+    /// Reports whether a mutating request may have executed despite the
+    /// client being unable to return a typed success value.
+    ///
+    /// Besides network-level transport failures, a decoding failure on a
+    /// successful `2xx` response is ambiguous: the server accepted and
+    /// processed the request, but the client could not understand the success
+    /// body. Such mutations must be reconciled rather than classified as
+    /// rejected or retried blindly.
+    #[must_use]
+    pub const fn is_ambiguous_mutation_outcome(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Decode {
+                status: Some(status),
+                ..
+            } => *status >= 200 && *status < 300,
+            _ => false,
+        }
+    }
 }
 
 /// Convenience alias for results produced by the raw transport.
@@ -282,5 +302,22 @@ mod tests {
         assert!(error.source().unwrap().to_string().contains("secret-token"));
         assert!(!error.to_string().contains("secret-token"));
         assert!(!format!("{error:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn successful_decode_failure_is_an_ambiguous_mutation_outcome() {
+        let successful_decode_failure = Error::Decode {
+            message: "live success body evolved".into(),
+            status: Some(200),
+            source: None,
+        };
+        let rejected_decode_failure = Error::Decode {
+            message: "error body mismatch".into(),
+            status: Some(422),
+            source: None,
+        };
+
+        assert!(successful_decode_failure.is_ambiguous_mutation_outcome());
+        assert!(!rejected_decode_failure.is_ambiguous_mutation_outcome());
     }
 }
