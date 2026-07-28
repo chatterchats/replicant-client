@@ -1,7 +1,7 @@
 ---
 title: "Star catalogue"
 source_url: "https://replicant.space/docs/api/locations/star-catalogue/"
-crawled_at: "2026-07-24T18:16:34.170387+00:00"
+crawled_at: "2026-07-28T00:53:11.331032+00:00"
 ---
 
 API · Locations
@@ -50,7 +50,8 @@ response response
       },
       "estimated_planets": 6,
       "entry_point": CYGNUS-5-L4,
-      "has_hub": true
+      "has_hub": true,
+      "region": "solzone",
     },
     {
       "designation": "TARAZEDAR",
@@ -61,7 +62,8 @@ response response
         "y": 0.44,
         "z": 6.71
       },
-      "estimated_planets": 4
+      "estimated_planets": 4,
+      "region": "solzone"
     }
   ]
 }

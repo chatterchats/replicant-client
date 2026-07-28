@@ -1,7 +1,7 @@
 ---
 title: "Configure"
 source_url: "https://replicant.space/docs/api/replicants/configure/"
-crawled_at: "2026-07-24T18:16:34.212140+00:00"
+crawled_at: "2026-07-28T00:53:11.369033+00:00"
 ---
 
 API · Replicants

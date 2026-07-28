@@ -1,7 +1,7 @@
 ---
 title: "Moving devices"
 source_url: "https://replicant.space/docs/interstellar/moving-devices/"
-crawled_at: "2026-07-24T18:16:35.282045+00:00"
+crawled_at: "2026-07-28T00:53:12.270952+00:00"
 ---
 
 Interstellar Transport

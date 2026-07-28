@@ -1,7 +1,7 @@
 ---
 title: "AMI digests"
 source_url: "https://replicant.space/docs/api/events/ami-digests/"
-crawled_at: "2026-07-24T18:16:33.689628+00:00"
+crawled_at: "2026-07-28T00:53:10.891040+00:00"
 ---
 
 API · Events
@@ -24,9 +24,11 @@ By default, a digest is emitted every evaluation tick (roughly every 10 seconds 
 For players with lots of AMI controllers, this can be slowed down via `PATCH /v1/accounts/me` by setting `events.ami_digest_interval` to a multiplier between 1 and 30.
 A value of `5` means a digest is emitted at most every 5 ticks. Events continue to buffer during the gap, so no data is lost; the next digest covers a longer window.
 
-## Stowed controllers
+## Inactive directives
 
-Digest events are not sent when the controller device has been stowed. The only activity stowed devices are available for is reconfiguration. When you redeploy a previously active controller, you may notice some older events appearing in the next digest. These are buffered events from before. This will happen if an active fleet is stowed between digest intervals and can mostly be ignored.
+Digest events are not sent when the controller's directive is inactive - for example, when the controller has been stowed. When you redeploy a previously active controller, you may notice some older events appearing in the next digest. These are buffered events from before the stow and can mostly be ignored.
+
+While a directive is inactive, adopted devices that generate events will send them directly to your event stream as normal individual events rather than buffering them. This can happen when you manually scan with an adopted survey device while its controller is stowed, or when collecting resources with a transport drone after its delivery directive finishes. Any action taken by an adopted device whose controller's directive is not currently active will produce events on the stream directly.
 
 ## Digest event types
 
@@ -176,10 +178,32 @@ response ami.survey.digest
       "remaining": 8,
       "scanned": 28,
       "total": 36
-    }
+    },
+    "scans": [
+      {
+        "device_code": "00AC58D1",
+        "scan_target": "NUNKA-3",
+        "scan_type": "planet",
+        "report": { ... }
+      },
+      {
+        "device_code": "0F20C3DC",
+        "scan_target": "NUNKA-4",
+        "scan_type": "planet",
+        "report": { ... }
+      },
+      {
+        "device_code": "73983EFE",
+        "scan_target": "NUNKA-5",
+        "scan_type": "planet",
+        "report": { ... }
+      }
+    ]
   }
 }
 ```
+
+The `scans` array contains one entry for each `scan.completed` event that occurred during the digest window. Each entry includes the `device_code` that performed the scan, the `scan_target` name, the `scan_type`, and the full scan `report` object. The report contents vary by scan type and can be large — see the [scans documentation](https://replicant.space/docs/api/scans/) for the full report structure. When no scans completed during the window, the array is empty.
 
 ## Transport digest examples
 

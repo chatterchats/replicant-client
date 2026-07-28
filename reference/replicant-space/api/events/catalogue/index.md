@@ -1,7 +1,7 @@
 ---
 title: "Event catalogue"
 source_url: "https://replicant.space/docs/api/events/catalogue/"
-crawled_at: "2026-07-24T18:16:33.914559+00:00"
+crawled_at: "2026-07-28T00:53:11.103576+00:00"
 ---
 
 API · Events
@@ -115,6 +115,7 @@ response payload
     "rares": 40
   },
   "components": null,
+  "print_time": 600,
   "requires_autofactory": false
 }
 ```
@@ -610,7 +611,7 @@ response payload
 
 ### *prospect.completed*
 
-A survey drone completed a deep-space prospect, potentially discovering new star systems.
+A galactic observatory completed a deep-space prospect, potentially discovering new star systems.
 
 Example
 
@@ -773,7 +774,7 @@ response payload
 
 ### *search.started*
 
-A device began searching a belt for salvage sites.
+A device began searching a belt for new resource sites to mine.
 
 Example
 

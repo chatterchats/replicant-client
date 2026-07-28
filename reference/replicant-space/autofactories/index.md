@@ -1,7 +1,7 @@
 ---
 title: "Autofactories"
 source_url: "https://replicant.space/docs/autofactories/"
-crawled_at: "2026-07-24T18:16:34.678910+00:00"
+crawled_at: "2026-07-28T00:53:11.752300+00:00"
 ---
 
 Infrastructure
@@ -35,6 +35,7 @@ $ curl -X POST https://api.replicant.space/v1/devices/AF7C2310 \
     -d '{
       "command": "enqueue_print",
       "device_type": "mining_drone",
+      "quantity": 1,
       "tags": ["fleet-713"],
       "controller": "MC91FF22",
       "oncomplete": {
@@ -44,7 +45,7 @@ $ curl -X POST https://api.replicant.space/v1/devices/AF7C2310 \
     }'
 ```
 
-The `tags`, `controller` and `oncomplete` fields are optional. The `oncomplete` command currently only supports `travel` and `start_mining` - more commands will be supported soon.
+The `quantity`, `tags`, `controller` and `oncomplete` fields are optional. The `oncomplete` command currently only supports `travel` and `start_mining` - more commands will be supported soon.
 
 response 201 response
 

@@ -1,7 +1,7 @@
 ---
 title: "List devices"
 source_url: "https://replicant.space/docs/api/devices/list/"
-crawled_at: "2026-07-24T18:16:33.525625+00:00"
+crawled_at: "2026-07-28T00:53:10.730920+00:00"
 ---
 
 API · Devices
@@ -22,6 +22,8 @@ Returns all active (non-decommissioned) devices owned by any replicant on the ac
 | --- | --- | --- |
 | `replicant_code` | string · optional | Filter to a single replicant's devices. |
 | `device_type` | string · optional | Filter by device type (e.g. `mining_drone`). |
+| `tag` | string · optional | Filter by tag. |
+| `untagged` | boolean · optional | Filter by devices that are untagged. Incompatible with tag filter. |
 | `location` | string · optional | Filter by location. A star code like `SOL` matches all devices in that system. A specific location like `SOL-1`, `SOL-BELT-1`, or `SOL-3-L4` matches that exact location. |
 | `cursor` | integer · optional | Device ID to page from. Use `next_cursor` from the previous response. |
 | `limit` | integer · optional | Number of devices to return, default 20 (max 50). |

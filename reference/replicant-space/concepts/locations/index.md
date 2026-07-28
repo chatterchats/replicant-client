@@ -1,7 +1,7 @@
 ---
 title: "Locations"
 source_url: "https://replicant.space/docs/concepts/locations/"
-crawled_at: "2026-07-24T18:16:34.921414+00:00"
+crawled_at: "2026-07-28T00:53:11.962337+00:00"
 ---
 
 Core Concepts

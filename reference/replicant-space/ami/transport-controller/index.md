@@ -1,7 +1,7 @@
 ---
 title: "AMI Transport Controller"
 source_url: "https://replicant.space/docs/ami/transport-controller/"
-crawled_at: "2026-07-24T18:16:33.169500+00:00"
+crawled_at: "2026-07-28T00:53:10.371836+00:00"
 ---
 
 AMI Controllers

@@ -1,7 +1,7 @@
 ---
 title: "Resources"
 source_url: "https://replicant.space/docs/concepts/resources/"
-crawled_at: "2026-07-24T18:16:35.011606+00:00"
+crawled_at: "2026-07-28T00:53:12.041109+00:00"
 ---
 
 Core Concepts

@@ -1,7 +1,7 @@
 ---
 title: "Commands"
 source_url: "https://replicant.space/docs/api/devices/command/"
-crawled_at: "2026-07-24T18:16:33.479615+00:00"
+crawled_at: "2026-07-28T00:53:10.684535+00:00"
 ---
 
 API · Devices
@@ -99,7 +99,7 @@ Some device types add their own commands on top of the feature list:
 | *deposit_resources* | Instruct a device with cargo to unload at its location. Skip the resources param to empty everything.  `{command: deposit_resources, resources: { silicates: 50, rares: 30, ... }}` |
 | *dequeue_print* | Remove a specific item from a device's print queue. Supply the zero-indexed position in the list.  `{command: dequeue_print, index: 2}` |
 | *detach* | Disconnect one device from another. Skip the devices param to detach everything connected to it.  `{command: detach, targets: [ ... ]}` |
-| *enqueue_print* | Add an item to the print queue, with optional auto-adoption controller code and on-complete command.  `{command: enqueue_print, controller: <code>, oncomplete: <command>}` |
+| *enqueue_print* | Add an item to the print queue, with optional auto-adoption controller code and on-complete command.  `{command: enqueue_print, device_type: mining_drone, quantity: 1, controller: <code>, oncomplete: <command>}` |
 | *launch* | Deploy an AMI controller to your current location. This will also activate the AMI directive and deploy all controlled devices. Fly to a belt and launch your mining swarm with one command. |
 | *prospect* | Discover new stars beyond the galaxy catalogue. Deploy a [galactic observatory](../../../galactic-observatory/index.md) at the fringe and prospect outward, or specify a direction to search in any direction where stars look sparse.  `{command: prospect, direction: [x, y, z]}` |
 | *recall* | Instruct a device to come home and stow itself. If you fly away while it's returning to you, it will continue to chase you around the system like a wasp in summer. |

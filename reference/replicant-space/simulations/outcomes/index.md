@@ -1,7 +1,7 @@
 ---
 title: "Outcomes & history"
 source_url: "https://replicant.space/docs/simulations/outcomes/"
-crawled_at: "2026-07-24T18:16:35.487786+00:00"
+crawled_at: "2026-07-28T00:53:12.443775+00:00"
 ---
 
 Simulations

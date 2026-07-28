@@ -1,7 +1,7 @@
 ---
 title: "Nearest stars"
 source_url: "https://replicant.space/docs/api/replicants/stars/"
-crawled_at: "2026-07-24T18:16:34.484593+00:00"
+crawled_at: "2026-07-28T00:53:11.605782+00:00"
 ---
 
 API · Replicants
@@ -49,7 +49,9 @@ response response
       "entry_point": "CHAMAKUY-4-L4",
       "estimated_planets": 4,
       "estimated_travel_time": 0,
-      "position": { "x": 34.1906, "y": -8.9593, "z": -42.9832 }
+      "has_hub": true,
+      "position": { "x": 34.1906, "y": -8.9593, "z": -42.9832 },
+      "region": "solzone",
     },
     {
       "designation": "TARAZEDAR",
@@ -59,6 +61,7 @@ response response
       "estimated_planets": 5,
       "estimated_travel_time": 120,
       "position": { "x": 37.8, "y": -7.1, "z": -41.0 }
+      "region": "solzone",
     },
     {
       "designation": "PORRAMA",
@@ -68,6 +71,7 @@ response response
       "estimated_planets": 3,
       "estimated_travel_time": 182,
       "position": { "x": 29.4, "y": -12.2, "z": -40.1 }
+      "region": "solzone",
     }
   ]
 }

@@ -1,7 +1,7 @@
 ---
 title: "Galactic Observatory"
 source_url: "https://replicant.space/docs/galactic-observatory/"
-crawled_at: "2026-07-24T18:16:35.243150+00:00"
+crawled_at: "2026-07-28T00:53:12.239772+00:00"
 ---
 
 Infrastructure
