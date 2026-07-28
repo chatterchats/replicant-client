@@ -81,7 +81,8 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, DeviceType, Event, Operation, OperationStatus, Realm, SecretString, StartupPolicy,
-    SurveyDirective, domain::GalacticPosition, raw::devices::DeviceCommand,
+    SurveyDirective, domain::GalacticPosition, events::{EventLogQuery, GameEvent},
+    raw::devices::DeviceCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2397,6 +2398,144 @@ fn system_scan_response_was_ok(status: OperationStatus) -> bool {
     )
 }
 
+async fn latest_event_history_cursor(client: &Client) -> AnyResult<Option<String>> {
+    let response = client
+        .raw()
+        .events()
+        .list(&EventLogQuery {
+            limit: Some(1),
+            filtered: Some(false),
+            ..Default::default()
+        })
+        .await?;
+    Ok(response.value.events.last().map(|event| event.id.clone()))
+}
+
+async fn poll_survey_completion_history(
+    client: &Client,
+    cursor: &mut Option<String>,
+    controller: &str,
+    target: &str,
+) -> AnyResult<Option<(String, String, SurveyCompletionProof)>> {
+    const MAX_PAGES: usize = 10;
+
+    for page in 1..=MAX_PAGES {
+        let requested_cursor = cursor.clone();
+        let response = client
+            .raw()
+            .events()
+            .list(&EventLogQuery {
+                cursor: requested_cursor.clone(),
+                limit: Some(100),
+                filtered: Some(false),
+                device_code: Some(controller.to_owned()),
+                ..Default::default()
+            })
+            .await?;
+
+        let events = response.value.events;
+        let next_cursor = response.value.next_cursor;
+        let last_event_id = events.last().map(|event| event.id.clone());
+
+        debug!(
+            target: "replicant_client::explore",
+            event = "survey.history_page_checked",
+            controller,
+            star = target,
+            page,
+            events = events.len(),
+            cursor = requested_cursor.as_deref().unwrap_or(""),
+            next_cursor = next_cursor.as_deref().unwrap_or(""),
+            "checked unfiltered controller event history for survey completion"
+        );
+
+        for event in &events {
+            if let Some(proof) = raw_survey_completion_proof(event, controller, target) {
+                *cursor = Some(event.id.clone());
+                return Ok(Some((event.id.clone(), event.event.clone(), proof)));
+            }
+        }
+
+        match next_cursor {
+            Some(next) => {
+                let terminal = last_event_id.as_deref() == Some(next.as_str())
+                    || requested_cursor.as_ref() == Some(&next);
+                *cursor = Some(next);
+                if terminal {
+                    return Ok(None);
+                }
+            }
+            None => {
+                if let Some(last) = last_event_id {
+                    *cursor = Some(last);
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    warn!(
+        target: "replicant_client::explore",
+        event = "survey.history_page_bound_hit",
+        controller,
+        star = target,
+        max_pages = MAX_PAGES,
+        cursor = cursor.as_deref().unwrap_or(""),
+        "survey history fallback reached its page bound"
+    );
+    Ok(None)
+}
+
+fn raw_survey_completion_proof(
+    event: &GameEvent,
+    controller: &str,
+    target: &str,
+) -> Option<SurveyCompletionProof> {
+    if event.device_code.as_deref() != Some(controller) || !raw_event_in_star(event, target) {
+        return None;
+    }
+
+    if event.event == "ami.survey.digest"
+        && event.payload.get("directive").and_then(Value::as_str) == Some("survey_system")
+        && raw_survey_progress(event).is_some_and(|(_, remaining, _)| remaining == 0)
+    {
+        Some(SurveyCompletionProof::TerminalDigest)
+    } else if event.event == "directive.completed"
+        && event
+            .payload
+            .get("directive")
+            .and_then(Value::as_str)
+            .is_none_or(|directive| directive == "survey_system")
+    {
+        Some(SurveyCompletionProof::DirectiveCompleted)
+    } else {
+        None
+    }
+}
+
+fn raw_event_in_star(event: &GameEvent, target: &str) -> bool {
+    event.star.as_deref() == Some(target)
+        || event
+            .location
+            .as_deref()
+            .is_some_and(|location| designation_in_star(location, target))
+        || event
+            .payload
+            .get("destination")
+            .and_then(Value::as_str)
+            .is_some_and(|destination| designation_in_star(destination, target))
+        || event.payload.get("star").and_then(Value::as_str) == Some(target)
+}
+
+fn raw_survey_progress(event: &GameEvent) -> Option<(u64, u64, u64)> {
+    let progress = event.payload.get("report")?.get("progress")?.as_object()?;
+    Some((
+        progress.get("scanned")?.as_u64()?,
+        progress.get("remaining")?.as_u64()?,
+        progress.get("total")?.as_u64()?,
+    ))
+}
+
 async fn run_survey(
     client: &Client,
     config: &Config,
@@ -2409,7 +2548,20 @@ async fn run_survey(
         .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
     let controller_handle = client.devices().get(controller_code).await?;
     let controller = controller_handle.as_survey_controller()?;
+
+    // Capture a durable history watermark before opening the local live watch.
+    // If a completion lands during an SSE disconnect or between this request
+    // and watch subscription, the unfiltered-history fallback can still find it.
+    let mut history_cursor = latest_event_history_cursor(client).await?;
     let mut watch = client.events().watch().await?;
+    debug!(
+        target: "replicant_client::explore",
+        event = "survey.history_baseline_captured",
+        controller = controller_code,
+        star = target,
+        cursor = history_cursor.as_deref().unwrap_or(""),
+        "captured survey event-history watermark"
+    );
 
     let status = client.raw().devices().get(controller_code).await?.value;
     if survey_directive_needs_launch(status.ami_directive_status.as_deref()) {
@@ -2495,11 +2647,50 @@ async fn run_survey(
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
+                match poll_survey_completion_history(
+                    client,
+                    &mut history_cursor,
+                    controller_code,
+                    target,
+                )
+                .await
+                {
+                    Ok(Some((event_id, event_name, proof))) => {
+                        plan.last_event_id = Some(event_id.clone());
+                        info!(
+                            target: "replicant_client::explore",
+                            event = "survey.completion_history_observed",
+                            event_id,
+                            event_name,
+                            proof = ?proof,
+                            controller = controller_code,
+                            star = target,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "found missed survey completion in unfiltered event history"
+                        );
+                        confirm_survey_completion(client, config, target).await?;
+                        save_plan(&config.plan_path, plan)?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(history_error) => {
+                        warn!(
+                            target: "replicant_client::explore",
+                            event = "survey.history_poll_failed",
+                            controller = controller_code,
+                            star = target,
+                            error = %history_error,
+                            "could not check unfiltered event history; continuing the live wait"
+                        );
+                    }
+                }
+
                 info!(
                     target: "replicant_client::explore",
                     event = "survey.waiting",
                     controller = controller_code,
                     star = target,
+                    history_cursor = history_cursor.as_deref().unwrap_or(""),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "still waiting for survey completion"
                 );
@@ -3138,6 +3329,68 @@ mod tests {
         assert!(system_scan_response_was_ok(OperationStatus::Completed));
         assert!(!system_scan_response_was_ok(OperationStatus::Ambiguous));
         assert!(!system_scan_response_was_ok(OperationStatus::Rejected));
+    }
+
+    #[test]
+    fn unfiltered_history_directive_completion_is_terminal() {
+        let event = GameEvent {
+            id: "1785276160433-0".into(),
+            version: 1,
+            category: "directive".into(),
+            event: "directive.completed".into(),
+            replicant_code: Some("B6BA399E".into()),
+            device_code: Some("76C57506".into()),
+            device_type: Some("ami_survey_controller".into()),
+            star: Some("KRUKKRAK".into()),
+            location: Some("KRUKKRAK-1-L4".into()),
+            payload: [("directive".into(), serde_json::json!("survey_system"))]
+                .into_iter()
+                .collect(),
+            created_at: "2026-07-28T22:02:40Z".into(),
+            extra: Default::default(),
+        };
+
+        assert_eq!(
+            raw_survey_completion_proof(&event, "76C57506", "KRUKKRAK"),
+            Some(SurveyCompletionProof::DirectiveCompleted)
+        );
+        assert_eq!(
+            raw_survey_completion_proof(&event, "76C57506", "OTHER"),
+            None
+        );
+    }
+
+    #[test]
+    fn unfiltered_history_terminal_digest_is_supported() {
+        let event = GameEvent {
+            id: "1785276160434-0".into(),
+            version: 1,
+            category: "ami".into(),
+            event: "ami.survey.digest".into(),
+            replicant_code: Some("B6BA399E".into()),
+            device_code: Some("76C57506".into()),
+            device_type: Some("ami_survey_controller".into()),
+            star: Some("KRUKKRAK".into()),
+            location: Some("KRUKKRAK-1-L4".into()),
+            payload: [
+                ("directive".into(), serde_json::json!("survey_system")),
+                (
+                    "report".into(),
+                    serde_json::json!({
+                        "progress": {"scanned": 5, "remaining": 0, "total": 5}
+                    }),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            created_at: "2026-07-28T22:02:41Z".into(),
+            extra: Default::default(),
+        };
+
+        assert_eq!(
+            raw_survey_completion_proof(&event, "76C57506", "KRUKKRAK"),
+            Some(SurveyCompletionProof::TerminalDigest)
+        );
     }
 
     #[test]
