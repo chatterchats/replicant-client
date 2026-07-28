@@ -3,14 +3,14 @@
 //! This example:
 //!
 //! 1. synchronizes managed state and star knowledge;
-//! 2. selects one idle AMI survey controller and four idle survey drones;
-//! 3. adopts the drones, configures `survey_system`, and stows all five devices
-//!    in the racing vessel;
+//! 2. selects one idle AMI survey controller and the configured survey drones;
+//! 3. adopts the drones, configures `survey_system`, and stows the fleet in
+//!    the racing vessel;
 //! 4. pre-plans a deterministic nearest-neighbor route around a centre star;
 //! 5. travels one system at a time;
 //! 6. runs the replicant's instant `POST /v1/replicants/{code}/scan`;
 //! 7. launches the survey controller and waits for either a terminal
-//!    `ami.survey.digest` or `directive.complete`/`directive.completed`;
+//!    `ami.survey.digest` or `directive.completed`;
 //! 8. on startup, rechecks the current system scan and planet/moon survey completeness;
 //! 9. recalls and restows the fleet before the next hop.
 //!
@@ -518,20 +518,14 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     execute_route(client, config, &mut plan).await
 }
 
-
 #[derive(Clone, Debug)]
 struct CurrentSystemSurveyCheck {
     complete: Option<bool>,
-    known_bodies: usize,
-    surveyed_bodies: usize,
-    unsurveyed_bodies: Vec<String>,
     planets_total: Option<i64>,
     planets_scanned: Option<i64>,
-    moon_systems_checked: usize,
-    incomplete_moon_systems: Vec<String>,
-    hydration_failures: usize,
-    hydration_unknown_designations: usize,
-    hydration_maximum_reached: bool,
+    moons_total: Option<i64>,
+    moons_scanned: Option<i64>,
+    moons_total_estimated: Option<bool>,
 }
 
 async fn reconcile_current_system_scan_on_startup(
@@ -551,11 +545,7 @@ async fn reconcile_current_system_scan_on_startup(
         return Ok(());
     };
 
-    let Some(route_index) = plan
-        .route
-        .iter()
-        .position(|stop| stop.star == current_star)
-    else {
+    let Some(route_index) = plan.route.iter().position(|stop| stop.star == current_star) else {
         info!(
             target: "replicant_client::explore",
             event = "startup.current_system_check_skipped",
@@ -566,6 +556,19 @@ async fn reconcile_current_system_scan_on_startup(
         );
         return Ok(());
     };
+
+    if plan.route[route_index].completed {
+        info!(
+            target: "replicant_client::explore",
+            event = "startup.current_system_check_skipped",
+            star = %current_star,
+            route_index,
+            reason = "route_stop_complete",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "current route stop is already complete; skipping startup system recheck"
+        );
+        return Ok(());
+    }
 
     let local_explored = client
         .galaxy()
@@ -607,9 +610,7 @@ async fn reconcile_current_system_scan_on_startup(
 
             if local_explored == Some(true) {
                 Some(true)
-            } else if route_index == plan.next_index
-                && !plan.route[route_index].system_scan_done
-            {
+            } else if route_index == plan.next_index && !plan.route[route_index].system_scan_done {
                 return Err(io::Error::other(format!(
                     "unable to verify whether the current system {current_star} was scanned; refusing to risk a duplicate system_scan command: {refresh_error}"
                 ))
@@ -621,10 +622,7 @@ async fn reconcile_current_system_scan_on_startup(
     };
 
     let survey_check = if refreshed_explored == Some(true) {
-        Some(
-            inspect_current_system_surveys(client, config, &current_star)
-                .await?,
-        )
+        Some(inspect_current_system_surveys(client, config, &current_star).await?)
     } else {
         None
     };
@@ -646,17 +644,12 @@ async fn reconcile_current_system_scan_on_startup(
             event = "startup.planetary_survey_check_completed",
             star = %current_star,
             complete = check.complete,
-            known_bodies = check.known_bodies,
-            surveyed_bodies = check.surveyed_bodies,
-            unsurveyed_bodies = ?check.unsurveyed_bodies,
             planets_total = check.planets_total,
             planets_scanned = check.planets_scanned,
-            moon_systems_checked = check.moon_systems_checked,
-            incomplete_moon_systems = ?check.incomplete_moon_systems,
-            hydration_failures = check.hydration_failures,
-            hydration_unknown_designations = check.hydration_unknown_designations,
-            hydration_maximum_reached = check.hydration_maximum_reached,
-            "completed current-system planet and moon survey check"
+            moons_total = check.moons_total,
+            moons_scanned = check.moons_scanned,
+            moons_total_estimated = check.moons_total_estimated,
+            "completed current-system survey-counter check"
         );
     }
 
@@ -689,176 +682,65 @@ async fn inspect_current_system_surveys(
 ) -> AnyResult<CurrentSystemSurveyCheck> {
     let started = Instant::now();
 
-    // Fetch the system root with the target replicant's perspective so the
-    // server-provided planet progress counters reflect this survey fleet.
+    // The system response already contains the authoritative aggregate survey
+    // progress. No planet/moon hydration or individual body requests are
+    // needed to decide whether the system survey is complete.
     let root = client
         .raw()
         .locations()
         .get(current_star, Some(&config.replicant))
         .await?
         .value;
-    let planet_count_complete = count_progress_complete(root.planets_total, root.planets_scanned);
 
-    // Only planets and moons are scannable survey targets. Resource sites
-    // (`-SAL-`) and system objects (`-OBJ-`) are embedded reference data and
-    // must not be fetched or allowed to make survey completeness inconclusive.
-    let hydration = client
-        .locations()
-        .hydrate_system(current_star)
-        .planetary_bodies_only()
-        .max_depth(2)
-        .max_locations(4096)
-        .concurrency(config.star_detail_concurrency)
-        .run()
-        .await?;
-
-    let bodies = client
-        .locations()
-        .find()
-        .in_realm(Realm::Live)
-        .planetary_bodies()
-        .in_system(current_star)
-        .collect()
-        .await?;
-    let surveyed = client
-        .locations()
-        .find()
-        .in_realm(Realm::Live)
-        .planetary_bodies()
-        .in_system(current_star)
-        .surveyed()
-        .collect()
-        .await?;
-
-    let surveyed_ids = surveyed
-        .iter()
-        .map(|body| body.id().as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-    let unsurveyed_bodies = bodies
-        .iter()
-        .filter(|body| !surveyed_ids.contains(body.id().as_str()))
-        .map(|body| body.id().as_str().to_owned())
-        .collect::<Vec<_>>();
-
-    let planet_designations = bodies
-        .iter()
-        .filter(|body| {
-            body.location_type
-                .as_ref()
-                .is_some_and(|kind| kind.as_str() == "planet")
-        })
-        .map(|body| body.id().as_str().to_owned())
-        .collect::<Vec<_>>();
-
-    let moon_checks = stream::iter(planet_designations.iter().cloned())
-        .map(|planet| async move {
-            let detail = client
-                .raw()
-                .locations()
-                .get(&planet, Some(&config.replicant))
-                .await;
-            (planet, detail)
-        })
-        .buffer_unordered(config.star_detail_concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await;
-
-    let mut incomplete_moon_systems = Vec::new();
-    let mut moon_counts_known = true;
-    for (planet, result) in moon_checks {
-        match result {
-            Ok(response) => match count_progress_complete(
-                response.value.moons_total,
-                response.value.moons_scanned,
-            ) {
-                Some(true) => {}
-                Some(false) => incomplete_moon_systems.push(planet),
-                None => {
-                    moon_counts_known = false;
-                    warn!(
-                        target: "replicant_client::explore",
-                        event = "startup.planetary_survey_moon_count_unknown",
-                        star = current_star,
-                        planet,
-                        moons_total = response.value.moons_total,
-                        moons_scanned = response.value.moons_scanned,
-                        "planet detail did not provide enough moon progress data"
-                    );
-                }
-            },
-            Err(fetch_error) => {
-                moon_counts_known = false;
-                warn!(
-                    target: "replicant_client::explore",
-                    event = "startup.planetary_survey_planet_refresh_failed",
-                    star = current_star,
-                    planet,
-                    error = %fetch_error,
-                    "could not refresh planet detail while checking moon survey completeness"
-                );
-            }
-        }
-    }
-
-    let hydration_complete = !hydration.maximum_reached()
-        && hydration.failures().is_empty()
-        && hydration.unknown_designations().is_empty();
-    let all_known_bodies_surveyed =
-        unsurveyed_bodies.is_empty() && surveyed.len() == bodies.len();
-
-    let complete = if !hydration_complete {
-        None
-    } else if planet_count_complete == Some(false)
-        || !incomplete_moon_systems.is_empty()
-        || !all_known_bodies_surveyed
-    {
-        Some(false)
-    } else if planet_count_complete == Some(true) && moon_counts_known {
-        Some(true)
-    } else {
-        None
+    let planets_complete = exact_count_complete(root.planets_total, root.planets_scanned);
+    let moons_complete = match root.moons_total_estimated {
+        Some(false) => exact_count_complete(root.moons_total, root.moons_scanned),
+        Some(true) => Some(false),
+        None => None,
     };
+    let complete = aggregate_survey_counts_complete(planets_complete, moons_complete);
 
     info!(
         target: "replicant_client::explore",
         event = "startup.planetary_survey_inspected",
         star = current_star,
         complete,
-        known_bodies = bodies.len(),
-        surveyed_bodies = surveyed.len(),
         planets_total = root.planets_total,
         planets_scanned = root.planets_scanned,
-        planet_count_complete,
-        moon_systems_checked = planet_designations.len(),
-        moon_counts_known,
-        hydration_failures = hydration.failures().len(),
-        hydration_unknown_designations = hydration.unknown_designations().len(),
-        hydration_maximum_reached = hydration.maximum_reached(),
+        planets_complete,
+        moons_total = root.moons_total,
+        moons_scanned = root.moons_scanned,
+        moons_total_estimated = root.moons_total_estimated,
+        moons_complete,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "inspected current-system planetary survey completeness"
+        "inspected current-system survey completeness from aggregate counters"
     );
 
     Ok(CurrentSystemSurveyCheck {
         complete,
-        known_bodies: bodies.len(),
-        surveyed_bodies: surveyed.len(),
-        unsurveyed_bodies,
         planets_total: root.planets_total,
         planets_scanned: root.planets_scanned,
-        moon_systems_checked: planet_designations.len(),
-        incomplete_moon_systems,
-        hydration_failures: hydration.failures().len(),
-        hydration_unknown_designations: hydration.unknown_designations().len(),
-        hydration_maximum_reached: hydration.maximum_reached(),
+        moons_total: root.moons_total,
+        moons_scanned: root.moons_scanned,
+        moons_total_estimated: root.moons_total_estimated,
     })
 }
 
-fn count_progress_complete(total: Option<i64>, scanned: Option<i64>) -> Option<bool> {
+fn exact_count_complete(total: Option<i64>, scanned: Option<i64>) -> Option<bool> {
     match (total, scanned) {
-        (Some(total), _) if total <= 0 => Some(true),
-        (Some(total), Some(scanned)) => Some(scanned >= total),
-        (Some(_), None) => Some(false),
-        (None, _) => None,
+        (Some(total), Some(scanned)) => Some(scanned == total),
+        _ => None,
+    }
+}
+
+fn aggregate_survey_counts_complete(
+    planets_complete: Option<bool>,
+    moons_complete: Option<bool>,
+) -> Option<bool> {
+    match (planets_complete, moons_complete) {
+        (Some(true), Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        _ => None,
     }
 }
 
@@ -868,11 +750,7 @@ fn apply_startup_current_system_completion(
     system_scan_complete: bool,
     planetary_surveys_complete: Option<bool>,
 ) -> bool {
-    let Some(route_index) = plan
-        .route
-        .iter()
-        .position(|stop| stop.star == current_star)
-    else {
+    let Some(route_index) = plan.route.iter().position(|stop| stop.star == current_star) else {
         return false;
     };
 
@@ -1389,7 +1267,7 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
             if unique.len() != DRONE_COUNT {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "RS_EXPLORE_DRONES must contain four distinct device codes",
+                    format!("RS_EXPLORE_DRONES must contain {DRONE_COUNT} distinct device codes"),
                 )
                 .into());
             }
@@ -2161,16 +2039,47 @@ async fn verify_fleet_onboard_for_travel(
         .controller
         .as_deref()
         .ok_or_else(|| io::Error::other("route plan has no survey controller"))?;
+    if plan.drones.len() != DRONE_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "route plan must contain exactly {DRONE_COUNT} survey drones before travel; found {}",
+                plan.drones.len()
+            ),
+        )
+        .into());
+    }
 
     let vessel = client.raw().devices().get(&config.vessel).await?.value;
+    if vessel.device_type.as_deref() != Some("racing_vessel") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("configured vessel {} is not a racing_vessel", config.vessel),
+        )
+        .into());
+    }
     ensure_device_replicant(&vessel, &config.vessel, &config.replicant)?;
 
     let controller_status = client.raw().devices().get(controller).await?.value;
+    if controller_status.device_type.as_deref() != Some("ami_survey_controller") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("planned controller {controller} is not an ami_survey_controller"),
+        )
+        .into());
+    }
     ensure_device_replicant(&controller_status, controller, &config.replicant)?;
     ensure_stowed_in_vessel(&controller_status, controller, &config.vessel)?;
 
     for code in &plan.drones {
         let status = client.raw().devices().get(code).await?.value;
+        if status.device_type.as_deref() != Some("survey_drone") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("planned drone {code} is not a survey_drone"),
+            )
+            .into());
+        }
         ensure_device_replicant(&status, code, &config.replicant)?;
         ensure_stowed_in_vessel(&status, code, &config.vessel)?;
         if status.controller_device_code.as_deref() != Some(controller) {
@@ -2230,7 +2139,7 @@ async fn travel_to(
     if already_traveling_to_target {
         // A resumed trip cannot safely recall or stow devices mid-flight.
         // Refuse to continue unless authoritative device state proves the
-        // controller and all four drones were onboard when travel began.
+        // controller and every configured drone were onboard when travel began.
         verify_fleet_onboard_for_travel(client, config, plan).await?;
     } else {
         info!(
@@ -2334,20 +2243,14 @@ async fn travel_to(
     }
 }
 
-async fn run_system_scan(
-    client: &Client,
-    config: &Config,
-    target: &str,
-) -> AnyResult<()> {
+async fn run_system_scan(client: &Client, config: &Config, target: &str) -> AnyResult<()> {
     let started = Instant::now();
 
     let locally_explored = client
         .galaxy()
         .replicant_star_knowledge(&config.replicant)
         .into_iter()
-        .any(|knowledge| {
-            knowledge.star.id.as_str() == target && knowledge.explored == Some(true)
-        });
+        .any(|knowledge| knowledge.star.id.as_str() == target && knowledge.explored == Some(true));
     if locally_explored {
         info!(
             target: "replicant_client::explore",
@@ -2509,15 +2412,7 @@ async fn run_survey(
     let mut watch = client.events().watch().await?;
 
     let status = client.raw().devices().get(controller_code).await?.value;
-    let active = status.status.as_deref() == Some("coordinating")
-        || status.ami_directive_status.as_deref().is_some_and(|value| {
-            !matches!(
-                value,
-                "idle" | "inactive" | "completed" | "paused" | "stowed"
-            )
-        });
-
-    if !active {
+    if survey_directive_needs_launch(status.ami_directive_status.as_deref()) {
         info!(
             target: "replicant_client::explore",
             event = "survey.launch_started",
@@ -2534,8 +2429,9 @@ async fn run_survey(
             event = "survey.resumed",
             controller = controller_code,
             star = target,
-            status = status.ami_directive_status.as_deref().unwrap_or("unknown"),
-            "controller already reports an active directive"
+            directive_status = status.ami_directive_status.as_deref().unwrap_or("unknown"),
+            controller_status = status.status.as_deref().unwrap_or("unknown"),
+            "controller already has a launched survey directive"
         );
     }
 
@@ -2557,6 +2453,7 @@ async fn run_survey(
             Ok(Ok(event)) => {
                 plan.last_event_id = Some(event.id.as_str().to_owned());
 
+                let mut completion = None;
                 if is_survey_digest_for(&event, controller_code, target) {
                     let progress = survey_progress(&event);
                     info!(
@@ -2574,31 +2471,24 @@ async fn run_survey(
                     );
                     save_plan(&config.plan_path, plan)?;
 
-                    if progress.is_some_and(|(_, remaining, _)| remaining == 0) {
-                        info!(
-                            target: "replicant_client::explore",
-                            event = "survey.completed",
-                            controller = controller_code,
-                            star = target,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "survey-system digest reports no remaining bodies"
-                        );
-                        return Ok(());
-                    }
+                    completion = survey_completion_proof(&event, controller_code, target);
                 }
 
-                if is_survey_directive_completion_for(&event, controller_code, target) {
+                completion =
+                    completion.or_else(|| survey_completion_proof(&event, controller_code, target));
+                if let Some(proof) = completion {
                     info!(
                         target: "replicant_client::explore",
-                        event = "survey.directive_completed",
+                        event = "survey.completion_observed",
                         event_id = %event.id,
                         event_name = event.name.as_str(),
+                        proof = ?proof,
                         controller = controller_code,
                         star = target,
                         elapsed_ms = started.elapsed().as_millis() as u64,
-                        payload = ?event.payload,
-                        "controller emitted a terminal directive-completion event"
+                        "survey completion has event evidence; reconciling planet and moon completeness"
                     );
+                    confirm_survey_completion(client, config, target).await?;
                     save_plan(&config.plan_path, plan)?;
                     return Ok(());
                 }
@@ -2631,10 +2521,11 @@ async fn recall_and_stow(client: &Client, config: &Config, plan: &RoutePlan) -> 
 
     let status = client.raw().devices().get(controller_code).await?.value;
     if status.stowed_in_device_code.as_deref() != Some(config.vessel.as_str()) {
-        if status
-            .available_commands
-            .iter()
-            .any(|command| command == "withdraw")
+        if survey_directive_needs_recall(status.ami_directive_status.as_deref())
+            && status
+                .available_commands
+                .iter()
+                .any(|command| command == "withdraw")
         {
             info!(
                 target: "replicant_client::explore",
@@ -2649,8 +2540,9 @@ async fn recall_and_stow(client: &Client, config: &Config, plan: &RoutePlan) -> 
                 target: "replicant_client::explore",
                 event = "survey.withdraw_unavailable",
                 controller = controller_code,
-                status = status.status.as_deref().unwrap_or("unknown"),
-                "withdraw is not currently advertised; attempting authoritative stow verification"
+                controller_status = status.status.as_deref().unwrap_or("unknown"),
+                directive_status = status.ami_directive_status.as_deref().unwrap_or("unknown"),
+                "withdraw is not needed or not advertised; attempting authoritative stow verification"
             );
         }
     }
@@ -2755,15 +2647,8 @@ fn is_travel_event_for(event: &Event, config: &Config, target: &str) -> bool {
     actor_matches && event_in_star(event, target)
 }
 
-fn is_survey_directive_completion_for(
-    event: &Event,
-    controller: &str,
-    target: &str,
-) -> bool {
-    if !matches!(
-        event.name.as_str(),
-        "directive.completed"
-    ) {
+fn is_survey_directive_completion_for(event: &Event, controller: &str, target: &str) -> bool {
+    if !matches!(event.name.as_str(), "directive.completed") {
         return false;
     }
 
@@ -2774,10 +2659,7 @@ fn is_survey_directive_completion_for(
         || json_reference_matches(event.payload.get("device"), controller)
         || json_reference_matches(event.payload.get("controller"), controller)
         || json_reference_matches(event.payload.get("device_code"), controller)
-        || json_reference_matches(
-            event.payload.get("controller_device_code"),
-            controller,
-        );
+        || json_reference_matches(event.payload.get("controller_device_code"), controller);
 
     if !controller_matches {
         return false;
@@ -2798,6 +2680,68 @@ fn is_survey_directive_completion_for(
     // the active route stop; otherwise the uniquely matched controller is
     // sufficient because it runs only one directive at a time.
     !event_has_location_context(event) || event_in_star(event, target)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SurveyCompletionProof {
+    TerminalDigest,
+    DirectiveCompleted,
+}
+
+fn survey_completion_proof(
+    event: &Event,
+    controller: &str,
+    target: &str,
+) -> Option<SurveyCompletionProof> {
+    if is_survey_digest_for(event, controller, target)
+        && survey_progress(event).is_some_and(|(_, remaining, _)| remaining == 0)
+    {
+        Some(SurveyCompletionProof::TerminalDigest)
+    } else if is_survey_directive_completion_for(event, controller, target) {
+        Some(SurveyCompletionProof::DirectiveCompleted)
+    } else {
+        None
+    }
+}
+
+fn survey_directive_needs_launch(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("idle" | "inactive" | "completed" | "paused" | "stowed")
+    )
+}
+
+fn survey_directive_needs_recall(status: Option<&str>) -> bool {
+    status.is_some_and(|status| !survey_directive_needs_launch(Some(status)))
+}
+
+async fn confirm_survey_completion(
+    client: &Client,
+    config: &Config,
+    target: &str,
+) -> AnyResult<()> {
+    let check = inspect_current_system_surveys(client, config, target).await?;
+    info!(
+        target: "replicant_client::explore",
+        event = "survey.completion_reconciled",
+        star = target,
+        complete = check.complete,
+        known_bodies = check.known_bodies,
+        surveyed_bodies = check.surveyed_bodies,
+        unsurveyed_bodies = ?check.unsurveyed_bodies,
+        "authoritatively reconciled planet and moon survey completeness"
+    );
+    match check.complete {
+        Some(true) => Ok(()),
+        Some(false) => Err(io::Error::other(format!(
+            "survey completion evidence for {target} conflicts with authoritative planet/moon state"
+        ))
+        .into()),
+        None => Err(io::Error::other(format!(
+            "survey completion evidence for {target} needs a complete planet/moon reconciliation"
+        ))
+        .into()),
+    }
 }
 
 fn event_has_location_context(event: &Event) -> bool {
@@ -2891,6 +2835,7 @@ fn save_plan(path: &Path, plan: &RoutePlan) -> AnyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use replicant_client::{DeviceId, DeviceKey, StarId, domain::StarKey};
 
     #[test]
     fn designation_matching_accepts_star_and_child_locations() {
@@ -3019,7 +2964,6 @@ mod tests {
         assert_eq!(plan.next_index, 1);
         assert_eq!(plan.phase, RunPhase::PreparingFleet);
     }
-
 
     #[test]
     fn startup_reconciliation_advances_scanned_unsurveyed_stop_to_surveying() {
@@ -3158,12 +3102,30 @@ mod tests {
     }
 
     #[test]
-    fn count_progress_requires_scanned_to_reach_total() {
-        assert_eq!(count_progress_complete(Some(4), Some(4)), Some(true));
-        assert_eq!(count_progress_complete(Some(4), Some(3)), Some(false));
-        assert_eq!(count_progress_complete(Some(4), None), Some(false));
-        assert_eq!(count_progress_complete(Some(0), None), Some(true));
-        assert_eq!(count_progress_complete(None, Some(3)), None);
+    fn survey_counter_completion_requires_exact_authoritative_counts() {
+        assert_eq!(exact_count_complete(Some(4), Some(4)), Some(true));
+        assert_eq!(exact_count_complete(Some(4), Some(3)), Some(false));
+        assert_eq!(exact_count_complete(Some(4), Some(5)), Some(false));
+        assert_eq!(exact_count_complete(Some(0), Some(0)), Some(true));
+        assert_eq!(exact_count_complete(Some(0), None), None);
+        assert_eq!(exact_count_complete(None, Some(3)), None);
+    }
+
+    #[test]
+    fn aggregate_survey_completion_requires_planets_and_exact_moons() {
+        assert_eq!(
+            aggregate_survey_counts_complete(Some(true), Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            aggregate_survey_counts_complete(Some(false), Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            aggregate_survey_counts_complete(Some(true), Some(false)),
+            Some(false)
+        );
+        assert_eq!(aggregate_survey_counts_complete(Some(true), None), None);
     }
 
     #[test]
@@ -3177,13 +3139,13 @@ mod tests {
     }
 
     #[test]
-    fn directive_complete_is_a_terminal_survey_event() {
+    fn directive_completed_is_the_terminal_survey_event() {
         let event = Event {
             id: replicant_client::EventId::from("2-0"),
             realm: Some(Realm::Live),
-            name: replicant_client::domain::EventName::from("directive.complete"),
+            name: replicant_client::domain::EventName::from("directive.completed"),
             category: replicant_client::domain::EventCategory::from("device"),
-            device: Some(DeviceKey::new(
+            device: Some(DeviceKey::in_realm(
                 Realm::Live,
                 DeviceId::from("CONTROLLER"),
             )),
@@ -3191,12 +3153,9 @@ mod tests {
             location: None,
             star: None,
             occurred_at: "2026-07-27T00:00:00Z".into(),
-            payload: [(
-                "directive".into(),
-                serde_json::json!("survey_system"),
-            )]
-            .into_iter()
-            .collect(),
+            payload: [("directive".into(), serde_json::json!("survey_system"))]
+                .into_iter()
+                .collect(),
         };
 
         assert!(is_survey_directive_completion_for(
@@ -3204,6 +3163,10 @@ mod tests {
             "CONTROLLER",
             "TEJUT"
         ));
+        assert_eq!(
+            survey_completion_proof(&event, "CONTROLLER", "TEJUT"),
+            Some(SurveyCompletionProof::DirectiveCompleted)
+        );
     }
 
     #[test]
@@ -3223,10 +3186,7 @@ mod tests {
                     "controller".into(),
                     serde_json::json!({"code": "CONTROLLER"}),
                 ),
-                (
-                    "directive".into(),
-                    serde_json::json!("survey_system"),
-                ),
+                ("directive".into(), serde_json::json!("survey_system")),
                 ("star".into(), serde_json::json!("TEJUT")),
             ]
             .into_iter()
@@ -3239,10 +3199,76 @@ mod tests {
             "TEJUT"
         ));
         assert!(!is_survey_directive_completion_for(
-            &event,
-            "OTHER",
-            "TEJUT"
+            &event, "OTHER", "TEJUT"
         ));
+    }
+
+    #[test]
+    fn survey_completion_proofs_are_order_independent() {
+        let directive_completed = Event {
+            id: replicant_client::EventId::from("directive-1"),
+            realm: Some(Realm::Live),
+            name: replicant_client::domain::EventName::from("directive.completed"),
+            category: replicant_client::domain::EventCategory::from("device"),
+            device: Some(DeviceKey::in_realm(
+                Realm::Live,
+                DeviceId::from("CONTROLLER"),
+            )),
+            replicant: None,
+            location: None,
+            star: Some(StarKey::in_realm(Realm::Live, StarId::from("TEJUT"))),
+            occurred_at: "2026-07-27T00:00:00Z".into(),
+            payload: [("directive".into(), serde_json::json!("survey_system"))]
+                .into_iter()
+                .collect(),
+        };
+        let terminal_digest = Event {
+            id: replicant_client::EventId::from("digest-1"),
+            realm: Some(Realm::Live),
+            name: replicant_client::domain::EventName::from("ami.survey.digest"),
+            category: replicant_client::domain::EventCategory::from("ami"),
+            device: Some(DeviceKey::in_realm(
+                Realm::Live,
+                DeviceId::from("CONTROLLER"),
+            )),
+            replicant: None,
+            location: None,
+            star: Some(StarKey::in_realm(Realm::Live, StarId::from("TEJUT"))),
+            occurred_at: "2026-07-27T00:00:01Z".into(),
+            payload: [
+                ("directive".into(), serde_json::json!("survey_system")),
+                (
+                    "report".into(),
+                    serde_json::json!({"progress": {"scanned": 4, "remaining": 0, "total": 4}}),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let completion_before_digest = [directive_completed.clone(), terminal_digest.clone()]
+            .iter()
+            .find_map(|event| survey_completion_proof(event, "CONTROLLER", "TEJUT"));
+        let digest_before_completion = [terminal_digest.clone(), directive_completed.clone()]
+            .iter()
+            .find_map(|event| survey_completion_proof(event, "CONTROLLER", "TEJUT"));
+
+        assert_eq!(
+            completion_before_digest,
+            Some(SurveyCompletionProof::DirectiveCompleted)
+        );
+        assert_eq!(
+            digest_before_completion,
+            Some(SurveyCompletionProof::TerminalDigest)
+        );
+        let scan_event = Event {
+            name: replicant_client::domain::EventName::from("scan.completed"),
+            ..terminal_digest
+        };
+        assert_eq!(
+            survey_completion_proof(&scan_event, "CONTROLLER", "TEJUT"),
+            None,
+            "individual body scans are never system-scan completion evidence"
+        );
     }
 
     #[test]
@@ -3267,5 +3293,23 @@ mod tests {
             .collect(),
         };
         assert_eq!(survey_progress(&event), Some((28, 8, 36)));
+    }
+
+    #[test]
+    fn active_controller_state_does_not_block_launch_or_recall_decisions() {
+        assert!(survey_directive_needs_launch(Some("inactive")));
+        assert!(!survey_directive_needs_launch(Some("active")));
+        assert!(survey_directive_needs_recall(Some("active")));
+        assert!(!survey_directive_needs_recall(Some("inactive")));
+    }
+
+    #[test]
+    fn restart_while_restowing_does_not_resubmit_withdraw() {
+        let statuses = ["active", "inactive"];
+        let unsafe_withdraws = statuses
+            .into_iter()
+            .filter(|status| survey_directive_needs_recall(Some(status)))
+            .count();
+        assert_eq!(unsafe_withdraws, 1);
     }
 }
