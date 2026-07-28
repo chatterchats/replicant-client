@@ -71,6 +71,79 @@ pub fn merge_replicant(
     MergeOutcome::Replaced(incoming)
 }
 
+pub fn merge_device(
+    existing: Observation<Device>,
+    mut incoming: Observation<Device>,
+) -> MergeOutcome<Observation<Device>> {
+    if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
+        trace!(target: "replicant_client::domain", "retaining device because incoming observation is stale");
+        return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
+    }
+    if matches!(existing.metadata.access, AccessScope::Owned)
+        && matches!(incoming.metadata.access, AccessScope::Public)
+    {
+        trace!(target: "replicant_client::domain", "preserving private device ownership and hosting from public observation");
+        incoming.value.relationships.assigned_replicant =
+            existing.value.relationships.assigned_replicant;
+        incoming.value.relationships.hosting_replicant =
+            existing.value.relationships.hosting_replicant;
+    }
+    MergeOutcome::Replaced(incoming)
+}
+
+fn preserve<T: Clone>(incoming: &mut Option<T>, existing: &Option<T>) {
+    if incoming.is_none() {
+        *incoming = existing.clone();
+    }
+}
+
+pub fn merge_star(
+    existing: Observation<Star>,
+    mut incoming: Observation<Star>,
+) -> MergeOutcome<Observation<Star>> {
+    if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
+        return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
+    }
+    preserve(&mut incoming.value.name, &existing.value.name);
+    preserve(
+        &mut incoming.value.spectral_type,
+        &existing.value.spectral_type,
+    );
+    preserve(&mut incoming.value.entry_point, &existing.value.entry_point);
+    preserve(&mut incoming.value.position, &existing.value.position);
+    preserve(&mut incoming.value.has_hub, &existing.value.has_hub);
+    preserve(&mut incoming.value.region, &existing.value.region);
+    MergeOutcome::Replaced(incoming)
+}
+
+pub fn merge_star_knowledge(
+    existing: Observation<StarKnowledge>,
+    mut incoming: Observation<StarKnowledge>,
+) -> MergeOutcome<Observation<StarKnowledge>> {
+    if metadata_order(&incoming.metadata, &existing.metadata).is_lt() {
+        return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
+    }
+    preserve(&mut incoming.value.position, &existing.value.position);
+    preserve(
+        &mut incoming.value.spectral_type,
+        &existing.value.spectral_type,
+    );
+    preserve(&mut incoming.value.entry_point, &existing.value.entry_point);
+    preserve(&mut incoming.value.explored, &existing.value.explored);
+    preserve(&mut incoming.value.has_hub, &existing.value.has_hub);
+    preserve(&mut incoming.value.has_life, &existing.value.has_life);
+    preserve(&mut incoming.value.region, &existing.value.region);
+    preserve(
+        &mut incoming.value.distance_from_replicant,
+        &existing.value.distance_from_replicant,
+    );
+    preserve(
+        &mut incoming.value.estimated_travel_time,
+        &existing.value.estimated_travel_time,
+    );
+    MergeOutcome::Replaced(incoming)
+}
+
 pub fn event_delta<T: Clone>(
     existing: Observation<T>,
     delta: ObservationMetadata,

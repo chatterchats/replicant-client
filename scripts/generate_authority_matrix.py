@@ -6,6 +6,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 inventory = json.loads((ROOT / "policy/operations.json").read_text())
+documented_deltas = json.loads(
+    (ROOT / "policy/documented-operation-deltas.json").read_text()
+)
 
 OVERRIDES = {
     ("GET", "/v1/accounts/me"): ("entity_snapshot", "complete_entity", "never"),
@@ -43,15 +46,18 @@ def classify(method, path):
     return ("collection_member", "endpoint_scoped", "never")
 
 operations = []
-for operation in inventory["operations"]:
+for operation in [*inventory["operations"], *documented_deltas["operations"]]:
     if operation["classification"] != "supported":
         continue
     method, path = operation["method"], operation["path"]
     authority, completeness, tombstone = classify(method, path)
     operations.append({"method": method, "path": path, "authority": authority, "completeness": completeness, "tombstone": tombstone})
 
+operations.sort(key=lambda entry: (entry["path"], entry["method"]))
+
 (ROOT / "policy/authority-matrix.json").write_text(json.dumps({
     "version": 1,
-    "contract": "Replicant Space 2.3.1",
+    "sync_domain_policy": "policy/sync-domains.json",
+    "contract": "Verified Replicant Space 2.3.3 OpenAPI corpus",
     "operations": operations,
 }, indent=2) + "\n")

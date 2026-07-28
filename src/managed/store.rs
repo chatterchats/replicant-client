@@ -30,7 +30,9 @@ use crate::domain::{
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA: &str =
+    include_str!("../../migrations/0002_device_relationship_semantics.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -436,12 +438,23 @@ impl StoreProxy {
         event: &Event,
         cursor: &str,
         devices: &[Observation<Device>],
+        locations: &[Observation<Location>],
+        reconciliation_targets: &[(Realm, String)],
     ) -> Result<bool, StoreError> {
         let event = event.clone();
         let cursor = cursor.to_owned();
         let devices = devices.to_vec();
-        self.0
-            .execute_blocking(move |s| s.append_event_and_project(&event, &cursor, &devices))
+        let locations = locations.to_vec();
+        let reconciliation_targets = reconciliation_targets.to_vec();
+        self.0.execute_blocking(move |s| {
+            s.append_event_and_project(
+                &event,
+                &cursor,
+                &devices,
+                &locations,
+                &reconciliation_targets,
+            )
+        })
     }
     pub(crate) fn append_event_and_decommission(
         &mut self,
@@ -660,6 +673,19 @@ impl Store {
             transaction.execute("DELETE FROM schema_migrations WHERE version = 0", [])?;
             transaction.execute(
                 "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1)",
+                [CURRENT_SCHEMA_VERSION.to_string()],
+            )?;
+            transaction.commit()?;
+        } else if version == Some(1) {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA)?;
+            migrate_device_relationship_observations(&transaction)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = ?1 WHERE version = 1",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [CURRENT_SCHEMA_VERSION.to_string()],
             )?;
             transaction.commit()?;
@@ -1028,6 +1054,8 @@ impl Store {
         event: &Event,
         cursor: &str,
         devices: &[Observation<Device>],
+        locations: &[Observation<Location>],
+        reconciliation_targets: &[(Realm, String)],
     ) -> Result<bool, StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
@@ -1041,6 +1069,26 @@ impl Store {
         }
         for device in devices {
             persist_device(&transaction, device)?;
+        }
+        for location in locations {
+            transaction.execute(
+                "INSERT INTO locations(realm, location_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, location_id) DO UPDATE SET observation_json = excluded.observation_json",
+                params![
+                    realm_key(&location.value.key.realm),
+                    location.value.key.id.as_str(),
+                    serde_json::to_string(location)?,
+                ],
+            )?;
+        }
+        for target in reconciliation_targets {
+            transaction.execute(
+                "INSERT INTO reconciliation_queue(work_id, realm, kind, payload_json, not_before, attempts, state) VALUES (?1, ?2, 'location', ?3, NULL, 0, 'queued') ON CONFLICT(work_id) DO UPDATE SET realm = excluded.realm, kind = excluded.kind, payload_json = excluded.payload_json, not_before = NULL, attempts = 0, state = 'queued'",
+                params![
+                    format!("location:{}", target.1),
+                    realm_key(&target.0),
+                    serde_json::to_string(&serde_json::json!({ "id": target.1 }))?,
+                ],
+            )?;
         }
         advance_event_cursor(&transaction, cursor)?;
         Self::commit(transaction, fail_commit)?;
@@ -1596,6 +1644,41 @@ impl Store {
     }
 }
 
+fn migrate_device_relationship_observations(
+    transaction: &Transaction<'_>,
+) -> Result<(), StoreError> {
+    let mut statement =
+        transaction.prepare("SELECT realm, device_id, observation_json FROM devices")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let rows = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (realm, device_id, observation_json) in rows {
+        let mut observation: Value = serde_json::from_str(&observation_json)?;
+        let Some(relationships) = observation
+            .pointer_mut("/value/relationships")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(assigned_replicant) = relationships.remove("hosted_by") {
+            relationships
+                .entry("assigned_replicant")
+                .or_insert(assigned_replicant);
+            transaction.execute(
+                "UPDATE devices SET observation_json = ?3 WHERE realm = ?1 AND device_id = ?2",
+                params![realm, device_id, serde_json::to_string(&observation)?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Redis stream IDs are `<milliseconds>-<sequence>` decimal pairs.  They are
 /// ordered numerically; lexical comparison misorders values such as `10-0`
 /// and `9-999`.
@@ -1691,11 +1774,20 @@ fn persist_device(
             target.id.as_str(),
         )?;
     }
-    if let Some(target) = &device.relationships.hosted_by {
+    if let Some(target) = &device.relationships.assigned_replicant {
         persist_relationship(
             transaction,
             device,
-            "hosted_by",
+            "assigned_replicant",
+            &target.realm,
+            target.id.as_str(),
+        )?;
+    }
+    if let Some(target) = &device.relationships.hosting_replicant {
+        persist_relationship(
+            transaction,
+            device,
+            "hosting_replicant",
             &target.realm,
             target.id.as_str(),
         )?;
@@ -1914,17 +2006,93 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (2);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (3);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             })
         ));
         fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn version_one_device_relationships_migrate_and_restore_as_assignments() {
+        let path = test_path("device-relationship-v1");
+        let mut legacy = device(Realm::Live, "D1");
+        legacy.value.relationships.assigned_replicant = Some(ReplicantKey::live("OWNER".into()));
+        let mut observation = serde_json::to_value(&legacy).expect("serialize v1 fixture");
+        let relationships = observation
+            .pointer_mut("/value/relationships")
+            .and_then(Value::as_object_mut)
+            .expect("fixture relationships");
+        let assigned = relationships
+            .remove("assigned_replicant")
+            .expect("fixture assignment");
+        relationships.insert("hosted_by".into(), assigned);
+
+        let connection = Connection::open(&path).expect("create v1 database");
+        Store::configure(&connection, true).expect("configure v1 database");
+        connection
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);")
+            .expect("create v1 migration ledger");
+        connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("create v1 schema");
+        connection
+            .execute("INSERT INTO schema_migrations(version) VALUES (1)", [])
+            .expect("record v1 schema");
+        connection
+            .execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '1')",
+                [],
+            )
+            .expect("record v1 metadata");
+        connection
+            .execute(
+                "INSERT INTO devices(realm, device_id, access_scope, observed_at, observation_json) VALUES ('live', 'D1', 'owned', 0, ?1)",
+                [serde_json::to_string(&observation).expect("encode v1 observation")],
+            )
+            .expect("insert v1 device");
+        connection
+            .execute(
+                "INSERT INTO device_relationships(realm, device_id, relationship, target_realm, target_id) VALUES ('live', 'D1', 'hosted_by', 'live', 'OWNER')",
+                [],
+            )
+            .expect("insert v1 relationship");
+        drop(connection);
+
+        let store = Store::open_file(&path).expect("migrate v1 database");
+        let restored = store.restore_devices().expect("restore migrated device");
+        let restored = restored
+            .get(&DeviceKey::live("D1".into()))
+            .expect("restored device");
+        assert_eq!(
+            restored
+                .value
+                .relationships
+                .assigned_replicant
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("OWNER")
+        );
+        assert!(restored.value.relationships.hosting_replicant.is_none());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT relationship FROM device_relationships WHERE realm = 'live' AND device_id = 'D1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("migrated relationship row"),
+            "assigned_replicant"
+        );
+        drop(store);
+        std::fs::remove_file(path).expect("remove migrated database");
     }
 
     #[test]
@@ -1985,7 +2153,13 @@ mod tests {
         let mut store = Store::open_memory().expect("open memory store");
         store.fail_next_commit();
         assert!(matches!(
-            store.append_event_and_project(&event(), "cursor-1", &[device(Realm::Live, "d1")]),
+            store.append_event_and_project(
+                &event(),
+                "cursor-1",
+                &[device(Realm::Live, "d1")],
+                &[],
+                &[]
+            ),
             Err(StoreError::InjectedCommitFailure)
         ));
         assert_eq!(store.event_count().expect("event count"), 0);
@@ -2028,7 +2202,7 @@ mod tests {
     fn journal_primitives_round_trip_event_and_operation_records() {
         let mut store = Store::open_memory().expect("open memory store");
         store
-            .append_event_and_project(&event(), "cursor-1", &[])
+            .append_event_and_project(&event(), "cursor-1", &[], &[], &[])
             .expect("append event");
         assert_eq!(store.read_events().expect("read events"), vec![event()]);
         store
@@ -2129,7 +2303,7 @@ mod tests {
         let mut store = Store::open_memory().expect("open memory store");
         assert!(!store.has_event("1-0").expect("has_event before append"));
         store
-            .append_event_and_project(&event(), "1-0", &[])
+            .append_event_and_project(&event(), "1-0", &[], &[], &[])
             .expect("append event");
         assert!(store.has_event("1-0").expect("has_event after append"));
         assert!(!store.has_event("2-0").expect("has_event for unseen id"));
@@ -2204,7 +2378,7 @@ mod tests {
             // crashed before the atomic store-and-advance-cursor commit.
             store.fail_next_commit();
             assert!(matches!(
-                store.append_event_and_project(&event(), "cursor-1", &[]),
+                store.append_event_and_project(&event(), "cursor-1", &[], &[], &[]),
                 Err(StoreError::InjectedCommitFailure)
             ));
         }

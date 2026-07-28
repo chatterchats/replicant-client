@@ -41,12 +41,8 @@ struct Config {
 
 impl Config {
     fn from_args() -> AnyResult<Option<Self>> {
-        let token = env::var("RS_API_TOKEN").map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RS_API_TOKEN is required",
-            )
-        })?;
+        let token = env::var("RS_API_TOKEN")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RS_API_TOKEN is required"))?;
 
         let mut relay = env::var("RS_BOBNET_RELAY").ok();
         let mut limit = env_i64("RS_BOBNET_LIMIT", 50)?.clamp(1, 100);
@@ -230,7 +226,10 @@ async fn main() -> AnyResult<()> {
                     .unwrap_or_else(|| "System".to_owned()),
                 sender_code: message.replicant_code.clone(),
                 current_star: message.current_star.clone(),
-                timestamp: message.time.clone().unwrap_or_else(|| "unknown time".to_owned()),
+                timestamp: message
+                    .time
+                    .clone()
+                    .unwrap_or_else(|| "unknown time".to_owned()),
                 body: message
                     .message
                     .clone()
@@ -334,8 +333,8 @@ fn message_from_event(event: &Event) -> Option<DisplayMessage> {
         .unwrap_or_else(|| "System".to_owned());
     let current_star = string_field(payload, &["current_star"])
         .or_else(|| event.star.as_ref().map(|star| star.id.as_str().to_owned()));
-    let timestamp = string_field(payload, &["time", "created_at"])
-        .unwrap_or_else(|| event.occurred_at.clone());
+    let timestamp =
+        string_field(payload, &["time", "created_at"]).unwrap_or_else(|| event.occurred_at.clone());
 
     Some(DisplayMessage {
         id: integer_field(payload.get("id")),
@@ -396,10 +395,7 @@ fn print_message(message: &DisplayMessage) -> AnyResult<()> {
 }
 
 fn normalize_channel(channel: &str) -> String {
-    channel
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase()
+    channel.trim().trim_start_matches('#').to_ascii_lowercase()
 }
 
 fn display_channel(channel: &str) -> String {

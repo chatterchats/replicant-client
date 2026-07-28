@@ -9,6 +9,12 @@ ROOT = Path(__file__).resolve().parent.parent
 inventory = json.loads((ROOT / "policy/operations.json").read_text())
 matrix = json.loads((ROOT / "policy/authority-matrix.json").read_text())
 expected = {(entry["method"], entry["path"]) for entry in inventory["operations"] if entry["classification"] == "supported"}
+deltas = json.loads((ROOT / "policy/documented-operation-deltas.json").read_text())
+expected.update(
+    (entry["method"], entry["path"])
+    for entry in deltas["operations"]
+    if entry["classification"] == "supported"
+)
 actual = {(entry["method"], entry["path"]) for entry in matrix["operations"]}
 errors = []
 if expected != actual:

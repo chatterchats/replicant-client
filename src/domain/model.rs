@@ -19,7 +19,10 @@ pub struct Account {
 pub struct DeviceRelationships {
     pub attached_to: Option<DeviceKey>,
     pub controller: Option<DeviceKey>,
-    pub hosted_by: Option<ReplicantKey>,
+    /// Replicant currently assigned as this device's owner or operator.
+    pub assigned_replicant: Option<ReplicantKey>,
+    /// Replicant matrix physically hosted by this device.
+    pub hosting_replicant: Option<ReplicantKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -370,6 +373,8 @@ pub struct Star {
     pub spectral_type: Option<String>,
     pub entry_point: Option<LocationKey>,
     pub position: Option<GalacticPosition>,
+    pub has_hub: Option<bool>,
+    pub region: Option<String>,
 }
 
 /// A star observation from one owned replicant's perspective.  It is not a
@@ -382,7 +387,9 @@ pub struct StarKnowledge {
     pub spectral_type: Option<String>,
     pub entry_point: Option<LocationKey>,
     pub explored: Option<bool>,
+    pub has_hub: Option<bool>,
     pub has_life: Option<bool>,
+    pub region: Option<String>,
     pub distance_from_replicant: Option<f64>,
     pub estimated_travel_time: Option<i64>,
 }

@@ -40,6 +40,8 @@ pub struct LeaderboardEntry {
     /// Contributions counted toward this entry, for contribution-based
     /// boards (e.g. megastructure).
     pub contribution_count: Option<i64>,
+    /// Colony designation, when this is a colony leaderboard entry.
+    pub designation: Option<String>,
     /// Replicant display name.
     pub name: Option<String>,
     /// Rank on this board.
@@ -52,7 +54,7 @@ pub struct LeaderboardEntry {
     pub value: Option<f64>,
 }
 
-/// Response body for `GET /v1/leaderboards/{distance,fleet,megastructure,reputation,trades,xp}`.
+/// Response body for standard ranked leaderboards, including colony boards.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct LeaderboardResponse {
@@ -136,6 +138,30 @@ impl LeaderboardsClient {
             .execute(
                 Method::GET,
                 "v1/leaderboards",
+                true,
+                RequestSafety::SafeRead,
+            )
+            .await
+    }
+
+    /// Fetches the colony-moon suitability leaderboard.
+    pub async fn colony_moon(&self) -> Result<RawResponse<LeaderboardResponse>, Error> {
+        self.client
+            .execute(
+                Method::GET,
+                "v1/leaderboards/colony_moon",
+                true,
+                RequestSafety::SafeRead,
+            )
+            .await
+    }
+
+    /// Fetches the colony-planet suitability leaderboard.
+    pub async fn colony_planet(&self) -> Result<RawResponse<LeaderboardResponse>, Error> {
+        self.client
+            .execute(
+                Method::GET,
+                "v1/leaderboards/colony_planet",
                 true,
                 RequestSafety::SafeRead,
             )

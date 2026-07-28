@@ -73,7 +73,7 @@ contract policy check passed:
 2 admin
 message_notify exclusion recorded
 mining aliases recorded
-no stray replicant-sdk references
+no stray predecessor-crate references
 
 forward compatibility policy check passed
 

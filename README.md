@@ -9,7 +9,9 @@ to choose the SQLite path and `REPLICANT_INIT_*` bounds to cap the traversal.
 
 A durable, stateful Rust client for building [Replicant Space](https://replicant.space) applications.
 
-`replicant-client` targets the Replicant Space `2.3.1` contract. It is
+`replicant-client` targets Replicant Space documentation through `2.3.3`,
+using the checked-in verified `2.3.3` OpenAPI corpus plus explicit
+rendered-document corrections where the specification remains incomplete. It is
 client-centered: the normal entry point is `replicant_client::Client`, which
 fetches, validates, normalizes, persists, publishes, watches, reconciles, and
 performs game operations, without requiring the application to assemble a
@@ -36,7 +38,7 @@ let miners = client
 ```
 
 **Status:** this repository is at the Phase 1 bootstrap stage. The package,
-feature graph, and checked-in Replicant Space 2.3.1 contract corpus exist;
+feature graph, and checked-in Replicant Space contract corpus exist;
 the client itself does not yet. See
 [`docs/implementation/rewrite-guide.md`](docs/implementation/rewrite-guide.md)
 for the full implementation plan.
@@ -53,13 +55,14 @@ for the full implementation plan.
 
 ## Contract
 
-The corrected Replicant Space 2.3.1 documentation and OpenAPI spec are
-checked in under [`reference/replicant-space/`](reference/replicant-space/).
-[`policy/`](policy/) records a machine-readable inventory of all 84 contract
-operations: 77 supported, 5 deprecated, and 2 admin-only (7 excluded).
-`scripts/contract_policy_check.py` verifies this inventory against the
-checked-in OpenAPI document on every run; see the Makefile's
-`contract-policy-check` target.
+The verified Replicant Space 2.3.3 OpenAPI corpus is checked in under
+[`reference/replicant-space/`](reference/replicant-space/). Its inventory
+contains 86 operations: 79 supported, 5 deprecated, and 2 admin-only.
+Rendered-document corrections remain explicit under [`docs/contract/`](docs/contract/)
+and [`policy/contract-metadata.json`](policy/contract-metadata.json); the
+documented-operation delta list is currently empty because both colony routes
+are now present in OpenAPI. `scripts/contract_policy_check.py` verifies the
+checksum, inventory, exclusions, and correction metadata.
 
 ## Development
 

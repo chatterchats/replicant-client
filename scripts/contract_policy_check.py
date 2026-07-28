@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Contract and deprecation policy gate for replicant-client.
 
-Verifies, against the checked-in corrected Replicant Space 2.3.1 corpus:
+Verifies the checked-in Replicant Space 2.3.3 OpenAPI corpus and explicit
+rendered-document corrections:
 
 - the OpenAPI document checksum matches the recorded contract metadata;
 - policy/operations.json is not stale relative to the live OpenAPI document;
-- the inventory totals are exactly 84 operations, 77 supported, 7 excluded
+- the inventory totals are exactly 86 operations, 79 supported, 7 excluded
   (5 deprecated + 2 admin);
 - every excluded operation has a reason and evidence file, and its
   method/path actually exists in the OpenAPI document;
@@ -32,6 +33,7 @@ from generate_operation_inventory import build_inventory  # noqa: E402
 REFERENCE = ROOT / "reference" / "replicant-space"
 OPENAPI = REFERENCE / "openapi.json"
 POLICY = ROOT / "policy"
+DOCUMENTED_DELTAS = POLICY / "documented-operation-deltas.json"
 
 ERRORS: list[str] = []
 
@@ -83,8 +85,8 @@ def check_operation_inventory(spec: dict) -> None:
 
     totals = checked_in["totals"]
     expected_totals = {
-        "total_operations": 84,
-        "supported": 77,
+        "total_operations": 86,
+        "supported": 79,
         "deprecated": 5,
         "admin": 2,
         "excluded": 7,
@@ -118,6 +120,20 @@ def check_operation_inventory(spec: dict) -> None:
                 f"evidence file for {op['method']} {op['path']} not found: "
                 f"{op['evidence']}"
             )
+
+
+def check_documented_operation_deltas(metadata: dict) -> None:
+    data = json.loads(DOCUMENTED_DELTAS.read_text())
+    operations = data.get("operations", [])
+    if data.get("base_openapi_version") != metadata.get("openapi_version"):
+        fail("documented operation deltas use the wrong OpenAPI baseline")
+    if data.get("documentation_version") != metadata.get("documentation_version"):
+        fail("documented operation deltas use the wrong documentation version")
+    if len(operations) != metadata.get("documented_operation_delta_count"):
+        fail("documented operation delta count does not match contract metadata")
+
+    if operations:
+        fail(f"unexpected documented operation deltas: {operations!r}")
 
 
 def check_excluded_fields() -> None:
@@ -242,6 +258,7 @@ def main() -> None:
     spec = check_openapi_checksum(metadata)
     check_contract_mismatches(metadata)
     check_operation_inventory(spec)
+    check_documented_operation_deltas(metadata)
     check_excluded_fields()
     check_normalization_aliases()
     check_no_old_crate_name()
@@ -252,8 +269,9 @@ def main() -> None:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
 
-    print("contract policy check passed: 84 operations (77 supported, "
-          "5 deprecated, 2 admin); message_notify excluded; mining aliases "
+    print("contract policy check passed: 84 OpenAPI operations "
+          "(77 supported, 5 deprecated, 2 admin) plus 2 documented "
+          "leaderboard deltas; message_notify excluded; mining aliases "
           "recorded; no stray replicant-sdk references.")
 
 

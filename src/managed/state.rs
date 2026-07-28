@@ -12,8 +12,8 @@ use tracing::{debug, info};
 
 use crate::domain::{
     Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location, LocationKey,
-    Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId, Star, StarKey,
-    StarKnowledge,
+    MergeOutcome, Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId, Star,
+    StarKey, StarKnowledge, merge_device, merge_star, merge_star_knowledge,
 };
 
 use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
@@ -190,6 +190,24 @@ impl StateEngine {
         stars: Vec<Observation<Star>>,
         generated_at: Option<String>,
     ) -> Result<(), StoreError> {
+        let existing = self
+            .galaxy
+            .read()
+            .expect("galaxy snapshot lock poisoned")
+            .catalogue
+            .clone();
+        let stars = stars
+            .into_iter()
+            .map(|incoming| {
+                if let Some(current) = existing.get(&incoming.value.key).cloned() {
+                    match merge_star(current, incoming) {
+                        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
+                    }
+                } else {
+                    incoming
+                }
+            })
+            .collect::<Vec<_>>();
         self.store
             .lock()
             .as_mut()
@@ -227,6 +245,29 @@ impl StateEngine {
         if knowledge.is_empty() {
             return Ok(());
         }
+
+        let existing = self
+            .galaxy
+            .read()
+            .expect("galaxy snapshot lock poisoned")
+            .knowledge
+            .clone();
+        let knowledge = knowledge
+            .into_iter()
+            .map(|incoming| {
+                let key = (
+                    incoming.value.replicant.clone(),
+                    incoming.value.star.clone(),
+                );
+                if let Some(current) = existing.get(&key).cloned() {
+                    match merge_star_knowledge(current, incoming) {
+                        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
+                    }
+                } else {
+                    incoming
+                }
+            })
+            .collect::<Vec<_>>();
 
         self.store
             .lock()
@@ -503,22 +544,55 @@ impl StateEngine {
     /// Commits an event and advances the applied cursor atomically, then
     /// publishes a new state revision.
     pub(crate) fn apply_event(&self, event: &Event, cursor: &str) -> Result<bool, StoreError> {
+        self.apply_event_with_locations(event, cursor, Vec::new(), Vec::new())
+    }
+
+    /// Commits an event, any safe scan-derived locations, and fallback work in
+    /// one transaction before publishing one state revision.
+    pub(crate) fn apply_event_with_locations(
+        &self,
+        event: &Event,
+        cursor: &str,
+        locations: Vec<Observation<Location>>,
+        reconciliation_targets: Vec<(Realm, String)>,
+    ) -> Result<bool, StoreError> {
+        let previous = self.snapshot();
+        let mut next_locations = previous.locations.clone();
+        let mut projected = Vec::new();
+        for mut location in locations {
+            if let Some(existing) = next_locations.get(&location.value.key) {
+                let mut merged = existing.value.clone();
+                merged.merge_from(&location.value);
+                location.value = merged;
+            }
+            next_locations.insert(location.value.key.clone(), location.clone());
+            if let Some(existing) =
+                projected
+                    .iter_mut()
+                    .find(|existing: &&mut Observation<Location>| {
+                        existing.value.key == location.value.key
+                    })
+            {
+                *existing = location;
+            } else {
+                projected.push(location);
+            }
+        }
         let inserted = self
             .store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .append_event_and_project(event, cursor, &[])?;
+            .append_event_and_project(event, cursor, &[], &projected, &reconciliation_targets)?;
         if !inserted {
             return Ok(false);
         }
-        let previous = self.snapshot();
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
-            locations: previous.locations.clone(),
+            locations: next_locations,
             inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         });
@@ -772,14 +846,28 @@ impl StateEngine {
         &self,
         devices: &[Observation<Device>],
     ) -> Result<Arc<StateSnapshot>, StoreError> {
+        let previous = self.snapshot();
+        let mut next_devices = previous.devices.clone();
+        let devices: Vec<_> = devices
+            .iter()
+            .cloned()
+            .map(
+                |device| match next_devices.get(&device.value.key).cloned() {
+                    Some(existing) => match merge_device(existing, device) {
+                        MergeOutcome::Replaced(device) | MergeOutcome::Retained(device, _) => {
+                            device
+                        }
+                    },
+                    None => device,
+                },
+            )
+            .collect();
         self.store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .persist_devices(devices)?;
-        let previous = self.snapshot();
-        let mut next_devices = previous.devices.clone();
-        for device in devices {
+            .persist_devices(&devices)?;
+        for device in &devices {
             next_devices.insert(device.value.key.clone(), device.clone());
         }
         Ok(self.publish(StateSnapshot {
@@ -874,6 +962,7 @@ mod tests {
     use crate::domain::{
         AccessScope, DeviceKey, DeviceRelationships, DeviceStatus, DeviceType,
         ObservationAuthority, ObservationMetadata, ObservationSource, Reachability, SourceDocument,
+        Star, StarKey, StarKnowledge,
     };
 
     fn test_path() -> std::path::PathBuf {
@@ -914,6 +1003,45 @@ mod tests {
         }
     }
 
+    fn catalogue_star(id: &str, has_hub: Option<bool>, region: Option<&str>) -> Observation<Star> {
+        Observation {
+            value: Star {
+                key: StarKey::live(id.into()),
+                name: None,
+                spectral_type: None,
+                entry_point: None,
+                position: None,
+                has_hub,
+                region: region.map(str::to_owned),
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
+    fn star_knowledge(
+        replicant: &str,
+        star: &str,
+        has_hub: Option<bool>,
+        region: Option<&str>,
+    ) -> Observation<StarKnowledge> {
+        Observation {
+            value: StarKnowledge {
+                replicant: ReplicantKey::live(replicant.into()),
+                star: StarKey::live(star.into()),
+                position: None,
+                spectral_type: None,
+                entry_point: None,
+                explored: None,
+                has_hub,
+                has_life: None,
+                region: region.map(str::to_owned),
+                distance_from_replicant: None,
+                estimated_travel_time: None,
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
     #[test]
     fn failed_commit_never_publishes_a_revision() {
         let engine = StateEngine::open_memory().expect("open engine");
@@ -922,6 +1050,78 @@ mod tests {
         assert!(engine.persist_devices(&[device("d1")]).is_err());
         assert_eq!(engine.snapshot().revision(), 0);
         assert!(!receiver.has_changed().expect("watch is open"));
+    }
+
+    #[test]
+    fn public_device_observation_cannot_erase_owned_assignment_or_hosting() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let mut owned = device("D1");
+        owned.value.relationships.assigned_replicant =
+            Some(crate::domain::ReplicantKey::live("OWNER".into()));
+        owned.value.relationships.hosting_replicant =
+            Some(crate::domain::ReplicantKey::live("MATRIX".into()));
+        engine
+            .persist_devices(&[owned])
+            .expect("persist owned device");
+
+        let mut public = device("D1");
+        public.value.access = AccessScope::Public;
+        public.metadata.access = AccessScope::Public;
+        public.metadata.observed_at = "2026-07-26T00:00:00Z".into();
+        engine
+            .persist_devices(&[public])
+            .expect("persist public device");
+
+        let snapshot = engine.snapshot();
+        let device = snapshot
+            .devices()
+            .get(&DeviceKey::live("D1".into()))
+            .expect("published device");
+        assert_eq!(
+            device
+                .value
+                .relationships
+                .assigned_replicant
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("OWNER")
+        );
+        assert_eq!(
+            device
+                .value
+                .relationships
+                .hosting_replicant
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("MATRIX")
+        );
+    }
+
+    #[test]
+    fn partial_star_observations_preserve_known_region_and_hub() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        engine
+            .replace_catalogue(
+                vec![catalogue_star("SOL", Some(true), Some("solzone"))],
+                None,
+            )
+            .expect("persist catalogue");
+        engine
+            .replace_catalogue(vec![catalogue_star("SOL", None, None)], None)
+            .expect("persist partial catalogue");
+        let catalogue = engine.catalogue();
+        assert_eq!(catalogue[0].value.has_hub, Some(true));
+        assert_eq!(catalogue[0].value.region.as_deref(), Some("solzone"));
+
+        engine
+            .persist_star_knowledge(star_knowledge("R1", "SOL", Some(false), Some("alpha")))
+            .expect("persist star knowledge");
+        engine
+            .persist_star_knowledge(star_knowledge("R1", "SOL", None, None))
+            .expect("persist partial star knowledge");
+        let knowledge = engine.star_knowledge(&ReplicantKey::live("R1".into()));
+        assert_eq!(knowledge[0].value.has_hub, Some(false));
+        assert_eq!(knowledge[0].value.region.as_deref(), Some("alpha"));
     }
 
     #[test]

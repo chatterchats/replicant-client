@@ -32,38 +32,38 @@
       "leg_distance_ly": 5.7224141636201,
       "survey_required": true,
       "system_scan_done": true,
-      "survey_done": false,
-      "completed": false
+      "survey_done": true,
+      "completed": true
     },
     {
       "star": "XIKHWAKHUX",
       "entry_point": "XIKHWAKHUX-5-L4",
       "distance_from_center_ly": 5.727384223186009,
       "leg_distance_ly": 3.389969448239907,
-      "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false,
-      "completed": false
+      "survey_required": false,
+      "system_scan_done": true,
+      "survey_done": true,
+      "completed": true
     },
     {
       "star": "KHUKKI",
       "entry_point": "KHUKKI-3-L4",
       "distance_from_center_ly": 8.825279130996357,
       "leg_distance_ly": 5.444481633727843,
-      "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false,
-      "completed": false
+      "survey_required": false,
+      "system_scan_done": true,
+      "survey_done": true,
+      "completed": true
     },
     {
       "star": "XIKKKUX",
       "entry_point": "XIKKKUX-4-L4",
       "distance_from_center_ly": 11.860779011515207,
       "leg_distance_ly": 4.329634809080324,
-      "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false,
-      "completed": false
+      "survey_required": false,
+      "system_scan_done": true,
+      "survey_done": true,
+      "completed": true
     },
     {
       "star": "KHAKWU",
@@ -71,9 +71,9 @@
       "distance_from_center_ly": 10.262830396143157,
       "leg_distance_ly": 3.3209258739092555,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false,
-      "completed": false
+      "system_scan_done": true,
+      "survey_done": true,
+      "completed": true
     },
     {
       "star": "XUXKIHI",
@@ -766,7 +766,7 @@
       "completed": false
     }
   ],
-  "next_index": 1,
-  "phase": "surveying",
-  "last_event_id": "1785125947022-0"
+  "next_index": 6,
+  "phase": "restowing",
+  "last_event_id": "1785203213354-0"
 }

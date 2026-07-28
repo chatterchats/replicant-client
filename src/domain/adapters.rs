@@ -10,6 +10,7 @@ use crate::{events::GameEvent, raw};
 #[non_exhaustive]
 pub enum NormalizeError {
     MissingIdentity(&'static str),
+    InvalidScanReport,
 }
 
 impl core::fmt::Display for NormalizeError {
@@ -18,8 +19,53 @@ impl core::fmt::Display for NormalizeError {
             Self::MissingIdentity(field) => {
                 write!(f, "response omitted required identity `{field}`")
             }
+            Self::InvalidScanReport => {
+                write!(f, "scan report is incomplete or has an unsupported shape")
+            }
         }
     }
+}
+
+/// Normalizes the documented body portion of a `scan.completed` report.
+///
+/// Both direct scan events and AMI survey digests carry this exact shape.  The
+/// report is intentionally retained as evidence because it is open-ended.
+pub fn scan_report_location(
+    scan_target: &str,
+    scan_type: &str,
+    report: &serde_json::Map<String, Value>,
+    realm: Realm,
+    observed_at: impl Into<ObservationTime>,
+    event_id: &str,
+) -> Result<Observation<Location>, NormalizeError> {
+    if !matches!(scan_type, "planet" | "moon") {
+        return Err(NormalizeError::InvalidScanReport);
+    }
+    let body = report
+        .get(scan_type)
+        .and_then(Value::as_object)
+        .filter(|body| body.get("designation").and_then(Value::as_str) == Some(scan_target))
+        .ok_or(NormalizeError::InvalidScanReport)?;
+    let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+        "location": scan_target,
+        "location_type": scan_type,
+        "scanned": true,
+        scan_type: body,
+    }))
+    .map_err(|_| NormalizeError::InvalidScanReport)?;
+    let mut observation = location_detail(&raw, realm, observed_at)?;
+    observation.metadata.source = ObservationSource::EventLog;
+    observation.metadata.authority = ObservationAuthority::EventDelta;
+    observation.metadata.source_document = SourceDocument {
+        operation: "event:scan.completed".into(),
+        request_id: None,
+        document_id: Some(event_id.into()),
+    };
+    observation.value.unknown.insert(
+        "event_scan_report".into(),
+        sanitize_scan_evidence(&Value::Object(report.clone())),
+    );
+    Ok(observation)
 }
 
 impl std::error::Error for NormalizeError {}
@@ -61,6 +107,30 @@ fn required(value: Option<&String>, field: &'static str) -> Result<String, Norma
     })
 }
 
+fn sanitize_scan_evidence(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let key_lower = key.to_ascii_lowercase();
+                    let value = if ["authorization", "password", "secret", "token"]
+                        .iter()
+                        .any(|sensitive| key_lower.contains(sensitive))
+                    {
+                        Value::String("<redacted>".into())
+                    } else {
+                        sanitize_scan_evidence(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(sanitize_scan_evidence).collect()),
+        _ => value.clone(),
+    }
+}
+
 fn knowledge<T>(value: Option<T>) -> Knowledge<T> {
     value.map_or(Knowledge::Unknown, Knowledge::Present)
 }
@@ -100,8 +170,12 @@ fn device(
         .location
         .as_ref()
         .map(|value| WorldKey::in_realm(realm.clone(), LocationId::new(value)));
-    let hosted_by = raw
+    let assigned_replicant = raw
         .replicant_code
+        .as_ref()
+        .map(|value| WorldKey::in_realm(realm.clone(), ReplicantId::new(value)));
+    let hosting_replicant = raw
+        .hosting_replicant
         .as_ref()
         .map(|value| WorldKey::in_realm(realm.clone(), ReplicantId::new(value)));
     let related = |value: &Option<String>| {
@@ -136,7 +210,8 @@ fn device(
         relationships: DeviceRelationships {
             attached_to: related(&raw.attached_to_device_code),
             controller: related(&raw.controller_device_code),
-            hosted_by,
+            assigned_replicant,
+            hosting_replicant,
         },
         access,
     })
@@ -509,6 +584,8 @@ pub fn catalogue_star(
             .as_ref()
             .map(|id| WorldKey::in_realm(realm, LocationId::new(id))),
         position: raw.position.and_then(position),
+        has_hub: raw.has_hub,
+        region: raw.region.clone(),
     };
     Ok(Observation {
         value,
@@ -554,7 +631,9 @@ pub fn replicant_star_knowledge(
                 .as_ref()
                 .map(|id| WorldKey::in_realm(realm, LocationId::new(id))),
             explored: raw.explored,
+            has_hub: raw.has_hub,
             has_life: raw.has_life,
+            region: raw.region.clone(),
             distance_from_replicant: raw
                 .distance_from_replicant
                 .filter(|value| value.is_finite()),

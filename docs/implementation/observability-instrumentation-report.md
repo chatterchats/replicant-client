@@ -200,7 +200,7 @@ patch whitespace check
 ```
 
 The existing `contract_policy_check.py` still fails because historical
-`replicant-sdk` references are present in the checked-in rewrite guide and
+predecessor-crate references are present in the checked-in rewrite guide and
 post-Phase 11 review. Those references existed before this observability
 change and are unrelated to tracing.
 

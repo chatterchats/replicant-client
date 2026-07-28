@@ -1,17 +1,18 @@
 {
-  "$schema_note": "Provenance and authority metadata for the corrected Replicant Space 2.3.1 contract corpus checked in at reference/replicant-space/.",
-  "replicant_space_version": "2.3.1",
+  "$schema_note": "Provenance for the verified Replicant Space 2.3.3 OpenAPI corpus; rendered-document corrections remain explicit metadata.",
+  "replicant_space_version": "2.3.3",
   "crawl_timestamp": "2026-07-24T18:16:35.649754+00:00",
-  "openapi_fetched_at": "2026-07-22T03:29:15.141566+00:00",
-  "documentation_archive_sha256": "a6b02569b17fcfccf29b4f439777df9864c04b91f89d43f2da464b3c28f65e8d",
-  "openapi_sha256": "ca018a938541f23c4838e8fe58f78889d9ca4b9ab81b488112f90589dd83c2f4",
-  "openapi_operation_count": 84,
-  "openapi_path_count": 70,
+  "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
+  "openapi_fetched_at": "2026-07-28T09:11:06.627Z",
+  "documentation_archive_sha256": "e271b1a32602dd9ec80da6b9d64f392efc58a574f8da7584de0ae9205acabc73",
+  "openapi_sha256": "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f",
+  "openapi_operation_count": 86,
+  "openapi_path_count": 72,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
   "openapi_documentation_mismatches": [
     {
       "scope": "GET /v1/events/stream",
-      "difference": "Rendered documentation defines the cursor query parameter and text/event-stream framing; OpenAPI declares neither a parameter nor a success response.",
+      "difference": "OpenAPI declares the cursor query parameter and a 422 response, but still has no 2xx response or text/event-stream framing.",
       "raw_policy": "Implement the documented cursor and standard SSE framing while preserving event names and JSON payloads as open values.",
       "evidence": "api/events/stream/index.md"
     },
@@ -31,5 +32,9 @@
   "notes": [
     "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
     "reference/replicant-space/openapi.json sha256 is verified by scripts/contract_policy_check.py on every run."
-  ]
+  ],
+  "documentation_version": "2.3.3",
+  "documentation_crawled_at": "2026-07-28T00:53:11Z",
+  "openapi_version": "2.3.3",
+  "documented_operation_delta_count": 0
 }

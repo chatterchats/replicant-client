@@ -1,10 +1,11 @@
 //! `replicant-client` is a durable, stateful Rust client for building
 //! Replicant Space applications.
 //!
-//! The crate targets the Replicant Space `2.3.1` contract. The corrected
-//! contract corpus is checked in under `reference/replicant-space/`, and the
-//! machine-readable operation inventory it was derived from lives under
-//! `policy/`.
+//! The crate targets the Replicant Space `2.3.3` rendered contract. The
+//! checked-in OpenAPI baseline remains `2.3.1`; documentation-only additions
+//! and schema corrections from `2.3.2`/`2.3.3` are recorded explicitly under
+//! `policy/` and `docs/contract/` instead of being silently attributed to the
+//! older machine-readable schema.
 //!
 //! [`Client`] is the managed entry point: its gateways return normalized domain
 //! values and commit successful observations before returning. [`raw`] is the
@@ -33,10 +34,9 @@ pub use error::{Error, ErrorDetails, Result};
 /// Typed raw HTTP transport for the current (non-deprecated, non-admin)
 /// Replicant Space contract.
 ///
-/// Returns transport DTOs and response metadata only. Exposes only the 77
-/// current, supported operations; the 5 deprecated and 2 administrative
-/// operations excluded by `policy/operations.json` have no corresponding
-/// method here and are not callable.
+/// Returns transport DTOs and response metadata only. The supported surface
+/// combines the checked-in OpenAPI inventory with documented post-OpenAPI
+/// operation deltas. Deprecated and administrative operations remain excluded.
 #[cfg(feature = "raw")]
 pub mod raw;
 

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use reqwest::Method;
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::error::Error;
 use crate::raw::common::{encode_path_segment, with_query};
@@ -32,6 +32,7 @@ where
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(value) => Ok(Some(value)),
         serde_json::Value::Object(object) => Ok([
+            "replicant_code",
             "designation",
             "device_code",
             "location_code",
@@ -63,6 +64,15 @@ fn validate_page_limit(limit: Option<i64>) -> Result<(), Error> {
     if limit.is_some_and(|value| !(1..=100).contains(&value)) {
         return Err(Error::Configuration {
             message: "page limit must be between 1 and 100".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_device_list_limit(limit: Option<i64>) -> Result<(), Error> {
+    if limit.is_some_and(|value| !(1..=50).contains(&value)) {
+        return Err(Error::Configuration {
+            message: "device list limit must be between 1 and 50".into(),
         });
     }
     Ok(())
@@ -113,7 +123,8 @@ pub struct PrintingInfo {
     pub completes_at: Option<String>,
     /// Device type being printed.
     pub device_type: Option<String>,
-    /// Estimated seconds remaining.
+    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub eta_seconds: Option<f64>,
     /// Completion percentage.
     pub progress_percent: Option<f64>,
@@ -132,7 +143,8 @@ pub struct ProspectInfo {
     pub completes_at: Option<String>,
     /// Prospecting direction vector.
     pub direction: Option<Vec<f64>>,
-    /// Estimated seconds remaining.
+    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub eta_seconds: Option<f64>,
     /// Origin location designation.
     pub origin: Option<String>,
@@ -146,7 +158,8 @@ pub struct ProspectInfo {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct RepairInfo {
-    /// Estimated seconds remaining.
+    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub eta_seconds: Option<f64>,
     /// Completion percentage.
     pub progress_percent: Option<f64>,
@@ -162,7 +175,8 @@ pub struct RepairInfo {
 pub struct ScanInfo {
     /// When the scan completes, RFC3339.
     pub completes_at: Option<String>,
-    /// Estimated seconds remaining.
+    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub eta_seconds: Option<f64>,
     /// Completion percentage.
     pub progress_percent: Option<f64>,
@@ -186,7 +200,8 @@ pub struct TravelInfo {
     pub distance_au: Option<f64>,
     /// Distance of this leg, in light-years.
     pub distance_ly: Option<f64>,
-    /// Estimated seconds remaining for this leg.
+    /// Estimated seconds remaining for this leg. Replicant Space 2.3.3 emits
+    /// whole seconds; `f64` is retained for source compatibility.
     pub eta_seconds: Option<f64>,
     /// When the final destination is reached, RFC3339.
     pub final_arrives_at: Option<String>,
@@ -201,7 +216,8 @@ pub struct TravelInfo {
     /// Remaining route legs, open-shaped.
     #[serde(default)]
     pub route: Vec<JsonObject>,
-    /// Estimated seconds remaining for the whole route.
+    /// Estimated seconds remaining for the whole route. Replicant Space 2.3.3
+    /// emits whole seconds; `f64` is retained for source compatibility.
     pub route_eta_seconds: Option<f64>,
     /// Completion percentage of the whole route.
     pub route_progress_percent: Option<f64>,
@@ -298,8 +314,11 @@ pub struct DeviceStatus {
     pub repair: Option<RepairInfo>,
     /// Percentage of repair cost already paid.
     pub repair_paid_pct: Option<f64>,
-    /// The hosting replicant's code, for hosted devices.
+    /// Replicant currently assigned as this device's owner/operator.
     pub replicant_code: Option<String>,
+    /// Replicant matrix physically hosted by this device, when this is a vessel.
+    #[serde(default, deserialize_with = "deserialize_optional_reference")]
+    pub hosting_replicant: Option<String>,
     /// In-progress scan, if any.
     pub scan: Option<ScanInfo>,
     /// Device status, e.g. `"active"`, `"deactivated"`.
@@ -350,10 +369,14 @@ pub struct DeviceListResponse {
 /// Query parameters for `GET /v1/devices`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceListQuery {
-    /// Restrict to devices hosted by/owned by this replicant.
+    /// Restrict to devices assigned to this replicant.
     pub replicant_code: Option<String>,
     /// Restrict to a single device type.
     pub device_type: Option<String>,
+    /// Restrict to devices carrying this tag.
+    pub tag: Option<String>,
+    /// Restrict to devices with no tags. Incompatible with `tag`.
+    pub untagged: Option<bool>,
     /// Restrict to a single location designation.
     pub location: Option<String>,
     /// Opaque integer cursor from a previous page's `next_cursor`.
@@ -497,6 +520,9 @@ pub enum DeviceCommand {
     EnqueuePrint {
         /// The device type to print.
         device_type: String,
+        /// Number of identical devices to enqueue.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        quantity: Option<i64>,
         /// The controller device to route this print through, if not this
         /// device itself.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -703,7 +729,8 @@ pub struct DeviceCommandResponse {
     /// Per-target errors, for batch commands, open-shaped.
     #[serde(default)]
     pub errors: Vec<JsonObject>,
-    /// Estimated seconds remaining for the triggered operation.
+    /// Estimated seconds remaining for the triggered operation. Replicant Space
+    /// 2.3.3 emits whole seconds; `f64` is retained for source compatibility.
     pub eta_seconds: Option<f64>,
     /// Final arrival time after a multi-leg `travel` command, RFC3339.
     pub final_arrives_at: Option<String>,
@@ -884,11 +911,19 @@ impl DevicesClient {
         &self,
         query: &DeviceListQuery,
     ) -> Result<RawResponse<DeviceListResponse>, Error> {
+        validate_device_list_limit(query.limit)?;
+        if query.tag.is_some() && query.untagged.is_some() {
+            return Err(Error::Configuration {
+                message: "device list tag and untagged filters are incompatible".into(),
+            });
+        }
         let path = with_query(
             "v1/devices",
             &[
                 ("replicant_code", query.replicant_code.clone()),
                 ("device_type", query.device_type.clone()),
+                ("tag", query.tag.clone()),
+                ("untagged", query.untagged.map(|value| value.to_string())),
                 ("location", query.location.clone()),
                 ("cursor", query.cursor.map(|value| value.to_string())),
                 ("limit", query.limit.map(|value| value.to_string())),
@@ -905,6 +940,7 @@ impl DevicesClient {
         tag: &str,
         query: &DeviceTagListQuery,
     ) -> Result<RawResponse<DeviceListResponse>, Error> {
+        validate_device_list_limit(query.limit)?;
         let base = format!("v1/devices/tags/{}", encode_path_segment(tag));
         let path = with_query(
             &base,
@@ -1056,7 +1092,22 @@ impl DevicesClient {
 
 #[cfg(test)]
 mod command_response_tests {
-    use super::DeviceCommandResponse;
+    use super::{DeviceCommand, DeviceCommandResponse};
+
+    #[test]
+    fn enqueue_print_serializes_optional_quantity() {
+        let command = DeviceCommand::EnqueuePrint {
+            device_type: "survey_drone".to_owned(),
+            quantity: Some(4),
+            controller: None,
+            oncomplete: None,
+            tags: None,
+        };
+        let payload = serde_json::to_value(command).expect("serialize enqueue_print");
+        assert_eq!(payload["command"], "enqueue_print");
+        assert_eq!(payload["device_type"], "survey_drone");
+        assert_eq!(payload["quantity"], 4);
+    }
 
     #[test]
     fn command_references_accept_strings_and_objects() {

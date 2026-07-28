@@ -1162,10 +1162,7 @@ fn verified_child_designations(
         }
     };
 
-    for items in [&location.planets, &location.moons]
-        .into_iter()
-        .flatten()
-    {
+    for items in [&location.planets, &location.moons].into_iter().flatten() {
         for item in items {
             add(item);
         }
@@ -2171,13 +2168,9 @@ mod tests {
             .await;
         let client = client_at(&server.uri()).await;
 
-        let operation = device_command(
-            &client,
-            "D1",
-            raw::devices::DeviceCommand::SystemScan,
-        )
-        .await
-        .expect("operation remains durable when a 2xx success body evolves");
+        let operation = device_command(&client, "D1", raw::devices::DeviceCommand::SystemScan)
+            .await
+            .expect("operation remains durable when a 2xx success body evolves");
 
         assert_eq!(
             operation.status().await.expect("status"),

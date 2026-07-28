@@ -1,14 +1,14 @@
 {
   "api_version": "v1",
   "etag": null,
-  "fetched_at": "2026-07-22T03:29:15.141566+00:00",
-  "last_changed_at": "2026-07-22T03:29:15.141576+00:00",
+  "fetched_at": "2026-07-28T09:11:06.627Z",
+  "last_changed_at": "2026-07-28T09:11:06.627Z",
   "last_modified": null,
   "openapi_version": "3.0.3",
-  "operation_count": 84,
-  "path_count": 70,
+  "operation_count": 86,
+  "path_count": 72,
   "schema_count": 159,
-  "sha256": "ca018a938541f23c4838e8fe58f78889d9ca4b9ab81b488112f90589dd83c2f4",
+  "sha256": "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f",
   "source_url": "https://api.replicant.space/swagger/openapi.json",
   "title": "Replicant Space"
 }

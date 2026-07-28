@@ -568,7 +568,7 @@ impl SyncClient {
 
     async fn sync_devices(&self) -> std::result::Result<SyncOutcome, SyncDomainError> {
         let mut query = raw::devices::DeviceListQuery {
-            limit: Some(100),
+            limit: Some(50),
             ..Default::default()
         };
         let mut present = BTreeSet::<DeviceKey>::new();
@@ -720,7 +720,7 @@ impl SyncClient {
             }
         }
         for device in self.client.managed_state().devices() {
-            if let Some(replicant) = device.value.relationships.hosted_by {
+            if let Some(replicant) = device.value.relationships.hosting_replicant {
                 codes.insert(replicant.id.as_str().to_owned());
             }
         }
@@ -1102,11 +1102,11 @@ mod tests {
             ),
             (
                 "/v1/devices",
-                serde_json::json!({"devices": [{"device_code": "D1", "replicant_code": "R1", "location": "SOL-4"}]}),
+                serde_json::json!({"devices": [{"device_code": "D1", "replicant_code": "OWNER", "hosting_replicant": "MATRIX", "location": "SOL-4"}]}),
             ),
             (
-                "/v1/replicants/R1",
-                serde_json::json!({"replicant_code": "R1", "location": "SOL-4"}),
+                "/v1/replicants/MATRIX",
+                serde_json::json!({"replicant_code": "MATRIX", "location": "SOL-4"}),
             ),
             (
                 "/v1/locations/SOL-4",
@@ -1166,7 +1166,7 @@ mod tests {
                 .expect("local Riker candidate query");
         }
 
-        assert_eq!(report.readiness, SyncReadiness::Complete);
+        assert_eq!(report.readiness, SyncReadiness::Complete, "{report:?}");
         assert_eq!(
             report.completed,
             SyncPlan::full().ordered().expect("full plan")
@@ -1182,7 +1182,14 @@ mod tests {
                 .managed_state()
                 .replicants()
                 .iter()
-                .any(|entry| entry.value.key.id.as_str() == "R1")
+                .any(|entry| entry.value.key.id.as_str() == "MATRIX")
+        );
+        assert!(
+            !client
+                .managed_state()
+                .replicants()
+                .iter()
+                .any(|entry| entry.value.key.id.as_str() == "OWNER")
         );
         assert!(
             client
@@ -1241,7 +1248,7 @@ mod tests {
                 .managed_state()
                 .replicants()
                 .iter()
-                .any(|entry| entry.value.key.id.as_str() == "R1")
+                .any(|entry| entry.value.key.id.as_str() == "MATRIX")
         );
         assert!(
             restored
@@ -1291,7 +1298,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"devices": [{"device_code": "D1", "replicant_code": "R1"}]}),
+                serde_json::json!({"devices": [{"device_code": "D1", "replicant_code": "OWNER", "hosting_replicant": "R1"}]}),
             ))
             .mount(&server)
             .await;

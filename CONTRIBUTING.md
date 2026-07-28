@@ -15,8 +15,8 @@ them to the feature that needs them.
 
 ## Contract authority
 
-The corrected Replicant Space 2.3.1 documentation and OpenAPI spec under
-[`reference/replicant-space/`](reference/replicant-space/) are the contract.
+The verified Replicant Space 2.3.3 OpenAPI corpus under
+[`reference/replicant-space/`](reference/replicant-space/) is the contract.
 Rendered documentation deprecation asides override missing OpenAPI
 `deprecated` flags — see `policy/contract-metadata.json`.
 
@@ -25,6 +25,7 @@ exposes, update the relevant policy file under `policy/` and re-run:
 
 ```sh
 python3 scripts/generate_operation_inventory.py
+python3 scripts/generate_authority_matrix.py
 python3 scripts/contract_policy_check.py
 ```
 

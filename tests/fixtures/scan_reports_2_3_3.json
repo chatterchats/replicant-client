@@ -1,0 +1,12 @@
+{
+  "direct_planet": {"scan_target":"NUNKA-3","scan_type":"planet","report":{"planet":{"designation":"NUNKA-3","atmosphere":"thin"}}},
+  "direct_moon": {"scan_target":"NUNKA-3-MOON-1","scan_type":"moon","report":{"moon":{"designation":"NUNKA-3-MOON-1","magnetic_field":"weak"}}},
+  "digest": {"report":{"scans":[
+    {"scan_target":"NUNKA-3","scan_type":"planet","report":{"planet":{"designation":"NUNKA-3"}}},
+    {"scan_target":"NUNKA-3-MOON-1","scan_type":"moon","report":{"moon":{"designation":"NUNKA-3-MOON-1"}}},
+    {"scan_target":"NUNKA-3","scan_type":"planet","report":{"planet":{"designation":"NUNKA-3"}}},
+    {"scan_target":"BROKEN","scan_type":"planet","report":{"planet":{}}}
+  ]}},
+  "empty_digest": {"report":{"scans":[]}},
+  "future_fields": {"scan_target":"NUNKA-4","scan_type":"planet","report":{"planet":{"designation":"NUNKA-4"},"future_report":{"safe":true}}}
+}

@@ -136,7 +136,7 @@ macro_rules! common_controller_methods {
             self.device.command(DeviceCommand::Launch).await
         }
 
-        /// Recalls the fleet and pauses execution.
+        /// Requests that the controller recall its fleet.
         pub async fn withdraw(&self) -> Result<Operation> {
             self.device.command(DeviceCommand::Withdraw).await
         }

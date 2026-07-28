@@ -904,6 +904,27 @@ impl DeviceHandle {
         self.command(raw::devices::DeviceCommand::Unfurl).await
     }
 
+    /// Queues `quantity` copies of a device on this autofactory.
+    pub async fn enqueue_print(
+        &self,
+        device_type: impl Into<String>,
+        quantity: i64,
+    ) -> Result<Operation> {
+        if quantity < 1 {
+            return Err(Error::Configuration {
+                message: "autofactory print quantity must be at least one".into(),
+            });
+        }
+        self.command(raw::devices::DeviceCommand::EnqueuePrint {
+            device_type: device_type.into(),
+            quantity: Some(quantity),
+            controller: None,
+            oncomplete: None,
+            tags: None,
+        })
+        .await
+    }
+
     /// Dispatches any known device command as a durable operation. The
     /// intended command is checked against this device's latest cached
     /// `available_commands` first, but the server remains authoritative.
@@ -1105,7 +1126,9 @@ pub struct DeviceQuery {
     system: Option<String>,
     attached_to: DeviceLinkFilter<DeviceKey>,
     controller: DeviceLinkFilter<DeviceKey>,
-    hosted_by: DeviceLinkFilter<ReplicantKey>,
+    assigned_replicant: DeviceLinkFilter<ReplicantKey>,
+    hosting_replicant: DeviceLinkFilter<ReplicantKey>,
+    untagged: bool,
     without_adopted_devices: bool,
 }
 
@@ -1118,7 +1141,9 @@ impl DeviceQuery {
             system: None,
             attached_to: DeviceLinkFilter::Any,
             controller: DeviceLinkFilter::Any,
-            hosted_by: DeviceLinkFilter::Any,
+            assigned_replicant: DeviceLinkFilter::Any,
+            hosting_replicant: DeviceLinkFilter::Any,
+            untagged: false,
             without_adopted_devices: false,
         }
     }
@@ -1197,6 +1222,13 @@ impl DeviceQuery {
         self
     }
 
+    /// Requires the device to have no user-assigned tags.
+    #[must_use]
+    pub fn untagged(mut self) -> Self {
+        self.untagged = true;
+        self
+    }
+
     #[must_use]
     pub fn attached_to(mut self, device: DeviceKey) -> Self {
         self.attached_to = DeviceLinkFilter::Is(device);
@@ -1228,8 +1260,15 @@ impl DeviceQuery {
     }
 
     #[must_use]
-    pub fn hosted_by(mut self, replicant: ReplicantKey) -> Self {
-        self.hosted_by = DeviceLinkFilter::Is(replicant);
+    pub fn assigned_to(mut self, replicant: ReplicantKey) -> Self {
+        self.assigned_replicant = DeviceLinkFilter::Is(replicant);
+        self
+    }
+
+    /// Matches vessels physically hosting this replicant's matrix.
+    #[must_use]
+    pub fn hosting_replicant(mut self, replicant: ReplicantKey) -> Self {
+        self.hosting_replicant = DeviceLinkFilter::Is(replicant);
         self
     }
 
@@ -1270,7 +1309,9 @@ impl DeviceQuery {
             }
             predicate_matches += 1;
 
-            if !self.tags.iter().all(|tag| entry.value.tags.contains(tag)) {
+            if !self.tags.iter().all(|tag| entry.value.tags.contains(tag))
+                || (self.untagged && !entry.value.tags.is_empty())
+            {
                 continue;
             }
             tag_matches += 1;
@@ -1296,8 +1337,11 @@ impl DeviceQuery {
                 &self.controller,
                 entry.value.relationships.controller.as_ref(),
             ) || !matches_link(
-                &self.hosted_by,
-                entry.value.relationships.hosted_by.as_ref(),
+                &self.assigned_replicant,
+                entry.value.relationships.assigned_replicant.as_ref(),
+            ) || !matches_link(
+                &self.hosting_replicant,
+                entry.value.relationships.hosting_replicant.as_ref(),
             ) {
                 continue;
             }
@@ -1351,6 +1395,7 @@ impl DeviceQuery {
             target: "replicant_client::query::devices",
             event = "query.devices_collected",
             results = handles.len(),
+            untagged = self.untagged,
             without_adopted_devices = self.without_adopted_devices,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "collected local device query results"
@@ -1613,8 +1658,13 @@ impl DevicesGateway {
             .collect())
     }
 }
+
 fn query_is_unfiltered(query: &raw::devices::DeviceListQuery) -> bool {
-    query.device_type.is_none() && query.location.is_none() && query.replicant_code.is_none()
+    query.device_type.is_none()
+        && query.location.is_none()
+        && query.replicant_code.is_none()
+        && query.tag.is_none()
+        && query.untagged.is_none()
 }
 
 /// Owned replicant gateway. Owned detail is normalized with private authority.
@@ -2111,6 +2161,19 @@ mod tests {
             .collect();
         assert_eq!(miner_ids, ["DRONE"]);
 
+        let untagged_ids: Vec<_> = client
+            .devices()
+            .find()
+            .owned()
+            .untagged()
+            .collect()
+            .await
+            .expect("untagged query")
+            .into_iter()
+            .map(|device| device.id().as_str().to_owned())
+            .collect();
+        assert_eq!(untagged_ids, ["CTRL"]);
+
         let snapshot = client
             .devices()
             .miners()
@@ -2141,6 +2204,74 @@ mod tests {
 
         // No mock is mounted: every successful assertion above proves that
         // local query evaluation made no HTTP request.
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn enqueue_print_validates_quantity_and_uses_one_durable_submission() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let device = DeviceHandle::for_test(client.clone(), DeviceKey::live("FACTORY".into()));
+        let error = device
+            .enqueue_print("survey_drone", 0)
+            .await
+            .expect_err("zero quantity must be rejected before submission");
+        assert!(matches!(error, Error::Configuration { .. }));
+
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/FACTORY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        device
+            .enqueue_print("survey_drone", 3)
+            .await
+            .expect("durable print operation");
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = requests[0].body_json().expect("JSON body");
+        assert_eq!(body["command"], "enqueue_print");
+        assert_eq!(body["device_type"], "survey_drone");
+        assert_eq!(body["quantity"], 3);
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn tagged_remote_list_is_filtered_and_never_reconciles_missing_devices() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [{"device_code": "TAGGED", "device_type": "mining_drone", "status": "idle"}],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        client
+            .managed_state()
+            .persist_devices(&[cached_device(
+                "MISSING",
+                DeviceType::MiningDrone,
+                DeviceStatus::Idle,
+            )])
+            .expect("seed device");
+        let query = raw::devices::DeviceListQuery {
+            tag: Some("ore".into()),
+            ..Default::default()
+        };
+        assert!(!query_is_unfiltered(&query));
+        client.devices().list(&query).await.expect("tagged list");
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live("MISSING".into()))
+                .is_some(),
+            "filtered collection absence is never a tombstone"
+        );
         server.verify().await;
         client.close().await.expect("close");
     }
@@ -2311,6 +2442,41 @@ mod tests {
         let diagnostics = query.collect_with_diagnostics().await.expect("diagnostics");
         assert_eq!(results, diagnostics.matches);
         assert_eq!(results.len(), 1);
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn device_assignment_and_hosting_queries_are_local_and_distinct() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let mut vessel = cached_device("VESSEL", DeviceType::from("vessel"), DeviceStatus::Idle);
+        vessel.value.relationships.assigned_replicant = Some(ReplicantKey::live("OWNER".into()));
+        vessel.value.relationships.hosting_replicant = Some(ReplicantKey::live("MATRIX".into()));
+        let mut drone = cached_device("DRONE", DeviceType::MiningDrone, DeviceStatus::Idle);
+        drone.value.relationships.assigned_replicant = Some(ReplicantKey::live("OWNER".into()));
+        client
+            .managed_state()
+            .persist_devices(&[vessel, drone])
+            .expect("persist cached devices");
+
+        let assigned = client
+            .devices()
+            .find()
+            .assigned_to(ReplicantKey::live("OWNER".into()))
+            .collect()
+            .await
+            .expect("local assignment query");
+        let hosted = client
+            .devices()
+            .find()
+            .hosting_replicant(ReplicantKey::live("MATRIX".into()))
+            .collect()
+            .await
+            .expect("local hosting query");
+        assert_eq!(assigned.len(), 2);
+        assert_eq!(hosted.len(), 1);
+        assert_eq!(hosted[0].id().as_str(), "VESSEL");
         server.verify().await;
         client.close().await.expect("close");
     }

@@ -16,7 +16,8 @@ pub struct Blueprint {
     pub short_description: Option<String>,
     /// Full description.
     pub description: Option<String>,
-    /// Base print time, in seconds.
+    /// Base print time in seconds. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub print_time: Option<f64>,
     /// Base structural strength.
     pub strength: Option<f64>,

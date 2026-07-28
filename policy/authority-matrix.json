@@ -1,7 +1,7 @@
 {
   "version": 1,
   "sync_domain_policy": "policy/sync-domains.json",
-  "contract": "Replicant Space 2.3.1",
+  "contract": "Verified Replicant Space 2.3.3 OpenAPI corpus",
   "operations": [
     {
       "method": "POST",
@@ -279,6 +279,20 @@
     {
       "method": "GET",
       "path": "/v1/leaderboards",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/colony_moon",
+      "authority": "state_neutral",
+      "completeness": "volatile_or_history",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/leaderboards/colony_planet",
       "authority": "state_neutral",
       "completeness": "volatile_or_history",
       "tombstone": "never"

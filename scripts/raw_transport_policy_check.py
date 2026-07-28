@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that Phase 2 exposes exactly the 77 supported callable methods."""
+"""Verify the OpenAPI-backed raw surface."""
 
 import json
 import re
@@ -20,7 +20,7 @@ EXPECTED = {
     "src/raw/feedback.rs": {"submit"},
     "src/raw/galaxy.rs": {"stars_near", "catalogue"},
     "src/raw/inventory.rs": {"list", "for_replicant"},
-    "src/raw/leaderboards.rs": {"index", "distance", "fleet", "megastructure", "reputation", "simulations", "simulation_scenario", "trades", "xp"},
+    "src/raw/leaderboards.rs": {"index", "colony_moon", "colony_planet", "distance", "fleet", "megastructure", "reputation", "simulations", "simulation_scenario", "trades", "xp"},
     "src/raw/location_events.rs": {"list", "resolve"},
     "src/raw/locations.rs": {"system_map", "get", "contribute"},
     "src/raw/messages.rs": {"list", "mark_read"},
@@ -81,8 +81,11 @@ for actual, expected in zip(inventory["operations"], expected_inventory["operati
             f"{expected['method']} {expected['path']}"
         )
 supported = inventory["totals"]["supported"]
-if actual_total != supported:
-    errors.append(f"callable total is {actual_total}, policy requires {supported}")
+expected_total = supported
+if actual_total != expected_total:
+    errors.append(
+        f"callable total is {actual_total}, policy requires {supported} OpenAPI operations"
+    )
 
 by_route = {(item["method"], item["path"]): item for item in inventory["operations"]}
 for route in OPAQUE_SUCCESS_RESPONSES:
@@ -109,4 +112,7 @@ if errors:
         print(f"  - {error}", file=sys.stderr)
     sys.exit(1)
 
-print("raw transport policy check passed: 77 callable methods; route descriptors match the contract")
+print(
+    f"raw transport policy check passed: {supported} OpenAPI-backed methods; "
+    "route descriptors match the corpus"
+)

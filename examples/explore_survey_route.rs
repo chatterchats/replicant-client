@@ -2726,9 +2726,11 @@ async fn confirm_survey_completion(
         event = "survey.completion_reconciled",
         star = target,
         complete = check.complete,
-        known_bodies = check.known_bodies,
-        surveyed_bodies = check.surveyed_bodies,
-        unsurveyed_bodies = ?check.unsurveyed_bodies,
+        planets_total = check.planets_total,
+        planets_scanned = check.planets_scanned,
+        moons_total = check.moons_total,
+        moons_scanned = check.moons_scanned,
+        moons_total_estimated = check.moons_total_estimated,
         "authoritatively reconciled planet and moon survey completeness"
     );
     match check.complete {

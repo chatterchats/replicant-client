@@ -1,8 +1,8 @@
 //! The raw, unmanaged Replicant Space HTTP client.
 //!
-//! `raw::Client` exposes exactly the 77 current, non-deprecated,
-//! non-administrative operations recorded as `"supported"` in
-//! `policy/operations.json`. It returns transport DTOs and
+//! `raw::Client` exposes the current non-deprecated, non-administrative
+//! operations recorded by the OpenAPI baseline and the explicit rendered-doc
+//! deltas under `policy/`. It returns transport DTOs and
 //! [`crate::raw::ResponseMetadata`] only; it never hydrates, persists, publishes,
 //! journals operations, or reconciles state against a local store. Those are
 //! managed-client concerns built on top of this transport in a later phase.

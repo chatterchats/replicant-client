@@ -15,6 +15,7 @@ include = [
   "/README.md",
   "/CONTRIBUTING.md",
   "/SECURITY.md",
+  "/docs/contract/**",
   "/docs/observability.md",
   "/src/**",
   "/migrations/**",
@@ -24,8 +25,11 @@ include = [
 ]
 
 [package.metadata.replicant-space]
-version = "2.3.1"
-openapi-sha256 = "ca018a938541f23c4838e8fe58f78889d9ca4b9ab81b488112f90589dd83c2f4"
+version = "2.3.3"
+documentation-version = "2.3.3"
+documentation-archive-sha256 = "e271b1a32602dd9ec80da6b9d64f392efc58a574f8da7584de0ae9205acabc73"
+openapi-version = "2.3.3"
+openapi-sha256 = "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f"
 
 [lib]
 name = "replicant_client"
@@ -118,4 +122,16 @@ required-features = ["managed"]
 
 [[example]]
 name = "bobnet_messages"
+required-features = ["managed"]
+
+[[example]]
+name = "game_concepts"
+required-features = ["managed"]
+
+[[example]]
+name = "initialize_colony_database"
+required-features = ["managed"]
+
+[[example]]
+name = "rikers_colony_candidates"
 required-features = ["managed"]

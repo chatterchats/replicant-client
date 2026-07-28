@@ -30,8 +30,12 @@ pub struct StarItem {
     pub estimated_travel_time: Option<i64>,
     /// Whether this star has been explored.
     pub explored: Option<bool>,
+    /// Whether this star hosts a system hub.
+    pub has_hub: Option<bool>,
     /// Whether this star is known to host life.
     pub has_life: Option<bool>,
+    /// Catalogue region, e.g. `solzone`, `alpha`, `beta`, or `gamma`.
+    pub region: Option<String>,
     /// Galactic coordinates.
     pub position: Option<Position>,
     /// Spectral classification.
@@ -84,6 +88,8 @@ pub struct CatalogueStar {
     pub has_hub: Option<bool>,
     /// Display name.
     pub name: Option<String>,
+    /// Catalogue region, e.g. `solzone`, `alpha`, `beta`, or `gamma`.
+    pub region: Option<String>,
     /// Galactic coordinates.
     pub position: Option<Position>,
     /// Spectral classification.

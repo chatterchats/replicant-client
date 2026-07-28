@@ -94,7 +94,7 @@ The remaining prompts should not be completed because they target the wrong prod
 
 - Prompt 4 assumes event-stream behaviors that the corrected documentation does not guarantee. In particular, an old SSE cursor does not produce a distinct rejection; the server silently begins at the earliest retained event.
 - Prompt 5 is constrained by the old exhaustive `TypedCommand` and 1.x compatibility requirements. The new crate should design a new durable operation model.
-- Prompt 6 rewrites documentation for `replicant-sdk`, which is no longer the target product.
+- Prompt 6 rewrites documentation for the predecessor crate, which is no longer the target product.
 - Prompt 7 enforces old feature tiers and compatibility.
 - Prompt 8 prepares a release that will not happen.
 
@@ -201,7 +201,7 @@ The following decisions are not open to reinterpretation by implementation promp
 5. Source code lives under root `src/`, not `crates/`.
 6. `replicant_client::Client` is the normal entry point.
 7. There is no public `Runtime`.
-8. There is no compatibility layer for `replicant-sdk`.
+8. There is no compatibility layer for the predecessor crate.
 9. There are no old module aliases.
 10. Deprecated game endpoints and fields are not part of the public managed API.
 11. Deprecated game endpoints are not exposed through `raw` either.
@@ -1513,7 +1513,7 @@ client.bobnet()
 
 Create a fresh schema version 1 for `replicant-client`.
 
-There is no requirement to migrate a `replicant-sdk` database. Do not copy the old migrations unchanged.
+There is no requirement to migrate a predecessor-crate database. Do not copy the old migrations unchanged.
 
 The new schema should include durable support for:
 

@@ -16,6 +16,7 @@
 //! cursor-advanced in one atomic commit before publication.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -246,6 +247,7 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
     let event =
         domain::account_event(raw_event, resolve_realm(client, raw_event), observed_at()).value;
     let cursor = raw_event.id.clone();
+    let (scan_locations, scan_fallbacks) = scan_projection(&event);
     let inserted = if event.name == domain::EventName::DeviceDecommissioned {
         // Device decommissioning is an explicit removal signal (unlike a
         // filtered or visibility-scoped collection page).
@@ -257,7 +259,7 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
     } else {
         client
             .managed_state()
-            .apply_event(&event, &cursor)
+            .apply_event_with_locations(&event, &cursor, scan_locations, scan_fallbacks)
             .map_err(persistence_error)?
     };
     if !inserted {
@@ -339,6 +341,85 @@ fn schedule_continuity_reconciliation(client: &Client) -> Result<()> {
             &serde_json::json!({ "id": "account" }),
         )
         .map_err(persistence_error)
+}
+
+/// Projects direct and controller-collated scan reports through one adapter.
+/// Invalid entries retain the raw event and request only their own refresh.
+fn scan_projection(
+    event: &Event,
+) -> (
+    Vec<domain::Observation<domain::Location>>,
+    Vec<(Realm, String)>,
+) {
+    let Some(realm) = event.realm.clone() else {
+        return (Vec::new(), Vec::new());
+    };
+    let entries: Vec<BTreeMap<String, Value>> = match event.name.as_str() {
+        "scan.completed" => vec![event.payload.clone()],
+        "ami.survey.digest" => event
+            .payload
+            .get("report")
+            .and_then(|report| report.get("scans"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .map(|entry| {
+                entry
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut locations = Vec::new();
+    let mut fallbacks = BTreeSet::new();
+    for entry in &entries {
+        let target = entry.get("scan_target").and_then(Value::as_str);
+        let result = target
+            .zip(entry.get("scan_type").and_then(Value::as_str))
+            .zip(entry.get("report").and_then(Value::as_object))
+            .ok_or(())
+            .and_then(|((target, scan_type), report)| {
+                domain::scan_report_location(
+                    target,
+                    scan_type,
+                    report,
+                    realm.clone(),
+                    event.occurred_at.clone(),
+                    event.id.as_str(),
+                )
+                .map_err(|_| ())
+            });
+        match result {
+            Ok(location) => locations.push(location),
+            Err(()) => {
+                if let Some(target) = target {
+                    warn!(
+                        target: "replicant_client::events",
+                        event_id = %event.id,
+                        scan_target = target,
+                        "scan report was not projectable; queued targeted reconciliation"
+                    );
+                    fallbacks.insert(target.to_owned());
+                } else {
+                    warn!(
+                        target: "replicant_client::events",
+                        event_id = %event.id,
+                        "scan report was malformed and had no target for reconciliation"
+                    );
+                }
+            }
+        }
+    }
+    (
+        locations,
+        fallbacks
+            .into_iter()
+            .map(|target| (realm.clone(), target))
+            .collect(),
+    )
 }
 
 /// `trade.completed` cross-domain reconciliation: the buyer/seller device
@@ -992,6 +1073,260 @@ mod tests {
     };
     use crate::managed::{ClientDegradation, ClientStatus};
     use crate::raw::{SecretString, Url};
+
+    fn scan_event(name: &str, payload: serde_json::Value) -> Event {
+        scan_event_with_id("scan-test", name, payload)
+    }
+
+    fn scan_event_with_id(id: &str, name: &str, payload: serde_json::Value) -> Event {
+        Event {
+            id: crate::domain::EventId::from(id),
+            realm: Some(Realm::Live),
+            name: crate::domain::EventName::from(name),
+            category: crate::domain::EventCategory::from("scan"),
+            device: None,
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-27T00:00:00Z".into(),
+            payload: payload
+                .as_object()
+                .expect("object payload")
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scan_reports_project_direct_and_digest_delivery_modes() {
+        let direct = scan_event(
+            "scan.completed",
+            serde_json::json!({
+                "scan_target": "NUNKA-3",
+                "scan_type": "planet",
+                "report": {"planet": {"designation": "NUNKA-3", "atmosphere": "thin"}}
+            }),
+        );
+        let (direct_locations, direct_fallbacks) = scan_projection(&direct);
+        assert_eq!(direct_locations.len(), 1);
+        assert!(direct_fallbacks.is_empty());
+        assert_eq!(direct_locations[0].value.scanned, Some(true));
+        assert_eq!(
+            direct_locations[0].metadata.authority,
+            ObservationAuthority::EventDelta
+        );
+        let future = scan_event(
+            "scan.completed",
+            serde_json::json!({
+                "scan_target": "NUNKA-4",
+                "scan_type": "planet",
+                "report": {"planet": {"designation": "NUNKA-4"}, "future": {"kept": true}}
+            }),
+        );
+        assert_eq!(
+            scan_projection(&future).0[0].value.unknown["event_scan_report"]["future"]["kept"],
+            true
+        );
+
+        let digest = scan_event(
+            "ami.survey.digest",
+            serde_json::json!({
+                "report": {"scans": [
+                    {"scan_target": "NUNKA-3", "scan_type": "planet", "report": {"planet": {"designation": "NUNKA-3", "atmosphere": "thin"}}},
+                    {"scan_target": "NUNKA-3-MOON-1", "scan_type": "moon", "report": {"moon": {"designation": "NUNKA-3-MOON-1"}}},
+                    {"scan_target": "NUNKA-3", "scan_type": "planet", "report": {"planet": {"designation": "NUNKA-3"}}},
+                    {"scan_target": "BROKEN", "scan_type": "planet", "report": {"planet": {}}}
+                ]}
+            }),
+        );
+        let (digest_locations, digest_fallbacks) = scan_projection(&digest);
+        assert_eq!(digest_locations.len(), 3);
+        assert_eq!(digest_fallbacks, vec![(Realm::Live, "BROKEN".into())]);
+        assert_eq!(direct_locations[0].value, digest_locations[0].value);
+
+        let active_digest = scan_event(
+            "ami.survey.digest",
+            serde_json::json!({"report": {"scans": [{
+                "scan_target": "NUNKA-3",
+                "scan_type": "planet",
+                "report": {"planet": {"designation": "NUNKA-3", "atmosphere": "thin"}}
+            }]}}),
+        );
+        let direct_state = crate::managed::state::StateEngine::open_memory().expect("direct state");
+        let digest_state = crate::managed::state::StateEngine::open_memory().expect("digest state");
+        let (locations, fallbacks) = scan_projection(&direct);
+        direct_state
+            .apply_event_with_locations(&direct, direct.id.as_str(), locations, fallbacks)
+            .expect("direct event");
+        let (locations, fallbacks) = scan_projection(&active_digest);
+        digest_state
+            .apply_event_with_locations(
+                &active_digest,
+                active_digest.id.as_str(),
+                locations,
+                fallbacks,
+            )
+            .expect("digest event");
+        assert_eq!(
+            direct_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>(),
+            digest_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>()
+        );
+
+        let empty = scan_event(
+            "ami.survey.digest",
+            serde_json::json!({"report": {"scans": []}}),
+        );
+        assert_eq!(scan_projection(&empty), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn inactive_direct_scans_and_active_digest_replay_to_the_same_state() {
+        let direct_events = [
+            scan_event_with_id(
+                "1-0",
+                "scan.completed",
+                serde_json::json!({
+                    "scan_target": "NUNKA-3", "scan_type": "planet",
+                    "report": {"planet": {"designation": "NUNKA-3"}}
+                }),
+            ),
+            scan_event_with_id(
+                "2-0",
+                "scan.completed",
+                serde_json::json!({
+                    "scan_target": "NUNKA-3-MOON-1", "scan_type": "moon",
+                    "report": {"moon": {"designation": "NUNKA-3-MOON-1"}}
+                }),
+            ),
+        ];
+        let digest = scan_event_with_id(
+            "1-0",
+            "ami.survey.digest",
+            serde_json::json!({"report": {"scans": [
+                {"scan_target": "NUNKA-3", "scan_type": "planet", "report": {"planet": {"designation": "NUNKA-3"}}},
+                {"scan_target": "NUNKA-3-MOON-1", "scan_type": "moon", "report": {"moon": {"designation": "NUNKA-3-MOON-1"}}}
+            ]}}),
+        );
+        let direct_state = crate::managed::state::StateEngine::open_memory().expect("direct state");
+        let digest_state = crate::managed::state::StateEngine::open_memory().expect("digest state");
+
+        for event in &direct_events {
+            let (locations, fallbacks) = scan_projection(event);
+            assert!(
+                direct_state
+                    .apply_event_with_locations(event, event.id.as_str(), locations, fallbacks)
+                    .expect("direct scan is committed")
+            );
+        }
+        let (locations, fallbacks) = scan_projection(&digest);
+        assert!(
+            digest_state
+                .apply_event_with_locations(&digest, digest.id.as_str(), locations, fallbacks)
+                .expect("digest is committed")
+        );
+        assert_eq!(
+            direct_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>(),
+            digest_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>()
+        );
+
+        let replay = &direct_events[1];
+        let (locations, fallbacks) = scan_projection(replay);
+        assert!(
+            !direct_state
+                .apply_event_with_locations(replay, replay.id.as_str(), locations, fallbacks)
+                .expect("replayed direct scan is ignored")
+        );
+        assert_eq!(
+            direct_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>(),
+            digest_state
+                .locations()
+                .into_iter()
+                .map(|location| location.value)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scan_projection_is_committed_with_the_event_and_replay_is_a_noop() {
+        let event = scan_event(
+            "scan.completed",
+            serde_json::json!({
+                "scan_target": "NUNKA-3",
+                "scan_type": "planet",
+                "report": {"planet": {"designation": "NUNKA-3"}}
+            }),
+        );
+        let state = crate::managed::state::StateEngine::open_memory().expect("state");
+        let (locations, fallbacks) = scan_projection(&event);
+        assert!(
+            state
+                .apply_event_with_locations(
+                    &event,
+                    event.id.as_str(),
+                    locations.clone(),
+                    fallbacks.clone()
+                )
+                .expect("first event is committed")
+        );
+        assert_eq!(state.snapshot().revision(), 1);
+        assert_eq!(state.locations().len(), 1);
+        assert!(
+            state
+                .claim_reconciliation_work()
+                .expect("queue lookup")
+                .is_none(),
+            "a fully projectable report must not schedule fallback HTTP"
+        );
+        assert!(
+            !state
+                .apply_event_with_locations(&event, event.id.as_str(), locations, fallbacks)
+                .expect("replayed event is ignored")
+        );
+        assert_eq!(state.snapshot().revision(), 1);
+        assert_eq!(state.locations().len(), 1);
+
+        let malformed = scan_event(
+            "scan.completed",
+            serde_json::json!({
+                "scan_target": "BROKEN",
+                "scan_type": "planet",
+                "report": {"planet": {}}
+            }),
+        );
+        let fallback_state =
+            crate::managed::state::StateEngine::open_memory().expect("fallback state");
+        let (locations, fallbacks) = scan_projection(&malformed);
+        fallback_state
+            .apply_event_with_locations(&malformed, malformed.id.as_str(), locations, fallbacks)
+            .expect("malformed event is still committed");
+        let work = fallback_state
+            .claim_reconciliation_work()
+            .expect("queue lookup")
+            .expect("targeted reconciliation");
+        assert_eq!(work.kind, "location");
+        assert_eq!(work.payload["id"], "BROKEN");
+    }
 
     fn device_in_realm(realm: Realm, id: &str) -> Observation<Device> {
         Observation {

@@ -83,7 +83,8 @@ pub struct PrintingInfo {
     pub completes_at: Option<String>,
     /// Device type being printed.
     pub device_type: Option<String>,
-    /// Estimated seconds remaining.
+    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
+    /// `f64` is retained for source compatibility and accepts integer JSON.
     pub eta_seconds: Option<f64>,
     /// Completion percentage.
     pub progress_percent: Option<f64>,
