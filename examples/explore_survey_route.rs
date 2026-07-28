@@ -530,6 +530,7 @@ struct CurrentSystemSurveyCheck {
     moon_systems_checked: usize,
     incomplete_moon_systems: Vec<String>,
     hydration_failures: usize,
+    hydration_unknown_designations: usize,
     hydration_maximum_reached: bool,
 }
 
@@ -653,6 +654,7 @@ async fn reconcile_current_system_scan_on_startup(
             moon_systems_checked = check.moon_systems_checked,
             incomplete_moon_systems = ?check.incomplete_moon_systems,
             hydration_failures = check.hydration_failures,
+            hydration_unknown_designations = check.hydration_unknown_designations,
             hydration_maximum_reached = check.hydration_maximum_reached,
             "completed current-system planet and moon survey check"
         );
@@ -697,10 +699,14 @@ async fn inspect_current_system_surveys(
         .value;
     let planet_count_complete = count_progress_complete(root.planets_total, root.planets_scanned);
 
+    // Only planets and moons are scannable survey targets. Resource sites
+    // (`-SAL-`) and system objects (`-OBJ-`) are embedded reference data and
+    // must not be fetched or allowed to make survey completeness inconclusive.
     let hydration = client
         .locations()
         .hydrate_system(current_star)
-        .all_known_objects()
+        .planetary_bodies_only()
+        .max_depth(2)
         .max_locations(4096)
         .concurrency(config.star_detail_concurrency)
         .run()
@@ -794,8 +800,9 @@ async fn inspect_current_system_surveys(
         }
     }
 
-    let hydration_complete =
-        !hydration.maximum_reached() && hydration.failures().is_empty();
+    let hydration_complete = !hydration.maximum_reached()
+        && hydration.failures().is_empty()
+        && hydration.unknown_designations().is_empty();
     let all_known_bodies_surveyed =
         unsurveyed_bodies.is_empty() && surveyed.len() == bodies.len();
 
@@ -825,6 +832,7 @@ async fn inspect_current_system_surveys(
         moon_systems_checked = planet_designations.len(),
         moon_counts_known,
         hydration_failures = hydration.failures().len(),
+        hydration_unknown_designations = hydration.unknown_designations().len(),
         hydration_maximum_reached = hydration.maximum_reached(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "inspected current-system planetary survey completeness"
@@ -840,6 +848,7 @@ async fn inspect_current_system_surveys(
         moon_systems_checked: planet_designations.len(),
         incomplete_moon_systems,
         hydration_failures: hydration.failures().len(),
+        hydration_unknown_designations: hydration.unknown_designations().len(),
         hydration_maximum_reached: hydration.maximum_reached(),
     })
 }
@@ -2753,7 +2762,7 @@ fn is_survey_directive_completion_for(
 ) -> bool {
     if !matches!(
         event.name.as_str(),
-        "directive.complete" | "directive.completed"
+        "directive.completed"
     ) {
         return false;
     }

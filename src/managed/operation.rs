@@ -876,6 +876,7 @@ impl LocationsGateway {
         LocationHydration {
             client: self.client.clone(),
             root: star_designation.into(),
+            scope: LocationHydrationScope::AllKnownObjects,
             max_locations: 4096,
             max_depth: 64,
             concurrency: 1,
@@ -923,6 +924,12 @@ impl LocationHydrationReport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocationHydrationScope {
+    AllKnownObjects,
+    PlanetaryBodiesOnly,
+}
+
 /// Configures recursive hydration.  It never constructs a designation from a
 /// count or naming convention; only designations present in documented fields
 /// are queued.
@@ -930,6 +937,7 @@ impl LocationHydrationReport {
 pub struct LocationHydration {
     client: Client,
     root: String,
+    scope: LocationHydrationScope,
     max_locations: usize,
     max_depth: usize,
     concurrency: usize,
@@ -937,7 +945,18 @@ pub struct LocationHydration {
 impl LocationHydration {
     /// Selects every documented designation-bearing child collection.
     #[must_use]
-    pub fn all_known_objects(self) -> Self {
+    pub fn all_known_objects(mut self) -> Self {
+        self.scope = LocationHydrationScope::AllKnownObjects;
+        self
+    }
+    /// Selects only planets and moons.
+    ///
+    /// This excludes embedded resource sites, system objects, devices, shops,
+    /// belts, and parent references. It is appropriate for workflows that only
+    /// need scannable planetary-body knowledge.
+    #[must_use]
+    pub fn planetary_bodies_only(mut self) -> Self {
+        self.scope = LocationHydrationScope::PlanetaryBodiesOnly;
         self
     }
     /// Sets the maximum number of unique location requests.
@@ -967,6 +986,7 @@ impl LocationHydration {
             target: "replicant_client::locations",
             event = "locations.hydration_started",
             root = %self.root,
+            scope = ?self.scope,
             max_locations = self.max_locations,
             max_depth = self.max_depth,
             configured_concurrency = self.concurrency,
@@ -1079,8 +1099,11 @@ impl LocationHydration {
             report.locations_committed += 1;
 
             let extract_started = Instant::now();
-            let children =
-                verified_child_designations(&response.value, &mut report.unknown_designations);
+            let children = verified_child_designations(
+                &response.value,
+                &mut report.unknown_designations,
+                self.scope,
+            );
             let child_count = children.len();
             for child in children {
                 if !seen.contains(&child) {
@@ -1128,6 +1151,7 @@ fn object_designation(value: &raw::JsonObject) -> Option<String> {
 fn verified_child_designations(
     location: &raw::locations::Location,
     unknown: &mut BTreeSet<String>,
+    scope: LocationHydrationScope,
 ) -> Vec<String> {
     let mut result = BTreeSet::new();
     let mut add = |object: &raw::JsonObject| {
@@ -1137,39 +1161,50 @@ fn verified_child_designations(
             unknown.insert("documented child without designation".into());
         }
     };
-    for items in [
-        &location.planets,
-        &location.moons,
-        &location.system_objects,
-        &location.devices,
-        &location.resource_sites,
-        &location.shops,
-    ]
-    .into_iter()
-    .flatten()
+
+    for items in [&location.planets, &location.moons]
+        .into_iter()
+        .flatten()
     {
         for item in items {
             add(item);
         }
     }
-    for object in [
-        &location.asteroid_belt,
-        &location.kuiper,
-        &location.lagrange,
-        &location.oort,
-        &location.outer_system,
-        &location.object,
-        &location.star,
-        &location.belt,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        add(object);
+
+    if scope == LocationHydrationScope::AllKnownObjects {
+        for items in [
+            &location.system_objects,
+            &location.devices,
+            &location.resource_sites,
+            &location.shops,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for item in items {
+                add(item);
+            }
+        }
+        for object in [
+            &location.asteroid_belt,
+            &location.kuiper,
+            &location.lagrange,
+            &location.oort,
+            &location.outer_system,
+            &location.object,
+            &location.star,
+            &location.belt,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add(object);
+        }
+        if let Some(parent) = &location.parent {
+            result.insert(parent.clone());
+        }
     }
-    if let Some(parent) = &location.parent {
-        result.insert(parent.clone());
-    }
+
     result.into_iter().collect()
 }
 
@@ -1186,13 +1221,71 @@ mod location_hydration_tests {
                     .unwrap()
                     .clone(),
             ]),
+            resource_sites: Some(vec![
+                serde_json::json!({"designation": "SOL-2-SAL-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            system_objects: Some(vec![
+                serde_json::json!({"designation": "SOL-OBJ-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
             moons_total: Some(99),
             ..Default::default()
         };
         let mut unknown = BTreeSet::new();
         assert_eq!(
-            verified_child_designations(&location, &mut unknown),
-            vec!["SOL-2"]
+            verified_child_designations(
+                &location,
+                &mut unknown,
+                LocationHydrationScope::AllKnownObjects,
+            ),
+            vec!["SOL-2", "SOL-2-SAL-1", "SOL-OBJ-1"]
+        );
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn planetary_body_scope_excludes_unscannable_children() {
+        let location = raw::locations::Location {
+            planets: Some(vec![
+                serde_json::json!({"designation": "XIKKKUX-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            moons: Some(vec![
+                serde_json::json!({"designation": "XIKKKUX-1-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            resource_sites: Some(vec![
+                serde_json::json!({"designation": "XIKKKUX-1-1-SAL-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            system_objects: Some(vec![
+                serde_json::json!({"designation": "XIKKKUX-OBJ-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]),
+            ..Default::default()
+        };
+        let mut unknown = BTreeSet::new();
+
+        assert_eq!(
+            verified_child_designations(
+                &location,
+                &mut unknown,
+                LocationHydrationScope::PlanetaryBodiesOnly,
+            ),
+            vec!["XIKKKUX-1", "XIKKKUX-1-1"]
         );
         assert!(unknown.is_empty());
     }
