@@ -367,6 +367,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {

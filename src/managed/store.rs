@@ -419,6 +419,9 @@ impl StoreProxy {
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.0.execute_blocking(|s| s.event_cursor())
     }
+    pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
+        self.0.execute_blocking(|store| store.read_events())
+    }
     pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
         let cursor = cursor.to_owned();
         self.0
@@ -1906,6 +1909,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {
@@ -2146,6 +2154,45 @@ mod tests {
         let restored = store.restore_devices().expect("restore devices");
         assert_eq!(restored.len(), 2);
         assert!(restored.contains_key(&DeviceKey::live("same-code".into())));
+    }
+
+    #[test]
+    fn device_operational_state_survives_store_round_trip() {
+        let mut store = Store::open_memory().expect("open memory store");
+        let mut observation = device(Realm::Live, "DRONE");
+        observation.value.relationships.stowed_in = Some(DeviceKey::live("VESSEL".into()));
+        observation.value.relationships.controller = Some(DeviceKey::live("CTRL".into()));
+        observation.value.relationships.stowed_devices =
+            vec![DeviceKey::live("CHILD".into())];
+        observation.value.stow_capacity = Some(5);
+        observation.value.stow_used = Some(2);
+        observation.value.active_directive = Some(crate::domain::ActiveDeviceDirective {
+            directive: Some(crate::domain::DeviceDirective::from("survey_system")),
+            status: Some("active".into()),
+            details: BTreeMap::from([(
+                "directive".into(),
+                serde_json::Value::String("survey_system".into()),
+            )]),
+        });
+        observation.value.travel = Some(crate::domain::TravelState {
+            destination: Some(crate::domain::LocationKey::live("SOL-4-L4".into())),
+            eta_seconds: Some(42),
+            stage: Some("recalling".into()),
+            ..crate::domain::TravelState::default()
+        });
+        let expected = observation.value.clone();
+
+        store
+            .persist_devices(&[observation])
+            .expect("persist operational device");
+        let restored = store.restore_devices().expect("restore devices");
+        assert_eq!(
+            restored
+                .get(&DeviceKey::live("DRONE".into()))
+                .expect("restored operational device")
+                .value,
+            expected
+        );
     }
 
     #[test]

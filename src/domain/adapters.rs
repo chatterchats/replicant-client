@@ -160,16 +160,104 @@ pub fn account_me(
     }
 }
 
+fn related_device_list(
+    values: &[raw::JsonObject],
+    realm: &Realm,
+) -> Vec<DeviceKey> {
+    let mut devices = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("device_code")
+                .or_else(|| value.get("code"))
+                .and_then(Value::as_str)
+        })
+        .map(|id| WorldKey::in_realm(realm.clone(), DeviceId::new(id)))
+        .collect::<Vec<_>>();
+    devices.sort();
+    devices.dedup();
+    devices
+}
+
+fn location_key(value: &Option<String>, realm: &Realm) -> Option<LocationKey> {
+    value
+        .as_ref()
+        .map(|id| WorldKey::in_realm(realm.clone(), LocationId::new(id)))
+}
+
+fn whole_seconds(value: Option<f64>) -> Option<i64> {
+    value.filter(|value| value.is_finite()).and_then(|value| {
+        let rounded = value.round();
+        ((value - rounded).abs() <= f64::EPSILON
+            && rounded >= i64::MIN as f64
+            && rounded <= i64::MAX as f64)
+            .then_some(rounded as i64)
+    })
+}
+
+fn device_travel(
+    travel: &Option<raw::devices::TravelInfo>,
+    realm: &Realm,
+) -> Option<TravelState> {
+    travel.as_ref().map(|travel| TravelState {
+        arrives_at: travel.arrives_at.clone(),
+        departed_at: travel.departed_at.clone(),
+        destination: location_key(&travel.destination, realm),
+        eta_seconds: whole_seconds(travel.eta_seconds),
+        final_arrives_at: travel.final_arrives_at.clone(),
+        final_destination: location_key(&travel.final_destination, realm),
+        origin: location_key(&travel.origin, realm),
+        route_eta_seconds: whole_seconds(travel.route_eta_seconds),
+        stage: travel.stage.clone(),
+        travel_type: travel.r#type.clone(),
+    })
+}
+
+fn replicant_travel(
+    travel: &Option<raw::replicants::TravelInfo>,
+    realm: &Realm,
+) -> Option<TravelState> {
+    travel.as_ref().map(|travel| TravelState {
+        arrives_at: travel.arrives_at.clone(),
+        departed_at: travel.departed_at.clone(),
+        destination: location_key(&travel.destination, realm),
+        eta_seconds: travel.eta_seconds,
+        origin: location_key(&travel.origin, realm),
+        stage: travel.stage.clone(),
+        travel_type: travel.r#type.clone(),
+        ..TravelState::default()
+    })
+}
+
+fn active_device_directive(raw: &raw::devices::DeviceStatus) -> Option<ActiveDeviceDirective> {
+    if raw.ami_directive.is_none() && raw.ami_directive_status.is_none() {
+        return None;
+    }
+    let details = raw
+        .ami_directive
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let directive = details
+        .get("directive")
+        .or_else(|| details.get("name"))
+        .and_then(Value::as_str)
+        .map(DeviceDirective::from);
+    Some(ActiveDeviceDirective {
+        directive,
+        status: raw.ami_directive_status.clone(),
+        details,
+    })
+}
+
 fn device(
     raw: &raw::devices::DeviceStatus,
     realm: Realm,
     access: AccessScope,
 ) -> Result<Device, NormalizeError> {
     let device_id = DeviceId::new(required(raw.device_code.as_ref(), "device_code")?);
-    let location = raw
-        .location
-        .as_ref()
-        .map(|value| WorldKey::in_realm(realm.clone(), LocationId::new(value)));
+    let location = location_key(&raw.location, &realm);
     let assigned_replicant = raw
         .replicant_code
         .as_ref()
@@ -209,10 +297,19 @@ fn device(
         tags: raw.tags.clone(),
         relationships: DeviceRelationships {
             attached_to: related(&raw.attached_to_device_code),
+            stowed_in: related(&raw.stowed_in_device_code),
             controller: related(&raw.controller_device_code),
+            attached_devices: related_device_list(&raw.attached_devices, &realm),
+            controlled_devices: related_device_list(&raw.controlled_devices, &realm),
+            stowed_devices: related_device_list(&raw.stowed_devices, &realm),
             assigned_replicant,
             hosting_replicant,
         },
+        attach_capacity: raw.attach_capacity,
+        stow_capacity: raw.stow_capacity,
+        stow_used: raw.stow_used,
+        active_directive: active_device_directive(raw),
+        travel: device_travel(&raw.travel, &realm),
         access,
     })
 }
@@ -339,7 +436,7 @@ fn replicant(
     let hosted_device = raw
         .hosted_device_code
         .as_ref()
-        .map(|id| WorldKey::in_realm(realm, DeviceId::new(id)));
+        .map(|id| WorldKey::in_realm(realm.clone(), DeviceId::new(id)));
     let private = owned.then(|| OwnedReplicantData {
         description: raw.description.clone(),
         pronouns: raw.pronouns.clone(),
@@ -354,6 +451,7 @@ fn replicant(
         status: raw.status.clone().map(ReplicantStatus::from),
         location,
         hosted_device,
+        travel: replicant_travel(&raw.travel, &realm),
         private,
         access,
     })
@@ -450,6 +548,13 @@ pub fn location_detail(
             .parent
             .as_ref()
             .map(|parent| WorldKey::in_realm(realm.clone(), LocationId::new(parent))),
+        survey_progress: LocationSurveyProgress {
+            planets_total: raw.planets_total,
+            planets_scanned: raw.planets_scanned,
+            moons_total: raw.moons_total,
+            moons_scanned: raw.moons_scanned,
+            moons_total_estimated: raw.moons_total_estimated,
+        },
         environment: LocationEnvironment {
             atmosphere: knowledge(
                 body.and_then(|body| body.atmosphere.clone())
@@ -818,4 +923,195 @@ mod location_tests {
             Some(Value::Object(_))
         ));
     }
+
+    #[test]
+    fn device_operational_state_is_retained_by_managed_normalization() {
+        let raw: raw::devices::DeviceStatus = serde_json::from_value(serde_json::json!({
+            "device_code": "DRONE",
+            "device_type": "survey_drone",
+            "status": "recalling",
+            "replicant_code": "R1",
+            "location": null,
+            "stowed_in_device_code": "VESSEL",
+            "controller_device_code": "CTRL",
+            "attached_devices": [{"device_code": "ATTACHED"}],
+            "controlled_devices": [{"device_code": "CONTROLLED"}],
+            "stowed_devices": [{"device_code": "STOWED"}],
+            "attach_capacity": 2,
+            "stow_capacity": 5,
+            "stow_used": 3,
+            "available_commands": ["withdraw", "stow"],
+            "ami_directive": {
+                "directive": "survey_system",
+                "planets": "all",
+                "moons": "all"
+            },
+            "ami_directive_status": "active",
+            "travel": {
+                "origin": "SOL-1-L4",
+                "destination": "SOL-4-L4",
+                "final_destination": "SOL-4-L4",
+                "arrives_at": "2026-07-29T12:00:00Z",
+                "final_arrives_at": "2026-07-29T12:00:00Z",
+                "eta_seconds": 42,
+                "route_eta_seconds": 42,
+                "stage": "recalling",
+                "type": "local"
+            }
+        }))
+        .expect("device status should decode");
+
+        let observation = device_detail(
+            &raw,
+            Realm::Live,
+            AccessScope::Owned,
+            ObservationTime::now(),
+        )
+        .expect("device should normalize");
+        let device = observation.value;
+
+        assert_eq!(
+            device.relationships.stowed_in.as_ref().map(|key| key.id.as_str()),
+            Some("VESSEL")
+        );
+        assert_eq!(
+            device.relationships.controller.as_ref().map(|key| key.id.as_str()),
+            Some("CTRL")
+        );
+        assert_eq!(
+            device
+                .relationships
+                .attached_devices
+                .iter()
+                .map(|key| key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ATTACHED"]
+        );
+        assert_eq!(
+            device
+                .relationships
+                .controlled_devices
+                .iter()
+                .map(|key| key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["CONTROLLED"]
+        );
+        assert_eq!(
+            device
+                .relationships
+                .stowed_devices
+                .iter()
+                .map(|key| key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["STOWED"]
+        );
+        assert_eq!(device.attach_capacity, Some(2));
+        assert_eq!(device.stow_capacity, Some(5));
+        assert_eq!(device.stow_used, Some(3));
+        let directive = device
+            .active_directive
+            .as_ref()
+            .expect("active directive should be retained");
+        assert_eq!(
+            directive.directive.as_ref().map(DeviceDirective::as_str),
+            Some("survey_system")
+        );
+        assert_eq!(directive.status.as_deref(), Some("active"));
+        assert_eq!(
+            directive.details.get("planets").and_then(Value::as_str),
+            Some("all")
+        );
+        let travel = device.travel.as_ref().expect("travel should be retained");
+        assert_eq!(
+            travel.destination.as_ref().map(|key| key.id.as_str()),
+            Some("SOL-4-L4")
+        );
+        assert_eq!(travel.eta_seconds, Some(42));
+        assert_eq!(travel.stage.as_deref(), Some("recalling"));
+    }
+
+    #[test]
+    fn replicant_travel_is_retained_by_managed_normalization() {
+        let raw: raw::replicants::ReplicantStatus = serde_json::from_value(serde_json::json!({
+            "replicant_code": "R1",
+            "status": "traveling",
+            "location": null,
+            "travel": {
+                "origin": "SOL",
+                "destination": "KRUKKRAK",
+                "arrives_at": "2026-07-29T13:00:00Z",
+                "eta_seconds": 120,
+                "stage": "interstellar",
+                "type": "direct"
+            }
+        }))
+        .expect("replicant status should decode");
+
+        let observation = owned_replicant_detail(&raw, Realm::Live, ObservationTime::now())
+            .expect("replicant should normalize");
+        let travel = observation
+            .value
+            .travel
+            .as_ref()
+            .expect("travel should be retained");
+        assert_eq!(
+            travel.destination.as_ref().map(|key| key.id.as_str()),
+            Some("KRUKKRAK")
+        );
+        assert_eq!(travel.eta_seconds, Some(120));
+        assert_eq!(travel.stage.as_deref(), Some("interstellar"));
+    }
+
+    #[test]
+    fn aggregate_system_survey_progress_is_retained() {
+        let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "KRUKKRAK",
+            "location_type": "star",
+            "planets_total": 10,
+            "planets_scanned": 10,
+            "moons_total": 195,
+            "moons_scanned": 195,
+            "moons_total_estimated": false
+        }))
+        .expect("location should decode");
+
+        let observation = location_detail(&raw, Realm::Live, ObservationTime::now())
+            .expect("location should normalize");
+        assert_eq!(observation.value.survey_progress.planets_total, Some(10));
+        assert_eq!(observation.value.survey_progress.planets_scanned, Some(10));
+        assert_eq!(observation.value.survey_progress.moons_total, Some(195));
+        assert_eq!(observation.value.survey_progress.moons_scanned, Some(195));
+        assert_eq!(
+            observation.value.survey_progress.moons_total_estimated,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn old_device_json_without_operational_fields_still_decodes() {
+        let device: Device = serde_json::from_value(serde_json::json!({
+            "key": {"realm": "Live", "id": "D1"},
+            "device_type": "survey_drone",
+            "status": "idle",
+            "location": null,
+            "features": [],
+            "available_commands": [],
+            "available_directives": [],
+            "tags": [],
+            "relationships": {
+                "attached_to": null,
+                "controller": null,
+                "assigned_replicant": null,
+                "hosting_replicant": null
+            },
+            "access": "Owned"
+        }))
+        .expect("legacy device JSON should decode");
+
+        assert!(device.relationships.stowed_in.is_none());
+        assert!(device.relationships.attached_devices.is_empty());
+        assert!(device.active_directive.is_none());
+        assert!(device.travel.is_none());
+    }
+
 }

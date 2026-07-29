@@ -202,7 +202,7 @@
       "leg_distance_ly": 4.115067983642565,
       "survey_required": true,
       "system_scan_done": true,
-      "survey_done": false
+      "survey_done": true
     },
     {
       "star": "XIXI",
@@ -210,8 +210,8 @@
       "distance_from_center_ly": 20.78482114284364,
       "leg_distance_ly": 5.823222321876451,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "KUHKI",
@@ -219,8 +219,8 @@
       "distance_from_center_ly": 18.48210759518513,
       "leg_distance_ly": 2.728528112371211,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "XHAKHKHU",
@@ -228,8 +228,8 @@
       "distance_from_center_ly": 15.663609253617116,
       "leg_distance_ly": 4.593616606770736,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "XIHAKHXA",
@@ -237,8 +237,8 @@
       "distance_from_center_ly": 20.041117426181604,
       "leg_distance_ly": 5.671179268899896,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "XUKHKI",
@@ -246,8 +246,8 @@
       "distance_from_center_ly": 21.353510790734145,
       "leg_distance_ly": 4.212124701382901,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "XHIKWU",
@@ -255,8 +255,8 @@
       "distance_from_center_ly": 23.134510338885494,
       "leg_distance_ly": 2.34959255403996,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "KRAKHUX",
@@ -264,8 +264,8 @@
       "distance_from_center_ly": 26.0092557407935,
       "leg_distance_ly": 3.611143343873237,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "WIHAX",
@@ -273,8 +273,8 @@
       "distance_from_center_ly": 22.18788538887832,
       "leg_distance_ly": 6.5030213931679395,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "WUHA",
@@ -282,8 +282,8 @@
       "distance_from_center_ly": 20.802591174658986,
       "leg_distance_ly": 2.2273982603028193,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "KHUXXWAK",
@@ -291,8 +291,8 @@
       "distance_from_center_ly": 22.46915093611683,
       "leg_distance_ly": 2.245437304847322,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "XHAKKWUKKXHU",
@@ -300,8 +300,8 @@
       "distance_from_center_ly": 26.382254806593007,
       "leg_distance_ly": 4.4238816925862725,
       "survey_required": true,
-      "system_scan_done": false,
-      "survey_done": false
+      "system_scan_done": true,
+      "survey_done": true
     },
     {
       "star": "WUKHKAKIH",
@@ -309,7 +309,7 @@
       "distance_from_center_ly": 29.465116608966603,
       "leg_distance_ly": 3.436131100525702,
       "survey_required": true,
-      "system_scan_done": false,
+      "system_scan_done": true,
       "survey_done": false
     },
     {
@@ -691,6 +691,6 @@
       "survey_done": false
     }
   ],
-  "next_index": 20,
+  "next_index": 32,
   "phase": "surveying"
 }

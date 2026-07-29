@@ -825,14 +825,17 @@ impl LocationsGateway {
         super::gateways::LocationQuery::new(self.client.clone())
     }
 
-    /// Fetches, normalizes, commits, and publishes one location before returning it.
-    pub async fn get(&self, designation: &str) -> Result<domain::Location> {
+    async fn get_scoped(
+        &self,
+        designation: &str,
+        replicant_code: Option<&str>,
+    ) -> Result<domain::Location> {
         self.client.ensure_open()?;
         let response = self
             .client
             .managed_raw()
             .locations()
-            .get(designation, None)
+            .get(designation, replicant_code)
             .await?;
         let observation = domain::location_detail(
             &response.value,
@@ -850,6 +853,22 @@ impl LocationsGateway {
             .persist_location(observation)
             .map_err(persistence_error)?;
         Ok(self.cached(designation).unwrap_or(value))
+    }
+
+    /// Fetches, normalizes, commits, and publishes one unscoped location.
+    pub async fn get(&self, designation: &str) -> Result<domain::Location> {
+        self.get_scoped(designation, None).await
+    }
+
+    /// Fetches one location with replicant-relative fields such as travel
+    /// estimates and account-specific system survey progress, then commits the
+    /// normalized location before returning it.
+    pub async fn get_for_replicant(
+        &self,
+        designation: &str,
+        replicant_code: &str,
+    ) -> Result<domain::Location> {
+        self.get_scoped(designation, Some(replicant_code)).await
     }
 
     /// Alias for [`Self::get`]; remote I/O remains explicit.
@@ -2096,7 +2115,7 @@ mod tests {
 
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, query_param},
     };
 
     use super::*;
@@ -2123,6 +2142,46 @@ mod tests {
             .start()
             .await
             .expect("restore-only client")
+    }
+
+    #[tokio::test]
+    async fn replicant_scoped_location_get_commits_aggregate_survey_progress() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/KRUKKRAK"))
+            .and(query_param("replicant", "R1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "KRUKKRAK",
+                "location_type": "star",
+                "planets_total": 10,
+                "planets_scanned": 10,
+                "moons_total": 195,
+                "moons_scanned": 195,
+                "moons_total_estimated": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let location = client
+            .locations()
+            .get_for_replicant("KRUKKRAK", "R1")
+            .await
+            .expect("managed scoped location get");
+        assert_eq!(location.survey_progress.planets_total, Some(10));
+        assert_eq!(location.survey_progress.planets_scanned, Some(10));
+        assert_eq!(location.survey_progress.moons_total, Some(195));
+        assert_eq!(location.survey_progress.moons_scanned, Some(195));
+        assert_eq!(location.survey_progress.moons_total_estimated, Some(false));
+
+        let cached = client
+            .locations()
+            .cached("KRUKKRAK")
+            .expect("committed location");
+        assert_eq!(cached, location);
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[tokio::test]

@@ -646,6 +646,7 @@ mod location_predicate_tests {
             system_tags: Vec::new(),
             system: Some("SOL".into()),
             parent: None,
+            survey_progress: Default::default(),
             environment: LocationEnvironment {
                 atmosphere: Knowledge::Present(Atmosphere::Standard),
                 magnetic_field: Knowledge::Present(true),
@@ -890,6 +891,13 @@ impl DeviceHandle {
         self.command(raw::devices::DeviceCommand::Stow { target })
             .await
     }
+    /// Transfers this device to another account or replicant.
+    pub async fn change_owner(&self, target: impl Into<String>) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::ChangeOwner {
+            target: target.into(),
+        })
+        .await
+    }
     /// Attaches one or more devices to this device.
     pub async fn attach(&self, targets: raw::devices::TargetsCommand) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Attach(targets))
@@ -1125,6 +1133,7 @@ pub struct DeviceQuery {
     tags: Vec<String>,
     system: Option<String>,
     attached_to: DeviceLinkFilter<DeviceKey>,
+    stowed_in: DeviceLinkFilter<DeviceKey>,
     controller: DeviceLinkFilter<DeviceKey>,
     assigned_replicant: DeviceLinkFilter<ReplicantKey>,
     hosting_replicant: DeviceLinkFilter<ReplicantKey>,
@@ -1140,6 +1149,7 @@ impl DeviceQuery {
             tags: Vec::new(),
             system: None,
             attached_to: DeviceLinkFilter::Any,
+            stowed_in: DeviceLinkFilter::Any,
             controller: DeviceLinkFilter::Any,
             assigned_replicant: DeviceLinkFilter::Any,
             hosting_replicant: DeviceLinkFilter::Any,
@@ -1241,10 +1251,18 @@ impl DeviceQuery {
         self
     }
 
-    /// Alias for the attachment relationship used by the stow command.
+    /// Matches devices physically stowed inside `device`.
     #[must_use]
-    pub fn stowed_in(self, device: DeviceKey) -> Self {
-        self.attached_to(device)
+    pub fn stowed_in(mut self, device: DeviceKey) -> Self {
+        self.stowed_in = DeviceLinkFilter::Is(device);
+        self
+    }
+
+    /// Matches devices which are not currently stowed inside another device.
+    #[must_use]
+    pub fn not_stowed(mut self) -> Self {
+        self.stowed_in = DeviceLinkFilter::None;
+        self
     }
 
     #[must_use]
@@ -1333,6 +1351,9 @@ impl DeviceQuery {
             if !matches_link(
                 &self.attached_to,
                 entry.value.relationships.attached_to.as_ref(),
+            ) || !matches_link(
+                &self.stowed_in,
+                entry.value.relationships.stowed_in.as_ref(),
             ) || !matches_link(
                 &self.controller,
                 entry.value.relationships.controller.as_ref(),
@@ -1533,6 +1554,189 @@ impl DeviceQuerySubscription {
     }
 }
 
+/// Explicit remote collection refresh for owned devices.
+///
+/// Every fetched page is normalized, committed, and published before the
+/// builder advances to the next page. Filtered traversals never infer device
+/// removal from absence; an unfiltered traversal reconciles membership only
+/// after reaching the terminal cursor.
+#[derive(Clone, Debug)]
+pub struct DeviceRefreshQuery {
+    client: Client,
+    replicant_code: Option<String>,
+    device_type: Option<DeviceType>,
+    tag: Option<String>,
+    untagged: bool,
+    location: Option<String>,
+    page_size: i64,
+    max_pages: usize,
+}
+
+impl DeviceRefreshQuery {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            replicant_code: None,
+            device_type: None,
+            tag: None,
+            untagged: false,
+            location: None,
+            page_size: 50,
+            max_pages: 100,
+        }
+    }
+
+    /// Restricts the remote traversal to devices assigned to this replicant.
+    #[must_use]
+    pub fn assigned_to(mut self, replicant_code: impl Into<String>) -> Self {
+        self.replicant_code = Some(replicant_code.into());
+        self
+    }
+
+    /// Restricts the remote traversal to one device type.
+    #[must_use]
+    pub fn of_type(mut self, device_type: DeviceType) -> Self {
+        self.device_type = Some(device_type);
+        self
+    }
+
+    /// Restricts the remote traversal to one exact location designation.
+    #[must_use]
+    pub fn at(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
+        self
+    }
+
+    /// Restricts the remote traversal to devices carrying this tag.
+    #[must_use]
+    pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    /// Restricts the remote traversal to devices with no tags.
+    #[must_use]
+    pub fn untagged(mut self) -> Self {
+        self.untagged = true;
+        self
+    }
+
+    /// Sets the requested page size, clamped to the documented `1..=50` range.
+    #[must_use]
+    pub fn page_size(mut self, page_size: i64) -> Self {
+        self.page_size = page_size.clamp(1, 50);
+        self
+    }
+
+    /// Bounds the number of cursor pages accepted from the server.
+    #[must_use]
+    pub fn max_pages(mut self, max_pages: usize) -> Self {
+        self.max_pages = max_pages.max(1);
+        self
+    }
+
+    fn is_filtered(&self) -> bool {
+        self.replicant_code.is_some()
+            || self.device_type.is_some()
+            || self.tag.is_some()
+            || self.untagged
+            || self.location.is_some()
+    }
+
+    /// Fetches every page, committing each observation before returning a
+    /// stable key-sorted set of handles.
+    pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
+        self.client.ensure_open()?;
+        if self.tag.is_some() && self.untagged {
+            return Err(Error::Configuration {
+                message: "device refresh cannot combine a tag with `untagged`".into(),
+            });
+        }
+
+        let started_at = Instant::now();
+        let filtered = self.is_filtered();
+        let mut query = raw::devices::DeviceListQuery {
+            replicant_code: self.replicant_code,
+            device_type: self.device_type.map(|value| value.as_str().to_owned()),
+            tag: self.tag,
+            untagged: self.untagged.then_some(true),
+            location: self.location,
+            cursor: None,
+            limit: Some(self.page_size),
+        };
+        let mut keys = BTreeSet::new();
+        let mut pages = 0usize;
+
+        loop {
+            if pages >= self.max_pages {
+                return Err(Error::Configuration {
+                    message: format!(
+                        "device refresh exceeded its {}-page bound before reaching the terminal cursor",
+                        self.max_pages
+                    ),
+                });
+            }
+
+            let response = self.client.managed_raw().devices().list(&query).await?;
+            let next_cursor = response.value.next_cursor;
+            let collection = domain::device_collection(
+                &response.value,
+                Realm::Live,
+                filtered,
+                !filtered && next_cursor.is_none(),
+                observed_at(),
+            )
+            .map_err(normalization)?;
+            for observation in &collection.members {
+                keys.insert(observation.value.key.clone());
+            }
+            self.client
+                .managed_state()
+                .persist_devices(&collection.members)
+                .map_err(|_| Error::Persistence {
+                    message: "SQLite store operation failed".into(),
+                })?;
+            pages += 1;
+
+            match next_cursor {
+                Some(cursor) if query.cursor != Some(cursor) => query.cursor = Some(cursor),
+                Some(_) => {
+                    return Err(Error::Decode {
+                        message: "device collection returned a non-advancing cursor".into(),
+                        status: None,
+                        source: None,
+                    });
+                }
+                None => break,
+            }
+        }
+
+        if !filtered {
+            self.client
+                .managed_state()
+                .reconcile_owned_devices(&keys)
+                .map_err(|_| Error::Persistence {
+                    message: "SQLite store operation failed".into(),
+                })?;
+        }
+
+        info!(
+            target: "replicant_client::gateway::devices",
+            event = "devices.refresh_many_completed",
+            pages,
+            item_count = keys.len(),
+            filtered,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed paginated device refresh"
+        );
+
+        Ok(keys
+            .into_iter()
+            .map(|key| DeviceHandle::new(self.client.clone(), key))
+            .collect())
+    }
+}
+
 /// Gateway for owned devices. `cached` and `find` are local-only.
 #[derive(Clone, Debug)]
 pub struct DevicesGateway {
@@ -1557,6 +1761,11 @@ impl DevicesGateway {
     #[must_use]
     pub fn miners(&self) -> DeviceQuery {
         self.find().miners()
+    }
+    /// Starts an explicit managed, paginated remote collection refresh.
+    #[must_use]
+    pub fn refresh_many(&self) -> DeviceRefreshQuery {
+        DeviceRefreshQuery::new(self.client.clone())
     }
     /// Starts a local query for devices of a controller type.
     #[must_use]
@@ -2034,8 +2243,8 @@ impl InventoryGateway {
 #[cfg(test)]
 mod tests {
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        Match, Mock, MockServer, Request, ResponseTemplate,
+        matchers::{method, path, query_param},
     };
 
     use super::*;
@@ -2058,6 +2267,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: domain::DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: domain::ObservationMetadata {
@@ -2076,6 +2290,18 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MissingQueryParam(&'static str);
+
+    impl Match for MissingQueryParam {
+        fn matches(&self, request: &Request) -> bool {
+            request
+                .url
+                .query_pairs()
+                .all(|(name, _)| name.as_ref() != self.0)
+        }
+    }
+
     async fn client_at(base_url: &str) -> Client {
         Client::builder()
             .authentication_token(SecretString::from("token".to_string()))
@@ -2085,6 +2311,25 @@ mod tests {
             .start()
             .await
             .expect("restore-only client")
+    }
+
+    #[tokio::test]
+    async fn refresh_many_page_size_clamps_to_raw_device_bounds() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+
+        assert_eq!(
+            DeviceRefreshQuery::new(client.clone()).page_size(0).page_size,
+            1
+        );
+        assert_eq!(
+            DeviceRefreshQuery::new(client.clone())
+                .page_size(500)
+                .page_size,
+            50
+        );
+
+        client.close().await.expect("close");
     }
 
     #[tokio::test]
@@ -2398,6 +2643,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: Some("SOL".into()),
                 parent: None,
+                survey_progress: Default::default(),
                 environment: domain::LocationEnvironment {
                     atmosphere: Knowledge::Present(Atmosphere::Standard),
                     magnetic_field: Knowledge::Present(true),
@@ -2480,4 +2726,191 @@ mod tests {
         server.verify().await;
         client.close().await.expect("close");
     }
+
+    #[tokio::test]
+    async fn refresh_many_paginates_and_commits_operational_device_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .and(query_param("replicant_code", "R1"))
+            .and(query_param("limit", "2"))
+            .and(MissingQueryParam("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [
+                    {
+                        "device_code": "VESSEL",
+                        "device_type": "racing_vessel",
+                        "status": "idle",
+                        "replicant_code": "R1",
+                        "location": "SOL-4-L4",
+                        "stow_capacity": 5,
+                        "stow_used": 1,
+                        "stowed_devices": [{"device_code": "DRONE"}]
+                    },
+                    {
+                        "device_code": "CTRL",
+                        "device_type": "ami_survey_controller",
+                        "status": "active",
+                        "replicant_code": "R1",
+                        "location": null,
+                        "stowed_in_device_code": "VESSEL",
+                        "ami_directive": {"directive": "survey_system"},
+                        "ami_directive_status": "active"
+                    }
+                ],
+                "next_cursor": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .and(query_param("replicant_code", "R1"))
+            .and(query_param("limit", "2"))
+            .and(query_param("cursor", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [{
+                    "device_code": "DRONE",
+                    "device_type": "survey_drone",
+                    "status": "recalling",
+                    "replicant_code": "R1",
+                    "location": null,
+                    "controller_device_code": "CTRL",
+                    "travel": {
+                        "origin": "SOL-1-L4",
+                        "destination": "SOL-4-L4",
+                        "eta_seconds": 10,
+                        "stage": "recalling"
+                    }
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let handles = client
+            .devices()
+            .refresh_many()
+            .assigned_to("R1")
+            .page_size(2)
+            .collect()
+            .await
+            .expect("managed paginated refresh");
+        assert_eq!(handles.len(), 3);
+
+        let vessel = client
+            .devices()
+            .cached("VESSEL")
+            .expect("cached vessel")
+            .snapshot()
+            .await
+            .expect("vessel snapshot");
+        assert_eq!(vessel.stow_capacity, Some(5));
+        assert_eq!(vessel.stow_used, Some(1));
+        assert_eq!(
+            vessel
+                .relationships
+                .stowed_devices
+                .iter()
+                .map(|key| key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["DRONE"]
+        );
+
+        let controller = client
+            .devices()
+            .cached("CTRL")
+            .expect("cached controller")
+            .snapshot()
+            .await
+            .expect("controller snapshot");
+        assert_eq!(
+            controller
+                .relationships
+                .stowed_in
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("VESSEL")
+        );
+        assert_eq!(
+            controller
+                .active_directive
+                .as_ref()
+                .and_then(|directive| directive.directive.as_ref())
+                .map(|directive| directive.as_str()),
+            Some("survey_system")
+        );
+
+        let drone = client
+            .devices()
+            .cached("DRONE")
+            .expect("cached drone")
+            .snapshot()
+            .await
+            .expect("drone snapshot");
+        assert_eq!(
+            drone
+                .relationships
+                .controller
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("CTRL")
+        );
+        assert_eq!(
+            drone
+                .travel
+                .as_ref()
+                .and_then(|travel| travel.destination.as_ref())
+                .map(|key| key.id.as_str()),
+            Some("SOL-4-L4")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn stowed_relationship_query_is_distinct_from_attachment() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let vessel = DeviceKey::live("VESSEL".into());
+        let mut attached = cached_device("ATTACHED", DeviceType::MiningDrone, DeviceStatus::Idle);
+        attached.value.relationships.attached_to = Some(vessel.clone());
+        let mut stowed = cached_device("STOWED", DeviceType::MiningDrone, DeviceStatus::Idle);
+        stowed.value.relationships.stowed_in = Some(vessel.clone());
+        client
+            .managed_state()
+            .persist_devices(&[attached, stowed])
+            .expect("persist cached devices");
+
+        let stowed_ids = client
+            .devices()
+            .find()
+            .stowed_in(vessel)
+            .collect()
+            .await
+            .expect("stowed query")
+            .into_iter()
+            .map(|device| device.id().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(stowed_ids, ["STOWED"]);
+
+        let not_stowed_ids = client
+            .devices()
+            .find()
+            .not_stowed()
+            .collect()
+            .await
+            .expect("not-stowed query")
+            .into_iter()
+            .map(|device| device.id().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(not_stowed_ids, ["ATTACHED"]);
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
 }

@@ -109,6 +109,99 @@ impl EventEngine {
     }
 }
 
+/// Result of an explicit managed event-log catch-up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventCatchUpReport {
+    /// Whether the traversal reached the current end of the event log.
+    pub complete: bool,
+    /// Last durably applied account event cursor after the traversal.
+    pub cursor: Option<String>,
+}
+
+/// Local-only query over the durable, deduplicated account event journal.
+#[derive(Clone, Debug)]
+pub struct EventHistoryQuery {
+    client: Client,
+    after: Option<String>,
+    device_code: Option<String>,
+    event_name: Option<String>,
+}
+
+impl EventHistoryQuery {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            after: None,
+            device_code: None,
+            event_name: None,
+        }
+    }
+
+    /// Returns only events whose stream ID is after `cursor`.
+    #[must_use]
+    pub fn after(mut self, cursor: impl Into<String>) -> Self {
+        self.after = Some(cursor.into());
+        self
+    }
+
+    /// Returns only events associated with this device code.
+    #[must_use]
+    pub fn for_device(mut self, device_code: impl Into<String>) -> Self {
+        self.device_code = Some(device_code.into());
+        self
+    }
+
+    /// Returns only events with this exact event name.
+    #[must_use]
+    pub fn named(mut self, event_name: impl Into<String>) -> Self {
+        self.event_name = Some(event_name.into());
+        self
+    }
+
+    /// Collects a stable event-ID-ordered view from the durable local journal.
+    pub async fn collect(self) -> Result<Vec<Event>> {
+        self.client.ensure_open()?;
+        let mut events = self
+            .client
+            .managed_state()
+            .events()
+            .map_err(persistence_error)?;
+        events.retain(|event| {
+            self.after
+                .as_deref()
+                .is_none_or(|cursor| stream_id_is_after(event.id.as_str(), cursor))
+                && self.device_code.as_deref().is_none_or(|device_code| {
+                    event
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| device.id.as_str() == device_code)
+                })
+                && self
+                    .event_name
+                    .as_deref()
+                    .is_none_or(|event_name| event.name.as_str() == event_name)
+        });
+        events.sort_by(|left, right| stream_id_cmp(left.id.as_str(), right.id.as_str()));
+        Ok(events)
+    }
+}
+
+fn stream_id_parts(value: &str) -> Option<(u64, u64)> {
+    let (milliseconds, sequence) = value.split_once('-')?;
+    Some((milliseconds.parse().ok()?, sequence.parse().ok()?))
+}
+
+fn stream_id_cmp(left: &str, right: &str) -> core::cmp::Ordering {
+    match (stream_id_parts(left), stream_id_parts(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn stream_id_is_after(candidate: &str, cursor: &str) -> bool {
+    stream_id_cmp(candidate, cursor).is_gt()
+}
+
 /// Managed event observation gateway returned by [`Client::events`].
 #[derive(Clone, Debug)]
 pub struct EventsGateway {
@@ -118,6 +211,34 @@ pub struct EventsGateway {
 impl EventsGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Returns the last durably applied account event cursor. Local-only.
+    pub fn cursor(&self) -> Result<Option<String>> {
+        self.client.ensure_open()?;
+        self.client
+            .managed_state()
+            .event_cursor()
+            .map_err(persistence_error)
+    }
+
+    /// Explicitly catches up the unfiltered account event log, durably applying
+    /// every page before returning. This is the managed recovery path for an
+    /// SSE reconnect gap.
+    pub async fn catch_up(&self, max_pages: usize) -> Result<EventCatchUpReport> {
+        self.client.ensure_open()?;
+        let cursor = self.cursor()?;
+        let outcome = catch_up_unfiltered(&self.client, cursor, max_pages.max(1)).await?;
+        Ok(EventCatchUpReport {
+            complete: matches!(outcome, CatchUpOutcome::Complete),
+            cursor: self.cursor()?,
+        })
+    }
+
+    /// Starts a local-only query over the durable event journal.
+    #[must_use]
+    pub fn history(&self) -> EventHistoryQuery {
+        EventHistoryQuery::new(self.client.clone())
     }
 
     /// Subscribes to deduplicated events learned from unfiltered log
@@ -1099,6 +1220,86 @@ mod tests {
     }
 
     #[test]
+    fn stream_ids_are_ordered_numerically_not_lexically() {
+        assert!(stream_id_is_after("10-0", "9-999"));
+        assert!(stream_id_is_after("10-2", "10-1"));
+        assert!(!stream_id_is_after("10-1", "10-1"));
+        assert!(stream_id_cmp("100-0", "99-999").is_gt());
+    }
+
+    #[tokio::test]
+    async fn managed_event_history_is_durable_local_and_filterable() {
+        let client = restore_only_client().await;
+        let first = Event {
+            id: crate::domain::EventId::from("9-999"),
+            realm: Some(Realm::Live),
+            name: crate::domain::EventName::from("travel.departed"),
+            category: crate::domain::EventCategory::from("travel"),
+            device: Some(DeviceKey::live(DeviceId::from("D1"))),
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-29T00:00:00Z".into(),
+            payload: BTreeMap::new(),
+        };
+        let second = Event {
+            id: crate::domain::EventId::from("10-0"),
+            realm: Some(Realm::Live),
+            name: crate::domain::EventName::from("directive.completed"),
+            category: crate::domain::EventCategory::from("directive"),
+            device: Some(DeviceKey::live(DeviceId::from("D1"))),
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-29T00:00:01Z".into(),
+            payload: BTreeMap::new(),
+        };
+        let other = Event {
+            id: crate::domain::EventId::from("10-1"),
+            realm: Some(Realm::Live),
+            name: crate::domain::EventName::from("directive.completed"),
+            category: crate::domain::EventCategory::from("directive"),
+            device: Some(DeviceKey::live(DeviceId::from("D2"))),
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-07-29T00:00:02Z".into(),
+            payload: BTreeMap::new(),
+        };
+        client
+            .managed_state()
+            .apply_event(&first, first.id.as_str())
+            .expect("persist first event");
+        client
+            .managed_state()
+            .apply_event(&second, second.id.as_str())
+            .expect("persist second event");
+        client
+            .managed_state()
+            .apply_event(&other, other.id.as_str())
+            .expect("persist other event");
+
+        let events = client
+            .events()
+            .history()
+            .after("9-999")
+            .for_device("D1")
+            .named("directive.completed")
+            .collect()
+            .await
+            .expect("local managed history");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["10-0"]
+        );
+        assert_eq!(client.events().cursor().expect("cursor").as_deref(), Some("10-1"));
+        client.close().await.expect("close");
+    }
+
+    #[test]
     fn scan_reports_project_direct_and_digest_delivery_modes() {
         let direct = scan_event(
             "scan.completed",
@@ -1340,6 +1541,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {
@@ -1370,6 +1576,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {

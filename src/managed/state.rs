@@ -510,6 +510,15 @@ impl StateEngine {
             .event_cursor()
     }
 
+    /// Returns the durable, deduplicated account event journal.
+    pub(crate) fn events(&self) -> Result<Vec<Event>, StoreError> {
+        self.store
+            .lock()
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .read_events()
+    }
+
     /// Persists a baseline watermark with no accompanying event.
     pub(crate) fn set_event_cursor(&self, cursor: &str) -> Result<(), StoreError> {
         self.store
@@ -985,6 +994,11 @@ mod tests {
                 available_directives: Vec::new(),
                 tags: Vec::new(),
                 relationships: DeviceRelationships::default(),
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                active_directive: None,
+                travel: None,
                 access: AccessScope::Owned,
             },
             metadata: ObservationMetadata {
@@ -1174,6 +1188,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: Some("SOL".into()),
                 parent: None,
+                survey_progress: Default::default(),
                 environment: crate::domain::LocationEnvironment {
                     atmosphere: crate::domain::Knowledge::Present(crate::domain::Atmosphere::from(
                         "thin",
@@ -1201,6 +1216,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: None,
                 parent: None,
+                survey_progress: Default::default(),
                 environment: crate::domain::LocationEnvironment::default(),
                 unknown: BTreeMap::new(),
             },

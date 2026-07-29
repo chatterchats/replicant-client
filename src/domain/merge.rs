@@ -65,6 +65,7 @@ pub fn merge_replicant(
     }
     if matches!(incoming.metadata.access, AccessScope::Public) {
         trace!(target: "replicant_client::domain", "preserving private replicant fields from public observation");
+        incoming.value.travel = existing.value.travel.clone();
         incoming.value.private = existing.value.private.clone();
         incoming.value.access = existing.value.access.clone();
     }
@@ -87,6 +88,17 @@ pub fn merge_device(
             existing.value.relationships.assigned_replicant;
         incoming.value.relationships.hosting_replicant =
             existing.value.relationships.hosting_replicant;
+        incoming.value.relationships.stowed_in = existing.value.relationships.stowed_in;
+        incoming.value.relationships.attached_devices =
+            existing.value.relationships.attached_devices;
+        incoming.value.relationships.controlled_devices =
+            existing.value.relationships.controlled_devices;
+        incoming.value.relationships.stowed_devices = existing.value.relationships.stowed_devices;
+        incoming.value.attach_capacity = existing.value.attach_capacity;
+        incoming.value.stow_capacity = existing.value.stow_capacity;
+        incoming.value.stow_used = existing.value.stow_used;
+        incoming.value.active_directive = existing.value.active_directive;
+        incoming.value.travel = existing.value.travel;
     }
     MergeOutcome::Replaced(incoming)
 }

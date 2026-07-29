@@ -79,11 +79,14 @@ pub mod managed {
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions, Readiness,
         ReadinessComponent, ReconciliationPolicy, StartupPolicy,
     };
-    pub use events::{EventWatch, EventsGateway};
+    pub use events::{
+        EventCatchUpReport, EventHistoryQuery, EventWatch, EventsGateway,
+    };
     pub use galaxy::{CatalogueReport, GalaxyGateway, ReplicantStarSyncReport};
     pub use gateways::{
         AccountGateway, DeviceHandle, DeviceQuery, DeviceQueryChange, DeviceQuerySubscription,
-        DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway, LocationDiagnostic,
+        DeviceRefreshQuery, DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway,
+        LocationDiagnostic,
         LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
         LocationQueryDiagnostics, ReplicantHandle, ReplicantQuery, ReplicantsGateway,
     };
@@ -105,8 +108,9 @@ pub mod managed {
 pub use managed::{
     AccountGateway, BobnetGateway, BobnetWatch, CatalogueReport, Client, ClientBuilder,
     ClientDegradation, ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery,
-    DeviceQueryChange, DeviceQuerySubscription, DeviceWatch, DevicesGateway, DirectoryGateway,
-    DynamicCommand, EventStreamOptions, EventWatch, EventsGateway, FleetController, GalaxyGateway,
+    DeviceQueryChange, DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway,
+    DirectoryGateway, DynamicCommand, EventCatchUpReport, EventHistoryQuery, EventStreamOptions,
+    EventWatch, EventsGateway, FleetController, GalaxyGateway,
     InventoryGateway, LocationDiagnostic, LocationEventsGateway, LocationHydration,
     LocationHydrationFailure, LocationHydrationReport, LocationPredicateDiagnostic,
     LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, LocationsGateway,
@@ -125,8 +129,9 @@ pub use raw::SecretString;
 
 #[cfg(feature = "managed")]
 pub use domain::{
-    Account, AccountId, Atmosphere, Device, DeviceCommand, DeviceId, DeviceKey, DeviceStatus,
-    DeviceType, Event, EventId, Knowledge, LifeStage, Location, LocationId, LocationKey,
-    OperationId, Realm, Replicant, ReplicantId, ReplicantKey, SimulationId, Star, StarId,
-    StarKnowledge, TradeId, WorldKey,
+    Account, AccountId, ActiveDeviceDirective, Atmosphere, Device, DeviceCommand, DeviceId,
+    DeviceKey, DeviceRelationships, DeviceStatus, DeviceType, Event, EventId, Knowledge, LifeStage,
+    Location, LocationId, LocationKey, LocationSurveyProgress, OperationId, Realm, Replicant,
+    ReplicantId, ReplicantKey, SimulationId, Star, StarId, StarKnowledge, TradeId, TravelState,
+    WorldKey,
 };

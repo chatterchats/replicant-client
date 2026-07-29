@@ -18,11 +18,45 @@ pub struct Account {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceRelationships {
     pub attached_to: Option<DeviceKey>,
+    #[serde(default)]
+    pub stowed_in: Option<DeviceKey>,
     pub controller: Option<DeviceKey>,
+    #[serde(default)]
+    pub attached_devices: Vec<DeviceKey>,
+    #[serde(default)]
+    pub controlled_devices: Vec<DeviceKey>,
+    #[serde(default)]
+    pub stowed_devices: Vec<DeviceKey>,
     /// Replicant currently assigned as this device's owner or operator.
     pub assigned_replicant: Option<ReplicantKey>,
     /// Replicant matrix physically hosted by this device.
     pub hosting_replicant: Option<ReplicantKey>,
+}
+
+/// Normalized in-progress travel shared by devices and replicants.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TravelState {
+    pub arrives_at: Option<String>,
+    pub departed_at: Option<String>,
+    pub destination: Option<LocationKey>,
+    pub eta_seconds: Option<i64>,
+    pub final_arrives_at: Option<String>,
+    pub final_destination: Option<LocationKey>,
+    pub origin: Option<LocationKey>,
+    pub route_eta_seconds: Option<i64>,
+    pub stage: Option<String>,
+    pub travel_type: Option<String>,
+}
+
+/// Current AMI directive and its forward-compatible detail fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ActiveDeviceDirective {
+    pub directive: Option<DeviceDirective>,
+    pub status: Option<String>,
+    #[serde(default)]
+    pub details: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -36,7 +70,29 @@ pub struct Device {
     pub available_directives: Vec<DeviceDirective>,
     pub tags: Vec<String>,
     pub relationships: DeviceRelationships,
+    #[serde(default)]
+    pub attach_capacity: Option<i64>,
+    #[serde(default)]
+    pub stow_capacity: Option<i64>,
+    #[serde(default)]
+    pub stow_used: Option<i64>,
+    #[serde(default)]
+    pub active_directive: Option<ActiveDeviceDirective>,
+    #[serde(default)]
+    pub travel: Option<TravelState>,
     pub access: AccessScope,
+}
+
+impl Device {
+    #[must_use]
+    pub fn is_stowed_in(&self, vessel: &DeviceKey) -> bool {
+        self.relationships.stowed_in.as_ref() == Some(vessel)
+    }
+
+    #[must_use]
+    pub fn is_traveling(&self) -> bool {
+        self.travel.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,6 +112,8 @@ pub struct Replicant {
     pub status: Option<ReplicantStatus>,
     pub location: Option<LocationKey>,
     pub hosted_device: Option<DeviceKey>,
+    #[serde(default)]
+    pub travel: Option<TravelState>,
     pub private: Option<OwnedReplicantData>,
     pub access: AccessScope,
 }
@@ -101,6 +159,15 @@ pub struct LocationEnvironment {
     pub distance_from_sol_ly: Knowledge<f64>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocationSurveyProgress {
+    pub planets_total: Option<i64>,
+    pub planets_scanned: Option<i64>,
+    pub moons_total: Option<i64>,
+    pub moons_scanned: Option<i64>,
+    pub moons_total_estimated: Option<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Location {
     pub key: LocationKey,
@@ -110,6 +177,8 @@ pub struct Location {
     pub system_tags: Vec<String>,
     pub system: Option<String>,
     pub parent: Option<LocationKey>,
+    #[serde(default)]
+    pub survey_progress: LocationSurveyProgress,
     pub environment: LocationEnvironment,
     /// Sanitized, untyped response fields retained for a later contract update.
     #[serde(default)]
@@ -193,6 +262,26 @@ impl Location {
         }
         self.system = newer.system.clone().or_else(|| self.system.clone());
         self.parent = newer.parent.clone().or_else(|| self.parent.clone());
+        self.survey_progress.planets_total = newer
+            .survey_progress
+            .planets_total
+            .or(self.survey_progress.planets_total);
+        self.survey_progress.planets_scanned = newer
+            .survey_progress
+            .planets_scanned
+            .or(self.survey_progress.planets_scanned);
+        self.survey_progress.moons_total = newer
+            .survey_progress
+            .moons_total
+            .or(self.survey_progress.moons_total);
+        self.survey_progress.moons_scanned = newer
+            .survey_progress
+            .moons_scanned
+            .or(self.survey_progress.moons_scanned);
+        self.survey_progress.moons_total_estimated = newer
+            .survey_progress
+            .moons_total_estimated
+            .or(self.survey_progress.moons_total_estimated);
         merge_knowledge(
             &mut self.environment.atmosphere,
             &newer.environment.atmosphere,

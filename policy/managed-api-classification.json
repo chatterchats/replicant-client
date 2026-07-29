@@ -1,16 +1,174 @@
 {
-  "version": 1,
-  "durable_managed_domains": ["account", "devices", "replicants", "locations", "inventory", "simulations"],
+  "version": 2,
+  "durable_managed_domains": [
+    "account",
+    "devices",
+    "replicants",
+    "locations",
+    "inventory",
+    "simulations"
+  ],
   "classifications": {
-    "account": {"stateful_managed_read": ["get", "refresh", "rebind_after_verified_email"], "durable_mutation": ["update", "wipe"]},
-    "devices": {"stateful_managed_read": ["get", "refresh", "list"], "state_neutral_managed_read": ["cached", "find", "miners"], "durable_mutation": ["DeviceHandle::* command/configure/permission methods"], "local_watch": ["DeviceHandle::snapshot", "DeviceHandle::watch"]},
-    "replicants": {"stateful_managed_read": ["get_owned", "ReplicantHandle::refresh"], "state_neutral_managed_read": ["cached", "find", "ReplicantHandle::snapshot"], "durable_mutation": ["ReplicantHandle::* mutation methods"]},
-    "directory": {"stateful_managed_read": ["replicant", "search"], "reconciliation": "never from public or filtered results"},
-    "inventory": {"stateful_managed_read": ["list", "for_replicant"], "reconciliation": "never by absence"},
-    "simulations": {"stateful_managed_read": ["history"], "state_neutral_managed_read": ["find"], "volatile_cache_reference_read": ["scenarios", "active"], "durable_mutation": ["start", "abandon"]},
-    "trading": {"volatile_cache_reference_read": ["visible_to", "TradeControllerHandle::trades", "TradeControllerHandle::sync"], "durable_mutation": ["create", "execute", "delete"]},
-    "bobnet": {"volatile_cache_reference_read": ["channels", "RelayHistoryQuery::latest", "RelayHistoryQuery::list", "watch"], "durable_mutation": ["send"]},
-    "messages_locations_events": {"raw_only": ["read/list history not normalized into a durable domain"], "durable_mutation": ["mark_read", "contribute", "resolve"]}
+    "account": {
+      "stateful_managed_read": [
+        "get",
+        "refresh",
+        "rebind_after_verified_email"
+      ],
+      "durable_mutation": [
+        "update",
+        "wipe"
+      ]
+    },
+    "devices": {
+      "stateful_managed_read": [
+        "get",
+        "refresh",
+        "refresh_many"
+      ],
+      "state_neutral_managed_read": [
+        "cached",
+        "find",
+        "miners",
+        "controllers"
+      ],
+      "durable_mutation": [
+        "DeviceHandle::* command/configure/permission methods"
+      ],
+      "local_watch": [
+        "DeviceHandle::snapshot",
+        "DeviceHandle::watch"
+      ],
+      "operational_state": [
+        "stow/attachment/controller relationships",
+        "capacities",
+        "active AMI directive",
+        "active travel"
+      ]
+    },
+    "replicants": {
+      "stateful_managed_read": [
+        "get_owned",
+        "ReplicantHandle::refresh"
+      ],
+      "state_neutral_managed_read": [
+        "cached",
+        "find",
+        "ReplicantHandle::snapshot"
+      ],
+      "durable_mutation": [
+        "ReplicantHandle::* mutation methods"
+      ],
+      "operational_state": [
+        "active travel"
+      ]
+    },
+    "directory": {
+      "stateful_managed_read": [
+        "replicant",
+        "search"
+      ],
+      "reconciliation": "never from public or filtered results"
+    },
+    "inventory": {
+      "stateful_managed_read": [
+        "list",
+        "for_replicant"
+      ],
+      "reconciliation": "never by absence"
+    },
+    "simulations": {
+      "stateful_managed_read": [
+        "history"
+      ],
+      "state_neutral_managed_read": [
+        "find"
+      ],
+      "volatile_cache_reference_read": [
+        "scenarios",
+        "active"
+      ],
+      "durable_mutation": [
+        "start",
+        "abandon"
+      ]
+    },
+    "trading": {
+      "volatile_cache_reference_read": [
+        "visible_to",
+        "TradeControllerHandle::trades",
+        "TradeControllerHandle::sync"
+      ],
+      "durable_mutation": [
+        "create",
+        "execute",
+        "delete"
+      ]
+    },
+    "bobnet": {
+      "volatile_cache_reference_read": [
+        "channels",
+        "RelayHistoryQuery::latest",
+        "RelayHistoryQuery::list",
+        "watch"
+      ],
+      "durable_mutation": [
+        "send"
+      ]
+    },
+    "locations": {
+      "stateful_managed_read": [
+        "get",
+        "get_for_replicant",
+        "refresh",
+        "hydrate_system"
+      ],
+      "state_neutral_managed_read": [
+        "cached",
+        "find"
+      ],
+      "durable_mutation": [
+        "contribute"
+      ],
+      "operational_state": [
+        "aggregate planet/moon survey progress"
+      ]
+    },
+    "events": {
+      "stateful_managed_read": [
+        "catch_up"
+      ],
+      "state_neutral_managed_read": [
+        "cursor",
+        "history"
+      ],
+      "local_watch": [
+        "watch"
+      ],
+      "durability": "deduplicated account event journal and applied cursor"
+    },
+    "messages": {
+      "durable_mutation": [
+        "mark_read"
+      ]
+    },
+    "location_events": {
+      "state_neutral_managed_read": [
+        "list"
+      ],
+      "durable_mutation": [
+        "resolve"
+      ],
+      "note": "returns contract DTOs because no durable location-event projection exists"
+    }
   },
-  "full_sync_excludes": ["global star catalogue", "leaderboards", "public directory pages", "BobNet history", "trade views", "device logs/audit", "simulation scenarios/active views"]
+  "full_sync_excludes": [
+    "global star catalogue",
+    "leaderboards",
+    "public directory pages",
+    "BobNet history",
+    "trade views",
+    "device logs/audit",
+    "simulation scenarios/active views"
+  ]
 }
