@@ -37,6 +37,21 @@ let miners = client
     .await?;
 ```
 
+## FTL relay expansion example
+
+The workspace includes a pure `replicant-route-planner` crate and a
+restart-safe managed example that plans an exact minimum-new-relay network,
+reuses or activates account-owned relays, manufactures any shortfall, deploys
+and verifies the network, and returns the selected replicant to its hub.
+Planning is the default; add `--execute` to permit mutations.
+
+```sh
+cargo run --example expand_ftl_relay_network -- \
+  --replicant Chats-1 \
+  --hub SCEPTURUM-BELT-1 \
+  WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
+```
+
 **Status:** this repository is at the Phase 1 bootstrap stage. The package,
 feature graph, and checked-in Replicant Space contract corpus exist;
 the client itself does not yet. See

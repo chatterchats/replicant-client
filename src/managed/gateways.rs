@@ -23,6 +23,8 @@ use super::ami::{FleetController, MiningController, SurveyController, TransportC
 use super::operation::{self, ConfirmAccountWipe, DynamicCommand, Operation};
 use super::travel::TravelBuilder;
 
+const MAX_DEVICE_TAG_CHARACTERS: usize = 32;
+
 /// A local device-update stream. It never polls or otherwise issues network requests.
 pub struct DeviceWatch {
     receiver: watch::Receiver<std::sync::Arc<super::state::StateSnapshot>>,
@@ -929,6 +931,47 @@ impl DeviceHandle {
             controller: None,
             oncomplete: None,
             tags: None,
+        })
+        .await
+    }
+
+    /// Queues `quantity` tagged copies of a device on this autofactory.
+    ///
+    /// Tags are persisted with each printed device and are useful for
+    /// restart-safe orchestration that must identify the physical outputs of
+    /// individual print jobs.
+    pub async fn enqueue_print_with_tags<I, S>(
+        &self,
+        device_type: impl Into<String>,
+        quantity: i64,
+        tags: I,
+    ) -> Result<Operation>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if quantity < 1 {
+            return Err(Error::Configuration {
+                message: "autofactory print quantity must be at least one".into(),
+            });
+        }
+        let tags = tags.into_iter().map(Into::into).collect::<Vec<String>>();
+        if let Some(tag) = tags
+            .iter()
+            .find(|tag| tag.chars().count() > MAX_DEVICE_TAG_CHARACTERS)
+        {
+            return Err(Error::Configuration {
+                message: format!(
+                    "device tag {tag:?} exceeds the {MAX_DEVICE_TAG_CHARACTERS}-character limit"
+                ),
+            });
+        }
+        self.command(raw::devices::DeviceCommand::EnqueuePrint {
+            device_type: device_type.into(),
+            quantity: Some(quantity),
+            controller: None,
+            oncomplete: None,
+            tags: Some(tags),
         })
         .await
     }
@@ -2319,7 +2362,9 @@ mod tests {
         let client = client_at(&server.uri()).await;
 
         assert_eq!(
-            DeviceRefreshQuery::new(client.clone()).page_size(0).page_size,
+            DeviceRefreshQuery::new(client.clone())
+                .page_size(0)
+                .page_size,
             1
         );
         assert_eq!(
@@ -2463,11 +2508,16 @@ mod tests {
             .await
             .expect_err("zero quantity must be rejected before submission");
         assert!(matches!(error, Error::Configuration { .. }));
+        let error = device
+            .enqueue_print_with_tags("ftl_relay", 1, ["x".repeat(33)])
+            .await
+            .expect_err("overlong tags must be rejected before submission");
+        assert!(matches!(error, Error::Configuration { .. }));
 
         Mock::given(method("POST"))
             .and(path("/v1/devices/FACTORY"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         device
@@ -2479,6 +2529,24 @@ mod tests {
         assert_eq!(body["command"], "enqueue_print");
         assert_eq!(body["device_type"], "survey_drone");
         assert_eq!(body["quantity"], 3);
+
+        device
+            .enqueue_print_with_tags(
+                "ftl_relay",
+                1,
+                ["relay-expansion:test", "relay-site:TARGET"],
+            )
+            .await
+            .expect("durable tagged print operation");
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = requests[1].body_json().expect("JSON body");
+        assert_eq!(body["command"], "enqueue_print");
+        assert_eq!(body["device_type"], "ftl_relay");
+        assert_eq!(body["quantity"], 1);
+        assert_eq!(
+            body["tags"],
+            serde_json::json!(["relay-expansion:test", "relay-site:TARGET"])
+        );
         server.verify().await;
         client.close().await.expect("close");
     }
@@ -2912,5 +2980,4 @@ mod tests {
         server.verify().await;
         client.close().await.expect("close");
     }
-
 }

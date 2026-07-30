@@ -1295,7 +1295,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["10-0"]
         );
-        assert_eq!(client.events().cursor().expect("cursor").as_deref(), Some("10-1"));
+        assert_eq!(
+            client.events().cursor().expect("cursor").as_deref(),
+            Some("10-1")
+        );
         client.close().await.expect("close");
     }
 

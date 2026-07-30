@@ -2162,8 +2162,7 @@ mod tests {
         let mut observation = device(Realm::Live, "DRONE");
         observation.value.relationships.stowed_in = Some(DeviceKey::live("VESSEL".into()));
         observation.value.relationships.controller = Some(DeviceKey::live("CTRL".into()));
-        observation.value.relationships.stowed_devices =
-            vec![DeviceKey::live("CHILD".into())];
+        observation.value.relationships.stowed_devices = vec![DeviceKey::live("CHILD".into())];
         observation.value.stow_capacity = Some(5);
         observation.value.stow_used = Some(2);
         observation.value.active_directive = Some(crate::domain::ActiveDeviceDirective {

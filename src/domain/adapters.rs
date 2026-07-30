@@ -160,10 +160,7 @@ pub fn account_me(
     }
 }
 
-fn related_device_list(
-    values: &[raw::JsonObject],
-    realm: &Realm,
-) -> Vec<DeviceKey> {
+fn related_device_list(values: &[raw::JsonObject], realm: &Realm) -> Vec<DeviceKey> {
     let mut devices = values
         .iter()
         .filter_map(|value| {
@@ -195,10 +192,7 @@ fn whole_seconds(value: Option<f64>) -> Option<i64> {
     })
 }
 
-fn device_travel(
-    travel: &Option<raw::devices::TravelInfo>,
-    realm: &Realm,
-) -> Option<TravelState> {
+fn device_travel(travel: &Option<raw::devices::TravelInfo>, realm: &Realm) -> Option<TravelState> {
     travel.as_ref().map(|travel| TravelState {
         arrives_at: travel.arrives_at.clone(),
         departed_at: travel.departed_at.clone(),
@@ -971,11 +965,19 @@ mod location_tests {
         let device = observation.value;
 
         assert_eq!(
-            device.relationships.stowed_in.as_ref().map(|key| key.id.as_str()),
+            device
+                .relationships
+                .stowed_in
+                .as_ref()
+                .map(|key| key.id.as_str()),
             Some("VESSEL")
         );
         assert_eq!(
-            device.relationships.controller.as_ref().map(|key| key.id.as_str()),
+            device
+                .relationships
+                .controller
+                .as_ref()
+                .map(|key| key.id.as_str()),
             Some("CTRL")
         );
         assert_eq!(
@@ -1113,5 +1115,4 @@ mod location_tests {
         assert!(device.active_directive.is_none());
         assert!(device.travel.is_none());
     }
-
 }

@@ -79,15 +79,12 @@ pub mod managed {
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions, Readiness,
         ReadinessComponent, ReconciliationPolicy, StartupPolicy,
     };
-    pub use events::{
-        EventCatchUpReport, EventHistoryQuery, EventWatch, EventsGateway,
-    };
+    pub use events::{EventCatchUpReport, EventHistoryQuery, EventWatch, EventsGateway};
     pub use galaxy::{CatalogueReport, GalaxyGateway, ReplicantStarSyncReport};
     pub use gateways::{
         AccountGateway, DeviceHandle, DeviceQuery, DeviceQueryChange, DeviceQuerySubscription,
         DeviceRefreshQuery, DeviceWatch, DevicesGateway, DirectoryGateway, InventoryGateway,
-        LocationDiagnostic,
-        LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
+        LocationDiagnostic, LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
         LocationQueryDiagnostics, ReplicantHandle, ReplicantQuery, ReplicantsGateway,
     };
     pub use operation::{
@@ -110,13 +107,12 @@ pub use managed::{
     ClientDegradation, ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery,
     DeviceQueryChange, DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway,
     DirectoryGateway, DynamicCommand, EventCatchUpReport, EventHistoryQuery, EventStreamOptions,
-    EventWatch, EventsGateway, FleetController, GalaxyGateway,
-    InventoryGateway, LocationDiagnostic, LocationEventsGateway, LocationHydration,
-    LocationHydrationFailure, LocationHydrationReport, LocationPredicateDiagnostic,
-    LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, LocationsGateway,
-    MessagesGateway, MiningController, MiningDirective, Operation, OperationOutcome,
-    OperationStatus, OperationWatch, OperationsGateway, Readiness, ReadinessComponent,
-    ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
+    EventWatch, EventsGateway, FleetController, GalaxyGateway, InventoryGateway,
+    LocationDiagnostic, LocationEventsGateway, LocationHydration, LocationHydrationFailure,
+    LocationHydrationReport, LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
+    LocationQueryDiagnostics, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
+    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
+    ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
     ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
     SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
     SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,

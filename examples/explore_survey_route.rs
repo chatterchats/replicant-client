@@ -80,9 +80,8 @@ use std::{
 
 use futures::{StreamExt, stream};
 use replicant_client::{
-    Client, Device, DeviceType, Error as ClientError, Event, Operation,
-    OperationStatus, Realm, SecretString, StartupPolicy, SurveyDirective,
-    domain::GalacticPosition,
+    Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
+    SecretString, StartupPolicy, SurveyDirective, domain::GalacticPosition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,7 +185,6 @@ fn required_device<'a>(
     })
 }
 
-
 const PLAN_VERSION: u32 = 2;
 const LEGACY_PLAN_VERSION: u32 = 1;
 const DRONE_COUNT: usize = 3;
@@ -261,9 +259,8 @@ struct Config {
 impl Config {
     fn from_env() -> AnyResult<Self> {
         let token = SecretString::from(
-            env::var("RS_API_TOKEN").map_err(|_| {
-                app_error(io::ErrorKind::InvalidInput, "RS_API_TOKEN is required")
-            })?,
+            env::var("RS_API_TOKEN")
+                .map_err(|_| app_error(io::ErrorKind::InvalidInput, "RS_API_TOKEN is required"))?,
         );
 
         let drone_overrides = env::var("RS_EXPLORE_DRONES").ok().map(|value| {
@@ -533,7 +530,6 @@ impl RoutePlan {
     }
 }
 
-
 #[derive(Clone)]
 struct CandidateStar {
     star: String,
@@ -629,10 +625,9 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         verify_fleet(client, config, &plan, FleetVerification::travel()).await?;
     } else {
         if phase_requires_stowed_fleet(plan.phase) {
-            let controller = plan
-                .controller
-                .as_deref()
-                .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
+            let controller = plan.controller.as_deref().ok_or_else(|| {
+                app_error(io::ErrorKind::Other, "route plan has no survey controller")
+            })?;
             ensure_replicant_owns_device(client, controller, &config.replicant).await?;
             for code in &plan.drones {
                 ensure_replicant_owns_device(client, code, &config.replicant).await?;
@@ -738,9 +733,12 @@ async fn reconcile_current_system_scan_on_startup(
             if local_explored == Some(true) {
                 Some(true)
             } else if route_index == plan.next_index && !plan.route[route_index].system_scan_done {
-                return Err(app_error(io::ErrorKind::Other, format!(
-                    "unable to verify whether the current system {current_star} was scanned; refusing to risk a duplicate system_scan command: {refresh_error}"
-                )));
+                return Err(app_error(
+                    io::ErrorKind::Other,
+                    format!(
+                        "unable to verify whether the current system {current_star} was scanned; refusing to risk a duplicate system_scan command: {refresh_error}"
+                    ),
+                ));
             } else {
                 local_explored
             }
@@ -1359,10 +1357,12 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
         save_plan(&config.plan_path, plan)?;
     }
 
-    let controller_code = plan
-        .controller
-        .clone()
-        .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no selected controller"))?;
+    let controller_code = plan.controller.clone().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::Other,
+            "route plan has no selected controller",
+        )
+    })?;
 
     if plan.drones.is_empty() {
         let drones = if let Some(codes) = &config.drone_overrides {
@@ -1434,7 +1434,9 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
                     io::ErrorKind::NotFound,
                     format!(
                         "only {} eligible account-owned survey drones are available at {} or already stowed in vessel {}; need {DRONE_COUNT}",
-                        selected.len(), location_id, config.vessel
+                        selected.len(),
+                        location_id,
+                        config.vessel
                     ),
                 ));
             }
@@ -1637,10 +1639,7 @@ async fn verify_fleet(
 }
 
 fn phase_requires_stowed_fleet(phase: RunPhase) -> bool {
-    matches!(
-        phase,
-        RunPhase::Ready | RunPhase::SystemScanning
-    )
+    matches!(phase, RunPhase::Ready | RunPhase::SystemScanning)
 }
 
 fn ensure_account_owned(account_owned: &BTreeSet<String>, code: &str) -> AnyResult<()> {
@@ -1753,12 +1752,11 @@ async fn wait_for_device_owner(
     let started = Instant::now();
     let mut delay = INITIAL_DELAY;
     let mut attempts = 0_u32;
-    let mut last_replicant = None;
 
     loop {
         attempts += 1;
         let refreshed = refresh_device_snapshot(client, code).await?;
-        last_replicant = device_replicant(&refreshed).map(str::to_owned);
+        let last_replicant = device_replicant(&refreshed).map(str::to_owned);
 
         if last_replicant.as_deref() == Some(replicant) {
             let operation_status = match operation.reconcile().await {
@@ -1844,11 +1842,7 @@ fn ensure_device_type(device: &Device, code: &str, expected_type: &str) -> AnyRe
     ))
 }
 
-fn ensure_device_replicant(
-    device: &Device,
-    code: &str,
-    expected_replicant: &str,
-) -> AnyResult<()> {
+fn ensure_device_replicant(device: &Device, code: &str, expected_replicant: &str) -> AnyResult<()> {
     match device_replicant(device) {
         Some(actual) if actual == expected_replicant => Ok(()),
         Some(actual) => Err(app_error(
@@ -2162,7 +2156,10 @@ async fn wait_immediate_operation(label: &str, operation: &Operation) -> AnyResu
     match outcome.status {
         OperationStatus::Completed => Ok(()),
         OperationStatus::Rejected | OperationStatus::Cancelled | OperationStatus::Failed => {
-            Err(app_error(io::ErrorKind::Other, format!("{label} ended with {:?}", outcome.status)))
+            Err(app_error(
+                io::ErrorKind::Other,
+                format!("{label} ended with {:?}", outcome.status),
+            ))
         }
         _ => {
             warn!(
@@ -2379,8 +2376,7 @@ async fn travel_to(
                         "observed relevant travel event"
                     );
                     if event.name.as_str() == "travel.arrived"
-                        && current_star(client, &config.replicant).await?.as_deref()
-                            == Some(target)
+                        && current_star(client, &config.replicant).await?.as_deref() == Some(target)
                     {
                         info!(
                             target: "replicant_client::explore",
@@ -2512,10 +2508,13 @@ async fn run_system_scan(client: &Client, config: &Config, target: &str) -> AnyR
 
     match outcome.status {
         OperationStatus::Rejected | OperationStatus::Cancelled | OperationStatus::Failed => {
-            return Err(app_error(io::ErrorKind::Other, format!(
-                "instant system scan for {target} ended with {:?}: {:?}",
-                outcome.status, outcome.response
-            )));
+            return Err(app_error(
+                io::ErrorKind::Other,
+                format!(
+                    "instant system scan for {target} ended with {:?}: {:?}",
+                    outcome.status, outcome.response
+                ),
+            ));
         }
         _ => {}
     }
@@ -2550,11 +2549,14 @@ async fn run_system_scan(client: &Client, config: &Config, target: &str) -> AnyR
         return Ok(());
     }
 
-    Err(app_error(io::ErrorKind::Other, format!(
-        "system scan operation {} for {target} is {:?}, and targeted star knowledge does not confirm completion; rerun to reconcile without submitting a blind duplicate",
-        operation.id(),
-        outcome.status
-    )))
+    Err(app_error(
+        io::ErrorKind::Other,
+        format!(
+            "system scan operation {} for {target} is {:?}, and targeted star knowledge does not confirm completion; rerun to reconcile without submitting a blind duplicate",
+            operation.id(),
+            outcome.status
+        ),
+    ))
 }
 
 fn system_scan_response_was_ok(status: OperationStatus) -> bool {
@@ -2975,9 +2977,7 @@ async fn wait_for_fleet_return(
                 io::ErrorKind::TimedOut,
                 format!(
                     "survey fleet did not return to vessel {} at {} within {RETURN_TIMEOUT:?}; pending={:?}, withdraw_status={operation_status:?}",
-                    config.vessel,
-                    check.vessel_location,
-                    check.pending
+                    config.vessel, check.vessel_location, check.pending
                 ),
             ));
         }
@@ -3315,12 +3315,18 @@ async fn confirm_survey_completion(
     );
     match check.complete {
         Some(true) => Ok(()),
-        Some(false) => Err(app_error(io::ErrorKind::Other, format!(
-            "survey completion evidence for {target} conflicts with authoritative planet/moon state"
-        ))),
-        None => Err(app_error(io::ErrorKind::Other, format!(
-            "survey completion evidence for {target} needs a complete planet/moon reconciliation"
-        ))),
+        Some(false) => Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "survey completion evidence for {target} conflicts with authoritative planet/moon state"
+            ),
+        )),
+        None => Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "survey completion evidence for {target} needs a complete planet/moon reconciliation"
+            ),
+        )),
     }
 }
 
@@ -3729,9 +3735,11 @@ mod tests {
         assert!(plan.stop_is_finalized(0));
         assert!(!plan.stop_is_finalized(1));
         assert_eq!(plan.phase, RunPhase::Restowing);
-        assert!(!serde_json::to_string(&plan)
-            .expect("plan should serialize")
-            .contains("completed"));
+        assert!(
+            !serde_json::to_string(&plan)
+                .expect("plan should serialize")
+                .contains("completed")
+        );
     }
 
     #[test]
@@ -3810,10 +3818,7 @@ mod tests {
             realm: Some(Realm::Live),
             name: replicant_client::domain::EventName::from("directive.completed"),
             category: replicant_client::domain::EventCategory::from("directive"),
-            device: Some(DeviceKey::in_realm(
-                Realm::Live,
-                DeviceId::from("76C57506"),
-            )),
+            device: Some(DeviceKey::in_realm(Realm::Live, DeviceId::from("76C57506"))),
             replicant: None,
             location: Some(replicant_client::LocationKey::in_realm(
                 Realm::Live,
@@ -3830,10 +3835,7 @@ mod tests {
             survey_completion_proof(&event, "76C57506", "KRUKKRAK"),
             Some(SurveyCompletionProof::DirectiveCompleted)
         );
-        assert_eq!(
-            survey_completion_proof(&event, "76C57506", "OTHER"),
-            None
-        );
+        assert_eq!(survey_completion_proof(&event, "76C57506", "OTHER"), None);
     }
 
     #[test]
@@ -3843,10 +3845,7 @@ mod tests {
             realm: Some(Realm::Live),
             name: replicant_client::domain::EventName::from("ami.survey.digest"),
             category: replicant_client::domain::EventCategory::from("ami"),
-            device: Some(DeviceKey::in_realm(
-                Realm::Live,
-                DeviceId::from("76C57506"),
-            )),
+            device: Some(DeviceKey::in_realm(Realm::Live, DeviceId::from("76C57506"))),
             replicant: None,
             location: Some(replicant_client::LocationKey::in_realm(
                 Realm::Live,
@@ -4036,10 +4035,7 @@ mod tests {
 
     #[test]
     fn fleet_return_rate_limit_delay_never_retries_immediately() {
-        assert_eq!(
-            fleet_return_rate_limit_delay(None),
-            Duration::from_secs(15)
-        );
+        assert_eq!(fleet_return_rate_limit_delay(None), Duration::from_secs(15));
         assert_eq!(
             fleet_return_rate_limit_delay(Some(Duration::ZERO)),
             Duration::from_secs(15)
