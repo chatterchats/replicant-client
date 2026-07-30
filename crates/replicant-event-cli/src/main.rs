@@ -2,22 +2,26 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     error::Error as StdError,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use replicant_client::{Client, Replicant, SecretString, StartupPolicy, raw};
 use replicant_event_planner::{
     BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
-    OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event, role_tag,
+    OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
+    role_tag,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, prelude::*};
 
-const PLAN_VERSION: u32 = 1;
+mod executor;
+
+const PLAN_VERSION: u32 = 2;
 const DEFAULT_REPLICANT: &str = "Chats-1";
 const DEFAULT_HOME: &str = "SCEPTURUM-BELT-1";
 const DEFAULT_PLAN_PATH: &str = "event-mission.json";
@@ -36,6 +40,8 @@ enum Command {
     Interactive,
     List,
     Plan,
+    Run,
+    Resume,
     Status,
 }
 
@@ -49,6 +55,10 @@ struct Config {
     database: PathBuf,
     plan_path: PathBuf,
     replace_plan: bool,
+    execute: bool,
+    wait_timeout: Duration,
+    verbose: bool,
+    log_file: Option<PathBuf>,
     json: bool,
 }
 
@@ -62,10 +72,18 @@ impl Config {
         let mut database = PathBuf::from(
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
         );
-        let mut plan_path = PathBuf::from(
-            env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()),
-        );
+        let mut plan_path =
+            PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
         let mut replace_plan = false;
+        let mut execute = env_flag("RS_EVENT_EXECUTE");
+        let mut wait_timeout = Duration::from_secs(
+            env::var("RS_EVENT_WAIT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(21_600),
+        );
+        let mut verbose = env_flag("RS_EVENT_VERBOSE");
+        let mut log_file = env::var("RS_EVENT_LOG_FILE").ok().map(PathBuf::from);
         let mut json = false;
 
         let mut arguments = env::args().skip(1).peekable();
@@ -78,6 +96,14 @@ impl Config {
                 "plan" => {
                     arguments.next();
                     Command::Plan
+                }
+                "run" => {
+                    arguments.next();
+                    Command::Run
+                }
+                "resume" => {
+                    arguments.next();
+                    Command::Resume
                 }
                 "status" => {
                     arguments.next();
@@ -108,6 +134,26 @@ impl Config {
                     plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
                 }
                 "--replace-plan" => replace_plan = true,
+                "--execute" => execute = true,
+                "--wait-timeout-secs" => {
+                    wait_timeout = Duration::from_secs(
+                        required_argument(&mut arguments, "--wait-timeout-secs")?
+                            .parse()
+                            .map_err(|_| {
+                                app_error(
+                                    io::ErrorKind::InvalidInput,
+                                    "--wait-timeout-secs must be an integer",
+                                )
+                            })?,
+                    );
+                }
+                "--verbose" => verbose = true,
+                "--log-file" => {
+                    log_file = Some(PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--log-file",
+                    )?))
+                }
                 "--json" => json = true,
                 "-h" | "--help" => {
                     print_help();
@@ -140,6 +186,10 @@ impl Config {
             database,
             plan_path,
             replace_plan,
+            execute,
+            wait_timeout,
+            verbose,
+            log_file,
             json,
         })
     }
@@ -157,31 +207,38 @@ fn required_argument(
     })
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
 fn print_help() {
     println!(
         "Replicant event logistics\n\n\
-Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
-This first implementation slice performs live discovery, comparison, logistics\n\
-planning, and durable plan creation. Gameplay execution is intentionally not\n\
-enabled until the saved-plan executor is added."
+Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events run --execute [OPTIONS]\n  replicant-events resume --execute [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --execute                 Permit gameplay mutations for run/resume\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+Planning is the default. The run and resume commands reconcile the durable\n\
+mission plan against live state before continuing."
     );
 }
 
-#[allow(dead_code)] // Future executor phases are persisted from the first schema version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MissionPhase {
     Planned,
+    ClaimingTransports,
     Manufacturing,
     PreparingFleet,
     Outbound,
+    Staging,
+    InstallingBeacon,
     ReadyToResolve,
     Resolving,
     CollectingRewards,
     Returning,
+    CleaningUp,
     Completed,
     CompletedWithWarnings,
+    #[allow(dead_code)] // Reserved for a future explicit cancellation command.
     Cancelled,
 }
 
@@ -194,7 +251,6 @@ impl MissionPhase {
     }
 }
 
-#[allow(dead_code)] // Claim records are populated by the execution slice.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClaimedDevice {
     device_code: String,
@@ -215,25 +271,19 @@ struct EventMissionPlan {
     event: EventDefinition,
     selected_criterion: CriterionAssessment,
     grants_unearned_achievement: bool,
+    #[serde(default)]
     claimed_devices: Vec<ClaimedDevice>,
+    #[serde(default)]
+    execution: executor::ExecutionState,
 }
 
 #[tokio::main]
 async fn main() -> AnyResult<()> {
-    println!("\nReplicant Event Logistics Planner (v{})\nLoading Config...", env!("CARGO_PKG_VERSION"));
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("replicant_client=info,info")),
-        )
-        .try_init()
-        .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
-
     let config = Config::from_args_and_env()?;
+    init_logging(&config)?;
     if config.command == Command::Status {
         return show_status(&config);
     }
-    println!("Config Loaded...\nInitializing Client...");
 
     let token = env::var("RS_API_TOKEN")
         .map(SecretString::from)
@@ -244,18 +294,77 @@ async fn main() -> AnyResult<()> {
         .startup_policy(StartupPolicy::Essential)
         .start()
         .await?;
-    println!("Client Initialized...");
     let result = run(&client, &config).await;
     let close_result = client.close().await;
     close_result?;
     result
 }
 
+fn init_logging(config: &Config) -> AnyResult<()> {
+    if !config.verbose && config.log_file.is_none() {
+        return Ok(());
+    }
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("replicant_client=info,replicant_event_cli=info,info"));
+
+    match (&config.log_file, config.verbose) {
+        (None, true) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+                .try_init()
+                .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+        }
+        (Some(path), verbose) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            let registry = tracing_subscriber::registry().with(filter);
+            if verbose {
+                registry
+                    .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            } else {
+                registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            }
+        }
+        (None, false) => {}
+    }
+    Ok(())
+}
+
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
-    println!("Client Syncing...");
     let sync = client.sync().full().await?;
-    println!("Client Synced...\nRunning...");
     info!(readiness = ?sync.readiness, "full managed synchronization completed");
+
+    if matches!(config.command, Command::Run | Command::Resume) {
+        if !config.plan_path.exists() {
+            return Err(app_error(
+                io::ErrorKind::NotFound,
+                format!("no mission plan exists at {}", config.plan_path.display()),
+            ));
+        }
+        let mut plan = load_plan(&config.plan_path)?;
+        executor::execute_saved_plan(client, config, &mut plan).await?;
+        return Ok(());
+    }
 
     let events = fetch_active_events(client).await?;
     let earned = fetch_earned_achievements(client).await?;
@@ -277,12 +386,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         return Ok(());
     }
 
-    let selected_event = select_event(
-        &events,
-        config.event.as_deref(),
-        config.command,
-        &earned,
-    )?;
+    let selected_event = select_event(&events, config.event.as_deref(), config.command, &earned)?;
     let event = normalize_event(selected_event)?;
     let replicant = select_replicant(client, config.replicant.as_deref(), config.command).await?;
     let replicant_code = replicant.key.id.as_str().to_owned();
@@ -320,6 +424,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         selected_criterion,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
         claimed_devices: Vec::new(),
+        execution: executor::ExecutionState::default(),
     };
     save_plan(&config.plan_path, &plan)?;
 
@@ -327,7 +432,10 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
         print_event_plan(&event_plan);
-        println!("\nSelected criterion: {}", plan.selected_criterion.criterion_name);
+        println!(
+            "\nSelected criterion: {}",
+            plan.selected_criterion.criterion_name
+        );
         println!("Replicant: {}", plan.selected_replicant);
         println!("Saved plan: {}", config.plan_path.display());
         println!(
@@ -336,6 +444,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
             role_tag("cargo"),
             role_tag("carrier")
         );
+        println!("Execute with: replicant-events run --execute");
     }
     Ok(())
 }
@@ -393,7 +502,10 @@ fn normalize_event(raw_event: &raw::events::LocationEvent) -> AnyResult<EventDef
         )
     })?;
     let location = raw_event.location.clone().ok_or_else(|| {
-        app_error(io::ErrorKind::InvalidData, "location event omitted location")
+        app_error(
+            io::ErrorKind::InvalidData,
+            "location event omitted location",
+        )
     })?;
     let title = raw_event
         .title
@@ -450,7 +562,11 @@ async fn select_replicant(
             index + 1,
             replicant.name.as_deref().unwrap_or("<unnamed>"),
             replicant.key.id.as_str(),
-            if index == default_index { " [default]" } else { "" }
+            if index == default_index {
+                " [default]"
+            } else {
+                ""
+            }
         );
     }
     let selected = prompt_index("Select replicant", replicants.len(), default_index + 1)?;
@@ -554,10 +670,7 @@ fn select_criterion(
         if criterion.feasible {
             return Ok(criterion);
         }
-        println!(
-            "That option is blocked: {}",
-            criterion.blockers.join("; ")
-        );
+        println!("That option is blocked: {}", criterion.blockers.join("; "));
     }
 }
 
@@ -651,6 +764,7 @@ async fn fetch_devices(
                         .attach_capacity
                         .or_else(|| blueprint.map(|item| item.attach_capacity))
                         .unwrap_or(0),
+                    attach_used: i64::try_from(device.attached_devices.len())?,
                     controlled_by_ami: device.controller_device_code.is_some(),
                     travelling: device.travel.is_some(),
                 },
@@ -694,11 +808,7 @@ async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, Bluepri
                     stow_capacity: blueprint.stow_capacity.unwrap_or(0),
                     resources: numeric_map(blueprint.resources.as_ref()),
                     components: numeric_map(blueprint.components.as_ref()),
-                    features: blueprint
-                        .features
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect(),
+                    features: blueprint.features.unwrap_or_default().into_iter().collect(),
                 },
             ))
         })
@@ -749,7 +859,9 @@ fn build_factory_workloads(
                 .iter()
                 .map(|job| {
                     let device_type = string_field(job, &["device_type", "type"]);
-                    let quantity = integer_field(job, &["quantity", "count"]).unwrap_or(1).max(1);
+                    let quantity = integer_field(job, &["quantity", "count"])
+                        .unwrap_or(1)
+                        .max(1);
                     device_type
                         .and_then(|device_type| blueprints.get(device_type))
                         .map(|blueprint| blueprint.print_time_seconds * quantity as f64)
@@ -851,7 +963,10 @@ fn print_event_plan(plan: &EventPlan) {
     if plan.grants_unearned_achievement {
         println!("Achievement: NOT YET EARNED");
     }
-    println!("Reward: {}", format_resources(&plan.event.rewards.resources));
+    println!(
+        "Reward: {}",
+        format_resources(&plan.event.rewards.resources)
+    );
     if let Some(xp) = plan.event.rewards.xp {
         println!("XP: {xp}");
     }
@@ -860,7 +975,11 @@ fn print_event_plan(plan: &EventPlan) {
         println!("\n  {}. {}", index + 1, criterion.criterion_name);
         println!(
             "     Status:               {}",
-            if criterion.feasible { "FEASIBLE" } else { "BLOCKED" }
+            if criterion.feasible {
+                "FEASIBLE"
+            } else {
+                "BLOCKED"
+            }
         );
         println!(
             "     Remaining materials: {}",
@@ -937,9 +1056,7 @@ fn format_compact_resources(resources: &ResourceMap) -> String {
     }
     resources
         .iter()
-        .map(|(resource, quantity)| {
-            format!("{quantity} {}", resource_abbreviation(resource))
-        })
+        .map(|(resource, quantity)| format!("{quantity} {}", resource_abbreviation(resource)))
         .collect::<Vec<_>>()
         .join(" + ")
 }
@@ -1004,7 +1121,11 @@ fn truncate(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_owned();
     }
-    value.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn format_duration(seconds: f64) -> String {
@@ -1043,7 +1164,10 @@ fn prompt_index(prompt: &str, maximum: usize, default: usize) -> AnyResult<usize
 }
 
 fn save_plan(path: &Path, plan: &EventMissionPlan) -> AnyResult<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     let temporary = path.with_extension("json.tmp");
@@ -1078,5 +1202,32 @@ fn show_status(config: &Config) -> AnyResult<()> {
     println!("Replicant:  {}", plan.selected_replicant);
     println!("Home:       {}", plan.home_location);
     println!("Mission tag: {}", plan.mission_tag);
+    println!(
+        "Prints:     {}/{} produced",
+        plan.execution
+            .print_batches
+            .iter()
+            .map(|batch| batch.produced_codes.len())
+            .sum::<usize>(),
+        plan.execution
+            .print_batches
+            .iter()
+            .filter_map(|batch| usize::try_from(batch.quantity).ok())
+            .sum::<usize>()
+    );
+    println!(
+        "Claims:     {}/{} released",
+        plan.claimed_devices
+            .iter()
+            .filter(|claim| claim.released)
+            .count(),
+        plan.claimed_devices.len()
+    );
+    if !plan.execution.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.execution.warnings {
+            println!("  - {warning}");
+        }
+    }
     Ok(())
 }

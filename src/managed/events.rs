@@ -916,7 +916,7 @@ async fn run_sse_loop(
                 let Some(client) = weak.upgrade() else {
                     return;
                 };
-                info!(
+                debug!(
                     target: "replicant_client::events",
                     event = "events.sse_connected",
                     elapsed_ms = connect_started.elapsed().as_millis() as u64,

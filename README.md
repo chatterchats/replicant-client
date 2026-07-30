@@ -40,23 +40,27 @@ let miners = client
 ## Event logistics CLI
 
 The workspace includes a pure `replicant-event-planner` crate and the
-`replicant-events` binary. The initial implementation performs live event
-discovery, interactive event and criterion selection, achievement-aware
-comparison, progress and destination-stock subtraction, manufacturing/resource
-preflight, AMI-free Cargo Freighter selection, repeated-trip planning, Surge
-Carrier planning, and the persistent FTL-beacon objective.
+`replicant-events` binary. It performs live event discovery, interactive event
+and criterion selection, achievement-aware comparison, progress and
+location-stock subtraction, balanced manufacturing, AMI-free Cargo Freighter
+selection, repeated-trip logistics, event resolution, reward recovery, fleet
+return, and the best-effort persistent FTL-beacon objective.
 
 ```sh
-cargo run -p replicant-event-cli -- list
-cargo run -p replicant-event-cli -- plan WIXUKHHU-4-EVT-002
-cargo run -p replicant-event-cli -- status
+cargo run --quiet -p replicant-event-cli -- list
+cargo run --quiet -p replicant-event-cli -- plan WIXUKHHU-4-EVT-002
+cargo run --quiet -p replicant-event-cli -- run --execute
+cargo run --quiet -p replicant-event-cli -- resume --execute
+cargo run --quiet -p replicant-event-cli -- status
 ```
 
 `Chats-1` and `SCEPTURUM-BELT-1` are the defaults. Use `--replicant` and
 `--home` to override them. Plans are saved atomically to `event-mission.json`;
 only one nonterminal mission is allowed in the first release. Cargo Freighters
-with an AMI controller relationship are never selected. Gameplay execution is
-being added as the next implementation slice on top of the persisted plan.
+with an AMI controller relationship are never selected. Claimed mission devices
+receive bounded tags, remain assigned to the selected replicant, and have only
+the mission-added tags removed after they are safely returned. The CLI is quiet
+by default; use `--verbose` and/or `--log-file PATH` for diagnostics.
 
 ## FTL relay expansion example
 

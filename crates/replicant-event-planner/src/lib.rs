@@ -196,6 +196,9 @@ pub struct DeviceStock {
     pub cargo_capacity: i64,
     /// Attached-device capacity.
     pub attach_capacity: i64,
+    /// Attachment slots currently occupied.
+    #[serde(default)]
+    pub attach_used: i64,
     /// Whether an AMI controller currently controls this device.
     pub controlled_by_ami: bool,
     /// Whether the device is travelling.
@@ -303,8 +306,9 @@ pub struct TransportPlan {
 pub enum BeaconAction {
     /// An active account-owned beacon already exists at the event body.
     AlreadyActive,
-    /// Activate an inactive beacon already at the event body.
-    ActivateExisting,
+    /// Deploy an inactive beacon already at the event body.
+    #[serde(alias = "activate_existing")]
+    DeployExisting,
     /// Carry an inactive account-owned beacon to the event body.
     TransportExisting,
     /// Print and transport a new beacon.
@@ -404,6 +408,49 @@ pub struct EventPlan {
     pub grants_unearned_achievement: bool,
     /// Assessments for all valid criteria.
     pub criteria: Vec<CriterionAssessment>,
+}
+
+/// Requirements still missing for one selected criterion at the event body.
+///
+/// Progress and current event-body stock are treated as two observations of
+/// the same satisfaction state; the larger observed quantity is used rather
+/// than summing them, which avoids double-counting mirrored progress fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemainingRequirements {
+    /// Resource quantities still required.
+    pub resources: ResourceMap,
+    /// Device quantities still required.
+    pub devices: Vec<DeviceRequirement>,
+}
+
+/// Recalculates the live remaining requirements for a selected criterion.
+pub fn remaining_requirements(
+    event: &EventDefinition,
+    criterion_name: &str,
+    event_inventory: &ResourceMap,
+    event_devices: &[DeviceStock],
+) -> Result<RemainingRequirements, PlannerError> {
+    let criterion = event
+        .criteria
+        .iter()
+        .find(|criterion| criterion.name.eq_ignore_ascii_case(criterion_name))
+        .ok_or_else(|| {
+            PlannerError::InvalidEvent(format!(
+                "criterion {criterion_name:?} is not present on event {}",
+                event.designation
+            ))
+        })?;
+    let progress = extract_progress(event.progress.as_ref()).for_criterion(&criterion.name);
+    let mut event_stock = BTreeMap::new();
+    for device in event_devices.iter().filter(|device| {
+        device.location.as_deref() == Some(event.location.as_str()) && device.is_inactive()
+    }) {
+        *event_stock.entry(device.device_type.clone()).or_default() += 1;
+    }
+    Ok(RemainingRequirements {
+        resources: subtract_resources(&criterion.resources, &progress.resources, event_inventory),
+        devices: subtract_device_requirements(&criterion.devices, &progress.devices, &event_stock),
+    })
 }
 
 /// All state required to assess one event.
@@ -907,7 +954,9 @@ fn plan_device_transport(
         .devices
         .iter()
         .filter(|device| {
-            device.attach_capacity > 0 && device.is_transport_eligible(&context.mission_tag_prefix)
+            device.attach_capacity > 0
+                && device.attach_used == 0
+                && device.is_transport_eligible(&context.mission_tag_prefix)
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -977,7 +1026,10 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
     if let Some(beacon) = beacons.iter().find(|device| {
         device.location.as_deref() == Some(event_location)
             && device.status.as_deref().is_some_and(|status| {
-                matches!(status.to_ascii_lowercase().as_str(), "active" | "beaconing")
+                matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "active" | "beaconing" | "monitoring"
+                )
             })
     }) {
         return BeaconPlan {
@@ -992,7 +1044,7 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
         .find(|device| device.location.as_deref() == Some(event_location) && device.is_inactive())
     {
         return BeaconPlan {
-            action: BeaconAction::ActivateExisting,
+            action: BeaconAction::DeployExisting,
             device_code: Some(beacon.code.clone()),
             transport_slots: 0,
             warning: None,
@@ -1161,17 +1213,19 @@ fn extract_progress(progress: Option<&Value>) -> ProgressSnapshot {
             }
         }
     }
-    if let Some(Value::Array(criteria)) = object.get("criteria") {
-        for criterion in criteria {
-            let Some(criterion) = criterion.as_object() else {
-                continue;
-            };
-            let Some(name) = criterion.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let parsed = parse_progress_values(criterion);
-            if !parsed.resources.is_empty() || !parsed.devices.is_empty() {
-                snapshot.criteria.insert(name.to_owned(), parsed);
+    for key in ["criteria", "options"] {
+        if let Some(Value::Array(criteria)) = object.get(key) {
+            for criterion in criteria {
+                let Some(criterion) = criterion.as_object() else {
+                    continue;
+                };
+                let Some(name) = criterion.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let parsed = parse_progress_values(criterion);
+                if !parsed.resources.is_empty() || !parsed.devices.is_empty() {
+                    snapshot.criteria.insert(name.to_owned(), parsed);
+                }
             }
         }
     }
@@ -1187,7 +1241,7 @@ fn parse_progress_values(object: &Map<String, Value>) -> ProgressValues {
         "delivered_resources",
     ] {
         if let Some(value) = object.get(key) {
-            merge_resources(&mut result.resources, &numeric_map(Some(value)));
+            merge_resources(&mut result.resources, &progress_resource_map(value));
         }
     }
     for key in [
@@ -1197,10 +1251,51 @@ fn parse_progress_values(object: &Map<String, Value>) -> ProgressValues {
         "delivered_devices",
     ] {
         if let Some(value) = object.get(key) {
-            merge_device_counts(&mut result.devices, &device_count_map(value));
+            merge_device_counts(&mut result.devices, &progress_device_map(value));
         }
     }
     result
+}
+
+fn progress_resource_map(value: &Value) -> ResourceMap {
+    match value {
+        Value::Object(_) => numeric_map(Some(value)),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|item| {
+                let resource = ["resource_type", "resource", "type"]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(Value::as_str))?;
+                let quantity = ["current", "quantity", "count", "delivered"]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(value_to_i64))
+                    .unwrap_or(0);
+                (quantity > 0).then_some((resource.to_owned(), quantity))
+            })
+            .collect(),
+        _ => ResourceMap::new(),
+    }
+}
+
+fn progress_device_map(value: &Value) -> BTreeMap<String, i64> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|item| {
+                let device_type = ["device_type", "type"]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(Value::as_str))?;
+                let count = ["current", "count", "quantity", "delivered"]
+                    .into_iter()
+                    .find_map(|key| item.get(key).and_then(value_to_i64))
+                    .unwrap_or(0);
+                (count > 0).then_some((device_type.to_owned(), count))
+            })
+            .collect(),
+        _ => device_count_map(value),
+    }
 }
 
 fn parse_criterion(
@@ -1331,9 +1426,9 @@ fn subtract_resources(
     required
         .iter()
         .filter_map(|(resource, quantity)| {
-            let remaining = quantity
-                .saturating_sub(*progress.get(resource).unwrap_or(&0))
-                .saturating_sub(*inventory.get(resource).unwrap_or(&0));
+            let satisfied =
+                (*progress.get(resource).unwrap_or(&0)).max(*inventory.get(resource).unwrap_or(&0));
+            let remaining = quantity.saturating_sub(satisfied);
             (remaining > 0).then_some((resource.clone(), remaining))
         })
         .collect()
@@ -1347,10 +1442,9 @@ fn subtract_device_requirements(
     required
         .iter()
         .filter_map(|item| {
-            let remaining = item
-                .count
-                .saturating_sub(*progress.get(&item.device_type).unwrap_or(&0))
-                .saturating_sub(*event_stock.get(&item.device_type).unwrap_or(&0));
+            let satisfied = (*progress.get(&item.device_type).unwrap_or(&0))
+                .max(*event_stock.get(&item.device_type).unwrap_or(&0));
+            let remaining = item.count.saturating_sub(satisfied);
             (remaining > 0).then_some(DeviceRequirement {
                 device_type: item.device_type.clone(),
                 count: remaining,
@@ -1359,13 +1453,22 @@ fn subtract_device_requirements(
         .collect()
 }
 
-fn expand_blueprint_resources(
+/// Expands one blueprint quantity into its total raw-resource cost.
+pub fn blueprint_resource_cost(
     device_type: &str,
     quantity: i64,
     blueprints: &BTreeMap<String, BlueprintSpec>,
 ) -> Result<ResourceMap, PlannerError> {
     let mut visiting = BTreeSet::new();
     expand_blueprint_resources_inner(device_type, quantity, blueprints, &mut visiting)
+}
+
+fn expand_blueprint_resources(
+    device_type: &str,
+    quantity: i64,
+    blueprints: &BTreeMap<String, BlueprintSpec>,
+) -> Result<ResourceMap, PlannerError> {
+    blueprint_resource_cost(device_type, quantity, blueprints)
 }
 
 fn expand_blueprint_resources_inner(
@@ -1605,7 +1708,13 @@ mod tests {
         );
         blueprints.insert(SURGE_CARRIER.into(), blueprint(SURGE_CARRIER, 800.0, 0, 9));
         PlanningContext {
-            home_inventory: [("structural".into(), 100_000)].into_iter().collect(),
+            home_inventory: [
+                ("conductive".into(), 100_000),
+                ("silicates".into(), 100_000),
+                ("structural".into(), 100_000),
+            ]
+            .into_iter()
+            .collect(),
             event_inventory: ResourceMap::new(),
             blueprints,
             devices: vec![
@@ -1618,6 +1727,7 @@ mod tests {
                     tags: BTreeSet::new(),
                     cargo_capacity: 500,
                     attach_capacity: 0,
+                    attach_used: 0,
                     controlled_by_ami: true,
                     travelling: false,
                 },
@@ -1630,6 +1740,7 @@ mod tests {
                     tags: BTreeSet::new(),
                     cargo_capacity: 500,
                     attach_capacity: 0,
+                    attach_used: 0,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1642,6 +1753,7 @@ mod tests {
                     tags: BTreeSet::new(),
                     cargo_capacity: 500,
                     attach_capacity: 0,
+                    attach_used: 0,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1654,6 +1766,7 @@ mod tests {
                     tags: BTreeSet::new(),
                     cargo_capacity: 0,
                     attach_capacity: 9,
+                    attach_used: 0,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1712,13 +1825,25 @@ mod tests {
     }
 
     #[test]
-    fn subtracts_destination_inventory_and_progress() {
+    fn subtracts_destination_inventory_and_progress_without_double_counting() {
         let mut event = event();
         event.progress = Some(json!({
-            "deep_scan_containment": {
-                "resources": {"silicates": 25},
-                "devices": {"sensor_array": 1}
-            }
+            "met": false,
+            "options": [{
+                "name": "deep_scan_containment",
+                "resources": [{
+                    "resource_type": "silicates",
+                    "current": 25,
+                    "required": 200,
+                    "met": false
+                }],
+                "devices": [{
+                    "device_type": "sensor_array",
+                    "current": 1,
+                    "required": 2,
+                    "met": false
+                }]
+            }]
         }));
         let mut context = context();
         context.event_inventory.insert("silicates".into(), 50);
@@ -1731,6 +1856,7 @@ mod tests {
             tags: BTreeSet::new(),
             cargo_capacity: 0,
             attach_capacity: 0,
+            attach_used: 0,
             controlled_by_ami: false,
             travelling: false,
         });
@@ -1740,7 +1866,7 @@ mod tests {
             .iter()
             .find(|item| item.criterion_name == "deep_scan_containment")
             .expect("criterion");
-        assert_eq!(deep.remaining_resources["silicates"], 125);
+        assert_eq!(deep.remaining_resources["silicates"], 150);
         assert_eq!(
             deep.remaining_devices,
             vec![DeviceRequirement {
@@ -1748,6 +1874,55 @@ mod tests {
                 count: 1
             }]
         );
+    }
+
+    #[test]
+    fn occupied_carrier_is_not_selected() {
+        let mut context = context();
+        let carrier = context
+            .devices
+            .iter_mut()
+            .find(|device| device.code == "SC-1")
+            .expect("carrier");
+        carrier.attach_used = 1;
+        let plan = plan_event(event(), &context).expect("plan");
+        assert!(plan.criteria.iter().all(|criterion| {
+            criterion
+                .carriers
+                .transports
+                .iter()
+                .all(|transport| transport.code != "SC-1")
+        }));
+        assert!(plan.criteria.iter().all(|criterion| {
+            criterion
+                .carriers
+                .transports
+                .iter()
+                .any(|transport| transport.must_print && transport.device_type == SURGE_CARRIER)
+        }));
+    }
+
+    #[test]
+    fn monitoring_beacon_satisfies_secondary_objective() {
+        let mut context = context();
+        context.devices.push(DeviceStock {
+            code: "BEACON-1".into(),
+            device_type: FTL_BEACON.into(),
+            status: Some("monitoring".into()),
+            location: Some("WIXUKHHU-4".into()),
+            assigned_replicant: Some("Chats-1".into()),
+            tags: BTreeSet::new(),
+            cargo_capacity: 0,
+            attach_capacity: 0,
+            attach_used: 0,
+            controlled_by_ami: false,
+            travelling: false,
+        });
+        let plan = plan_event(event(), &context).expect("plan");
+        assert!(plan.criteria.iter().all(|criterion| {
+            criterion.beacon.action == BeaconAction::AlreadyActive
+                && criterion.beacon.device_code.as_deref() == Some("BEACON-1")
+        }));
     }
 
     #[test]
@@ -1821,6 +1996,31 @@ mod tests {
         );
         assert!(feasible.feasible);
         assert!(!feasible.recommendations.is_empty());
+    }
+
+    #[test]
+    fn missing_event_materials_block_only_the_affected_criterion() {
+        let mut context = context();
+        context.home_inventory.remove("conductive");
+        let plan = plan_event(event(), &context).expect("plan");
+        let blocked = plan
+            .criteria
+            .iter()
+            .find(|criterion| criterion.criterion_name == "sensor_shield_containment")
+            .expect("blocked criterion");
+        let feasible = plan
+            .criteria
+            .iter()
+            .find(|criterion| criterion.criterion_name == "deep_scan_containment")
+            .expect("feasible criterion");
+        assert!(!blocked.feasible);
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("conductive"))
+        );
+        assert!(feasible.feasible);
     }
 
     #[test]
