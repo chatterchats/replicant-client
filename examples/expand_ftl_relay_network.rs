@@ -44,8 +44,8 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant,
-    SecretString, StartupPolicy, raw,
+    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, SecretString,
+    StartupPolicy, raw,
 };
 use replicant_route_planner::{
     NetworkNode, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
@@ -99,10 +99,8 @@ impl Config {
         let mut database = PathBuf::from(
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
         );
-        let mut replicant =
-            env::var("RS_RELAY_REPLICANT").unwrap_or_else(|_| "Chats-1".into());
-        let mut hub =
-            env::var("RS_RELAY_HUB").unwrap_or_else(|_| "SCEPTURUM-BELT-1".into());
+        let mut replicant = env::var("RS_RELAY_REPLICANT").unwrap_or_else(|_| "Chats-1".into());
+        let mut hub = env::var("RS_RELAY_HUB").unwrap_or_else(|_| "SCEPTURUM-BELT-1".into());
         let mut plan_path = PathBuf::from(
             env::var("RS_RELAY_PLAN").unwrap_or_else(|_| "ftl-relay-expansion.json".into()),
         );
@@ -124,9 +122,7 @@ impl Config {
                 "--rebuild-plan" => rebuild_plan = true,
                 "--replicant" => replicant = required_argument(&mut arguments, "--replicant")?,
                 "--hub" => hub = required_argument(&mut arguments, "--hub")?,
-                "--plan" => {
-                    plan_path = PathBuf::from(required_argument(&mut arguments, "--plan")?)
-                }
+                "--plan" => plan_path = PathBuf::from(required_argument(&mut arguments, "--plan")?),
                 "--database" => {
                     database = PathBuf::from(required_argument(&mut arguments, "--database")?)
                 }
@@ -192,7 +188,10 @@ impl Config {
     }
 }
 
-fn required_argument(arguments: &mut impl Iterator<Item = String>, option: &str) -> AnyResult<String> {
+fn required_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> AnyResult<String> {
     arguments.next().ok_or_else(|| {
         app_error(
             io::ErrorKind::InvalidInput,
@@ -408,12 +407,14 @@ async fn create_plan(
         }
     }
 
-    let census =
-        refresh_device_census(client, &config.hub, vessel_code, &system_names).await?;
+    let census = refresh_device_census(client, &config.hub, vessel_code, &system_names).await?;
     if census.factories.is_empty() {
         return Err(app_error(
             io::ErrorKind::NotFound,
-            format!("no account-owned autofactories are present at {}", config.hub),
+            format!(
+                "no account-owned autofactories are present at {}",
+                config.hub
+            ),
         ));
     }
     if !census.active_relay_codes.contains_key(&start_system) {
@@ -453,11 +454,7 @@ async fn create_plan(
         },
     )?;
 
-    let mission_id = format!(
-        "{}-{}",
-        start_system.to_lowercase(),
-        uuid::Uuid::new_v4()
-    );
+    let mission_id = format!("{}-{}", start_system.to_lowercase(), uuid::Uuid::new_v4());
     let mut hub_stock = census.hub_stock.clone();
     hub_stock.sort();
     let mut factory_load = census
@@ -507,7 +504,10 @@ async fn create_plan(
                         )
                     })?;
                 let relay = census.devices.get(&relay_code).ok_or_else(|| {
-                    app_error(io::ErrorKind::NotFound, "selected relay omitted from census")
+                    app_error(
+                        io::ErrorKind::NotFound,
+                        "selected relay omitted from census",
+                    )
                 })?;
                 let location = device_location(relay).ok_or_else(|| {
                     app_error(
@@ -626,7 +626,12 @@ async fn choose_l4_location(client: &Client, node: &NetworkNode) -> AnyResult<St
     {
         return Ok(entry_point.to_owned());
     }
-    let mut locations = client.locations().find().in_system(&node.system).collect().await?;
+    let mut locations = client
+        .locations()
+        .find()
+        .in_system(&node.system)
+        .collect()
+        .await?;
     locations.sort_by(|left, right| left.key.id.as_str().cmp(right.key.id.as_str()));
     if let Some(location) = locations
         .iter()
@@ -703,7 +708,10 @@ async fn refresh_device_census(
                     continue;
                 };
                 if device_status(device) == Some(RELAYING) {
-                    active_relay_codes.entry(system).or_default().push(code.clone());
+                    active_relay_codes
+                        .entry(system)
+                        .or_default()
+                        .push(code.clone());
                 } else if device_has_command(device, "activate") {
                     inactive_relay_codes
                         .entry(system)
@@ -733,13 +741,7 @@ async fn refresh_device_census(
     for code in factory_codes {
         factories.push(fetch_factory_state(client, &code).await?);
     }
-    factories.sort_by_key(|factory| {
-        (
-            factory.printing,
-            factory.queue_depth,
-            factory.code.clone(),
-        )
-    });
+    factories.sort_by_key(|factory| (factory.printing, factory.queue_depth, factory.code.clone()));
     Ok(DeviceCensus {
         devices,
         active_relay_codes,
@@ -800,9 +802,12 @@ fn stable_tag_hash(value: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    value.as_bytes().iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    })
+    value
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 fn relay_mission_tag(mission_id: &str) -> String {
@@ -945,7 +950,12 @@ async fn ensure_manufacturing_resources(
     let blueprint = blueprints
         .iter()
         .find(|blueprint| blueprint.device_type.as_deref() == Some(FTL_RELAY))
-        .ok_or_else(|| app_error(io::ErrorKind::NotFound, "FTL relay blueprint is not unlocked"))?;
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                "FTL relay blueprint is not unlocked",
+            )
+        })?;
     let mut requirements = numeric_requirements(blueprint.resources.as_ref());
     for (component, amount) in numeric_requirements(blueprint.components.as_ref()) {
         *requirements.entry(component).or_default() += amount;
@@ -1015,10 +1025,7 @@ fn numeric_requirements(object: Option<&raw::JsonObject>) -> BTreeMap<String, i6
         .collect()
 }
 
-async fn ensure_planned_active_coverage(
-    client: &Client,
-    plan: &MissionPlan,
-) -> AnyResult<()> {
+async fn ensure_planned_active_coverage(client: &Client, plan: &MissionPlan) -> AnyResult<()> {
     let mut required = plan
         .network
         .active_relay_systems
@@ -1126,9 +1133,7 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "multiple mission-tagged relays exist for {system}: {previous}, {code}"
-                ),
+                format!("multiple mission-tagged relays exist for {system}: {previous}, {code}"),
             ));
         }
     }
@@ -1293,11 +1298,7 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
     Ok(())
 }
 
-async fn execute_plan(
-    client: &Client,
-    config: &Config,
-    plan: &mut MissionPlan,
-) -> AnyResult<()> {
+async fn execute_plan(client: &Client, config: &Config, plan: &mut MissionPlan) -> AnyResult<()> {
     ensure_manufacturing_resources(
         client,
         &plan.hub_location,
@@ -1360,9 +1361,9 @@ async fn submit_print_jobs(
                 .into_iter()
                 .take(slots)
             {
-                let first_index = *job_indices.first().ok_or_else(|| {
-                    app_error(io::ErrorKind::InvalidData, "empty print batch")
-                })?;
+                let first_index = *job_indices
+                    .first()
+                    .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "empty print batch"))?;
                 let mission_tag = plan.print_jobs[first_index].mission_tag.clone();
                 let correlation_tag =
                     print_job_correlation_tag(&plan.print_jobs[first_index]).to_owned();
@@ -1374,11 +1375,7 @@ async fn submit_print_jobs(
 
                 let factory = client.devices().get(&state.code).await?;
                 let operation = factory
-                    .enqueue_print_with_tags(
-                        FTL_RELAY,
-                        quantity,
-                        [mission_tag, correlation_tag],
-                    )
+                    .enqueue_print_with_tags(FTL_RELAY, quantity, [mission_tag, correlation_tag])
                     .await?;
                 let operation_id = operation.id().as_str().to_owned();
                 for index in &job_indices {
@@ -1614,9 +1611,7 @@ async fn execute_stop(
     travel_to(client, config, &plan.replicant_code, &stop.location).await?;
     let relay = client.devices().get(relay_code).await?;
     let snapshot = relay.snapshot().await?;
-    if stop.action == StopAction::DeployAndActivate
-        && snapshot.relationships.stowed_in.is_some()
-    {
+    if stop.action == StopAction::DeployAndActivate && snapshot.relationships.stowed_in.is_some() {
         if !device_has_command(&snapshot, "deploy") {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
@@ -1750,9 +1745,11 @@ async fn wait_for_parent_connection(
     let deadline = Instant::now() + config.wait_timeout;
     loop {
         let network = client.devices().get(relay_code).await?.network().await?;
-        if network.connections.iter().any(|connection| {
-            connection.star.as_deref() == Some(parent_system)
-        }) {
+        if network
+            .connections
+            .iter()
+            .any(|connection| connection.star.as_deref() == Some(parent_system))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1883,9 +1880,15 @@ fn print_plan(plan: &MissionPlan) {
         "  Existing inactive activation stops: {}",
         plan.network.activation_systems.len()
     );
-    println!("  Reusable inactive relays at hub: {}", plan.hub_stock_relays.len());
+    println!(
+        "  Reusable inactive relays at hub: {}",
+        plan.hub_stock_relays.len()
+    );
     println!("  Relays to print: {}", plan.print_jobs.len());
-    println!("  Total tree distance: {:.4} ly", plan.network.total_edge_distance_ly);
+    println!(
+        "  Total tree distance: {:.4} ly",
+        plan.network.total_edge_distance_ly
+    );
     println!(
         "  Deployment trip: {} hops, {:.4} routed ly including return ({})",
         plan.network.execution_hops,
@@ -1958,7 +1961,10 @@ fn device_status(device: &Device) -> Option<&str> {
 }
 
 fn device_location(device: &Device) -> Option<&str> {
-    device.location.as_ref().map(|location| location.id.as_str())
+    device
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str())
 }
 
 fn assigned_replicant(device: &Device) -> Option<&str> {
@@ -2004,12 +2010,10 @@ mod tests {
 
     #[test]
     fn generated_relay_tags_fit_the_api_limit() {
-        let mission =
-            relay_mission_tag("scepturum-12345678-1234-1234-1234-123456789abc");
+        let mission = relay_mission_tag("scepturum-12345678-1234-1234-1234-123456789abc");
         let direct_site = relay_site_tag("XHAKKWUKKXHU");
-        let shortened_site = relay_site_tag(
-            "A-SYSTEM-DESIGNATION-THAT-IS-LONGER-THAN-THE-TAG-LIMIT",
-        );
+        let shortened_site =
+            relay_site_tag("A-SYSTEM-DESIGNATION-THAT-IS-LONGER-THAN-THE-TAG-LIMIT");
         let batch = relay_batch_tag(&mission, "6523AC61");
 
         for tag in [&mission, &direct_site, &shortened_site, &batch] {

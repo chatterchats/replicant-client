@@ -1,5 +1,10 @@
 [workspace]
-members = [".", "crates/replicant-route-planner"]
+members = [
+  ".",
+  "crates/replicant-route-planner",
+  "crates/replicant-event-planner",
+  "crates/replicant-event-cli",
+]
 resolver = "3"
 
 [package]

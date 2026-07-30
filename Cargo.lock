@@ -1183,6 +1183,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicant-event-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "replicant-event-planner",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "replicant-event-planner"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "replicant-route-planner"
 version = "0.1.0"
 dependencies = [

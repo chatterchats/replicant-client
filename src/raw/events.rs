@@ -7,9 +7,31 @@
 //! This module defines that shape once so [`crate::raw::accounts`] and
 //! [`crate::raw::location_events`] do not each define their own copy.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::raw::JsonObject;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrManyCriteria {
+    One(JsonObject),
+    Many(Vec<JsonObject>),
+}
+
+fn deserialize_optional_criteria<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<JsonObject>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        match Option::<OneOrManyCriteria>::deserialize(deserializer)? {
+            None => None,
+            Some(OneOrManyCriteria::One(criteria)) => Some(vec![criteria]),
+            Some(OneOrManyCriteria::Many(criteria)) => Some(criteria),
+        },
+    )
+}
 
 /// A location event discovered or completed by a replicant: a first-contact
 /// beacon, a megastructure contribution milestone, and similar site-scoped
@@ -39,7 +61,9 @@ pub struct LocationEvent {
     pub discovered_at: Option<String>,
     /// When the event was completed, RFC3339.
     pub completed_at: Option<String>,
-    /// Resolution criteria, open-shaped.
+    /// Resolution criteria, accepting either the documented single object or
+    /// the live array of alternative completion methods.
+    #[serde(default, deserialize_with = "deserialize_optional_criteria")]
     pub criteria: Option<Vec<JsonObject>>,
     /// Current progress toward resolution, open-shaped.
     pub progress: Option<JsonObject>,
@@ -60,4 +84,36 @@ pub struct LocationEventListResponse {
     pub events: Vec<LocationEvent>,
     /// Cursor for the next page, or `None` if this is the last page.
     pub next_cursor: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn location_event_accepts_one_criterion_object() {
+        let event: LocationEvent = serde_json::from_value(serde_json::json!({
+            "designation": "QIGONOG-3-EVT-001",
+            "location": "QIGONOG-3",
+            "criteria": {
+                "resources": {"conductive": 250}
+            }
+        }))
+        .expect("single criterion");
+        assert_eq!(event.criteria.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn location_event_accepts_alternative_criteria_array() {
+        let event: LocationEvent = serde_json::from_value(serde_json::json!({
+            "designation": "WIXUKHHU-4-EVT-002",
+            "location": "WIXUKHHU-4",
+            "criteria": [
+                {"name": "first", "resources": {"conductive": 150}},
+                {"name": "second", "resources": {"silicates": 200}}
+            ]
+        }))
+        .expect("criterion alternatives");
+        assert_eq!(event.criteria.as_ref().map(Vec::len), Some(2));
+    }
 }

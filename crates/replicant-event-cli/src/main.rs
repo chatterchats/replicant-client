@@ -1,0 +1,1082 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    error::Error as StdError,
+    fs::{self, File},
+    io::{self, BufRead, BufWriter, Write},
+    path::{Path, PathBuf},
+};
+
+use replicant_client::{Client, Replicant, SecretString, StartupPolicy, raw};
+use replicant_event_planner::{
+    BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
+    OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event, role_tag,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+const PLAN_VERSION: u32 = 1;
+const DEFAULT_REPLICANT: &str = "Chats-1";
+const DEFAULT_HOME: &str = "SCEPTURUM-BELT-1";
+const DEFAULT_PLAN_PATH: &str = "event-mission.json";
+const EVENT_MISSION_TAG_PREFIX: &str = "evt-m:";
+const AUTOFACTORY: &str = "autofactory";
+
+type AnyError = Box<dyn StdError + Send + Sync + 'static>;
+type AnyResult<T> = Result<T, AnyError>;
+
+fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
+    io::Error::new(kind, message.into()).into()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Interactive,
+    List,
+    Plan,
+    Status,
+}
+
+#[derive(Debug)]
+struct Config {
+    command: Command,
+    event: Option<String>,
+    criterion: Option<String>,
+    replicant: Option<String>,
+    home: String,
+    database: PathBuf,
+    plan_path: PathBuf,
+    replace_plan: bool,
+    json: bool,
+}
+
+impl Config {
+    fn from_args_and_env() -> AnyResult<Self> {
+        let mut command = Command::Interactive;
+        let mut event = None;
+        let mut criterion = None;
+        let mut replicant = env::var("RS_EVENT_REPLICANT").ok();
+        let mut home = env::var("RS_EVENT_HOME").unwrap_or_else(|_| DEFAULT_HOME.into());
+        let mut database = PathBuf::from(
+            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
+        );
+        let mut plan_path = PathBuf::from(
+            env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()),
+        );
+        let mut replace_plan = false;
+        let mut json = false;
+
+        let mut arguments = env::args().skip(1).peekable();
+        if let Some(first) = arguments.peek().map(String::as_str) {
+            command = match first {
+                "list" => {
+                    arguments.next();
+                    Command::List
+                }
+                "plan" => {
+                    arguments.next();
+                    Command::Plan
+                }
+                "status" => {
+                    arguments.next();
+                    Command::Status
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                _ => Command::Interactive,
+            };
+        }
+
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--event" => event = Some(required_argument(&mut arguments, "--event")?),
+                "--criterion" => {
+                    criterion = Some(required_argument(&mut arguments, "--criterion")?)
+                }
+                "--replicant" => {
+                    replicant = Some(required_argument(&mut arguments, "--replicant")?)
+                }
+                "--home" => home = required_argument(&mut arguments, "--home")?,
+                "--database" => {
+                    database = PathBuf::from(required_argument(&mut arguments, "--database")?)
+                }
+                "--plan-file" => {
+                    plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
+                }
+                "--replace-plan" => replace_plan = true,
+                "--json" => json = true,
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown option: {value}"),
+                    ));
+                }
+                value if event.is_none() && command == Command::Plan => {
+                    event = Some(value.to_owned());
+                }
+                value => {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidInput,
+                        format!("unexpected argument: {value}"),
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            command,
+            event,
+            criterion,
+            replicant,
+            home: home.to_uppercase(),
+            database,
+            plan_path,
+            replace_plan,
+            json,
+        })
+    }
+}
+
+fn required_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> AnyResult<String> {
+    arguments.next().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} requires a value"),
+        )
+    })
+}
+
+fn print_help() {
+    println!(
+        "Replicant event logistics\n\n\
+Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+This first implementation slice performs live discovery, comparison, logistics\n\
+planning, and durable plan creation. Gameplay execution is intentionally not\n\
+enabled until the saved-plan executor is added."
+    );
+}
+
+#[allow(dead_code)] // Future executor phases are persisted from the first schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MissionPhase {
+    Planned,
+    Manufacturing,
+    PreparingFleet,
+    Outbound,
+    ReadyToResolve,
+    Resolving,
+    CollectingRewards,
+    Returning,
+    Completed,
+    CompletedWithWarnings,
+    Cancelled,
+}
+
+impl MissionPhase {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::CompletedWithWarnings | Self::Cancelled
+        )
+    }
+}
+
+#[allow(dead_code)] // Claim records are populated by the execution slice.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClaimedDevice {
+    device_code: String,
+    role: String,
+    original_tags: Vec<String>,
+    mission_tags: Vec<String>,
+    released: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EventMissionPlan {
+    version: u32,
+    mission_id: String,
+    mission_tag: String,
+    phase: MissionPhase,
+    selected_replicant: String,
+    home_location: String,
+    event: EventDefinition,
+    selected_criterion: CriterionAssessment,
+    grants_unearned_achievement: bool,
+    claimed_devices: Vec<ClaimedDevice>,
+}
+
+#[tokio::main]
+async fn main() -> AnyResult<()> {
+    println!("\nReplicant Event Logistics Planner (v{})\nLoading Config...", env!("CARGO_PKG_VERSION"));
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("replicant_client=info,info")),
+        )
+        .try_init()
+        .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+
+    let config = Config::from_args_and_env()?;
+    if config.command == Command::Status {
+        return show_status(&config);
+    }
+    println!("Config Loaded...\nInitializing Client...");
+
+    let token = env::var("RS_API_TOKEN")
+        .map(SecretString::from)
+        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
+    let client = Client::builder()
+        .authentication_token(token)
+        .sqlite(&config.database)
+        .startup_policy(StartupPolicy::Essential)
+        .start()
+        .await?;
+    println!("Client Initialized...");
+    let result = run(&client, &config).await;
+    let close_result = client.close().await;
+    close_result?;
+    result
+}
+
+async fn run(client: &Client, config: &Config) -> AnyResult<()> {
+    println!("Client Syncing...");
+    let sync = client.sync().full().await?;
+    println!("Client Synced...\nRunning...");
+    info!(readiness = ?sync.readiness, "full managed synchronization completed");
+
+    let events = fetch_active_events(client).await?;
+    let earned = fetch_earned_achievements(client).await?;
+    if events.is_empty() {
+        println!("No active discovered location events were returned.");
+        return Ok(());
+    }
+
+    if config.command == Command::List {
+        let definitions = events
+            .iter()
+            .map(normalize_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        if config.json {
+            println!("{}", serde_json::to_string_pretty(&definitions)?);
+        } else {
+            print_event_table(&definitions, &earned);
+        }
+        return Ok(());
+    }
+
+    let selected_event = select_event(
+        &events,
+        config.event.as_deref(),
+        config.command,
+        &earned,
+    )?;
+    let event = normalize_event(selected_event)?;
+    let replicant = select_replicant(client, config.replicant.as_deref(), config.command).await?;
+    let replicant_code = replicant.key.id.as_str().to_owned();
+
+    if config.plan_path.exists() && !config.replace_plan {
+        let existing = load_plan(&config.plan_path)?;
+        if !existing.phase.is_terminal() {
+            return Err(app_error(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "active mission {} already exists at {}; use status or --replace-plan",
+                    existing.mission_id,
+                    config.plan_path.display()
+                ),
+            ));
+        }
+    }
+
+    let context = build_context(client, &event, &earned, &config.home).await?;
+    let event_plan = plan_event(event, &context)?;
+    let selected_criterion = select_criterion(
+        &event_plan,
+        config.criterion.as_deref(),
+        config.command == Command::Interactive || config.criterion.is_none(),
+    )?;
+    let mission_id = uuid::Uuid::new_v4().simple().to_string();
+    let plan = EventMissionPlan {
+        version: PLAN_VERSION,
+        mission_id: mission_id.clone(),
+        mission_tag: mission_tag(&mission_id),
+        phase: MissionPhase::Planned,
+        selected_replicant: replicant_code,
+        home_location: config.home.clone(),
+        event: event_plan.event.clone(),
+        selected_criterion,
+        grants_unearned_achievement: event_plan.grants_unearned_achievement,
+        claimed_devices: Vec::new(),
+    };
+    save_plan(&config.plan_path, &plan)?;
+
+    if config.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print_event_plan(&event_plan);
+        println!("\nSelected criterion: {}", plan.selected_criterion.criterion_name);
+        println!("Replicant: {}", plan.selected_replicant);
+        println!("Saved plan: {}", config.plan_path.display());
+        println!(
+            "Mission tags reserved for execution: {}, {}, {}",
+            plan.mission_tag,
+            role_tag("cargo"),
+            role_tag("carrier")
+        );
+    }
+    Ok(())
+}
+
+async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::LocationEvent>> {
+    let mut cursor = None;
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        let response = client
+            .raw()
+            .accounts()
+            .events(&raw::accounts::AccountEventsQuery {
+                status: Some("active".into()),
+                cursor,
+                limit: Some(100),
+            })
+            .await?
+            .value;
+        events.extend(response.events);
+        let Some(next) = response.next_cursor else {
+            events.sort_by(|left, right| {
+                left.location
+                    .cmp(&right.location)
+                    .then_with(|| left.title.cmp(&right.title))
+                    .then_with(|| left.designation.cmp(&right.designation))
+            });
+            return Ok(events);
+        };
+        cursor = Some(next);
+    }
+    Err(app_error(
+        io::ErrorKind::InvalidData,
+        "event listing exceeded the 100-page safety bound",
+    ))
+}
+
+async fn fetch_earned_achievements(client: &Client) -> AnyResult<BTreeSet<String>> {
+    Ok(client
+        .raw()
+        .accounts()
+        .achievements()
+        .await?
+        .value
+        .achievements
+        .into_iter()
+        .filter_map(|achievement| achievement.achievement_key)
+        .collect())
+}
+
+fn normalize_event(raw_event: &raw::events::LocationEvent) -> AnyResult<EventDefinition> {
+    let designation = raw_event.designation.clone().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            "location event omitted designation",
+        )
+    })?;
+    let location = raw_event.location.clone().ok_or_else(|| {
+        app_error(io::ErrorKind::InvalidData, "location event omitted location")
+    })?;
+    let title = raw_event
+        .title
+        .clone()
+        .unwrap_or_else(|| designation.clone());
+    Ok(EventDefinition::from_open_fields(OpenEventFields {
+        designation,
+        location,
+        title,
+        description: raw_event.description.clone(),
+        event_type: raw_event.event_type.clone(),
+        tier: raw_event.tier,
+        status: raw_event.status.clone(),
+        criteria: raw_event.criteria.as_deref().unwrap_or_default(),
+        progress: raw_event.progress.as_ref(),
+        rewards: raw_event.rewards.as_ref(),
+    })?)
+}
+
+async fn select_replicant(
+    client: &Client,
+    requested: Option<&str>,
+    command: Command,
+) -> AnyResult<Replicant> {
+    let handles = client.replicants().find().owned().collect().await?;
+    let mut replicants = Vec::new();
+    for handle in handles {
+        replicants.push(handle.snapshot().await?);
+    }
+    replicants.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
+    });
+    if let Some(requested) = requested {
+        return resolve_replicant(&replicants, requested);
+    }
+    if command != Command::Interactive {
+        return resolve_replicant(&replicants, DEFAULT_REPLICANT);
+    }
+    println!("\nReplicants:");
+    let default_index = replicants
+        .iter()
+        .position(|replicant| {
+            replicant
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(DEFAULT_REPLICANT))
+        })
+        .unwrap_or(0);
+    for (index, replicant) in replicants.iter().enumerate() {
+        println!(
+            "  {:>2}. {:<20} {}{}",
+            index + 1,
+            replicant.name.as_deref().unwrap_or("<unnamed>"),
+            replicant.key.id.as_str(),
+            if index == default_index { " [default]" } else { "" }
+        );
+    }
+    let selected = prompt_index("Select replicant", replicants.len(), default_index + 1)?;
+    Ok(replicants.remove(selected - 1))
+}
+
+fn resolve_replicant(replicants: &[Replicant], requested: &str) -> AnyResult<Replicant> {
+    let mut matches = replicants
+        .iter()
+        .filter(|replicant| {
+            replicant.key.id.as_str().eq_ignore_ascii_case(requested)
+                || replicant
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(app_error(
+            io::ErrorKind::NotFound,
+            format!("no owned replicant matches {requested:?}"),
+        )),
+        _ => Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("replicant name {requested:?} is ambiguous; use its code"),
+        )),
+    }
+}
+
+fn select_event<'a>(
+    events: &'a [raw::events::LocationEvent],
+    requested: Option<&str>,
+    command: Command,
+    earned: &BTreeSet<String>,
+) -> AnyResult<&'a raw::events::LocationEvent> {
+    if let Some(requested) = requested {
+        return events
+            .iter()
+            .find(|event| {
+                event
+                    .designation
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(requested))
+            })
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::NotFound,
+                    format!("active event {requested:?} was not found"),
+                )
+            });
+    }
+    if command != Command::Interactive {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "plan requires an event designation when not interactive",
+        ));
+    }
+    let definitions = events
+        .iter()
+        .map(normalize_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    print_event_table(&definitions, earned);
+    let selected = prompt_index("Select event", events.len(), 1)?;
+    Ok(&events[selected - 1])
+}
+
+fn select_criterion(
+    plan: &EventPlan,
+    requested: Option<&str>,
+    interactive: bool,
+) -> AnyResult<CriterionAssessment> {
+    if let Some(requested) = requested {
+        let criterion = plan
+            .criteria
+            .iter()
+            .find(|criterion| criterion.criterion_name.eq_ignore_ascii_case(requested))
+            .cloned()
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::NotFound,
+                    format!("criterion {requested:?} was not found"),
+                )
+            })?;
+        return require_feasible_criterion(criterion);
+    }
+    if plan.criteria.len() == 1 {
+        return require_feasible_criterion(plan.criteria[0].clone());
+    }
+    if !interactive {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "event has multiple criteria; use --criterion",
+        ));
+    }
+    print_event_plan(plan);
+    loop {
+        let selected = prompt_index("Select completion option", plan.criteria.len(), 1)?;
+        let criterion = plan.criteria[selected - 1].clone();
+        if criterion.feasible {
+            return Ok(criterion);
+        }
+        println!(
+            "That option is blocked: {}",
+            criterion.blockers.join("; ")
+        );
+    }
+}
+
+fn require_feasible_criterion(criterion: CriterionAssessment) -> AnyResult<CriterionAssessment> {
+    if criterion.feasible {
+        Ok(criterion)
+    } else {
+        Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "criterion {:?} is blocked: {}",
+                criterion.criterion_name,
+                criterion.blockers.join("; ")
+            ),
+        ))
+    }
+}
+
+async fn build_context(
+    client: &Client,
+    event: &EventDefinition,
+    earned: &BTreeSet<String>,
+    home: &str,
+) -> AnyResult<PlanningContext> {
+    let blueprints = fetch_blueprints(client).await?;
+    let devices = fetch_devices(client, &blueprints).await?;
+    let home_inventory = fetch_inventory(client, home).await?;
+    let event_inventory = fetch_inventory(client, &event.location).await?;
+    let factories = build_factory_workloads(&devices, &blueprints, home);
+    Ok(PlanningContext {
+        home_inventory,
+        event_inventory,
+        blueprints,
+        devices: devices.into_iter().map(|item| item.stock).collect(),
+        factories,
+        earned_achievements: earned.clone(),
+        home_location: home.to_owned(),
+        mission_tag_prefix: EVENT_MISSION_TAG_PREFIX.into(),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LiveDevice {
+    stock: DeviceStock,
+    printing_eta_seconds: f64,
+    print_queue: Vec<Map<String, Value>>,
+}
+
+async fn fetch_devices(
+    client: &Client,
+    blueprints: &BTreeMap<String, BlueprintSpec>,
+) -> AnyResult<Vec<LiveDevice>> {
+    let mut cursor = None;
+    let mut devices = Vec::new();
+    for _ in 0..100 {
+        let response = client
+            .raw()
+            .devices()
+            .list(&raw::devices::DeviceListQuery {
+                replicant_code: None,
+                device_type: None,
+                tag: None,
+                untagged: None,
+                location: None,
+                cursor,
+                limit: Some(50),
+            })
+            .await?
+            .value;
+        for device in response.devices {
+            let Some(code) = device.device_code.clone() else {
+                continue;
+            };
+            let Some(device_type) = device.device_type.clone() else {
+                continue;
+            };
+            let blueprint = blueprints.get(&device_type);
+            devices.push(LiveDevice {
+                stock: DeviceStock {
+                    code,
+                    device_type,
+                    status: device.status,
+                    location: device.location,
+                    assigned_replicant: device.replicant_code,
+                    tags: device.tags.into_iter().collect(),
+                    cargo_capacity: device
+                        .cargo_capacity
+                        .or_else(|| blueprint.map(|item| item.cargo_capacity))
+                        .unwrap_or(0),
+                    attach_capacity: device
+                        .attach_capacity
+                        .or_else(|| blueprint.map(|item| item.attach_capacity))
+                        .unwrap_or(0),
+                    controlled_by_ami: device.controller_device_code.is_some(),
+                    travelling: device.travel.is_some(),
+                },
+                printing_eta_seconds: device
+                    .printing
+                    .and_then(|printing| printing.eta_seconds)
+                    .unwrap_or(0.0),
+                print_queue: device.print_queue,
+            });
+        }
+        let Some(next) = response.next_cursor else {
+            devices.sort_by(|left, right| left.stock.code.cmp(&right.stock.code));
+            return Ok(devices);
+        };
+        cursor = Some(next);
+    }
+    Err(app_error(
+        io::ErrorKind::InvalidData,
+        "device listing exceeded the 100-page safety bound",
+    ))
+}
+
+async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, BlueprintSpec>> {
+    Ok(client
+        .raw()
+        .blueprints()
+        .list()
+        .await?
+        .value
+        .blueprints
+        .into_iter()
+        .filter_map(|blueprint| {
+            let device_type = blueprint.device_type?;
+            Some((
+                device_type.clone(),
+                BlueprintSpec {
+                    device_type,
+                    print_time_seconds: blueprint.print_time.unwrap_or(0.0),
+                    cargo_capacity: blueprint.cargo_capacity.unwrap_or(0),
+                    attach_capacity: blueprint.attach_capacity.unwrap_or(0),
+                    stow_capacity: blueprint.stow_capacity.unwrap_or(0),
+                    resources: numeric_map(blueprint.resources.as_ref()),
+                    components: numeric_map(blueprint.components.as_ref()),
+                    features: blueprint
+                        .features
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                },
+            ))
+        })
+        .collect())
+}
+
+async fn fetch_inventory(client: &Client, location: &str) -> AnyResult<ResourceMap> {
+    let (inventories, _) = client
+        .inventory()
+        .list(&raw::inventory::AccountInventoryQuery {
+            location: Some(location.to_owned()),
+            cursor: None,
+            limit: Some(50),
+        })
+        .await?;
+    Ok(inventories
+        .into_iter()
+        .find(|inventory| {
+            inventory
+                .location
+                .as_ref()
+                .is_some_and(|item| item.id.as_str() == location)
+        })
+        .map(|inventory| {
+            inventory
+                .items
+                .into_iter()
+                .map(|item| (item.resource, item.quantity))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn build_factory_workloads(
+    devices: &[LiveDevice],
+    blueprints: &BTreeMap<String, BlueprintSpec>,
+    home: &str,
+) -> Vec<FactoryWorkload> {
+    let mut workloads = devices
+        .iter()
+        .filter(|device| {
+            device.stock.device_type == AUTOFACTORY
+                && device.stock.location.as_deref() == Some(home)
+        })
+        .map(|device| {
+            let queued = device
+                .print_queue
+                .iter()
+                .map(|job| {
+                    let device_type = string_field(job, &["device_type", "type"]);
+                    let quantity = integer_field(job, &["quantity", "count"]).unwrap_or(1).max(1);
+                    device_type
+                        .and_then(|device_type| blueprints.get(device_type))
+                        .map(|blueprint| blueprint.print_time_seconds * quantity as f64)
+                        .unwrap_or(0.0)
+                })
+                .sum::<f64>();
+            FactoryWorkload {
+                code: device.stock.code.clone(),
+                remaining_seconds: device.printing_eta_seconds + queued,
+            }
+        })
+        .collect::<Vec<_>>();
+    workloads.sort_by(|left, right| left.code.cmp(&right.code));
+    workloads
+}
+
+fn numeric_map(object: Option<&Map<String, Value>>) -> BTreeMap<String, i64> {
+    let Some(object) = object else {
+        return BTreeMap::new();
+    };
+    object
+        .iter()
+        .filter_map(|(key, value)| value_to_i64(value).map(|amount| (key.clone(), amount)))
+        .filter(|(_, amount)| *amount > 0)
+        .collect()
+}
+
+fn value_to_i64(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_u64()
+            .and_then(|number| i64::try_from(number).ok())
+            .or_else(|| value.as_f64().map(|number| number.round() as i64))
+    })
+}
+
+fn string_field<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+}
+
+fn integer_field(object: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(value_to_i64))
+}
+
+fn print_event_table(events: &[EventDefinition], earned: &BTreeSet<String>) {
+    println!(
+        "{:<3} {:<13} {:<30} {:<5} {:<22} {:<10} {:<22} FLAGS",
+        "#", "SYS", "TITLE", "WAYS", "MATERIALS", "DEVICES", "REWARD"
+    );
+    println!("{}", "-".repeat(122));
+    for (index, event) in events.iter().enumerate() {
+        let materials = event
+            .criteria
+            .iter()
+            .map(|criterion| format_compact_resources(&criterion.resources))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let devices = event
+            .criteria
+            .iter()
+            .map(|criterion| {
+                criterion
+                    .devices
+                    .iter()
+                    .map(|item| item.count)
+                    .sum::<i64>()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let reward = format_compact_resources(&event.rewards.resources);
+        let flags = event
+            .rewards
+            .completion_achievement
+            .as_ref()
+            .filter(|achievement| !earned.contains(*achievement))
+            .map(|_| "NEW ACH")
+            .unwrap_or("");
+        println!(
+            "{:<3} {:<13} {:<30} {:<5} {:<22} {:<10} {:<22} {}",
+            index + 1,
+            truncate(&system_from_location(&event.location), 13),
+            truncate(&event.title, 30),
+            event.criteria.len(),
+            truncate(&materials, 22),
+            truncate(&devices, 10),
+            truncate(&reward, 22),
+            flags
+        );
+    }
+    println!("\nReward rarity note: Rares > Volatiles > Conductive.");
+}
+
+fn print_event_plan(plan: &EventPlan) {
+    println!("\n{}", plan.event.title);
+    println!("{} · {}", plan.event.location, plan.event.designation);
+    if plan.grants_unearned_achievement {
+        println!("Achievement: NOT YET EARNED");
+    }
+    println!("Reward: {}", format_resources(&plan.event.rewards.resources));
+    if let Some(xp) = plan.event.rewards.xp {
+        println!("XP: {xp}");
+    }
+    println!("\nCompletion options:");
+    for (index, criterion) in plan.criteria.iter().enumerate() {
+        println!("\n  {}. {}", index + 1, criterion.criterion_name);
+        println!(
+            "     Status:               {}",
+            if criterion.feasible { "FEASIBLE" } else { "BLOCKED" }
+        );
+        println!(
+            "     Remaining materials: {}",
+            format_resources(&criterion.remaining_resources)
+        );
+        println!(
+            "     Remaining devices:   {}",
+            format_devices(&criterion.remaining_devices)
+        );
+        println!(
+            "     Reused / printed:     {} / {}",
+            criterion.reused_devices.len(),
+            criterion.print_count()
+        );
+        println!(
+            "     Cargo:                {} transport(s), {} inbound trip(s), {} reward trip(s)",
+            criterion.cargo.transports.len(),
+            criterion.cargo.inbound_trips,
+            criterion.cargo.outbound_trips
+        );
+        println!(
+            "     Device carrier:       {} transport(s), {} trip(s)",
+            criterion.carriers.transports.len(),
+            criterion.carriers.inbound_trips
+        );
+        println!("     Beacon:               {:?}", criterion.beacon.action);
+        println!(
+            "     Print ready estimate: {}",
+            format_duration(criterion.print_schedule.makespan_seconds)
+        );
+        if !criterion.recommendations.is_empty() {
+            println!(
+                "     Badges:               {}",
+                criterion
+                    .recommendations
+                    .iter()
+                    .map(recommendation_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for blocker in &criterion.blockers {
+            println!("     Blocker:              {blocker}");
+        }
+        for warning in &criterion.warnings {
+            println!("     Warning:              {warning}");
+        }
+        for batch in &criterion.print_schedule.batches {
+            println!(
+                "     Print:                {} × {} on {} (factory finish {})",
+                batch.quantity,
+                batch.device_type,
+                batch.factory_code,
+                format_duration(batch.projected_finish_seconds)
+            );
+        }
+    }
+}
+
+fn recommendation_label(recommendation: &Recommendation) -> &'static str {
+    match recommendation {
+        Recommendation::Fastest => "FASTEST",
+        Recommendation::LowestManufacturingCost => "LOWEST COST",
+        Recommendation::LowestRareResourceUse => "LOWEST RARE USE",
+        Recommendation::FewestPrints => "FEWEST PRINTS",
+        Recommendation::FewestTrips => "FEWEST TRIPS",
+        Recommendation::UsesExistingStockBest => "USES STOCK",
+    }
+}
+
+fn format_compact_resources(resources: &ResourceMap) -> String {
+    if resources.is_empty() {
+        return "—".into();
+    }
+    resources
+        .iter()
+        .map(|(resource, quantity)| {
+            format!("{quantity} {}", resource_abbreviation(resource))
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn resource_abbreviation(resource: &str) -> String {
+    match resource.to_ascii_lowercase().as_str() {
+        "carbon" => "Car".into(),
+        "conductive" => "Con".into(),
+        "silicate" | "silicates" => "Sil".into(),
+        "structural" => "Str".into(),
+        "volatile" | "volatiles" => "Vol".into(),
+        "rare" | "rares" => "Rar".into(),
+        _ => display_name(resource).chars().take(3).collect(),
+    }
+}
+
+fn format_resources(resources: &ResourceMap) -> String {
+    if resources.is_empty() {
+        return "—".into();
+    }
+    resources
+        .iter()
+        .map(|(resource, quantity)| format!("{quantity} {}", display_name(resource)))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn format_devices(devices: &[replicant_event_planner::DeviceRequirement]) -> String {
+    if devices.is_empty() {
+        return "—".into();
+    }
+    devices
+        .iter()
+        .map(|item| format!("{} × {}", item.count, display_name(&item.device_type)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_name(value: &str) -> String {
+    value
+        .split('_')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn system_from_location(location: &str) -> String {
+    location
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.chars().all(|character| character.is_ascii_digit()))
+        .map(|(system, _)| system.to_owned())
+        .unwrap_or_else(|| location.to_owned())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    value.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let hours = total / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn prompt_index(prompt: &str, maximum: usize, default: usize) -> AnyResult<usize> {
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("{prompt} [{default}]: ");
+        io::stdout().flush()?;
+        line.clear();
+        stdin.lock().read_line(&mut line)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        if let Ok(value) = trimmed.parse::<usize>()
+            && (1..=maximum).contains(&value)
+        {
+            return Ok(value);
+        }
+        println!("Enter a number from 1 to {maximum}.");
+    }
+}
+
+fn save_plan(path: &Path, plan: &EventMissionPlan) -> AnyResult<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let file = File::create(&temporary)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, plan)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn load_plan(path: &Path) -> AnyResult<EventMissionPlan> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn show_status(config: &Config) -> AnyResult<()> {
+    if !config.plan_path.exists() {
+        println!("No mission plan exists at {}.", config.plan_path.display());
+        return Ok(());
+    }
+    let plan = load_plan(&config.plan_path)?;
+    if config.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    println!("Mission:    {}", plan.mission_id);
+    println!("Phase:      {:?}", plan.phase);
+    println!("Event:      {}", plan.event.designation);
+    println!("Criterion:  {}", plan.selected_criterion.criterion_name);
+    println!("Replicant:  {}", plan.selected_replicant);
+    println!("Home:       {}", plan.home_location);
+    println!("Mission tag: {}", plan.mission_tag);
+    Ok(())
+}
