@@ -12,6 +12,7 @@ name = "replicant-events"
 path = "src/main.rs"
 
 [dependencies]
+futures = "0.3"
 replicant-client = { version = "1.0.0", path = "../..", features = ["managed"] }
 replicant-event-planner = { version = "0.1.0", path = "../replicant-event-planner" }
 serde = { version = "1.0", features = ["derive"] }

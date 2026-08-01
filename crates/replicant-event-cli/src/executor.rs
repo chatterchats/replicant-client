@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::{join_all, try_join_all};
 use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, raw};
 use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
@@ -1920,44 +1921,24 @@ async fn recover_rewards(
         save_plan(&config.plan_path, plan)?;
     }
 
-    start_replicant_travel_to(
-        client,
-        &plan.selected_replicant,
-        &plan.home_location,
-    )
-    .await?;
-
     let deadline = Instant::now() + config.wait_timeout;
     loop {
+        try_join_all(
+            cargo
+                .iter()
+                .map(|code| settle_reward_transport(client, config, plan, code)),
+        )
+        .await?;
+
+        let mut carrying_rewards = false;
         for code in &cargo {
-            let mut detail = client.raw().devices().get(code).await?.value;
+            let detail = client.raw().devices().get(code).await?.value;
             ensure_uncontrolled_cargo(&detail, code)?;
-            if detail.travel.is_some() {
-                let destination = planned_device_destination(&detail).ok_or_else(|| {
-                    app_error(
-                        io::ErrorKind::InvalidData,
-                        format!("cargo transport {code} is travelling without a destination"),
-                    )
-                })?;
-                if destination != plan.home_location && destination != plan.event.location {
-                    return Err(app_error(
-                        io::ErrorKind::Other,
-                        format!("cargo transport {code} is travelling to unexpected destination {destination}"),
-                    ));
-                }
-                ensure_device_at(client, config, code, &destination).await?;
-                detail = client.raw().devices().get(code).await?.value;
-                ensure_uncontrolled_cargo(&detail, code)?;
-            }
-            let carried = cargo_map(&detail);
-            if detail.location.as_deref() == Some(plan.home_location.as_str())
-                && !carried.is_empty()
-            {
-                deposit_all(client, config, code).await?;
-            } else if !carried.is_empty() {
-                ensure_device_at(client, config, code, &plan.home_location).await?;
-                deposit_all(client, config, code).await?;
-            }
+            carrying_rewards |= !cargo_map(&detail).is_empty();
+        }
+        if carrying_rewards {
+            return_event_fleet_home(client, config, plan, &cargo).await?;
+            deposit_all_devices(client, config, &cargo).await?;
         }
 
         let remaining = reward_remaining_at_home(client, plan).await?;
@@ -1975,33 +1956,56 @@ async fn recover_rewards(
             "recovering event rewards"
         );
         let before = sum_resources(&remaining);
+        travel_devices_to(client, config, &cargo, &plan.event.location).await?;
+
+        let mut capacities = Vec::with_capacity(cargo.len());
         for code in &cargo {
-            ensure_device_at(client, config, code, &plan.event.location).await?;
             let detail = client.raw().devices().get(code).await?.value;
             ensure_uncontrolled_cargo(&detail, code)?;
             if !cargo_map(&detail).is_empty() {
-                ensure_device_at(client, config, code, &plan.home_location).await?;
-                deposit_all(client, config, code).await?;
-                continue;
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("cargo transport {code} is not empty before reward collection"),
+                ));
             }
             let capacity = detail.cargo_capacity.unwrap_or(0);
-            let current_remaining = reward_remaining_at_home(client, plan).await?;
-            let manifest = take_manifest(&current_remaining, capacity);
-            if manifest.is_empty() {
-                continue;
+            if capacity <= 0 {
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("cargo transport {code} has no usable cargo capacity"),
+                ));
             }
+            capacities.push((code.clone(), capacity));
+        }
+
+        let manifests = allocate_manifests(&remaining, &capacities);
+        if manifests.is_empty() {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                "no Cargo Freighter can carry the remaining event rewards",
+            ));
+        }
+        for (code, manifest) in &manifests {
             info!(
                 mission_id = %plan.mission_id,
                 transport = %code,
                 manifest = %format_resource_map(&manifest),
                 "collecting reward manifest"
             );
-            collect_resources(client, config, code, &manifest).await?;
-            ensure_device_at(client, config, code, &plan.home_location).await?;
-            deposit_all(client, config, code).await?;
-            if reward_remaining_at_home(client, plan).await?.is_empty() {
-                return Ok(());
-            }
+        }
+        finish_all(
+            join_all(
+                manifests
+                    .iter()
+                    .map(|(code, manifest)| collect_resources(client, config, code, manifest)),
+            )
+            .await,
+        )?;
+
+        return_event_fleet_home(client, config, plan, &cargo).await?;
+        deposit_all_devices(client, config, &cargo).await?;
+        if reward_remaining_at_home(client, plan).await?.is_empty() {
+            return Ok(());
         }
 
         let remaining = reward_remaining_at_home(client, plan).await?;
@@ -2018,6 +2022,69 @@ async fn recover_rewards(
             sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+async fn settle_reward_transport(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+    code: &str,
+) -> AnyResult<()> {
+    let detail = client.raw().devices().get(code).await?.value;
+    ensure_uncontrolled_cargo(&detail, code)?;
+    if detail.travel.is_none() {
+        return Ok(());
+    }
+    let destination = planned_device_destination(&detail).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            format!("cargo transport {code} is travelling without a destination"),
+        )
+    })?;
+    if destination != plan.home_location && destination != plan.event.location {
+        return Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "cargo transport {code} is travelling to unexpected destination {destination}"
+            ),
+        ));
+    }
+    ensure_device_at(client, config, code, &destination).await
+}
+
+async fn deposit_all_devices(
+    client: &Client,
+    config: &Config,
+    codes: &[String],
+) -> AnyResult<()> {
+    finish_all(
+        join_all(
+            codes
+                .iter()
+                .map(|code| deposit_all(client, config, code)),
+        )
+        .await,
+    )
+}
+
+async fn return_event_fleet_home(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+    cargo: &[String],
+) -> AnyResult<()> {
+    let mut devices = cargo.to_vec();
+    devices.extend(carrier_codes(plan));
+    devices.sort();
+    devices.dedup();
+    travel_fleet_to(
+        client,
+        config,
+        &devices,
+        Some(&plan.selected_replicant),
+        &plan.home_location,
+    )
+    .await
 }
 
 async fn reward_remaining_at_home(
@@ -2051,15 +2118,10 @@ async fn return_mission_assets(
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
-    recover_failed_beacon(client, config, plan).await?;
-
-    for code in cargo_codes(plan) {
-        ensure_device_at(client, config, &code, &plan.home_location).await?;
-        let detail = client.raw().devices().get(&code).await?.value;
-        ensure_uncontrolled_cargo(&detail, &code)?;
-        if !cargo_map(&detail).is_empty() {
-            deposit_all(client, config, &code).await?;
-        }
+    let cargo = cargo_codes(plan);
+    for code in &cargo {
+        let detail = client.raw().devices().get(code).await?.value;
+        ensure_uncontrolled_cargo(&detail, code)?;
     }
 
     let mission_payload = plan
@@ -2068,8 +2130,9 @@ async fn return_mission_assets(
         .iter()
         .map(|device| device.code.as_str())
         .collect::<BTreeSet<_>>();
-    for code in carrier_codes(plan) {
-        let detail = client.raw().devices().get(&code).await?.value;
+    let carriers = carrier_codes(plan);
+    for code in &carriers {
+        let detail = client.raw().devices().get(code).await?.value;
         if !detail.attached_devices.is_empty() {
             let attached = detail
                 .attached_devices
@@ -2078,19 +2141,26 @@ async fn return_mission_assets(
                 .filter(|attached| mission_payload.contains(attached.as_str()))
                 .collect::<Vec<_>>();
             if !attached.is_empty() {
-                detach_devices(client, config, &code, &attached).await?;
+                detach_devices(client, config, code, &attached).await?;
             }
         }
-        ensure_device_at(client, config, &code, &plan.home_location).await?;
     }
 
-    travel_replicant_to(
+    let mut devices = cargo.clone();
+    devices.extend(carriers);
+    devices.sort();
+    devices.dedup();
+    travel_fleet_to(
         client,
         config,
-        &plan.selected_replicant,
+        &devices,
+        Some(&plan.selected_replicant),
         &plan.home_location,
     )
     .await?;
+
+    deposit_all_devices(client, config, &cargo).await?;
+    recover_failed_beacon(client, config, plan).await?;
     Ok(())
 }
 
@@ -2301,6 +2371,15 @@ async fn ensure_device_at(
     code: &str,
     destination: &str,
 ) -> AnyResult<()> {
+    start_device_travel_to(client, code, destination).await?;
+    wait_for_device_at(client, config, code, destination).await
+}
+
+async fn start_device_travel_to(
+    client: &Client,
+    code: &str,
+    destination: &str,
+) -> AnyResult<()> {
     let detail = client.raw().devices().get(code).await?.value;
     if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
         return Ok(());
@@ -2320,6 +2399,11 @@ async fn ensure_device_at(
             ));
         }
     } else {
+        info!(
+            device = %code,
+            destination = %destination,
+            "dispatching device travel"
+        );
         let operation = client
             .devices()
             .get(code)
@@ -2332,27 +2416,88 @@ async fn ensure_device_at(
             .await?;
         ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
     }
+    Ok(())
+}
 
+async fn wait_for_device_at(
+    client: &Client,
+    config: &Config,
+    code: &str,
+    destination: &str,
+) -> AnyResult<()> {
     wait_for_raw_device(client, config, code, |device| {
         device.travel.is_none() && device.location.as_deref() == Some(destination)
     })
     .await
 }
 
+async fn dispatch_devices_to(
+    client: &Client,
+    codes: &[String],
+    destination: &str,
+) -> AnyResult<()> {
+    finish_all(
+        join_all(
+            codes
+                .iter()
+                .map(|code| start_device_travel_to(client, code, destination)),
+        )
+        .await,
+    )
+}
+
+async fn wait_for_devices_at(
+    client: &Client,
+    config: &Config,
+    codes: &[String],
+    destination: &str,
+) -> AnyResult<()> {
+    try_join_all(
+        codes
+            .iter()
+            .map(|code| wait_for_device_at(client, config, code, destination)),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn travel_devices_to(
+    client: &Client,
+    config: &Config,
+    codes: &[String],
+    destination: &str,
+) -> AnyResult<()> {
+    if codes.is_empty() {
+        return Ok(());
+    }
+    info!(
+        count = codes.len(),
+        devices = %codes.join(","),
+        destination = %destination,
+        "dispatching device travel batch"
+    );
+    dispatch_devices_to(client, codes, destination).await?;
+    wait_for_devices_at(client, config, codes, destination).await
+}
+
 async fn start_replicant_travel_to(
     client: &Client,
     replicant_code: &str,
     destination: &str,
-) -> AnyResult<()> {
+) -> AnyResult<Option<String>> {
     let handle = client.replicants().get_owned(replicant_code).await?;
     let snapshot = handle.snapshot().await?;
+    let origin = snapshot
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned());
     if snapshot.travel.is_none()
         && snapshot
             .location
             .as_ref()
             .is_some_and(|location| location.id.as_str() == destination)
     {
-        return Ok(());
+        return Ok(origin);
     }
     if let Some(travel) = &snapshot.travel {
         let planned = travel
@@ -2369,7 +2514,7 @@ async fn start_replicant_travel_to(
                 ),
             ));
         }
-        return Ok(());
+        return Ok(origin);
     }
 
     info!(
@@ -2379,17 +2524,16 @@ async fn start_replicant_travel_to(
     );
     let operation = handle.travel().to(destination).depart().await?;
     ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
-    Ok(())
+    Ok(origin)
 }
 
-async fn travel_replicant_to(
+async fn wait_for_replicant_at(
     client: &Client,
     config: &Config,
     replicant_code: &str,
     destination: &str,
+    mut departure_origin: Option<String>,
 ) -> AnyResult<()> {
-    start_replicant_travel_to(client, replicant_code, destination).await?;
-
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
@@ -2399,13 +2543,32 @@ async fn travel_replicant_to(
             .await?
             .snapshot()
             .await?;
-        if snapshot.travel.is_none()
-            && snapshot
-                .location
-                .as_ref()
-                .is_some_and(|location| location.id.as_str() == destination)
-        {
-            return Ok(());
+        let location = snapshot
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str());
+        match replicant_travel_decision(
+            location,
+            snapshot.travel.is_some(),
+            destination,
+            departure_origin.as_deref(),
+        ) {
+            ReplicantTravelDecision::Arrived => return Ok(()),
+            ReplicantTravelDecision::Continue => {
+                let Some(intermediate) = location else {
+                    continue;
+                };
+                info!(
+                    replicant = %replicant_code,
+                    intermediate = %intermediate,
+                    destination = %destination,
+                    "continuing replicant travel from intermediate waypoint"
+                );
+                departure_origin =
+                    start_replicant_travel_to(client, replicant_code, destination).await?;
+                continue;
+            }
+            ReplicantTravelDecision::Wait => {}
         }
         if Instant::now() >= deadline {
             return Err(app_error(
@@ -2415,6 +2578,100 @@ async fn travel_replicant_to(
         }
         wait_for_relevant_event(&mut watch, deadline, &["travel.arrived"]).await?;
     }
+}
+
+async fn travel_replicant_to(
+    client: &Client,
+    config: &Config,
+    replicant_code: &str,
+    destination: &str,
+) -> AnyResult<()> {
+    let departure_origin =
+        start_replicant_travel_to(client, replicant_code, destination).await?;
+    wait_for_replicant_at(
+        client,
+        config,
+        replicant_code,
+        destination,
+        departure_origin,
+    )
+    .await
+}
+
+async fn travel_fleet_to(
+    client: &Client,
+    config: &Config,
+    devices: &[String],
+    replicant: Option<&str>,
+    destination: &str,
+) -> AnyResult<()> {
+    info!(
+        device_count = devices.len(),
+        devices = %devices.join(","),
+        replicant = replicant.unwrap_or("none"),
+        destination = %destination,
+        "dispatching mission fleet"
+    );
+
+    match replicant {
+        Some(replicant) => {
+            let (devices_result, replicant_result) = tokio::join!(
+                dispatch_devices_to(client, devices, destination),
+                start_replicant_travel_to(client, replicant, destination),
+            );
+            devices_result?;
+            let departure_origin = replicant_result?;
+            tokio::try_join!(
+                wait_for_devices_at(client, config, devices, destination),
+                wait_for_replicant_at(
+                    client,
+                    config,
+                    replicant,
+                    destination,
+                    departure_origin,
+                ),
+            )?;
+        }
+        None => {
+            dispatch_devices_to(client, devices, destination).await?;
+            wait_for_devices_at(client, config, devices, destination).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicantTravelDecision {
+    Arrived,
+    Continue,
+    Wait,
+}
+
+fn replicant_travel_decision(
+    location: Option<&str>,
+    travelling: bool,
+    destination: &str,
+    departure_origin: Option<&str>,
+) -> ReplicantTravelDecision {
+    if travelling {
+        return ReplicantTravelDecision::Wait;
+    }
+    if location == Some(destination) {
+        return ReplicantTravelDecision::Arrived;
+    }
+    if let (Some(location), Some(departure_origin)) = (location, departure_origin)
+        && location != departure_origin
+    {
+        return ReplicantTravelDecision::Continue;
+    }
+    ReplicantTravelDecision::Wait
+}
+
+fn finish_all(results: Vec<AnyResult<()>>) -> AnyResult<()> {
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 async fn collect_resources(
@@ -2689,6 +2946,36 @@ fn take_manifest(resources: &ResourceMap, capacity: i64) -> ResourceMap {
     result
 }
 
+fn allocate_manifests(
+    resources: &ResourceMap,
+    capacities: &[(String, i64)],
+) -> Vec<(String, ResourceMap)> {
+    let mut remaining = resources.clone();
+    let mut manifests = Vec::new();
+    for (code, capacity) in capacities {
+        let manifest = take_manifest(&remaining, *capacity);
+        if manifest.is_empty() {
+            continue;
+        }
+        for (resource, quantity) in &manifest {
+            let remove = if let Some(remaining_quantity) = remaining.get_mut(resource) {
+                *remaining_quantity = remaining_quantity.saturating_sub(*quantity);
+                *remaining_quantity == 0
+            } else {
+                false
+            };
+            if remove {
+                remaining.remove(resource);
+            }
+        }
+        manifests.push((code.clone(), manifest));
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    manifests
+}
+
 fn merge_resources(target: &mut ResourceMap, source: &ResourceMap) {
     for (resource, quantity) in source {
         *target.entry(resource.clone()).or_default() += quantity;
@@ -2723,4 +3010,100 @@ fn format_device_requirements(requirements: &[DeviceRequirement]) -> String {
         .map(|item| format!("{} {}", item.count, item.device_type))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ReplicantTravelDecision, ResourceMap, allocate_manifests, merge_resources,
+        replicant_travel_decision,
+    };
+
+    #[test]
+    fn allocates_reward_manifests_across_the_fleet() {
+        let resources = ResourceMap::from([
+            ("conductive".to_owned(), 300),
+            ("rares".to_owned(), 600),
+        ]);
+        let capacities = [("CF-1".to_owned(), 500), ("CF-2".to_owned(), 400)];
+
+        let manifests = allocate_manifests(&resources, &capacities);
+
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].0, "CF-1");
+        assert_eq!(manifests[0].1.values().sum::<i64>(), 500);
+        assert_eq!(manifests[1].0, "CF-2");
+        assert_eq!(manifests[1].1.values().sum::<i64>(), 400);
+
+        let mut allocated = ResourceMap::new();
+        for (_, manifest) in manifests {
+            merge_resources(&mut allocated, &manifest);
+        }
+        assert_eq!(allocated, resources);
+    }
+
+    #[test]
+    fn does_not_dispatch_unused_reward_capacity() {
+        let resources = ResourceMap::from([("rares".to_owned(), 250)]);
+        let capacities = [("CF-1".to_owned(), 500), ("CF-2".to_owned(), 500)];
+
+        let manifests = allocate_manifests(&resources, &capacities);
+
+        assert_eq!(
+            manifests,
+            vec![(
+                "CF-1".to_owned(),
+                ResourceMap::from([("rares".to_owned(), 250)])
+            )]
+        );
+    }
+
+    #[test]
+    fn continues_only_after_reaching_an_idle_intermediate_waypoint() {
+        assert_eq!(
+            replicant_travel_decision(
+                Some("SCEPTURUM-BELT-1"),
+                false,
+                "KHUXKRIXX-3",
+                Some("SCEPTURUM-BELT-1"),
+            ),
+            ReplicantTravelDecision::Wait,
+        );
+        assert_eq!(
+            replicant_travel_decision(
+                Some("SCEPTURUM-7-L4"),
+                true,
+                "KHUXKRIXX-3",
+                Some("SCEPTURUM-BELT-1"),
+            ),
+            ReplicantTravelDecision::Wait,
+        );
+        assert_eq!(
+            replicant_travel_decision(
+                Some("SCEPTURUM-7-L4"),
+                false,
+                "KHUXKRIXX-3",
+                Some("SCEPTURUM-BELT-1"),
+            ),
+            ReplicantTravelDecision::Continue,
+        );
+        assert_eq!(
+            replicant_travel_decision(
+                Some("SCEPTURUM-7-L4"),
+                false,
+                "KHUXKRIXX-3",
+                None,
+            ),
+            ReplicantTravelDecision::Wait,
+        );
+        assert_eq!(
+            replicant_travel_decision(
+                Some("KHUXKRIXX-3"),
+                false,
+                "KHUXKRIXX-3",
+                Some("SCEPTURUM-7-L4"),
+            ),
+            ReplicantTravelDecision::Arrived,
+        );
+    }
 }
