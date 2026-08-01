@@ -1186,6 +1186,7 @@ dependencies = [
 name = "replicant-event-cli"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "replicant-client",
  "replicant-event-planner",
  "serde",

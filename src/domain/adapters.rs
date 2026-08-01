@@ -528,6 +528,19 @@ pub fn location_detail(
         .scanned
         .or_else(|| survey_environment_evidence.then_some(true));
     let surveyed = scanned == Some(true);
+    let mut unknown = raw.unknown.clone();
+    if let Some(belt) = &raw.belt {
+        unknown.insert("belt".into(), Value::Object(belt.clone()));
+    }
+    if let Some(asteroid_belt) = &raw.asteroid_belt {
+        unknown.insert(
+            "asteroid_belt".into(),
+            Value::Object(asteroid_belt.clone()),
+        );
+    }
+    if let Some(mining_bonus_pct) = raw.mining_bonus_pct {
+        unknown.insert("mining_bonus_pct".into(), Value::from(mining_bonus_pct));
+    }
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),
@@ -575,7 +588,7 @@ pub fn location_detail(
             },
             ..LocationEnvironment::default()
         },
-        unknown: raw.unknown.clone().into_iter().collect(),
+        unknown: unknown.into_iter().collect(),
     };
     Ok(Observation {
         value,
@@ -1086,6 +1099,34 @@ mod location_tests {
         assert_eq!(
             observation.value.survey_progress.moons_total_estimated,
             Some(false)
+        );
+    }
+
+    #[test]
+    fn belt_metadata_is_retained_in_managed_location_evidence() {
+        let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "TARAZEDAR-BELT-1",
+            "location_type": "belt",
+            "belt": {
+                "density": "dense",
+                "designation": "TARAZEDAR-BELT-1",
+                "inner_radius_au": 0.6,
+                "outer_radius_au": 0.9,
+                "resources": {"carbon": "rich"}
+            },
+            "mining_bonus_pct": 12.5
+        }))
+        .expect("belt location should decode");
+
+        let observation = location_detail(&raw, Realm::Live, ObservationTime::now())
+            .expect("belt location should normalize");
+        assert_eq!(
+            observation.value.unknown["belt"]["density"],
+            Value::String("dense".into())
+        );
+        assert_eq!(
+            observation.value.unknown["mining_bonus_pct"],
+            Value::from(12.5)
         );
     }
 

@@ -149,3 +149,7 @@ required-features = ["managed"]
 [[example]]
 name = "expand_ftl_relay_network"
 required-features = ["managed"]
+
+[[example]]
+name = "nearby_belt_report"
+required-features = ["managed"]
