@@ -33,6 +33,12 @@ pub(crate) struct ExecutionState {
     #[serde(default)]
     pub(crate) reward_home_baseline: Option<ResourceMap>,
     #[serde(default)]
+    pub(crate) reward_recovered: ResourceMap,
+    #[serde(default)]
+    pub(crate) reward_pending_deposits: BTreeMap<String, ResourceMap>,
+    #[serde(default)]
+    pub(crate) reward_accounting_initialized: bool,
+    #[serde(default)]
     pub(crate) event_resolved: bool,
     #[serde(default)]
     pub(crate) beacon_completed: bool,
@@ -1864,6 +1870,10 @@ async fn resolve_event(
             Some(fetch_inventory(client, &plan.home_location).await?);
         save_plan(&config.plan_path, plan)?;
     }
+    if !plan.execution.reward_accounting_initialized {
+        plan.execution.reward_accounting_initialized = true;
+        save_plan(&config.plan_path, plan)?;
+    }
 
     let operation = client
         .location_events()
@@ -1920,6 +1930,8 @@ async fn recover_rewards(
             Some(fetch_inventory(client, &plan.home_location).await?);
         save_plan(&config.plan_path, plan)?;
     }
+    initialize_reward_accounting(client, config, plan).await?;
+    reconcile_pending_reward_deposits(client, config, plan).await?;
 
     let deadline = Instant::now() + config.wait_timeout;
     loop {
@@ -1938,10 +1950,10 @@ async fn recover_rewards(
         }
         if carrying_rewards {
             return_event_fleet_home(client, config, plan, &cargo).await?;
-            deposit_all_devices(client, config, &cargo).await?;
+            checkpoint_and_deposit_rewards(client, config, plan, &cargo).await?;
         }
 
-        let remaining = reward_remaining_at_home(client, plan).await?;
+        let remaining = reward_remaining(plan);
         if remaining.is_empty() {
             info!(
                 mission_id = %plan.mission_id,
@@ -1978,7 +1990,18 @@ async fn recover_rewards(
             capacities.push((code.clone(), capacity));
         }
 
-        let manifests = allocate_manifests(&remaining, &capacities);
+        let available = fetch_inventory(client, &plan.event.location).await?;
+        let collectable = resources_available_from(&remaining, &available);
+        if collectable.is_empty() {
+            return Err(app_error(
+                io::ErrorKind::NotFound,
+                format!(
+                    "event location no longer holds advertised rewards still unaccounted for: {}",
+                    format_resource_map(&remaining)
+                ),
+            ));
+        }
+        let manifests = allocate_manifests(&collectable, &capacities);
         if manifests.is_empty() {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
@@ -2003,12 +2026,12 @@ async fn recover_rewards(
         )?;
 
         return_event_fleet_home(client, config, plan, &cargo).await?;
-        deposit_all_devices(client, config, &cargo).await?;
-        if reward_remaining_at_home(client, plan).await?.is_empty() {
+        checkpoint_and_deposit_rewards(client, config, plan, &cargo).await?;
+        if reward_remaining(plan).is_empty() {
             return Ok(());
         }
 
-        let remaining = reward_remaining_at_home(client, plan).await?;
+        let remaining = reward_remaining(plan);
         if Instant::now() >= deadline {
             return Err(app_error(
                 io::ErrorKind::TimedOut,
@@ -2022,6 +2045,95 @@ async fn recover_rewards(
             sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+async fn initialize_reward_accounting(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    if plan.execution.reward_accounting_initialized {
+        return Ok(());
+    }
+    let baseline = plan
+        .execution
+        .reward_home_baseline
+        .as_ref()
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "reward baseline is missing"))?;
+    let current = fetch_inventory(client, &plan.home_location).await?;
+    plan.execution.reward_recovered = legacy_recovered_rewards(
+        &plan.event.rewards.resources,
+        baseline,
+        &current,
+    );
+    plan.execution.reward_accounting_initialized = true;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        mission_id = %plan.mission_id,
+        recovered = %format_resource_map(&plan.execution.reward_recovered),
+        "initialized durable reward accounting for an existing mission"
+    );
+    Ok(())
+}
+
+async fn checkpoint_and_deposit_rewards(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    codes: &[String],
+) -> AnyResult<()> {
+    let mut remaining = reward_remaining(plan);
+    for code in codes {
+        if plan.execution.reward_pending_deposits.contains_key(code) {
+            continue;
+        }
+        let detail = client.raw().devices().get(code).await?.value;
+        let manifest = resources_available_from(&remaining, &cargo_map(&detail));
+        if manifest.is_empty() {
+            continue;
+        }
+        subtract_resources(&mut remaining, &manifest);
+        plan.execution
+            .reward_pending_deposits
+            .insert(code.clone(), manifest);
+    }
+    save_plan(&config.plan_path, plan)?;
+    reconcile_pending_reward_deposits(client, config, plan).await
+}
+
+async fn reconcile_pending_reward_deposits(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    let pending = plan.execution.reward_pending_deposits.clone();
+    for (code, manifest) in pending {
+        let mut detail = client.raw().devices().get(&code).await?.value;
+        if !cargo_map(&detail).is_empty()
+            && detail.location.as_deref() != Some(plan.home_location.as_str())
+        {
+            ensure_device_at(client, config, &code, &plan.home_location).await?;
+            detail = client.raw().devices().get(&code).await?.value;
+        }
+        if !cargo_map(&detail).is_empty() {
+            deposit_all(client, config, &code).await?;
+        }
+        merge_recovered_rewards(
+            &mut plan.execution.reward_recovered,
+            &plan.event.rewards.resources,
+            &manifest,
+        );
+        plan.execution.reward_pending_deposits.remove(&code);
+        save_plan(&config.plan_path, plan)?;
+        info!(
+            mission_id = %plan.mission_id,
+            transport = %code,
+            deposited = %format_resource_map(&manifest),
+            recovered = %format_resource_map(&plan.execution.reward_recovered),
+            "checkpointed recovered event rewards at home"
+        );
+    }
+    Ok(())
 }
 
 async fn settle_reward_transport(
@@ -2087,29 +2199,24 @@ async fn return_event_fleet_home(
     .await
 }
 
-async fn reward_remaining_at_home(
-    client: &Client,
-    plan: &EventMissionPlan,
-) -> AnyResult<ResourceMap> {
-    let baseline = plan
-        .execution
-        .reward_home_baseline
-        .as_ref()
-        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "reward baseline is missing"))?;
-    let current = fetch_inventory(client, &plan.home_location).await?;
-    Ok(plan
+fn reward_remaining(plan: &EventMissionPlan) -> ResourceMap {
+    plan
         .event
         .rewards
         .resources
         .iter()
         .filter_map(|(resource, reward)| {
-            let baseline_quantity = *baseline.get(resource).unwrap_or(&0);
-            let current_quantity = *current.get(resource).unwrap_or(&0);
-            let recovered = current_quantity.saturating_sub(baseline_quantity);
+            let recovered = plan
+                .execution
+                .reward_recovered
+                .get(resource)
+                .copied()
+                .unwrap_or(0)
+                .max(0);
             let remaining = reward.saturating_sub(recovered);
             (remaining > 0).then_some((resource.clone(), remaining))
         })
-        .collect())
+        .collect()
 }
 
 
@@ -2982,6 +3089,54 @@ fn merge_resources(target: &mut ResourceMap, source: &ResourceMap) {
     }
 }
 
+fn resources_available_from(requested: &ResourceMap, available: &ResourceMap) -> ResourceMap {
+    requested
+        .iter()
+        .filter_map(|(resource, requested_quantity)| {
+            let available_quantity = available.get(resource).copied().unwrap_or(0).max(0);
+            let quantity = (*requested_quantity).max(0).min(available_quantity);
+            (quantity > 0).then_some((resource.clone(), quantity))
+        })
+        .collect()
+}
+
+fn legacy_recovered_rewards(
+    rewards: &ResourceMap,
+    baseline: &ResourceMap,
+    current: &ResourceMap,
+) -> ResourceMap {
+    rewards
+        .iter()
+        .filter_map(|(resource, reward)| {
+            let baseline_quantity = baseline.get(resource).copied().unwrap_or(0);
+            let current_quantity = current.get(resource).copied().unwrap_or(0);
+            let recovered = current_quantity
+                .saturating_sub(baseline_quantity)
+                .max(0)
+                .min((*reward).max(0));
+            (recovered > 0).then_some((resource.clone(), recovered))
+        })
+        .collect()
+}
+
+fn merge_recovered_rewards(
+    recovered: &mut ResourceMap,
+    rewards: &ResourceMap,
+    deposited: &ResourceMap,
+) {
+    for (resource, quantity) in deposited {
+        let maximum = rewards.get(resource).copied().unwrap_or(0).max(0);
+        if maximum == 0 {
+            continue;
+        }
+        let current = recovered.get(resource).copied().unwrap_or(0).max(0);
+        recovered.insert(
+            resource.clone(),
+            current.saturating_add((*quantity).max(0)).min(maximum),
+        );
+    }
+}
+
 fn sum_resources(resources: &ResourceMap) -> i64 {
     resources.values().copied().sum()
 }
@@ -3015,8 +3170,9 @@ fn format_device_requirements(requirements: &[DeviceRequirement]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicantTravelDecision, ResourceMap, allocate_manifests, merge_resources,
-        replicant_travel_decision,
+        ReplicantTravelDecision, ResourceMap, allocate_manifests, legacy_recovered_rewards,
+        merge_recovered_rewards, merge_resources, replicant_travel_decision,
+        resources_available_from,
     };
 
     #[test]
@@ -3056,6 +3212,45 @@ mod tests {
                 ResourceMap::from([("rares".to_owned(), 250)])
             )]
         );
+    }
+
+    #[test]
+    fn legacy_home_inventory_consumption_does_not_inflate_rewards() {
+        let rewards = ResourceMap::from([
+            ("conductive".to_owned(), 300),
+            ("rares".to_owned(), 600),
+        ]);
+        let baseline = ResourceMap::from([
+            ("conductive".to_owned(), 157_246),
+            ("rares".to_owned(), 16_971),
+        ]);
+        let current = ResourceMap::from([
+            ("conductive".to_owned(), 156_620),
+            ("rares".to_owned(), 16_737),
+        ]);
+
+        assert!(legacy_recovered_rewards(&rewards, &baseline, &current).is_empty());
+        assert_eq!(
+            resources_available_from(
+                &rewards,
+                &ResourceMap::from([("conductive".to_owned(), 300)])
+            ),
+            ResourceMap::from([("conductive".to_owned(), 300)])
+        );
+    }
+
+    #[test]
+    fn recovered_reward_ledger_is_capped_at_the_advertised_reward() {
+        let rewards = ResourceMap::from([("conductive".to_owned(), 300)]);
+        let mut recovered = ResourceMap::from([("conductive".to_owned(), 200)]);
+
+        merge_recovered_rewards(
+            &mut recovered,
+            &rewards,
+            &ResourceMap::from([("conductive".to_owned(), 500)]),
+        );
+
+        assert_eq!(recovered, rewards);
     }
 
     #[test]
