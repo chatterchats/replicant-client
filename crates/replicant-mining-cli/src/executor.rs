@@ -387,6 +387,9 @@ async fn submit_print_batches(
     let mut reported_factories = false;
     loop {
         reconcile_print_batches(client, mission).await?;
+        if purpose == PrintPurpose::Site {
+            progress_site_pipeline(client, config, mission).await?;
+        }
         let factories =
             factory_workloads(client, &devices, &blueprints, &mission.hub_location).await?;
         let reassigned = rebalance_pending_print_batches(
@@ -639,6 +642,9 @@ async fn wait_for_print_outputs(
     let deadline = Instant::now() + config.wait_timeout;
     loop {
         reconcile_print_batches(client, mission).await?;
+        if purpose == PrintPurpose::Site {
+            progress_site_pipeline(client, config, mission).await?;
+        }
         save_plan(&config.plan_path, mission)?;
         let incomplete = phase_batches(mission, purpose)
             .into_iter()
@@ -719,6 +725,48 @@ async fn allocate_site_assets(
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
+    allocate_available_site_assets(client, config, mission).await?;
+    let incomplete = mission
+        .sites
+        .iter()
+        .filter(|site| site.phase == SitePhase::Planned)
+        .map(|site| site.system.as_str())
+        .collect::<Vec<_>>();
+    if !incomplete.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "site printing completed without enough hub devices for: {}",
+                incomplete.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn progress_site_pipeline(
+    client: &Client,
+    config: &Config,
+    mission: &mut MiningMission,
+) -> AnyResult<()> {
+    let allocated = allocate_available_site_assets(client, config, mission).await?;
+    finish_arrived_sites(client, config, mission).await?;
+    reconcile_carrier_claims(client, mission).await?;
+    dispatch_ready_sites(client, config, mission).await?;
+    if allocated > 0 {
+        info!(
+            allocated,
+            "allocated complete mining setups while manufacturing continues"
+        );
+    }
+    Ok(())
+}
+
+async fn allocate_available_site_assets(
+    client: &Client,
+    config: &Config,
+    mission: &mut MiningMission,
+) -> AnyResult<usize> {
     let devices = refresh_device_snapshots(client).await?;
     let mut used = mission
         .sites
@@ -732,9 +780,11 @@ async fn allocate_site_assets(
         )
         .collect::<BTreeSet<_>>();
     let mut pool = reusable_pool(&devices, &mission.hub_location, &mission.mission_tag, &used);
+    let mut allocated = 0usize;
     for index in 0..mission.sites.len() {
-        if mission.sites[index].phase == SitePhase::Operational {
-            tag_site_assets(client, &mission.sites[index]).await?;
+        if mission.sites[index].phase != SitePhase::Planned
+            || !pool_can_complete_site(&pool, &mission.sites[index].assets)
+        {
             continue;
         }
         fill_site_asset(
@@ -771,6 +821,7 @@ async fn allocate_site_assets(
         )?;
         mission.sites[index].missing.clear();
         mission.sites[index].phase = SitePhase::Ready;
+        allocated += 1;
         save_plan(&config.plan_path, mission)?;
         ensure_asset_ownership(
             client,
@@ -780,7 +831,19 @@ async fn allocate_site_assets(
         .await?;
         tag_site_assets(client, &mission.sites[index]).await?;
     }
-    Ok(())
+    Ok(allocated)
+}
+
+fn pool_can_complete_site(pool: &BTreeMap<String, Vec<String>>, assets: &SiteAssets) -> bool {
+    let missing = replicant_mining_planner::shortages(
+        &replicant_mining_planner::mining_site_requirements(),
+        &assets.counts(),
+    );
+    missing.iter().all(|(device_type, quantity)| {
+        i64::try_from(pool.get(device_type).map_or(0, Vec::len)).is_ok_and(|available| {
+            available >= *quantity
+        })
+    })
 }
 
 fn reusable_pool(
@@ -1819,5 +1882,28 @@ mod tests {
             });
         assert_eq!(pending_counts["AF1"], 1);
         assert_eq!(pending_counts["AF2"], 3);
+    }
+
+    #[test]
+    fn site_pipeline_waits_for_one_complete_setup() {
+        let assets = SiteAssets::default();
+        let mut pool = BTreeMap::<String, Vec<String>>::new();
+        pool.insert(MINING_CONTROLLER.into(), vec!["mc".into()]);
+        pool.insert(
+            MINING_DRONE.into(),
+            ["m1", "m2", "m3", "m4"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        pool.insert(SURVEY_CONTROLLER.into(), vec!["sc".into()]);
+        pool.insert(
+            SURVEY_DRONE.into(),
+            ["s1", "s2"].into_iter().map(str::to_owned).collect(),
+        );
+
+        assert!(!pool_can_complete_site(&pool, &assets));
+        pool.insert(MAINTENANCE_DRONE.into(), vec!["md".into()]);
+        assert!(pool_can_complete_site(&pool, &assets));
     }
 }
