@@ -533,10 +533,7 @@ pub fn location_detail(
         unknown.insert("belt".into(), Value::Object(belt.clone()));
     }
     if let Some(asteroid_belt) = &raw.asteroid_belt {
-        unknown.insert(
-            "asteroid_belt".into(),
-            Value::Object(asteroid_belt.clone()),
-        );
+        unknown.insert("asteroid_belt".into(), Value::Object(asteroid_belt.clone()));
     }
     if let Some(mining_bonus_pct) = raw.mining_bonus_pct {
         unknown.insert("mining_bonus_pct".into(), Value::from(mining_bonus_pct));
