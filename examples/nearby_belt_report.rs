@@ -68,9 +68,9 @@ impl Config {
             ));
         }
 
-        let radius_ly = radius.parse::<f64>().map_err(|error| {
-            input_error(format!("RADIUS_LY must be a number: {error}"))
-        })?;
+        let radius_ly = radius
+            .parse::<f64>()
+            .map_err(|error| input_error(format!("RADIUS_LY must be a number: {error}")))?;
         if !radius_ly.is_finite() || radius_ly < 0.0 {
             return Err(input_error(
                 "RADIUS_LY must be a non-negative finite number",
@@ -156,9 +156,7 @@ impl BeltReport {
         }
         self.resources
             .iter()
-            .map(|(resource, scarcity)| {
-                format!("{}={scarcity}", resource_abbreviation(resource))
-            })
+            .map(|(resource, scarcity)| format!("{}={scarcity}", resource_abbreviation(resource)))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -446,7 +444,9 @@ fn print_report(config: &Config, examined_systems: usize, belts: &[BeltReport]) 
         );
     }
     println!();
-    println!("Resources: Car=carbon Con=conductive Rar=rares Sil=silicates Str=structural Vol=volatiles");
+    println!(
+        "Resources: Car=carbon Con=conductive Rar=rares Sil=silicates Str=structural Vol=volatiles"
+    );
 }
 
 fn input_error(message: impl Into<String>) -> AnyError {
@@ -497,16 +497,18 @@ mod tests {
 
     #[test]
     fn density_order_is_dense_then_moderate_then_sparse() {
-        let rank = |density: &str| BeltReport {
-            system: "SOL".into(),
-            designation: "SOL-BELT-1".into(),
-            distance_ly: 0.0,
-            density: density.into(),
-            inner_radius_au: None,
-            outer_radius_au: None,
-            resources: BTreeMap::new(),
-        }
-        .density_rank();
+        let rank = |density: &str| {
+            BeltReport {
+                system: "SOL".into(),
+                designation: "SOL-BELT-1".into(),
+                distance_ly: 0.0,
+                density: density.into(),
+                inner_radius_au: None,
+                outer_radius_au: None,
+                resources: BTreeMap::new(),
+            }
+            .density_rank()
+        };
 
         assert!(rank("dense") > rank("moderate"));
         assert!(rank("moderate") > rank("sparse"));
