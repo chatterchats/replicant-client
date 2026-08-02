@@ -29,3 +29,5 @@ __pycache__/
 patches/
 logs/
 *.json
+*.zip
+mining-expansion*
