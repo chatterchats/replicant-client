@@ -1207,6 +1207,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicant-mining-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "replicant-mining-planner",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "replicant-mining-planner"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "replicant-route-planner"
 version = "0.1.0"
 dependencies = [

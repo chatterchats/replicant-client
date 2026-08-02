@@ -62,6 +62,30 @@ receive bounded tags, remain assigned to the selected replicant, and have only
 the mission-added tags removed after they are safely returned. The CLI is quiet
 by default; use `--verbose` and/or `--log-file PATH` for diagnostics.
 
+## Mining expansion CLI
+
+The `replicant-mining-planner` crate and `replicant-mining` binary audit a
+list of known systems, repair or create one nine-device mining setup at the
+densest discovered belt in each system, and establish one Cargo Freighter
+`ferry` route per belt back to the manufacturing hub. The executor reuses idle
+hub stock, balances shortages across Autofactories, deploys as many complete
+sets concurrently as there are available Surge Carriers, retroactively tags
+existing automation, and persists every stage to `mining-expansion.json`.
+
+```sh
+cargo run --quiet -p replicant-mining-cli -- plan \
+  --hub SCEPTURUM-BELT-1 \
+  --systems-file examples/mining-expansion-systems.txt
+
+cargo run --quiet -p replicant-mining-cli -- run
+cargo run --quiet -p replicant-mining-cli -- status
+```
+
+`plan` performs reads only. `run` always reconciles the persisted mission and
+continues its first incomplete stage, so there is no separate resume command
+or execution-confirmation flag. The binary is quiet by default; use
+`--verbose` and/or `--log-file PATH` when diagnostics are needed.
+
 ## FTL relay expansion example
 
 The workspace includes a pure `replicant-route-planner` crate and a

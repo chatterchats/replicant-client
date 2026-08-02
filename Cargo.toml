@@ -4,6 +4,8 @@ members = [
   "crates/replicant-route-planner",
   "crates/replicant-event-planner",
   "crates/replicant-event-cli",
+  "crates/replicant-mining-planner",
+  "crates/replicant-mining-cli",
 ]
 resolver = "3"
 
