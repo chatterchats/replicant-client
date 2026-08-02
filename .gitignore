@@ -28,3 +28,4 @@ __pycache__/
 /reference/replicant-space/.crawl-cache.json
 patches/
 logs/
+*.json
