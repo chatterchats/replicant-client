@@ -7,8 +7,7 @@ use std::{
 use futures::future::{join_all, try_join_all};
 use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, raw};
 use replicant_event_planner::{
-    BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
-    role_tag,
+    BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost, role_tag,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,8 +15,8 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 
 use super::{
-    AnyResult, ClaimedDevice, Config, EventMissionPlan, MissionPhase, app_error,
-    fetch_blueprints, fetch_devices, fetch_inventory, normalize_event, save_plan,
+    AnyResult, ClaimedDevice, Config, EventMissionPlan, MissionPhase, app_error, fetch_blueprints,
+    fetch_devices, fetch_inventory, normalize_event, save_plan,
 };
 
 const CARGO_FREIGHTER: &str = "cargo_freighter";
@@ -98,7 +97,12 @@ pub(crate) async fn execute_saved_plan(
         set_phase(config, plan, MissionPhase::Manufacturing)?;
         reconcile_print_batches(client, plan).await?;
         save_plan(&config.plan_path, plan)?;
-        if !plan.execution.print_batches.iter().any(|batch| batch.submitted) {
+        if !plan
+            .execution
+            .print_batches
+            .iter()
+            .any(|batch| batch.submitted)
+        {
             ensure_home_resources(client, config, plan).await?;
         }
         submit_print_batches(client, config, plan).await?;
@@ -205,11 +209,7 @@ fn phase_rank(phase: MissionPhase) -> u8 {
     }
 }
 
-fn set_phase(
-    config: &Config,
-    plan: &mut EventMissionPlan,
-    phase: MissionPhase,
-) -> AnyResult<()> {
+fn set_phase(config: &Config, plan: &mut EventMissionPlan, phase: MissionPhase) -> AnyResult<()> {
     if phase_rank(plan.phase) <= phase_rank(phase) {
         info!(
             mission_id = %plan.mission_id,
@@ -285,7 +285,6 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
-
 async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -> AnyResult<()> {
     let batch_tags = plan
         .execution
@@ -353,13 +352,10 @@ async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -
             ));
         }
         batch.produced_codes = codes;
-        let queued = factory_jobs
-            .get(&batch.factory_code)
-            .is_some_and(|jobs| {
-                jobs.iter().any(|tags| {
-                    tags.contains(&plan.mission_tag) && tags.contains(&batch.batch_tag)
-                })
-            });
+        let queued = factory_jobs.get(&batch.factory_code).is_some_and(|jobs| {
+            jobs.iter()
+                .any(|tags| tags.contains(&plan.mission_tag) && tags.contains(&batch.batch_tag))
+        });
         if queued || i64::try_from(batch.produced_codes.len())? == batch.quantity {
             batch.submission_started = true;
             batch.submitted = true;
@@ -400,10 +396,7 @@ async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -
     Ok(())
 }
 
-async fn factory_job_tags(
-    client: &Client,
-    factory_code: &str,
-) -> AnyResult<Vec<BTreeSet<String>>> {
+async fn factory_job_tags(client: &Client, factory_code: &str) -> AnyResult<Vec<BTreeSet<String>>> {
     let detail = client.raw().devices().get(factory_code).await?.value;
     let mut jobs = Vec::new();
     if let Some(printing) = detail.printing {
@@ -541,11 +534,7 @@ fn disable_optional_beacon(
             device_type,
             *quantity,
         );
-        decrement_execution_batches(
-            &mut plan.execution.print_batches,
-            device_type,
-            *quantity,
-        );
+        decrement_execution_batches(&mut plan.execution.print_batches, device_type, *quantity);
     }
     subtract_resources(
         &mut plan.selected_criterion.manufacturing_resources,
@@ -760,9 +749,12 @@ async fn wait_for_print_outputs(
     loop {
         reconcile_print_batches(client, plan).await?;
         save_plan(&config.plan_path, plan)?;
-        if plan.execution.print_batches.iter().all(|batch| {
-            i64::try_from(batch.produced_codes.len()).ok() == Some(batch.quantity)
-        }) {
+        if plan
+            .execution
+            .print_batches
+            .iter()
+            .all(|batch| i64::try_from(batch.produced_codes.len()).ok() == Some(batch.quantity))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -800,10 +792,7 @@ async fn wait_for_print_outputs(
     }
 }
 
-async fn assign_printed_outputs(
-    client: &Client,
-    plan: &mut EventMissionPlan,
-) -> AnyResult<()> {
+async fn assign_printed_outputs(client: &Client, plan: &mut EventMissionPlan) -> AnyResult<()> {
     let mut by_type = BTreeMap::<String, Vec<String>>::new();
     for batch in &plan.execution.print_batches {
         by_type
@@ -970,7 +959,6 @@ fn next_unused(
         .cloned()
 }
 
-
 async fn claim_mission_assets(
     client: &Client,
     config: &Config,
@@ -1133,9 +1121,7 @@ async fn claim_device(
                 .relationships
                 .assigned_replicant
                 .as_ref()
-                .is_some_and(|replicant| {
-                    replicant.id.as_str() == plan.selected_replicant.as_str()
-                })
+                .is_some_and(|replicant| replicant.id.as_str() == plan.selected_replicant.as_str())
         })
         .await?;
     }
@@ -1249,11 +1235,7 @@ async fn gather_remote_payload(
     Ok(())
 }
 
-async fn ensure_free_standing(
-    client: &Client,
-    config: &Config,
-    code: &str,
-) -> AnyResult<()> {
+async fn ensure_free_standing(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
     let detail = client.raw().devices().get(code).await?.value;
     if let Some(attached_to) = detail.attached_to_device_code {
         return Err(app_error(
@@ -1271,7 +1253,6 @@ async fn ensure_free_standing(
     }
     Ok(())
 }
-
 
 async fn deliver_event_resources(
     client: &Client,
@@ -1311,7 +1292,9 @@ async fn deliver_event_resources(
                 if destination != plan.home_location && destination != plan.event.location {
                     return Err(app_error(
                         io::ErrorKind::Other,
-                        format!("cargo transport {code} is travelling to unexpected destination {destination}"),
+                        format!(
+                            "cargo transport {code} is travelling to unexpected destination {destination}"
+                        ),
                     ));
                 }
                 ensure_device_at(client, config, code, &destination).await?;
@@ -1423,7 +1406,9 @@ async fn stage_event_devices(
                 if destination != plan.home_location && destination != plan.event.location {
                     return Err(app_error(
                         io::ErrorKind::Other,
-                        format!("carrier {carrier} is travelling to unexpected destination {destination}"),
+                        format!(
+                            "carrier {carrier} is travelling to unexpected destination {destination}"
+                        ),
                     ));
                 }
                 ensure_device_at(client, config, carrier, &destination).await?;
@@ -1523,10 +1508,11 @@ async fn stage_event_devices(
 
         let new_remaining = live_remaining_requirements(client, plan).await?.devices;
         if device_requirement_total(&new_remaining) >= device_requirement_total(&remaining)
-            && needed == new_remaining
-                .iter()
-                .map(|item| (item.device_type.clone(), item.count))
-                .collect::<BTreeMap<_, _>>()
+            && needed
+                == new_remaining
+                    .iter()
+                    .map(|item| (item.device_type.clone(), item.count))
+                    .collect::<BTreeMap<_, _>>()
         {
             sleep(POLL_INTERVAL).await;
         }
@@ -1560,10 +1546,7 @@ fn select_payload_for_trip(
     selected
 }
 
-async fn mark_delivered_payload(
-    client: &Client,
-    plan: &mut EventMissionPlan,
-) -> AnyResult<()> {
+async fn mark_delivered_payload(client: &Client, plan: &mut EventMissionPlan) -> AnyResult<()> {
     for payload in &mut plan.execution.payload_devices {
         let detail = match client.raw().devices().get(&payload.code).await {
             Ok(response) => response.value,
@@ -1671,7 +1654,10 @@ async fn install_beacon(
     });
     if !deployed {
         if !detail.available_commands.is_empty()
-            && !detail.available_commands.iter().any(|command| command == "deploy")
+            && !detail
+                .available_commands
+                .iter()
+                .any(|command| command == "deploy")
         {
             return Err(app_error(
                 io::ErrorKind::Other,
@@ -1698,12 +1684,12 @@ async fn install_beacon(
     Ok(())
 }
 
-
 async fn live_remaining_requirements(
     client: &Client,
     plan: &EventMissionPlan,
 ) -> AnyResult<replicant_event_planner::RemainingRequirements> {
-    let Some(event) = fetch_event_definition(client, &plan.event.designation, "active").await? else {
+    let Some(event) = fetch_event_definition(client, &plan.event.designation, "active").await?
+    else {
         if fetch_event_definition(client, &plan.event.designation, "completed")
             .await?
             .is_some()
@@ -1822,10 +1808,7 @@ async fn fetch_location_device_stock(
     ))
 }
 
-async fn verify_event_requirements(
-    client: &Client,
-    plan: &EventMissionPlan,
-) -> AnyResult<()> {
+async fn verify_event_requirements(client: &Client, plan: &EventMissionPlan) -> AnyResult<()> {
     let remaining = live_remaining_requirements(client, plan).await?;
     if remaining.resources.is_empty() && remaining.devices.is_empty() {
         Ok(())
@@ -2012,7 +1995,7 @@ async fn recover_rewards(
             info!(
                 mission_id = %plan.mission_id,
                 transport = %code,
-                manifest = %format_resource_map(&manifest),
+                manifest = %format_resource_map(manifest),
                 "collecting reward manifest"
             );
         }
@@ -2061,11 +2044,8 @@ async fn initialize_reward_accounting(
         .as_ref()
         .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "reward baseline is missing"))?;
     let current = fetch_inventory(client, &plan.home_location).await?;
-    plan.execution.reward_recovered = legacy_recovered_rewards(
-        &plan.event.rewards.resources,
-        baseline,
-        &current,
-    );
+    plan.execution.reward_recovered =
+        legacy_recovered_rewards(&plan.event.rewards.resources, baseline, &current);
     plan.execution.reward_accounting_initialized = true;
     save_plan(&config.plan_path, plan)?;
     info!(
@@ -2156,27 +2136,14 @@ async fn settle_reward_transport(
     if destination != plan.home_location && destination != plan.event.location {
         return Err(app_error(
             io::ErrorKind::Other,
-            format!(
-                "cargo transport {code} is travelling to unexpected destination {destination}"
-            ),
+            format!("cargo transport {code} is travelling to unexpected destination {destination}"),
         ));
     }
     ensure_device_at(client, config, code, &destination).await
 }
 
-async fn deposit_all_devices(
-    client: &Client,
-    config: &Config,
-    codes: &[String],
-) -> AnyResult<()> {
-    finish_all(
-        join_all(
-            codes
-                .iter()
-                .map(|code| deposit_all(client, config, code)),
-        )
-        .await,
-    )
+async fn deposit_all_devices(client: &Client, config: &Config, codes: &[String]) -> AnyResult<()> {
+    finish_all(join_all(codes.iter().map(|code| deposit_all(client, config, code))).await)
 }
 
 async fn return_event_fleet_home(
@@ -2200,8 +2167,7 @@ async fn return_event_fleet_home(
 }
 
 fn reward_remaining(plan: &EventMissionPlan) -> ResourceMap {
-    plan
-        .event
+    plan.event
         .rewards
         .resources
         .iter()
@@ -2218,7 +2184,6 @@ fn reward_remaining(plan: &EventMissionPlan) -> ResourceMap {
         })
         .collect()
 }
-
 
 async fn return_mission_assets(
     client: &Client,
@@ -2482,11 +2447,7 @@ async fn ensure_device_at(
     wait_for_device_at(client, config, code, destination).await
 }
 
-async fn start_device_travel_to(
-    client: &Client,
-    code: &str,
-    destination: &str,
-) -> AnyResult<()> {
+async fn start_device_travel_to(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
     let detail = client.raw().devices().get(code).await?.value;
     if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
         return Ok(());
@@ -2693,8 +2654,7 @@ async fn travel_replicant_to(
     replicant_code: &str,
     destination: &str,
 ) -> AnyResult<()> {
-    let departure_origin =
-        start_replicant_travel_to(client, replicant_code, destination).await?;
+    let departure_origin = start_replicant_travel_to(client, replicant_code, destination).await?;
     wait_for_replicant_at(
         client,
         config,
@@ -2730,13 +2690,7 @@ async fn travel_fleet_to(
             let departure_origin = replicant_result?;
             tokio::try_join!(
                 wait_for_devices_at(client, config, devices, destination),
-                wait_for_replicant_at(
-                    client,
-                    config,
-                    replicant,
-                    destination,
-                    departure_origin,
-                ),
+                wait_for_replicant_at(client, config, replicant, destination, departure_origin,),
             )?;
         }
         None => {
@@ -2982,10 +2936,7 @@ async fn wait_for_relevant_event(
     }
 }
 
-async fn ensure_operation_accepted(
-    operation: &Operation,
-    wait: Duration,
-) -> AnyResult<()> {
+async fn ensure_operation_accepted(operation: &Operation, wait: Duration) -> AnyResult<()> {
     let outcome = operation.wait_timeout(wait).await?;
     if matches!(
         outcome.status,
@@ -3004,10 +2955,7 @@ async fn ensure_operation_accepted(
     Ok(())
 }
 
-fn ensure_uncontrolled_cargo(
-    device: &raw::devices::DeviceStatus,
-    code: &str,
-) -> AnyResult<()> {
+fn ensure_uncontrolled_cargo(device: &raw::devices::DeviceStatus, code: &str) -> AnyResult<()> {
     if device.controller_device_code.is_some() {
         Err(app_error(
             io::ErrorKind::InvalidData,
@@ -3177,10 +3125,8 @@ mod tests {
 
     #[test]
     fn allocates_reward_manifests_across_the_fleet() {
-        let resources = ResourceMap::from([
-            ("conductive".to_owned(), 300),
-            ("rares".to_owned(), 600),
-        ]);
+        let resources =
+            ResourceMap::from([("conductive".to_owned(), 300), ("rares".to_owned(), 600)]);
         let capacities = [("CF-1".to_owned(), 500), ("CF-2".to_owned(), 400)];
 
         let manifests = allocate_manifests(&resources, &capacities);
@@ -3216,10 +3162,8 @@ mod tests {
 
     #[test]
     fn legacy_home_inventory_consumption_does_not_inflate_rewards() {
-        let rewards = ResourceMap::from([
-            ("conductive".to_owned(), 300),
-            ("rares".to_owned(), 600),
-        ]);
+        let rewards =
+            ResourceMap::from([("conductive".to_owned(), 300), ("rares".to_owned(), 600)]);
         let baseline = ResourceMap::from([
             ("conductive".to_owned(), 157_246),
             ("rares".to_owned(), 16_971),
@@ -3283,12 +3227,7 @@ mod tests {
             ReplicantTravelDecision::Continue,
         );
         assert_eq!(
-            replicant_travel_decision(
-                Some("SCEPTURUM-7-L4"),
-                false,
-                "KHUXKRIXX-3",
-                None,
-            ),
+            replicant_travel_decision(Some("SCEPTURUM-7-L4"), false, "KHUXKRIXX-3", None,),
             ReplicantTravelDecision::Wait,
         );
         assert_eq!(
