@@ -708,23 +708,25 @@ fn execution_batches(
 ) -> Vec<ExecutionPrintBatch> {
     batches
         .iter()
-        .map(|batch| ExecutionPrintBatch {
-            purpose,
-            factory_code: batch.factory_code.clone(),
-            device_type: batch.device_type.clone(),
-            quantity: batch.quantity,
-            projected_finish_seconds: batch.projected_finish_seconds,
-            batch_tag: format!(
-                "mine-b:{:016x}",
-                stable_hash(&format!(
-                    "{mission_id}:{purpose:?}:{}:{}:{}",
-                    batch.factory_code, batch.sequence, batch.device_type
-                ))
-            ),
-            submission_started: false,
-            submitted: false,
-            operation_id: None,
-            produced_codes: Vec::new(),
+        .flat_map(|batch| {
+            (0..batch.quantity).map(move |unit_index| ExecutionPrintBatch {
+                purpose,
+                factory_code: batch.factory_code.clone(),
+                device_type: batch.device_type.clone(),
+                quantity: 1,
+                projected_finish_seconds: batch.projected_finish_seconds,
+                batch_tag: format!(
+                    "mine-b:{:016x}",
+                    stable_hash(&format!(
+                        "{mission_id}:{purpose:?}:{}:{}:{}:{unit_index}",
+                        batch.factory_code, batch.sequence, batch.device_type
+                    ))
+                ),
+                submission_started: false,
+                submitted: false,
+                operation_id: None,
+                produced_codes: Vec::new(),
+            })
         })
         .collect()
 }
@@ -1423,6 +1425,28 @@ mod tests {
     #[test]
     fn tags_are_normalized_for_uppercase_systems() {
         assert_eq!(site_tag("ILPHARD"), "mine-s:ilphard");
+    }
+
+    #[test]
+    fn execution_batches_use_single_queue_units() {
+        let scheduled = PrintBatch {
+            factory_code: "AF1".into(),
+            device_type: MINING_DRONE.into(),
+            quantity: 3,
+            sequence: 0,
+            projected_finish_seconds: 300.0,
+        };
+        let batches = execution_batches("mission", PrintPurpose::Site, &[scheduled]);
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.quantity == 1));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.batch_tag.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
     }
 
     #[test]

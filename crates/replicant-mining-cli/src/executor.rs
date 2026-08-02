@@ -9,22 +9,23 @@ use replicant_client::{
     domain::Device, managed::Operation, raw as api_raw,
 };
 use replicant_mining_planner::{
-    CARGO_FREIGHTER, MAINTENANCE_DRONE, MINING_CONTROLLER, MINING_DRONE, QuantityMap,
-    SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE, TRANSPORT_CONTROLLER, role_tag,
+    BlueprintSpec, CARGO_FREIGHTER, FactoryWorkload, MAINTENANCE_DRONE, MINING_CONTROLLER,
+    MINING_DRONE, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE,
+    TRANSPORT_CONTROLLER, role_tag,
 };
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::info;
 
 use super::{
-    AnyResult, Config, MiningMission, MissionPhase, PrintPurpose, RoutePhase, SiteAssets,
-    SitePhase, app_error, audit_route, audit_site, controller_code, device_location, device_type,
-    fetch_blueprints, find_device, format_quantities, has_directive, has_reservation_tag,
-    refresh_device_snapshots, save_plan,
+    AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
+    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code, device_location,
+    device_type, factory_workloads, fetch_blueprints, find_device, format_quantities,
+    has_directive, has_reservation_tag, integer_field, refresh_device_snapshots, save_plan,
+    stable_hash,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const OPERATION_WAIT: Duration = Duration::from_secs(30);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) async fn execute(
@@ -165,12 +166,57 @@ async fn execute_print_phase(
     purpose: PrintPurpose,
 ) -> AnyResult<()> {
     reconcile_print_batches(client, mission).await?;
+    let migrated = split_pending_print_batches(mission);
+    if migrated > 0 {
+        info!(
+            grouped_batches = migrated,
+            unit_batches = mission.print_batches.len(),
+            "split pending print quantities into queue-safe unit batches"
+        );
+    }
     save_plan(&config.plan_path, mission)?;
     if phase_batches(mission, purpose).is_empty() {
         return Ok(());
     }
     submit_print_batches(client, config, mission, purpose).await?;
     wait_for_print_outputs(client, config, mission, purpose).await
+}
+
+fn split_pending_print_batches(mission: &mut MiningMission) -> usize {
+    let batches = std::mem::take(&mut mission.print_batches);
+    let mut normalized = Vec::with_capacity(batches.len());
+    let mut migrated = 0usize;
+    for batch in batches {
+        let can_split = batch.quantity > 1
+            && !batch.submission_started
+            && !batch.submitted
+            && batch.operation_id.is_none()
+            && batch.produced_codes.is_empty();
+        if !can_split {
+            normalized.push(batch);
+            continue;
+        }
+        migrated += 1;
+        normalized.extend(unit_print_batches(batch));
+    }
+    mission.print_batches = normalized;
+    migrated
+}
+
+fn unit_print_batches(batch: ExecutionPrintBatch) -> Vec<ExecutionPrintBatch> {
+    (0..batch.quantity)
+        .map(|unit_index| {
+            let mut unit = batch.clone();
+            unit.quantity = 1;
+            if unit_index > 0 {
+                unit.batch_tag = format!(
+                    "mine-b:{:016x}",
+                    stable_hash(&format!("{}:{unit_index}", batch.batch_tag))
+                );
+            }
+            unit
+        })
+        .collect()
 }
 
 fn phase_batches(mission: &MiningMission, purpose: PrintPurpose) -> Vec<usize> {
@@ -336,9 +382,36 @@ async fn submit_print_batches(
     purpose: PrintPurpose,
 ) -> AnyResult<()> {
     let blueprints = fetch_blueprints(client).await?;
+    let devices = refresh_device_snapshots(client).await?;
     let deadline = Instant::now() + config.wait_timeout;
+    let mut reported_factories = false;
     loop {
         reconcile_print_batches(client, mission).await?;
+        let factories =
+            factory_workloads(client, &devices, &blueprints, &mission.hub_location).await?;
+        let reassigned = rebalance_pending_print_batches(
+            mission,
+            purpose,
+            &blueprints,
+            &factories,
+        )?;
+        if !reported_factories {
+            info!(
+                purpose = ?purpose,
+                factories = %format_factory_workloads(&factories),
+                assignments = %format_factory_assignments(mission, purpose),
+                "discovered Autofactories and balanced pending prints"
+            );
+            reported_factories = true;
+        }
+        if reassigned > 0 {
+            info!(
+                purpose = ?purpose,
+                reassigned,
+                assignments = %format_factory_assignments(mission, purpose),
+                "rebalanced pending prints across available Autofactories"
+            );
+        }
         save_plan(&config.plan_path, mission)?;
         let pending = phase_batches(mission, purpose)
             .into_iter()
@@ -439,6 +512,124 @@ async fn submit_print_batches(
     }
 }
 
+fn rebalance_pending_print_batches(
+    mission: &mut MiningMission,
+    purpose: PrintPurpose,
+    blueprints: &BTreeMap<String, BlueprintSpec>,
+    factories: &[FactoryWorkload],
+) -> AnyResult<usize> {
+    let mut pending = mission
+        .print_batches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, batch)| {
+            (batch.purpose == purpose
+                && !batch.submission_started
+                && !batch.submitted
+                && batch.operation_id.is_none()
+                && batch.produced_codes.is_empty())
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    if factories.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "printing is required but no Autofactory is available at {}",
+                mission.hub_location
+            ),
+        ));
+    }
+
+    pending.sort_by(|left, right| {
+        let left_batch = &mission.print_batches[*left];
+        let right_batch = &mission.print_batches[*right];
+        let left_seconds = blueprints
+            .get(&left_batch.device_type)
+            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
+        let right_seconds = blueprints
+            .get(&right_batch.device_type)
+            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
+        right_seconds
+            .total_cmp(&left_seconds)
+            .then_with(|| left_batch.device_type.cmp(&right_batch.device_type))
+            .then_with(|| left_batch.batch_tag.cmp(&right_batch.batch_tag))
+    });
+
+    let mut loads = factories
+        .iter()
+        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
+        .collect::<BTreeMap<_, _>>();
+    let mut reassigned = 0usize;
+    for index in pending {
+        let seconds = blueprints
+            .get(&mission.print_batches[index].device_type)
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "missing blueprint for {}",
+                        mission.print_batches[index].device_type
+                    ),
+                )
+            })?
+            .print_time_seconds
+            .max(0.0);
+        let factory_code = loads
+            .iter()
+            .min_by(|left, right| left.1.total_cmp(right.1).then_with(|| left.0.cmp(right.0)))
+            .map(|(code, _)| code.clone())
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::NotFound,
+                    "printing is required but no Autofactory is available",
+                )
+            })?;
+        let finish = loads.entry(factory_code.clone()).or_default();
+        *finish += seconds;
+        let batch = &mut mission.print_batches[index];
+        if batch.factory_code != factory_code {
+            batch.factory_code = factory_code;
+            reassigned += 1;
+        }
+        batch.projected_finish_seconds = *finish;
+    }
+    Ok(reassigned)
+}
+
+fn format_factory_workloads(factories: &[FactoryWorkload]) -> String {
+    factories
+        .iter()
+        .map(|factory| {
+            format!(
+                "{}:{:.0}s",
+                factory.code, factory.remaining_seconds
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_factory_assignments(mission: &MiningMission, purpose: PrintPurpose) -> String {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for batch in mission.print_batches.iter().filter(|batch| {
+        batch.purpose == purpose
+            && !batch.submitted
+            && batch.operation_id.is_none()
+            && batch.produced_codes.is_empty()
+    }) {
+        *counts.entry(&batch.factory_code).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(factory, count)| format!("{factory}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 async fn wait_for_print_outputs(
     client: &Client,
     config: &Config,
@@ -476,7 +667,18 @@ async fn wait_for_print_outputs(
 async fn factory_queue_slots(client: &Client, factory_code: &str) -> AnyResult<usize> {
     let detail = client.raw().devices().get(factory_code).await?.value;
     let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1))?;
-    Ok(queue_size.saturating_sub(detail.print_queue.len()))
+    Ok(queue_size.saturating_sub(queued_print_units(&detail.print_queue)?))
+}
+
+fn queued_print_units(jobs: &[serde_json::Map<String, Value>]) -> AnyResult<usize> {
+    let mut queued_units = 0usize;
+    for job in jobs {
+        let quantity = integer_field(job, &["quantity", "count"])
+            .unwrap_or(1)
+            .max(1);
+        queued_units = queued_units.saturating_add(usize::try_from(quantity)?);
+    }
+    Ok(queued_units)
 }
 
 async fn hub_inventory(client: &Client, hub: &str) -> AnyResult<QuantityMap> {
@@ -1449,7 +1651,10 @@ async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResu
 }
 
 async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
-    let outcome = operation.wait_timeout(OPERATION_WAIT).await?;
+    // Managed mutation construction has already completed the one durable HTTP
+    // submission attempt. Read that classification immediately; waiting for a
+    // terminal evidence state here serializes independent queue submissions.
+    let outcome = operation.outcome().await?;
     if matches!(
         outcome.status,
         OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
@@ -1478,5 +1683,141 @@ fn role_for_type(device_type_name: &str) -> &'static str {
         CARGO_FREIGHTER => "cargo-freighter",
         SURGE_CARRIER => "carrier",
         _ => "device",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn print_batch(factory: &str, tag: &str) -> ExecutionPrintBatch {
+        ExecutionPrintBatch {
+            purpose: PrintPurpose::Site,
+            factory_code: factory.into(),
+            device_type: MINING_DRONE.into(),
+            quantity: 1,
+            projected_finish_seconds: 0.0,
+            batch_tag: tag.into(),
+            submission_started: false,
+            submitted: false,
+            operation_id: None,
+            produced_codes: Vec::new(),
+        }
+    }
+
+    fn mission_with_batches(print_batches: Vec<ExecutionPrintBatch>) -> MiningMission {
+        MiningMission {
+            version: 1,
+            mission_id: "mission".into(),
+            mission_tag: "mine-m:0000000000000001".into(),
+            phase: MissionPhase::ManufacturingSites,
+            selected_replicant: "replicant".into(),
+            hub_location: "HUB-BELT-1".into(),
+            sites: Vec::new(),
+            routes: Vec::new(),
+            print_batches,
+            site_print_requirements: QuantityMap::new(),
+            route_print_requirements: QuantityMap::new(),
+            total_material_cost: QuantityMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn grouped_pending_batch_splits_into_distinct_units() {
+        let original_tag = "mine-b:0000000000000001";
+        let batch = ExecutionPrintBatch {
+            purpose: PrintPurpose::Site,
+            factory_code: "AF1".into(),
+            device_type: MINING_DRONE.into(),
+            quantity: 3,
+            projected_finish_seconds: 300.0,
+            batch_tag: original_tag.into(),
+            submission_started: false,
+            submitted: false,
+            operation_id: None,
+            produced_codes: Vec::new(),
+        };
+        let units = unit_print_batches(batch);
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|unit| unit.quantity == 1));
+        assert_eq!(units[0].batch_tag, original_tag);
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.batch_tag.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn queue_occupancy_counts_print_quantities() {
+        let jobs = vec![
+            [("quantity".into(), Value::from(2))]
+                .into_iter()
+                .collect(),
+            [("count".into(), Value::from(3))]
+                .into_iter()
+                .collect(),
+            serde_json::Map::new(),
+        ];
+        assert_eq!(queued_print_units(&jobs).unwrap(), 6);
+    }
+
+    #[test]
+    fn pending_prints_rebalance_across_live_factories() {
+        let mut submitted = print_batch("AF1", "submitted");
+        submitted.submission_started = true;
+        submitted.submitted = true;
+        submitted.operation_id = Some("operation".into());
+        let mut mission = mission_with_batches(vec![
+            submitted,
+            print_batch("AF1", "one"),
+            print_batch("AF1", "two"),
+            print_batch("AF1", "three"),
+            print_batch("AF1", "four"),
+        ]);
+        let blueprints = [(
+            MINING_DRONE.into(),
+            BlueprintSpec {
+                device_type: MINING_DRONE.into(),
+                print_time_seconds: 100.0,
+                resources: QuantityMap::new(),
+                components: QuantityMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let factories = vec![
+            FactoryWorkload {
+                code: "AF1".into(),
+                remaining_seconds: 300.0,
+            },
+            FactoryWorkload {
+                code: "AF2".into(),
+                remaining_seconds: 0.0,
+            },
+        ];
+
+        let reassigned = rebalance_pending_print_batches(
+            &mut mission,
+            PrintPurpose::Site,
+            &blueprints,
+            &factories,
+        )
+        .unwrap();
+
+        assert_eq!(reassigned, 3);
+        assert_eq!(mission.print_batches[0].factory_code, "AF1");
+        let pending_counts = mission.print_batches[1..]
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, batch| {
+                *counts.entry(&batch.factory_code).or_default() += 1;
+                counts
+            });
+        assert_eq!(pending_counts["AF1"], 1);
+        assert_eq!(pending_counts["AF2"], 3);
     }
 }
