@@ -11,8 +11,8 @@ Do not disclose vulnerabilities in public issues, discussions, pull
 requests, or commits. Use the repository's private security-advisory
 feature, or the maintainers' private contact method if that is unavailable.
 
-Include the affected commit or version, the Replicant Space contract version
-(`2.3.1`), impact, reproduction steps, and any known mitigation.
+Include the affected commit or version, the Replicant Space version
+(`2.3.5`), impact, reproduction steps, and any known mitigation.
 
 ## Consumer security responsibilities
 

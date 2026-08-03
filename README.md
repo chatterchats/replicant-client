@@ -1,213 +1,238 @@
 # replicant-client
 
-## Colony database initializer
+`replicant-client` is a durable, stateful Rust client for the Replicant Space
+API. It combines typed HTTP and SSE access with a managed client that
+normalizes remote observations, stores them in SQLite, publishes consistent
+snapshots, reconciles state, and journals mutations before sending them.
 
-`cargo run --example initialize_colony_database` performs only managed safe
-reads and populates the durable survey database from knowledge the account has
-already discovered. It cannot discover unsurveyed worlds; use `REPLICANT_DB`
-to choose the SQLite path and `REPLICANT_INIT_*` bounds to cap the traversal.
+The crate targets the Replicant Space documentation through **2.3.5**. Its
+machine-readable baseline is the checked-in, verified 2.3.3 OpenAPI document,
+with later rendered-document changes recorded explicitly under
+[`docs/contract`](docs/contract).
 
-A durable, stateful Rust client for building [Replicant Space](https://replicant.space) applications.
+## Requirements
 
-`replicant-client` targets Replicant Space documentation through `2.3.5`,
-using the checked-in verified `2.3.3` OpenAPI corpus plus explicit
-rendered-document corrections where the specification remains incomplete. It is
-client-centered: the normal entry point is `replicant_client::Client`, which
-fetches, validates, normalizes, persists, publishes, watches, reconciles, and
-performs game operations, without requiring the application to assemble a
-transport client, runtime, state actor, or persistence layer by hand.
+- Rust 1.94 or newer
+- Tokio when using the asynchronous client
+- A Replicant Space API token for authenticated requests
 
-```rust
-use replicant_client::{Client, SecretString};
-
-let client = Client::builder()
-    .authentication_token(SecretString::from(token))
-    .sqlite("replicant-client.sqlite")
-    .start()
-    .await?;
-
-client.ready().await?;
-
-let miners = client
-    .devices()
-    .miners()
-    .idle()
-    .at("SOL")
-    .collect()
-    .await?;
+```toml
+[dependencies]
+replicant-client = "1.0.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Event logistics CLI
+The default features enable the managed client and rustls TLS.
 
-The workspace includes a pure `replicant-event-planner` crate and the
-`replicant-events` binary. It performs live event discovery, interactive event
-and criterion selection, achievement-aware comparison, progress and
-location-stock subtraction, balanced manufacturing, AMI-free Cargo Freighter
-selection, repeated-trip logistics, event resolution, reward recovery, fleet
-return, and the best-effort persistent FTL-beacon objective.
+## Managed client
 
-```sh
-cargo run --quiet -p replicant-event-cli -- list
-cargo run --quiet -p replicant-event-cli -- plan WIXUKHHU-4-EVT-002
-cargo run --quiet -p replicant-event-cli -- run --execute
-cargo run --quiet -p replicant-event-cli -- resume --execute
-cargo run --quiet -p replicant-event-cli -- status
+`replicant_client::Client` is the normal entry point. A file-backed client
+restores its last committed snapshot before applying its startup policy.
+
+```rust,no_run
+use replicant_client::{Client, SecretString, StartupPolicy};
+
+#[tokio::main]
+async fn main() -> replicant_client::Result<()> {
+    let token = std::env::var("REPLICANT_API_KEY")
+        .map_err(|_| replicant_client::Error::Configuration {
+            message: "set REPLICANT_API_KEY".into(),
+        })?;
+
+    let client = Client::builder()
+        .authentication_token(SecretString::from(token))
+        .sqlite("replicant-client.sqlite")
+        .startup_policy(StartupPolicy::Essential)
+        .start()
+        .await?;
+
+    client.ready().await?;
+    println!("account: {:?}", client.account().get().await?);
+    client.close().await
+}
 ```
 
-`Chats-1` and `SCEPTURUM-BELT-1` are the defaults. Use `--replicant` and
-`--home` to override them. Plans are saved atomically to `event-mission.json`;
-only one nonterminal mission is allowed in the first release. Cargo Freighters
-with an AMI controller relationship are never selected. Claimed mission devices
-receive bounded tags, remain assigned to the selected replicant, and have only
-the mission-added tags removed after they are safely returned. The CLI is quiet
-by default; use `--verbose` and/or `--log-file PATH` for diagnostics.
+Use `ClientBuilder::in_memory()` for tests or temporary applications. The
+builder also configures the base URL, request timeout, rate-limit policies,
+event streaming, reconciliation, and startup behavior.
 
-## Mining expansion CLI
+### Startup policies
 
-The `replicant-mining-planner` crate and `replicant-mining` binary audit a
-list of known systems, repair or create one nine-device mining setup at the
-densest discovered belt in each system, and establish one Cargo Freighter
-`ferry` route per belt back to the manufacturing hub. The executor reuses idle
-hub stock, balances shortages across Autofactories, deploys as many complete
-sets concurrently as there are available Surge Carriers, retroactively tags
-existing automation, and persists every stage to `mining-expansion.json`.
+| Policy | Behavior |
+| --- | --- |
+| `RestoreOnly` | Restore SQLite state without network activity. |
+| `Essential` | Bind the account, establish the essential baseline, catch up events, and connect the live event stream. This is the default. |
+| `Full` | Require all bounded account-domain baselines before startup is ready. |
 
-```sh
-cargo run --quiet -p replicant-mining-cli -- plan \
-  --hub SCEPTURUM-BELT-1 \
-  --systems-file examples/mining-expansion-systems.txt
+`status()`, `readiness()`, and `watch_status()` expose lifecycle health.
+`ready()` waits for the configured policy. `close()` is idempotent across all
+clones and flushes the store after stopping background work.
 
-cargo run --quiet -p replicant-mining-cli -- run
-cargo run --quiet -p replicant-mining-cli -- status
+## The consistency model
+
+The managed client follows four rules that matter to callers:
+
+1. A successful managed remote read has already been normalized, committed to
+   SQLite, and published to the local snapshot before it returns.
+2. Fluent queries and cached lookups are local-only. They never hide network
+   requests.
+3. Unsafe mutations are durably registered before transmission and are never
+   blindly retried after an ambiguous transport failure.
+4. Live and simulation data are isolated by `Realm`; public directory data
+   cannot erase richer account-owned data.
+
+Use explicit methods to choose where data comes from:
+
+- `get()` or `refresh()` performs a targeted remote read.
+- `find()`, `cached()`, and `state()` read committed local state.
+- `sync()` performs bounded REST reconciliation.
+- `events()` combines durable event-log catch-up with low-latency SSE.
+- `raw()` bypasses managed persistence and publication entirely.
+
+## Gateways and handles
+
+The client groups behavior by game domain. Gateways cover accounts, devices,
+owned and directory replicants, galaxy data, inventories, messages, BobNet,
+location events, trading, simulations, synchronization, events, and durable
+operations. Entity handles keep an ID and realm attached to targeted reads and
+mutations.
+
+```rust,no_run
+use replicant_client::{Client, DeviceStatus, DeviceType};
+
+async fn idle_miners(client: &Client) -> replicant_client::Result<()> {
+    let miners = client
+        .devices()
+        .find()
+        .of_type(DeviceType::MiningDrone)
+        .with_status(DeviceStatus::Idle)
+        .collect()
+        .await?;
+
+    for miner in miners {
+        println!("{}", miner.key.id);
+    }
+    Ok(())
+}
 ```
 
-`plan` performs reads only. `run` always reconciles the persisted mission and
-continues its first incomplete stage, so there is no separate resume command
-or execution-confirmation flag. The binary is quiet by default; use
-`--verbose` and/or `--log-file PATH` when diagnostics are needed.
+The query runs against the latest committed snapshot. Call
+`client.devices().get(code).await?` or `client.sync().essential().await?`
+first when freshness is required.
 
-## Distributed printing CLI
+## Synchronization and events
 
-The reusable `replicant-printing` crate balances work across every eligible
-Autofactory at a hub. Its CLI accepts repeated print requests and, on Replicant
-Space 2.3.5, can request compacted output for devices with the `modular`
-blueprint feature.
+REST synchronization is the correctness mechanism; SSE is an observation
+channel. On startup the managed client restores its durable cursor, catches up
+through the unfiltered event log, and then connects SSE. If continuity cannot
+be proven, it schedules REST reconciliation.
 
-```sh
-cargo run --quiet -p replicant-printing-cli -- \
-  --hub SCEPTURUM-BELT-1 \
-  --flatpack \
-  --print 6 autofactory \
-  --print 6 cargo_freighter
+```rust,no_run
+use replicant_client::Client;
+
+async fn reconcile(client: &Client) -> replicant_client::Result<()> {
+    let report = client.sync().full().await?;
+    println!("completed: {:?}", report.completed);
+    Ok(())
+}
 ```
 
-## FTL relay expansion CLI
+Managed event watches are deduplicated and only publish events after their
+effects and cursor are durable. Use `client.raw().events()` when an unmanaged
+history page or SSE stream is intentionally preferred.
 
-The workspace includes a pure `replicant-route-planner` crate and a
-restart-safe managed CLI that plans an exact minimum-new-relay network,
-reuses or activates account-owned relays, manufactures any shortfall, deploys
-and verifies the network, and returns the selected replicant to its hub.
+## Durable operations
 
-```sh
-cargo run --quiet -p replicant-relay-cli -- plan \
-  --replicant Chats-1 \
-  --hub SCEPTURUM-BELT-1 \
-  WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
+Managed mutations return an `Operation`. The operation journal records intent
+before sending, then classifies the result as accepted, rejected, ambiguous,
+or resolved by later evidence. Inspect previous operations through
+`client.operations()` after a restart. Do not repeat an ambiguous mutation by
+hand unless application-specific evidence proves that it is safe.
 
-cargo run --quiet -p replicant-relay-cli -- run
-cargo run --quiet -p replicant-relay-cli -- status
+## Raw client
+
+Enable only `raw` when SQLite, managed state, and background workers are not
+needed:
+
+```toml
+replicant-client = { version = "1.0.0", default-features = false, features = ["raw", "rustls-tls"] }
 ```
 
-`plan` is read-only. `run` reconciles and continues the persisted
-`ftl-relay-expansion.json` mission, so it replaces both the former execute and
-resume invocations and requires no `--execute` flag.
+```rust,no_run
+use replicant_client::raw::{Client, SecretString};
 
-## Survey route CLI
-
-`replicant-survey` plans a bounded route around a centre system, prepares an
-AMI survey fleet, scans and surveys each system, and checkpoints every phase
-to `explore-survey-route.json`.
-
-```sh
-cargo run --quiet -p replicant-survey-cli -- plan \
-  --replicant B6BA399E \
-  --vessel FD5EA802 \
-  --center SCEPTURUM \
-  --radius 30
-
-cargo run --quiet -p replicant-survey-cli -- run
-cargo run --quiet -p replicant-survey-cli -- status
+async fn account(token: String) -> replicant_client::Result<()> {
+    let client = Client::builder()
+        .authentication_token(SecretString::from(token))
+        .build()?;
+    let response = client.accounts().me().await?;
+    println!("status: {}", response.metadata.status);
+    println!("account: {:?}", response.value);
+    Ok(())
+}
 ```
 
-As with mining and relay expansion, rerunning `run` reconciles live state and
-continues the incomplete mission. Use `--verbose` or `--log-file PATH` for
-diagnostics.
-
-## Riker colony candidates CLI
-
-The read-only `replicant-rikers` command synchronizes known survey data,
-prints staged local-query diagnostics, and ranks explainable colony candidates.
-It never sends the proposed message to BobNet.
-
-```sh
-cargo run --quiet -p replicant-rikers-cli -- --limit 10
-```
-
-**Status:** this repository is at the Phase 1 bootstrap stage. The package,
-feature graph, and checked-in Replicant Space contract corpus exist;
-the client itself does not yet. See
-[`docs/implementation/rewrite-guide.md`](docs/implementation/rewrite-guide.md)
-for the full implementation plan.
+Raw responses contain transport DTOs plus status, request ID, and rate-limit
+metadata. Safe reads may use bounded retries; mutating requests are never
+automatically retried. Raw calls do not update managed state, even when the raw
+client came from `Client::raw()`.
 
 ## Features
 
-| Feature | Implies | Provides |
-| --- | --- | --- |
-| `raw` | — | Typed raw HTTP transport for the current, non-deprecated, non-admin contract. |
-| `events` | `raw` | Raw SSE parsing and event streaming. |
-| `managed` (default) | `events` | SQLite-backed durable state, synchronization, durable operations, and the managed `Client`. |
-| `rustls-tls` (default) | — | reqwest's rustls TLS backend. |
-| `native-tls` | — | reqwest's native-tls TLS backend. |
+| Feature | Includes |
+| --- | --- |
+| `raw` | Typed HTTP transport, authentication, DTOs, pagination, and rate-limit metadata. |
+| `events` | `raw` plus SSE framing and raw event streaming. |
+| `managed` | `events` plus SQLite, normalized state, synchronization, durable operations, and `Client`. Enabled by default. |
+| `rustls-tls` | rustls with native root certificates. Enabled by default. |
+| `native-tls` | The platform native-TLS backend. |
 
-## Contract
+Examples:
 
-The verified Replicant Space 2.3.3 OpenAPI corpus is checked in under
-[`reference/replicant-space/`](reference/replicant-space/). Its inventory
-contains 86 operations: 79 supported, 5 deprecated, and 2 admin-only.
-Replicant Space 2.3.5 rendered-document corrections remain explicit under [`docs/contract/`](docs/contract/)
-and [`policy/contract-metadata.json`](policy/contract-metadata.json); the
-documented-operation delta list is currently empty because both colony routes
-are now present in OpenAPI. `scripts/contract_policy_check.py` verifies the
-checksum, inventory, exclusions, and correction metadata.
+```sh
+cargo run --example raw_read --no-default-features --features raw,rustls-tls
+cargo run --example raw_events --no-default-features --features events,rustls-tls
+cargo run --example managed_sync
+cargo run --example fluent_queries
+```
+
+## Persistence and security
+
+SQLite stores account binding, normalized projections, simulation realms,
+event history and cursor state, reconciliation work, and the operation journal.
+Tokens are held through secrecy-aware wrappers and are never persisted.
+Debug output redacts credentials; request instrumentation must not include
+authorization headers or private message bodies.
+
+Use a separate database per account. The managed store rejects an authenticated
+account that does not match its durable binding. Back up or remove the SQLite
+database only while the client is closed.
+
+## Contract boundaries
+
+The public surface includes current, non-deprecated, non-administrative
+operations from the verified OpenAPI baseline plus explicit rendered-document
+deltas. Deprecated and admin-only endpoints are intentionally unavailable,
+including through `raw`. Unknown JSON fields are ignored, and open server
+vocabularies preserve unknown values for forward compatibility.
 
 ## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 cargo check --no-default-features --features raw
 cargo check --no-default-features --features events
-cargo check --all-features
-make contract-policy-check
+python3 scripts/contract_policy_check.py
 ```
+
+Run `make ci` for the complete formatting, lint, test, feature, documentation,
+package, and contract-policy suite. See [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`SECURITY.md`](SECURITY.md), and
+[`docs/observability.md`](docs/observability.md) for repository-specific
+guidance.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-## Observability
-
-The client emits structured `tracing` events for HTTP requests, rate-limit
-waits, managed synchronization, event catch-up, durable operations, SQLite
-work, state publication, galaxy hydration, and location traversal. The library
-does not install a subscriber; applications remain in control of formatting
-and export. The `initialize_colony_database` example includes a timestamped
-`tracing-subscriber` setup and useful default filters.
-
-See `docs/observability.md` for targets, duration fields, and a workflow for
-locating initializer and synchronization bottlenecks.
-
-The colony database initializer accepts
-`REPLICANT_INIT_STAR_CATALOGUE_LIMIT_BYTES` to override the dedicated bounded
-`GET /v1/stars` response cap (32 MiB by default). Ordinary API endpoints keep
-their smaller default response limit.
+MIT
