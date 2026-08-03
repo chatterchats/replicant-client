@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+pub use replicant_printing::{FactoryWorkload, PrintBatch, PrintSchedule, schedule_prints};
+use replicant_printing::PrintTime;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -38,37 +40,10 @@ pub struct BlueprintSpec {
     pub components: QuantityMap,
 }
 
-/// Existing queued work on an Autofactory.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct FactoryWorkload {
-    /// Autofactory device code.
-    pub code: String,
-    /// Estimated seconds until newly appended work can begin.
-    pub remaining_seconds: f64,
-}
-
-/// A quantity-batched print assignment.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PrintBatch {
-    /// Autofactory device code.
-    pub factory_code: String,
-    /// Canonical device type.
-    pub device_type: String,
-    /// Quantity submitted in one operation.
-    pub quantity: i64,
-    /// New-work sequence within this factory.
-    pub sequence: usize,
-    /// Projected total factory workload after the batch.
-    pub projected_finish_seconds: f64,
-}
-
-/// Complete distributed manufacturing schedule.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct PrintSchedule {
-    /// Quantity batches grouped by the scheduler.
-    pub batches: Vec<PrintBatch>,
-    /// Maximum projected finish time across factories.
-    pub projected_finish_seconds: f64,
+impl PrintTime for BlueprintSpec {
+    fn print_time_seconds(&self) -> f64 {
+        self.print_time_seconds
+    }
 }
 
 /// Planner validation failures.
@@ -77,9 +52,6 @@ pub enum PlannerError {
     /// A required blueprint was not supplied.
     #[error("missing blueprint for required device type `{0}`")]
     MissingBlueprint(String),
-    /// Manufacturing is required but no Autofactory is available.
-    #[error("printing is required but no Autofactory is available")]
-    NoAutofactory,
     /// A component dependency cycle was encountered.
     #[error("blueprint component cycle includes `{0}`")]
     ComponentCycle(String),
@@ -118,88 +90,6 @@ pub fn multiply(requirements: &QuantityMap, count: i64) -> QuantityMap {
         .iter()
         .map(|(device_type, quantity)| (device_type.clone(), quantity.saturating_mul(count.max(0))))
         .collect()
-}
-
-/// Balances individual print units against existing factory workloads and
-/// combines adjacent equal-type units on the same factory into quantities.
-pub fn schedule_prints(
-    required: &QuantityMap,
-    blueprints: &BTreeMap<String, BlueprintSpec>,
-    factories: &[FactoryWorkload],
-) -> Result<PrintSchedule, PlannerError> {
-    if required.values().all(|quantity| *quantity <= 0) {
-        return Ok(PrintSchedule::default());
-    }
-    if factories.is_empty() {
-        return Err(PlannerError::NoAutofactory);
-    }
-
-    let mut units = Vec::new();
-    for (device_type, quantity) in required {
-        if *quantity <= 0 {
-            continue;
-        }
-        let blueprint = blueprints
-            .get(device_type)
-            .ok_or_else(|| PlannerError::MissingBlueprint(device_type.clone()))?;
-        for _ in 0..*quantity {
-            units.push((device_type.clone(), blueprint.print_time_seconds.max(0.0)));
-        }
-    }
-    units.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-
-    let mut loads = factories
-        .iter()
-        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
-        .collect::<BTreeMap<_, _>>();
-    let mut assigned = BTreeMap::<String, Vec<(String, i64, f64)>>::new();
-    for (device_type, seconds) in units {
-        let factory = loads
-            .iter()
-            .min_by(|left, right| left.1.total_cmp(right.1).then_with(|| left.0.cmp(right.0)))
-            .map(|(code, _)| code.clone())
-            .ok_or(PlannerError::NoAutofactory)?;
-        let finish = loads.entry(factory.clone()).or_default();
-        *finish += seconds;
-        let queue = assigned.entry(factory).or_default();
-        if let Some((last_type, quantity, projected)) = queue.last_mut()
-            && *last_type == device_type
-        {
-            *quantity += 1;
-            *projected = *finish;
-        } else {
-            queue.push((device_type, 1, *finish));
-        }
-    }
-
-    let mut batches = Vec::new();
-    for (factory_code, queue) in assigned {
-        for (sequence, (device_type, quantity, projected_finish_seconds)) in
-            queue.into_iter().enumerate()
-        {
-            batches.push(PrintBatch {
-                factory_code: factory_code.clone(),
-                device_type,
-                quantity,
-                sequence,
-                projected_finish_seconds,
-            });
-        }
-    }
-    batches.sort_by(|left, right| {
-        left.factory_code
-            .cmp(&right.factory_code)
-            .then_with(|| left.sequence.cmp(&right.sequence))
-    });
-    Ok(PrintSchedule {
-        projected_finish_seconds: loads.values().copied().fold(0.0, f64::max),
-        batches,
-    })
 }
 
 /// Expands blueprint resource and component costs recursively.

@@ -8,6 +8,7 @@ description = "Pure mining-network expansion planning for Replicant Space."
 license = "MIT"
 
 [dependencies]
+replicant-printing = { version = "0.1.0", path = "../replicant-printing", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 

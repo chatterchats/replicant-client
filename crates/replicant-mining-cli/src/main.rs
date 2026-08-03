@@ -18,6 +18,7 @@ use replicant_mining_planner::{
     add_quantities, blueprint_resource_cost, mining_site_requirements, schedule_prints, shortages,
     site_tag,
 };
+use replicant_printing::managed::inspect_factory;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::info;
@@ -1128,34 +1129,11 @@ async fn factory_workloads(
     for device in devices.iter().filter(|device| {
         device_type(device) == Some(AUTOFACTORY) && device_location(device) == Some(hub)
     }) {
-        let detail = client
-            .raw()
-            .devices()
-            .get(device.key.id.as_str())
-            .await?
-            .value;
-        let active = detail
-            .printing
-            .and_then(|printing| printing.eta_seconds)
-            .unwrap_or(0.0);
-        let queued = detail
-            .print_queue
-            .iter()
-            .map(|job| {
-                let device_type = string_field(job, &["device_type", "type"]);
-                let quantity = integer_field(job, &["quantity", "count"])
-                    .unwrap_or(1)
-                    .max(1);
-                device_type
-                    .and_then(|device_type| blueprints.get(device_type))
-                    .map(|blueprint| blueprint.print_time_seconds * quantity as f64)
-                    .unwrap_or(0.0)
-            })
-            .sum::<f64>();
-        factories.push(FactoryWorkload {
-            code: device.key.id.as_str().to_owned(),
-            remaining_seconds: active + queued,
-        });
+        factories.push(
+            inspect_factory(client, device.key.id.as_str(), blueprints)
+                .await?
+                .workload(),
+        );
     }
     factories.sort_by(|left, right| left.code.cmp(&right.code));
     Ok(factories)
@@ -1182,16 +1160,6 @@ fn value_to_i64(value: &Value) -> Option<i64> {
             .and_then(|number| i64::try_from(number).ok())
             .or_else(|| value.as_f64().map(|number| number.round() as i64))
     })
-}
-
-fn string_field<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str))
-}
-
-fn integer_field(object: &Map<String, Value>, keys: &[&str]) -> Option<i64> {
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(value_to_i64))
 }
 
 fn save_plan(path: &Path, mission: &MiningMission) -> AnyResult<()> {

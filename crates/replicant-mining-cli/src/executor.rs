@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     time::{Duration, Instant},
 };
@@ -13,6 +13,8 @@ use replicant_mining_planner::{
     MINING_DRONE, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE,
     TRANSPORT_CONTROLLER, role_tag,
 };
+use replicant_printing::managed::{enqueue_print, factory_queue_slots};
+use replicant_printing::schedule_prints;
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::info;
@@ -21,8 +23,7 @@ use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
     SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code, device_location,
     device_type, factory_workloads, fetch_blueprints, find_device, format_quantities,
-    has_directive, has_reservation_tag, integer_field, refresh_device_snapshots, save_plan,
-    stable_hash,
+    has_directive, has_reservation_tag, refresh_device_snapshots, save_plan, stable_hash,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -457,20 +458,18 @@ async fn submit_print_batches(
 
             mission.print_batches[index].submission_started = true;
             save_plan(&config.plan_path, mission)?;
-            let operation = client
-                .devices()
-                .get(&batch.factory_code)
-                .await?
-                .enqueue_print_with_tags(
-                    batch.device_type.clone(),
-                    batch.quantity,
-                    [
-                        mission.mission_tag.clone(),
-                        role_tag(role_for_type(&batch.device_type)),
-                        batch.batch_tag.clone(),
-                    ],
-                )
-                .await?;
+            let operation = enqueue_print(
+                client,
+                &batch.factory_code,
+                &batch.device_type,
+                batch.quantity,
+                &[
+                    mission.mission_tag.clone(),
+                    role_tag(role_for_type(&batch.device_type)),
+                    batch.batch_tag.clone(),
+                ],
+            )
+            .await?;
             mission.print_batches[index].operation_id = Some(operation.id().as_str().to_owned());
             mission.print_batches[index].submitted = true;
             save_plan(&config.plan_path, mission)?;
@@ -537,68 +536,52 @@ fn rebalance_pending_print_batches(
     if pending.is_empty() {
         return Ok(0);
     }
-    if factories.is_empty() {
-        return Err(app_error(
-            io::ErrorKind::NotFound,
-            format!(
-                "printing is required but no Autofactory is available at {}",
-                mission.hub_location
-            ),
-        ));
-    }
-
-    pending.sort_by(|left, right| {
-        let left_batch = &mission.print_batches[*left];
-        let right_batch = &mission.print_batches[*right];
-        let left_seconds = blueprints
-            .get(&left_batch.device_type)
-            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
-        let right_seconds = blueprints
-            .get(&right_batch.device_type)
-            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
-        right_seconds
-            .total_cmp(&left_seconds)
-            .then_with(|| left_batch.device_type.cmp(&right_batch.device_type))
-            .then_with(|| left_batch.batch_tag.cmp(&right_batch.batch_tag))
+    let required = pending.iter().fold(QuantityMap::new(), |mut required, index| {
+        *required
+            .entry(mission.print_batches[*index].device_type.clone())
+            .or_default() += 1;
+        required
     });
-
-    let mut loads = factories
-        .iter()
-        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
-        .collect::<BTreeMap<_, _>>();
+    let schedule = schedule_prints(&required, blueprints, factories)?;
+    let mut assignments = BTreeMap::<String, VecDeque<(String, f64)>>::new();
+    for batch in schedule.batches {
+        for _ in 0..batch.quantity {
+            assignments
+                .entry(batch.device_type.clone())
+                .or_default()
+                .push_back((
+                    batch.factory_code.clone(),
+                    batch.projected_finish_seconds,
+                ));
+        }
+    }
+    pending.sort_by(|left, right| {
+        mission.print_batches[*left]
+            .device_type
+            .cmp(&mission.print_batches[*right].device_type)
+            .then_with(|| {
+                mission.print_batches[*left]
+                    .batch_tag
+                    .cmp(&mission.print_batches[*right].batch_tag)
+            })
+    });
     let mut reassigned = 0usize;
     for index in pending {
-        let seconds = blueprints
-            .get(&mission.print_batches[index].device_type)
+        let (factory_code, projected_finish_seconds) = assignments
+            .get_mut(&mission.print_batches[index].device_type)
+            .and_then(VecDeque::pop_front)
             .ok_or_else(|| {
                 app_error(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "missing blueprint for {}",
-                        mission.print_batches[index].device_type
-                    ),
-                )
-            })?
-            .print_time_seconds
-            .max(0.0);
-        let factory_code = loads
-            .iter()
-            .min_by(|left, right| left.1.total_cmp(right.1).then_with(|| left.0.cmp(right.0)))
-            .map(|(code, _)| code.clone())
-            .ok_or_else(|| {
-                app_error(
-                    io::ErrorKind::NotFound,
-                    "printing is required but no Autofactory is available",
+                    "distributed print schedule omitted a pending unit",
                 )
             })?;
-        let finish = loads.entry(factory_code.clone()).or_default();
-        *finish += seconds;
         let batch = &mut mission.print_batches[index];
         if batch.factory_code != factory_code {
             batch.factory_code = factory_code;
             reassigned += 1;
         }
-        batch.projected_finish_seconds = *finish;
+        batch.projected_finish_seconds = projected_finish_seconds;
     }
     Ok(reassigned)
 }
@@ -668,23 +651,6 @@ async fn wait_for_print_outputs(
         }
         sleep(POLL_INTERVAL).await;
     }
-}
-
-async fn factory_queue_slots(client: &Client, factory_code: &str) -> AnyResult<usize> {
-    let detail = client.raw().devices().get(factory_code).await?.value;
-    let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1))?;
-    Ok(queue_size.saturating_sub(queued_print_units(&detail.print_queue)?))
-}
-
-fn queued_print_units(jobs: &[serde_json::Map<String, Value>]) -> AnyResult<usize> {
-    let mut queued_units = 0usize;
-    for job in jobs {
-        let quantity = integer_field(job, &["quantity", "count"])
-            .unwrap_or(1)
-            .max(1);
-        queued_units = queued_units.saturating_add(usize::try_from(quantity)?);
-    }
-    Ok(queued_units)
 }
 
 async fn hub_inventory(client: &Client, hub: &str) -> AnyResult<QuantityMap> {
@@ -1813,20 +1779,6 @@ mod tests {
                 .len(),
             3
         );
-    }
-
-    #[test]
-    fn queue_occupancy_counts_print_quantities() {
-        let jobs = vec![
-            [("quantity".into(), Value::from(2))]
-                .into_iter()
-                .collect(),
-            [("count".into(), Value::from(3))]
-                .into_iter()
-                .collect(),
-            serde_json::Map::new(),
-        ];
-        assert_eq!(queued_print_units(&jobs).unwrap(), 6);
     }
 
     #[test]

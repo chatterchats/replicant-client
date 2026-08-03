@@ -1212,6 +1212,7 @@ version = "0.1.0"
 dependencies = [
  "replicant-client",
  "replicant-mining-planner",
+ "replicant-printing",
  "serde",
  "serde_json",
  "tokio",
@@ -1224,8 +1225,32 @@ dependencies = [
 name = "replicant-mining-planner"
 version = "0.1.0"
 dependencies = [
+ "replicant-printing",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "replicant-printing"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "replicant-printing-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "replicant-printing",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
