@@ -95,7 +95,11 @@ fn required_argument(
     option: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     arguments.next().ok_or_else(|| {
-        io::Error::new(ErrorKind::InvalidInput, format!("{option} requires a value")).into()
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{option} requires a value"),
+        )
+        .into()
     })
 }
 

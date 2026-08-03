@@ -255,18 +255,13 @@ impl Config {
         let mut drone_overrides = env::var("RS_EXPLORE_DRONES")
             .ok()
             .map(|value| parse_drone_codes(&value));
-        let mut replace_plan =
-            env_bool("RS_EXPLORE_REPLACE_PLAN", false)?
-                || env_bool("RS_EXPLORE_REBUILD_PLAN", false)?;
+        let mut replace_plan = env_bool("RS_EXPLORE_REPLACE_PLAN", false)?
+            || env_bool("RS_EXPLORE_REBUILD_PLAN", false)?;
         let mut include_explored = env_bool("RS_EXPLORE_INCLUDE_EXPLORED", false)?;
-        let mut travel_timeout = Duration::from_secs(env_u64(
-            "RS_EXPLORE_TRAVEL_TIMEOUT_SECS",
-            6 * 60 * 60,
-        )?);
-        let mut survey_timeout = Duration::from_secs(env_u64(
-            "RS_EXPLORE_SURVEY_TIMEOUT_SECS",
-            6 * 60 * 60,
-        )?);
+        let mut travel_timeout =
+            Duration::from_secs(env_u64("RS_EXPLORE_TRAVEL_TIMEOUT_SECS", 6 * 60 * 60)?);
+        let mut survey_timeout =
+            Duration::from_secs(env_u64("RS_EXPLORE_SURVEY_TIMEOUT_SECS", 6 * 60 * 60)?);
         let mut verbose = env_bool("RS_EXPLORE_VERBOSE", false)?;
 
         while let Some(argument) = arguments.next() {
@@ -280,10 +275,8 @@ impl Config {
                     center = required_argument(&mut arguments, "--center")?.to_ascii_uppercase()
                 }
                 "--radius" => {
-                    radius_ly = positive_f64(
-                        &required_argument(&mut arguments, "--radius")?,
-                        "--radius",
-                    )?;
+                    radius_ly =
+                        positive_f64(&required_argument(&mut arguments, "--radius")?, "--radius")?;
                 }
                 "--system-limit" => {
                     system_limit = positive_usize(
@@ -406,9 +399,7 @@ fn validate_drone_codes(drones: Option<&[String]>) -> AnyResult<()> {
     let Some(drones) = drones else {
         return Ok(());
     };
-    if drones.len() != DRONE_COUNT
-        || drones.iter().collect::<BTreeSet<_>>().len() != DRONE_COUNT
-    {
+    if drones.len() != DRONE_COUNT || drones.iter().collect::<BTreeSet<_>>().len() != DRONE_COUNT {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
             format!("--drones must contain exactly {DRONE_COUNT} distinct comma-separated codes"),

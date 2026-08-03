@@ -1984,15 +1984,16 @@ fn validate_loaded_plan(
             "saved plan hub differs from --hub; use plan --replace-plan",
         ));
     }
-    if config.command == Command::Plan && !config.targets.is_empty() && plan.targets != config.targets
+    if config.command == Command::Plan
+        && !config.targets.is_empty()
+        && plan.targets != config.targets
     {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
             "saved plan targets differ from the command line; use plan --replace-plan",
         ));
     }
-    if config.command == Command::Plan
-        && (plan.max_hop_ly - config.max_hop_ly).abs() > f64::EPSILON
+    if config.command == Command::Plan && (plan.max_hop_ly - config.max_hop_ly).abs() > f64::EPSILON
     {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
