@@ -60,16 +60,16 @@ durable state currently has no star-coordinate projection, so
 durably persisted coordinate join exists; it cannot silently match a hard
 predicate or gain a heuristic bonus.
 
-## Riker candidate example
+## Riker candidate CLI
 
-`examples/rikers_colony_candidates.rs` is the installed target example. Its
+`crates/replicant-rikers-cli/src/main.rs` is the installed target command. Its
 only remote action is `client.sync().full()`. It then runs Riker's hard query
 locally, assigns an explainable non-authoritative score, sorts by score then
 distance from SOL, caps output at ten, and only prints `Riker, how about
 <designation>?`; it never sends BobNet.
 
 The final direct-value query API returns `Location` snapshots rather than
-handles, so the example uses `world.id().as_str()` instead of
+handles, so the CLI uses `world.id().as_str()` instead of
 `handle.snapshot().await?.key.id`. This preserves the same stable
 realm-qualified designation without a redundant local async hop.
 
@@ -109,5 +109,5 @@ cargo test --all-features
 Files changed by this prompt: `src/raw/locations.rs`, `src/domain/model.rs`,
 `src/domain/adapters.rs`, `src/domain/vocab.rs`, `src/managed/state.rs`,
 `src/managed/gateways.rs`, `src/managed/operation.rs`, `src/managed/sync.rs`, `src/lib.rs`,
-`examples/rikers_colony_candidates.rs`, the
+`crates/replicant-rikers-cli/src/main.rs`, the
 sanitized fixture, Mermaid pack, remediation ledger/checker, and this report.

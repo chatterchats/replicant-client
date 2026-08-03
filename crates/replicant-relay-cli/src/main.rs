@@ -1,25 +1,18 @@
-//! Plans and executes an account-owned FTL relay expansion.
+//! Plans and runs an account-owned FTL relay expansion.
 //!
-//! The example uses the pure `replicant-route-planner` workspace crate for an
+//! This CLI uses the pure `replicant-route-planner` workspace crate for an
 //! exact minimum-new-relay Steiner tree over a uniform 7.499 ly graph. Managed
 //! client operations perform all mutations. The raw escape hatch is used only
 //! for blueprint costs and autofactory queue details that are not represented
 //! by the normalized managed projection.
 //!
-//! Dry-run planning is the default. Add `--execute` to manufacture, transport,
-//! deploy, activate, verify, and return to the manufacturing hub.
-//!
 //! ```text
-//! cargo run --example expand_ftl_relay_network -- \
+//! cargo run --quiet -p replicant-relay-cli -- plan \
 //!   --replicant Chats-1 \
 //!   --hub SCEPTURUM-BELT-1 \
 //!   WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
 //!
-//! cargo run --example expand_ftl_relay_network -- \
-//!   --execute \
-//!   --replicant Chats-1 \
-//!   --hub SCEPTURUM-BELT-1 \
-//!   WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
+//! cargo run --quiet -p replicant-relay-cli -- run
 //! ```
 //!
 //! Environment:
@@ -29,15 +22,14 @@
 //! - `RS_RELAY_REPLICANT=Chats-1`
 //! - `RS_RELAY_HUB=SCEPTURUM-BELT-1`
 //! - `RS_RELAY_PLAN=ftl-relay-expansion.json`
-//! - `RS_RELAY_EXECUTE=1`
-//! - `RS_RELAY_REBUILD_PLAN=1`
+//! - `RS_RELAY_REPLACE_PLAN=1`
 //! - `RS_RELAY_WAIT_TIMEOUT_SECS=21600`
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     error::Error as StdError,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -55,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 const PLAN_VERSION: u32 = 1;
 const DEFAULT_MAX_HOP_LY: f64 = 7.499;
@@ -77,25 +69,46 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Plan,
+    Run,
+    Status,
+}
+
 #[derive(Debug)]
 struct Config {
-    token: SecretString,
+    command: Command,
     database: PathBuf,
     replicant: String,
     hub: String,
     plan_path: PathBuf,
     max_hop_ly: f64,
-    execute: bool,
-    rebuild_plan: bool,
+    replace_plan: bool,
     wait_timeout: Duration,
     targets: Vec<String>,
+    verbose: bool,
+    log_file: Option<PathBuf>,
 }
 
 impl Config {
     fn from_args_and_env() -> AnyResult<Self> {
-        let token = env::var("RS_API_TOKEN")
-            .map(SecretString::from)
-            .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
+        let mut arguments = env::args().skip(1);
+        let command = match arguments.next().as_deref() {
+            Some("plan") => Command::Plan,
+            Some("run") => Command::Run,
+            Some("status") => Command::Status,
+            Some("-h" | "--help") | None => {
+                print_help();
+                std::process::exit(0);
+            }
+            Some(other) => {
+                return Err(app_error(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown command: {other}"),
+                ));
+            }
+        };
         let mut database = PathBuf::from(
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
         );
@@ -105,8 +118,8 @@ impl Config {
             env::var("RS_RELAY_PLAN").unwrap_or_else(|_| "ftl-relay-expansion.json".into()),
         );
         let mut max_hop_ly = DEFAULT_MAX_HOP_LY;
-        let mut execute = env_flag("RS_RELAY_EXECUTE");
-        let mut rebuild_plan = env_flag("RS_RELAY_REBUILD_PLAN");
+        let mut replace_plan =
+            env_flag("RS_RELAY_REPLACE_PLAN") || env_flag("RS_RELAY_REBUILD_PLAN");
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_RELAY_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -114,12 +127,12 @@ impl Config {
                 .unwrap_or(21_600),
         );
         let mut targets = Vec::new();
+        let mut verbose = env_flag("RS_RELAY_VERBOSE");
+        let mut log_file = env::var("RS_RELAY_LOG_FILE").ok().map(PathBuf::from);
 
-        let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
-                "--execute" => execute = true,
-                "--rebuild-plan" => rebuild_plan = true,
+                "--replace-plan" | "--rebuild-plan" => replace_plan = true,
                 "--replicant" => replicant = required_argument(&mut arguments, "--replicant")?,
                 "--hub" => hub = required_argument(&mut arguments, "--hub")?,
                 "--plan" => plan_path = PathBuf::from(required_argument(&mut arguments, "--plan")?),
@@ -145,6 +158,13 @@ impl Config {
                             })?,
                     );
                 }
+                "--verbose" => verbose = true,
+                "--log-file" => {
+                    log_file = Some(PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--log-file",
+                    )?));
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -155,13 +175,19 @@ impl Config {
                         format!("unknown option: {value}"),
                     ));
                 }
-                value => targets.extend(
+                value if command == Command::Plan => targets.extend(
                     value
                         .split(',')
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                         .map(str::to_uppercase),
                 ),
+                value => {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidInput,
+                        format!("unexpected argument for {command:?}: {value}"),
+                    ));
+                }
             }
         }
 
@@ -173,17 +199,24 @@ impl Config {
         }
         targets.sort();
         targets.dedup();
+        if command != Command::Plan && replace_plan {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--replace-plan belongs on the plan command",
+            ));
+        }
         Ok(Self {
-            token,
+            command,
             database,
             replicant,
             hub: hub.to_uppercase(),
             plan_path,
             max_hop_ly,
-            execute,
-            rebuild_plan,
+            replace_plan,
             wait_timeout,
             targets,
+            verbose,
+            log_file,
         })
     }
 }
@@ -207,9 +240,11 @@ fn env_flag(name: &str) -> bool {
 fn print_help() {
     println!(
         "FTL relay expansion\n\n\
-Usage:\n  cargo run --example expand_ftl_relay_network -- [OPTIONS] SYSTEM...\n\n\
-Options:\n  --execute                  Permit gameplay mutations\n  --rebuild-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               Uniform relay range (default: 7.499)\n  --wait-timeout-secs N      Per-phase timeout\n  -h, --help                 Show this help\n\n\
-Targets are system designations, not planet locations."
+Usage:\n  replicant-relay plan [SYSTEM ...] [OPTIONS]\n  replicant-relay run [OPTIONS]\n  replicant-relay status [OPTIONS]\n\n\
+Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               Uniform relay range (default: 7.499)\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Targets are system designations, not planet locations. Plan is read-only. Run\n\
+always reconciles and continues the persisted mission; there is no separate\n\
+resume command or --execute confirmation."
     );
 }
 
@@ -279,19 +314,92 @@ struct FactoryState {
     observed_job_tags: Vec<BTreeSet<String>>,
 }
 
+struct MissionLock {
+    path: PathBuf,
+}
+
+impl MissionLock {
+    fn acquire(mission_path: &Path) -> AnyResult<Self> {
+        let lock_path = mission_path.with_extension("lock");
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        for attempt in 0..2 {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path: lock_path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    let owner = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok());
+                    let owner_is_running =
+                        owner.is_some_and(|pid| PathBuf::from(format!("/proc/{pid}")).exists());
+                    if owner_is_running {
+                        return Err(app_error(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "another relay executor holds {} (pid {})",
+                                lock_path.display(),
+                                owner.unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    fs::remove_file(&lock_path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!("could not acquire {}", lock_path.display()),
+        ))
+    }
+}
+
+impl Drop for MissionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 #[tokio::main]
 async fn main() -> AnyResult<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("replicant_client=info,info")),
-        )
-        .try_init()
-        .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
-
     let config = Config::from_args_and_env()?;
+    init_logging(&config)?;
+    if config.command == Command::Status {
+        let plan = load_plan(&config.plan_path)?;
+        print_plan(&plan);
+        return Ok(());
+    }
+    if config.command == Command::Run && !config.plan_path.exists() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "no relay mission exists at {}; create one with `replicant-relay plan ...`",
+                config.plan_path.display()
+            ),
+        ));
+    }
+    let token = env::var("RS_API_TOKEN")
+        .map(SecretString::from)
+        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
+    let _mission_lock = if config.command == Command::Run {
+        Some(MissionLock::acquire(&config.plan_path)?)
+    } else {
+        None
+    };
     let client = Client::builder()
-        .authentication_token(config.token.clone())
+        .authentication_token(token)
         .sqlite(&config.database)
         .startup_policy(StartupPolicy::Essential)
         .start()
@@ -303,12 +411,64 @@ async fn main() -> AnyResult<()> {
     result
 }
 
+fn init_logging(config: &Config) -> AnyResult<()> {
+    if !config.verbose && config.log_file.is_none() {
+        return Ok(());
+    }
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,replicant_relay=info,replicant_client::ops=info"));
+    match (&config.log_file, config.verbose) {
+        (None, true) => tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+            .try_init()
+            .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?,
+        (Some(path), verbose) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            let registry = tracing_subscriber::registry().with(filter);
+            if verbose {
+                registry
+                    .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            } else {
+                registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            }
+        }
+        (None, false) => {}
+    }
+    Ok(())
+}
+
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     let sync = client.sync().full().await?;
     info!(readiness = ?sync.readiness, "full managed synchronization completed");
     client.galaxy().refresh_catalogue().await?;
 
-    let replicant = resolve_owned_replicant(client, &config.replicant).await?;
+    let requested_replicant = if config.command == Command::Run {
+        load_plan(&config.plan_path)?.replicant_code
+    } else {
+        config.replicant.clone()
+    };
+    let replicant = resolve_owned_replicant(client, &requested_replicant).await?;
     let replicant_code = replicant.key.id.as_str().to_owned();
     let vessel_code = replicant
         .hosted_device
@@ -321,7 +481,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
             )
         })?;
 
-    let mut plan = if config.plan_path.exists() && !config.rebuild_plan {
+    let mut plan = if config.plan_path.exists() && !config.replace_plan {
         let plan = load_plan(&config.plan_path)?;
         validate_loaded_plan(&plan, config, &replicant_code, &vessel_code)?;
         plan
@@ -341,11 +501,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     save_plan(&config.plan_path, &plan)?;
     print_plan(&plan);
 
-    if !config.execute {
-        warn!(
-            plan = %config.plan_path.display(),
-            "plan only; rerun with --execute to permit manufacturing and deployment"
-        );
+    if config.command == Command::Plan {
         return Ok(());
     }
 
@@ -1811,30 +1967,36 @@ fn validate_loaded_plan(
         return Err(app_error(
             io::ErrorKind::InvalidData,
             format!(
-                "plan version {} is unsupported; use --rebuild-plan",
+                "plan version {} is unsupported; create a replacement with `plan --replace-plan`",
                 plan.version
             ),
         ));
     }
-    if plan.replicant_code != replicant_code
-        || plan.vessel_code != vessel_code
-        || plan.hub_location != config.hub
+    if plan.replicant_code != replicant_code || plan.vessel_code != vessel_code {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "saved plan does not match the selected replicant or its current vessel",
+        ));
+    }
+    if config.command == Command::Plan && plan.hub_location != config.hub {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "saved plan hub differs from --hub; use plan --replace-plan",
+        ));
+    }
+    if config.command == Command::Plan && !config.targets.is_empty() && plan.targets != config.targets
     {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
-            "saved plan does not match the selected replicant, vessel, or hub; use --rebuild-plan",
+            "saved plan targets differ from the command line; use plan --replace-plan",
         ));
     }
-    if !config.targets.is_empty() && plan.targets != config.targets {
+    if config.command == Command::Plan
+        && (plan.max_hop_ly - config.max_hop_ly).abs() > f64::EPSILON
+    {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
-            "saved plan targets differ from the command line; use --rebuild-plan",
-        ));
-    }
-    if (plan.max_hop_ly - config.max_hop_ly).abs() > f64::EPSILON {
-        return Err(app_error(
-            io::ErrorKind::InvalidInput,
-            "saved plan maximum hop differs from --max-hop; use --rebuild-plan",
+            "saved plan maximum hop differs from --max-hop; use plan --replace-plan",
         ));
     }
     Ok(())

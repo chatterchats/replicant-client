@@ -101,19 +101,56 @@ cargo run --quiet -p replicant-printing-cli -- \
   --print 6 cargo_freighter
 ```
 
-## FTL relay expansion example
+## FTL relay expansion CLI
 
 The workspace includes a pure `replicant-route-planner` crate and a
-restart-safe managed example that plans an exact minimum-new-relay network,
+restart-safe managed CLI that plans an exact minimum-new-relay network,
 reuses or activates account-owned relays, manufactures any shortfall, deploys
 and verifies the network, and returns the selected replicant to its hub.
-Planning is the default; add `--execute` to permit mutations.
 
 ```sh
-cargo run --example expand_ftl_relay_network -- \
+cargo run --quiet -p replicant-relay-cli -- plan \
   --replicant Chats-1 \
   --hub SCEPTURUM-BELT-1 \
   WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
+
+cargo run --quiet -p replicant-relay-cli -- run
+cargo run --quiet -p replicant-relay-cli -- status
+```
+
+`plan` is read-only. `run` reconciles and continues the persisted
+`ftl-relay-expansion.json` mission, so it replaces both the former execute and
+resume invocations and requires no `--execute` flag.
+
+## Survey route CLI
+
+`replicant-survey` plans a bounded route around a centre system, prepares an
+AMI survey fleet, scans and surveys each system, and checkpoints every phase
+to `explore-survey-route.json`.
+
+```sh
+cargo run --quiet -p replicant-survey-cli -- plan \
+  --replicant B6BA399E \
+  --vessel FD5EA802 \
+  --center SCEPTURUM \
+  --radius 30
+
+cargo run --quiet -p replicant-survey-cli -- run
+cargo run --quiet -p replicant-survey-cli -- status
+```
+
+As with mining and relay expansion, rerunning `run` reconciles live state and
+continues the incomplete mission. Use `--verbose` or `--log-file PATH` for
+diagnostics.
+
+## Riker colony candidates CLI
+
+The read-only `replicant-rikers` command synchronizes known survey data,
+prints staged local-query diagnostics, and ranks explainable colony candidates.
+It never sends the proposed message to BobNet.
+
+```sh
+cargo run --quiet -p replicant-rikers-cli -- --limit 10
 ```
 
 **Status:** this repository is at the Phase 1 bootstrap stage. The package,

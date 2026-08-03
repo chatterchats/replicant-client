@@ -34,23 +34,97 @@ enum RotationClass {
     Unknown,
 }
 
+#[derive(Debug)]
+struct Config {
+    database: String,
+    limit: usize,
+    diagnostics: bool,
+}
+
+impl Config {
+    fn from_args_and_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut database =
+            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".to_owned());
+        let mut limit = env::var("RS_RIKERS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10usize);
+        let mut diagnostics = true;
+        let mut arguments = env::args().skip(1);
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--database" => database = required_argument(&mut arguments, "--database")?,
+                "--limit" => {
+                    limit = required_argument(&mut arguments, "--limit")?
+                        .parse()
+                        .map_err(|_| {
+                            io::Error::new(ErrorKind::InvalidInput, "--limit must be an integer")
+                        })?;
+                }
+                "--no-diagnostics" => diagnostics = false,
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("unexpected argument: {other}"),
+                    )
+                    .into());
+                }
+            }
+        }
+        if limit == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "--limit must be greater than zero",
+            )
+            .into());
+        }
+        Ok(Self {
+            database,
+            limit,
+            diagnostics,
+        })
+    }
+}
+
+fn required_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    arguments.next().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidInput, format!("{option} requires a value")).into()
+    })
+}
+
+fn print_help() {
+    println!(
+        "Riker colony candidates\n\n\
+Usage:\n  replicant-rikers [OPTIONS]\n\n\
+Options:\n  --database PATH     Managed SQLite database\n  --limit N           Maximum candidates to print (default: 10)\n  --no-diagnostics    Hide staged local-query counts\n  -h, --help          Show this help\n\n\
+This command synchronizes known survey data, scores candidates locally, and\n\
+prints suggestions. It never sends a BobNet message or performs gameplay\n\
+mutations."
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_args_and_env()?;
     let token = env::var("RS_API_TOKEN").map_err(|_| {
         io::Error::new(
             ErrorKind::NotFound,
-            "RS_API_TOKEN is required; export it before running this example",
+            "RS_API_TOKEN is required; export it before running this command",
         )
     })?;
 
-    let database =
-        env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".to_owned());
-
-    eprintln!("database: {database}");
+    eprintln!("database: {}", config.database);
 
     let client = Client::builder()
         .authentication_token(SecretString::from(token))
-        .sqlite(&database)
+        .sqlite(&config.database)
         .start()
         .await?;
 
@@ -59,7 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sync = client.sync().full().await?;
     eprintln!("full sync readiness: {:?}", sync.readiness);
 
-    print_location_pipeline_diagnostics(&client).await?;
+    if config.diagnostics {
+        print_location_pipeline_diagnostics(&client).await?;
+    }
 
     let worlds = client
         .locations()
@@ -112,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .then_with(|| left.designation.cmp(&right.designation))
     });
 
-    for candidate in candidates.into_iter().take(10) {
+    for candidate in candidates.into_iter().take(config.limit) {
         println!("Riker, how about {}?", candidate.designation);
         println!(
             "  heuristic score: {:.1} (local planning heuristic)",

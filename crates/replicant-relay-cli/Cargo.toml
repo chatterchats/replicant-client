@@ -1,0 +1,31 @@
+[package]
+name = "replicant-relay-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+description = "Durable FTL relay-network expansion automation for Replicant Space."
+license = "MIT"
+
+[[bin]]
+name = "replicant-relay"
+path = "src/main.rs"
+
+[dependencies]
+replicant-client = { version = "1.0.0", path = "../..", features = ["managed"] }
+replicant-route-planner = { version = "0.1.0", path = "../replicant-route-planner" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_imports = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = 0 }
+suspicious = { level = "deny", priority = 0 }

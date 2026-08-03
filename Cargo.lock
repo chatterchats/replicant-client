@@ -1165,7 +1165,6 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "httpdate",
- "replicant-route-planner",
  "reqwest",
  "rusqlite",
  "secrecy",
@@ -1254,11 +1253,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicant-relay-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "replicant-route-planner",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "replicant-rikers-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "tokio",
+]
+
+[[package]]
 name = "replicant-route-planner"
 version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "replicant-survey-cli"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "replicant-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
-# Riker Colony Survey Candidate Example
+# Riker Colony Survey Candidate CLI
 
-The bundled `reference/examples/rikers_colony_candidates.rs` is a required target example for Phase 11.6.01b.
+The bundled `crates/replicant-rikers-cli/src/main.rs` is the maintained target command for Phase 11.6.01b.
 
 It uses two stages:
 
@@ -25,7 +25,7 @@ Complex life is not rejected. Riker awarded 83 points to a world with an establi
 
 ## Weighted ranking clues
 
-The example then reads each candidate's local committed snapshot and assigns transparent heuristic weights for:
+The CLI then reads each candidate's local committed snapshot and assigns transparent heuristic weights for:
 
 - closeness to exactly `1.0g`;
 - closeness to a comfortable central temperature;
@@ -56,7 +56,7 @@ See `reference/riker-assessment-clues-2026-07-26.md`.
 - Candidate query, snapshot reads, scoring, and sorting are local-only.
 - Unknown values do not pass hard predicates.
 - Unknown bonus values contribute neither a bonus nor a penalty.
-- The example prints suggestions but never sends BobNet messages.
+- The CLI prints suggestions but never sends BobNet messages.
 - Results are sorted by heuristic score, then by closeness to the preferred distance band, and capped at ten.
 - The printed score is explicitly a local heuristic, not Riker's expected score.
 
@@ -94,4 +94,4 @@ The final API must expose equivalent typed local access to verified facts for:
 - distance from SOL;
 - and, when verified by current response fixtures, axial tilt, rotation/tidal-lock state, host-star spectral type, and nearby-belt abundance.
 
-If the final normalized model uses different equally ergonomic names, update the bundled example and explain the mapping in the evidence report.
+If the final normalized model uses different equally ergonomic names, update the bundled CLI and explain the mapping in the evidence report.

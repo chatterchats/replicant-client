@@ -1,6 +1,6 @@
-//! Resumable, intentionally simple survey-route automation.
+//! Durable survey-route planning and automation.
 //!
-//! This example:
+//! This CLI:
 //!
 //! 1. synchronizes managed state and star knowledge;
 //! 2. selects one idle AMI survey controller and the configured survey drones;
@@ -15,12 +15,8 @@
 //! 9. recalls and restows the fleet before the next hop.
 //!
 //! The plan is written atomically after every phase. Stop the process at any
-//! point and rerun it with the same plan path to resume.
-//!
-//! # Safety
-//!
-//! By default this example only synchronizes and creates the route plan. Set
-//! `RS_EXPLORE_EXECUTE=1` to permit mutations.
+//! point and run `replicant-survey run` again with the same mission path to
+//! reconcile live state and continue.
 //!
 //! # Environment
 //!
@@ -37,7 +33,6 @@
 //! - `RS_EXPLORE_SYSTEM_LIMIT=80`
 //! - `RS_EXPLORE_STAR_DETAIL_CONCURRENCY=8`
 //! - `RS_EXPLORE_PLAN=explore-survey-route.json`
-//! - `RS_EXPLORE_LOG=logs/explore-survey-route.log`
 //! - `REPLICANT_DB=replicant-client.sqlite`
 //!
 //! Optional fleet overrides:
@@ -47,9 +42,10 @@
 //!
 //! Other controls:
 //!
-//! - `RS_EXPLORE_EXECUTE=1` — permit gameplay mutations.
-//! - `RS_EXPLORE_REBUILD_PLAN=1` — replace an existing route plan.
+//! - `RS_EXPLORE_REPLACE_PLAN=1` — replace an existing route plan.
 //! - `RS_EXPLORE_INCLUDE_EXPLORED=1` — include already explored systems.
+//! - `RS_EXPLORE_VERBOSE=1` — show logs in the terminal.
+//! - `RS_EXPLORE_LOG_FILE=logs/explore-survey-route.log` — append file logs.
 //! - `RS_EXPLORE_TRAVEL_TIMEOUT_SECS=21600`
 //! - `RS_EXPLORE_SURVEY_TIMEOUT_SECS=21600`
 //! - `RUST_LOG=replicant_client=info,replicant_client::explore=debug`
@@ -57,8 +53,8 @@
 //! Example:
 //!
 //! ```text
-//! RS_EXPLORE_EXECUTE=1 \
-//! cargo run --example explore_survey_route
+//! cargo run --quiet -p replicant-survey-cli -- plan
+//! cargo run --quiet -p replicant-survey-cli -- run
 //! ```
 //!
 //! A nearest-neighbor seed followed by bounded 2-opt improvement is used rather
@@ -74,7 +70,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -86,10 +81,7 @@ use replicant_client::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{
-    EnvFilter,
-    fmt::{MakeWriter, format::FmtSpan, time::SystemTime as TraceSystemTime},
-};
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 type AnyError = Box<dyn StdError + Send + Sync + 'static>;
 type AnyResult<T> = Result<T, AnyError>;
@@ -197,47 +189,16 @@ const DEFAULT_FILTER: &str = concat!(
     "replicant_client::ops=info"
 );
 
-#[derive(Clone)]
-struct TeeMakeWriter {
-    file: Arc<Mutex<File>>,
-}
-
-struct TeeWriter {
-    file: Arc<Mutex<File>>,
-}
-
-impl<'a> MakeWriter<'a> for TeeMakeWriter {
-    type Writer = TeeWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        TeeWriter {
-            file: Arc::clone(&self.file),
-        }
-    }
-}
-
-impl Write for TeeWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        io::stderr().lock().write_all(buffer)?;
-        self.file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .write_all(buffer)?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        io::stderr().lock().flush()?;
-        self.file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .flush()
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Plan,
+    Run,
+    Status,
 }
 
 #[derive(Debug)]
 struct Config {
-    token: SecretString,
+    command: Command,
     database: PathBuf,
     replicant: String,
     vessel: String,
@@ -246,82 +207,256 @@ struct Config {
     system_limit: usize,
     star_detail_concurrency: usize,
     plan_path: PathBuf,
-    log_path: PathBuf,
+    log_path: Option<PathBuf>,
     controller_override: Option<String>,
     drone_overrides: Option<Vec<String>>,
-    execute: bool,
-    rebuild_plan: bool,
+    replace_plan: bool,
     include_explored: bool,
     travel_timeout: Duration,
     survey_timeout: Duration,
+    verbose: bool,
 }
 
 impl Config {
-    fn from_env() -> AnyResult<Self> {
-        let token = SecretString::from(
-            env::var("RS_API_TOKEN")
-                .map_err(|_| app_error(io::ErrorKind::InvalidInput, "RS_API_TOKEN is required"))?,
-        );
-
-        let drone_overrides = env::var("RS_EXPLORE_DRONES").ok().map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
-
-        if let Some(drones) = &drone_overrides {
-            if drones.len() != DRONE_COUNT {
+    fn from_args_and_env() -> AnyResult<Self> {
+        let mut arguments = env::args().skip(1);
+        let command = match arguments.next().as_deref() {
+            Some("plan") => Command::Plan,
+            Some("run") => Command::Run,
+            Some("status") => Command::Status,
+            Some("-h" | "--help") | None => {
+                print_help();
+                std::process::exit(0);
+            }
+            Some(other) => {
                 return Err(app_error(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "RS_EXPLORE_DRONES must contain exactly {DRONE_COUNT} comma-separated codes"
-                    ),
+                    format!("unknown command: {other}"),
                 ));
             }
-            if drones.iter().collect::<BTreeSet<_>>().len() != DRONE_COUNT {
-                return Err(app_error(
-                    io::ErrorKind::InvalidInput,
-                    format!("RS_EXPLORE_DRONES must contain {DRONE_COUNT} distinct device codes"),
-                ));
+        };
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
+        let mut replicant = env_string("RS_EXPLORE_REPLICANT", "B6BA399E");
+        let mut vessel = env_string("RS_EXPLORE_VESSEL", "FD5EA802");
+        let mut center = env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase();
+        let mut radius_ly = env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?;
+        let mut system_limit = env_usize("RS_EXPLORE_SYSTEM_LIMIT", 80)?.max(1);
+        let mut star_detail_concurrency =
+            env_usize("RS_EXPLORE_STAR_DETAIL_CONCURRENCY", 8)?.clamp(1, 16);
+        let mut plan_path = env::var_os("RS_EXPLORE_PLAN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("explore-survey-route.json"));
+        let mut log_path = env::var_os("RS_EXPLORE_LOG_FILE")
+            .or_else(|| env::var_os("RS_EXPLORE_LOG"))
+            .map(PathBuf::from);
+        let mut controller_override = env::var("RS_EXPLORE_CONTROLLER").ok();
+        let mut drone_overrides = env::var("RS_EXPLORE_DRONES")
+            .ok()
+            .map(|value| parse_drone_codes(&value));
+        let mut replace_plan =
+            env_bool("RS_EXPLORE_REPLACE_PLAN", false)?
+                || env_bool("RS_EXPLORE_REBUILD_PLAN", false)?;
+        let mut include_explored = env_bool("RS_EXPLORE_INCLUDE_EXPLORED", false)?;
+        let mut travel_timeout = Duration::from_secs(env_u64(
+            "RS_EXPLORE_TRAVEL_TIMEOUT_SECS",
+            6 * 60 * 60,
+        )?);
+        let mut survey_timeout = Duration::from_secs(env_u64(
+            "RS_EXPLORE_SURVEY_TIMEOUT_SECS",
+            6 * 60 * 60,
+        )?);
+        let mut verbose = env_bool("RS_EXPLORE_VERBOSE", false)?;
+
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--database" => {
+                    database = PathBuf::from(required_argument(&mut arguments, "--database")?)
+                }
+                "--replicant" => replicant = required_argument(&mut arguments, "--replicant")?,
+                "--vessel" => vessel = required_argument(&mut arguments, "--vessel")?,
+                "--center" => {
+                    center = required_argument(&mut arguments, "--center")?.to_ascii_uppercase()
+                }
+                "--radius" => {
+                    radius_ly = positive_f64(
+                        &required_argument(&mut arguments, "--radius")?,
+                        "--radius",
+                    )?;
+                }
+                "--system-limit" => {
+                    system_limit = positive_usize(
+                        &required_argument(&mut arguments, "--system-limit")?,
+                        "--system-limit",
+                    )?;
+                }
+                "--star-detail-concurrency" => {
+                    star_detail_concurrency = positive_usize(
+                        &required_argument(&mut arguments, "--star-detail-concurrency")?,
+                        "--star-detail-concurrency",
+                    )?
+                    .clamp(1, 16);
+                }
+                "--mission-file" | "--plan-file" => {
+                    plan_path = PathBuf::from(required_argument(&mut arguments, &argument)?)
+                }
+                "--controller" => {
+                    controller_override = Some(required_argument(&mut arguments, "--controller")?)
+                }
+                "--drones" => {
+                    drone_overrides = Some(parse_drone_codes(&required_argument(
+                        &mut arguments,
+                        "--drones",
+                    )?));
+                }
+                "--replace-plan" | "--rebuild-plan" => replace_plan = true,
+                "--include-explored" => include_explored = true,
+                "--travel-timeout-secs" => {
+                    travel_timeout = Duration::from_secs(u64::try_from(positive_usize(
+                        &required_argument(&mut arguments, "--travel-timeout-secs")?,
+                        "--travel-timeout-secs",
+                    )?)?);
+                }
+                "--survey-timeout-secs" => {
+                    survey_timeout = Duration::from_secs(u64::try_from(positive_usize(
+                        &required_argument(&mut arguments, "--survey-timeout-secs")?,
+                        "--survey-timeout-secs",
+                    )?)?);
+                }
+                "--verbose" => verbose = true,
+                "--log-file" => {
+                    log_path = Some(PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--log-file",
+                    )?));
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidInput,
+                        format!("unexpected argument: {other}"),
+                    ));
+                }
             }
         }
-
+        validate_drone_codes(drone_overrides.as_deref())?;
+        if command != Command::Plan && replace_plan {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--replace-plan belongs on the plan command",
+            ));
+        }
         Ok(Self {
-            token,
-            database: env::var_os("REPLICANT_DB")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite")),
-            replicant: env_string("RS_EXPLORE_REPLICANT", "B6BA399E"),
-            vessel: env_string("RS_EXPLORE_VESSEL", "FD5EA802"),
-            center: env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase(),
-            radius_ly: env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?,
-            system_limit: env_usize("RS_EXPLORE_SYSTEM_LIMIT", 80)?.max(1),
-            star_detail_concurrency: env_usize("RS_EXPLORE_STAR_DETAIL_CONCURRENCY", 8)?
-                .clamp(1, 16),
-            plan_path: env::var_os("RS_EXPLORE_PLAN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("explore-survey-route.json")),
-            log_path: env::var_os("RS_EXPLORE_LOG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("logs/explore-survey-route.log")),
-            controller_override: env::var("RS_EXPLORE_CONTROLLER").ok(),
+            command,
+            database,
+            replicant,
+            vessel,
+            center,
+            radius_ly,
+            system_limit,
+            star_detail_concurrency,
+            plan_path,
+            log_path,
+            controller_override,
             drone_overrides,
-            execute: env_bool("RS_EXPLORE_EXECUTE", false)?,
-            rebuild_plan: env_bool("RS_EXPLORE_REBUILD_PLAN", false)?,
-            include_explored: env_bool("RS_EXPLORE_INCLUDE_EXPLORED", false)?,
-            travel_timeout: Duration::from_secs(env_u64(
-                "RS_EXPLORE_TRAVEL_TIMEOUT_SECS",
-                6 * 60 * 60,
-            )?),
-            survey_timeout: Duration::from_secs(env_u64(
-                "RS_EXPLORE_SURVEY_TIMEOUT_SECS",
-                6 * 60 * 60,
-            )?),
+            replace_plan,
+            include_explored,
+            travel_timeout,
+            survey_timeout,
+            verbose,
         })
     }
+
+    fn adopt_plan_identity(&mut self, plan: &RoutePlan) {
+        self.replicant.clone_from(&plan.replicant);
+        self.vessel.clone_from(&plan.vessel);
+        self.center.clone_from(&plan.center);
+        self.radius_ly = plan.radius_ly;
+        self.system_limit = plan.system_limit;
+        self.include_explored = plan.include_explored;
+    }
+}
+
+fn required_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> AnyResult<String> {
+    arguments.next().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} requires a value"),
+        )
+    })
+}
+
+fn parse_drone_codes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn validate_drone_codes(drones: Option<&[String]>) -> AnyResult<()> {
+    let Some(drones) = drones else {
+        return Ok(());
+    };
+    if drones.len() != DRONE_COUNT
+        || drones.iter().collect::<BTreeSet<_>>().len() != DRONE_COUNT
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("--drones must contain exactly {DRONE_COUNT} distinct comma-separated codes"),
+        ));
+    }
+    Ok(())
+}
+
+fn positive_usize(value: &str, option: &str) -> AnyResult<usize> {
+    let value = value.parse::<usize>().map_err(|_| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be an integer"),
+        )
+    })?;
+    if value == 0 {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be greater than zero"),
+        ));
+    }
+    Ok(value)
+}
+
+fn positive_f64(value: &str, option: &str) -> AnyResult<f64> {
+    let value = value.parse::<f64>().map_err(|_| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be numeric"),
+        )
+    })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be finite and greater than zero"),
+        ));
+    }
+    Ok(value)
+}
+
+fn print_help() {
+    println!(
+        "Replicant survey route\n\n\
+Usage:\n  replicant-survey plan [OPTIONS]\n  replicant-survey run [OPTIONS]\n  replicant-survey status [OPTIONS]\n\n\
+Options:\n  --replicant CODE           Surveying replicant\n  --vessel CODE              Vessel carrying the survey fleet\n  --center SYSTEM            Route centre (default: SCEPTURUM)\n  --radius LY                Search radius (default: 30)\n  --system-limit N           Maximum route systems (default: 80)\n  --star-detail-concurrency N  Concurrent star-detail reads (1-16)\n  --controller CODE          Survey-controller override\n  --drones A,B,C             Three survey-drone overrides\n  --include-explored         Include systems already explored\n  --mission-file PATH        Persisted mission JSON\n  --replace-plan             Replace the existing mission during plan\n  --database PATH            Managed SQLite database\n  --travel-timeout-secs N    Per-travel wait timeout\n  --survey-timeout-secs N    Per-survey wait timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Plan performs reads and writes the mission only. Run always reconciles and\n\
+continues that mission; there is no separate resume command or --execute flag."
+    );
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -376,34 +511,50 @@ fn env_f64(name: &str, default: f64) -> AnyResult<f64> {
     }
 }
 
-fn install_tracing(log_path: &Path) -> AnyResult<()> {
-    if let Some(parent) = log_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
+fn install_tracing(config: &Config) -> AnyResult<()> {
+    if !config.verbose && config.log_path.is_none() {
+        return Ok(());
     }
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let writer = TeeMakeWriter {
-        file: Arc::new(Mutex::new(file)),
-    };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(writer)
-        .with_timer(TraceSystemTime)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_ansi(false)
-        .with_span_events(FmtSpan::CLOSE)
-        .try_init()
-        .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
-
+    match (&config.log_path, config.verbose) {
+        (None, true) => tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+            .try_init()
+            .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?,
+        (Some(path), verbose) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            let registry = tracing_subscriber::registry().with(filter);
+            if verbose {
+                registry
+                    .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            } else {
+                registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Mutex::new(file)),
+                    )
+                    .try_init()
+                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
+            }
+        }
+        (None, false) => {}
+    }
     Ok(())
 }
 
@@ -489,7 +640,7 @@ impl RoutePlan {
         {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
-                "existing route plan targets a different replicant, vessel, or centre; set RS_EXPLORE_REBUILD_PLAN=1 to replace it",
+                "existing route plan targets a different replicant, vessel, or centre; use plan --replace-plan",
             ));
         }
         if self.next_index > self.route.len() {
@@ -530,6 +681,64 @@ impl RoutePlan {
     }
 }
 
+struct MissionLock {
+    path: PathBuf,
+}
+
+impl MissionLock {
+    fn acquire(mission_path: &Path) -> AnyResult<Self> {
+        let lock_path = mission_path.with_extension("lock");
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        for attempt in 0..2 {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path: lock_path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    let owner = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok());
+                    let owner_is_running =
+                        owner.is_some_and(|pid| PathBuf::from(format!("/proc/{pid}")).exists());
+                    if owner_is_running {
+                        return Err(app_error(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "another survey executor holds {} (pid {})",
+                                lock_path.display(),
+                                owner.unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    fs::remove_file(&lock_path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!("could not acquire {}", lock_path.display()),
+        ))
+    }
+}
+
+impl Drop for MissionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 #[derive(Clone)]
 struct CandidateStar {
     star: String,
@@ -540,8 +749,25 @@ struct CandidateStar {
 
 #[tokio::main]
 async fn main() -> AnyResult<()> {
-    let config = Config::from_env()?;
-    install_tracing(&config.log_path)?;
+    let mut config = Config::from_args_and_env()?;
+    if config.command == Command::Status {
+        return show_status(&config);
+    }
+    if config.command == Command::Run && !config.plan_path.exists() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "no survey mission exists at {}; create one with `replicant-survey plan`",
+                config.plan_path.display()
+            ),
+        ));
+    }
+    if config.plan_path.exists() && !config.replace_plan {
+        let mut saved: RoutePlan = serde_json::from_slice(&fs::read(&config.plan_path)?)?;
+        saved.migrate()?;
+        config.adopt_plan_identity(&saved);
+    }
+    install_tracing(&config)?;
 
     info!(
         target: "replicant_client::explore",
@@ -553,13 +779,21 @@ async fn main() -> AnyResult<()> {
         system_limit = config.system_limit,
         star_detail_concurrency = config.star_detail_concurrency,
         plan = %config.plan_path.display(),
-        log = %config.log_path.display(),
-        execute = config.execute,
+        log = config.log_path.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
+        command = ?config.command,
         "starting survey-route automation"
     );
 
+    let token = env::var("RS_API_TOKEN")
+        .map(SecretString::from)
+        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
+    let _mission_lock = if config.command == Command::Run {
+        Some(MissionLock::acquire(&config.plan_path)?)
+    } else {
+        None
+    };
     let client = Client::builder()
-        .authentication_token(config.token.clone())
+        .authentication_token(token)
         .sqlite(&config.database)
         .startup_policy(StartupPolicy::Essential)
         .start()
@@ -573,11 +807,19 @@ async fn main() -> AnyResult<()> {
             target: "replicant_client::explore",
             event = "explore.failed",
             error = %error,
-            "survey-route automation failed; rerun to resume from the saved plan"
+            "survey-route automation failed; run it again to reconcile and continue the saved mission"
         );
     }
     close_result?;
     result
+}
+
+fn show_status(config: &Config) -> AnyResult<()> {
+    let mut plan: RoutePlan = serde_json::from_slice(&fs::read(&config.plan_path)?)?;
+    plan.migrate()?;
+    plan.normalize_progress();
+    print_plan(&plan);
+    Ok(())
 }
 
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
@@ -594,6 +836,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     let mut plan = load_or_create_plan(client, config).await?;
     if plan.next_index >= plan.route.len() || plan.phase == RunPhase::Complete {
         log_route(&plan);
+        print_plan(&plan);
         info!(
             target: "replicant_client::explore",
             event = "route.already_completed",
@@ -605,13 +848,9 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
 
     reconcile_current_system_scan_on_startup(client, config, &mut plan).await?;
     log_route(&plan);
+    print_plan(&plan);
 
-    if !config.execute {
-        warn!(
-            target: "replicant_client::explore",
-            event = "explore.plan_only",
-            "route plan created/loaded; set RS_EXPLORE_EXECUTE=1 to permit mutations"
-        );
+    if config.command == Command::Plan {
         return Ok(());
     }
 
@@ -939,7 +1178,7 @@ fn apply_startup_current_system_completion(
 }
 
 async fn load_or_create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
-    if config.rebuild_plan && config.plan_path.exists() {
+    if config.replace_plan && config.plan_path.exists() {
         info!(
             target: "replicant_client::explore",
             event = "route.plan_removed",
@@ -1254,6 +1493,32 @@ fn log_route(plan: &RoutePlan) {
             finalized = plan.stop_is_finalized(index),
             "planned route stop"
         );
+    }
+}
+
+fn print_plan(plan: &RoutePlan) {
+    let total_distance = plan
+        .route
+        .iter()
+        .map(|stop| stop.leg_distance_ly)
+        .sum::<f64>();
+    let completed = plan.next_index.min(plan.route.len());
+    println!("Survey route mission");
+    println!("  Replicant: {}", plan.replicant);
+    println!("  Vessel: {}", plan.vessel);
+    println!("  Centre: {}", plan.center);
+    println!("  Radius: {:.2} ly", plan.radius_ly);
+    println!("  Progress: {completed}/{} stops", plan.route.len());
+    println!("  Phase: {:?}", plan.phase);
+    println!("  Route distance: {total_distance:.2} ly");
+    if let Some(next) = plan.route.get(plan.next_index) {
+        println!("  Next system: {}", next.star);
+    }
+    if let Some(controller) = &plan.controller {
+        println!("  Survey controller: {controller}");
+    }
+    if !plan.drones.is_empty() {
+        println!("  Survey drones: {}", plan.drones.join(", "));
     }
 }
 
