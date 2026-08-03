@@ -533,6 +533,9 @@ pub enum DeviceCommand {
         /// Tags to apply to the printed device.
         #[serde(skip_serializing_if = "Option::is_none")]
         tags: Option<Vec<String>>,
+        /// Print a modular device in its compacted transport state.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flatpack: Option<bool>,
     },
     /// Launches a deployed device.
     Launch,
@@ -1102,11 +1105,13 @@ mod command_response_tests {
             controller: None,
             oncomplete: None,
             tags: None,
+            flatpack: Some(true),
         };
         let payload = serde_json::to_value(command).expect("serialize enqueue_print");
         assert_eq!(payload["command"], "enqueue_print");
         assert_eq!(payload["device_type"], "survey_drone");
         assert_eq!(payload["quantity"], 4);
+        assert_eq!(payload["flatpack"], true);
     }
 
     #[test]

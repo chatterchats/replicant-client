@@ -9,7 +9,7 @@ to choose the SQLite path and `REPLICANT_INIT_*` bounds to cap the traversal.
 
 A durable, stateful Rust client for building [Replicant Space](https://replicant.space) applications.
 
-`replicant-client` targets Replicant Space documentation through `2.3.3`,
+`replicant-client` targets Replicant Space documentation through `2.3.5`,
 using the checked-in verified `2.3.3` OpenAPI corpus plus explicit
 rendered-document corrections where the specification remains incomplete. It is
 client-centered: the normal entry point is `replicant_client::Client`, which
@@ -86,6 +86,21 @@ continues its first incomplete stage, so there is no separate resume command
 or execution-confirmation flag. The binary is quiet by default; use
 `--verbose` and/or `--log-file PATH` when diagnostics are needed.
 
+## Distributed printing CLI
+
+The reusable `replicant-printing` crate balances work across every eligible
+Autofactory at a hub. Its CLI accepts repeated print requests and, on Replicant
+Space 2.3.5, can request compacted output for devices with the `modular`
+blueprint feature.
+
+```sh
+cargo run --quiet -p replicant-printing-cli -- \
+  --hub SCEPTURUM-BELT-1 \
+  --flatpack \
+  --print 6 autofactory \
+  --print 6 cargo_freighter
+```
+
 ## FTL relay expansion example
 
 The workspace includes a pure `replicant-route-planner` crate and a
@@ -122,7 +137,7 @@ for the full implementation plan.
 The verified Replicant Space 2.3.3 OpenAPI corpus is checked in under
 [`reference/replicant-space/`](reference/replicant-space/). Its inventory
 contains 86 operations: 79 supported, 5 deprecated, and 2 admin-only.
-Rendered-document corrections remain explicit under [`docs/contract/`](docs/contract/)
+Replicant Space 2.3.5 rendered-document corrections remain explicit under [`docs/contract/`](docs/contract/)
 and [`policy/contract-metadata.json`](policy/contract-metadata.json); the
 documented-operation delta list is currently empty because both colony routes
 are now present in OpenAPI. `scripts/contract_policy_check.py` verifies the

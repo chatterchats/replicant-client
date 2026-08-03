@@ -2,7 +2,7 @@
 """Contract and deprecation policy gate for replicant-client.
 
 Verifies the checked-in Replicant Space 2.3.3 OpenAPI corpus and explicit
-rendered-document corrections:
+Replicant Space 2.3.5 rendered-document corrections:
 
 - the OpenAPI document checksum matches the recorded contract metadata;
 - policy/operations.json is not stale relative to the live OpenAPI document;

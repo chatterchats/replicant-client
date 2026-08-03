@@ -1,10 +1,10 @@
 {
-  "$schema_note": "Provenance for the verified Replicant Space 2.3.3 OpenAPI corpus; rendered-document corrections remain explicit metadata.",
-  "replicant_space_version": "2.3.3",
+  "$schema_note": "Provenance for the verified Replicant Space 2.3.3 OpenAPI corpus plus explicit Replicant Space 2.3.5 rendered-document corrections.",
+  "replicant_space_version": "2.3.5",
   "crawl_timestamp": "2026-07-24T18:16:35.649754+00:00",
   "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
   "openapi_fetched_at": "2026-07-28T09:11:06.627Z",
-  "documentation_archive_sha256": "e271b1a32602dd9ec80da6b9d64f392efc58a574f8da7584de0ae9205acabc73",
+  "documentation_archive_sha256": "1b8e96d9f94cd1e3e8fb5a56bc7451f8e53a2bb99bceca1d4e6ab1228aafe7a9",
   "openapi_sha256": "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f",
   "openapi_operation_count": 86,
   "openapi_path_count": 72,
@@ -33,8 +33,8 @@
     "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
     "reference/replicant-space/openapi.json sha256 is verified by scripts/contract_policy_check.py on every run."
   ],
-  "documentation_version": "2.3.3",
-  "documentation_crawled_at": "2026-07-28T00:53:11Z",
+  "documentation_version": "2.3.5",
+  "documentation_crawled_at": "2026-08-03T00:42:38.460301Z",
   "openapi_version": "2.3.3",
   "documented_operation_delta_count": 0
 }

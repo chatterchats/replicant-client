@@ -1,7 +1,7 @@
 ---
 title: "AMI digests"
 source_url: "https://replicant.space/docs/api/events/ami-digests/"
-crawled_at: "2026-07-28T00:53:10.891040+00:00"
+crawled_at: "2026-08-03T00:42:36.740045+00:00"
 ---
 
 API · Events
@@ -203,7 +203,7 @@ response ami.survey.digest
 }
 ```
 
-The `scans` array contains one entry for each `scan.completed` event that occurred during the digest window. Each entry includes the `device_code` that performed the scan, the `scan_target` name, the `scan_type`, and the full scan `report` object. The report contents vary by scan type and can be large — see the [scans documentation](https://replicant.space/docs/api/scans/) for the full report structure. When no scans completed during the window, the array is empty.
+The `scans` array contains one entry for each `scan.completed` event that occurred during the digest window. Each entry includes the `device_code` that performed the scan, the `scan_target` name, the `scan_type`, and the full scan `report` object. The report contents vary by scan type and can be large. If no scans completed during the evaluation window, the array is empty.
 
 ## Transport digest examples
 

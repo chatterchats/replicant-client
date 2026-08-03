@@ -546,26 +546,36 @@ fn scan_projection(
 /// `trade.completed` cross-domain reconciliation: the buyer/seller device
 /// and replicant named on the event envelope are already covered by
 /// [`schedule_narrow_reconciliation`]; this additionally targets any device
-/// codes the payload names directly (2.3.1's `new_device_codes`, for
-/// device-typed trade rewards), which the envelope's own device/replicant
+/// codes the payload names directly (the legacy `new_device_codes` field and
+/// 2.3.5's role-specific `rewards_received.devices` or
+/// `criteria_received.devices`), which the envelope's own device/replicant
 /// fields never carry.
 fn schedule_trade_completion_reconciliation(client: &Client, event: &Event) -> Result<()> {
     if event.name != domain::EventName::TradeCompleted {
         return Ok(());
     }
-    let Some(Value::Array(codes)) = event.payload.get("new_device_codes") else {
-        return Ok(());
-    };
+    let mut codes = BTreeSet::new();
+    if let Some(Value::Array(values)) = event.payload.get("new_device_codes") {
+        codes.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    for outcome in ["rewards_received", "criteria_received"] {
+        let Some(Value::Array(values)) = event
+            .payload
+            .get(outcome)
+            .and_then(Value::as_object)
+            .and_then(|items| items.get("devices"))
+        else {
+            continue;
+        };
+        codes.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
     let realm = event.realm.clone().unwrap_or_default();
-    for code in codes.iter().filter_map(Value::as_str) {
+    for code in codes {
+        let work_id = format!("device:{code}");
+        let payload = serde_json::json!({ "id": code });
         client
             .managed_state()
-            .enqueue_reconciliation(
-                &format!("device:{code}"),
-                &realm,
-                "device",
-                &serde_json::json!({ "id": code }),
-            )
+            .enqueue_reconciliation(&work_id, &realm, "device", &payload)
             .map_err(persistence_error)?;
     }
     Ok(())
@@ -1882,6 +1892,14 @@ mod tests {
             "new_device_codes".into(),
             serde_json::json!(["NEW1", "NEW2"]),
         );
+        event.payload.insert(
+            "rewards_received".into(),
+            serde_json::json!({"resources": {}, "devices": ["BUYER1", "NEW1"]}),
+        );
+        event.payload.insert(
+            "criteria_received".into(),
+            serde_json::json!({"resources": {}, "devices": ["SELLER1"]}),
+        );
 
         apply_event(&client, &event).expect("apply trade completion");
 
@@ -1900,6 +1918,9 @@ mod tests {
         assert!(scheduled.contains(&"TC1".to_string()));
         assert!(scheduled.contains(&"NEW1".to_string()));
         assert!(scheduled.contains(&"NEW2".to_string()));
+        assert!(scheduled.contains(&"BUYER1".to_string()));
+        assert!(scheduled.contains(&"SELLER1".to_string()));
+        assert_eq!(scheduled.len(), 5, "duplicate device codes are coalesced");
         client.close().await.expect("close");
     }
 

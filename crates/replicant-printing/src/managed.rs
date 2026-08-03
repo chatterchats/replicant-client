@@ -5,7 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use replicant_client::{Client, Operation, OperationStatus, domain::Device};
+use replicant_client::{
+    AutofactoryPrintOptions, Client, Operation, OperationStatus, domain::Device,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -58,6 +60,8 @@ pub struct QueueOptions {
     pub hub: String,
     /// Tags applied to every printed device.
     pub tags: Vec<String>,
+    /// Print requested modular devices in their compacted transport state.
+    pub flatpack: bool,
     /// Delay between queue-capacity checks when more work remains.
     pub poll_interval: Duration,
     /// Maximum time allowed to queue every requested unit.
@@ -71,6 +75,7 @@ impl QueueOptions {
         Self {
             hub: hub.into(),
             tags: Vec::new(),
+            flatpack: false,
             poll_interval: Duration::from_secs(5),
             wait_timeout: Duration::from_secs(21_600),
         }
@@ -88,6 +93,8 @@ pub struct QueueReport {
     pub by_factory: BTreeMap<String, i64>,
     /// Durable operation identifiers for each accepted unit submission.
     pub operation_ids: Vec<String>,
+    /// Whether the accepted jobs requested compacted modular output.
+    pub flatpack: bool,
 }
 
 /// Live discovery or durable queueing failure.
@@ -102,6 +109,9 @@ pub enum PrintingError {
     /// No owned Autofactory was found at the requested hub.
     #[error("no account-owned Autofactory is available at `{0}`")]
     NoFactoryAtHub(String),
+    /// Flatpack output was requested for a non-modular device blueprint.
+    #[error("flatpack output requires the `modular` feature, but `{0}` is not modular")]
+    FlatpackRequiresModular(String),
     /// A queue payload contained an invalid quantity.
     #[error("Autofactory {factory_code} reported invalid queued quantity {quantity}")]
     InvalidQueuedQuantity {
@@ -137,7 +147,9 @@ pub enum PrintingError {
 }
 
 /// Fetches unlocked blueprints and their print durations.
-pub async fn fetch_blueprints(client: &Client) -> Result<BTreeMap<String, Blueprint>, PrintingError> {
+pub async fn fetch_blueprints(
+    client: &Client,
+) -> Result<BTreeMap<String, Blueprint>, PrintingError> {
     Ok(client
         .raw()
         .blueprints()
@@ -153,6 +165,7 @@ pub async fn fetch_blueprints(client: &Client) -> Result<BTreeMap<String, Bluepr
                 Blueprint {
                     device_type,
                     print_time_seconds: blueprint.print_time.unwrap_or(0.0),
+                    features: blueprint.features.unwrap_or_default(),
                 },
             ))
         })
@@ -174,9 +187,7 @@ pub async fn discover_factories<B: PrintTime>(
     let mut factory_codes = Vec::new();
     for handle in handles {
         let snapshot = handle.snapshot().await?;
-        if device_type(&snapshot) == Some(AUTOFACTORY)
-            && device_location(&snapshot) == Some(hub)
-        {
+        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
             factory_codes.push(handle.id().as_str().to_owned());
         }
     }
@@ -244,10 +255,7 @@ pub async fn factory_queue_slots(
             quantity: detail.queue_size.unwrap_or(1),
         }
     })?;
-    Ok(queue_size.saturating_sub(queued_print_units(
-        factory_code,
-        &detail.print_queue,
-    )?))
+    Ok(queue_size.saturating_sub(queued_print_units(factory_code, &detail.print_queue)?))
 }
 
 /// Submits one durable print operation and verifies its immediate outcome.
@@ -262,14 +270,36 @@ pub async fn enqueue_print(
     quantity: i64,
     tags: &[String],
 ) -> Result<Operation, PrintingError> {
+    enqueue_print_configured(client, factory_code, device_type, quantity, tags, false).await
+}
+
+/// Submits one durable flatpack print operation for a modular device.
+pub async fn enqueue_print_flatpacked(
+    client: &Client,
+    factory_code: &str,
+    device_type: &str,
+    quantity: i64,
+    tags: &[String],
+) -> Result<Operation, PrintingError> {
+    enqueue_print_configured(client, factory_code, device_type, quantity, tags, true).await
+}
+
+async fn enqueue_print_configured(
+    client: &Client,
+    factory_code: &str,
+    device_type: &str,
+    quantity: i64,
+    tags: &[String],
+    flatpack: bool,
+) -> Result<Operation, PrintingError> {
     let handle = client.devices().get(factory_code).await?;
-    let operation = if tags.is_empty() {
-        handle.enqueue_print(device_type, quantity).await?
-    } else {
-        handle
-            .enqueue_print_with_tags(device_type, quantity, tags.iter().cloned())
-            .await?
-    };
+    let mut options = AutofactoryPrintOptions::new(quantity).tags(tags.iter().cloned());
+    if flatpack {
+        options = options.flatpacked();
+    }
+    let operation = handle
+        .enqueue_print_configured(device_type, options)
+        .await?;
     ensure_submission_accepted(&operation).await?;
     Ok(operation)
 }
@@ -315,6 +345,7 @@ pub async fn queue_prints(
     let mut remaining = requested.clone();
     let mut report = QueueReport {
         requested,
+        flatpack: options.flatpack,
         ..QueueReport::default()
     };
     if remaining.is_empty() {
@@ -323,8 +354,11 @@ pub async fn queue_prints(
 
     let blueprints = fetch_blueprints(client).await?;
     for device_type in remaining.keys() {
-        if !blueprints.contains_key(device_type) {
+        let Some(blueprint) = blueprints.get(device_type) else {
             return Err(ScheduleError::MissingBlueprint(device_type.clone()).into());
+        };
+        if options.flatpack && !blueprint.is_modular() {
+            return Err(PrintingError::FlatpackRequiresModular(device_type.clone()));
         }
     }
 
@@ -352,22 +386,32 @@ pub async fn queue_prints(
 
         for batch in schedule.batches {
             let available = slots.get(&batch.factory_code).copied().unwrap_or(0);
-            let quantity = usize::try_from(batch.quantity).map_err(|_| {
-                ScheduleError::InvalidQuantity {
+            let quantity =
+                usize::try_from(batch.quantity).map_err(|_| ScheduleError::InvalidQuantity {
                     device_type: batch.device_type.clone(),
                     quantity: batch.quantity,
-                }
-            })?;
+                })?;
             let to_submit = available.min(quantity);
             for _ in 0..to_submit {
-                let operation = enqueue_print(
-                    client,
-                    &batch.factory_code,
-                    &batch.device_type,
-                    1,
-                    &options.tags,
-                )
-                .await?;
+                let operation = if options.flatpack {
+                    enqueue_print_flatpacked(
+                        client,
+                        &batch.factory_code,
+                        &batch.device_type,
+                        1,
+                        &options.tags,
+                    )
+                    .await?
+                } else {
+                    enqueue_print(
+                        client,
+                        &batch.factory_code,
+                        &batch.device_type,
+                        1,
+                        &options.tags,
+                    )
+                    .await?
+                };
                 *remaining.entry(batch.device_type.clone()).or_default() -= 1;
                 *report.queued.entry(batch.device_type.clone()).or_default() += 1;
                 *report
@@ -381,6 +425,7 @@ pub async fn queue_prints(
                 info!(
                     factory = %batch.factory_code,
                     device_type = %batch.device_type,
+                    flatpack = options.flatpack,
                     "queued distributed print unit"
                 );
             }
@@ -455,12 +500,8 @@ mod tests {
     #[test]
     fn queue_occupancy_counts_device_quantities() {
         let jobs = vec![
-            [("quantity".into(), Value::from(2))]
-                .into_iter()
-                .collect(),
-            [("count".into(), Value::from(3))]
-                .into_iter()
-                .collect(),
+            [("quantity".into(), Value::from(2))].into_iter().collect(),
+            [("count".into(), Value::from(3))].into_iter().collect(),
             Map::new(),
         ];
         assert_eq!(queued_print_units("AF1", &jobs).unwrap(), 6);

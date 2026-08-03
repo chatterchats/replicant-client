@@ -31,6 +31,7 @@ struct Config {
     database: PathBuf,
     requests: Vec<PrintRequest>,
     tags: Vec<String>,
+    flatpack: bool,
     wait_timeout: Duration,
     poll_interval: Duration,
     verbose: bool,
@@ -51,6 +52,7 @@ impl Config {
         );
         let mut requests = Vec::new();
         let mut tags = Vec::new();
+        let mut flatpack = env_flag("RS_PRINTING_FLATPACK");
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_PRINTING_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -85,6 +87,7 @@ impl Config {
                     requests.push(PrintRequest::new(device_type, quantity));
                 }
                 "--tag" => tags.push(required_argument(&mut arguments, "--tag")?),
+                "--flatpack" => flatpack = true,
                 "--wait-timeout-secs" => {
                     wait_timeout = Duration::from_secs(
                         required_argument(&mut arguments, "--wait-timeout-secs")?
@@ -148,6 +151,7 @@ impl Config {
             database,
             requests,
             tags,
+            flatpack,
             wait_timeout,
             poll_interval,
             verbose,
@@ -177,7 +181,7 @@ fn print_help() {
     println!(
         "Replicant distributed printing\n\n\
 Usage:\n  replicant-printing [queue] --print QUANTITY DEVICE_TYPE [OPTIONS]\n\n\
-Options:\n  --print N DEVICE_TYPE    Queue N devices (repeatable)\n  --hub LOCATION           Autofactory location (default: SCEPTURUM-BELT-1)\n  --tag TAG                Tag every printed device (repeatable)\n  --database PATH          Managed SQLite database\n  --wait-timeout-secs N    Maximum queue-capacity wait (default: 21600)\n  --poll-seconds N          Queue-capacity poll interval (default: 5)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit the final report as JSON\n  -h, --help                Show this help\n\n\
+Options:\n  --print N DEVICE_TYPE    Queue N devices (repeatable)\n  --hub LOCATION           Autofactory location (default: SCEPTURUM-BELT-1)\n  --tag TAG                Tag every printed device (repeatable)\n  --flatpack               Print modular devices compacted for transport\n  --database PATH          Managed SQLite database\n  --wait-timeout-secs N    Maximum queue-capacity wait (default: 21600)\n  --poll-seconds N          Queue-capacity poll interval (default: 5)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit the final report as JSON\n  -h, --help                Show this help\n\n\
 The command distributes work by projected finish time, submits one device per\n\
 queue slot, and returns after all requested work is queued. It does not wait\n\
 for the physical devices to finish printing."
@@ -201,6 +205,7 @@ async fn main() -> AnyResult<()> {
     let options = QueueOptions {
         hub: config.hub.clone(),
         tags: config.tags.clone(),
+        flatpack: config.flatpack,
         poll_interval: config.poll_interval,
         wait_timeout: config.wait_timeout,
     };
@@ -218,7 +223,8 @@ fn print_report(config: &Config, report: &QueueReport) -> AnyResult<()> {
         return Ok(());
     }
     let total = report.queued.values().sum::<i64>();
-    println!("Queued {total} device(s) from {}:", config.hub);
+    let output = if report.flatpack { " flatpacked" } else { "" };
+    println!("Queued {total}{output} device(s) from {}:", config.hub);
     for (device_type, quantity) in &report.queued {
         println!("  {quantity:>4}  {device_type}");
     }
@@ -283,7 +289,7 @@ mod tests {
 
     #[test]
     fn repeated_print_arguments_are_retained() {
-        let requests = vec![
+        let requests = [
             PrintRequest::new("autofactory", 6),
             PrintRequest::new("cargo_freighter", 6),
         ];

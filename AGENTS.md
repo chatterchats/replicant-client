@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`replicant-client` is a durable, stateful Rust client for Replicant Space documentation through `2.3.3`, using the checked-in `2.3.1` OpenAPI file as the machine-readable baseline plus explicit rendered-document deltas. The primary entry point is `replicant_client::Client` — it fetches, validates, normalizes, persists (SQLite), publishes, watches, reconciles, and performs game operations without the application assembling a transport client, runtime, state actor, or persistence layer itself.
+`replicant-client` is a durable, stateful Rust client for Replicant Space documentation through `2.3.5`, using the checked-in verified `2.3.3` OpenAPI file as the machine-readable baseline plus explicit rendered-document deltas. The primary entry point is `replicant_client::Client` — it fetches, validates, normalizes, persists (SQLite), publishes, watches, reconciles, and performs game operations without the application assembling a transport client, runtime, state actor, or persistence layer itself.
 
 **Status:** Phase 1 bootstrap stage (see `Cargo.toml` package version `1.0.0`). The package, feature graph, contract corpus, domain model, and managed-client skeleton exist; large parts of the managed client (sync engine, event engine, operations engine) are still stubs. Before starting any new work, read `docs/implementation/rewrite-guide.md` in full — it is the authoritative implementation guide, records every locked product decision, and defines the phase sequence and each phase's definition of done. Do not treat this CLAUDE.md as a substitute for it.
 

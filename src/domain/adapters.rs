@@ -526,6 +526,7 @@ pub fn location_detail(
     });
     let scanned = raw
         .scanned
+        .or_else(|| body.and_then(|body| body.scanned))
         .or_else(|| survey_environment_evidence.then_some(true));
     let surveyed = scanned == Some(true);
     let mut unknown = raw.unknown.clone();
@@ -926,6 +927,22 @@ mod location_tests {
                 .and_then(|planet| planet.unknown.get("future_environment")),
             Some(Value::Object(_))
         ));
+    }
+
+    #[test]
+    fn nested_body_scanned_flag_is_normalized_even_when_false() {
+        let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-2",
+            "location_type": "moon",
+            "moon": {
+                "scanned": false,
+                "atmosphere": "thin"
+            }
+        }))
+        .expect("location should decode");
+        let observation = location_detail(&raw, Realm::Live, ObservationTime::now())
+            .expect("location should normalize");
+        assert_eq!(observation.value.scanned, Some(false));
     }
 
     #[test]

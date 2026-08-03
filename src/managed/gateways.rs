@@ -826,6 +826,62 @@ impl AccountGateway {
     }
 }
 
+/// Options for one Autofactory print command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutofactoryPrintOptions {
+    quantity: i64,
+    controller: Option<String>,
+    oncomplete: Option<raw::JsonObject>,
+    tags: Vec<String>,
+    flatpack: Option<bool>,
+}
+
+impl AutofactoryPrintOptions {
+    /// Creates options for `quantity` copies in the normal assembled state.
+    #[must_use]
+    pub fn new(quantity: i64) -> Self {
+        Self {
+            quantity,
+            controller: None,
+            oncomplete: None,
+            tags: Vec::new(),
+            flatpack: None,
+        }
+    }
+
+    /// Routes printed devices to an AMI controller.
+    #[must_use]
+    pub fn controller(mut self, controller: impl Into<String>) -> Self {
+        self.controller = Some(controller.into());
+        self
+    }
+
+    /// Sets the server-defined command run after each print completes.
+    #[must_use]
+    pub fn oncomplete(mut self, command: raw::JsonObject) -> Self {
+        self.oncomplete = Some(command);
+        self
+    }
+
+    /// Applies tags to every printed device.
+    #[must_use]
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Requests compacted output for a device with the `modular` feature.
+    #[must_use]
+    pub fn flatpacked(mut self) -> Self {
+        self.flatpack = Some(true);
+        self
+    }
+}
+
 /// A durable, local-state handle for a mutable device. It performs no unsafe actions.
 #[derive(Clone, Debug)]
 pub struct DeviceHandle {
@@ -920,19 +976,8 @@ impl DeviceHandle {
         device_type: impl Into<String>,
         quantity: i64,
     ) -> Result<Operation> {
-        if quantity < 1 {
-            return Err(Error::Configuration {
-                message: "autofactory print quantity must be at least one".into(),
-            });
-        }
-        self.command(raw::devices::DeviceCommand::EnqueuePrint {
-            device_type: device_type.into(),
-            quantity: Some(quantity),
-            controller: None,
-            oncomplete: None,
-            tags: None,
-        })
-        .await
+        self.enqueue_print_configured(device_type, AutofactoryPrintOptions::new(quantity))
+            .await
     }
 
     /// Queues `quantity` tagged copies of a device on this autofactory.
@@ -950,12 +995,32 @@ impl DeviceHandle {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        self.enqueue_print_configured(
+            device_type,
+            AutofactoryPrintOptions::new(quantity).tags(tags),
+        )
+        .await
+    }
+
+    /// Queues a print using quantity, tags, controller, follow-up, and
+    /// flatpack options.
+    pub async fn enqueue_print_configured(
+        &self,
+        device_type: impl Into<String>,
+        options: AutofactoryPrintOptions,
+    ) -> Result<Operation> {
+        let AutofactoryPrintOptions {
+            quantity,
+            controller,
+            oncomplete,
+            tags,
+            flatpack,
+        } = options;
         if quantity < 1 {
             return Err(Error::Configuration {
                 message: "autofactory print quantity must be at least one".into(),
             });
         }
-        let tags = tags.into_iter().map(Into::into).collect::<Vec<String>>();
         if let Some(tag) = tags
             .iter()
             .find(|tag| tag.chars().count() > MAX_DEVICE_TAG_CHARACTERS)
@@ -969,9 +1034,10 @@ impl DeviceHandle {
         self.command(raw::devices::DeviceCommand::EnqueuePrint {
             device_type: device_type.into(),
             quantity: Some(quantity),
-            controller: None,
-            oncomplete: None,
-            tags: Some(tags),
+            controller,
+            oncomplete,
+            tags: (!tags.is_empty()).then_some(tags),
+            flatpack,
         })
         .await
     }
@@ -2517,7 +2583,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/devices/FACTORY"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         device
@@ -2547,6 +2613,23 @@ mod tests {
             body["tags"],
             serde_json::json!(["relay-expansion:test", "relay-site:TARGET"])
         );
+
+        device
+            .enqueue_print_configured(
+                "autofactory",
+                AutofactoryPrintOptions::new(2)
+                    .tags(["factory-stock"])
+                    .flatpacked(),
+            )
+            .await
+            .expect("durable flatpack print operation");
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = requests[2].body_json().expect("JSON body");
+        assert_eq!(body["command"], "enqueue_print");
+        assert_eq!(body["device_type"], "autofactory");
+        assert_eq!(body["quantity"], 2);
+        assert_eq!(body["flatpack"], true);
+        assert_eq!(body["tags"], serde_json::json!(["factory-stock"]));
         server.verify().await;
         client.close().await.expect("close");
     }

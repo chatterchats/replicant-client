@@ -1,6 +1,6 @@
 {
-  "$schema_note": "Supported operations documented after the checked-in OpenAPI corpus; empty because the verified 2.3.3 corpus includes all known routes.",
+  "$schema_note": "Supported operations documented after the checked-in 2.3.3 OpenAPI corpus; the 2.3.5 rendered documentation adds fields and behavior but no routes.",
   "base_openapi_version": "2.3.3",
-  "documentation_version": "2.3.3",
+  "documentation_version": "2.3.5",
   "operations": []
 }

@@ -1,7 +1,7 @@
 ---
 title: "Event catalogue"
 source_url: "https://replicant.space/docs/api/events/catalogue/"
-crawled_at: "2026-07-28T00:53:11.103576+00:00"
+crawled_at: "2026-08-03T00:42:36.957318+00:00"
 ---
 
 API · Events
@@ -589,7 +589,8 @@ response payload
 ```
 {
   "device_type": "mining_drone",
-  "print_mode": "vessel"    // "vessel", or "autofactory"
+  "print_mode": "vessel",    // "vessel", or "autofactory"
+  "completes_at": "2026-08-02T14:30:00Z"
 }
 ```
 
@@ -1009,18 +1010,36 @@ response payload
 
 ### *trade.completed*
 
-A trade was fulfilled. Both buyer and seller get an event with their respective *role*.
+A trade was fulfilled. Both buyer and seller get an event with their respective *role*. The envelope *device_code* and *device_type* identify the trade controller (owned by the seller).
 
 Example
 
-response payload
+response buyer payload
 
 ```
 {
   "trade_code": "TRD-007C22",
   "trade_name": "Structural for Volatiles",
-  "role": "buyer",           // "buyer" or "seller"
-  "remaining_stock": 9       // seller side only
+  "role": "buyer",
+  "rewards_received": {
+    "resources": { "structural": 200 },
+    "devices": ["A1B2C3D4"]
+  }
+}
+```
+
+response seller payload
+
+```
+{
+  "trade_code": "TRD-007C22",
+  "trade_name": "Structural for Volatiles",
+  "role": "seller",
+  "remaining_stock": 9,
+  "criteria_received": {
+    "resources": { "conductive": 10 },
+    "devices": []
+  }
 }
 ```
 

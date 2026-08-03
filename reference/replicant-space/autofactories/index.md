@@ -1,7 +1,7 @@
 ---
 title: "Autofactories"
 source_url: "https://replicant.space/docs/autofactories/"
-crawled_at: "2026-07-28T00:53:11.752300+00:00"
+crawled_at: "2026-08-03T00:42:37.612901+00:00"
 ---
 
 Infrastructure
@@ -41,11 +41,12 @@ $ curl -X POST https://api.replicant.space/v1/devices/AF7C2310 \
       "oncomplete": {
         "command": "travel",
         "destination": "LERNA-BELT-1"
-      }
+      },
+      "flatpack": false
     }'
 ```
 
-The `quantity`, `tags`, `controller` and `oncomplete` fields are optional. The `oncomplete` command currently only supports `travel` and `start_mining` - more commands will be supported soon.
+The `quantity`, `tags`, `controller`, `oncomplete` and `flatpack` fields are optional. The `oncomplete` command currently only supports `travel` and `start_mining` - more commands will be supported soon.
 
 response 201 response
 
@@ -100,6 +101,10 @@ $ curl -X POST https://api.replicant.space/v1/devices/AF7C2310 \
       "command": "deactivate"
     }'
 ```
+
+## Flatpack printing
+
+Devices with the *modular* feature can be printed in a compacted state by setting `"flatpack": true` on the enqueue command. The device leaves the factory folded up and ready for transport. Printing time is slightly reduced to account for the simpler assembly.
 
 ## Relocation
 

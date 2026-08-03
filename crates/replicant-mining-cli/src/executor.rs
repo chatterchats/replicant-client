@@ -393,12 +393,8 @@ async fn submit_print_batches(
         }
         let factories =
             factory_workloads(client, &devices, &blueprints, &mission.hub_location).await?;
-        let reassigned = rebalance_pending_print_batches(
-            mission,
-            purpose,
-            &blueprints,
-            &factories,
-        )?;
+        let reassigned =
+            rebalance_pending_print_batches(mission, purpose, &blueprints, &factories)?;
         if !reported_factories {
             info!(
                 purpose = ?purpose,
@@ -536,12 +532,14 @@ fn rebalance_pending_print_batches(
     if pending.is_empty() {
         return Ok(0);
     }
-    let required = pending.iter().fold(QuantityMap::new(), |mut required, index| {
-        *required
-            .entry(mission.print_batches[*index].device_type.clone())
-            .or_default() += 1;
-        required
-    });
+    let required = pending
+        .iter()
+        .fold(QuantityMap::new(), |mut required, index| {
+            *required
+                .entry(mission.print_batches[*index].device_type.clone())
+                .or_default() += 1;
+            required
+        });
     let schedule = schedule_prints(&required, blueprints, factories)?;
     let mut assignments = BTreeMap::<String, VecDeque<(String, f64)>>::new();
     for batch in schedule.batches {
@@ -549,10 +547,7 @@ fn rebalance_pending_print_batches(
             assignments
                 .entry(batch.device_type.clone())
                 .or_default()
-                .push_back((
-                    batch.factory_code.clone(),
-                    batch.projected_finish_seconds,
-                ));
+                .push_back((batch.factory_code.clone(), batch.projected_finish_seconds));
         }
     }
     pending.sort_by(|left, right| {
@@ -589,12 +584,7 @@ fn rebalance_pending_print_batches(
 fn format_factory_workloads(factories: &[FactoryWorkload]) -> String {
     factories
         .iter()
-        .map(|factory| {
-            format!(
-                "{}:{:.0}s",
-                factory.code, factory.remaining_seconds
-            )
-        })
+        .map(|factory| format!("{}:{:.0}s", factory.code, factory.remaining_seconds))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -806,9 +796,8 @@ fn pool_can_complete_site(pool: &BTreeMap<String, Vec<String>>, assets: &SiteAss
         &assets.counts(),
     );
     missing.iter().all(|(device_type, quantity)| {
-        i64::try_from(pool.get(device_type).map_or(0, Vec::len)).is_ok_and(|available| {
-            available >= *quantity
-        })
+        i64::try_from(pool.get(device_type).map_or(0, Vec::len))
+            .is_ok_and(|available| available >= *quantity)
     })
 }
 
@@ -1826,12 +1815,13 @@ mod tests {
 
         assert_eq!(reassigned, 3);
         assert_eq!(mission.print_batches[0].factory_code, "AF1");
-        let pending_counts = mission.print_batches[1..]
-            .iter()
-            .fold(BTreeMap::<&str, usize>::new(), |mut counts, batch| {
+        let pending_counts = mission.print_batches[1..].iter().fold(
+            BTreeMap::<&str, usize>::new(),
+            |mut counts, batch| {
                 *counts.entry(&batch.factory_code).or_default() += 1;
                 counts
-            });
+            },
+        );
         assert_eq!(pending_counts["AF1"], 1);
         assert_eq!(pending_counts["AF2"], 3);
     }

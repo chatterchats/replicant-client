@@ -50,6 +50,8 @@ pub struct LocationSystemMap {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct PlanetaryBody {
+    /// Whether this planet or moon has been scanned.
+    pub scanned: Option<bool>,
     /// Reported atmospheric classification.
     pub atmosphere: Option<String>,
     /// Whether the body is inside the star's habitable zone.
@@ -212,5 +214,22 @@ impl LocationsClient {
         self.client
             .execute_json(Method::POST, &path, true, RequestSafety::Mutating, request)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Location;
+
+    #[test]
+    fn planet_and_moon_scanned_flags_are_retained() {
+        let location: Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-1",
+            "planet": {"scanned": true},
+            "moon": {"scanned": false}
+        }))
+        .unwrap();
+        assert_eq!(location.planet.unwrap().scanned, Some(true));
+        assert_eq!(location.moon.unwrap().scanned, Some(false));
     }
 }

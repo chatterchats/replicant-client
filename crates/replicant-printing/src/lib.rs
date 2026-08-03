@@ -28,11 +28,22 @@ pub struct Blueprint {
     pub device_type: String,
     /// Duration of one print in seconds.
     pub print_time_seconds: f64,
+    /// Open device feature flags supplied by the blueprint catalogue.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 impl PrintTime for Blueprint {
     fn print_time_seconds(&self) -> f64 {
         self.print_time_seconds
+    }
+}
+
+impl Blueprint {
+    /// Whether this device can be printed in a compacted flatpack state.
+    #[must_use]
+    pub fn is_modular(&self) -> bool {
+        self.features.iter().any(|feature| feature == "modular")
     }
 }
 
@@ -149,10 +160,7 @@ pub fn schedule_prints<B: PrintTime>(
             .get(device_type)
             .ok_or_else(|| ScheduleError::MissingBlueprint(device_type.clone()))?;
         for _ in 0..*quantity {
-            units.push((
-                device_type.clone(),
-                blueprint.print_time_seconds().max(0.0),
-            ));
+            units.push((device_type.clone(), blueprint.print_time_seconds().max(0.0)));
         }
     }
     units.sort_by(|left, right| {
@@ -234,6 +242,7 @@ mod tests {
             Blueprint {
                 device_type: "device".into(),
                 print_time_seconds: 100.0,
+                features: Vec::new(),
             },
         )]
         .into_iter()
@@ -264,5 +273,21 @@ mod tests {
     fn rejects_non_positive_quantities() {
         let error = normalize_requests(&[PrintRequest::new("autofactory", 0)]).unwrap_err();
         assert!(matches!(error, ScheduleError::InvalidQuantity { .. }));
+    }
+
+    #[test]
+    fn modular_feature_enables_flatpack_output() {
+        let modular = Blueprint {
+            device_type: "autofactory".into(),
+            print_time_seconds: 1.0,
+            features: vec!["modular".into()],
+        };
+        let ordinary = Blueprint {
+            device_type: "mining_drone".into(),
+            print_time_seconds: 1.0,
+            features: Vec::new(),
+        };
+        assert!(modular.is_modular());
+        assert!(!ordinary.is_modular());
     }
 }

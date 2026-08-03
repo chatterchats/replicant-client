@@ -122,6 +122,113 @@ pub struct AmiSurveyDigestPayload {
     pub extra: JsonObject,
 }
 
+/// Per-resource assignment state in an `ami.mining.digest` report.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct AmiMiningResourceReport {
+    /// Number of mining drones currently assigned to this resource.
+    pub actual: Option<i64>,
+    /// Total resource quantity available across matching sites.
+    pub capacity: Option<i64>,
+    /// Number of mining drones the controller wants assigned.
+    pub desired: Option<i64>,
+    /// Whether this resource is fully depleted.
+    pub exhausted: Option<bool>,
+    /// Future per-resource report fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Directive-specific report carried by an `ami.mining.digest`.
+///
+/// Known resource-allocation fields are typed. New directive shapes, including
+/// the Replicant Space 2.3.5 `gather_salvage` report, remain available through
+/// [`Self::extra`] until their complete schema is documented.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct AmiMiningReport {
+    /// Location currently coordinated by the mining controller.
+    pub location: Option<String>,
+    /// Resource assignment state keyed by resource type.
+    #[serde(default)]
+    pub resources: BTreeMap<String, AmiMiningResourceReport>,
+    /// Directive-specific and future report fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `ami.mining.digest`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct AmiMiningDigestPayload {
+    /// Active controller directive.
+    pub directive: Option<String>,
+    /// Buffered activity summary.
+    pub activity: Option<AmiDigestActivity>,
+    /// Current state of each managed device.
+    #[serde(default)]
+    pub devices: Vec<AmiDigestDevice>,
+    /// Mining progress and directive-specific report data.
+    pub report: Option<AmiMiningReport>,
+    /// Future digest fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `print.started`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct PrintStartedPayload {
+    /// Device type being printed.
+    pub device_type: Option<String>,
+    /// Open print origin, currently `vessel` or `autofactory`.
+    pub print_mode: Option<String>,
+    /// When the print is expected to finish, RFC3339.
+    pub completes_at: Option<String>,
+    /// Future print-start fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Resources and device codes exchanged in a completed trade.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TradeReceivedItems {
+    /// Resource quantities keyed by resource type.
+    #[serde(default)]
+    pub resources: JsonObject,
+    /// Device codes transferred by the trade.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// Future trade-outcome fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `trade.completed` for either participant role.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TradeCompletedPayload {
+    /// Stable trade code.
+    pub trade_code: Option<String>,
+    /// Human-readable trade name.
+    pub trade_name: Option<String>,
+    /// Participant role, currently `buyer` or `seller`.
+    pub role: Option<String>,
+    /// Remaining stock, present for the seller.
+    pub remaining_stock: Option<i64>,
+    /// Rewards transferred to the buyer.
+    pub rewards_received: Option<TradeReceivedItems>,
+    /// Criteria transferred to the seller.
+    pub criteria_received: Option<TradeReceivedItems>,
+    /// Device codes created or transferred by older event variants.
+    #[serde(default)]
+    pub new_device_codes: Vec<String>,
+    /// Future trade-completion fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
 /// Typed payload for `blueprint.unlocked`.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -204,10 +311,28 @@ impl GameEvent {
         self.decode_payload("ami.survey.digest")
     }
 
+    /// Decodes this event as an `ami.mining.digest`, returning `None` for a
+    /// different event name.
+    pub fn ami_mining_digest(&self) -> Result<Option<AmiMiningDigestPayload>, Error> {
+        self.decode_payload("ami.mining.digest")
+    }
+
     /// Decodes this event as `blueprint.unlocked`, returning `None` for a
     /// different event name.
     pub fn blueprint_unlocked(&self) -> Result<Option<BlueprintUnlockedPayload>, Error> {
         self.decode_payload("blueprint.unlocked")
+    }
+
+    /// Decodes this event as `print.started`, returning `None` for a
+    /// different event name.
+    pub fn print_started(&self) -> Result<Option<PrintStartedPayload>, Error> {
+        self.decode_payload("print.started")
+    }
+
+    /// Decodes this event as `trade.completed`, returning `None` for a
+    /// different event name.
+    pub fn trade_completed(&self) -> Result<Option<TradeCompletedPayload>, Error> {
+        self.decode_payload("trade.completed")
     }
 }
 
@@ -324,6 +449,23 @@ impl Client {
 mod tests {
     use super::GameEvent;
 
+    fn event(name: &str, payload: serde_json::Value) -> GameEvent {
+        serde_json::from_value(serde_json::json!({
+            "id": "1-0",
+            "version": 2,
+            "category": "test",
+            "event": name,
+            "replicant_code": null,
+            "device_code": null,
+            "device_type": null,
+            "star": null,
+            "location": null,
+            "payload": payload,
+            "created_at": "2026-08-02T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn unknown_event_and_payload_fields_round_trip_through_json_value() {
         let event: GameEvent = serde_json::from_value(serde_json::json!({
@@ -337,5 +479,89 @@ mod tests {
         assert_eq!(event.event, "future.arrived");
         assert_eq!(event.payload["new_shape"][1], 2);
         assert_eq!(event.extra["future_envelope"], true);
+    }
+
+    #[test]
+    fn print_started_exposes_completes_at() {
+        let event = event(
+            "print.started",
+            serde_json::json!({
+                "device_type": "autofactory",
+                "print_mode": "autofactory",
+                "completes_at": "2026-08-02T00:05:00Z"
+            }),
+        );
+        let payload = event.print_started().unwrap().unwrap();
+        assert_eq!(payload.device_type.as_deref(), Some("autofactory"));
+        assert_eq!(
+            payload.completes_at.as_deref(),
+            Some("2026-08-02T00:05:00Z")
+        );
+    }
+
+    #[test]
+    fn trade_completed_decodes_role_specific_outcomes() {
+        let buyer = event(
+            "trade.completed",
+            serde_json::json!({
+                "trade_code": "T1",
+                "role": "buyer",
+                "rewards_received": {
+                    "resources": {"conductive": 12},
+                    "devices": ["D1"]
+                }
+            }),
+        )
+        .trade_completed()
+        .unwrap()
+        .unwrap();
+        assert_eq!(buyer.role.as_deref(), Some("buyer"));
+        assert_eq!(
+            buyer.rewards_received.as_ref().unwrap().devices,
+            ["D1".to_owned()]
+        );
+
+        let seller = event(
+            "trade.completed",
+            serde_json::json!({
+                "trade_code": "T1",
+                "role": "seller",
+                "remaining_stock": 3,
+                "criteria_received": {
+                    "resources": {"carbon": 25},
+                    "devices": []
+                }
+            }),
+        )
+        .trade_completed()
+        .unwrap()
+        .unwrap();
+        assert_eq!(seller.role.as_deref(), Some("seller"));
+        assert_eq!(seller.remaining_stock, Some(3));
+        assert_eq!(
+            seller.criteria_received.as_ref().unwrap().resources["carbon"],
+            25
+        );
+    }
+
+    #[test]
+    fn mining_digest_types_known_resources_and_preserves_new_report_shapes() {
+        let event = event(
+            "ami.mining.digest",
+            serde_json::json!({
+                "directive": "gather_salvage",
+                "report": {
+                    "location": "SCEPTURUM-BELT-1",
+                    "resources": {
+                        "conductive": {"actual": 2, "desired": 4, "exhausted": false}
+                    },
+                    "salvage": {"remaining": 9}
+                }
+            }),
+        );
+        let payload = event.ami_mining_digest().unwrap().unwrap();
+        let report = payload.report.unwrap();
+        assert_eq!(report.resources["conductive"].desired, Some(4));
+        assert_eq!(report.extra["salvage"]["remaining"], 9);
     }
 }

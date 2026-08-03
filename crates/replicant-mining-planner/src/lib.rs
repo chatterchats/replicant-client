@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-pub use replicant_printing::{FactoryWorkload, PrintBatch, PrintSchedule, schedule_prints};
 use replicant_printing::PrintTime;
+pub use replicant_printing::{FactoryWorkload, PrintBatch, PrintSchedule, schedule_prints};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
