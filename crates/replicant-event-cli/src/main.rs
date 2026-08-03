@@ -41,7 +41,6 @@ enum Command {
     List,
     Plan,
     Run,
-    Resume,
     Status,
 }
 
@@ -55,7 +54,6 @@ struct Config {
     database: PathBuf,
     plan_path: PathBuf,
     replace_plan: bool,
-    execute: bool,
     wait_timeout: Duration,
     verbose: bool,
     log_file: Option<PathBuf>,
@@ -75,7 +73,6 @@ impl Config {
         let mut plan_path =
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
         let mut replace_plan = false;
-        let mut execute = env_flag("RS_EVENT_EXECUTE");
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_EVENT_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -100,10 +97,6 @@ impl Config {
                 "run" => {
                     arguments.next();
                     Command::Run
-                }
-                "resume" => {
-                    arguments.next();
-                    Command::Resume
                 }
                 "status" => {
                     arguments.next();
@@ -134,7 +127,6 @@ impl Config {
                     plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
                 }
                 "--replace-plan" => replace_plan = true,
-                "--execute" => execute = true,
                 "--wait-timeout-secs" => {
                     wait_timeout = Duration::from_secs(
                         required_argument(&mut arguments, "--wait-timeout-secs")?
@@ -186,7 +178,6 @@ impl Config {
             database,
             plan_path,
             replace_plan,
-            execute,
             wait_timeout,
             verbose,
             log_file,
@@ -214,10 +205,10 @@ fn env_flag(name: &str) -> bool {
 fn print_help() {
     println!(
         "Replicant event logistics\n\n\
-Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events run --execute [OPTIONS]\n  replicant-events resume --execute [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --execute                 Permit gameplay mutations for run/resume\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
-Planning is the default. The run and resume commands reconcile the durable\n\
-mission plan against live state before continuing."
+Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events run [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+Planning performs no gameplay mutations. Run always reconciles and continues\n\
+the persisted mission; there is no separate resume command or --execute flag."
     );
 }
 
@@ -277,6 +268,64 @@ struct EventMissionPlan {
     execution: executor::ExecutionState,
 }
 
+struct MissionLock {
+    path: PathBuf,
+}
+
+impl MissionLock {
+    fn acquire(mission_path: &Path) -> AnyResult<Self> {
+        let lock_path = mission_path.with_extension("lock");
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        for attempt in 0..2 {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path: lock_path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    let owner = fs::read_to_string(&lock_path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u32>().ok());
+                    let owner_is_running =
+                        owner.is_some_and(|pid| PathBuf::from(format!("/proc/{pid}")).exists());
+                    if owner_is_running {
+                        return Err(app_error(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "another event executor holds {} (pid {})",
+                                lock_path.display(),
+                                owner.unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    fs::remove_file(&lock_path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!("could not acquire {}", lock_path.display()),
+        ))
+    }
+}
+
+impl Drop for MissionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 #[tokio::main]
 async fn main() -> AnyResult<()> {
     let config = Config::from_args_and_env()?;
@@ -284,10 +333,24 @@ async fn main() -> AnyResult<()> {
     if config.command == Command::Status {
         return show_status(&config);
     }
+    if config.command == Command::Run && !config.plan_path.exists() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "no event mission exists at {}; create one with `replicant-events plan ...`",
+                config.plan_path.display()
+            ),
+        ));
+    }
 
     let token = env::var("RS_API_TOKEN")
         .map(SecretString::from)
         .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
+    let _mission_lock = if config.command == Command::Run {
+        Some(MissionLock::acquire(&config.plan_path)?)
+    } else {
+        None
+    };
     let client = Client::builder()
         .authentication_token(token)
         .sqlite(&config.database)
@@ -354,13 +417,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     let sync = client.sync().full().await?;
     info!(readiness = ?sync.readiness, "full managed synchronization completed");
 
-    if matches!(config.command, Command::Run | Command::Resume) {
-        if !config.plan_path.exists() {
-            return Err(app_error(
-                io::ErrorKind::NotFound,
-                format!("no mission plan exists at {}", config.plan_path.display()),
-            ));
-        }
+    if config.command == Command::Run {
         let mut plan = load_plan(&config.plan_path)?;
         executor::execute_saved_plan(client, config, &mut plan).await?;
         return Ok(());
@@ -444,7 +501,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
             role_tag("cargo"),
             role_tag("carrier")
         );
-        println!("Execute with: replicant-events run --execute");
+        println!("Execute with: replicant-events run");
     }
     Ok(())
 }

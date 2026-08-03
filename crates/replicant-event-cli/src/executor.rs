@@ -76,12 +76,6 @@ pub(crate) async fn execute_saved_plan(
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
-    if !config.execute {
-        return Err(app_error(
-            io::ErrorKind::PermissionDenied,
-            "event mission execution requires --execute",
-        ));
-    }
     if plan.phase.is_terminal() {
         println!(
             "Mission {} is already terminal ({:?}).",

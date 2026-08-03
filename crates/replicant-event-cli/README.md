@@ -11,25 +11,24 @@ The binary is an auxiliary repository tool and is not published.
 ```sh
 export RS_API_TOKEN='your-token'
 
-cargo run -p replicant-event-cli -- list
-cargo run -p replicant-event-cli -- plan WIXUKHHU-4-EVT-002
-cargo run -p replicant-event-cli -- run --execute
-cargo run -p replicant-event-cli -- status
+cargo run --quiet -p replicant-event-cli -- list
+cargo run --quiet -p replicant-event-cli -- plan WIXUKHHU-4-EVT-002
+cargo run --quiet -p replicant-event-cli -- run
+cargo run --quiet -p replicant-event-cli -- status
 ```
 
 Running without a subcommand starts the interactive flow. `list` and `plan`
-perform reads only. `run` and `resume` reject gameplay mutations unless
-`--execute` is present.
+perform no gameplay mutations. `run` loads the persisted mission, reconciles
+durable operations and live state, and continues the first incomplete phase.
 
 ## Workflow
 
 1. `list` shows available civilisation events.
 2. `plan [EVENT]` selects a criterion, inventories progress and destination
    stock, plans manufacturing and transport, and writes `event-mission.json`.
-3. `run --execute` starts the first incomplete phase.
-4. `resume --execute` reconciles durable operations and continues the saved
-   mission after interruption.
-5. `status` reads the mission file without connecting to the API.
+3. `run` reconciles durable operations and continues the first incomplete
+   phase. Run the same command again after an interruption or transient error.
+4. `status` reads the mission file without connecting to the API.
 
 The mission owns claimed devices and execution progress. A pre-existing active
 plan is preserved unless `--replace-plan` is supplied.
@@ -45,14 +44,13 @@ plan is preserved unless `--replace-plan` is supplied.
 | `--database PATH` | Managed SQLite database. |
 | `--plan-file PATH` | Mission JSON; defaults to `event-mission.json`. |
 | `--replace-plan` | Replace an existing active plan. |
-| `--execute` | Permit mutations for `run` or `resume`. |
 | `--wait-timeout-secs N` | Per-phase timeout; defaults to 21600. |
 | `--verbose` / `--log-file PATH` | Enable terminal or file tracing. |
 | `--json` | Emit machine-readable output. |
 
 Environment equivalents include `RS_EVENT_REPLICANT`, `RS_EVENT_HOME`,
-`REPLICANT_DB`, `RS_EVENT_PLAN`, `RS_EVENT_EXECUTE`,
-`RS_EVENT_WAIT_TIMEOUT_SECS`, `RS_EVENT_VERBOSE`, and `RS_EVENT_LOG_FILE`.
+`REPLICANT_DB`, `RS_EVENT_PLAN`, `RS_EVENT_WAIT_TIMEOUT_SECS`,
+`RS_EVENT_VERBOSE`, and `RS_EVENT_LOG_FILE`.
 Command-line values take precedence.
 
 ## Safety and recovery
@@ -63,7 +61,9 @@ records submission outcomes. Keep both files together when moving or backing
 up a mission, and do not edit them while the command is running.
 
 An ambiguous operation is reconciled from later evidence instead of being
-blindly resubmitted. Re-run `resume --execute` after fixing transient failures.
+blindly resubmitted. Re-run `run` after fixing transient failures. Only one
+executor may use a mission file at a time; `run` owns a sibling `.lock` file
+for the process lifetime and recovers a stale lock after an interrupted process.
 
 ## Verify
 

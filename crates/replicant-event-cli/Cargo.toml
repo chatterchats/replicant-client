@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 publish = false
-description = "Interactive civilisation-event logistics planner for Replicant Space."
+description = "Restart-safe civilisation-event logistics automation for Replicant Space."
 license = "MIT"
 
 [[bin]]
