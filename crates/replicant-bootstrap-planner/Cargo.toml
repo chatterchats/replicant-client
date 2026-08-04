@@ -1,0 +1,22 @@
+[package]
+name = "replicant-bootstrap-planner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+description = "Pure planning primitives for autonomous regional bootstraps in Replicant Space."
+license = "MIT"
+
+[dependencies]
+replicant-mining-planner = { version = "0.1.0", path = "../replicant-mining-planner" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_imports = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = 0 }
+suspicious = { level = "deny", priority = 0 }

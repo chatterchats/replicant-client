@@ -1159,6 +1159,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "replicant-bootstrap-cli"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "replicant-bootstrap-planner",
+ "replicant-client",
+ "replicant-mining-cli",
+ "replicant-mining-planner",
+ "replicant-printing",
+ "replicant-relay-cli",
+ "replicant-survey-cli",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "replicant-bootstrap-planner"
+version = "0.1.0"
+dependencies = [
+ "replicant-mining-planner",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "replicant-client"
 version = "1.0.0"
 dependencies = [
@@ -1188,6 +1217,7 @@ dependencies = [
  "futures",
  "replicant-client",
  "replicant-event-planner",
+ "replicant-printing",
  "serde",
  "serde_json",
  "tokio",
