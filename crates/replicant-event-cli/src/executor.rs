@@ -9,6 +9,7 @@ use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, 
 use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost, role_tag,
 };
+use replicant_printing::managed::factory_queue_slots;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::time::{Instant, sleep, timeout};
@@ -71,6 +72,50 @@ pub(crate) struct PayloadDevice {
     pub(crate) delivered: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PrintKickoff {
+    pub(crate) submitted: usize,
+    pub(crate) pending: usize,
+}
+
+pub(crate) async fn kickoff_printing(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    submission_limit: usize,
+) -> AnyResult<PrintKickoff> {
+    if plan.phase.is_terminal() || phase_rank(plan.phase) > phase_rank(MissionPhase::Manufacturing)
+    {
+        return Ok(PrintKickoff::default());
+    }
+    initialize_execution(plan);
+    split_pending_print_batches(plan);
+    save_plan(&config.plan_path, plan)?;
+    if plan.execution.print_batches.is_empty() {
+        return Ok(PrintKickoff::default());
+    }
+
+    set_phase(config, plan, MissionPhase::Manufacturing)?;
+    reconcile_print_batches(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
+    if !plan
+        .execution
+        .print_batches
+        .iter()
+        .any(|batch| batch.submitted)
+    {
+        ensure_home_resources(client, config, plan).await?;
+    }
+    let submitted = submit_available_print_batches(client, config, plan, submission_limit).await?;
+    let pending = plan
+        .execution
+        .print_batches
+        .iter()
+        .filter(|batch| !batch.submitted)
+        .count();
+    Ok(PrintKickoff { submitted, pending })
+}
+
 pub(crate) async fn execute_saved_plan(
     client: &Client,
     config: &Config,
@@ -85,6 +130,7 @@ pub(crate) async fn execute_saved_plan(
     }
 
     initialize_execution(plan);
+    split_pending_print_batches(plan);
     save_plan(&config.plan_path, plan)?;
 
     if phase_rank(plan.phase) <= phase_rank(MissionPhase::Manufacturing) {
@@ -117,6 +163,7 @@ pub(crate) async fn execute_saved_plan(
 
     if phase_rank(plan.phase) <= phase_rank(MissionPhase::Outbound) {
         set_phase(config, plan, MissionPhase::Outbound)?;
+        dispatch_replicant_outbound(client, plan).await?;
         deliver_event_resources(client, config, plan).await?;
     }
 
@@ -245,6 +292,37 @@ fn initialize_execution(plan: &mut EventMissionPlan) {
             .collect();
     }
     plan.version = plan.version.max(2);
+}
+
+fn split_pending_print_batches(plan: &mut EventMissionPlan) -> usize {
+    let batches = std::mem::take(&mut plan.execution.print_batches);
+    let mut normalized = Vec::with_capacity(batches.len());
+    let mut split = 0usize;
+    for batch in batches {
+        let can_split = batch.quantity > 1
+            && !batch.submission_started
+            && !batch.submitted
+            && batch.operation_id.is_none()
+            && batch.produced_codes.is_empty();
+        if !can_split {
+            normalized.push(batch);
+            continue;
+        }
+        split += 1;
+        normalized.extend((0..batch.quantity).map(|unit_index| {
+            let mut unit = batch.clone();
+            unit.quantity = 1;
+            if unit_index > 0 {
+                unit.batch_tag = format!(
+                    "evt-b:{:016x}",
+                    stable_hash(&format!("{}:{unit_index}", batch.batch_tag))
+                );
+            }
+            unit
+        }));
+    }
+    plan.execution.print_batches = normalized;
+    split
 }
 
 fn role_for_device_type(device_type: &str) -> &'static str {
@@ -642,67 +720,16 @@ async fn submit_print_batches(
     let deadline = Instant::now() + config.wait_timeout;
 
     loop {
-        let pending = plan
+        let submitted = submit_available_print_batches(client, config, plan, usize::MAX).await?;
+        if plan
             .execution
             .print_batches
             .iter()
-            .enumerate()
-            .filter_map(|(index, batch)| (!batch.submitted).then_some(index))
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
+            .all(|batch| batch.submitted)
+        {
             return Ok(());
         }
-
-        let factory_codes = pending
-            .iter()
-            .map(|index| plan.execution.print_batches[*index].factory_code.clone())
-            .collect::<BTreeSet<_>>();
-        let mut queue_slots = BTreeMap::new();
-        for factory_code in factory_codes {
-            queue_slots.insert(
-                factory_code.clone(),
-                factory_queue_slots(client, &factory_code).await?,
-            );
-        }
-
-        let mut submitted_any = false;
-        for index in pending {
-            let factory_code = plan.execution.print_batches[index].factory_code.clone();
-            let slots = queue_slots.get(&factory_code).copied().unwrap_or(0);
-            if slots == 0 {
-                continue;
-            }
-            {
-                let batch = &mut plan.execution.print_batches[index];
-                batch.submission_started = true;
-            }
-            save_plan(&config.plan_path, plan)?;
-
-            let batch = plan.execution.print_batches[index].clone();
-            let factory = client.devices().get(&batch.factory_code).await?;
-            let operation = factory
-                .enqueue_print_with_tags(
-                    batch.device_type.clone(),
-                    batch.quantity,
-                    [
-                        plan.mission_tag.clone(),
-                        role_tag(&batch.role),
-                        batch.batch_tag.clone(),
-                    ],
-                )
-                .await?;
-            {
-                let current = &mut plan.execution.print_batches[index];
-                current.operation_id = Some(operation.id().as_str().to_owned());
-                current.submitted = true;
-            }
-            save_plan(&config.plan_path, plan)?;
-            ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
-            queue_slots.insert(factory_code, slots - 1);
-            submitted_any = true;
-        }
-
-        if submitted_any {
+        if submitted > 0 {
             reconcile_print_batches(client, plan).await?;
             save_plan(&config.plan_path, plan)?;
             continue;
@@ -724,10 +751,80 @@ async fn submit_print_batches(
     }
 }
 
-async fn factory_queue_slots(client: &Client, factory_code: &str) -> AnyResult<usize> {
-    let detail = client.raw().devices().get(factory_code).await?.value;
-    let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1))?;
-    Ok(queue_size.saturating_sub(detail.print_queue.len()))
+async fn submit_available_print_batches(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    submission_limit: usize,
+) -> AnyResult<usize> {
+    reconcile_print_batches(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
+    let pending = plan
+        .execution
+        .print_batches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, batch)| (!batch.submitted).then_some(index))
+        .collect::<Vec<_>>();
+    if pending.is_empty() || submission_limit == 0 {
+        return Ok(0);
+    }
+
+    let factory_codes = pending
+        .iter()
+        .map(|index| plan.execution.print_batches[*index].factory_code.clone())
+        .collect::<BTreeSet<_>>();
+    let mut queue_slots = BTreeMap::new();
+    for factory_code in factory_codes {
+        queue_slots.insert(
+            factory_code.clone(),
+            factory_queue_slots(client, &factory_code).await?,
+        );
+    }
+
+    let mut submitted = 0usize;
+    for index in pending {
+        if submitted >= submission_limit {
+            break;
+        }
+        let factory_code = plan.execution.print_batches[index].factory_code.clone();
+        let slots = queue_slots.get(&factory_code).copied().unwrap_or(0);
+        if slots == 0 {
+            continue;
+        }
+        let batch = plan.execution.print_batches[index].clone();
+        if batch.quantity != 1 {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pending print batch {} has queue-unsafe quantity {}; recreate the plan or clear its unsubmitted execution batches",
+                    batch.batch_tag, batch.quantity
+                ),
+            ));
+        }
+        plan.execution.print_batches[index].submission_started = true;
+        save_plan(&config.plan_path, plan)?;
+
+        let factory = client.devices().get(&batch.factory_code).await?;
+        let operation = factory
+            .enqueue_print_with_tags(
+                batch.device_type.clone(),
+                1,
+                [
+                    plan.mission_tag.clone(),
+                    role_tag(&batch.role),
+                    batch.batch_tag.clone(),
+                ],
+            )
+            .await?;
+        plan.execution.print_batches[index].operation_id = Some(operation.id().as_str().to_owned());
+        plan.execution.print_batches[index].submitted = true;
+        save_plan(&config.plan_path, plan)?;
+        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        queue_slots.insert(factory_code, slots - 1);
+        submitted += 1;
+    }
+    Ok(submitted)
 }
 
 async fn wait_for_print_outputs(
@@ -1355,6 +1452,17 @@ async fn deliver_event_resources(
             sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+async fn dispatch_replicant_outbound(client: &Client, plan: &EventMissionPlan) -> AnyResult<()> {
+    info!(
+        mission_id = %plan.mission_id,
+        replicant = %plan.selected_replicant,
+        destination = %plan.event.location,
+        "dispatching replicant alongside outbound event logistics"
+    );
+    start_replicant_travel_to(client, &plan.selected_replicant, &plan.event.location).await?;
+    Ok(())
 }
 
 async fn stage_event_devices(

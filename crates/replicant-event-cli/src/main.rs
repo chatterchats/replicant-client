@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+mod campaign;
 mod executor;
 
 const PLAN_VERSION: u32 = 2;
@@ -44,7 +45,7 @@ enum Command {
     Status,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Config {
     command: Command,
     event: Option<String>,
@@ -54,6 +55,7 @@ struct Config {
     database: PathBuf,
     plan_path: PathBuf,
     replace_plan: bool,
+    all_events: bool,
     wait_timeout: Duration,
     verbose: bool,
     log_file: Option<PathBuf>,
@@ -73,6 +75,7 @@ impl Config {
         let mut plan_path =
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
         let mut replace_plan = false;
+        let mut all_events = false;
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_EVENT_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -127,6 +130,7 @@ impl Config {
                     plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
                 }
                 "--replace-plan" => replace_plan = true,
+                "--all" => all_events = true,
                 "--wait-timeout-secs" => {
                     wait_timeout = Duration::from_secs(
                         required_argument(&mut arguments, "--wait-timeout-secs")?
@@ -169,6 +173,19 @@ impl Config {
             }
         }
 
+        if all_events && command != Command::Plan {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--all belongs on the plan command",
+            ));
+        }
+        if all_events && (event.is_some() || criterion.is_some()) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--all cannot be combined with --event, a positional event, or --criterion",
+            ));
+        }
+
         Ok(Self {
             command,
             event,
@@ -178,6 +195,7 @@ impl Config {
             database,
             plan_path,
             replace_plan,
+            all_events,
             wait_timeout,
             verbose,
             log_file,
@@ -205,10 +223,12 @@ fn env_flag(name: &str) -> bool {
 fn print_help() {
     println!(
         "Replicant event logistics\n\n\
-Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events run [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission plan (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events plan --all [OPTIONS]\n  replicant-events run [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
 Planning performs no gameplay mutations. Run always reconciles and continues\n\
-the persisted mission; there is no separate resume command or --execute flag."
+the persisted mission or all-events campaign; there is no separate resume\n\
+command or --execute flag. Campaigns start print queues before completing\n\
+material-only events while manufacturing continues."
     );
 }
 
@@ -418,6 +438,11 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     info!(readiness = ?sync.readiness, "full managed synchronization completed");
 
     if config.command == Command::Run {
+        if campaign::is_campaign_file(&config.plan_path)? {
+            let mut plan = campaign::load_campaign(&config.plan_path)?;
+            campaign::execute_campaign(client, config, &mut plan).await?;
+            return Ok(());
+        }
         let mut plan = load_plan(&config.plan_path)?;
         executor::execute_saved_plan(client, config, &mut plan).await?;
         return Ok(());
@@ -443,12 +468,30 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         return Ok(());
     }
 
+    if config.all_events {
+        let definitions = events
+            .iter()
+            .map(normalize_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        campaign::create_campaign(client, config, definitions, &earned).await?;
+        return Ok(());
+    }
+
     let selected_event = select_event(&events, config.event.as_deref(), config.command, &earned)?;
     let event = normalize_event(selected_event)?;
     let replicant = select_replicant(client, config.replicant.as_deref(), config.command).await?;
     let replicant_code = replicant.key.id.as_str().to_owned();
 
     if config.plan_path.exists() && !config.replace_plan {
+        if campaign::is_campaign_file(&config.plan_path)? {
+            return Err(app_error(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "an all-events campaign already exists at {}; use run, status, or plan --replace-plan",
+                    config.plan_path.display()
+                ),
+            ));
+        }
         let existing = load_plan(&config.plan_path)?;
         if !existing.phase.is_terminal() {
             return Err(app_error(
@@ -1246,6 +1289,10 @@ fn show_status(config: &Config) -> AnyResult<()> {
     if !config.plan_path.exists() {
         println!("No mission plan exists at {}.", config.plan_path.display());
         return Ok(());
+    }
+    if campaign::is_campaign_file(&config.plan_path)? {
+        let campaign = campaign::load_campaign(&config.plan_path)?;
+        return campaign::show_campaign_status(config, &campaign);
     }
     let plan = load_plan(&config.plan_path)?;
     if config.json {

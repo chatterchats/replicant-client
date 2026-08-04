@@ -21,6 +21,17 @@ Running without a subcommand starts the interactive flow. `list` and `plan`
 perform no gameplay mutations. `run` loads the persisted mission, reconciles
 durable operations and live state, and continues the first incomplete phase.
 
+To plan and work through every active discovered event:
+
+```sh
+cargo run --quiet -p replicant-event-cli -- plan --all
+cargo run --quiet -p replicant-event-cli -- run
+```
+
+An all-events campaign automatically selects the feasible completion option
+with the most planner recommendation badges. Ties prefer fewer prints, a
+shorter print schedule, fewer trips, and finally the stable criterion name.
+
 ## Workflow
 
 1. `list` shows available civilisation events.
@@ -29,6 +40,18 @@ durable operations and live state, and continues the first incomplete phase.
 3. `run` reconciles durable operations and continues the first incomplete
    phase. Run the same command again after an interruption or transient error.
 4. `status` reads the mission file without connecting to the API.
+
+For an all-events campaign, planning reserves home resources and consumable
+device stock across the entire campaign. Execution fills available
+Autofactory slots round-robin, then completes events requiring no printed
+devices while manufacturing continues. Device-dependent events follow in
+projected print-ready order. While a material-only event is in flight, a
+background feeder continues filling newly opened Autofactory slots. Travel and
+event resolution remain serialized so missions do not fight over the selected
+replicant or reusable transports. Within each mission, the replicant departs as
+soon as the outbound phase begins, in parallel with Cargo Freighter and Surge
+Carrier delivery work; resolution waits for arrival rather than starting a
+second outbound leg after staging.
 
 The mission owns claimed devices and execution progress. A pre-existing active
 plan is preserved unless `--replace-plan` is supplied.
@@ -39,6 +62,7 @@ plan is preserved unless `--replace-plan` is supplied.
 | --- | --- |
 | `--event DESIGNATION` | Event to plan. |
 | `--criterion NAME` | Completion option to select. |
+| `--all` | Plan every active discovered event and choose criteria automatically. |
 | `--replicant NAME_OR_CODE` | Acting replicant; defaults to `Chats-1`. |
 | `--home LOCATION` | Manufacturing hub; defaults to `SCEPTURUM-BELT-1`. |
 | `--database PATH` | Managed SQLite database. |
@@ -59,6 +83,12 @@ Every mutation goes through the managed client's durable operation journal.
 The mission file records higher-level phase progress; the SQLite database
 records submission outcomes. Keep both files together when moving or backing
 up a mission, and do not edit them while the command is running.
+
+An all-events campaign also creates a sibling campaign directory containing
+one durable mission JSON per event. Keep that directory with the main campaign
+file. Events that cannot yet be funded remain listed as blocked; after the
+currently feasible events finish, `run` replans those events against newly
+returned rewards and live inventory.
 
 An ambiguous operation is reconciled from later evidence instead of being
 blindly resubmitted. Re-run `run` after fixing transient failures. Only one
