@@ -187,7 +187,13 @@ pub async fn discover_factories<B: PrintTime>(
     let mut factory_codes = Vec::new();
     for handle in handles {
         let snapshot = handle.snapshot().await?;
-        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
+        if device_type(&snapshot) == Some(AUTOFACTORY)
+            && device_location(&snapshot) == Some(hub)
+            && snapshot
+                .available_commands
+                .iter()
+                .any(|command| command.as_str() == "enqueue_print")
+        {
             factory_codes.push(handle.id().as_str().to_owned());
         }
     }

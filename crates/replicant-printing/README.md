@@ -74,6 +74,10 @@ wait timeout. `QueueReport` records accepted quantities by factory and the
 durable operation IDs. Queueing returns after all work is accepted; it does not
 wait for physical printing to finish.
 
+Factory discovery requires the live `enqueue_print` command, so flatpacked or
+inactive Autofactory outputs at the same hub are not mistaken for usable
+printers.
+
 ## Errors and guarantees
 
 `ScheduleError` covers pure input and capacity problems. `PrintingError` adds
