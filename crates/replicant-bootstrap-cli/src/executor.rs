@@ -643,13 +643,25 @@ async fn dispatch_to_landing(client: &Client, config: &Config, mission: &mut Boo
     set_phase(config, mission, MissionPhase::Outbound).await?;
     let devices = mission.carrier_loads.iter().map(|load| load.carrier.clone())
         .chain(mission.assets.get(CARGO_FREIGHTER).into_iter().flatten().cloned()).collect::<Vec<_>>();
-    info!(devices=devices.len(), replicants=2, destination=%mission.landing_entry, "dispatching the complete ark concurrently");
-    let (device_starts, operator_start, explorer_start) = tokio::join!(
-        async { finish_all(join_all(devices.iter().map(|code| start_device_travel(client, code, &mission.landing_entry))).await) },
+    let departures = devices.iter().map(|code| {
+        (code.clone(), mission.landing_entry.clone())
+    }).collect::<Vec<_>>();
+    ensure_operator_in_comms_for_departures(
+        client,
+        &mission.operator.code,
+        &departures,
+        config.wait_timeout,
+    ).await?;
+    info!(devices=devices.len(), destination=%mission.landing_entry,
+        "submitting complete ark travel before the controlling replicant departs");
+    finish_all(join_all(devices.iter().map(|code| {
+        start_device_travel(client, code, &mission.landing_entry)
+    })).await)?;
+    let (operator_start, explorer_start) = tokio::join!(
         start_replicant_travel(client, &mission.operator.code, &mission.landing_entry),
         start_replicant_travel(client, &mission.explorer.code, &mission.landing_entry),
     );
-    device_starts?; operator_start?; explorer_start?;
+    operator_start?; explorer_start?;
     let (device_waits, operator_wait, explorer_wait) = tokio::join!(
         async { finish_all(join_all(devices.iter().map(|code| wait_device_at(client, code, &mission.landing_entry, config.wait_timeout))).await) },
         wait_replicant_at(client, &mission.operator.code, &mission.landing_entry, config.wait_timeout),
@@ -1259,14 +1271,29 @@ async fn establish_capital(client: &Client, config: &Config, mission: &mut Boots
     let other_carriers = mission.carrier_loads.iter().filter(|load| load.carrier != infrastructure_carrier)
         .map(|load| load.carrier.clone()).collect::<Vec<_>>();
     let freighters = mission.assets.get(CARGO_FREIGHTER).cloned().unwrap_or_default();
-    let (infra_start, carrier_starts, freighter_starts, operator_start, explorer_start) = tokio::join!(
+    let departures = std::iter::once((infrastructure_carrier.clone(), capital_entry.clone()))
+        .chain(other_carriers.iter().cloned().map(|code| (code, capital_belt.clone())))
+        .chain(freighters.iter().cloned().map(|code| (code, capital_belt.clone())))
+        .collect::<Vec<_>>();
+    ensure_operator_in_comms_for_departures(
+        client,
+        &mission.operator.code,
+        &departures,
+        config.wait_timeout,
+    ).await?;
+    info!(devices=departures.len(), capital=%capital_belt,
+        "submitting capital-bound ark travel before the controlling replicant departs");
+    let (infra_start, carrier_starts, freighter_starts) = tokio::join!(
         start_device_travel(client, &infrastructure_carrier, &capital_entry),
         async { finish_all(join_all(other_carriers.iter().map(|code| start_device_travel(client, code, &capital_belt))).await) },
         async { finish_all(join_all(freighters.iter().map(|code| start_device_travel(client, code, &capital_belt))).await) },
+    );
+    infra_start?; carrier_starts?; freighter_starts?;
+    let (operator_start, explorer_start) = tokio::join!(
         start_replicant_travel(client, &mission.operator.code, &capital_belt),
         start_replicant_travel(client, &mission.explorer.code, &capital_belt),
     );
-    infra_start?; carrier_starts?; freighter_starts?; operator_start?; explorer_start?;
+    operator_start?; explorer_start?;
     let (infra_wait, carriers_wait, freighters_wait, operator_wait, explorer_wait) = tokio::join!(
         wait_device_at(client, &infrastructure_carrier, &capital_entry, config.wait_timeout),
         async { finish_all(join_all(other_carriers.iter().map(|code| wait_device_at(client, code, &capital_belt, config.wait_timeout))).await) },
@@ -1489,6 +1516,67 @@ fn attached_codes(device: &raw::devices::DeviceStatus) -> BTreeSet<String> {
 
 fn reference_code(value: &Map<String, Value>) -> Option<String> {
     ["device_code", "code", "device"].into_iter().find_map(|key| value.get(key).and_then(Value::as_str)).map(str::to_owned)
+}
+
+async fn ensure_operator_in_comms_for_departures(
+    client: &Client,
+    operator: &str,
+    departures: &[(String, String)],
+    timeout: Duration,
+) -> AnyResult<()> {
+    let mut pending = Vec::new();
+    let mut origins = BTreeSet::new();
+    for (code, destination) in departures {
+        let detail = client.raw().devices().get(code).await?.value;
+        if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
+            continue;
+        }
+        if let Some(travel) = &detail.travel {
+            let planned = travel
+                .final_destination
+                .as_deref()
+                .or(travel.destination.as_deref());
+            if planned == Some(destination) {
+                continue;
+            }
+            return Err(app_error(
+                io::ErrorKind::Other,
+                format!("device {code} is travelling to {planned:?}, not {destination}"),
+            ));
+        }
+        let origin = detail.location.ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("device {code} needs to depart for {destination} but has no location"),
+            )
+        })?;
+        origins.insert(origin);
+        pending.push(code.clone());
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if origins.len() != 1 {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ark devices awaiting departure are split across locations {origins:?}: {pending:?}"
+            ),
+        ));
+    }
+    let origin = origins.into_iter().next().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            "ark departure has pending devices but no origin",
+        )
+    })?;
+    info!(
+        operator,
+        origin = %origin,
+        devices = pending.len(),
+        "positioning the controlling replicant before submitting ark travel"
+    );
+    wait_replicant_at(client, operator, &origin, timeout).await
 }
 
 async fn start_device_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
