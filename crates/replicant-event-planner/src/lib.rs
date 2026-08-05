@@ -199,6 +199,12 @@ pub struct DeviceStock {
     /// Attachment slots currently occupied.
     #[serde(default)]
     pub attach_used: i64,
+    /// Carrier this device is currently attached to, when any.
+    #[serde(default)]
+    pub attached_to_device_code: Option<String>,
+    /// Vessel this device is currently stowed in, when any.
+    #[serde(default)]
+    pub stowed_in_device_code: Option<String>,
     /// Whether an AMI controller currently controls this device.
     pub controlled_by_ami: bool,
     /// Whether the device is travelling.
@@ -218,17 +224,64 @@ impl DeviceStock {
         }) && !self.travelling
     }
 
+    /// Whether the device is not nested inside another device.
+    #[must_use]
+    pub fn is_free_standing(&self) -> bool {
+        self.attached_to_device_code.is_none() && self.stowed_in_device_code.is_none()
+    }
+
+    /// Whether the device is in the same star system as `location`.
+    #[must_use]
+    pub fn is_in_same_system_as(&self, location: &str) -> bool {
+        self.location
+            .as_deref()
+            .is_some_and(|device_location| same_system(device_location, location))
+    }
+
+    /// Whether another automation workflow has reserved this device.
+    ///
+    /// `allowed_event_mission` permits a currently executing event mission to
+    /// retain its own claim while still rejecting every other mission and the
+    /// bootstrap, mining, and relay namespaces.
+    #[must_use]
+    pub fn is_reserved_for_workflow(
+        &self,
+        mission_tag_prefix: &str,
+        allowed_event_mission: Option<&str>,
+    ) -> bool {
+        self.tags.iter().any(|tag| {
+            if tag.starts_with(mission_tag_prefix) {
+                return allowed_event_mission != Some(tag.as_str());
+            }
+            [
+                "boot-m:",
+                "boot-r:",
+                "region:",
+                "mine-m:",
+                "mine-b:",
+                "mine-r:",
+                "mine-s:",
+                "relay-m:",
+                "relay-b:",
+                "relay-s:",
+                "infra-r:",
+                "infra-s:",
+            ]
+            .iter()
+            .any(|prefix| tag.starts_with(*prefix))
+        })
+    }
+
     /// Whether the device can be claimed as a mission transport.
     ///
-    /// AMI-controlled transports are deliberately ineligible.
+    /// AMI-controlled, nested, travelling, and workflow-reserved transports
+    /// are deliberately ineligible.
     #[must_use]
     pub fn is_transport_eligible(&self, mission_tag_prefix: &str) -> bool {
         !self.controlled_by_ami
             && !self.travelling
-            && !self
-                .tags
-                .iter()
-                .any(|tag| tag.starts_with(mission_tag_prefix))
+            && self.is_free_standing()
+            && !self.is_reserved_for_workflow(mission_tag_prefix, None)
     }
 }
 
@@ -643,7 +696,11 @@ fn assess_criterion(
         .devices
         .iter()
         .filter(|device| {
-            device.is_inactive() && device.location.as_deref() != Some(&event.location)
+            device.is_inactive()
+                && device.is_free_standing()
+                && device.location.as_deref() == Some(context.home_location.as_str())
+                && device.location.as_deref() != Some(&event.location)
+                && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
         })
         .collect::<Vec<_>>();
     reusable_pool.sort_by(|left, right| {
@@ -884,6 +941,7 @@ fn plan_cargo_transport(
         .filter(|device| {
             device.device_type == CARGO_FREIGHTER
                 && device.cargo_capacity > 0
+                && device.is_in_same_system_as(&context.home_location)
                 && device.is_transport_eligible(&context.mission_tag_prefix)
         })
         .collect::<Vec<_>>();
@@ -956,6 +1014,7 @@ fn plan_device_transport(
         .filter(|device| {
             device.attach_capacity > 0
                 && device.attach_used == 0
+                && device.is_in_same_system_as(&context.home_location)
                 && device.is_transport_eligible(&context.mission_tag_prefix)
         })
         .collect::<Vec<_>>();
@@ -1039,9 +1098,12 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
             warning: None,
         };
     }
-    if let Some(beacon) = beacons
-        .iter()
-        .find(|device| device.location.as_deref() == Some(event_location) && device.is_inactive())
+    if let Some(beacon) = beacons.iter().find(|device| {
+        device.location.as_deref() == Some(event_location)
+            && device.is_inactive()
+            && device.is_free_standing()
+            && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
+    })
     {
         return BeaconPlan {
             action: BeaconAction::DeployExisting,
@@ -1050,7 +1112,12 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
             warning: None,
         };
     }
-    if let Some(beacon) = beacons.iter().find(|device| device.is_inactive()) {
+    if let Some(beacon) = beacons.iter().find(|device| {
+        device.is_inactive()
+            && device.is_free_standing()
+            && device.location.as_deref() == Some(context.home_location.as_str())
+            && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
+    }) {
         return BeaconPlan {
             action: BeaconAction::TransportExisting,
             device_code: Some(beacon.code.clone()),
@@ -1408,10 +1475,8 @@ fn inactive_devices_at(
     for device in devices.iter().filter(|device| {
         device.location.as_deref() == Some(location)
             && device.is_inactive()
-            && !device
-                .tags
-                .iter()
-                .any(|tag| tag.starts_with(mission_tag_prefix))
+            && device.is_free_standing()
+            && !device.is_reserved_for_workflow(mission_tag_prefix, None)
     }) {
         *counts.entry(device.device_type.clone()).or_default() += 1;
     }
@@ -1586,6 +1651,18 @@ fn location_rank(location: Option<&str>, home: &str) -> u8 {
     }
 }
 
+fn same_system(left: &str, right: &str) -> bool {
+    system_designation(left).eq_ignore_ascii_case(system_designation(right))
+}
+
+fn system_designation(location: &str) -> &str {
+    location
+        .split('-')
+        .next()
+        .filter(|system| !system.is_empty())
+        .unwrap_or(location)
+}
+
 fn carrier_rank(device_type: &str) -> u8 {
     if device_type == SURGE_CARRIER { 0 } else { 1 }
 }
@@ -1728,6 +1805,8 @@ mod tests {
                     cargo_capacity: 500,
                     attach_capacity: 0,
                     attach_used: 0,
+                    attached_to_device_code: None,
+                    stowed_in_device_code: None,
                     controlled_by_ami: true,
                     travelling: false,
                 },
@@ -1741,6 +1820,8 @@ mod tests {
                     cargo_capacity: 500,
                     attach_capacity: 0,
                     attach_used: 0,
+                    attached_to_device_code: None,
+                    stowed_in_device_code: None,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1754,6 +1835,8 @@ mod tests {
                     cargo_capacity: 500,
                     attach_capacity: 0,
                     attach_used: 0,
+                    attached_to_device_code: None,
+                    stowed_in_device_code: None,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1767,6 +1850,8 @@ mod tests {
                     cargo_capacity: 0,
                     attach_capacity: 9,
                     attach_used: 0,
+                    attached_to_device_code: None,
+                    stowed_in_device_code: None,
                     controlled_by_ami: false,
                     travelling: false,
                 },
@@ -1857,6 +1942,8 @@ mod tests {
             cargo_capacity: 0,
             attach_capacity: 0,
             attach_used: 0,
+            attached_to_device_code: None,
+            stowed_in_device_code: None,
             controlled_by_ami: false,
             travelling: false,
         });
@@ -1903,6 +1990,109 @@ mod tests {
     }
 
     #[test]
+    fn payload_reuse_is_limited_to_free_unreserved_stock_at_the_home_hub() {
+        let mut context = context();
+        for (code, location, tags, attached_to_device_code) in [
+            (
+                "SENSOR-REMOTE",
+                "RHWYRHYR-5-L4",
+                BTreeSet::new(),
+                None,
+            ),
+            (
+                "SENSOR-SAME-SYSTEM",
+                "SCEPTURUM-7-L4",
+                BTreeSet::new(),
+                None,
+            ),
+            (
+                "SENSOR-BOOTSTRAP",
+                "SCEPTURUM-BELT-1",
+                ["boot-m:regional-beta".into()].into_iter().collect(),
+                None,
+            ),
+            (
+                "SENSOR-ATTACHED",
+                "SCEPTURUM-BELT-1",
+                BTreeSet::new(),
+                Some("OTHER-CARRIER".into()),
+            ),
+            (
+                "SENSOR-HOME",
+                "SCEPTURUM-BELT-1",
+                BTreeSet::new(),
+                None,
+            ),
+        ] {
+            context.devices.push(DeviceStock {
+                code: code.into(),
+                device_type: "sensor_array".into(),
+                status: Some("inactive".into()),
+                location: Some(location.into()),
+                assigned_replicant: Some("Chats-1".into()),
+                tags,
+                cargo_capacity: 0,
+                attach_capacity: 0,
+                attach_used: 0,
+                attached_to_device_code,
+                stowed_in_device_code: None,
+                controlled_by_ami: false,
+                travelling: false,
+            });
+        }
+
+        let plan = plan_event(event(), &context).expect("plan");
+        let criterion = plan
+            .criteria
+            .iter()
+            .find(|criterion| criterion.criterion_name == "sensor_shield_containment")
+            .expect("criterion");
+        assert_eq!(criterion.reused_devices, vec!["SENSOR-HOME".to_owned()]);
+    }
+
+    #[test]
+    fn remote_transports_and_bootstrap_carriers_are_not_selected() {
+        let mut context = context();
+        context.devices.push(DeviceStock {
+            code: "CF-BETA".into(),
+            device_type: CARGO_FREIGHTER.into(),
+            status: Some("idle".into()),
+            location: Some("RHWYRHYR-5-L4".into()),
+            assigned_replicant: Some("Chats-3".into()),
+            tags: BTreeSet::new(),
+            cargo_capacity: 5_000,
+            attach_capacity: 0,
+            attach_used: 0,
+            attached_to_device_code: None,
+            stowed_in_device_code: None,
+            controlled_by_ami: false,
+            travelling: false,
+        });
+        let carrier = context
+            .devices
+            .iter_mut()
+            .find(|device| device.code == "SC-1")
+            .expect("carrier");
+        carrier.tags.insert("boot-m:regional-beta".into());
+
+        let plan = plan_event(event(), &context).expect("plan");
+        assert!(plan.criteria.iter().all(|criterion| {
+            criterion
+                .cargo
+                .transports
+                .iter()
+                .all(|transport| transport.code != "CF-BETA")
+        }));
+        assert!(plan.criteria.iter().all(|criterion| {
+            criterion
+                .carriers
+                .transports
+                .iter()
+                .all(|transport| transport.code != "SC-1")
+        }));
+    }
+
+    #[test]
     fn monitoring_beacon_satisfies_secondary_objective() {
         let mut context = context();
         context.devices.push(DeviceStock {
@@ -1915,6 +2105,8 @@ mod tests {
             cargo_capacity: 0,
             attach_capacity: 0,
             attach_used: 0,
+            attached_to_device_code: None,
+            stowed_in_device_code: None,
             controlled_by_ami: false,
             travelling: false,
         });

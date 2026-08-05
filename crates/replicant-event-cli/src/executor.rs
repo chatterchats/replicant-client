@@ -7,7 +7,8 @@ use std::{
 use futures::future::{join_all, try_join_all};
 use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, raw};
 use replicant_event_planner::{
-    BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost, role_tag,
+    BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
+    mission_tag, plan_event, role_tag,
 };
 use replicant_printing::managed::factory_queue_slots;
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,9 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 
 use super::{
-    AnyResult, ClaimedDevice, Config, EventMissionPlan, MissionPhase, app_error, fetch_blueprints,
-    fetch_devices, fetch_inventory, normalize_event, save_plan,
+    AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, MissionPhase,
+    app_error, build_context, fetch_blueprints, fetch_devices, fetch_earned_achievements,
+    fetch_inventory, normalize_event, save_plan,
 };
 
 const CARGO_FREIGHTER: &str = "cargo_freighter";
@@ -129,26 +131,43 @@ pub(crate) async fn execute_saved_plan(
         return Ok(());
     }
 
-    initialize_execution(plan);
-    split_pending_print_batches(plan);
-    save_plan(&config.plan_path, plan)?;
+    let mut home_scope_replans = 0usize;
+    loop {
+        initialize_execution(plan);
+        split_pending_print_batches(plan);
+        save_plan(&config.plan_path, plan)?;
 
-    if phase_rank(plan.phase) <= phase_rank(MissionPhase::Manufacturing) {
-        set_phase(config, plan, MissionPhase::Manufacturing)?;
-        reconcile_print_batches(client, plan).await?;
-        save_plan(&config.plan_path, plan)?;
-        if !plan
-            .execution
-            .print_batches
-            .iter()
-            .any(|batch| batch.submitted)
-        {
-            ensure_home_resources(client, config, plan).await?;
+        if phase_rank(plan.phase) <= phase_rank(MissionPhase::Manufacturing) {
+            set_phase(config, plan, MissionPhase::Manufacturing)?;
+            reconcile_print_batches(client, plan).await?;
+            save_plan(&config.plan_path, plan)?;
+            if !plan
+                .execution
+                .print_batches
+                .iter()
+                .any(|batch| batch.submitted)
+            {
+                ensure_home_resources(client, config, plan).await?;
+            }
+            submit_print_batches(client, config, plan).await?;
+            wait_for_print_outputs(client, config, plan).await?;
+            assign_printed_outputs(client, plan).await?;
+            save_plan(&config.plan_path, plan)?;
         }
-        submit_print_batches(client, config, plan).await?;
-        wait_for_print_outputs(client, config, plan).await?;
-        assign_printed_outputs(client, plan).await?;
-        save_plan(&config.plan_path, plan)?;
+
+        if phase_rank(plan.phase) <= phase_rank(MissionPhase::PreparingFleet)
+            && replan_nonlocal_assets(client, config, plan).await?
+        {
+            home_scope_replans += 1;
+            if home_scope_replans > 1 {
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    "event mission still selected nonlocal or reserved assets after replanning",
+                ));
+            }
+            continue;
+        }
+        break;
     }
 
     if phase_rank(plan.phase) <= phase_rank(MissionPhase::ClaimingTransports) {
@@ -226,6 +245,301 @@ pub(crate) async fn execute_saved_plan(
     );
     for warning in &plan.execution.warnings {
         println!("Warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn replan_nonlocal_assets(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    let violations = nonlocal_asset_violations(client, plan).await?;
+    if violations.is_empty() {
+        return Ok(false);
+    }
+
+    warn!(
+        mission = %plan.mission_id,
+        violations = %violations.join("; "),
+        "replanning event mission to keep assets at the home hub"
+    );
+
+    let event = fetch_event_definition(client, &plan.event.designation, "active")
+        .await?
+        .unwrap_or_else(|| plan.event.clone());
+    let earned = fetch_earned_achievements(client).await?;
+    let mut context = build_context(client, &event, &earned, &plan.home_location).await?;
+    for device in &mut context.devices {
+        device.tags.remove(&plan.mission_tag);
+    }
+    let event_plan = plan_event(event, &context)?;
+    let criterion_name = plan.selected_criterion.criterion_name.clone();
+    let selected_criterion = event_plan
+        .criteria
+        .iter()
+        .find(|criterion| criterion.criterion_name.eq_ignore_ascii_case(&criterion_name))
+        .cloned()
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "event {} no longer exposes criterion {criterion_name:?}",
+                    event_plan.event.designation
+                ),
+            )
+        })?;
+    if !selected_criterion.feasible {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "criterion {criterion_name:?} cannot be replanned with home-scoped assets: {}",
+                selected_criterion.blockers.join("; ")
+            ),
+        ));
+    }
+
+    release_preflight_claims(client, config, plan).await?;
+    let previous_mission_id = plan.mission_id.clone();
+    let replanned_mission_id = uuid::Uuid::new_v4().simple().to_string();
+    plan.mission_id = replanned_mission_id.clone();
+    plan.mission_tag = mission_tag(&replanned_mission_id);
+    plan.event = event_plan.event;
+    plan.selected_criterion = selected_criterion;
+    plan.grants_unearned_achievement = event_plan.grants_unearned_achievement;
+    plan.execution = ExecutionState::default();
+    plan.phase = MissionPhase::Planned;
+    save_plan(&config.plan_path, plan)?;
+    println!(
+        "Replanned mission {} as {} using free stock at {} and transports in its home system.",
+        previous_mission_id, plan.mission_id, plan.home_location
+    );
+    Ok(true)
+}
+
+async fn nonlocal_asset_violations(
+    client: &Client,
+    plan: &EventMissionPlan,
+) -> AnyResult<Vec<String>> {
+    let blueprints = fetch_blueprints(client).await?;
+    let devices = fetch_devices(client, &blueprints).await?;
+    let stocks = devices
+        .into_iter()
+        .map(|device| (device.stock.code.clone(), device.stock))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = Vec::new();
+
+    for code in &plan.selected_criterion.reused_devices {
+        match stocks.get(code) {
+            Some(device) if home_payload_eligible(device, plan) => {}
+            Some(device) => violations.push(format!(
+                "payload {code} is at {:?}, nested in {:?}/{:?}, or reserved by another workflow",
+                device.location, device.attached_to_device_code, device.stowed_in_device_code
+            )),
+            None => violations.push(format!("payload {code} is no longer visible")),
+        }
+    }
+
+    for transport in &plan.selected_criterion.cargo.transports {
+        if transport.code.starts_with("<print:") {
+            violations.push(format!(
+                "cargo transport placeholder {} was not assigned",
+                transport.code
+            ));
+            continue;
+        }
+        match stocks.get(&transport.code) {
+            Some(device)
+                if home_transport_eligible(device, plan)
+                    && !device.controlled_by_ami
+                    && device.cargo_capacity >= transport.capacity => {}
+            Some(device) => violations.push(format!(
+                "cargo transport {} is not a free eligible transport in the home system (location {:?})",
+                transport.code, device.location
+            )),
+            None => violations.push(format!(
+                "cargo transport {} is no longer visible",
+                transport.code
+            )),
+        }
+    }
+
+    for transport in &plan.selected_criterion.carriers.transports {
+        if transport.code.starts_with("<print:") {
+            violations.push(format!(
+                "device carrier placeholder {} was not assigned",
+                transport.code
+            ));
+            continue;
+        }
+        let Some(device) = stocks.get(&transport.code) else {
+            violations.push(format!(
+                "device carrier {} is no longer visible",
+                transport.code
+            ));
+            continue;
+        };
+        if !home_transport_eligible(device, plan)
+            || device.attach_capacity < transport.capacity
+        {
+            violations.push(format!(
+                "device carrier {} is not empty and eligible in the home system (location {:?}, used {})",
+                transport.code, device.location, device.attach_used
+            ));
+            continue;
+        }
+        if device.attach_used > 0 {
+            let detail = client.raw().devices().get(&transport.code).await?.value;
+            let mission_payload = plan
+                .execution
+                .payload_devices
+                .iter()
+                .map(|payload| payload.code.as_str())
+                .collect::<BTreeSet<_>>();
+            let foreign = detail
+                .attached_devices
+                .iter()
+                .filter_map(reference_code)
+                .filter(|code| !mission_payload.contains(code.as_str()))
+                .collect::<Vec<_>>();
+            if !foreign.is_empty() {
+                violations.push(format!(
+                    "device carrier {} contains non-mission attachments: {}",
+                    transport.code,
+                    foreign.join(", ")
+                ));
+            }
+        }
+    }
+
+    if let Some(code) = plan.selected_criterion.beacon.device_code.as_deref() {
+        let valid = match plan.selected_criterion.beacon.action {
+            BeaconAction::AlreadyActive => true,
+            BeaconAction::DeployExisting => stocks.get(code).is_some_and(|device| {
+                device.location.as_deref() == Some(plan.event.location.as_str())
+                    && device.is_inactive()
+                    && device.is_free_standing()
+                    && !device.is_reserved_for_workflow(
+                        EVENT_MISSION_TAG_PREFIX,
+                        Some(plan.mission_tag.as_str()),
+                    )
+            }),
+            BeaconAction::TransportExisting | BeaconAction::PrintAndTransport => stocks
+                .get(code)
+                .is_some_and(|device| home_payload_eligible(device, plan)),
+            BeaconAction::Unavailable => true,
+        };
+        if !valid {
+            violations.push(format!(
+                "beacon {code} is not eligible at the event or home hub"
+            ));
+        }
+    }
+
+    for payload in &plan.execution.payload_devices {
+        if payload.delivered {
+            continue;
+        }
+        match stocks.get(&payload.code) {
+            Some(device) if home_payload_eligible(device, plan) => {}
+            Some(device) => violations.push(format!(
+                "prepared payload {} is not free stock at {} (location {:?})",
+                payload.code, plan.home_location, device.location
+            )),
+            None => violations.push(format!(
+                "prepared payload {} is no longer visible",
+                payload.code
+            )),
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn home_payload_eligible(device: &DeviceStock, plan: &EventMissionPlan) -> bool {
+    let mission_carriers = plan
+        .selected_criterion
+        .carriers
+        .transports
+        .iter()
+        .map(|transport| transport.code.as_str())
+        .collect::<BTreeSet<_>>();
+    let attached_to_mission_carrier = device
+        .attached_to_device_code
+        .as_deref()
+        .is_some_and(|carrier| mission_carriers.contains(carrier));
+    let position_eligible = if attached_to_mission_carrier {
+        device.is_in_same_system_as(&plan.home_location) && device.stowed_in_device_code.is_none()
+    } else {
+        device.location.as_deref() == Some(plan.home_location.as_str())
+            && device.is_free_standing()
+    };
+    position_eligible
+        && device.is_inactive()
+        && !device.is_reserved_for_workflow(
+            EVENT_MISSION_TAG_PREFIX,
+            Some(plan.mission_tag.as_str()),
+        )
+}
+
+fn home_transport_eligible(device: &DeviceStock, plan: &EventMissionPlan) -> bool {
+    device.is_in_same_system_as(&plan.home_location)
+        && !device.travelling
+        && device.is_free_standing()
+        && !device.is_reserved_for_workflow(
+            EVENT_MISSION_TAG_PREFIX,
+            Some(plan.mission_tag.as_str()),
+        )
+}
+
+async fn release_preflight_claims(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    for index in 0..plan.claimed_devices.len() {
+        if plan.claimed_devices[index].released {
+            continue;
+        }
+        let claim = plan.claimed_devices[index].clone();
+        let detail = match client.raw().devices().get(&claim.device_code).await {
+            Ok(response) => response.value,
+            Err(error) if error.status() == Some(404) => {
+                plan.claimed_devices[index].released = true;
+                save_plan(&config.plan_path, plan)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let removable = claim
+            .mission_tags
+            .iter()
+            .filter(|tag| !claim.original_tags.contains(*tag) && detail.tags.contains(*tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !removable.is_empty() {
+            let operation = client
+                .devices()
+                .get(&claim.device_code)
+                .await?
+                .configure(raw::devices::DeviceConfiguration {
+                    add_tags: None,
+                    remove_tags: Some(removable.clone()),
+                    tags: None,
+                })
+                .await?;
+            ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+            wait_for_device_snapshot(client, config, &claim.device_code, |device| {
+                removable
+                    .iter()
+                    .all(|tag| !device.tags.iter().any(|existing| existing == tag))
+            })
+            .await?;
+        }
+        plan.claimed_devices[index].released = true;
+        save_plan(&config.plan_path, plan)?;
     }
     Ok(())
 }
@@ -1157,6 +1471,7 @@ async fn claim_device(
         .find(|claim| claim.device_code == code)
     {
         claim.role = role.to_owned();
+        claim.released = false;
         for tag in &missing_tags {
             if !claim.mission_tags.contains(tag) {
                 claim.mission_tags.push(tag.clone());
@@ -1895,6 +2210,8 @@ async fn fetch_location_device_stock(
                     .or_else(|| blueprint.map(|item| item.attach_capacity))
                     .unwrap_or(0),
                 attach_used: i64::try_from(device.attached_devices.len())?,
+                attached_to_device_code: device.attached_to_device_code,
+                stowed_in_device_code: device.stowed_in_device_code,
                 controlled_by_ami: device.controller_device_code.is_some(),
                 travelling: device.travel.is_some(),
             });

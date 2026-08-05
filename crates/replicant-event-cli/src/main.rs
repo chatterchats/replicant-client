@@ -1148,6 +1148,8 @@ async fn fetch_devices(
                         .or_else(|| blueprint.map(|item| item.attach_capacity))
                         .unwrap_or(0),
                     attach_used: i64::try_from(device.attached_devices.len())?,
+                    attached_to_device_code: device.attached_to_device_code,
+                    stowed_in_device_code: device.stowed_in_device_code,
                     controlled_by_ami: device.controller_device_code.is_some(),
                     travelling: device.travel.is_some(),
                 },
