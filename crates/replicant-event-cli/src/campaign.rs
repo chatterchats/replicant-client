@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{
-    AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, MissionPhase,
-    PLAN_VERSION, app_error, build_factory_workloads, executor, fetch_active_events,
-    fetch_blueprints, fetch_devices, fetch_earned_achievements, fetch_inventory, load_plan,
-    normalize_event, save_plan, select_replicant,
+    AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, EventScope,
+    MissionPhase, PLAN_VERSION, app_error, build_factory_workloads, executor,
+    fetch_active_events_in_scope, fetch_blueprints, fetch_devices, fetch_earned_achievements,
+    fetch_inventory, load_plan, normalize_event, save_plan, select_replicant,
 };
 
 const CAMPAIGN_VERSION: u32 = 1;
@@ -30,6 +30,8 @@ pub(crate) struct EventCampaignPlan {
     campaign_id: String,
     selected_replicant: String,
     home_location: String,
+    #[serde(default)]
+    event_scope: EventScope,
     missions: Vec<CampaignMission>,
     blocked_events: Vec<BlockedEvent>,
     #[serde(default)]
@@ -55,6 +57,7 @@ struct CampaignStatusReport {
     campaign_id: String,
     selected_replicant: String,
     home_location: String,
+    event_scope: EventScope,
     completed: usize,
     total: usize,
     missions: Vec<CampaignMissionStatus>,
@@ -144,6 +147,7 @@ pub(crate) async fn create_campaign(
         campaign_id,
         selected_replicant: replicant_code,
         home_location: config.home.clone(),
+        event_scope: config.event_scope(),
         missions: Vec::new(),
         blocked_events: Vec::new(),
         warnings: Vec::new(),
@@ -283,6 +287,7 @@ async fn plan_campaign_event(
         phase: MissionPhase::Planned,
         selected_replicant: campaign.selected_replicant.clone(),
         home_location: campaign.home_location.clone(),
+        event_scope: campaign.event_scope.clone(),
         event: event_plan.event,
         selected_criterion,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
@@ -558,7 +563,7 @@ async fn retry_blocked_events(
     config: &Config,
     campaign: &mut EventCampaignPlan,
 ) -> AnyResult<usize> {
-    let active = fetch_active_events(client)
+    let active = fetch_active_events_in_scope(client, &campaign.event_scope)
         .await?
         .iter()
         .map(normalize_event)
@@ -639,6 +644,7 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
         campaign_id: campaign.campaign_id.clone(),
         selected_replicant: campaign.selected_replicant.clone(),
         home_location: campaign.home_location.clone(),
+        event_scope: campaign.event_scope.clone(),
         completed,
         total: statuses.len() + campaign.blocked_events.len(),
         missions: statuses,
@@ -653,6 +659,7 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
     println!("Campaign:   {}", report.campaign_id);
     println!("Replicant:  {}", report.selected_replicant);
     println!("Home:       {}", report.home_location);
+    println!("Scope:      {}", report.event_scope.description());
     println!("Completed:  {}/{}", report.completed, report.total);
     for mission in report.missions {
         let phase = format!("{:?}", mission.phase);

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use replicant_client::{Client, Replicant, SecretString, StartupPolicy, raw};
+use replicant_client::{Client, Replicant, SecretString, Star, StartupPolicy, raw};
 use replicant_event_planner::{
     BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
     OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
@@ -16,7 +16,7 @@ use replicant_event_planner::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 mod campaign;
@@ -56,6 +56,9 @@ struct Config {
     plan_path: PathBuf,
     replace_plan: bool,
     all_events: bool,
+    region: Option<String>,
+    center: Option<String>,
+    radius_ly: Option<f64>,
     wait_timeout: Duration,
     verbose: bool,
     log_file: Option<PathBuf>,
@@ -76,6 +79,13 @@ impl Config {
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
         let mut replace_plan = false;
         let mut all_events = false;
+        let mut region = env::var("RS_EVENT_REGION").ok();
+        let mut center = env::var("RS_EVENT_CENTER").ok();
+        let mut radius_ly = env::var("RS_EVENT_RADIUS_LY")
+            .ok()
+            .map(|value| parse_radius(&value, "RS_EVENT_RADIUS_LY"))
+            .transpose()?;
+        let mut scope_cli_seen = false;
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_EVENT_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -131,6 +141,35 @@ impl Config {
                 }
                 "--replace-plan" => replace_plan = true,
                 "--all" => all_events = true,
+                "--region" => {
+                    reset_environment_scope(
+                        &mut scope_cli_seen,
+                        &mut region,
+                        &mut center,
+                        &mut radius_ly,
+                    );
+                    region = Some(required_argument(&mut arguments, "--region")?);
+                }
+                "--center" => {
+                    reset_environment_scope(
+                        &mut scope_cli_seen,
+                        &mut region,
+                        &mut center,
+                        &mut radius_ly,
+                    );
+                    center = Some(required_argument(&mut arguments, "--center")?);
+                }
+                "--radius" | "--radius-ly" => {
+                    reset_environment_scope(
+                        &mut scope_cli_seen,
+                        &mut region,
+                        &mut center,
+                        &mut radius_ly,
+                    );
+                    let option = argument.as_str();
+                    let value = required_argument(&mut arguments, option)?;
+                    radius_ly = Some(parse_radius(&value, option)?);
+                }
                 "--wait-timeout-secs" => {
                     wait_timeout = Duration::from_secs(
                         required_argument(&mut arguments, "--wait-timeout-secs")?
@@ -185,6 +224,32 @@ impl Config {
                 "--all cannot be combined with --event, a positional event, or --criterion",
             ));
         }
+        region = region.map(|value| value.trim().to_ascii_lowercase());
+        center = center.map(|value| value.trim().to_ascii_uppercase());
+        if region.as_deref().is_some_and(str::is_empty) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--region cannot be empty",
+            ));
+        }
+        if center.as_deref().is_some_and(str::is_empty) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--center cannot be empty",
+            ));
+        }
+        if region.is_some() && (center.is_some() || radius_ly.is_some()) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--region cannot be combined with --center or --radius",
+            ));
+        }
+        if center.is_some() && radius_ly.is_none() {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--center requires --radius",
+            ));
+        }
 
         Ok(Self {
             command,
@@ -196,12 +261,63 @@ impl Config {
             plan_path,
             replace_plan,
             all_events,
+            region,
+            center,
+            radius_ly,
             wait_timeout,
             verbose,
             log_file,
             json,
         })
     }
+
+    fn event_scope(&self) -> EventScope {
+        if let Some(region) = &self.region {
+            return EventScope::Region {
+                region: region.clone(),
+            };
+        }
+        if let Some(radius_ly) = self.radius_ly {
+            return EventScope::Radius {
+                center_system: system_from_location(
+                    self.center.as_deref().unwrap_or(self.home.as_str()),
+                ),
+                radius_ly,
+            };
+        }
+        EventScope::All
+    }
+}
+
+fn reset_environment_scope(
+    scope_cli_seen: &mut bool,
+    region: &mut Option<String>,
+    center: &mut Option<String>,
+    radius_ly: &mut Option<f64>,
+) {
+    if *scope_cli_seen {
+        return;
+    }
+    *scope_cli_seen = true;
+    *region = None;
+    *center = None;
+    *radius_ly = None;
+}
+
+fn parse_radius(value: &str, option: &str) -> AnyResult<f64> {
+    let radius = value.parse::<f64>().map_err(|_| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be a positive number"),
+        )
+    })?;
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be a positive finite number"),
+        ));
+    }
+    Ok(radius)
 }
 
 fn required_argument(
@@ -224,12 +340,41 @@ fn print_help() {
     println!(
         "Replicant event logistics\n\n\
 Usage:\n  replicant-events\n  replicant-events list [OPTIONS]\n  replicant-events plan [EVENT] [OPTIONS]\n  replicant-events plan --all [OPTIONS]\n  replicant-events run [OPTIONS]\n  replicant-events status [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --region REGION           Limit discovery to a catalogue region\n  --center LOCATION         Radius centre; accepts a star, system, or location\n  --radius LY               Limit discovery to LY around --center or --home\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
 Planning performs no gameplay mutations. Run always reconciles and continues\n\
 the persisted mission or all-events campaign; there is no separate resume\n\
 command or --execute flag. Campaigns start print queues before completing\n\
-material-only events while manufacturing continues."
+material-only events while manufacturing continues. Region and radius scopes\n\
+are persisted in mission files; --region is mutually exclusive with\n\
+--center/--radius."
     );
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EventScope {
+    #[default]
+    All,
+    Region {
+        region: String,
+    },
+    Radius {
+        center_system: String,
+        radius_ly: f64,
+    },
+}
+
+impl EventScope {
+    fn description(&self) -> String {
+        match self {
+            Self::All => "all discovered systems".into(),
+            Self::Region { region } => format!("catalogue region {region}"),
+            Self::Radius {
+                center_system,
+                radius_ly,
+            } => format!("within {radius_ly:.2} ly of {center_system}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -279,6 +424,8 @@ struct EventMissionPlan {
     phase: MissionPhase,
     selected_replicant: String,
     home_location: String,
+    #[serde(default)]
+    event_scope: EventScope,
     event: EventDefinition,
     selected_criterion: CriterionAssessment,
     grants_unearned_achievement: bool,
@@ -448,10 +595,14 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         return Ok(());
     }
 
-    let events = fetch_active_events(client).await?;
+    let event_scope = config.event_scope();
+    let events = fetch_active_events_in_scope(client, &event_scope).await?;
     let earned = fetch_earned_achievements(client).await?;
     if events.is_empty() {
-        println!("No active discovered location events were returned.");
+        println!(
+            "No active discovered location events were found in {}.",
+            event_scope.description()
+        );
         return Ok(());
     }
 
@@ -463,6 +614,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         if config.json {
             println!("{}", serde_json::to_string_pretty(&definitions)?);
         } else {
+            println!("Scope: {}\n", event_scope.description());
             print_event_table(&definitions, &earned);
         }
         return Ok(());
@@ -477,6 +629,9 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         return Ok(());
     }
 
+    if config.command == Command::Interactive && !config.json {
+        println!("Scope: {}\n", event_scope.description());
+    }
     let selected_event = select_event(&events, config.event.as_deref(), config.command, &earned)?;
     let event = normalize_event(selected_event)?;
     let replicant = select_replicant(client, config.replicant.as_deref(), config.command).await?;
@@ -520,6 +675,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         phase: MissionPhase::Planned,
         selected_replicant: replicant_code,
         home_location: config.home.clone(),
+        event_scope: event_scope.clone(),
         event: event_plan.event.clone(),
         selected_criterion,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
@@ -537,6 +693,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
             plan.selected_criterion.criterion_name
         );
         println!("Replicant: {}", plan.selected_replicant);
+        println!("Scope: {}", plan.event_scope.description());
         println!("Saved plan: {}", config.plan_path.display());
         println!(
             "Mission tags reserved for execution: {}, {}, {}",
@@ -579,6 +736,132 @@ async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::Loca
         io::ErrorKind::InvalidData,
         "event listing exceeded the 100-page safety bound",
     ))
+}
+
+async fn fetch_active_events_in_scope(
+    client: &Client,
+    scope: &EventScope,
+) -> AnyResult<Vec<raw::events::LocationEvent>> {
+    let events = fetch_active_events(client).await?;
+    if !matches!(scope, EventScope::All) {
+        client.galaxy().refresh_catalogue().await?;
+    }
+    filter_events_to_scope(events, client.galaxy().catalogue(), scope)
+}
+
+#[derive(Clone, Debug)]
+struct ScopeStar {
+    region: Option<String>,
+    position: Option<(f64, f64, f64)>,
+}
+
+fn filter_events_to_scope(
+    events: Vec<raw::events::LocationEvent>,
+    stars: Vec<Star>,
+    scope: &EventScope,
+) -> AnyResult<Vec<raw::events::LocationEvent>> {
+    if matches!(scope, EventScope::All) {
+        return Ok(events);
+    }
+
+    let catalogue = stars
+        .into_iter()
+        .map(|star| {
+            let position = star.position.map(|position| (position.x, position.y, position.z));
+            (
+                star.key.id.as_str().to_ascii_uppercase(),
+                ScopeStar {
+                    region: star.region,
+                    position,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let center = match scope {
+        EventScope::Radius { center_system, .. } => {
+            let star = catalogue.get(center_system).ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "event scope centre {center_system:?} is not present in the star catalogue"
+                    ),
+                )
+            })?;
+            Some(star.position.ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "event scope centre {center_system:?} has no catalogue coordinates"
+                    ),
+                )
+            })?)
+        }
+        EventScope::All | EventScope::Region { .. } => None,
+    };
+
+    let mut included = Vec::new();
+    let mut outside = 0usize;
+    let mut unresolved = 0usize;
+    for event in events {
+        let Some(location) = event.location.as_deref() else {
+            unresolved += 1;
+            continue;
+        };
+        let system = system_from_location(location);
+        let Some(star) = catalogue.get(&system) else {
+            unresolved += 1;
+            continue;
+        };
+        let matches = match scope {
+            EventScope::All => true,
+            EventScope::Region { region } => star
+                .region
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(region)),
+            EventScope::Radius { radius_ly, .. } => {
+                let Some(position) = star.position else {
+                    unresolved += 1;
+                    continue;
+                };
+                let Some(center) = center else {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidData,
+                        "radius event scope did not resolve its centre coordinates",
+                    ));
+                };
+                euclidean_distance_ly(center, position) <= *radius_ly
+            }
+        };
+        if matches {
+            included.push(event);
+        } else {
+            outside += 1;
+        }
+    }
+
+    if unresolved > 0 {
+        warn!(
+            scope = %scope.description(),
+            unresolved,
+            "excluded active events whose system catalogue data was incomplete"
+        );
+    }
+    info!(
+        scope = %scope.description(),
+        included = included.len(),
+        outside,
+        unresolved,
+        "filtered active events to the configured operating scope"
+    );
+    Ok(included)
+}
+
+fn euclidean_distance_ly(left: (f64, f64, f64), right: (f64, f64, f64)) -> f64 {
+    let dx = left.0 - right.0;
+    let dy = left.1 - right.1;
+    let dz = left.2 - right.2;
+    (dx.mul_add(dx, dy.mul_add(dy, dz * dz))).sqrt()
 }
 
 async fn fetch_earned_achievements(client: &Client) -> AnyResult<BTreeSet<String>> {
@@ -1211,10 +1494,11 @@ fn display_name(value: &str) -> String {
 
 fn system_from_location(location: &str) -> String {
     location
-        .rsplit_once('-')
-        .filter(|(_, suffix)| suffix.chars().all(|character| character.is_ascii_digit()))
-        .map(|(system, _)| system.to_owned())
-        .unwrap_or_else(|| location.to_owned())
+        .split('-')
+        .next()
+        .filter(|system| !system.is_empty())
+        .unwrap_or(location)
+        .to_ascii_uppercase()
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1305,6 +1589,7 @@ fn show_status(config: &Config) -> AnyResult<()> {
     println!("Criterion:  {}", plan.selected_criterion.criterion_name);
     println!("Replicant:  {}", plan.selected_replicant);
     println!("Home:       {}", plan.home_location);
+    println!("Scope:      {}", plan.event_scope.description());
     println!("Mission tag: {}", plan.mission_tag);
     println!(
         "Prints:     {}/{} produced",
@@ -1334,4 +1619,92 @@ fn show_status(config: &Config) -> AnyResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalogue_star(
+        designation: &str,
+        region: Option<&str>,
+        position: (f64, f64, f64),
+    ) -> Star {
+        serde_json::from_value(serde_json::json!({
+            "key": {"realm": "Live", "id": designation},
+            "name": null,
+            "spectral_type": null,
+            "entry_point": null,
+            "position": {"x": position.0, "y": position.1, "z": position.2},
+            "has_hub": null,
+            "region": region,
+        }))
+        .expect("catalogue star")
+    }
+
+    fn location_event(designation: &str, location: &str) -> raw::events::LocationEvent {
+        serde_json::from_value(serde_json::json!({
+            "designation": designation,
+            "location": location,
+        }))
+        .expect("location event")
+    }
+
+    #[test]
+    fn location_designations_resolve_to_their_star_system() {
+        assert_eq!(system_from_location("SCEPTURUM"), "SCEPTURUM");
+        assert_eq!(system_from_location("SCEPTURUM-7"), "SCEPTURUM");
+        assert_eq!(system_from_location("SCEPTURUM-7-L4"), "SCEPTURUM");
+        assert_eq!(system_from_location("SCEPTURUM-BELT-1"), "SCEPTURUM");
+    }
+
+    #[test]
+    fn region_scope_uses_catalogue_membership() {
+        let events = vec![
+            location_event("near-hub", "SCEPTURUM-7"),
+            location_event("alpha", "WIHAX-3"),
+            location_event("beta", "RHWYRHYR-5"),
+        ];
+        let stars = vec![
+            catalogue_star("SCEPTURUM", None, (0.0, 0.0, 0.0)),
+            catalogue_star("WIHAX", Some("alpha"), (20.0, 0.0, 0.0)),
+            catalogue_star("RHWYRHYR", Some("beta"), (300.0, 0.0, 0.0)),
+        ];
+        let filtered = filter_events_to_scope(
+            events,
+            stars,
+            &EventScope::Region {
+                region: "alpha".into(),
+            },
+        )
+        .expect("region filter");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].designation.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn radius_scope_can_include_unregioned_hub_neighbors() {
+        let events = vec![
+            location_event("hub", "SCEPTURUM-7"),
+            location_event("near", "ILPHARD-3"),
+            location_event("far", "RHWYRHYR-5"),
+        ];
+        let stars = vec![
+            catalogue_star("SCEPTURUM", None, (0.0, 0.0, 0.0)),
+            catalogue_star("ILPHARD", None, (18.0, 0.0, 0.0)),
+            catalogue_star("RHWYRHYR", Some("beta"), (290.0, 0.0, 0.0)),
+        ];
+        let filtered = filter_events_to_scope(
+            events,
+            stars,
+            &EventScope::Radius {
+                center_system: "SCEPTURUM".into(),
+                radius_ly: 35.0,
+            },
+        )
+        .expect("radius filter");
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].designation.as_deref(), Some("hub"));
+        assert_eq!(filtered[1].designation.as_deref(), Some("near"));
+    }
 }

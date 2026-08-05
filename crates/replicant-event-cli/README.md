@@ -28,6 +28,33 @@ cargo run --quiet -p replicant-event-cli -- plan --all
 cargo run --quiet -p replicant-event-cli -- run
 ```
 
+Discovery can be constrained to a catalogue region:
+
+```sh
+cargo run --quiet -p replicant-event-cli -- list --region alpha
+cargo run --quiet -p replicant-event-cli -- plan --all --region alpha
+```
+
+For an operating area that does not align exactly with a catalogue region,
+use a centre and light-year radius. The centre accepts a star, system, planet,
+belt, or Lagrange-point designation and is normalized to its star system:
+
+```sh
+cargo run --quiet -p replicant-event-cli -- list \
+  --center SCEPTURUM \
+  --radius 35
+
+cargo run --quiet -p replicant-event-cli -- plan --all \
+  --replicant Chats-1 \
+  --home SCEPTURUM-BELT-1 \
+  --radius 35
+```
+
+When `--radius` is supplied without `--center`, the centre defaults to the
+`--home` system. The selected scope is saved in both single-event missions and
+all-events campaigns, so later `run` commands and blocked-event replanning use
+the same boundary.
+
 An all-events campaign automatically selects the feasible completion option
 with the most planner recommendation badges. Ties prefer fewer prints, a
 shorter print schedule, fewer trips, and finally the stable criterion name.
@@ -63,6 +90,9 @@ plan is preserved unless `--replace-plan` is supplied.
 | `--event DESIGNATION` | Event to plan. |
 | `--criterion NAME` | Completion option to select. |
 | `--all` | Plan every active discovered event and choose criteria automatically. |
+| `--region REGION` | Include only events whose star belongs to the catalogue region. |
+| `--center LOCATION` | Centre for radius filtering; requires `--radius`. |
+| `--radius LY` | Include events within this distance of `--center`, or `--home` when no centre is supplied. |
 | `--replicant NAME_OR_CODE` | Acting replicant; defaults to `Chats-1`. |
 | `--home LOCATION` | Manufacturing hub; defaults to `SCEPTURUM-BELT-1`. |
 | `--database PATH` | Managed SQLite database. |
@@ -73,8 +103,9 @@ plan is preserved unless `--replace-plan` is supplied.
 | `--json` | Emit machine-readable output. |
 
 Environment equivalents include `RS_EVENT_REPLICANT`, `RS_EVENT_HOME`,
-`REPLICANT_DB`, `RS_EVENT_PLAN`, `RS_EVENT_WAIT_TIMEOUT_SECS`,
-`RS_EVENT_VERBOSE`, and `RS_EVENT_LOG_FILE`.
+`RS_EVENT_REGION`, `RS_EVENT_CENTER`, `RS_EVENT_RADIUS_LY`, `REPLICANT_DB`,
+`RS_EVENT_PLAN`, `RS_EVENT_WAIT_TIMEOUT_SECS`, `RS_EVENT_VERBOSE`, and
+`RS_EVENT_LOG_FILE`.
 Command-line values take precedence.
 
 ## Safety and recovery
