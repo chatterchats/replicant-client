@@ -9,7 +9,8 @@
 //! 4. pre-plans a deterministic nearest-neighbor route around a centre star;
 //! 5. travels one system at a time;
 //! 6. runs the replicant's instant `POST /v1/replicants/{code}/scan`;
-//! 7. launches the survey controller and waits for either a terminal
+//! 7. detaches the selected survey assets from any transport carrier, launches
+//!    the survey controller, and waits for either a terminal
 //!    `ami.survey.digest` or `directive.completed`;
 //! 8. on startup, rechecks the current system scan and planet/moon survey completeness;
 //! 9. recalls and restows the fleet before the next hop.
@@ -76,7 +77,7 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
-    SecretString, StartupPolicy, SurveyDirective, domain::GalacticPosition,
+    SecretString, StartupPolicy, SurveyDirective, domain::GalacticPosition, raw,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,6 +141,14 @@ fn device_stowed_in(device: &Device) -> Option<&str> {
     device
         .relationships
         .stowed_in
+        .as_ref()
+        .map(|value| value.id.as_str())
+}
+
+fn device_attached_to(device: &Device) -> Option<&str> {
+    device
+        .relationships
+        .attached_to
         .as_ref()
         .map(|value| value.id.as_str())
 }
@@ -2997,6 +3006,153 @@ async fn poll_survey_completion_history(
     Ok(None)
 }
 
+async fn detach_survey_fleet_from_carriers(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+    target: &str,
+) -> AnyResult<()> {
+    const DETACH_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+    let controller = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
+    let mut by_carrier = BTreeMap::<String, Vec<String>>::new();
+
+    for code in std::iter::once(controller).chain(plan.drones.iter().map(String::as_str)) {
+        let device = refresh_device_snapshot(client, code).await?;
+        ensure_device_replicant(&device, code, &config.replicant)?;
+
+        if device_stowed_in(&device) != Some(config.vessel.as_str())
+            && let Some(location) = device_location(&device)
+            && !designation_in_star(location, target)
+        {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "survey-fleet device {code} is at {location}, outside target system {target}"
+                ),
+            ));
+        }
+
+        if let Some(carrier) = device_attached_to(&device) {
+            by_carrier
+                .entry(carrier.to_owned())
+                .or_default()
+                .push(code.to_owned());
+        }
+    }
+
+    for (carrier, devices) in &by_carrier {
+        let carrier_snapshot = refresh_device_snapshot(client, carrier).await?;
+        let carrier_location = device_location(&carrier_snapshot).ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("carrier {carrier} containing the survey fleet has no location"),
+            )
+        })?;
+        if !designation_in_star(carrier_location, target) {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "survey-fleet devices {} are attached to carrier {carrier} at {carrier_location}, outside target system {target}",
+                    devices.join(", ")
+                ),
+            ));
+        }
+
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.fleet_detach_started",
+            carrier,
+            devices = ?devices,
+            star = target,
+            "detaching survey-fleet devices from their transport carrier before surveying"
+        );
+        let operation = client
+            .devices()
+            .get(carrier)
+            .await?
+            .command(raw::devices::DeviceCommand::Detach(
+                raw::devices::TargetsCommand {
+                    device: None,
+                    devices: Some(Value::Array(
+                        devices.iter().cloned().map(Value::String).collect(),
+                    )),
+                    target: None,
+                    targets: None,
+                },
+            ))
+            .await?;
+        let label = format!("detach survey fleet from carrier {carrier}");
+        wait_immediate_operation(&label, &operation).await?;
+
+        let started = Instant::now();
+        loop {
+            let carrier_snapshot = refresh_device_snapshot(client, carrier).await?;
+            let attached = carrier_snapshot
+                .relationships
+                .attached_devices
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let pending = devices
+                .iter()
+                .filter(|code| attached.contains(code.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if pending.is_empty() {
+                info!(
+                    target: "replicant_client::explore",
+                    event = "survey.fleet_detached",
+                    carrier,
+                    devices = ?devices,
+                    star = target,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "managed device state confirms the survey fleet is detached"
+                );
+                break;
+            }
+
+            if started.elapsed() >= DETACH_TIMEOUT {
+                return Err(app_error(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "survey-fleet devices did not detach from carrier {carrier} within {DETACH_TIMEOUT:?}; pending={pending:?}"
+                    ),
+                ));
+            }
+
+            debug!(
+                target: "replicant_client::explore",
+                event = "survey.fleet_detach_waiting",
+                carrier,
+                pending = ?pending,
+                star = target,
+                "waiting for managed state to confirm carrier detachment"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    for code in std::iter::once(controller).chain(plan.drones.iter().map(String::as_str)) {
+        let device = refresh_device_snapshot(client, code).await?;
+        if let Some(carrier) = device_attached_to(&device) {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "survey-fleet device {code} remains attached to carrier {carrier}; refusing to launch a reduced survey fleet"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_survey(
     client: &Client,
     config: &Config,
@@ -3009,6 +3165,12 @@ async fn run_survey(
         .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
     let controller_handle = client.devices().get(controller_code).await?;
     let controller = controller_handle.as_survey_controller()?;
+
+    // A device can be physically present in the target system while still
+    // attached to a surge carrier or other transport. Attached survey assets
+    // do not reliably participate in the controller directive, which can make
+    // a three-drone survey silently run with only one effective drone.
+    detach_survey_fleet_from_carriers(client, config, plan, target).await?;
 
     // Capture a durable history watermark before opening the local live watch.
     // If a completion lands during an SSE disconnect or between this request
