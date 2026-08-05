@@ -44,6 +44,7 @@ impl Blueprint {
     #[must_use]
     pub fn is_modular(&self) -> bool {
         self.features.iter().any(|feature| feature == "modular")
+            || matches!(self.device_type.as_str(), "autofactory" | "system_hub")
     }
 }
 
@@ -289,5 +290,19 @@ mod tests {
         };
         assert!(modular.is_modular());
         assert!(!ordinary.is_modular());
+    }
+
+    #[test]
+    fn documented_modular_infrastructure_survives_missing_feature_flags() {
+        let hub = Blueprint {
+            device_type: "system_hub".into(),
+            ..Blueprint::default()
+        };
+        let autofactory = Blueprint {
+            device_type: "autofactory".into(),
+            ..Blueprint::default()
+        };
+        assert!(hub.is_modular());
+        assert!(autofactory.is_modular());
     }
 }

@@ -60,6 +60,33 @@ where
     }
 }
 
+fn deserialize_references<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .filter_map(|value| match value {
+            serde_json::Value::String(value) => Some(Ok(value)),
+            serde_json::Value::Object(object) => [
+                "replicant_code",
+                "device_code",
+                "code",
+                "id",
+            ]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .map(Ok),
+            serde_json::Value::Null => None,
+            other => Some(Err(D::Error::custom(format!(
+                "expected a string or reference object, got {other}"
+            )))),
+        })
+        .collect()
+}
+
 fn validate_page_limit(limit: Option<i64>) -> Result<(), Error> {
     if limit.is_some_and(|value| !(1..=100).contains(&value)) {
         return Err(Error::Configuration {
@@ -667,7 +694,7 @@ pub struct DeviceCommandResponse {
     /// Arrival time after a `travel` command, RFC3339.
     pub arrives_at: Option<String>,
     /// Devices attached by an `attach` command.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_references")]
     pub attached_devices: Vec<String>,
     /// Resource availability after a `start_mining` command.
     pub availability: Option<String>,
@@ -719,7 +746,7 @@ pub struct DeviceCommandResponse {
     /// Destination type after a `travel` command.
     pub destination_type: Option<String>,
     /// Devices detached by a `detach` command.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_references")]
     pub detached: Vec<String>,
     /// The command's target device code.
     pub device_code: Option<String>,
@@ -1136,5 +1163,17 @@ mod command_response_tests {
         .expect("unknown object details should not fail the entire command response");
 
         assert_eq!(response.star, None);
+    }
+
+    #[test]
+    fn command_reference_lists_accept_strings_and_objects() {
+        let response: DeviceCommandResponse = serde_json::from_value(serde_json::json!({
+            "attached_devices": ["D1", {"device_code": "D2", "device_type": "survey_drone"}],
+            "detached": [{"code": "D3"}]
+        }))
+        .expect("mixed command reference lists should deserialize");
+
+        assert_eq!(response.attached_devices, ["D1".to_owned(), "D2".to_owned()]);
+        assert_eq!(response.detached, ["D3".to_owned()]);
     }
 }

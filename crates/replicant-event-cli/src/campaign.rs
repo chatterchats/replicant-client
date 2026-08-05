@@ -657,7 +657,7 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
     for mission in report.missions {
         let phase = format!("{:?}", mission.phase);
         println!(
-            "  {:<18} {:<24} {:<22} badges={} prints={}/{}{}",
+            "  {:<25} {:<25} {:<12} badges={} prints={}/{}{}",
             mission.event_designation,
             mission.criterion,
             phase,

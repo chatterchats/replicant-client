@@ -1563,7 +1563,13 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
         let controller_code = if let Some(code) = &config.controller_override {
             ensure_account_owned(&account_owned_devices, code)?;
             let device = refresh_device_snapshot(client, code).await?;
-            validate_controller_candidate(&device, code, &location_id, &config.vessel)?;
+            validate_controller_candidate(
+                &device,
+                code,
+                &location_id,
+                &config.vessel,
+                true,
+            )?;
             code.clone()
         } else {
             let controllers = client
@@ -1580,7 +1586,13 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
             for controller in controllers {
                 let code = controller.id().as_str().to_owned();
                 let device = controller.snapshot().await?;
-                match validate_controller_candidate(&device, &code, &location_id, &config.vessel) {
+                match validate_controller_candidate(
+                    &device,
+                    &code,
+                    &location_id,
+                    &config.vessel,
+                    false,
+                ) {
                     Ok(()) => eligible.push((
                         device_replicant(&device) == Some(config.replicant.as_str()),
                         code,
@@ -1639,6 +1651,7 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
                     &controller_code,
                     &location_id,
                     &config.vessel,
+                    true,
                 )?;
             }
             codes.clone()
@@ -1665,6 +1678,7 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
                     &controller_code,
                     &location_id,
                     &config.vessel,
+                    false,
                 ) {
                     Ok(()) => eligible.push((
                         device_replicant(&device) == Some(config.replicant.as_str()),
@@ -1707,6 +1721,25 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
     ensure_replicant_owns_device(client, &controller_code, &config.replicant).await?;
     for code in &plan.drones {
         ensure_replicant_owns_device(client, code, &config.replicant).await?;
+    }
+
+    let selected_drones = plan.drones.iter().cloned().collect::<BTreeSet<_>>();
+    let controller_snapshot = refresh_device_snapshot(client, &controller_code).await?;
+    let unexpected_controlled = controller_snapshot
+        .relationships
+        .controlled_devices
+        .iter()
+        .map(|device| device.id.as_str().to_owned())
+        .filter(|code| !selected_drones.contains(code))
+        .collect::<Vec<_>>();
+    if !unexpected_controlled.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "survey controller {controller_code} also controls unrelated devices {}; release them before resuming",
+                unexpected_controlled.join(", ")
+            ),
+        ));
     }
 
     verify_fleet(client, config, plan, FleetVerification::for_plan(plan)).await?;
@@ -1770,7 +1803,7 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
         wait_immediate_operation("configure survey_system", &operation).await?;
     }
 
-    stow_fleet(client, config, plan).await?;
+    recall_and_stow(client, config, plan).await?;
 
     plan.fleet_prepared = true;
     plan.phase = RunPhase::Ready;
@@ -1915,6 +1948,7 @@ fn validate_controller_candidate(
     code: &str,
     vessel_location: &str,
     vessel: &str,
+    allow_same_system_recall: bool,
 ) -> AnyResult<()> {
     ensure_device_type(device, code, "ami_survey_controller")?;
     if device_status_name(device) != Some("idle") {
@@ -1923,13 +1957,17 @@ fn validate_controller_candidate(
             format!("survey controller {code} is not idle"),
         ));
     }
-    if !device.relationships.controlled_devices.is_empty() {
+    if !allow_same_system_recall && !device.relationships.controlled_devices.is_empty() {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
             format!("survey controller {code} already controls one or more devices"),
         ));
     }
-    validate_device_vessel_placement(device, code, vessel_location, vessel)
+    if allow_same_system_recall {
+        validate_device_vessel_recoverability(device, code, vessel_location, vessel)
+    } else {
+        validate_device_vessel_placement(device, code, vessel_location, vessel)
+    }
 }
 
 fn validate_drone_candidate(
@@ -1938,6 +1976,7 @@ fn validate_drone_candidate(
     controller: &str,
     vessel_location: &str,
     vessel: &str,
+    allow_same_system_recall: bool,
 ) -> AnyResult<()> {
     ensure_device_type(device, code, "survey_drone")?;
     if device_status_name(device) != Some("idle") {
@@ -1954,7 +1993,11 @@ fn validate_drone_candidate(
             format!("survey drone {code} is already controlled by {actual}"),
         ));
     }
-    validate_device_vessel_placement(device, code, vessel_location, vessel)
+    if allow_same_system_recall {
+        validate_device_vessel_recoverability(device, code, vessel_location, vessel)
+    } else {
+        validate_device_vessel_placement(device, code, vessel_location, vessel)
+    }
 }
 
 async fn ensure_replicant_owns_device(
@@ -2137,6 +2180,62 @@ fn validate_device_vessel_placement(
             ),
         )),
     }
+}
+
+fn device_can_rejoin_vessel(
+    stowed_in: Option<&str>,
+    location: Option<&str>,
+    recall_available: bool,
+    vessel: &str,
+    vessel_location: &str,
+) -> bool {
+    stowed_in == Some(vessel)
+        || location == Some(vessel_location)
+        || (stowed_in.is_none()
+            && recall_available
+            && location.is_some_and(|location| {
+                designation_in_star(location, star_from_designation(vessel_location))
+            }))
+}
+
+fn validate_device_vessel_recoverability(
+    device: &Device,
+    code: &str,
+    vessel_location: &str,
+    vessel: &str,
+) -> AnyResult<()> {
+    if device_can_rejoin_vessel(
+        device_stowed_in(device),
+        device_location(device),
+        device_has_command(device, "recall"),
+        vessel,
+        vessel_location,
+    ) {
+        return Ok(());
+    }
+
+    if let Some(actual) = device_stowed_in(device) {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("device {code} is stowed in vessel {actual}, not required vessel {vessel}"),
+        ));
+    }
+
+    let location = device_location(device);
+    let same_system = location.is_some_and(|location| {
+        designation_in_star(location, star_from_designation(vessel_location))
+    });
+    let reason = if same_system {
+        "it does not advertise the recall command"
+    } else {
+        "it is not in the vessel's current system"
+    };
+    Err(app_error(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "device {code} is not stowed in vessel {vessel} and is at {location:?}, while the vessel is at {vessel_location}; {reason}"
+        ),
+    ))
 }
 
 fn ensure_stowed_in_vessel(device: &Device, code: &str, vessel: &str) -> AnyResult<()> {
@@ -3053,8 +3152,8 @@ async fn run_survey(
 struct FleetReturnCheck {
     vessel_location: String,
     pending: Vec<String>,
+    pending_codes: Vec<String>,
     recall_in_progress: bool,
-    controller_status: Option<String>,
     controller_directive_status: Option<String>,
     controller_withdraw_available: bool,
 }
@@ -3109,17 +3208,8 @@ async fn recall_and_stow(client: &Client, config: &Config, plan: &RoutePlan) -> 
     }
 
     let mut withdraw_operation = None;
-    if initial.recall_in_progress {
-        info!(
-            target: "replicant_client::explore",
-            event = "survey.recall_already_in_progress",
-            controller = controller_code,
-            vessel = %config.vessel,
-            vessel_location = %initial.vessel_location,
-            pending = ?initial.pending,
-            "survey completion already triggered automatic fleet recall"
-        );
-    } else if survey_directive_needs_recall(initial.controller_directive_status.as_deref())
+    if !initial.recall_in_progress
+        && survey_directive_needs_recall(initial.controller_directive_status.as_deref())
         && initial.controller_withdraw_available
     {
         info!(
@@ -3146,22 +3236,130 @@ async fn recall_and_stow(client: &Client, config: &Config, plan: &RoutePlan) -> 
         );
         withdraw_operation = Some(operation);
     } else {
-        warn!(
-            target: "replicant_client::explore",
-            event = "survey.withdraw_unavailable",
-            controller = controller_code,
-            controller_status = initial.controller_status.as_deref().unwrap_or("unknown"),
-            directive_status = initial
-                .controller_directive_status
-                .as_deref()
-                .unwrap_or("unknown"),
-            pending = ?initial.pending,
-            "fleet has not returned, but withdraw is not currently advertised; waiting for managed placement to converge"
-        );
+        if initial.recall_in_progress {
+            info!(
+                target: "replicant_client::explore",
+                event = "survey.recall_already_in_progress",
+                controller = controller_code,
+                vessel = %config.vessel,
+                vessel_location = %initial.vessel_location,
+                pending = ?initial.pending,
+                "at least one survey-fleet device is already returning"
+            );
+        }
+        request_direct_fleet_recall(client, config, &initial).await?;
     }
 
     wait_for_fleet_return(client, config, plan, initial, withdraw_operation.as_ref()).await?;
     stow_fleet(client, config, plan).await
+}
+
+async fn request_direct_fleet_recall(
+    client: &Client,
+    config: &Config,
+    check: &FleetReturnCheck,
+) -> AnyResult<()> {
+    let devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    let vessel = required_device(&devices, &config.vessel, "racing vessel")?;
+    ensure_device_replicant(vessel, &config.vessel, &config.replicant)?;
+    let vessel_location = device_location(vessel).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            format!("vessel {} has no current location", config.vessel),
+        )
+    })?;
+
+    let mut requested = 0_usize;
+    let mut still_pending = 0_usize;
+    let mut observed_returning = check.recall_in_progress;
+
+    for code in &check.pending_codes {
+        let device = required_device(&devices, code, "survey-fleet device")?;
+        ensure_device_replicant(device, code, &config.replicant)?;
+
+        if device_has_returned_to_vessel(
+            device_stowed_in(device),
+            device_location(device),
+            &config.vessel,
+            vessel_location,
+        ) {
+            continue;
+        }
+        still_pending += 1;
+
+        if device_state_indicates_recall(
+            device_status_name(device),
+            device_location(device),
+            device_stowed_in(device),
+            device.is_traveling(),
+        ) {
+            observed_returning = true;
+            continue;
+        }
+
+        if let Some(actual) = device_stowed_in(device) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "survey-fleet device {code} is stowed in vessel {actual}, not required vessel {}",
+                    config.vessel
+                ),
+            ));
+        }
+        let location = device_location(device)
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("survey-fleet device {code} has no location and is not returning"),
+                )
+            })?
+            .to_owned();
+        if !designation_in_star(&location, star_from_designation(vessel_location)) {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "survey-fleet device {code} is at {location}, outside vessel {}'s current system at {vessel_location}; move it into the same system before resuming",
+                    config.vessel
+                ),
+            ));
+        }
+        if !device_has_command(device, "recall") {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "survey-fleet device {code} is at {location}, but does not advertise recall and cannot rejoin vessel {} at {vessel_location}",
+                    config.vessel
+                ),
+            ));
+        }
+
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.device_recall_started",
+            device = code,
+            location = %location,
+            vessel = %config.vessel,
+            vessel_location,
+            "recalling survey-fleet device directly to the replicant vessel"
+        );
+        let handle = client.devices().get(code).await?;
+        let operation = handle.recall().await?;
+        let label = format!("recall survey-fleet device {code}");
+        wait_immediate_operation(&label, &operation).await?;
+        requested += 1;
+    }
+
+    if still_pending > 0 && requested == 0 && !observed_returning {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "survey fleet has not returned to vessel {} at {vessel_location}, and no pending device can be recalled",
+                config.vessel
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn wait_for_fleet_return(
@@ -3323,6 +3521,7 @@ async fn inspect_fleet_return_state(
     ensure_device_replicant(controller_device, controller, &config.replicant)?;
 
     let mut pending = Vec::new();
+    let mut pending_codes = Vec::new();
     let mut recall_in_progress = false;
 
     for code in std::iter::once(controller).chain(plan.drones.iter().map(String::as_str)) {
@@ -3346,6 +3545,7 @@ async fn inspect_fleet_return_state(
             travel_active,
         );
         recall_in_progress |= device_recalling;
+        pending_codes.push(code.to_owned());
         pending.push(format!(
             "{code}: status={}, location={}, stowed_in={}, travel_active={travel_active}, recalling={device_recalling}",
             device_status_name(device).unwrap_or("unknown"),
@@ -3357,8 +3557,8 @@ async fn inspect_fleet_return_state(
     Ok(FleetReturnInspection::Available(FleetReturnCheck {
         vessel_location: vessel_location.to_owned(),
         pending,
+        pending_codes,
         recall_in_progress,
-        controller_status: device_status_name(controller_device).map(str::to_owned),
         controller_directive_status: active_directive_status(controller_device).map(str::to_owned),
         controller_withdraw_available: device_has_command(controller_device, "withdraw"),
     }))
@@ -4419,9 +4619,47 @@ mod tests {
         ));
         assert!(!device_has_returned_to_vessel(
             None,
+            Some("STAR-1"),
+            "VESSEL",
+            "STAR-1-L4"
+        ));
+        assert!(!device_has_returned_to_vessel(
+            None,
             Some("STAR-2"),
             "VESSEL",
             "STAR-1-L4"
+        ));
+    }
+
+    #[test]
+    fn override_fleet_devices_are_recoverable_from_the_same_system() {
+        assert!(device_can_rejoin_vessel(
+            None,
+            Some("RHWYRHYR-5"),
+            true,
+            "6592B774",
+            "RHWYRHYR-5-L4"
+        ));
+        assert!(!device_can_rejoin_vessel(
+            None,
+            Some("RHWYRHYR-5"),
+            false,
+            "6592B774",
+            "RHWYRHYR-5-L4"
+        ));
+        assert!(!device_can_rejoin_vessel(
+            None,
+            Some("OTHER-5"),
+            true,
+            "6592B774",
+            "RHWYRHYR-5-L4"
+        ));
+        assert!(!device_can_rejoin_vessel(
+            Some("OTHER-VESSEL"),
+            Some("RHWYRHYR-5"),
+            true,
+            "6592B774",
+            "RHWYRHYR-5-L4"
         ));
     }
 

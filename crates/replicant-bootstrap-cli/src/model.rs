@@ -11,6 +11,8 @@ pub enum MissionPhase {
     Planned,
     ManufacturingArk,
     LoadingArk,
+    StagingAtSource,
+    StagedAtSource,
     Outbound,
     QuickScouting,
     EstablishingCapital,
@@ -31,13 +33,53 @@ impl MissionPhase {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplicantIdentity {
+    #[serde(default)]
+    pub requested: String,
+    #[serde(default)]
     pub code: String,
     pub name: Option<String>,
+    #[serde(default)]
     pub vessel: String,
+}
+
+impl ReplicantIdentity {
+    pub fn pending(requested: impl Into<String>) -> Self {
+        let requested = requested.into();
+        Self {
+            requested: requested.clone(),
+            code: String::new(),
+            name: Some(requested),
+            vessel: String::new(),
+        }
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        !self.code.is_empty() && !self.vessel.is_empty()
+    }
+
+    pub fn query(&self) -> &str {
+        if self.requested.is_empty() {
+            self.name.as_deref().unwrap_or(&self.code)
+        } else {
+            &self.requested
+        }
+    }
+
+    pub fn migrate(&mut self) {
+        if self.requested.is_empty() {
+            self.requested = self
+                .name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| self.code.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PrintState {
+    #[serde(default)]
+    pub targets: BTreeMap<String, i64>,
     pub requirements: BTreeMap<String, i64>,
     pub submission_started: bool,
     pub queued: bool,
@@ -62,6 +104,7 @@ pub struct CarrierLoad {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChildMissions {
+    /// Legacy child path retained for mission-file compatibility; quick scouting is parent-checkpointed.
     pub quick_survey: PathBuf,
     pub initial_mining: PathBuf,
     pub survey: PathBuf,
@@ -78,6 +121,10 @@ pub struct BootstrapMission {
     pub phase: MissionPhase,
     pub region: String,
     pub source_hub: String,
+    #[serde(default)]
+    pub source_system: String,
+    #[serde(default)]
+    pub source_entry: String,
     pub landing_star: String,
     pub landing_entry: String,
     pub operator: ReplicantIdentity,
@@ -92,6 +139,12 @@ pub struct BootstrapMission {
     pub print: PrintState,
     #[serde(default)]
     pub assets: BTreeMap<String, Vec<String>>,
+    /// Total attachment-carrier count reserved for this ark.
+    #[serde(default)]
+    pub carrier_target: i64,
+    /// Maximum number of the carrier target that may be satisfied by idle stock.
+    #[serde(default)]
+    pub reused_carrier_target: i64,
     #[serde(default)]
     pub seed_freighters: Vec<SeedFreighter>,
     #[serde(default)]
@@ -108,4 +161,29 @@ pub struct BootstrapMission {
     pub children: ChildMissions,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplicantIdentity;
+
+    #[test]
+    fn future_replicant_keeps_the_requested_name() {
+        let identity = ReplicantIdentity::pending("Chats-3");
+        assert_eq!(identity.query(), "Chats-3");
+        assert!(!identity.is_resolved());
+    }
+
+    #[test]
+    fn legacy_identity_migrates_to_a_stable_query() {
+        let mut identity = ReplicantIdentity {
+            requested: String::new(),
+            code: "96593446".into(),
+            name: Some("Chats-1".into()),
+            vessel: "F7CD8684".into(),
+        };
+        identity.migrate();
+        assert_eq!(identity.query(), "Chats-1");
+        assert!(identity.is_resolved());
+    }
 }

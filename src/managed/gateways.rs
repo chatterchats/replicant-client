@@ -944,6 +944,10 @@ impl DeviceHandle {
     pub async fn deploy(&self) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Deploy).await
     }
+    /// Recalls this device to its assigned replicant's vessel.
+    pub async fn recall(&self) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::Recall).await
+    }
     /// Stows this device inside another.
     pub async fn stow(&self, target: Option<String>) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Stow { target })

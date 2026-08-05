@@ -11,8 +11,6 @@ use thiserror::Error;
 
 /// Autofactory blueprint identifier.
 pub const AUTOFACTORY: &str = "autofactory";
-/// System Hub blueprint identifier.
-pub const SYSTEM_HUB: &str = "system_hub";
 /// Conventional FTL relay blueprint identifier.
 pub const FTL_RELAY: &str = "ftl_relay";
 /// Cheap monitoring beacon blueprint identifier.
@@ -40,12 +38,33 @@ pub struct BootstrapProfile {
     pub cargo_freighters: i64,
     /// AMI transport controllers staged for belt routes.
     pub transport_controllers: i64,
-    /// Dedicated maintenance drones for the System Hub.
+    /// Dedicated maintenance drones for the regional capital.
     pub hub_maintenance_drones: i64,
     /// Extra survey drones accompanying the exploration controller.
     pub exploration_survey_drones: i64,
-    /// Spare conventional relays carried to establish the island root.
+    /// Conventional relays carried to establish the island root.
     pub root_relays: i64,
+    /// Additional conventional relays carried for the first expansion wave.
+    #[serde(default = "default_expansion_relays")]
+    pub expansion_relays: i64,
+    /// Monitoring beacons carried for intelligent-life worlds.
+    #[serde(default = "default_ftl_beacons")]
+    pub ftl_beacons: i64,
+    /// Newly printed Surge Carriers reserved for relay and beacon payloads.
+    #[serde(default = "default_dedicated_surge_carriers")]
+    pub dedicated_surge_carriers: i64,
+}
+
+const fn default_ftl_beacons() -> i64 {
+    9
+}
+
+const fn default_expansion_relays() -> i64 {
+    18
+}
+
+const fn default_dedicated_surge_carriers() -> i64 {
+    3
 }
 
 impl Default for BootstrapProfile {
@@ -58,6 +77,9 @@ impl Default for BootstrapProfile {
             hub_maintenance_drones: 2,
             exploration_survey_drones: 3,
             root_relays: 1,
+            expansion_relays: default_expansion_relays(),
+            ftl_beacons: default_ftl_beacons(),
+            dedicated_surge_carriers: default_dedicated_surge_carriers(),
         }
     }
 }
@@ -113,7 +135,15 @@ pub fn validate_profile(profile: &BootstrapProfile) -> Result<(), PlannerError> 
         3,
         3,
     )?;
-    validate_count("root_relays", profile.root_relays, 1, 4)
+    validate_count("root_relays", profile.root_relays, 1, 4)?;
+    validate_count("expansion_relays", profile.expansion_relays, 0, 36)?;
+    validate_count("ftl_beacons", profile.ftl_beacons, 0, 18)?;
+    validate_count(
+        "dedicated_surge_carriers",
+        profile.dedicated_surge_carriers,
+        0,
+        12,
+    )
 }
 
 fn validate_count(
@@ -147,11 +177,20 @@ pub fn ark_device_requirements(profile: &BootstrapProfile) -> QuantityMap {
                 TRANSPORT_CONTROLLER.to_owned(),
                 profile.transport_controllers,
             ),
-            (SYSTEM_HUB.to_owned(), 1),
-            (FTL_RELAY.to_owned(), profile.root_relays),
-            (MAINTENANCE_DRONE.to_owned(), profile.hub_maintenance_drones),
+            (
+                FTL_RELAY.to_owned(),
+                profile.root_relays.saturating_add(profile.expansion_relays),
+            ),
+            (FTL_BEACON.to_owned(), profile.ftl_beacons),
+            (
+                MAINTENANCE_DRONE.to_owned(),
+                profile.hub_maintenance_drones,
+            ),
             (SURVEY_CONTROLLER.to_owned(), 1),
-            (SURVEY_DRONE.to_owned(), profile.exploration_survey_drones),
+            (
+                SURVEY_DRONE.to_owned(),
+                profile.exploration_survey_drones,
+            ),
         ]
         .into_iter()
         .collect(),
@@ -184,6 +223,34 @@ pub fn missing_carriers(
     } else {
         (missing + carrier_capacity - 1) / carrier_capacity
     })
+}
+
+/// Split a payload between the minimum newly printed carrier reserve and only
+/// as many existing carriers as are still needed.
+pub fn carrier_provisioning(
+    payload_slots: i64,
+    existing_capacities: &[i64],
+    carrier_capacity: i64,
+    minimum_printed: i64,
+) -> Result<(usize, i64), PlannerError> {
+    if carrier_capacity <= 0 {
+        return Err(PlannerError::MissingCarrierCapacity);
+    }
+    let minimum_printed = minimum_printed.max(0);
+    let capacity_after_prints = minimum_printed.saturating_mul(carrier_capacity);
+    let required_existing_capacity = payload_slots.saturating_sub(capacity_after_prints);
+    let mut selected_capacity = 0_i64;
+    let mut selected_count = 0_usize;
+    for capacity in existing_capacities {
+        if selected_capacity >= required_existing_capacity {
+            break;
+        }
+        selected_capacity = selected_capacity.saturating_add((*capacity).max(0));
+        selected_count += 1;
+    }
+    let printed = missing_carriers(payload_slots, selected_capacity, carrier_capacity)?
+        .max(minimum_printed);
+    Ok((selected_count, printed))
 }
 
 /// One dense belt learned during the regional survey.
@@ -285,12 +352,41 @@ mod tests {
         assert_eq!(requirements[MINING_DRONE], 32);
         assert_eq!(requirements[AUTOFACTORY], 6);
         assert_eq!(requirements[CARGO_FREIGHTER], 6);
+        assert_eq!(requirements[FTL_RELAY], 19);
+        assert_eq!(requirements[FTL_BEACON], 9);
+        assert!(!requirements.contains_key("system_hub"));
     }
 
     #[test]
     fn carrier_count_uses_existing_capacity_first() {
         assert_eq!(missing_carriers(91, 50, 10), Ok(5));
         assert_eq!(missing_carriers(50, 50, 10), Ok(0));
+    }
+
+    #[test]
+    fn carrier_provisioning_does_not_claim_unused_existing_carriers() {
+        assert_eq!(carrier_provisioning(45, &[9, 9, 9, 9], 9, 3), Ok((2, 3)));
+        assert_eq!(carrier_provisioning(27, &[9, 9], 9, 3), Ok((0, 3)));
+    }
+
+    #[test]
+    fn legacy_profiles_gain_the_regional_network_reserve() {
+        let profile: BootstrapProfile = serde_json::from_str(
+            r#"{
+                "mining_setups": 8,
+                "autofactories": 6,
+                "cargo_freighters": 6,
+                "transport_controllers": 6,
+                "hub_maintenance_drones": 2,
+                "exploration_survey_drones": 3,
+                "root_relays": 1
+            }"#,
+        )
+        .expect("legacy profile");
+
+        assert_eq!(profile.expansion_relays, 18);
+        assert_eq!(profile.ftl_beacons, 9);
+        assert_eq!(profile.dedicated_surge_carriers, 3);
     }
 
     #[test]
@@ -315,8 +411,8 @@ mod tests {
                 distance_from_capital_ly: 12.0,
             },
         ];
-        let selected =
-            select_dense_belts(&candidates, "CAP-BELT-1", 2, 2).expect("two dense belts");
+        let selected = select_dense_belts(&candidates, "CAP-BELT-1", 2, 2)
+            .expect("two dense belts");
         assert_eq!(selected[0].system, "CAP");
         assert_eq!(selected[1].system, "NEAR");
     }

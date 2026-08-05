@@ -31,3 +31,5 @@ logs/
 *.json
 *.zip
 mining-expansion*
+*.lock
+!cargo.lock
