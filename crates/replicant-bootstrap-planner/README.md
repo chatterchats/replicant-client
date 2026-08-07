@@ -6,7 +6,7 @@ calculates Surge Carrier capacity, produces bounded reservation tags, and
 selects the nearest distinct dense-belt systems after a survey.
 
 The crate performs no network or filesystem I/O. The executable workflow is
-in `replicant-bootstrap-cli`.
+in `replicant-cli bootstrap`.
 
 ```sh
 cargo test -p replicant-bootstrap-planner

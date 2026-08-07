@@ -6,7 +6,7 @@ and transport facts into an actionable `EventPlan`.
 
 It performs no HTTP requests, persistence, or gameplay mutations. The crate is
 private to this repository (`publish = false`) and is used by
-`replicant-event-cli`.
+`replicant-cli event`.
 
 ## What it plans
 

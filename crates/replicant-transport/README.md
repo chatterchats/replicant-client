@@ -8,7 +8,7 @@ travel, repeated trips, and optional modular-device unfurling. Event-specific
 logic such as requirement progress, achievements, beacons, and reward recovery
 stays outside this crate.
 
-The companion `replicant-transport` CLI accepts either a system-wide origin
+The `replicant-cli transport` command accepts either a system-wide origin
 (`SCEPTURUM`) or an exact source location (`SCEPTURUM-BELT-1`).
 
 Device payloads can be selected either by type/count or by tag. A tag selector

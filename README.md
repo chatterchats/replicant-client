@@ -198,12 +198,11 @@ cargo run --example fluent_queries
 
 ## Auxiliary automations
 
-The workspace also contains restart-safe CLI workflows for events, distributed
-printing, mining expansion, FTL relay expansion, survey routes, colony
-candidate analysis, and autonomous regional bootstraps. Each automation has a
-crate-local README. See
-[`replicant-bootstrap-cli`](crates/replicant-bootstrap-cli/README.md) for the
-two-replicant Beta/Gamma ark workflow.
+The workspace also contains a single user-facing [`replicant-cli`](crates/replicant-cli/README.md)
+command crate for events, distributed printing, transport, mining expansion,
+FTL relay expansion, survey routes, colony candidate analysis, and autonomous
+regional bootstraps. The planner and reusable workflow crates remain separate
+libraries, while all executable command surfaces live under `replicant-cli`.
 
 ## Persistence and security
 

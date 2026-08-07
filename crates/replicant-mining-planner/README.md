@@ -38,7 +38,7 @@ assert!(missing.values().all(|quantity| *quantity >= 0));
 
 The planner does not decide which belt is best, inspect live stock, schedule
 Autofactories, transport equipment, or configure devices. Those orchestration
-steps belong to `replicant-mining-cli` and `replicant-printing`.
+steps belong to `replicant-cli mining` and `replicant-printing`.
 
 ## Verify
 

@@ -1159,26 +1159,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "replicant-bootstrap-cli"
-version = "0.1.0"
-dependencies = [
- "futures",
- "replicant-bootstrap-planner",
- "replicant-client",
- "replicant-mining-cli",
- "replicant-mining-planner",
- "replicant-printing",
- "replicant-relay-cli",
- "replicant-survey-cli",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "replicant-bootstrap-planner"
 version = "0.1.0"
 dependencies = [
@@ -1186,6 +1166,26 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "replicant-cli"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "replicant-bootstrap-planner",
+ "replicant-client",
+ "replicant-event-planner",
+ "replicant-mining-planner",
+ "replicant-printing",
+ "replicant-route-planner",
+ "replicant-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1212,44 +1212,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "replicant-event-cli"
-version = "0.1.0"
-dependencies = [
- "futures",
- "replicant-client",
- "replicant-event-planner",
- "replicant-printing",
- "replicant-transport",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "replicant-event-planner"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
-]
-
-[[package]]
-name = "replicant-mining-cli"
-version = "0.1.0"
-dependencies = [
- "replicant-client",
- "replicant-mining-planner",
- "replicant-printing",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1274,57 +1242,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "replicant-printing-cli"
-version = "0.1.0"
-dependencies = [
- "replicant-client",
- "replicant-printing",
- "serde_json",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "replicant-relay-cli"
-version = "0.1.0"
-dependencies = [
- "replicant-client",
- "replicant-route-planner",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "replicant-rikers-cli"
-version = "0.1.0"
-dependencies = [
- "replicant-client",
- "tokio",
-]
-
-[[package]]
 name = "replicant-route-planner"
 version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
-]
-
-[[package]]
-name = "replicant-survey-cli"
-version = "0.1.0"
-dependencies = [
- "futures",
- "replicant-client",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1337,17 +1259,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "replicant-transport-cli"
-version = "0.1.0"
-dependencies = [
- "replicant-client",
- "replicant-transport",
- "serde_json",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]

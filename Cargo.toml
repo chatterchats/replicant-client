@@ -3,18 +3,11 @@ members = [
   ".",
   "crates/replicant-route-planner",
   "crates/replicant-event-planner",
-  "crates/replicant-event-cli",
   "crates/replicant-mining-planner",
-  "crates/replicant-mining-cli",
   "crates/replicant-bootstrap-planner",
-  "crates/replicant-bootstrap-cli",
   "crates/replicant-printing",
-  "crates/replicant-printing-cli",
   "crates/replicant-transport",
-  "crates/replicant-transport-cli",
-  "crates/replicant-relay-cli",
-  "crates/replicant-survey-cli",
-  "crates/replicant-rikers-cli",
+  "crates/replicant-cli",
 ]
 resolver = "3"
 
