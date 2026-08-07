@@ -41,6 +41,7 @@ impl Config {
         let mut destination = None;
         let mut resources = ResourceMap::new();
         let mut devices = Vec::new();
+        let mut device_tags = Vec::new();
         let mut carrier = None;
         let mut database = PathBuf::from(
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
@@ -81,6 +82,19 @@ impl Config {
                         quantity,
                         device_type: normalize_key(&device_type),
                     });
+                }
+                "--device-tag" => {
+                    let tag = required_argument(&mut arguments, "--device-tag")?;
+                    let tag = tag.trim();
+                    if tag.is_empty() {
+                        return Err(app_error(
+                            io::ErrorKind::InvalidInput,
+                            "--device-tag cannot be empty",
+                        ));
+                    }
+                    if !device_tags.iter().any(|existing| existing == tag) {
+                        device_tags.push(tag.to_owned());
+                    }
                 }
                 "--resource" => {
                     let quantity = parse_positive_i64(
@@ -181,10 +195,10 @@ impl Config {
         })?;
         let destination = destination
             .ok_or_else(|| app_error(io::ErrorKind::InvalidInput, "--destination is required"))?;
-        if resources.is_empty() && devices.is_empty() {
+        if resources.is_empty() && devices.is_empty() && device_tags.is_empty() {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,
-                "specify at least one resource flag, --resource, or --devices",
+                "specify at least one resource flag, --resource, --devices, or --device-tag",
             ));
         }
 
@@ -194,6 +208,7 @@ impl Config {
                 destination: destination.trim().to_ascii_uppercase(),
                 resources,
                 devices,
+                device_tags,
                 carrier,
             },
             database,
@@ -438,10 +453,11 @@ fn print_help() {
     println!(
         "Replicant point-to-point transport\n\n\
 Usage:\n  replicant-transport --origin ORIGIN --destination LOCATION [PAYLOAD] [OPTIONS]\n\n\
-Payload:\n  --devices N DEVICE_TYPE   Move N free inactive devices (repeatable)\n  --carbon N                Move Carbon\n  --conductive N            Move Conductive\n  --rares N                 Move Rares\n  --silicates N             Move Silicates\n  --structural N            Move Structural\n  --volatiles N             Move Volatiles\n  --resource N TYPE         Move any open resource type (repeatable)\n\n\
+Payload:\n  --devices N DEVICE_TYPE   Move N free inactive devices (repeatable)\n  --device-tag TAG          Move every eligible device with TAG (repeatable)\n  --carbon N                Move Carbon\n  --conductive N            Move Conductive\n  --rares N                 Move Rares\n  --silicates N             Move Silicates\n  --structural N            Move Structural\n  --volatiles N             Move Volatiles\n  --resource N TYPE         Move any open resource type (repeatable)\n\n\
 Routing and carrier selection:\n  --origin LOCATION|SYSTEM  Exact source location, or search the whole source system\n  --destination LOCATION    Exact delivery location\n  --carrier TYPE            Require one transport of TYPE\n  --carrier N TYPE          Require N transports of TYPE\n  --return-carriers         Return transports after delivery (exact origin only)\n  --no-unfurl               Leave compacted modular payload compacted after delivery\n\n\
 Shared options:\n  --database PATH           Managed SQLite database\n  --wait-timeout-secs N     Travel/state wait timeout (default: 21600)\n  --poll-seconds N          State poll interval (default: 5)\n  --dry-run, --plan         Resolve payload/carriers without moving anything\n  --verbose                 Show transport tracing in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit plan/report as JSON\n  -h, --help                Show this help\n\n\
 Examples:\n  replicant-transport --origin SCEPTURUM --devices 36 exotic_matter_injector \\\n    --carrier 1 mobile_fleet --destination TWAFFY-OBJ-1\n\n\
+  replicant-transport --origin SCEPTURUM --device-tag twaffy-obj-1 \\\n    --carrier 1 mobile_fleet --destination TWAFFY-OBJ-1\n\n\
   replicant-transport --origin SCEPTURUM-BELT-1 --rares 400 --volatiles 100 \\\n    --carrier cargo_freighter --destination TWAFFY-OBJ-1\n\n\
 If --carrier is omitted, the planner chooses the smallest free transport that\n\
 can make the delivery in one trip; if none can, it chooses the largest usable\n\

@@ -8,6 +8,11 @@ replicant-transport --origin SCEPTURUM \
   --carrier 1 mobile_fleet \
   --destination TWAFFY-OBJ-1
 
+replicant-transport --origin SCEPTURUM \
+  --device-tag twaffy-obj-1 \
+  --carrier 1 mobile_fleet \
+  --destination TWAFFY-OBJ-1
+
 replicant-transport --origin SCEPTURUM-BELT-1 \
   --rares 400 --volatiles 100 \
   --carrier cargo_freighter \

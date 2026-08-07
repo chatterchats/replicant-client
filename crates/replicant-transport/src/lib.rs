@@ -59,6 +59,9 @@ pub struct DeliveryRequest {
     /// Device quantities to move.
     #[serde(default)]
     pub devices: Vec<DeviceRequest>,
+    /// Move every eligible device in the origin scope carrying any of these tags.
+    #[serde(default)]
+    pub device_tags: Vec<String>,
     /// Optional transport type/count restriction.
     #[serde(default)]
     pub carrier: Option<CarrierPreference>,
@@ -192,7 +195,12 @@ pub async fn plan_delivery(client: &Client, request: &DeliveryRequest) -> Result
         devices.push(handle.snapshot().await?);
     }
 
-    let payload_devices = select_payload_devices(&request.origin, &request.devices, &devices)?;
+    let payload_devices = select_payload_devices(
+        &request.origin,
+        &request.devices,
+        &request.device_tags,
+        &devices,
+    )?;
     let payload_codes = payload_devices
         .iter()
         .map(|payload| payload.code.clone())
@@ -353,9 +361,10 @@ fn validate_request(request: &DeliveryRequest) -> Result<()> {
             "destination cannot be empty".into(),
         ));
     }
-    if request.resources.is_empty() && request.devices.is_empty() {
+    if request.resources.is_empty() && request.devices.is_empty() && request.device_tags.is_empty()
+    {
         return Err(TransportError::Invalid(
-            "delivery requires at least one resource or device payload".into(),
+            "delivery requires at least one resource, device type, or device tag payload".into(),
         ));
     }
     if request.resources.values().any(|quantity| *quantity <= 0) {
@@ -366,6 +375,11 @@ fn validate_request(request: &DeliveryRequest) -> Result<()> {
     if request.devices.iter().any(|request| request.quantity <= 0) {
         return Err(TransportError::Invalid(
             "device quantities must be positive".into(),
+        ));
+    }
+    if request.device_tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(TransportError::Invalid(
+            "device tags cannot be empty".into(),
         ));
     }
     if request
@@ -491,10 +505,85 @@ async fn fetch_transport_capacities(client: &Client) -> Result<BTreeMap<String, 
 fn select_payload_devices(
     origin: &str,
     requests: &[DeviceRequest],
+    tags: &[String],
     devices: &[Device],
 ) -> Result<Vec<PayloadDevice>> {
     let mut selected = Vec::new();
     let mut used = BTreeSet::new();
+
+    for tag in tags {
+        let tag = tag.trim();
+        let mut matching = devices
+            .iter()
+            .filter(|device| {
+                device.tags.iter().any(|existing| existing == tag)
+                    && device
+                        .location
+                        .as_ref()
+                        .is_some_and(|location| scope_matches(origin, location.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        matching.sort_by(|left, right| {
+            let left_location = left
+                .location
+                .as_ref()
+                .map(|item| item.id.as_str())
+                .unwrap_or("");
+            let right_location = right
+                .location
+                .as_ref()
+                .map(|item| item.id.as_str())
+                .unwrap_or("");
+            origin_location_rank(origin, left_location)
+                .cmp(&origin_location_rank(origin, right_location))
+                .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
+        });
+
+        if matching.is_empty() {
+            return Err(TransportError::NotFound(format!(
+                "origin {origin} has no devices tagged {tag}"
+            )));
+        }
+
+        for device in matching {
+            let code = device.key.id.as_str().to_owned();
+            if used.contains(&code) {
+                continue;
+            }
+            if !eligible_payload(device) {
+                return Err(TransportError::Invalid(format!(
+                    "device {code} tagged {tag} is in the origin scope but is not a free inactive payload"
+                )));
+            }
+            if workflow_reserved(&device.tags) {
+                return Err(TransportError::Invalid(format!(
+                    "device {code} tagged {tag} is reserved by another workflow"
+                )));
+            }
+            let device_type = device
+                .device_type
+                .as_ref()
+                .map(|device_type| device_type.as_str().to_owned())
+                .ok_or_else(|| {
+                    TransportError::Invalid(format!(
+                        "payload device {code} tagged {tag} has no device type"
+                    ))
+                })?;
+            let location = device
+                .location
+                .as_ref()
+                .map(|item| item.id.as_str().to_owned())
+                .ok_or_else(|| {
+                    TransportError::Invalid(format!("payload device {code} has no location"))
+                })?;
+            used.insert(code.clone());
+            selected.push(PayloadDevice {
+                code,
+                device_type,
+                origin: location,
+            });
+        }
+    }
 
     for request in requests {
         let mut candidates = devices
@@ -508,10 +597,7 @@ fn select_payload_devices(
                     .location
                     .as_ref()
                     .is_some_and(|location| scope_matches(origin, location.id.as_str()))
-                    && inactive_payload(device)
-                    && device.relationships.attached_to.is_none()
-                    && device.relationships.stowed_in.is_none()
-                    && device.relationships.controller.is_none()
+                    && eligible_payload(device)
                     && !workflow_reserved(&device.tags)
                     && !used.contains(device.key.id.as_str())
             })
@@ -1394,6 +1480,13 @@ fn inactive_payload(device: &Device) -> bool {
     }) && device.travel.is_none()
 }
 
+fn eligible_payload(device: &Device) -> bool {
+    inactive_payload(device)
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.relationships.controller.is_none()
+}
+
 fn workflow_reserved(tags: &[String]) -> bool {
     tags.iter().any(|tag| {
         RESERVED_TAG_PREFIXES
@@ -1489,6 +1582,27 @@ fn format_resources(resources: &ResourceMap) -> String {
 mod tests {
     use super::*;
 
+    fn payload_device(code: &str, location: &str, tags: &[&str]) -> Device {
+        Device {
+            key: replicant_client::DeviceKey::live(code.into()),
+            device_type: Some(replicant_client::DeviceType::from("exotic_matter_injector")),
+            status: Some(replicant_client::DeviceStatus::from("inactive")),
+            location: Some(replicant_client::LocationKey::live(location.into())),
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            relationships: replicant_client::DeviceRelationships::default(),
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            active_directive: None,
+            travel: None,
+            access: replicant_client::domain::AccessScope::Owned,
+        }
+    }
+
     #[test]
     fn system_origin_matches_all_locations_in_system() {
         assert!(scope_matches("SCEPTURUM", "SCEPTURUM-BELT-1"));
@@ -1516,5 +1630,44 @@ mod tests {
             .collect();
         let manifest = take_manifest(&resources, 450);
         assert_eq!(manifest.values().sum::<i64>(), 450);
+    }
+
+    #[test]
+    fn tag_selector_selects_every_matching_device_in_origin_scope() {
+        let devices = vec![
+            payload_device("A", "SCEPTURUM-BELT-1", &["twaffy-obj-1"]),
+            payload_device("B", "SCEPTURUM-7-L4", &["twaffy-obj-1"]),
+            payload_device("C", "TWAFFY-OBJ-1", &["twaffy-obj-1"]),
+            payload_device("D", "SCEPTURUM-BELT-1", &["other"]),
+        ];
+
+        let selected = select_payload_devices("SCEPTURUM", &[], &["twaffy-obj-1".into()], &devices)
+            .expect("tag selection");
+        let codes = selected
+            .iter()
+            .map(|device| device.code.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(codes, ["A", "B"]);
+    }
+
+    #[test]
+    fn repeated_tag_selectors_do_not_duplicate_payload_codes() {
+        let devices = vec![payload_device(
+            "A",
+            "SCEPTURUM-BELT-1",
+            &["twaffy-obj-1", "ring-payload"],
+        )];
+
+        let selected = select_payload_devices(
+            "SCEPTURUM",
+            &[],
+            &["twaffy-obj-1".into(), "ring-payload".into()],
+            &devices,
+        )
+        .expect("tag selection");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].code, "A");
     }
 }
