@@ -31,6 +31,9 @@ pub struct Blueprint {
     /// Open device feature flags supplied by the blueprint catalogue.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Printable device components consumed by one completed unit.
+    #[serde(default)]
+    pub components: QuantityMap,
 }
 
 impl PrintTime for Blueprint {
@@ -101,6 +104,21 @@ pub struct PrintSchedule {
     pub projected_finish_seconds: f64,
 }
 
+/// Recursive manufacturing prerequisites for one user request.
+///
+/// Component waves are ordered from deepest leaf components to the devices
+/// consumed directly by the requested outputs. Each wave must physically
+/// finish before the next wave can be queued.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrintDependencyPlan {
+    /// Canonical quantities explicitly requested by the caller.
+    pub requested: QuantityMap,
+    /// Missing component quantities grouped into completion-ordered waves.
+    pub component_waves: Vec<QuantityMap>,
+    /// Existing free component stock reserved instead of reprinting it.
+    pub reused_components: QuantityMap,
+}
+
 /// Pure scheduling validation failures.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ScheduleError {
@@ -115,6 +133,20 @@ pub enum ScheduleError {
     /// A required blueprint was not supplied.
     #[error("missing blueprint for requested device type `{0}`")]
     MissingBlueprint(String),
+    /// A missing component cannot be printed because its blueprint is locked
+    /// or otherwise absent from the account catalogue.
+    #[error(
+        "component `{device_type}` is short by {missing}, but its blueprint is not unlocked"
+    )]
+    MissingComponentBlueprint {
+        /// Component device type.
+        device_type: String,
+        /// Quantity still missing after reserving local stock.
+        missing: i64,
+    },
+    /// Recursive component declarations contain a dependency cycle.
+    #[error("blueprint component cycle includes `{0}`")]
+    ComponentCycle(String),
     /// Manufacturing was requested without an Autofactory.
     #[error("printing is required but no Autofactory is available")]
     NoAutofactory,
@@ -133,6 +165,109 @@ pub fn normalize_requests(requests: &[PrintRequest]) -> Result<QuantityMap, Sche
         *quantities.entry(request.device_type.clone()).or_default() += request.quantity;
     }
     Ok(quantities)
+}
+
+/// Expands printable component requirements into dependency-ordered waves.
+///
+/// Explicit requests are always printed in full. Existing free stock is only
+/// applied to component requirements, because consuming a device the caller
+/// explicitly requested would change the requested final quantity.
+pub fn plan_print_dependencies(
+    requests: &[PrintRequest],
+    blueprints: &BTreeMap<String, Blueprint>,
+    available_components: &QuantityMap,
+) -> Result<PrintDependencyPlan, ScheduleError> {
+    let requested = normalize_requests(requests)?;
+    for device_type in requested.keys() {
+        if !blueprints.contains_key(device_type) {
+            return Err(ScheduleError::MissingBlueprint(device_type.clone()));
+        }
+    }
+
+    let mut available = available_components.clone();
+    let mut reused_components = QuantityMap::new();
+    let mut waves = BTreeMap::<usize, QuantityMap>::new();
+
+    for (device_type, quantity) in &requested {
+        let blueprint = blueprints
+            .get(device_type)
+            .ok_or_else(|| ScheduleError::MissingBlueprint(device_type.clone()))?;
+        let mut visiting = vec![device_type.clone()];
+        for (component, component_quantity) in &blueprint.components {
+            schedule_component_requirement(
+                component,
+                component_quantity.saturating_mul(*quantity),
+                blueprints,
+                &mut available,
+                &mut reused_components,
+                &mut waves,
+                &mut visiting,
+            )?;
+        }
+    }
+
+    Ok(PrintDependencyPlan {
+        requested,
+        component_waves: waves.into_values().collect(),
+        reused_components,
+    })
+}
+
+fn schedule_component_requirement(
+    device_type: &str,
+    quantity: i64,
+    blueprints: &BTreeMap<String, Blueprint>,
+    available: &mut QuantityMap,
+    reused: &mut QuantityMap,
+    waves: &mut BTreeMap<usize, QuantityMap>,
+    visiting: &mut Vec<String>,
+) -> Result<usize, ScheduleError> {
+    if quantity <= 0 {
+        return Ok(0);
+    }
+    if visiting.iter().any(|item| item == device_type) {
+        return Err(ScheduleError::ComponentCycle(device_type.to_owned()));
+    }
+
+    let available_quantity = available.get(device_type).copied().unwrap_or(0).max(0);
+    let reused_quantity = quantity.min(available_quantity);
+    if reused_quantity > 0 {
+        available.insert(device_type.to_owned(), available_quantity - reused_quantity);
+        *reused.entry(device_type.to_owned()).or_default() += reused_quantity;
+    }
+    let missing = quantity - reused_quantity;
+    if missing == 0 {
+        return Ok(0);
+    }
+
+    let blueprint = blueprints.get(device_type).ok_or_else(|| {
+        ScheduleError::MissingComponentBlueprint {
+            device_type: device_type.to_owned(),
+            missing,
+        }
+    })?;
+    visiting.push(device_type.to_owned());
+    let mut deepest_child = 0usize;
+    for (component, component_quantity) in &blueprint.components {
+        deepest_child = deepest_child.max(schedule_component_requirement(
+            component,
+            component_quantity.saturating_mul(missing),
+            blueprints,
+            available,
+            reused,
+            waves,
+            visiting,
+        )?);
+    }
+    visiting.pop();
+
+    let depth = deepest_child.saturating_add(1);
+    *waves
+        .entry(depth)
+        .or_default()
+        .entry(device_type.to_owned())
+        .or_default() += missing;
+    Ok(depth)
 }
 
 /// Balances individual print units against existing Autofactory workloads.
@@ -244,6 +379,7 @@ mod tests {
                 device_type: "device".into(),
                 print_time_seconds: 100.0,
                 features: Vec::new(),
+                components: QuantityMap::new(),
             },
         )]
         .into_iter()
@@ -282,11 +418,13 @@ mod tests {
             device_type: "autofactory".into(),
             print_time_seconds: 1.0,
             features: vec!["modular".into()],
+            components: QuantityMap::new(),
         };
         let ordinary = Blueprint {
             device_type: "mining_drone".into(),
             print_time_seconds: 1.0,
             features: Vec::new(),
+            components: QuantityMap::new(),
         };
         assert!(modular.is_modular());
         assert!(!ordinary.is_modular());
@@ -304,5 +442,124 @@ mod tests {
         };
         assert!(hub.is_modular());
         assert!(autofactory.is_modular());
+    }
+
+    fn dependency_blueprint(device_type: &str, components: &[(&str, i64)]) -> Blueprint {
+        Blueprint {
+            device_type: device_type.into(),
+            print_time_seconds: 1.0,
+            features: Vec::new(),
+            components: components
+                .iter()
+                .map(|(name, quantity)| ((*name).to_owned(), *quantity))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn plans_exotic_injector_components_before_parent() {
+        let blueprints = [
+            (
+                "exotic_matter_injector".into(),
+                dependency_blueprint(
+                    "exotic_matter_injector",
+                    &[
+                        ("casimir_array", 1),
+                        ("exotic_particle_trap", 2),
+                        ("negative_energy_conduit", 1),
+                    ],
+                ),
+            ),
+            (
+                "exotic_particle_trap".into(),
+                dependency_blueprint("exotic_particle_trap", &[]),
+            ),
+            (
+                "negative_energy_conduit".into(),
+                dependency_blueprint("negative_energy_conduit", &[]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let stock = [("casimir_array".into(), 1)].into_iter().collect();
+        let plan = plan_print_dependencies(
+            &[PrintRequest::new("exotic_matter_injector", 1)],
+            &blueprints,
+            &stock,
+        )
+        .unwrap();
+        assert_eq!(plan.component_waves.len(), 1);
+        assert_eq!(plan.component_waves[0]["exotic_particle_trap"], 2);
+        assert_eq!(plan.component_waves[0]["negative_energy_conduit"], 1);
+        assert_eq!(plan.reused_components["casimir_array"], 1);
+        assert_eq!(plan.requested["exotic_matter_injector"], 1);
+    }
+
+    #[test]
+    fn nested_components_are_ordered_leaf_first() {
+        let blueprints = [
+            (
+                "parent".into(),
+                dependency_blueprint("parent", &[("middle", 1)]),
+            ),
+            (
+                "middle".into(),
+                dependency_blueprint("middle", &[("leaf", 2)]),
+            ),
+            ("leaf".into(), dependency_blueprint("leaf", &[])),
+        ]
+        .into_iter()
+        .collect();
+        let plan = plan_print_dependencies(
+            &[PrintRequest::new("parent", 1)],
+            &blueprints,
+            &QuantityMap::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.component_waves.len(), 2);
+        assert_eq!(plan.component_waves[0]["leaf"], 2);
+        assert_eq!(plan.component_waves[1]["middle"], 1);
+    }
+
+    #[test]
+    fn locked_component_is_allowed_when_local_stock_covers_it() {
+        let blueprints = [(
+            "parent".into(),
+            dependency_blueprint("parent", &[("event_component", 1)]),
+        )]
+        .into_iter()
+        .collect();
+        let stock = [("event_component".into(), 1)].into_iter().collect();
+        let plan = plan_print_dependencies(
+            &[PrintRequest::new("parent", 1)],
+            &blueprints,
+            &stock,
+        )
+        .unwrap();
+        assert!(plan.component_waves.is_empty());
+        assert_eq!(plan.reused_components["event_component"], 1);
+    }
+
+    #[test]
+    fn rejects_component_cycles() {
+        let blueprints = [
+            (
+                "parent".into(),
+                dependency_blueprint("parent", &[("part", 1)]),
+            ),
+            (
+                "part".into(),
+                dependency_blueprint("part", &[("parent", 1)]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let error = plan_print_dependencies(
+            &[PrintRequest::new("parent", 1)],
+            &blueprints,
+            &QuantityMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ScheduleError::ComponentCycle(_)));
     }
 }
