@@ -21,6 +21,15 @@ help:
 	  'policy-checks          		Run all checked-in policy gates' \
 	  'ci                    		Run the full local CI-equivalent suite'
 
+clean:
+	$(CARGO) clean
+
+build:
+	$(CARGO) build --all-features
+
+build-workspace:
+	$(CARGO) build --workspace --all-features
+
 fmt:
 	$(CARGO) fmt --all
 

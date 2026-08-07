@@ -417,8 +417,9 @@ fn init_logging(config: &Config) -> AnyResult<()> {
     if !config.verbose && config.log_file.is_none() {
         return Ok(());
     }
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,replicant_cli::relay=info,replicant_client::ops=info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,replicant_cli::relay=info,replicant_client::ops=info")
+    });
     match (&config.log_file, config.verbose) {
         (None, true) => tracing_subscriber::registry()
             .with(filter)

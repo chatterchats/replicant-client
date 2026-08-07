@@ -4,6 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::mining::{MiningExpansionRequest, execute_expansion as execute_mining};
+use crate::relay::{RelayExpansionRequest, execute_expansion as execute_relays};
+use crate::survey::{SurveyRequest, execute_survey};
 use futures::future::join_all;
 use replicant_bootstrap_planner::{
     AUTOFACTORY, BeltCandidate, FTL_RELAY, SEED_RESOURCES, SURGE_CARRIER, ark_device_requirements,
@@ -14,7 +17,6 @@ use replicant_client::{
     domain::{GalacticPosition, Location},
     raw,
 };
-use crate::mining::{MiningExpansionRequest, execute_expansion as execute_mining};
 use replicant_mining_planner::{
     CARGO_FREIGHTER, MAINTENANCE_DRONE, SURVEY_CONTROLLER, SURVEY_DRONE,
 };
@@ -22,8 +24,6 @@ use replicant_printing::{
     PrintRequest,
     managed::{QueueOptions, fetch_blueprints, queue_prints},
 };
-use crate::relay::{RelayExpansionRequest, execute_expansion as execute_relays};
-use crate::survey::{SurveyRequest, execute_survey};
 use serde_json::{Map, Value};
 use tokio::time::sleep;
 use tracing::{info, warn};

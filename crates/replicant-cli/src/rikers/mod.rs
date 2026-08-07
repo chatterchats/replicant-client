@@ -42,7 +42,9 @@ struct Config {
 }
 
 impl Config {
-    fn from_args_and_env(arguments: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn from_args_and_env(
+        arguments: impl IntoIterator<Item = String>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let mut database =
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".to_owned());
         let mut limit = env::var("RS_RIKERS_LIMIT")
