@@ -219,12 +219,7 @@ impl DeviceStock {
         self.status.as_deref().is_some_and(|status| {
             matches!(
                 status.to_ascii_lowercase().as_str(),
-                "inactive"
-                    | "deactivated"
-                    | "idle"
-                    | "stowed"
-                    | "recalled"
-                    | "compacted"
+                "inactive" | "deactivated" | "idle" | "stowed" | "recalled" | "compacted"
             )
         }) && !self.travelling
     }
@@ -259,18 +254,8 @@ impl DeviceStock {
                 return allowed_event_mission != Some(tag.as_str());
             }
             [
-                "boot-m:",
-                "boot-r:",
-                "region:",
-                "mine-m:",
-                "mine-b:",
-                "mine-r:",
-                "mine-s:",
-                "relay-m:",
-                "relay-b:",
-                "relay-s:",
-                "infra-r:",
-                "infra-s:",
+                "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:", "mine-s:",
+                "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
             ]
             .iter()
             .any(|prefix| tag.starts_with(*prefix))
@@ -1108,8 +1093,7 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
             && device.is_inactive()
             && device.is_free_standing()
             && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
-    })
-    {
+    }) {
         return BeaconPlan {
             action: BeaconAction::DeployExisting,
             device_code: Some(beacon.code.clone()),
@@ -2020,12 +2004,7 @@ mod tests {
     fn payload_reuse_is_limited_to_free_unreserved_stock_at_the_home_hub() {
         let mut context = context();
         for (code, location, tags, attached_to_device_code) in [
-            (
-                "SENSOR-REMOTE",
-                "RHWYRHYR-5-L4",
-                BTreeSet::new(),
-                None,
-            ),
+            ("SENSOR-REMOTE", "RHWYRHYR-5-L4", BTreeSet::new(), None),
             (
                 "SENSOR-SAME-SYSTEM",
                 "SCEPTURUM-7-L4",
@@ -2044,12 +2023,7 @@ mod tests {
                 BTreeSet::new(),
                 Some("OTHER-CARRIER".into()),
             ),
-            (
-                "SENSOR-HOME",
-                "SCEPTURUM-BELT-1",
-                BTreeSet::new(),
-                None,
-            ),
+            ("SENSOR-HOME", "SCEPTURUM-BELT-1", BTreeSet::new(), None),
         ] {
             context.devices.push(DeviceStock {
                 code: code.into(),

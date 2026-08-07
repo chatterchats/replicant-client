@@ -69,16 +69,11 @@ where
         .into_iter()
         .filter_map(|value| match value {
             serde_json::Value::String(value) => Some(Ok(value)),
-            serde_json::Value::Object(object) => [
-                "replicant_code",
-                "device_code",
-                "code",
-                "id",
-            ]
-            .into_iter()
-            .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
-            .map(str::to_owned)
-            .map(Ok),
+            serde_json::Value::Object(object) => ["replicant_code", "device_code", "code", "id"]
+                .into_iter()
+                .find_map(|key| object.get(key).and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .map(Ok),
             serde_json::Value::Null => None,
             other => Some(Err(D::Error::custom(format!(
                 "expected a string or reference object, got {other}"
@@ -1156,7 +1151,10 @@ mod command_response_tests {
         let payload = serde_json::to_value(command).expect("serialize triangulate");
         assert_eq!(payload["command"], "triangulate");
         assert_eq!(payload["signature"], "a3f7c2e8b1d94f06");
-        assert_eq!(payload["target"], serde_json::json!([5000.0, 14_000.0, 100.0]));
+        assert_eq!(
+            payload["target"],
+            serde_json::json!([5000.0, 14_000.0, 100.0])
+        );
     }
 
     #[test]
@@ -1228,7 +1226,10 @@ mod command_response_tests {
         }))
         .expect("mixed command reference lists should deserialize");
 
-        assert_eq!(response.attached_devices, ["D1".to_owned(), "D2".to_owned()]);
+        assert_eq!(
+            response.attached_devices,
+            ["D1".to_owned(), "D2".to_owned()]
+        );
         assert_eq!(response.detached, ["D3".to_owned()]);
     }
 }

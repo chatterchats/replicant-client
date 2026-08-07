@@ -423,12 +423,11 @@ impl Config {
                     )?;
                 }
                 "--maintenance-check-secs" => {
-                    maintenance_check_interval = Duration::from_secs(u64::try_from(
-                        positive_usize(
+                    maintenance_check_interval =
+                        Duration::from_secs(u64::try_from(positive_usize(
                             &required_argument(&mut arguments, "--maintenance-check-secs")?,
                             "--maintenance-check-secs",
-                        )?,
-                    )?);
+                        )?)?);
                 }
                 "--verbose" => verbose = true,
                 "--log-file" => {
@@ -1810,13 +1809,7 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
         let controller_code = if let Some(code) = &config.controller_override {
             ensure_account_owned(&account_owned_devices, code)?;
             let device = refresh_device_snapshot(client, code).await?;
-            validate_controller_candidate(
-                &device,
-                code,
-                &location_id,
-                &config.vessel,
-                true,
-            )?;
+            validate_controller_candidate(&device, code, &location_id, &config.vessel, true)?;
             code.clone()
         } else {
             let controllers = client
@@ -2787,7 +2780,6 @@ async fn wait_immediate_operation(label: &str, operation: &Operation) -> AnyResu
     }
 }
 
-
 async fn fleet_capacity_snapshot(
     client: &Client,
     plan: &RoutePlan,
@@ -2806,13 +2798,11 @@ async fn fleet_below_maintenance_threshold(
     threshold_pct: f64,
 ) -> AnyResult<bool> {
     let capacities = fleet_capacity_snapshot(client, plan).await?;
-    let degraded = capacities
-        .iter()
-        .any(|(_, capacity)| {
-            capacity
-                .as_ref()
-                .is_some_and(|value| *value <= threshold_pct)
-        });
+    let degraded = capacities.iter().any(|(_, capacity)| {
+        capacity
+            .as_ref()
+            .is_some_and(|value| *value <= threshold_pct)
+    });
     info!(
         target: "replicant_client::explore",
         event = "survey.capacity_checked",
@@ -2825,9 +2815,7 @@ async fn fleet_below_maintenance_threshold(
 }
 
 fn maintenance_interval_due(plan: &RoutePlan) -> Option<usize> {
-    let completed_since_maintenance = plan
-        .next_index
-        .saturating_sub(plan.last_maintenance_index);
+    let completed_since_maintenance = plan.next_index.saturating_sub(plan.last_maintenance_index);
     (completed_since_maintenance >= plan.maintenance_interval)
         .then_some(completed_since_maintenance)
 }
@@ -2859,7 +2847,9 @@ async fn current_replicant_location(
 ) -> AnyResult<Option<String>> {
     let handle = client.replicants().get_owned(replicant_code).await?;
     let snapshot = handle.snapshot().await?;
-    Ok(snapshot.location.map(|location| location.id.as_str().to_owned()))
+    Ok(snapshot
+        .location
+        .map(|location| location.id.as_str().to_owned()))
 }
 
 async fn travel_replicant_to_location(
@@ -2922,10 +2912,12 @@ async fn recover_fleet_for_maintenance(
     config: &Config,
     plan: &RoutePlan,
 ) -> AnyResult<()> {
-    let controller_code = plan
-        .controller
-        .as_deref()
-        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route plan has no survey controller"))?;
+    let controller_code = plan.controller.as_deref().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            "route plan has no survey controller",
+        )
+    })?;
     let controller_snapshot = refresh_device_snapshot(client, controller_code).await?;
     if operational_capacity_percent(&controller_snapshot)
         .map_or(true, |capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT)
@@ -3092,7 +3084,10 @@ async fn deploy_device_for_maintenance(
     if device_stowed_in(&device) != Some(config.vessel.as_str()) {
         return Err(app_error(
             io::ErrorKind::InvalidData,
-            format!("survey device {code} is not stowed in vessel {} before maintenance", config.vessel),
+            format!(
+                "survey device {code} is not stowed in vessel {} before maintenance",
+                config.vessel
+            ),
         ));
     }
     let operation = client.devices().get(code).await?.deploy().await?;
@@ -3100,9 +3095,7 @@ async fn deploy_device_for_maintenance(
     let started = Instant::now();
     loop {
         let refreshed = refresh_device_snapshot(client, code).await?;
-        if device_stowed_in(&refreshed).is_none()
-            && device_location(&refreshed) == Some(location)
-        {
+        if device_stowed_in(&refreshed).is_none() && device_location(&refreshed) == Some(location) {
             return Ok(());
         }
         if started.elapsed() >= Duration::from_secs(10 * 60) {
@@ -3117,9 +3110,7 @@ async fn deploy_device_for_maintenance(
 
 async fn stop_device_for_repair(client: &Client, code: &str) -> AnyResult<()> {
     let device = refresh_device_snapshot(client, code).await?;
-    if active_directive_status(&device) == Some("inactive")
-        || device.active_directive.is_none()
-    {
+    if active_directive_status(&device) == Some("inactive") || device.active_directive.is_none() {
         return Ok(());
     }
 
@@ -3156,13 +3147,14 @@ async fn wait_for_repair_capacity(
         let status = operation.status().await?;
         if matches!(
             status,
-            OperationStatus::Rejected
-                | OperationStatus::Cancelled
-                | OperationStatus::Failed
+            OperationStatus::Rejected | OperationStatus::Cancelled | OperationStatus::Failed
         ) {
             return Err(app_error(
                 io::ErrorKind::Other,
-                format!("repair operation {} for {code} ended as {status:?}", operation.id()),
+                format!(
+                    "repair operation {} for {code} ended as {status:?}",
+                    operation.id()
+                ),
             ));
         }
         if started.elapsed() >= MAINTENANCE_TIMEOUT {
@@ -3188,13 +3180,7 @@ fn active_directive_for_restore(device: &Device) -> Option<SavedDeviceDirective>
         return None;
     }
     let directive = active.directive.as_ref()?.as_str().to_owned();
-    let object = |key: &str| {
-        active
-            .details
-            .get(key)
-            .and_then(Value::as_object)
-            .cloned()
-    };
+    let object = |key: &str| active.details.get(key).and_then(Value::as_object).cloned();
     Some(SavedDeviceDirective {
         directive,
         configuration: object("configuration"),
@@ -3202,11 +3188,7 @@ fn active_directive_for_restore(device: &Device) -> Option<SavedDeviceDirective>
     })
 }
 
-async fn repair_survey_fleet(
-    client: &Client,
-    config: &Config,
-    plan: &RoutePlan,
-) -> AnyResult<()> {
+async fn repair_survey_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyResult<()> {
     let (maintenance_drone_code, location) = maintenance_drone_at_home(client, plan).await?;
     travel_replicant_to_location(client, config, &location).await?;
 
@@ -3271,10 +3253,12 @@ async fn repair_survey_fleet(
         wait_immediate_operation("restore maintenance drone directive", &operation).await?;
     }
 
-    let controller_code = plan
-        .controller
-        .as_deref()
-        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route plan has no survey controller"))?;
+    let controller_code = plan.controller.as_deref().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            "route plan has no survey controller",
+        )
+    })?;
     let controller = client
         .devices()
         .get(controller_code)
@@ -3311,12 +3295,8 @@ async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -
                 prepare_fleet(client, config, plan).await?;
             }
             RunPhase::Ready => {
-                if fleet_below_maintenance_threshold(
-                    client,
-                    plan,
-                    plan.maintenance_threshold_pct,
-                )
-                .await?
+                if fleet_below_maintenance_threshold(client, plan, plan.maintenance_threshold_pct)
+                    .await?
                 {
                     warn!(
                         target: "replicant_client::explore",
@@ -5009,12 +4989,8 @@ mod tests {
 
     #[test]
     fn maintenance_restowing_does_not_require_an_already_stowed_fleet() {
-        assert!(!phase_requires_stowed_fleet(
-            RunPhase::MaintenanceRestowing
-        ));
-        assert!(phase_requires_stowed_fleet(
-            RunPhase::MaintenanceReturning
-        ));
+        assert!(!phase_requires_stowed_fleet(RunPhase::MaintenanceRestowing));
+        assert!(phase_requires_stowed_fleet(RunPhase::MaintenanceReturning));
     }
 
     #[test]

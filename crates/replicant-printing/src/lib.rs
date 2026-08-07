@@ -47,7 +47,10 @@ impl Blueprint {
     #[must_use]
     pub fn is_modular(&self) -> bool {
         self.features.iter().any(|feature| feature == "modular")
-            || matches!(self.device_type.as_str(), "autofactory" | "system_hub" | "exotic_matter_injector")
+            || matches!(
+                self.device_type.as_str(),
+                "autofactory" | "system_hub" | "exotic_matter_injector"
+            )
     }
 }
 
@@ -135,9 +138,7 @@ pub enum ScheduleError {
     MissingBlueprint(String),
     /// A missing component cannot be printed because its blueprint is locked
     /// or otherwise absent from the account catalogue.
-    #[error(
-        "component `{device_type}` is short by {missing}, but its blueprint is not unlocked"
-    )]
+    #[error("component `{device_type}` is short by {missing}, but its blueprint is not unlocked")]
     MissingComponentBlueprint {
         /// Component device type.
         device_type: String,
@@ -240,12 +241,13 @@ fn schedule_component_requirement(
         return Ok(0);
     }
 
-    let blueprint = blueprints.get(device_type).ok_or_else(|| {
-        ScheduleError::MissingComponentBlueprint {
-            device_type: device_type.to_owned(),
-            missing,
-        }
-    })?;
+    let blueprint =
+        blueprints
+            .get(device_type)
+            .ok_or_else(|| ScheduleError::MissingComponentBlueprint {
+                device_type: device_type.to_owned(),
+                missing,
+            })?;
     visiting.push(device_type.to_owned());
     let mut deepest_child = 0usize;
     for (component, component_quantity) in &blueprint.components {
@@ -530,12 +532,8 @@ mod tests {
         .into_iter()
         .collect();
         let stock = [("event_component".into(), 1)].into_iter().collect();
-        let plan = plan_print_dependencies(
-            &[PrintRequest::new("parent", 1)],
-            &blueprints,
-            &stock,
-        )
-        .unwrap();
+        let plan = plan_print_dependencies(&[PrintRequest::new("parent", 1)], &blueprints, &stock)
+            .unwrap();
         assert!(plan.component_waves.is_empty());
         assert_eq!(plan.reused_components["event_component"], 1);
     }

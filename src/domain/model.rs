@@ -74,7 +74,11 @@ impl OperationalCapacity {
     /// Returns a percentage-point interpretation suitable for thresholds.
     #[must_use]
     pub fn percent(self) -> f64 {
-        if self.0 <= 1.0 { self.0 * 100.0 } else { self.0 }
+        if self.0 <= 1.0 {
+            self.0 * 100.0
+        } else {
+            self.0
+        }
     }
 }
 

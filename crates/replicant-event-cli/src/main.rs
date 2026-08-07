@@ -767,7 +767,9 @@ fn filter_events_to_scope(
     let catalogue = stars
         .into_iter()
         .map(|star| {
-            let position = star.position.map(|position| (position.x, position.y, position.z));
+            let position = star
+                .position
+                .map(|position| (position.x, position.y, position.z));
             (
                 star.key.id.as_str().to_ascii_uppercase(),
                 ScopeStar {
@@ -791,9 +793,7 @@ fn filter_events_to_scope(
             Some(star.position.ok_or_else(|| {
                 app_error(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "event scope centre {center_system:?} has no catalogue coordinates"
-                    ),
+                    format!("event scope centre {center_system:?} has no catalogue coordinates"),
                 )
             })?)
         }
@@ -1627,11 +1627,7 @@ fn show_status(config: &Config) -> AnyResult<()> {
 mod tests {
     use super::*;
 
-    fn catalogue_star(
-        designation: &str,
-        region: Option<&str>,
-        position: (f64, f64, f64),
-    ) -> Star {
+    fn catalogue_star(designation: &str, region: Option<&str>, position: (f64, f64, f64)) -> Star {
         serde_json::from_value(serde_json::json!({
             "key": {"realm": "Live", "id": designation},
             "name": null,

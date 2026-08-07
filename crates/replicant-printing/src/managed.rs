@@ -244,7 +244,9 @@ pub enum PrintingError {
         response: Option<Value>,
     },
     /// A managed printing/factory operation is not yet safely classified.
-    #[error("managed operation {operation_id} has unresolved status {status:?}; it was not retried")]
+    #[error(
+        "managed operation {operation_id} has unresolved status {status:?}; it was not retried"
+    )]
     SubmissionUnresolved {
         /// Durable managed operation identifier.
         operation_id: String,
@@ -510,14 +512,7 @@ pub async fn queue_prints(
             return Err(PrintingError::FlatpackRequiresModular(device_type.clone()));
         }
     }
-    queue_print_batch(
-        client,
-        &requested,
-        options,
-        &blueprints,
-        options.flatpack,
-    )
-    .await
+    queue_print_batch(client, &requested, options, &blueprints, options.flatpack).await
 }
 
 /// Queues requested devices after recursively manufacturing their subdevices.
@@ -535,11 +530,9 @@ pub async fn queue_prints_with_components(
     let blueprints = fetch_blueprints(client).await?;
     let requested = normalize_requests(requests)?;
     let component_types = component_dependency_types(&requested, &blueprints)?;
-    wait_for_existing_component_work(client, &options.hub, &component_types, options)
-    .await?;
+    wait_for_existing_component_work(client, &options.hub, &component_types, options).await?;
     let available_components = discover_component_stock(client, &options.hub).await?;
-    let dependency_plan =
-        plan_print_dependencies(requests, &blueprints, &available_components)?;
+    let dependency_plan = plan_print_dependencies(requests, &blueprints, &available_components)?;
 
     for device_type in dependency_plan.requested.keys() {
         let blueprint = blueprints
@@ -799,9 +792,7 @@ async fn wait_for_existing_component_work(
                 return Ok(());
             }
             clear_after_pending = true;
-            info!(
-                "existing prerequisite work cleared; confirming completed inventory projection"
-            );
+            info!("existing prerequisite work cleared; confirming completed inventory projection");
             sleep(options.poll_interval).await;
             continue;
         }
@@ -925,10 +916,7 @@ pub async fn printing_status_in_system(
             continue;
         };
         if device_type == AUTOFACTORY {
-            factories.push((
-                handle.id().as_str().to_owned(),
-                Some(location.to_owned()),
-            ));
+            factories.push((handle.id().as_str().to_owned(), Some(location.to_owned())));
         }
         if !matches_required_tags(&snapshot.tags, tags) {
             continue;
@@ -945,12 +933,13 @@ pub async fn printing_status_in_system(
         if free {
             *free_quantities.entry(device_type.to_owned()).or_default() += 1;
         }
-        let entry = inventory
-            .entry(device_type.to_owned())
-            .or_insert_with(|| DeviceInventoryStatus {
-                device_type: device_type.to_owned(),
-                ..DeviceInventoryStatus::default()
-            });
+        let entry =
+            inventory
+                .entry(device_type.to_owned())
+                .or_insert_with(|| DeviceInventoryStatus {
+                    device_type: device_type.to_owned(),
+                    ..DeviceInventoryStatus::default()
+                });
         entry.total += 1;
         if free {
             entry.free += 1;
@@ -1106,8 +1095,7 @@ fn calculate_manufacturing_status(
             let available = quantity(&component_free, &device_type);
             let active = quantity(&component_active, &device_type);
             let queued = quantity(&component_queued, &device_type);
-            let (missing, surplus) =
-                manufacturing_gap(required, available, active, queued);
+            let (missing, surplus) = manufacturing_gap(required, available, active, queued);
             ManufacturingStatusLine {
                 device_type,
                 required,
@@ -1128,10 +1116,7 @@ fn calculate_manufacturing_status(
     ))
 }
 
-fn queue_job_status(
-    value: &Map<String, Value>,
-    required_tags: &[String],
-) -> FactoryPrintJobStatus {
+fn queue_job_status(value: &Map<String, Value>, required_tags: &[String]) -> FactoryPrintJobStatus {
     let tags = string_array_field(value, "tags");
     FactoryPrintJobStatus {
         device_type: string_field(value, &["device_type", "type"])
@@ -1282,7 +1267,12 @@ pub async fn clear_factories_in_system(
                     status: detail.status,
                 });
             }
-            let operation = client.devices().get(&factory_code).await?.deactivate().await?;
+            let operation = client
+                .devices()
+                .get(&factory_code)
+                .await?
+                .deactivate()
+                .await?;
             match ensure_submission_accepted(&operation).await {
                 Ok(()) => {
                     report
@@ -1329,7 +1319,11 @@ fn nothing_to_deactivate(response: Option<&Value>) -> bool {
         .and_then(Value::as_object)
         .and_then(|response| response.get("message"))
         .and_then(Value::as_str)
-        .is_some_and(|message| message.to_ascii_lowercase().contains("nothing to deactivate"))
+        .is_some_and(|message| {
+            message
+                .to_ascii_lowercase()
+                .contains("nothing to deactivate")
+        })
 }
 
 fn merge_quantities(target: &mut QuantityMap, source: &QuantityMap) {
@@ -1545,9 +1539,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let requested = [("exotic_matter_injector".into(), 5)]
-            .into_iter()
-            .collect();
+        let requested = [("exotic_matter_injector".into(), 5)].into_iter().collect();
         let inventory = [
             ("exotic_matter_injector".into(), 2),
             ("casimir_array".into(), 1),
@@ -1562,9 +1554,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let queued = [("exotic_matter_injector".into(), 1)]
-            .into_iter()
-            .collect();
+        let queued = [("exotic_matter_injector".into(), 1)].into_iter().collect();
 
         let (targets, components, waves, remaining) = calculate_manufacturing_status(
             &requested,

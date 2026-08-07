@@ -2674,7 +2674,10 @@ mod tests {
                 target: vec![5000.0, 14_000.0, 100.0],
             },
         });
-        assert_eq!(evidence["event_names"], serde_json::json!(["triangulation.complete"]));
+        assert_eq!(
+            evidence["event_names"],
+            serde_json::json!(["triangulation.complete"])
+        );
         assert_eq!(
             evidence["failure_event_names"],
             serde_json::json!(["triangulation.failed"])
@@ -2722,10 +2725,7 @@ mod tests {
         );
         client
             .managed_state()
-            .set_operation_state(
-                "op-triangulate",
-                OperationStatus::AwaitingEvidence.as_str(),
-            )
+            .set_operation_state("op-triangulate", OperationStatus::AwaitingEvidence.as_str())
             .expect("await evidence");
 
         let event = domain::Event {

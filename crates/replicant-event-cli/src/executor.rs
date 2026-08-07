@@ -280,7 +280,11 @@ async fn replan_nonlocal_assets(
     let selected_criterion = event_plan
         .criteria
         .iter()
-        .find(|criterion| criterion.criterion_name.eq_ignore_ascii_case(&criterion_name))
+        .find(|criterion| {
+            criterion
+                .criterion_name
+                .eq_ignore_ascii_case(&criterion_name)
+        })
         .cloned()
         .ok_or_else(|| {
             app_error(
@@ -381,9 +385,7 @@ async fn nonlocal_asset_violations(
             ));
             continue;
         };
-        if !home_transport_eligible(device, plan)
-            || device.attach_capacity < transport.capacity
-        {
+        if !home_transport_eligible(device, plan) || device.attach_capacity < transport.capacity {
             violations.push(format!(
                 "device carrier {} is not empty and eligible in the home system (location {:?}, used {})",
                 transport.code, device.location, device.attach_used
@@ -475,25 +477,20 @@ fn home_payload_eligible(device: &DeviceStock, plan: &EventMissionPlan) -> bool 
     let position_eligible = if attached_to_mission_carrier {
         device.is_in_same_system_as(&plan.home_location) && device.stowed_in_device_code.is_none()
     } else {
-        device.location.as_deref() == Some(plan.home_location.as_str())
-            && device.is_free_standing()
+        device.location.as_deref() == Some(plan.home_location.as_str()) && device.is_free_standing()
     };
     position_eligible
         && device.is_inactive()
-        && !device.is_reserved_for_workflow(
-            EVENT_MISSION_TAG_PREFIX,
-            Some(plan.mission_tag.as_str()),
-        )
+        && !device
+            .is_reserved_for_workflow(EVENT_MISSION_TAG_PREFIX, Some(plan.mission_tag.as_str()))
 }
 
 fn home_transport_eligible(device: &DeviceStock, plan: &EventMissionPlan) -> bool {
     device.is_in_same_system_as(&plan.home_location)
         && !device.travelling
         && device.is_free_standing()
-        && !device.is_reserved_for_workflow(
-            EVENT_MISSION_TAG_PREFIX,
-            Some(plan.mission_tag.as_str()),
-        )
+        && !device
+            .is_reserved_for_workflow(EVENT_MISSION_TAG_PREFIX, Some(plan.mission_tag.as_str()))
 }
 
 async fn release_preflight_claims(
@@ -1102,7 +1099,10 @@ async fn submit_available_print_batches(
         .await?
         .into_iter()
         .filter_map(|(device_type, blueprint)| {
-            blueprint.features.contains("modular").then_some(device_type)
+            blueprint
+                .features
+                .contains("modular")
+                .then_some(device_type)
         })
         .collect::<BTreeSet<_>>();
 
@@ -1730,11 +1730,7 @@ fn command_available(detail: &raw::devices::DeviceStatus, expected: &str) -> boo
         .any(|command| command.eq_ignore_ascii_case(expected))
 }
 
-async fn ensure_attachable_device(
-    client: &Client,
-    config: &Config,
-    code: &str,
-) -> AnyResult<()> {
+async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
     ensure_free_standing(client, config, code).await?;
     let mut detail = client.raw().devices().get(code).await?.value;
     if !is_modular_device(&detail) || status_is(&detail, "compacted") {
@@ -1742,8 +1738,10 @@ async fn ensure_attachable_device(
     }
 
     if status_is(&detail, "compacting") {
-        wait_for_raw_device(client, config, code, |device| status_is(device, "compacted"))
-            .await?;
+        wait_for_raw_device(client, config, code, |device| {
+            status_is(device, "compacted")
+        })
+        .await?;
         return Ok(());
     }
 

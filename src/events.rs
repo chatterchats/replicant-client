@@ -460,9 +460,7 @@ impl GameEvent {
 
     /// Decodes this event as `triangulation.complete`, returning `None` for a
     /// different event name.
-    pub fn triangulation_completed(
-        &self,
-    ) -> Result<Option<TriangulationCompletedPayload>, Error> {
+    pub fn triangulation_completed(&self) -> Result<Option<TriangulationCompletedPayload>, Error> {
         self.decode_payload("triangulation.complete")
     }
 
@@ -680,21 +678,27 @@ mod tests {
                 .as_deref(),
             Some("2026-08-06T15:22:00Z")
         );
-        assert!(event("device.compacted", serde_json::json!({}))
-            .device_compacted()
+        assert!(
+            event("device.compacted", serde_json::json!({}))
+                .device_compacted()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            event(
+                "device.unfurling",
+                serde_json::json!({"completes_at": "2026-08-06T15:23:00Z"}),
+            )
+            .device_unfurling()
             .unwrap()
-            .is_some());
-        assert!(event(
-            "device.unfurling",
-            serde_json::json!({"completes_at": "2026-08-06T15:23:00Z"}),
-        )
-        .device_unfurling()
-        .unwrap()
-        .is_some());
-        assert!(event("device.unfurled", serde_json::json!({}))
-            .device_unfurled()
-            .unwrap()
-            .is_some());
+            .is_some()
+        );
+        assert!(
+            event("device.unfurled", serde_json::json!({}))
+                .device_unfurled()
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

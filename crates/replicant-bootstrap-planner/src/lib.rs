@@ -182,15 +182,9 @@ pub fn ark_device_requirements(profile: &BootstrapProfile) -> QuantityMap {
                 profile.root_relays.saturating_add(profile.expansion_relays),
             ),
             (FTL_BEACON.to_owned(), profile.ftl_beacons),
-            (
-                MAINTENANCE_DRONE.to_owned(),
-                profile.hub_maintenance_drones,
-            ),
+            (MAINTENANCE_DRONE.to_owned(), profile.hub_maintenance_drones),
             (SURVEY_CONTROLLER.to_owned(), 1),
-            (
-                SURVEY_DRONE.to_owned(),
-                profile.exploration_survey_drones,
-            ),
+            (SURVEY_DRONE.to_owned(), profile.exploration_survey_drones),
         ]
         .into_iter()
         .collect(),
@@ -248,8 +242,8 @@ pub fn carrier_provisioning(
         selected_capacity = selected_capacity.saturating_add((*capacity).max(0));
         selected_count += 1;
     }
-    let printed = missing_carriers(payload_slots, selected_capacity, carrier_capacity)?
-        .max(minimum_printed);
+    let printed =
+        missing_carriers(payload_slots, selected_capacity, carrier_capacity)?.max(minimum_printed);
     Ok((selected_count, printed))
 }
 
@@ -411,8 +405,8 @@ mod tests {
                 distance_from_capital_ly: 12.0,
             },
         ];
-        let selected = select_dense_belts(&candidates, "CAP-BELT-1", 2, 2)
-            .expect("two dense belts");
+        let selected =
+            select_dense_belts(&candidates, "CAP-BELT-1", 2, 2).expect("two dense belts");
         assert_eq!(selected[0].system, "CAP");
         assert_eq!(selected[1].system, "NEAR");
     }

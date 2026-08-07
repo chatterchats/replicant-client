@@ -315,13 +315,9 @@ async fn main() -> AnyResult<()> {
             print_clear_report(&config, &report)?;
         }
         Command::Status => {
-            let result = printing_status_in_system(
-                &client,
-                &config.system,
-                &config.requests,
-                &config.tags,
-            )
-            .await;
+            let result =
+                printing_status_in_system(&client, &config.system, &config.requests, &config.tags)
+                    .await;
             let close_result = client.close().await;
             let report = result?;
             close_result?;
@@ -338,7 +334,10 @@ fn print_queue_report(config: &Config, report: &QueueReport) -> AnyResult<()> {
     }
     let total = report.queued.values().sum::<i64>();
     let output = if report.flatpack { " flatpacked" } else { "" };
-    println!("Queued {total}{output} requested device(s) from {}:", config.hub);
+    println!(
+        "Queued {total}{output} requested device(s) from {}:",
+        config.hub
+    );
     for (device_type, quantity) in &report.queued {
         println!("  {quantity:>4}  {device_type}");
     }
@@ -369,7 +368,11 @@ fn print_clear_report(config: &Config, report: &ClearReport) -> AnyResult<()> {
     println!(
         "Cleared {} Autofactor{} in {}:",
         report.factories.len(),
-        if report.factories.len() == 1 { "y" } else { "ies" },
+        if report.factories.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         report.system
     );
     for factory in &report.factories {
