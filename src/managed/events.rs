@@ -837,7 +837,20 @@ async fn process_reconciliation_work(client: &Client, work: &ReconciliationWork)
         })?;
     match work.kind.as_str() {
         "device" => {
-            let response = client.managed_raw().devices().get(id).await?;
+            let response = match client.managed_raw().devices().get(id).await {
+                Ok(response) => response,
+                Err(error) if error.status() == Some(404) => {
+                    debug!(
+                        target: "replicant_client::events",
+                        event = "reconciliation.device_not_found",
+                        device_code = id,
+                        work_id = %work.work_id,
+                        "device reconciliation target no longer exists; completing work without retry"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             let device = domain::device_detail(
                 &response.value,
                 work.realm.clone(),
@@ -1719,6 +1732,34 @@ mod tests {
             .start()
             .await
             .expect("restore-only client")
+    }
+
+    #[tokio::test]
+    async fn device_reconciliation_not_found_is_terminal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/GONE"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "Device not found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = restore_only_client_at(&server.uri()).await;
+        let work = ReconciliationWork {
+            work_id: "device:GONE".into(),
+            realm: Realm::Live,
+            kind: "device".into(),
+            payload: serde_json::json!({"id": "GONE"}),
+            attempts: 0,
+        };
+
+        process_reconciliation_work(&client, &work)
+            .await
+            .expect("404 is terminal for targeted device reconciliation");
+
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[tokio::test]

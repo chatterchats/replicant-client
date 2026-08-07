@@ -1042,11 +1042,15 @@ impl Store {
         for (realm, id) in missing {
             transaction.execute(
                 "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
-                params![realm, id],
+                params![&realm, &id],
             )?;
             transaction.execute(
                 "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, 'device', ?2, datetime('now'), 'complete-unfiltered-device-traversal')",
-                params![realm, id],
+                params![&realm, &id],
+            )?;
+            transaction.execute(
+                "DELETE FROM reconciliation_queue WHERE realm = ?1 AND kind = 'device' AND work_id = ?2",
+                params![&realm, format!("device:{id}")],
             )?;
         }
         Self::commit(transaction, fail_commit)
@@ -1118,13 +1122,19 @@ impl Store {
             return Ok(false);
         }
         for key in decommissioned {
+            let realm = realm_key(&key.realm);
+            let device_id = key.id.as_str();
             transaction.execute(
                 "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
-                params![realm_key(&key.realm), key.id.as_str()],
+                params![&realm, device_id],
             )?;
             transaction.execute(
                 "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, 'device', ?2, datetime('now'), 'explicit-decommission-event')",
-                params![realm_key(&key.realm), key.id.as_str()],
+                params![&realm, device_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM reconciliation_queue WHERE realm = ?1 AND kind = 'device' AND work_id = ?2",
+                params![&realm, format!("device:{device_id}")],
             )?;
         }
         advance_event_cursor(&transaction, cursor)?;
@@ -1448,6 +1458,10 @@ impl Store {
         &mut self,
     ) -> Result<Option<ReconciliationWork>, StoreError> {
         let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM reconciliation_queue WHERE kind = 'device' AND EXISTS (SELECT 1 FROM tombstones WHERE tombstones.realm = reconciliation_queue.realm AND tombstones.kind = 'device' AND reconciliation_queue.work_id = 'device:' || tombstones.item_id)",
+            [],
+        )?;
         let row = transaction
             .query_row(
                 "SELECT work_id, realm, kind, payload_json, attempts FROM reconciliation_queue WHERE state = 'queued' AND (not_before IS NULL OR CAST(not_before AS INTEGER) <= CAST(strftime('%s','now') AS INTEGER)) ORDER BY rowid LIMIT 1",
@@ -1875,7 +1889,7 @@ fn access_key(access: &crate::domain::AccessScope) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -1895,6 +1909,17 @@ mod tests {
             .expect("clock before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("replicant-client-{name}-{nonce}.sqlite"))
+    }
+
+    fn reconciliation_count(store: &Store, work_id: &str) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM reconciliation_queue WHERE work_id = ?1",
+                [work_id],
+                |row| row.get(0),
+            )
+            .expect("count reconciliation work")
     }
 
     fn device(realm: Realm, id: &str) -> Observation<Device> {
@@ -2363,6 +2388,14 @@ mod tests {
             .persist_devices(&[device(Realm::Live, "d1")])
             .expect("seed device");
         let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
+        store
+            .enqueue_reconciliation(
+                "device:d1",
+                &Realm::Live,
+                "device",
+                &json!({"id": "d1"}),
+            )
+            .expect("queue stale reconciliation");
 
         let mut decommission_event = event();
         decommission_event.name = EventName::from("device.decommissioned");
@@ -2382,6 +2415,7 @@ mod tests {
         );
         let restored = store.restore_devices().expect("restore devices");
         assert!(!restored.contains_key(&key));
+        assert_eq!(reconciliation_count(&store, "device:d1"), 0);
     }
 
     #[test]
@@ -2391,6 +2425,14 @@ mod tests {
             .persist_devices(&[device(Realm::Live, "d1")])
             .expect("seed device");
         let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
+        store
+            .enqueue_reconciliation(
+                "device:d1",
+                &Realm::Live,
+                "device",
+                &json!({"id": "d1"}),
+            )
+            .expect("queue reconciliation");
         store.fail_next_commit();
         assert!(matches!(
             store.append_event_and_decommission(
@@ -2403,6 +2445,58 @@ mod tests {
         assert_eq!(store.device_count().expect("device count"), 1);
         assert_eq!(store.event_cursor().expect("cursor"), None);
         assert!(store.read_events().expect("event journal").is_empty());
+        assert_eq!(reconciliation_count(&store, "device:d1"), 1);
+    }
+
+    #[test]
+    fn full_device_reconciliation_cancels_removed_device_work() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .persist_devices(&[device(Realm::Live, "d1")])
+            .expect("seed device");
+        store
+            .enqueue_reconciliation(
+                "device:d1",
+                &Realm::Live,
+                "device",
+                &json!({"id": "d1"}),
+            )
+            .expect("queue reconciliation");
+
+        store
+            .reconcile_owned_devices(&BTreeSet::new())
+            .expect("reconcile missing device");
+
+        assert_eq!(reconciliation_count(&store, "device:d1"), 0);
+    }
+
+    #[test]
+    fn reconciliation_claim_prunes_device_work_already_tombstoned() {
+        let mut store = Store::open_memory().expect("open memory store");
+        store
+            .connection
+            .execute(
+                "INSERT INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES ('live', 'device', 'd1', datetime('now'), 'explicit-decommission-event')",
+                [],
+            )
+            .expect("seed tombstone");
+        store
+            .enqueue_reconciliation(
+                "device:d1",
+                &Realm::Live,
+                "device",
+                &json!({"id": "d1"}),
+            )
+            .expect("queue stale reconciliation");
+        assert_eq!(reconciliation_count(&store, "device:d1"), 1);
+
+        assert!(
+            store
+                .claim_reconciliation_work()
+                .expect("claim after tombstone")
+                .is_none()
+        );
+        assert_eq!(reconciliation_count(&store, "device:d1"), 0);
     }
 
     #[test]
