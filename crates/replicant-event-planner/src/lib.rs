@@ -219,7 +219,12 @@ impl DeviceStock {
         self.status.as_deref().is_some_and(|status| {
             matches!(
                 status.to_ascii_lowercase().as_str(),
-                "inactive" | "deactivated" | "idle" | "stowed" | "recalled"
+                "inactive"
+                    | "deactivated"
+                    | "idle"
+                    | "stowed"
+                    | "recalled"
+                    | "compacted"
             )
         }) && !self.travelling
     }
@@ -1987,6 +1992,28 @@ mod tests {
                 .iter()
                 .any(|transport| transport.must_print && transport.device_type == SURGE_CARRIER)
         }));
+    }
+
+    #[test]
+    fn compacted_modular_device_is_inactive_stock() {
+        let device = DeviceStock {
+            code: "AF-1".into(),
+            device_type: "autofactory".into(),
+            status: Some("compacted".into()),
+            location: Some("SCEPTURUM-BELT-1".into()),
+            assigned_replicant: Some("Chats-1".into()),
+            tags: BTreeSet::new(),
+            cargo_capacity: 0,
+            attach_capacity: 0,
+            attach_used: 0,
+            attached_to_device_code: None,
+            stowed_in_device_code: None,
+            controlled_by_ami: false,
+            travelling: false,
+        };
+
+        assert!(device.is_inactive());
+        assert!(device.is_free_standing());
     }
 
     #[test]

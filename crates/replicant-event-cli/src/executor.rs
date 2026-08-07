@@ -5,7 +5,9 @@ use std::{
 };
 
 use futures::future::{join_all, try_join_all};
-use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, raw};
+use replicant_client::{
+    AutofactoryPrintOptions, Client, Device, Operation, OperationId, OperationStatus, raw,
+};
 use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
     mission_tag, plan_event, role_tag,
@@ -1096,6 +1098,14 @@ async fn submit_available_print_batches(
         );
     }
 
+    let modular_device_types = fetch_blueprints(client)
+        .await?
+        .into_iter()
+        .filter_map(|(device_type, blueprint)| {
+            blueprint.features.contains("modular").then_some(device_type)
+        })
+        .collect::<BTreeSet<_>>();
+
     let mut submitted = 0usize;
     for index in pending {
         if submitted >= submission_limit {
@@ -1119,17 +1129,24 @@ async fn submit_available_print_batches(
         plan.execution.print_batches[index].submission_started = true;
         save_plan(&config.plan_path, plan)?;
 
+        let flatpacked = modular_device_types.contains(&batch.device_type);
+        let mut options = AutofactoryPrintOptions::new(1).tags([
+            plan.mission_tag.clone(),
+            role_tag(&batch.role),
+            batch.batch_tag.clone(),
+        ]);
+        if flatpacked {
+            options = options.flatpacked();
+        }
+        info!(
+            factory = %batch.factory_code,
+            device_type = %batch.device_type,
+            flatpacked,
+            "submitting event print batch"
+        );
         let factory = client.devices().get(&batch.factory_code).await?;
         let operation = factory
-            .enqueue_print_with_tags(
-                batch.device_type.clone(),
-                1,
-                [
-                    plan.mission_tag.clone(),
-                    role_tag(&batch.role),
-                    batch.batch_tag.clone(),
-                ],
-            )
+            .enqueue_print_configured(batch.device_type.clone(), options)
             .await?;
         plan.execution.print_batches[index].operation_id = Some(operation.id().as_str().to_owned());
         plan.execution.print_batches[index].submitted = true;
@@ -1556,6 +1573,7 @@ async fn prepare_initial_fleet(
     }
 
     gather_remote_payload(client, config, plan).await?;
+    prepare_home_payload_for_attachment(client, config, plan).await?;
 
     for code in carrier_codes(plan) {
         ensure_device_at(client, config, &code, &plan.home_location).await?;
@@ -1585,6 +1603,25 @@ async fn prepare_initial_fleet(
                 ));
             }
             detach_devices(client, config, &code, &attached).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_home_payload_for_attachment(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+) -> AnyResult<()> {
+    for payload in &plan.execution.payload_devices {
+        if payload.delivered {
+            continue;
+        }
+        let detail = client.raw().devices().get(&payload.code).await?.value;
+        if detail.location.as_deref() == Some(plan.home_location.as_str())
+            && detail.attached_to_device_code.is_none()
+        {
+            ensure_attachable_device(client, config, &payload.code).await?;
         }
     }
     Ok(())
@@ -1628,7 +1665,7 @@ async fn gather_remote_payload(
             )
         })?;
         ensure_device_at(client, config, carrier, &source).await?;
-        ensure_free_standing(client, config, &code).await?;
+        ensure_attachable_device(client, config, &code).await?;
         attach_devices(client, config, carrier, std::slice::from_ref(&code)).await?;
         ensure_device_at(client, config, carrier, &plan.home_location).await?;
         detach_devices(client, config, carrier, std::slice::from_ref(&code)).await?;
@@ -1654,6 +1691,143 @@ async fn ensure_free_standing(client: &Client, config: &Config, code: &str) -> A
         ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
         wait_for_raw_device(client, config, code, |device| {
             device.stowed_in_device_code.is_none()
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+fn is_modular_device(detail: &raw::devices::DeviceStatus) -> bool {
+    detail
+        .features
+        .iter()
+        .any(|feature| feature.eq_ignore_ascii_case("modular"))
+        || detail
+            .available_commands
+            .iter()
+            .chain(detail.commands.iter())
+            .any(|command| matches!(command.as_str(), "compact" | "unfurl"))
+        || detail.status.as_deref().is_some_and(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "compacting" | "compacted" | "unfurling"
+            )
+        })
+}
+
+fn status_is(detail: &raw::devices::DeviceStatus, expected: &str) -> bool {
+    detail
+        .status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case(expected))
+}
+
+fn command_available(detail: &raw::devices::DeviceStatus, expected: &str) -> bool {
+    detail
+        .available_commands
+        .iter()
+        .chain(detail.commands.iter())
+        .any(|command| command.eq_ignore_ascii_case(expected))
+}
+
+async fn ensure_attachable_device(
+    client: &Client,
+    config: &Config,
+    code: &str,
+) -> AnyResult<()> {
+    ensure_free_standing(client, config, code).await?;
+    let mut detail = client.raw().devices().get(code).await?.value;
+    if !is_modular_device(&detail) || status_is(&detail, "compacted") {
+        return Ok(());
+    }
+
+    if status_is(&detail, "compacting") {
+        wait_for_raw_device(client, config, code, |device| status_is(device, "compacted"))
+            .await?;
+        return Ok(());
+    }
+
+    if status_is(&detail, "unfurling") {
+        wait_for_raw_device(client, config, code, |device| {
+            !status_is(device, "unfurling")
+        })
+        .await?;
+        detail = client.raw().devices().get(code).await?.value;
+        if status_is(&detail, "compacted") {
+            return Ok(());
+        }
+    }
+
+    if detail.printing.is_some() || !detail.print_queue.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "modular payload {code} must finish its Autofactory work before it can be compacted for event transport"
+            ),
+        ));
+    }
+    if !command_available(&detail, "compact") {
+        return Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "modular payload {code} is {:?} and does not currently advertise compact; it cannot be attached until it is compacted",
+                detail.status
+            ),
+        ));
+    }
+
+    info!(device = %code, "compacting modular event payload for carrier attachment");
+    let operation = client.devices().get(code).await?.compact().await?;
+    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    wait_for_raw_device(client, config, code, |device| {
+        status_is(device, "compacted")
+            && device.attached_to_device_code.is_none()
+            && device.stowed_in_device_code.is_none()
+    })
+    .await
+}
+
+async fn unfurl_modular_devices(
+    client: &Client,
+    config: &Config,
+    codes: &[String],
+) -> AnyResult<()> {
+    for code in codes {
+        let mut detail = match client.raw().devices().get(code).await {
+            Ok(response) => response.value,
+            Err(error) if error.status() == Some(404) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !is_modular_device(&detail) {
+            continue;
+        }
+        if status_is(&detail, "unfurling") {
+            wait_for_raw_device(client, config, code, |device| {
+                !status_is(device, "unfurling")
+            })
+            .await?;
+            detail = client.raw().devices().get(code).await?.value;
+        }
+        if !status_is(&detail, "compacted") && !command_available(&detail, "unfurl") {
+            continue;
+        }
+        if !command_available(&detail, "unfurl") {
+            return Err(app_error(
+                io::ErrorKind::Other,
+                format!(
+                    "modular payload {code} is compacted but does not currently advertise unfurl"
+                ),
+            ));
+        }
+        info!(device = %code, "unfurling modular event payload after delivery");
+        let operation = client.devices().get(code).await?.unfurl().await?;
+        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        wait_for_raw_device(client, config, code, |device| {
+            !status_is(device, "compacted")
+                && !status_is(device, "compacting")
+                && !status_is(device, "unfurling")
+                && device.attached_to_device_code.is_none()
+                && device.stowed_in_device_code.is_none()
         })
         .await?;
     }
@@ -1780,6 +1954,32 @@ async fn dispatch_replicant_outbound(client: &Client, plan: &EventMissionPlan) -
     Ok(())
 }
 
+async fn unfurl_delivered_modular_payload(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+) -> AnyResult<()> {
+    let mut codes = Vec::new();
+    for payload in &plan.execution.payload_devices {
+        if payload.role != "payload" {
+            continue;
+        }
+        let detail = match client.raw().devices().get(&payload.code).await {
+            Ok(response) => response.value,
+            Err(error) if error.status() == Some(404) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if detail.location.as_deref() == Some(plan.event.location.as_str())
+            && detail.attached_to_device_code.is_none()
+            && detail.stowed_in_device_code.is_none()
+            && is_modular_device(&detail)
+        {
+            codes.push(payload.code.clone());
+        }
+    }
+    unfurl_modular_devices(client, config, &codes).await
+}
+
 async fn stage_event_devices(
     client: &Client,
     config: &Config,
@@ -1789,6 +1989,7 @@ async fn stage_event_devices(
     let deadline = Instant::now() + config.wait_timeout;
 
     loop {
+        unfurl_delivered_modular_payload(client, config, plan).await?;
         let remaining = live_remaining_requirements(client, plan).await?.devices;
         if remaining.is_empty() {
             mark_delivered_payload(client, plan).await?;
@@ -1840,6 +2041,7 @@ async fn stage_event_devices(
                     .filter_map(reference_code)
                     .collect::<Vec<_>>();
                 detach_devices(client, config, carrier, &attached).await?;
+                unfurl_modular_devices(client, config, &attached).await?;
                 made_progress = true;
             }
 
@@ -1874,11 +2076,12 @@ async fn stage_event_devices(
                 continue;
             }
             for code in &selected {
-                ensure_free_standing(client, config, code).await?;
+                ensure_attachable_device(client, config, code).await?;
             }
             attach_devices(client, config, carrier, &selected).await?;
             ensure_device_at(client, config, carrier, &plan.event.location).await?;
             detach_devices(client, config, carrier, &selected).await?;
+            unfurl_modular_devices(client, config, &selected).await?;
             for payload in &mut plan.execution.payload_devices {
                 if selected.contains(&payload.code) {
                     payload.delivered = true;
@@ -2042,7 +2245,7 @@ async fn install_beacon(
                 )
             })?;
             ensure_device_at(client, config, &carrier, &source).await?;
-            ensure_free_standing(client, config, &code).await?;
+            ensure_attachable_device(client, config, &code).await?;
             attach_devices(client, config, &carrier, std::slice::from_ref(&code)).await?;
             ensure_device_at(client, config, &carrier, &plan.event.location).await?;
             detach_devices(client, config, &carrier, std::slice::from_ref(&code)).await?;
@@ -2709,7 +2912,7 @@ async fn recover_failed_beacon(
             )
         })?;
         ensure_device_at(client, config, &carrier, &source).await?;
-        ensure_free_standing(client, config, &code).await?;
+        ensure_attachable_device(client, config, &code).await?;
         attach_devices(client, config, &carrier, std::slice::from_ref(&code)).await?;
         ensure_device_at(client, config, &carrier, &plan.home_location).await?;
         detach_devices(client, config, &carrier, std::slice::from_ref(&code)).await?;
@@ -3536,11 +3739,32 @@ fn format_device_requirements(requirements: &[DeviceRequirement]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use replicant_client::raw;
+
     use super::{
-        ReplicantTravelDecision, ResourceMap, allocate_manifests, legacy_recovered_rewards,
-        merge_recovered_rewards, merge_resources, replicant_travel_decision,
-        resources_available_from,
+        ReplicantTravelDecision, ResourceMap, allocate_manifests, command_available,
+        is_modular_device, legacy_recovered_rewards, merge_recovered_rewards, merge_resources,
+        replicant_travel_decision, resources_available_from, status_is,
     };
+
+    #[test]
+    fn recognizes_modular_transport_states_and_commands() {
+        let mut device = raw::devices::DeviceStatus::default();
+        device.features = vec!["modular".into()];
+        device.available_commands = vec!["compact".into()];
+
+        assert!(is_modular_device(&device));
+        assert!(command_available(&device, "compact"));
+        assert!(!status_is(&device, "compacted"));
+
+        device.features.clear();
+        device.available_commands = vec!["unfurl".into()];
+        device.status = Some("compacted".into());
+
+        assert!(is_modular_device(&device));
+        assert!(command_available(&device, "unfurl"));
+        assert!(status_is(&device, "compacted"));
+    }
 
     #[test]
     fn allocates_reward_manifests_across_the_fleet() {
