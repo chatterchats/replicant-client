@@ -97,6 +97,7 @@ pub fn merge_device(
         incoming.value.attach_capacity = existing.value.attach_capacity;
         incoming.value.stow_capacity = existing.value.stow_capacity;
         incoming.value.stow_used = existing.value.stow_used;
+        incoming.value.operational_capacity = existing.value.operational_capacity;
         incoming.value.active_directive = existing.value.active_directive;
         incoming.value.travel = existing.value.travel;
     }

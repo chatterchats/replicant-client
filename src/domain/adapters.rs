@@ -302,6 +302,7 @@ fn device(
         attach_capacity: raw.attach_capacity,
         stow_capacity: raw.stow_capacity,
         stow_used: raw.stow_used,
+        operational_capacity: raw.operational_capacity.and_then(OperationalCapacity::new),
         active_directive: active_device_directive(raw),
         travel: device_travel(&raw.travel, &realm),
         access,
@@ -961,6 +962,7 @@ mod location_tests {
             "attach_capacity": 2,
             "stow_capacity": 5,
             "stow_used": 3,
+            "operational_capacity": 19.5,
             "available_commands": ["withdraw", "stow"],
             "ami_directive": {
                 "directive": "survey_system",
@@ -1037,6 +1039,10 @@ mod location_tests {
         assert_eq!(device.attach_capacity, Some(2));
         assert_eq!(device.stow_capacity, Some(5));
         assert_eq!(device.stow_used, Some(3));
+        assert_eq!(
+            device.operational_capacity.map(OperationalCapacity::raw),
+            Some(19.5)
+        );
         let directive = device
             .active_directive
             .as_ref()
@@ -1167,6 +1173,7 @@ mod location_tests {
 
         assert!(device.relationships.stowed_in.is_none());
         assert!(device.relationships.attached_devices.is_empty());
+        assert!(device.operational_capacity.is_none());
         assert!(device.active_directive.is_none());
         assert!(device.travel.is_none());
     }

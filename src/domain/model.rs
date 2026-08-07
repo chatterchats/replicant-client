@@ -49,6 +49,43 @@ pub struct TravelState {
     pub travel_type: Option<String>,
 }
 
+/// Operational-capacity value reported by the game API.
+///
+/// Current responses normally use percentage points (`0.0..=100.0`), while
+/// some historical fixtures used a `0.0..=1.0` fraction. The wrapper preserves
+/// the original wire value and provides [`Self::percent`] for safe comparisons.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationalCapacity(f64);
+
+impl OperationalCapacity {
+    /// Creates a finite, non-negative operational-capacity value.
+    #[must_use]
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    }
+
+    /// Returns the unmodified value received from the API.
+    #[must_use]
+    pub const fn raw(self) -> f64 {
+        self.0
+    }
+
+    /// Returns a percentage-point interpretation suitable for thresholds.
+    #[must_use]
+    pub fn percent(self) -> f64 {
+        if self.0 <= 1.0 { self.0 * 100.0 } else { self.0 }
+    }
+}
+
+impl PartialEq for OperationalCapacity {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for OperationalCapacity {}
+
 /// Current AMI directive and its forward-compatible detail fields.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,6 +113,11 @@ pub struct Device {
     pub stow_capacity: Option<i64>,
     #[serde(default)]
     pub stow_used: Option<i64>,
+    /// Current operational capacity reported by the server. Current game
+    /// responses use percentage points (0-100), while older fixtures may use
+    /// a 0-1 fraction; callers should normalize before comparing thresholds.
+    #[serde(default)]
+    pub operational_capacity: Option<OperationalCapacity>,
     #[serde(default)]
     pub active_directive: Option<ActiveDeviceDirective>,
     #[serde(default)]
