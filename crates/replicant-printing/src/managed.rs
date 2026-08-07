@@ -1540,7 +1540,7 @@ mod tests {
         .into_iter()
         .collect();
         let requested = [("exotic_matter_injector".into(), 5)].into_iter().collect();
-        let inventory = [
+        let inventory: QuantityMap = [
             ("exotic_matter_injector".into(), 2),
             ("casimir_array".into(), 1),
             ("exotic_particle_trap".into(), 1),

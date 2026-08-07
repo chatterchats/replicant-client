@@ -901,9 +901,18 @@ mod location_tests {
 
     #[test]
     fn nested_planet_environment_normalizes_without_losing_unknown_fields() {
-        let raw: raw::locations::Location = serde_json::from_str(include_str!(
-            "../../reference/replicant-space/fixtures/location-ilphard-3-sanitized.json"
-        ))
+        let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "ILPHARD-3",
+            "location_type": "planet",
+            "planet": {
+                "scanned": true,
+                "atmosphere": "dense",
+                "surface_gravity": 2.06,
+                "surface_temp_c": 125.0,
+                "life_stage": "intelligent",
+                "future_environment": {}
+            }
+        }))
         .expect("fixture decodes");
         let observation =
             location_detail(&raw, Realm::Live, ObservationTime::now()).expect("normalizes");

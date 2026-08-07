@@ -2920,7 +2920,7 @@ async fn recover_fleet_for_maintenance(
     })?;
     let controller_snapshot = refresh_device_snapshot(client, controller_code).await?;
     if operational_capacity_percent(&controller_snapshot)
-        .map_or(true, |capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT)
+        .is_none_or(|capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT)
         && active_directive_status(&controller_snapshot) != Some("inactive")
         && device_has_command(&controller_snapshot, "clear_directive")
     {
@@ -3032,7 +3032,7 @@ async fn maintenance_drone_at_home(
                 && device_attached_to(&device).is_none()
                 && !device.is_traveling()
                 && operational_capacity_percent(&device)
-                    .map_or(true, |capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT))
+                    .is_none_or(|capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT))
             .then_some((code, location))
         })
         .collect::<Vec<_>>();

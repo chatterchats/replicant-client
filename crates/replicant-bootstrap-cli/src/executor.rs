@@ -110,9 +110,7 @@ pub async fn resolve_replicant(
 }
 
 fn identity_from_replicant(query: &str, replicant: Replicant) -> Option<ReplicantIdentity> {
-    let Some(vessel) = replicant.hosted_device.as_ref() else {
-        return None;
-    };
+    let vessel = replicant.hosted_device.as_ref()?;
     Some(ReplicantIdentity {
         requested: query.to_owned(),
         code: replicant.key.id.as_str().to_owned(),
@@ -1663,11 +1661,11 @@ async fn wait_devices_stowed_in_vessel(
         let mut pending = Vec::new();
         for code in devices {
             let snapshot = client.devices().get(code).await?.snapshot().await?;
-            if !snapshot
+            if snapshot
                 .relationships
                 .stowed_in
                 .as_ref()
-                .is_some_and(|target| target.id.as_str() == vessel)
+                .is_none_or(|target| target.id.as_str() != vessel)
             {
                 pending.push(code.clone());
             }
