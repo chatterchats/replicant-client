@@ -940,6 +940,10 @@ impl DeviceHandle {
     pub async fn deactivate(&self) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Deactivate).await
     }
+    /// Cancels this device's current interruptible operation.
+    pub async fn cancel(&self) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::Cancel).await
+    }
     /// Deploys a device into the field.
     pub async fn deploy(&self) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Deploy).await
@@ -964,6 +968,14 @@ impl DeviceHandle {
     pub async fn attach(&self, targets: raw::devices::TargetsCommand) -> Result<Operation> {
         self.command(raw::devices::DeviceCommand::Attach(targets))
             .await
+    }
+    /// Repairs `target` using this maintenance-capable device.
+    pub async fn repair(&self, target: impl Into<String>) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::Repair {
+            device: None,
+            target: Some(target.into()),
+        })
+        .await
     }
     /// Compacts this device's stowed contents.
     pub async fn compact(&self) -> Result<Operation> {
@@ -2383,6 +2395,7 @@ mod tests {
                 attach_capacity: None,
                 stow_capacity: None,
                 stow_used: None,
+                operational_capacity: None,
                 active_directive: None,
                 travel: None,
                 access: AccessScope::Owned,

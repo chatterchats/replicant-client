@@ -1912,6 +1912,7 @@ mod tests {
                 attach_capacity: None,
                 stow_capacity: None,
                 stow_used: None,
+                operational_capacity: None,
                 active_directive: None,
                 travel: None,
                 access: AccessScope::Owned,
