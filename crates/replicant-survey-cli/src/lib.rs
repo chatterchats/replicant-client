@@ -13,7 +13,10 @@
 //!    the survey controller, and waits for either a terminal
 //!    `ami.survey.digest` or `directive.completed`;
 //! 8. on startup, rechecks the current system scan and planet/moon survey completeness;
-//! 9. recalls and restows the fleet before the next hop.
+//! 9. recalls and restows the fleet before the next hop;
+//! 10. checks operational capacity during long surveys and after each stop; and
+//! 11. recovers disabled devices, returns to a maintenance base, repairs the
+//!     fleet, and resumes the saved route.
 //!
 //! The plan is written atomically after every phase. Stop the process at any
 //! point and run `replicant-survey run` again with the same mission path to
@@ -49,6 +52,11 @@
 //! - `RS_EXPLORE_LOG_FILE=logs/explore-survey-route.log` — append file logs.
 //! - `RS_EXPLORE_TRAVEL_TIMEOUT_SECS=21600`
 //! - `RS_EXPLORE_SURVEY_TIMEOUT_SECS=21600`
+//! - `RS_EXPLORE_MAINTENANCE_HOME=<centre system>`
+//! - `RS_EXPLORE_MAINTENANCE_INTERVAL_SYSTEMS=40`
+//! - `RS_EXPLORE_MAINTENANCE_THRESHOLD_PCT=25`
+//! - `RS_EXPLORE_MAINTENANCE_RESUME_PCT=95`
+//! - `RS_EXPLORE_MAINTENANCE_CHECK_SECS=900`
 //! - `RUST_LOG=replicant_client=info,replicant_client::explore=debug`
 //!
 //! Example:
@@ -96,6 +104,23 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
 async fn refresh_device_snapshot(client: &Client, code: &str) -> AnyResult<Device> {
     let handle = client.devices().get(code).await?;
     Ok(handle.snapshot().await?)
+}
+
+async fn refresh_owned_device_snapshots(
+    client: &Client,
+) -> Result<BTreeMap<String, Device>, ClientError> {
+    let handles = client
+        .devices()
+        .refresh_many()
+        .page_size(50)
+        .collect()
+        .await?;
+    let mut devices = BTreeMap::new();
+    for handle in handles {
+        let device = handle.snapshot().await?;
+        devices.insert(handle.id().as_str().to_owned(), device);
+    }
+    Ok(devices)
 }
 
 async fn refresh_assigned_device_snapshots(
@@ -175,6 +200,20 @@ fn active_directive_status(device: &Device) -> Option<&str> {
         .and_then(|directive| directive.status.as_deref())
 }
 
+fn operational_capacity_percent(device: &Device) -> Option<f64> {
+    device
+        .operational_capacity
+        .map(replicant_client::domain::OperationalCapacity::percent)
+}
+
+fn survey_fleet_codes(plan: &RoutePlan) -> Vec<&str> {
+    plan.controller
+        .as_deref()
+        .into_iter()
+        .chain(plan.drones.iter().map(String::as_str))
+        .collect()
+}
+
 fn required_device<'a>(
     devices: &'a BTreeMap<String, Device>,
     code: &str,
@@ -188,9 +227,16 @@ fn required_device<'a>(
     })
 }
 
-const PLAN_VERSION: u32 = 2;
+const PLAN_VERSION: u32 = 3;
 const LEGACY_PLAN_VERSION: u32 = 1;
+const PRE_MAINTENANCE_PLAN_VERSION: u32 = 2;
 const DRONE_COUNT: usize = 3;
+const DEFAULT_MAINTENANCE_INTERVAL: usize = 40;
+const DEFAULT_MAINTENANCE_THRESHOLD_PCT: f64 = 25.0;
+const DEFAULT_MAINTENANCE_RESUME_PCT: f64 = 95.0;
+const DEFAULT_MAINTENANCE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const DEVICE_FUNCTIONAL_FLOOR_PCT: f64 = 21.0;
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_FILTER: &str = concat!(
     "replicant_client=info,",
     "replicant_client::explore=debug,",
@@ -225,6 +271,11 @@ struct Config {
     include_explored: bool,
     travel_timeout: Duration,
     survey_timeout: Duration,
+    maintenance_home: String,
+    maintenance_interval: usize,
+    maintenance_threshold_pct: f64,
+    maintenance_resume_pct: f64,
+    maintenance_check_interval: Duration,
     verbose: bool,
 }
 
@@ -273,6 +324,25 @@ impl Config {
             Duration::from_secs(env_u64("RS_EXPLORE_TRAVEL_TIMEOUT_SECS", 6 * 60 * 60)?);
         let mut survey_timeout =
             Duration::from_secs(env_u64("RS_EXPLORE_SURVEY_TIMEOUT_SECS", 6 * 60 * 60)?);
+        let mut maintenance_home = env::var("RS_EXPLORE_MAINTENANCE_HOME")
+            .ok()
+            .map(|value| value.to_ascii_uppercase());
+        let mut maintenance_interval = env_usize(
+            "RS_EXPLORE_MAINTENANCE_INTERVAL_SYSTEMS",
+            DEFAULT_MAINTENANCE_INTERVAL,
+        )?;
+        let mut maintenance_threshold_pct = env_f64(
+            "RS_EXPLORE_MAINTENANCE_THRESHOLD_PCT",
+            DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+        )?;
+        let mut maintenance_resume_pct = env_f64(
+            "RS_EXPLORE_MAINTENANCE_RESUME_PCT",
+            DEFAULT_MAINTENANCE_RESUME_PCT,
+        )?;
+        let mut maintenance_check_interval = Duration::from_secs(env_u64(
+            "RS_EXPLORE_MAINTENANCE_CHECK_SECS",
+            DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+        )?);
         let mut verbose = env_bool("RS_EXPLORE_VERBOSE", false)?;
 
         while let Some(argument) = arguments.next() {
@@ -328,6 +398,38 @@ impl Config {
                         "--survey-timeout-secs",
                     )?)?);
                 }
+                "--maintenance-home" => {
+                    maintenance_home = Some(
+                        required_argument(&mut arguments, "--maintenance-home")?
+                            .to_ascii_uppercase(),
+                    );
+                }
+                "--maintenance-interval-systems" => {
+                    maintenance_interval = positive_usize(
+                        &required_argument(&mut arguments, "--maintenance-interval-systems")?,
+                        "--maintenance-interval-systems",
+                    )?;
+                }
+                "--maintenance-threshold-pct" => {
+                    maintenance_threshold_pct = percentage(
+                        &required_argument(&mut arguments, "--maintenance-threshold-pct")?,
+                        "--maintenance-threshold-pct",
+                    )?;
+                }
+                "--maintenance-resume-pct" => {
+                    maintenance_resume_pct = percentage(
+                        &required_argument(&mut arguments, "--maintenance-resume-pct")?,
+                        "--maintenance-resume-pct",
+                    )?;
+                }
+                "--maintenance-check-secs" => {
+                    maintenance_check_interval = Duration::from_secs(u64::try_from(
+                        positive_usize(
+                            &required_argument(&mut arguments, "--maintenance-check-secs")?,
+                            "--maintenance-check-secs",
+                        )?,
+                    )?);
+                }
                 "--verbose" => verbose = true,
                 "--log-file" => {
                     log_path = Some(PathBuf::from(required_argument(
@@ -348,12 +450,25 @@ impl Config {
             }
         }
         validate_drone_codes(drone_overrides.as_deref())?;
+        if maintenance_threshold_pct > 100.0 || maintenance_resume_pct > 100.0 {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "maintenance capacity percentages must not exceed 100",
+            ));
+        }
+        if maintenance_resume_pct < maintenance_threshold_pct {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--maintenance-resume-pct must be greater than or equal to --maintenance-threshold-pct",
+            ));
+        }
         if command != Command::Plan && replace_plan {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,
                 "--replace-plan belongs on the plan command",
             ));
         }
+        let maintenance_home = maintenance_home.unwrap_or_else(|| center.clone());
         Ok(Self {
             command,
             database,
@@ -371,6 +486,11 @@ impl Config {
             include_explored,
             travel_timeout,
             survey_timeout,
+            maintenance_home,
+            maintenance_interval,
+            maintenance_threshold_pct,
+            maintenance_resume_pct,
+            maintenance_check_interval,
             verbose,
         })
     }
@@ -382,6 +502,12 @@ impl Config {
         self.radius_ly = plan.radius_ly;
         self.system_limit = plan.system_limit;
         self.include_explored = plan.include_explored;
+        self.maintenance_home.clone_from(&plan.maintenance_home);
+        self.maintenance_interval = plan.maintenance_interval;
+        self.maintenance_threshold_pct = plan.maintenance_threshold_pct;
+        self.maintenance_resume_pct = plan.maintenance_resume_pct;
+        self.maintenance_check_interval =
+            Duration::from_secs(plan.maintenance_check_seconds.max(1));
     }
 }
 
@@ -435,6 +561,22 @@ fn positive_usize(value: &str, option: &str) -> AnyResult<usize> {
     Ok(value)
 }
 
+fn percentage(value: &str, option: &str) -> AnyResult<f64> {
+    let value = value.parse::<f64>().map_err(|_| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be numeric"),
+        )
+    })?;
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{option} must be between 0 and 100"),
+        ));
+    }
+    Ok(value)
+}
+
 fn positive_f64(value: &str, option: &str) -> AnyResult<f64> {
     let value = value.parse::<f64>().map_err(|_| {
         app_error(
@@ -455,7 +597,7 @@ fn print_help() {
     println!(
         "Replicant survey route\n\n\
 Usage:\n  replicant-survey plan [OPTIONS]\n  replicant-survey run [OPTIONS]\n  replicant-survey status [OPTIONS]\n\n\
-Options:\n  --replicant CODE           Surveying replicant\n  --vessel CODE              Vessel carrying the survey fleet\n  --center SYSTEM            Route centre (default: SCEPTURUM)\n  --radius LY                Search radius (default: 30)\n  --system-limit N           Maximum route systems (default: 80)\n  --star-detail-concurrency N  Concurrent star-detail reads (1-16)\n  --controller CODE          Survey-controller override\n  --drones A,B,C             Three survey-drone overrides\n  --include-explored         Include systems already explored\n  --mission-file PATH        Persisted mission JSON\n  --replace-plan             Replace the existing mission during plan\n  --database PATH            Managed SQLite database\n  --travel-timeout-secs N    Per-travel wait timeout\n  --survey-timeout-secs N    Per-survey wait timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Options:\n  --replicant CODE           Surveying replicant\n  --vessel CODE              Vessel carrying the survey fleet\n  --center SYSTEM            Route centre (default: SCEPTURUM)\n  --radius LY                Search radius (default: 30)\n  --system-limit N           Maximum route systems (default: 80)\n  --star-detail-concurrency N  Concurrent star-detail reads (1-16)\n  --controller CODE          Survey-controller override\n  --drones A,B,C             Three survey-drone overrides\n  --include-explored         Include systems already explored\n  --mission-file PATH        Persisted mission JSON\n  --replace-plan             Replace the existing mission during plan\n  --database PATH            Managed SQLite database\n  --travel-timeout-secs N    Per-travel wait timeout\n  --survey-timeout-secs N    Per-survey wait timeout\n  --maintenance-home LOC     Home system/location for survey-fleet repair\n  --maintenance-interval-systems N  Proactive RTB interval (default: 40)\n  --maintenance-threshold-pct N  RTB at or below this capacity (default: 25)\n  --maintenance-resume-pct N  Repair target before resuming (default: 95)\n  --maintenance-check-secs N  Capacity check interval while surveying\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
 Plan performs reads and writes the mission only. Run always reconciles and\n\
 continues that mission; there is no separate resume command or --execute flag."
     );
@@ -569,6 +711,10 @@ enum RunPhase {
     SystemScanning,
     Surveying,
     Restowing,
+    MaintenanceRecovering,
+    MaintenanceReturning,
+    MaintenanceRepairing,
+    MaintenanceRestowing,
     Complete,
 }
 
@@ -599,6 +745,18 @@ struct RoutePlan {
     radius_ly: f64,
     system_limit: usize,
     include_explored: bool,
+    #[serde(default)]
+    maintenance_home: String,
+    #[serde(default = "default_maintenance_interval")]
+    maintenance_interval: usize,
+    #[serde(default = "default_maintenance_threshold_pct")]
+    maintenance_threshold_pct: f64,
+    #[serde(default = "default_maintenance_resume_pct")]
+    maintenance_resume_pct: f64,
+    #[serde(default = "default_maintenance_check_seconds")]
+    maintenance_check_seconds: u64,
+    #[serde(default)]
+    last_maintenance_index: usize,
     controller: Option<String>,
     drones: Vec<String>,
     fleet_prepared: bool,
@@ -607,15 +765,36 @@ struct RoutePlan {
     phase: RunPhase,
 }
 
+const fn default_maintenance_interval() -> usize {
+    DEFAULT_MAINTENANCE_INTERVAL
+}
+
+const fn default_maintenance_threshold_pct() -> f64 {
+    DEFAULT_MAINTENANCE_THRESHOLD_PCT
+}
+
+const fn default_maintenance_resume_pct() -> f64 {
+    DEFAULT_MAINTENANCE_RESUME_PCT
+}
+
+const fn default_maintenance_check_seconds() -> u64 {
+    DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs()
+}
+
 impl RoutePlan {
     fn migrate(&mut self) -> AnyResult<bool> {
         match self.version {
             PLAN_VERSION => Ok(false),
-            LEGACY_PLAN_VERSION => {
+            LEGACY_PLAN_VERSION | PRE_MAINTENANCE_PLAN_VERSION => {
                 // Version 1 stored a per-stop `completed` flag. Version 2
-                // uses `next_index` as the authoritative finalized-stop
-                // boundary, which preserves the Restowing safety phase.
-                // Serde safely ignores the legacy JSON field.
+                // introduced the authoritative `next_index` boundary. Version
+                // 3 persists maintenance policy and progress. Serde safely
+                // ignores the legacy JSON field and supplies defaults.
+                if self.maintenance_home.is_empty() {
+                    self.maintenance_home.clone_from(&self.center);
+                }
+                self.maintenance_interval = self.maintenance_interval.max(1);
+                self.maintenance_check_seconds = self.maintenance_check_seconds.max(1);
                 self.version = PLAN_VERSION;
                 Ok(true)
             }
@@ -649,6 +828,27 @@ impl RoutePlan {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
                 "route plan next_index exceeds route length",
+            ));
+        }
+        if self.maintenance_home.is_empty() {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                "route plan maintenance_home must not be empty",
+            ));
+        }
+        if self.maintenance_interval == 0 || self.maintenance_check_seconds == 0 {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                "route plan maintenance interval and check cadence must be greater than zero",
+            ));
+        }
+        if !(0.0..=100.0).contains(&self.maintenance_threshold_pct)
+            || !(0.0..=100.0).contains(&self.maintenance_resume_pct)
+            || self.maintenance_resume_pct < self.maintenance_threshold_pct
+        {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                "route plan maintenance capacity percentages are invalid",
             ));
         }
         Ok(())
@@ -897,6 +1097,22 @@ async fn reconcile_current_system_scan_on_startup(
     plan: &mut RoutePlan,
 ) -> AnyResult<()> {
     let started = Instant::now();
+    if matches!(
+        plan.phase,
+        RunPhase::MaintenanceRecovering
+            | RunPhase::MaintenanceReturning
+            | RunPhase::MaintenanceRepairing
+            | RunPhase::MaintenanceRestowing
+    ) {
+        info!(
+            target: "replicant_client::explore",
+            event = "startup.current_system_check_skipped",
+            phase = ?plan.phase,
+            reason = "maintenance_in_progress",
+            "preserving the saved maintenance checkpoint during startup reconciliation"
+        );
+        return Ok(());
+    }
     let Some(current_star) = current_star(client, &config.replicant).await? else {
         warn!(
             target: "replicant_client::explore",
@@ -1157,7 +1373,15 @@ fn apply_startup_current_system_completion(
         if plan.route[route_index].can_advance_without_restow() {
             changed |= plan.normalize_progress();
         } else if plan.fleet_prepared
-            && !matches!(plan.phase, RunPhase::Restowing | RunPhase::Complete)
+            && !matches!(
+                plan.phase,
+                RunPhase::Restowing
+                    | RunPhase::MaintenanceRecovering
+                    | RunPhase::MaintenanceReturning
+                    | RunPhase::MaintenanceRepairing
+                    | RunPhase::MaintenanceRestowing
+                    | RunPhase::Complete
+            )
         {
             let desired_phase = if !plan.route[route_index].system_scan_done {
                 RunPhase::SystemScanning
@@ -1447,6 +1671,12 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         radius_ly: config.radius_ly,
         system_limit: config.system_limit,
         include_explored: config.include_explored,
+        maintenance_home: config.maintenance_home.clone(),
+        maintenance_interval: config.maintenance_interval,
+        maintenance_threshold_pct: config.maintenance_threshold_pct,
+        maintenance_resume_pct: config.maintenance_resume_pct,
+        maintenance_check_seconds: config.maintenance_check_interval.as_secs(),
+        last_maintenance_index: next_index,
         controller: None,
         drones: Vec::new(),
         fleet_prepared: false,
@@ -1513,6 +1743,14 @@ fn print_plan(plan: &RoutePlan) {
     println!("  Progress: {completed}/{} stops", plan.route.len());
     println!("  Phase: {:?}", plan.phase);
     println!("  Route distance: {total_distance:.2} ly");
+    println!(
+        "  Maintenance: {} every {} stops at <= {:.1}% (resume >= {:.1}%, check {}s)",
+        plan.maintenance_home,
+        plan.maintenance_interval,
+        plan.maintenance_threshold_pct,
+        plan.maintenance_resume_pct,
+        plan.maintenance_check_seconds
+    );
     if let Some(next) = plan.route.get(plan.next_index) {
         println!("  Next system: {}", next.star);
     }
@@ -1839,11 +2077,17 @@ struct FleetVerification {
 
 impl FleetVerification {
     fn for_plan(plan: &RoutePlan) -> Self {
+        let directive_may_be_paused = matches!(
+            plan.phase,
+            RunPhase::MaintenanceRecovering
+                | RunPhase::MaintenanceReturning
+                | RunPhase::MaintenanceRepairing
+        );
         Self {
             context: "plan",
             require_stowed: phase_requires_stowed_fleet(plan.phase),
             require_adoption: plan.fleet_prepared,
-            require_directive: plan.fleet_prepared,
+            require_directive: plan.fleet_prepared && !directive_may_be_paused,
         }
     }
 
@@ -1939,7 +2183,10 @@ async fn verify_fleet(
 }
 
 fn phase_requires_stowed_fleet(phase: RunPhase) -> bool {
-    matches!(phase, RunPhase::Ready | RunPhase::SystemScanning)
+    matches!(
+        phase,
+        RunPhase::Ready | RunPhase::SystemScanning | RunPhase::MaintenanceReturning
+    )
 }
 
 fn ensure_account_owned(account_owned: &BTreeSet<String>, code: &str) -> AnyResult<()> {
@@ -2540,6 +2787,510 @@ async fn wait_immediate_operation(label: &str, operation: &Operation) -> AnyResu
     }
 }
 
+
+async fn fleet_capacity_snapshot(
+    client: &Client,
+    plan: &RoutePlan,
+) -> AnyResult<Vec<(String, Option<f64>)>> {
+    let mut capacities = Vec::new();
+    for code in survey_fleet_codes(plan) {
+        let device = refresh_device_snapshot(client, code).await?;
+        capacities.push((code.to_owned(), operational_capacity_percent(&device)));
+    }
+    Ok(capacities)
+}
+
+async fn fleet_below_maintenance_threshold(
+    client: &Client,
+    plan: &RoutePlan,
+    threshold_pct: f64,
+) -> AnyResult<bool> {
+    let capacities = fleet_capacity_snapshot(client, plan).await?;
+    let degraded = capacities
+        .iter()
+        .any(|(_, capacity)| {
+            capacity
+                .as_ref()
+                .is_some_and(|value| *value <= threshold_pct)
+        });
+    info!(
+        target: "replicant_client::explore",
+        event = "survey.capacity_checked",
+        threshold_pct,
+        capacities = ?capacities,
+        degraded,
+        "checked survey-fleet operational capacity"
+    );
+    Ok(degraded)
+}
+
+fn maintenance_interval_due(plan: &RoutePlan) -> Option<usize> {
+    let completed_since_maintenance = plan
+        .next_index
+        .saturating_sub(plan.last_maintenance_index);
+    (completed_since_maintenance >= plan.maintenance_interval)
+        .then_some(completed_since_maintenance)
+}
+
+async fn maintenance_reason(client: &Client, plan: &RoutePlan) -> AnyResult<Option<String>> {
+    if let Some(completed_since_maintenance) = maintenance_interval_due(plan) {
+        return Ok(Some(format!(
+            "interval:{completed_since_maintenance}/{}",
+            plan.maintenance_interval
+        )));
+    }
+
+    let capacities = fleet_capacity_snapshot(client, plan).await?;
+    if let Some((code, capacity)) = capacities.iter().find_map(|(code, capacity)| {
+        let capacity = match capacity {
+            Some(capacity) => *capacity,
+            None => return None,
+        };
+        (capacity <= plan.maintenance_threshold_pct).then_some((code, capacity))
+    }) {
+        return Ok(Some(format!("capacity:{code}:{capacity:.1}%")));
+    }
+    Ok(None)
+}
+
+async fn current_replicant_location(
+    client: &Client,
+    replicant_code: &str,
+) -> AnyResult<Option<String>> {
+    let handle = client.replicants().get_owned(replicant_code).await?;
+    let snapshot = handle.snapshot().await?;
+    Ok(snapshot.location.map(|location| location.id.as_str().to_owned()))
+}
+
+async fn travel_replicant_to_location(
+    client: &Client,
+    config: &Config,
+    destination: &str,
+) -> AnyResult<()> {
+    if current_replicant_location(client, &config.replicant)
+        .await?
+        .as_deref()
+        == Some(destination)
+    {
+        return Ok(());
+    }
+
+    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let snapshot = replicant.snapshot().await?;
+    let already_traveling = snapshot.travel.as_ref().is_some_and(|travel| {
+        travel
+            .destination
+            .as_ref()
+            .is_some_and(|target| target.id.as_str() == destination)
+    });
+    if !already_traveling {
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.maintenance_travel_started",
+            replicant = %config.replicant,
+            destination,
+            "moving the survey vessel for fleet recovery or maintenance"
+        );
+        let operation = replicant.travel().to(destination).depart().await?;
+        wait_immediate_operation("survey maintenance travel", &operation).await?;
+    }
+
+    let started = Instant::now();
+    loop {
+        if current_replicant_location(client, &config.replicant)
+            .await?
+            .as_deref()
+            == Some(destination)
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= config.travel_timeout {
+            return Err(app_error(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "maintenance travel to {destination} exceeded {:?}",
+                    config.travel_timeout
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+async fn recover_fleet_for_maintenance(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+) -> AnyResult<()> {
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route plan has no survey controller"))?;
+    let controller_snapshot = refresh_device_snapshot(client, controller_code).await?;
+    if operational_capacity_percent(&controller_snapshot)
+        .map_or(true, |capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT)
+        && active_directive_status(&controller_snapshot) != Some("inactive")
+        && device_has_command(&controller_snapshot, "clear_directive")
+    {
+        let controller = client
+            .devices()
+            .get(controller_code)
+            .await?
+            .as_survey_controller()?;
+        let operation = controller.clear_directive().await?;
+        wait_immediate_operation("pause survey directive for maintenance", &operation).await?;
+    }
+
+    let vessel = refresh_device_snapshot(client, &config.vessel).await?;
+    let mut vessel_location = device_location(&vessel)
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "survey vessel has no location"))?
+        .to_owned();
+
+    for code in survey_fleet_codes(plan) {
+        let device = refresh_device_snapshot(client, code).await?;
+        if device_stowed_in(&device) == Some(config.vessel.as_str()) {
+            continue;
+        }
+        if device_location(&device) == Some(vessel_location.as_str()) {
+            ensure_device_stowed_idempotently(client, config, code).await?;
+            continue;
+        }
+        let capacity = operational_capacity_percent(&device).unwrap_or(100.0);
+        if capacity > DEVICE_FUNCTIONAL_FLOOR_PCT && device_has_command(&device, "recall") {
+            info!(
+                target: "replicant_client::explore",
+                event = "survey.maintenance_recall_started",
+                device = code,
+                capacity_pct = capacity,
+                "recalling a still-functional survey device before maintenance"
+            );
+            let operation = client.devices().get(code).await?.recall().await?;
+            wait_immediate_operation("recall survey device for maintenance", &operation).await?;
+        }
+    }
+
+    let recall_started = Instant::now();
+    loop {
+        let mut waiting = Vec::new();
+        for code in survey_fleet_codes(plan) {
+            let device = refresh_device_snapshot(client, code).await?;
+            if device_stowed_in(&device) == Some(config.vessel.as_str()) {
+                continue;
+            }
+            let capacity = operational_capacity_percent(&device).unwrap_or(100.0);
+            if capacity > DEVICE_FUNCTIONAL_FLOOR_PCT
+                && device_location(&device) != Some(vessel_location.as_str())
+            {
+                waiting.push(code.to_owned());
+            }
+        }
+        if waiting.is_empty() || recall_started.elapsed() >= Duration::from_secs(20 * 60) {
+            break;
+        }
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.maintenance_recall_waiting",
+            pending = ?waiting,
+            "waiting for functional survey devices to return before rescuing disabled devices"
+        );
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+
+    for code in survey_fleet_codes(plan) {
+        let device = refresh_device_snapshot(client, code).await?;
+        if device_stowed_in(&device) == Some(config.vessel.as_str()) {
+            continue;
+        }
+        let location = device_location(&device).ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("degraded survey device {code} has no recoverable location"),
+            )
+        })?;
+        if location != vessel_location.as_str() {
+            info!(
+                target: "replicant_client::explore",
+                event = "survey.disabled_device_rendezvous",
+                device = code,
+                location,
+                "flying the vessel to a survey device that can no longer recall itself"
+            );
+            travel_replicant_to_location(client, config, location).await?;
+            vessel_location = location.to_owned();
+        }
+        ensure_device_stowed_idempotently(client, config, code).await?;
+    }
+
+    stow_fleet(client, config, plan).await
+}
+
+async fn maintenance_drone_at_home(
+    client: &Client,
+    plan: &RoutePlan,
+) -> AnyResult<(String, String)> {
+    let home_star = star_from_designation(&plan.maintenance_home);
+    let devices = refresh_owned_device_snapshots(client).await?;
+    let mut candidates = devices
+        .into_iter()
+        .filter_map(|(code, device)| {
+            let location = device_location(&device)?.to_owned();
+            (device_type_name(&device) == Some("maintenance_drone")
+                && designation_in_star(&location, home_star)
+                && device_stowed_in(&device).is_none()
+                && device_attached_to(&device).is_none()
+                && !device.is_traveling()
+                && operational_capacity_percent(&device)
+                    .map_or(true, |capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT))
+            .then_some((code, location))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_exact = left.1 == plan.maintenance_home;
+        let right_exact = right.1 == plan.maintenance_home;
+        right_exact
+            .cmp(&left_exact)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.into_iter().next().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "no functional, deployed maintenance drone is available in home system {home_star}"
+            ),
+        )
+    })
+}
+
+async fn return_to_maintenance_base(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+) -> AnyResult<()> {
+    stow_fleet(client, config, plan).await?;
+    let (maintenance_drone, location) = maintenance_drone_at_home(client, plan).await?;
+    info!(
+        target: "replicant_client::explore",
+        event = "survey.maintenance_rtb",
+        home = %plan.maintenance_home,
+        maintenance_drone,
+        repair_location = %location,
+        "returning the survey fleet to its maintenance base"
+    );
+    travel_replicant_to_location(client, config, &location).await
+}
+
+async fn deploy_device_for_maintenance(
+    client: &Client,
+    config: &Config,
+    code: &str,
+    location: &str,
+) -> AnyResult<()> {
+    let device = refresh_device_snapshot(client, code).await?;
+    if device_stowed_in(&device).is_none() && device_location(&device) == Some(location) {
+        return Ok(());
+    }
+    if device_stowed_in(&device) != Some(config.vessel.as_str()) {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("survey device {code} is not stowed in vessel {} before maintenance", config.vessel),
+        ));
+    }
+    let operation = client.devices().get(code).await?.deploy().await?;
+    wait_immediate_operation("deploy survey device for maintenance", &operation).await?;
+    let started = Instant::now();
+    loop {
+        let refreshed = refresh_device_snapshot(client, code).await?;
+        if device_stowed_in(&refreshed).is_none()
+            && device_location(&refreshed) == Some(location)
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= Duration::from_secs(10 * 60) {
+            return Err(app_error(
+                io::ErrorKind::TimedOut,
+                format!("survey device {code} did not deploy at {location}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn stop_device_for_repair(client: &Client, code: &str) -> AnyResult<()> {
+    let device = refresh_device_snapshot(client, code).await?;
+    if active_directive_status(&device) == Some("inactive")
+        || device.active_directive.is_none()
+    {
+        return Ok(());
+    }
+
+    let handle = client.devices().get(code).await?;
+    let operation = if device_has_command(&device, "clear_directive") {
+        handle
+            .command(raw::devices::DeviceCommand::ClearDirective)
+            .await?
+    } else if device_has_command(&device, "deactivate") {
+        handle.deactivate().await?
+    } else {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "survey device {code} is still running a directive and cannot be stopped for repair"
+            ),
+        ));
+    };
+    wait_immediate_operation("stop device for maintenance", &operation).await
+}
+
+async fn wait_for_repair_capacity(
+    client: &Client,
+    code: &str,
+    minimum_pct: f64,
+    operation: &Operation,
+) -> AnyResult<()> {
+    let started = Instant::now();
+    loop {
+        let device = refresh_device_snapshot(client, code).await?;
+        if operational_capacity_percent(&device).is_some_and(|value| value >= minimum_pct) {
+            return Ok(());
+        }
+        let status = operation.status().await?;
+        if matches!(
+            status,
+            OperationStatus::Rejected
+                | OperationStatus::Cancelled
+                | OperationStatus::Failed
+        ) {
+            return Err(app_error(
+                io::ErrorKind::Other,
+                format!("repair operation {} for {code} ended as {status:?}", operation.id()),
+            ));
+        }
+        if started.elapsed() >= MAINTENANCE_TIMEOUT {
+            return Err(app_error(
+                io::ErrorKind::TimedOut,
+                format!("repairing survey device {code} exceeded {MAINTENANCE_TIMEOUT:?}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SavedDeviceDirective {
+    directive: String,
+    configuration: Option<raw::JsonObject>,
+    notify: Option<raw::JsonObject>,
+}
+
+fn active_directive_for_restore(device: &Device) -> Option<SavedDeviceDirective> {
+    let active = device.active_directive.as_ref()?;
+    if active.status.as_deref() == Some("inactive") {
+        return None;
+    }
+    let directive = active.directive.as_ref()?.as_str().to_owned();
+    let object = |key: &str| {
+        active
+            .details
+            .get(key)
+            .and_then(Value::as_object)
+            .cloned()
+    };
+    Some(SavedDeviceDirective {
+        directive,
+        configuration: object("configuration"),
+        notify: object("notify"),
+    })
+}
+
+async fn repair_survey_fleet(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+) -> AnyResult<()> {
+    let (maintenance_drone_code, location) = maintenance_drone_at_home(client, plan).await?;
+    travel_replicant_to_location(client, config, &location).await?;
+
+    let maintenance_before = refresh_device_snapshot(client, &maintenance_drone_code).await?;
+    let maintenance_directive = active_directive_for_restore(&maintenance_before);
+    stop_device_for_repair(client, &maintenance_drone_code).await?;
+
+    for code in survey_fleet_codes(plan) {
+        deploy_device_for_maintenance(client, config, code, &location).await?;
+        stop_device_for_repair(client, code).await?;
+    }
+
+    let maintenance_snapshot = refresh_device_snapshot(client, &maintenance_drone_code).await?;
+    if !device_has_command(&maintenance_snapshot, "repair") {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "maintenance drone {maintenance_drone_code} at {location} does not advertise repair after its directive was stopped"
+            ),
+        ));
+    }
+    let maintenance = client.devices().get(&maintenance_drone_code).await?;
+    for code in survey_fleet_codes(plan) {
+        let device = refresh_device_snapshot(client, code).await?;
+        let capacity = operational_capacity_percent(&device).ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("survey device {code} did not report operational_capacity"),
+            )
+        })?;
+        if capacity >= plan.maintenance_resume_pct {
+            continue;
+        }
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.repair_started",
+            device = code,
+            capacity_pct = capacity,
+            target_pct = plan.maintenance_resume_pct,
+            maintenance_drone = %maintenance_drone_code,
+            "repairing a degraded survey-fleet device"
+        );
+        let operation = maintenance.repair(code.to_owned()).await?;
+        wait_for_repair_capacity(client, code, plan.maintenance_resume_pct, &operation).await?;
+    }
+
+    if let Some(saved) = maintenance_directive {
+        info!(
+            target: "replicant_client::explore",
+            event = "survey.maintenance_directive_restoring",
+            maintenance_drone = %maintenance_drone_code,
+            directive = %saved.directive,
+            "restoring the maintenance drone directive paused for direct repairs"
+        );
+        let operation = maintenance
+            .command(raw::devices::DeviceCommand::SetDirective {
+                directive: saved.directive,
+                configuration: saved.configuration,
+                notify: saved.notify,
+            })
+            .await?;
+        wait_immediate_operation("restore maintenance drone directive", &operation).await?;
+    }
+
+    let controller_code = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route plan has no survey controller"))?;
+    let controller = client
+        .devices()
+        .get(controller_code)
+        .await?
+        .as_survey_controller()?;
+    let operation = controller
+        .set_directive(SurveyDirective::SurveySystem {
+            planets: "all".to_owned(),
+            moons: "all".to_owned(),
+            recall: true,
+        })
+        .await?;
+    wait_immediate_operation("restore survey directive after maintenance", &operation).await?;
+    Ok(())
+}
+
 async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -> AnyResult<()> {
     while plan.next_index < plan.route.len() {
         let index = plan.next_index;
@@ -2560,6 +3311,25 @@ async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -
                 prepare_fleet(client, config, plan).await?;
             }
             RunPhase::Ready => {
+                if fleet_below_maintenance_threshold(
+                    client,
+                    plan,
+                    plan.maintenance_threshold_pct,
+                )
+                .await?
+                {
+                    warn!(
+                        target: "replicant_client::explore",
+                        event = "survey.maintenance_required_before_departure",
+                        index,
+                        star = %target,
+                        threshold_pct = plan.maintenance_threshold_pct,
+                        "survey fleet is below the maintenance threshold before departure"
+                    );
+                    plan.phase = RunPhase::MaintenanceReturning;
+                    save_plan(&config.plan_path, plan)?;
+                    continue;
+                }
                 let current = current_star(client, &config.replicant).await?;
                 if current.as_deref() != Some(target.as_str()) {
                     // `travel_to` owns the departure invariant and will recall,
@@ -2607,16 +3377,29 @@ async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -
                 save_plan(&config.plan_path, plan)?;
             }
             RunPhase::Surveying => {
-                run_survey(client, config, plan, &target).await?;
-                plan.route[index].survey_done = true;
-                plan.phase = RunPhase::Restowing;
+                match run_survey(client, config, plan, &target).await? {
+                    SurveyRunOutcome::Completed => {
+                        plan.route[index].survey_done = true;
+                        plan.phase = RunPhase::Restowing;
+                    }
+                    SurveyRunOutcome::MaintenanceRequired => {
+                        plan.phase = RunPhase::MaintenanceRecovering;
+                    }
+                }
                 save_plan(&config.plan_path, plan)?;
             }
             RunPhase::Restowing => {
                 recall_and_stow(client, config, plan).await?;
                 plan.next_index += 1;
+                let maintenance = if plan.next_index < plan.route.len() {
+                    maintenance_reason(client, plan).await?
+                } else {
+                    None
+                };
                 plan.phase = if plan.next_index >= plan.route.len() {
                     RunPhase::Complete
+                } else if maintenance.is_some() {
+                    RunPhase::MaintenanceReturning
                 } else {
                     RunPhase::Ready
                 };
@@ -2627,7 +3410,36 @@ async fn execute_route(client: &Client, config: &Config, plan: &mut RoutePlan) -
                     index,
                     star = %target,
                     next_index = plan.next_index,
+                    maintenance = maintenance.as_deref().unwrap_or("not_due"),
                     "route stop completed and saved"
+                );
+            }
+            RunPhase::MaintenanceRecovering => {
+                recover_fleet_for_maintenance(client, config, plan).await?;
+                plan.phase = RunPhase::MaintenanceReturning;
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::MaintenanceReturning => {
+                return_to_maintenance_base(client, config, plan).await?;
+                plan.phase = RunPhase::MaintenanceRepairing;
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::MaintenanceRepairing => {
+                repair_survey_fleet(client, config, plan).await?;
+                plan.phase = RunPhase::MaintenanceRestowing;
+                save_plan(&config.plan_path, plan)?;
+            }
+            RunPhase::MaintenanceRestowing => {
+                stow_fleet(client, config, plan).await?;
+                plan.last_maintenance_index = plan.next_index;
+                plan.phase = RunPhase::Ready;
+                save_plan(&config.plan_path, plan)?;
+                info!(
+                    target: "replicant_client::explore",
+                    event = "survey.maintenance_completed",
+                    next_index = plan.next_index,
+                    home = %plan.maintenance_home,
+                    "survey fleet repaired, stowed, and ready to resume the saved route"
                 );
             }
             RunPhase::Complete => break,
@@ -3153,16 +3965,32 @@ async fn detach_survey_fleet_from_carriers(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurveyRunOutcome {
+    Completed,
+    MaintenanceRequired,
+}
+
 async fn run_survey(
     client: &Client,
     config: &Config,
     plan: &RoutePlan,
     target: &str,
-) -> AnyResult<()> {
+) -> AnyResult<SurveyRunOutcome> {
     let controller_code = plan
         .controller
         .as_deref()
         .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
+    if fleet_below_maintenance_threshold(client, plan, config.maintenance_threshold_pct).await? {
+        warn!(
+            target: "replicant_client::explore",
+            event = "survey.maintenance_required_before_launch",
+            star = target,
+            threshold_pct = config.maintenance_threshold_pct,
+            "survey fleet is already below the maintenance threshold; refusing to launch"
+        );
+        return Ok(SurveyRunOutcome::MaintenanceRequired);
+    }
     let controller_handle = client.devices().get(controller_code).await?;
     let controller = controller_handle.as_survey_controller()?;
 
@@ -3211,12 +4039,25 @@ async fn run_survey(
     }
 
     let started = Instant::now();
+    let mut last_capacity_check = Instant::now();
     loop {
         if started.elapsed() >= config.survey_timeout {
+            if fleet_below_maintenance_threshold(client, plan, config.maintenance_threshold_pct)
+                .await?
+            {
+                warn!(
+                    target: "replicant_client::explore",
+                    event = "survey.maintenance_required_at_timeout",
+                    star = target,
+                    threshold_pct = config.maintenance_threshold_pct,
+                    "survey timed out with a degraded fleet; starting maintenance recovery"
+                );
+                return Ok(SurveyRunOutcome::MaintenanceRequired);
+            }
             return Err(app_error(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "survey at {target} exceeded {:?}; plan remains resumable",
+                    "survey at {target} exceeded {:?}; fleet capacity remains above the maintenance threshold and the plan remains resumable",
                     config.survey_timeout
                 ),
             ));
@@ -3255,7 +4096,7 @@ async fn run_survey(
                         "survey completion has event evidence; reconciling planet and moon completeness"
                     );
                     confirm_survey_completion(client, config, target).await?;
-                    return Ok(());
+                    return Ok(SurveyRunOutcome::Completed);
                 }
             }
             Ok(Err(error)) => return Err(error.into()),
@@ -3281,7 +4122,7 @@ async fn run_survey(
                             "found missed survey completion in unfiltered event history"
                         );
                         confirm_survey_completion(client, config, target).await?;
-                        return Ok(());
+                        return Ok(SurveyRunOutcome::Completed);
                     }
                     Ok(None) => {}
                     Err(history_error) => {
@@ -3293,6 +4134,27 @@ async fn run_survey(
                             error = %history_error,
                             "could not check unfiltered event history; continuing the live wait"
                         );
+                    }
+                }
+
+                if last_capacity_check.elapsed() >= config.maintenance_check_interval {
+                    last_capacity_check = Instant::now();
+                    if fleet_below_maintenance_threshold(
+                        client,
+                        plan,
+                        config.maintenance_threshold_pct,
+                    )
+                    .await?
+                    {
+                        warn!(
+                            target: "replicant_client::explore",
+                            event = "survey.maintenance_required",
+                            star = target,
+                            threshold_pct = config.maintenance_threshold_pct,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "survey fleet capacity crossed the maintenance threshold"
+                        );
+                        return Ok(SurveyRunOutcome::MaintenanceRequired);
                     }
                 }
 
@@ -4108,6 +4970,11 @@ pub async fn execute_survey(client: &Client, request: &SurveyRequest) -> AnyResu
         include_explored: request.include_explored,
         travel_timeout: request.travel_timeout,
         survey_timeout: request.survey_timeout,
+        maintenance_home: request.center.to_ascii_uppercase(),
+        maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+        maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+        maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+        maintenance_check_interval: DEFAULT_MAINTENANCE_CHECK_INTERVAL,
         verbose: false,
     };
     if request.mission_file.exists() {
@@ -4128,6 +4995,27 @@ pub async fn execute_survey(client: &Client, request: &SurveyRequest) -> AnyResu
 mod tests {
     use super::*;
     use replicant_client::{DeviceId, DeviceKey, StarId, domain::StarKey};
+
+    #[test]
+    fn operational_capacity_accepts_fraction_and_percentage_wire_shapes() {
+        let fractional = replicant_client::domain::OperationalCapacity::new(0.19)
+            .expect("fractional capacity should be valid");
+        let percentage = replicant_client::domain::OperationalCapacity::new(19.0)
+            .expect("percentage capacity should be valid");
+
+        assert!((fractional.percent() - 19.0).abs() < f64::EPSILON);
+        assert!((percentage.percent() - 19.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn maintenance_restowing_does_not_require_an_already_stowed_fleet() {
+        assert!(!phase_requires_stowed_fleet(
+            RunPhase::MaintenanceRestowing
+        ));
+        assert!(phase_requires_stowed_fleet(
+            RunPhase::MaintenanceReturning
+        ));
+    }
 
     #[test]
     fn designation_matching_accepts_star_and_child_locations() {
@@ -4220,6 +5108,12 @@ mod tests {
             radius_ly: 10.0,
             system_limit: 2,
             include_explored: false,
+            maintenance_home: "SCEPTURUM".into(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 0,
             controller: None,
             drones: Vec::new(),
             fleet_prepared: false,
@@ -4263,6 +5157,12 @@ mod tests {
             radius_ly: 10.0,
             system_limit: 1,
             include_explored: false,
+            maintenance_home: "TEJUT".into(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 0,
             controller: Some("CONTROLLER".into()),
             drones: vec!["D1".into(), "D2".into(), "D3".into(), "D4".into()],
             fleet_prepared: true,
@@ -4303,6 +5203,12 @@ mod tests {
             radius_ly: 10.0,
             system_limit: 1,
             include_explored: false,
+            maintenance_home: "TEJUT".into(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 0,
             controller: Some("CONTROLLER".into()),
             drones: vec!["D1".into(), "D2".into(), "D3".into(), "D4".into()],
             fleet_prepared: true,
@@ -4341,6 +5247,12 @@ mod tests {
             radius_ly: 10.0,
             system_limit: 2,
             include_explored: false,
+            maintenance_home: "TEJUT".into(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 0,
             controller: Some("CONTROLLER".into()),
             drones: vec!["D1".into(), "D2".into(), "D3".into(), "D4".into()],
             fleet_prepared: true,
@@ -4379,6 +5291,69 @@ mod tests {
         assert!(!plan.route[0].survey_done);
         assert!(!plan.stop_is_finalized(0));
         assert_eq!(plan.phase, RunPhase::Surveying);
+    }
+
+    #[test]
+    fn maintenance_interval_counts_stops_since_the_last_repair() {
+        let plan = RoutePlan {
+            version: PLAN_VERSION,
+            created_unix_seconds: 0,
+            replicant: "B6BA399E".into(),
+            vessel: "FD5EA802".into(),
+            center: "TEJUT".into(),
+            radius_ly: 10.0,
+            system_limit: 80,
+            include_explored: false,
+            maintenance_home: "TEJUT".into(),
+            maintenance_interval: 40,
+            maintenance_threshold_pct: 25.0,
+            maintenance_resume_pct: 95.0,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 9,
+            controller: None,
+            drones: Vec::new(),
+            fleet_prepared: false,
+            route: Vec::new(),
+            next_index: 49,
+            phase: RunPhase::Ready,
+        };
+
+        assert_eq!(maintenance_interval_due(&plan), Some(40));
+    }
+
+    #[test]
+    fn version_two_plan_migrates_with_center_as_maintenance_home() {
+        let json = r#"{
+            "version": 2,
+            "created_unix_seconds": 0,
+            "replicant": "B7AF4A8C",
+            "vessel": "6592B774",
+            "center": "THYFFAWFF",
+            "radius_ly": 30.0,
+            "system_limit": 80,
+            "include_explored": false,
+            "controller": "0B5B4C27",
+            "drones": ["006F778E", "0CC36AF8", "22D06BF8"],
+            "fleet_prepared": true,
+            "route": [],
+            "next_index": 0,
+            "phase": "complete"
+        }"#;
+
+        let mut plan: RoutePlan = serde_json::from_str(json).expect("version 2 plan should decode");
+        assert!(plan.migrate().expect("version 2 plan should migrate"));
+        assert_eq!(plan.version, PLAN_VERSION);
+        assert_eq!(plan.maintenance_home, "THYFFAWFF");
+        assert_eq!(plan.maintenance_interval, DEFAULT_MAINTENANCE_INTERVAL);
+        assert_eq!(
+            plan.maintenance_check_seconds,
+            DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs()
+        );
+        assert_eq!(
+            plan.maintenance_threshold_pct,
+            DEFAULT_MAINTENANCE_THRESHOLD_PCT
+        );
+        assert_eq!(plan.last_maintenance_index, 0);
     }
 
     #[test]
@@ -4424,6 +5399,8 @@ mod tests {
         let mut plan: RoutePlan = serde_json::from_str(json).expect("legacy plan should decode");
         assert!(plan.migrate().expect("legacy plan should migrate"));
         assert_eq!(plan.version, PLAN_VERSION);
+        assert_eq!(plan.maintenance_home, "TEJUT");
+        assert_eq!(plan.maintenance_interval, DEFAULT_MAINTENANCE_INTERVAL);
         assert!(plan.stop_is_finalized(0));
         assert!(!plan.stop_is_finalized(1));
         assert_eq!(plan.phase, RunPhase::Restowing);
@@ -4445,6 +5422,12 @@ mod tests {
             radius_ly: 10.0,
             system_limit: 1,
             include_explored: false,
+            maintenance_home: "TEJUT".into(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_seconds: DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
+            last_maintenance_index: 0,
             controller: Some("CONTROLLER".into()),
             drones: vec!["D1".into(), "D2".into(), "D3".into()],
             fleet_prepared: true,
