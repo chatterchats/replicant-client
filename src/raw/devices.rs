@@ -2,7 +2,7 @@
 //!
 //! This is the largest raw domain: listing/filtering owned devices, reading
 //! full device status, configuring tags, dispatching the unified device
-//! command endpoint (39 command names over 23 distinct payload shapes),
+//! command endpoint (40 command names over 24 distinct payload shapes),
 //! device event logs, network topology, and device permission grants
 //! (undocumented/opaque, like the trading endpoints).
 //!
@@ -526,7 +526,8 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
-    /// Deactivates an active device.
+    /// Deactivates an active device, cancelling any active prospecting or
+    /// triangulation action.
     Deactivate,
     /// Permanently decommissions a device.
     Decommission,
@@ -677,6 +678,13 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         via: Option<serde_json::Value>,
     },
+    /// Triangulates a spectral signature from a deep-space reference point.
+    Triangulate {
+        /// Spectral signature hash to locate.
+        signature: String,
+        /// Reference point coordinates `[x, y, z]` for the observation.
+        target: Vec<f64>,
+    },
     /// Unfurls a deployed structure.
     Unfurl,
     /// Withdraws a device from active service.
@@ -755,7 +763,7 @@ pub struct DeviceCommandResponse {
     pub detached: Vec<String>,
     /// The command's target device code.
     pub device_code: Option<String>,
-    /// Prospecting direction after a `prospect` command.
+    /// Direction returned by a `prospect` or completed triangulation.
     pub direction: Option<Vec<f64>>,
     /// Distance in AU after a `travel` command.
     pub distance_au: Option<f64>,
@@ -820,6 +828,8 @@ pub struct DeviceCommandResponse {
     /// Scan type after a scan-related command.
     #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub scan_type: Option<String>,
+    /// Spectral signature accepted by a `triangulate` command.
+    pub signature: Option<String>,
     /// Star after the command.
     #[serde(default, deserialize_with = "deserialize_optional_reference")]
     pub star: Option<String>,
@@ -833,6 +843,8 @@ pub struct DeviceCommandResponse {
     /// Tags after a print- or configuration-related command.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Reference coordinates accepted by a `triangulate` command.
+    pub target: Option<Vec<f64>>,
     /// Target device code, meaning depends on the dispatched command.
     pub target_device_code: Option<String>,
     /// Total route distance in light-years after a `travel` command.
@@ -1133,6 +1145,38 @@ mod command_response_tests {
     fn cancel_serializes_as_typed_device_command() {
         let payload = serde_json::to_value(DeviceCommand::Cancel).expect("serialize cancel");
         assert_eq!(payload, serde_json::json!({"command": "cancel"}));
+    }
+
+    #[test]
+    fn triangulate_serializes_signature_and_reference_point() {
+        let command = DeviceCommand::Triangulate {
+            signature: "a3f7c2e8b1d94f06".to_owned(),
+            target: vec![5000.0, 14_000.0, 100.0],
+        };
+        let payload = serde_json::to_value(command).expect("serialize triangulate");
+        assert_eq!(payload["command"], "triangulate");
+        assert_eq!(payload["signature"], "a3f7c2e8b1d94f06");
+        assert_eq!(payload["target"], serde_json::json!([5000.0, 14_000.0, 100.0]));
+    }
+
+    #[test]
+    fn triangulate_response_preserves_documented_fields() {
+        let response: DeviceCommandResponse = serde_json::from_value(serde_json::json!({
+            "status": "triangulating",
+            "signature": "a3f7c2e8b1d94f06",
+            "target": [5000, 14000, 100],
+            "started_at": "2026-08-05T10:30:00Z",
+            "completes_at": "2026-08-05T11:30:00Z"
+        }))
+        .expect("deserialize triangulate response");
+
+        assert_eq!(response.status.as_deref(), Some("triangulating"));
+        assert_eq!(response.signature.as_deref(), Some("a3f7c2e8b1d94f06"));
+        assert_eq!(response.target, Some(vec![5000.0, 14_000.0, 100.0]));
+        assert_eq!(
+            response.completes_at.as_deref(),
+            Some("2026-08-05T11:30:00Z")
+        );
     }
 
     #[test]

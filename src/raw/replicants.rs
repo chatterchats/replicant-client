@@ -349,6 +349,10 @@ pub struct PrintRequest {
     /// The device type to print.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_type: Option<String>,
+    /// Prints a modular device in its compacted transport state when `true`.
+    /// Supplying `false` explicitly is supported by Replicant Space 2.4.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flatpack: Option<bool>,
     /// Notification preferences for this print job, open-shaped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notify: Option<JsonObject>,
@@ -980,5 +984,25 @@ impl ReplicantsClient {
         self.client
             .execute_json(Method::POST, &path, true, RequestSafety::Mutating, request)
             .await
+    }
+}
+
+#[cfg(test)]
+mod print_request_tests {
+    use super::PrintRequest;
+
+    #[test]
+    fn vessel_print_preserves_explicit_false_flatpack() {
+        let request = PrintRequest {
+            command: Some("print".to_owned()),
+            device_type: Some("galactic_observatory".to_owned()),
+            flatpack: Some(false),
+            notify: None,
+        };
+
+        let payload = serde_json::to_value(request).expect("serialize vessel print request");
+        assert_eq!(payload["command"], "print");
+        assert_eq!(payload["device_type"], "galactic_observatory");
+        assert_eq!(payload["flatpack"], false);
     }
 }

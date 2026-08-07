@@ -1,11 +1,10 @@
 {
-  "$schema_note": "Provenance for the verified Replicant Space 2.3.3 OpenAPI corpus plus explicit Replicant Space 2.3.5 rendered-document corrections.",
-  "replicant_space_version": "2.3.5",
-  "crawl_timestamp": "2026-07-24T18:16:35.649754+00:00",
+  "$schema_note": "Provenance for the verified Replicant Space 2.4.0 OpenAPI and rendered-document corpus.",
+  "replicant_space_version": "2.4.0",
+  "crawl_timestamp": "2026-08-07T00:51:32.098451+00:00",
   "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
-  "openapi_fetched_at": "2026-07-28T09:11:06.627Z",
-  "documentation_archive_sha256": "1b8e96d9f94cd1e3e8fb5a56bc7451f8e53a2bb99bceca1d4e6ab1228aafe7a9",
-  "openapi_sha256": "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f",
+  "openapi_fetched_at": "2026-08-07T00:51:32.098451+00:00",
+  "openapi_sha256": "9f5498b2229e9aea6c20840b61267b09a0fffcc7ac87804b6c80db98fc058e31",
   "openapi_operation_count": 86,
   "openapi_path_count": 72,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
@@ -31,10 +30,14 @@
   ],
   "notes": [
     "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
-    "reference/replicant-space/openapi.json sha256 is verified by scripts/contract_policy_check.py on every run."
+    "reference/replicant-space/manifest.json and openapi.json SHA-256 values are verified by scripts/contract_policy_check.py on every run.",
+    "Replicant Space 2.4.0 keeps the route inventory at 72 paths and 86 operations while adding one device-command request schema, bringing the schema total to 160."
   ],
-  "documentation_version": "2.3.5",
-  "documentation_crawled_at": "2026-08-03T00:42:38.460301Z",
-  "openapi_version": "2.3.3",
-  "documented_operation_delta_count": 0
+  "documentation_version": "2.4.0",
+  "documentation_crawled_at": "2026-08-07T00:51:32.098451+00:00",
+  "openapi_version": "2.4.0",
+  "documented_operation_delta_count": 0,
+  "documentation_manifest_sha256": "54d5b394a5eb9f0ba54afb9eb1aae9bbad4d55a634a4299c1e7ab6c97c601f15",
+  "documentation_page_count": 84,
+  "openapi_schema_count": 160
 }

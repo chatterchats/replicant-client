@@ -43,11 +43,11 @@ include = [
 ]
 
 [package.metadata.replicant-space]
-version = "2.3.5"
-documentation-version = "2.3.5"
-documentation-archive-sha256 = "1b8e96d9f94cd1e3e8fb5a56bc7451f8e53a2bb99bceca1d4e6ab1228aafe7a9"
-openapi-version = "2.3.3"
-openapi-sha256 = "d6f89cbadc523160d25e26cec8ac9673fda7296512ea408c5dd7c55a13c08c3f"
+version = "2.4.0"
+documentation-version = "2.4.0"
+documentation-manifest-sha256 = "54d5b394a5eb9f0ba54afb9eb1aae9bbad4d55a634a4299c1e7ab6c97c601f15"
+openapi-version = "2.4.0"
+openapi-sha256 = "9f5498b2229e9aea6c20840b61267b09a0fffcc7ac87804b6c80db98fc058e31"
 
 [lib]
 name = "replicant_client"

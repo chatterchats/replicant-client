@@ -26,7 +26,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::domain::{self, DeviceKey, Event, Realm};
+use crate::domain::{self, DeviceId, DeviceKey, Event, Realm};
 use crate::events::{EventLogQuery, GameEvent};
 use crate::raw;
 use crate::{Error, Result};
@@ -356,6 +356,26 @@ fn resolve_realm(client: &Client, raw_event: &GameEvent) -> Option<Realm> {
     None
 }
 
+fn consumed_print_devices(event: &Event) -> Vec<DeviceKey> {
+    if event.name != domain::EventName::PrintCompleted {
+        return Vec::new();
+    }
+    let Some(realm) = event.realm.clone() else {
+        return Vec::new();
+    };
+    event
+        .payload
+        .get("consumed_device_codes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|code| DeviceKey::in_realm(realm.clone(), DeviceId::from(code)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
     let started = Instant::now();
     debug!(
@@ -369,10 +389,15 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
         domain::account_event(raw_event, resolve_realm(client, raw_event), observed_at()).value;
     let cursor = raw_event.id.clone();
     let (scan_locations, scan_fallbacks) = scan_projection(&event);
-    let inserted = if event.name == domain::EventName::DeviceDecommissioned {
+    let mut decommissioned = consumed_print_devices(&event);
+    if event.name == domain::EventName::DeviceDecommissioned {
         // Device decommissioning is an explicit removal signal (unlike a
         // filtered or visibility-scoped collection page).
-        let decommissioned: Vec<DeviceKey> = event.device.iter().cloned().collect();
+        decommissioned.extend(event.device.iter().cloned());
+    }
+    decommissioned.sort();
+    decommissioned.dedup();
+    let inserted = if !decommissioned.is_empty() {
         client
             .managed_state()
             .apply_event_with_decommission(&event, &cursor, &decommissioned)
@@ -405,6 +430,7 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
     }
     if event.realm.is_some() {
         super::operation::resolve_awaiting_evidence(client, &event)?;
+        schedule_print_completion_reconciliation(client, &event)?;
         schedule_trade_completion_reconciliation(client, &event)?;
         apply_simulation_lifecycle(client, &event)?;
     }
@@ -541,6 +567,30 @@ fn scan_projection(
             .map(|target| (realm.clone(), target))
             .collect(),
     )
+}
+
+/// A completed print names the newly created device in its payload rather
+/// than the event envelope. Reconcile it explicitly so tags, ownership, and
+/// placement become visible without waiting for a full device traversal.
+fn schedule_print_completion_reconciliation(client: &Client, event: &Event) -> Result<()> {
+    if event.name != domain::EventName::PrintCompleted {
+        return Ok(());
+    }
+    let Some(realm) = event.realm.as_ref() else {
+        return Ok(());
+    };
+    let Some(code) = event.payload.get("new_device_code").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    client
+        .managed_state()
+        .enqueue_reconciliation(
+            &format!("device:{code}"),
+            realm,
+            "device",
+            &serde_json::json!({ "id": code }),
+        )
+        .map_err(persistence_error)
 }
 
 /// `trade.completed` cross-domain reconciliation: the buyer/seller device
@@ -1879,6 +1929,55 @@ mod tests {
                 .expect("claim")
                 .is_none()
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn print_completed_tombstones_consumed_component_devices() {
+        let client = restore_only_client().await;
+        client
+            .managed_state()
+            .persist_devices(&[device("FACTORY"), device("C1"), device("C2")])
+            .expect("seed printer and components");
+
+        let mut event = game_event("3-1", "print.completed", Some("FACTORY"));
+        event
+            .payload
+            .insert("new_device_code".into(), serde_json::json!("NEW1"));
+        event.payload.insert(
+            "consumed_device_codes".into(),
+            serde_json::json!(["C1", "C2", "C1"]),
+        );
+        apply_event(&client, &event).expect("apply print completion");
+
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live(DeviceId::from("FACTORY")))
+                .is_some()
+        );
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live(DeviceId::from("C1")))
+                .is_none()
+        );
+        assert!(
+            client
+                .managed_state()
+                .device(&DeviceKey::live(DeviceId::from("C2")))
+                .is_none()
+        );
+        let mut scheduled = Vec::new();
+        while let Some(work) = client
+            .managed_state()
+            .claim_reconciliation_work()
+            .expect("claim reconciliation")
+        {
+            scheduled.push(work.payload["id"].as_str().unwrap().to_owned());
+        }
+        assert!(scheduled.contains(&"FACTORY".to_owned()));
+        assert!(scheduled.contains(&"NEW1".to_owned()));
         client.close().await.expect("close");
     }
 

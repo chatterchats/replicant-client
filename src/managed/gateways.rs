@@ -986,6 +986,19 @@ impl DeviceHandle {
         self.command(raw::devices::DeviceCommand::Unfurl).await
     }
 
+    /// Triangulates a spectral signature from a three-dimensional reference point.
+    pub async fn triangulate(
+        &self,
+        signature: impl Into<String>,
+        target: [f64; 3],
+    ) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::Triangulate {
+            signature: signature.into(),
+            target: target.into(),
+        })
+        .await
+    }
+
     /// Queues `quantity` copies of a device on this autofactory.
     pub async fn enqueue_print(
         &self,
@@ -2495,6 +2508,43 @@ mod tests {
                 .any(|inventory| inventory.location.as_ref().unwrap().id.as_str() == "SOL-BELT-1")
         );
 
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn triangulate_serializes_the_documented_command_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/OBS1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "triangulating",
+                "signature": "a3f7c2e8b1d94f06",
+                "target": [5000, 14000, 100],
+                "started_at": "2026-08-06T15:22:00Z",
+                "completes_at": "2026-08-06T16:22:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        let device = DeviceHandle::for_test(client.clone(), DeviceKey::live("OBS1".into()));
+
+        device
+            .triangulate("a3f7c2e8b1d94f06", [5000.0, 14_000.0, 100.0])
+            .await
+            .expect("durable triangulation operation");
+
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = requests[0].body_json().expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "command": "triangulate",
+                "signature": "a3f7c2e8b1d94f06",
+                "target": [5000.0, 14000.0, 100.0]
+            })
+        );
         server.verify().await;
         client.close().await.expect("close");
     }

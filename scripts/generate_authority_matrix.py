@@ -58,6 +58,6 @@ operations.sort(key=lambda entry: (entry["path"], entry["method"]))
 (ROOT / "policy/authority-matrix.json").write_text(json.dumps({
     "version": 1,
     "sync_domain_policy": "policy/sync-domains.json",
-    "contract": "Verified Replicant Space 2.3.3 OpenAPI corpus",
+    "contract": "Verified Replicant Space 2.4.0 OpenAPI corpus",
     "operations": operations,
 }, indent=2) + "\n")

@@ -20,12 +20,19 @@ macro_rules! open_value {
 }
 
 open_value!(EventName {
-    BobnetNew => "bobnet.new", DeviceDecommissioned => "device.decommissioned",
-    TradeCompleted => "trade.completed", SimulationCompleted => "simulation.completed"
+    BobnetNew => "bobnet.new",
+    DeviceCompacted => "device.compacted", DeviceCompacting => "device.compacting",
+    DeviceDecommissioned => "device.decommissioned",
+    DeviceUnfurled => "device.unfurled", DeviceUnfurling => "device.unfurling",
+    PrintCompleted => "print.completed", PrintStarted => "print.started",
+    SimulationCompleted => "simulation.completed", TradeCompleted => "trade.completed",
+    TriangulationComplete => "triangulation.complete",
+    TriangulationFailed => "triangulation.failed",
+    TriangulationStarted => "triangulation.started"
 });
 open_value!(DeviceCommand {
     Activate => "activate", Deactivate => "deactivate", Deploy => "deploy", Stow => "stow",
-    Attach => "attach", Compact => "compact", Unfurl => "unfurl"
+    Attach => "attach", Compact => "compact", Triangulate => "triangulate", Unfurl => "unfurl"
 });
 open_value!(DeviceFeature {
     Mining => "mining", Printing => "printing", Scanning => "scanning", Travel => "travel"

@@ -16,7 +16,7 @@ help:
 	  'test                   Run tests with all features enabled' \
 	  'doc                    Build docs with warnings denied' \
 	  'feature-checks         cargo check across the supported feature combinations' \
-	  'contract-policy-check  Verify the Replicant Space 2.3.1 operation inventory and exclusions' \
+	  'contract-policy-check  Verify the Replicant Space 2.4.0 operation inventory and exclusions' \
 	  'observability-policy-check Verify tracing targets, timing events, and secret guards' \
 	  'policy-checks          Run all checked-in policy gates' \
 	  'remediation-policy-check Verify the Phase 11.5 remediation ledger' \

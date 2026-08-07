@@ -185,7 +185,100 @@ pub struct PrintStartedPayload {
     pub print_mode: Option<String>,
     /// When the print is expected to finish, RFC3339.
     pub completes_at: Option<String>,
+    /// Tags requested for the printed device.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Future print-start fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `print.completed`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct PrintCompletedPayload {
+    /// Device type that finished printing.
+    pub device_type: Option<String>,
+    /// Newly created device code.
+    pub new_device_code: Option<String>,
+    /// Open print origin, currently `vessel` or `autofactory`.
+    pub print_mode: Option<String>,
+    /// Component device codes consumed by the print.
+    #[serde(default)]
+    pub consumed_device_codes: Vec<String>,
+    /// Tags applied to the new device.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Future print-completion fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for terminal modular-device transitions with no current fields.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct DeviceTransitionCompletedPayload {
+    /// Future transition-completion fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `device.compacting` and `device.unfurling`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct DeviceTransitionStartedPayload {
+    /// When the modular transition is expected to finish, RFC3339.
+    pub completes_at: Option<String>,
+    /// Future transition fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `triangulation.started`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TriangulationStartedPayload {
+    /// Spectral signature hash being tracked.
+    pub signature: Option<String>,
+    /// Reference point coordinates `[x, y, z]`.
+    #[serde(default)]
+    pub target: Vec<f64>,
+    /// When the observation is expected to finish, RFC3339.
+    pub completes_at: Option<String>,
+    /// Future triangulation fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `triangulation.complete`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TriangulationCompletedPayload {
+    /// Spectral signature hash that was located.
+    pub signature: Option<String>,
+    /// Reference point coordinates `[x, y, z]`.
+    #[serde(default)]
+    pub target: Vec<f64>,
+    /// Direction vector from the reference point toward the source.
+    #[serde(default)]
+    pub direction: Vec<f64>,
+    /// Future triangulation fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `triangulation.failed`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct TriangulationFailedPayload {
+    /// Spectral signature hash that could not be located.
+    pub signature: Option<String>,
+    /// Reference point coordinates `[x, y, z]`.
+    #[serde(default)]
+    pub target: Vec<f64>,
+    /// Open failure reason, currently `signature_not_found`.
+    pub reason: Option<String>,
+    /// Future triangulation fields.
     #[serde(flatten)]
     pub extra: JsonObject,
 }
@@ -327,6 +420,56 @@ impl GameEvent {
     /// different event name.
     pub fn print_started(&self) -> Result<Option<PrintStartedPayload>, Error> {
         self.decode_payload("print.started")
+    }
+
+    /// Decodes this event as `print.completed`, returning `None` for a
+    /// different event name.
+    pub fn print_completed(&self) -> Result<Option<PrintCompletedPayload>, Error> {
+        self.decode_payload("print.completed")
+    }
+
+    /// Decodes this event as `device.compacting`, returning `None` for a
+    /// different event name.
+    pub fn device_compacting(&self) -> Result<Option<DeviceTransitionStartedPayload>, Error> {
+        self.decode_payload("device.compacting")
+    }
+
+    /// Decodes this event as `device.compacted`, returning `None` for a
+    /// different event name.
+    pub fn device_compacted(&self) -> Result<Option<DeviceTransitionCompletedPayload>, Error> {
+        self.decode_payload("device.compacted")
+    }
+
+    /// Decodes this event as `device.unfurling`, returning `None` for a
+    /// different event name.
+    pub fn device_unfurling(&self) -> Result<Option<DeviceTransitionStartedPayload>, Error> {
+        self.decode_payload("device.unfurling")
+    }
+
+    /// Decodes this event as `device.unfurled`, returning `None` for a
+    /// different event name.
+    pub fn device_unfurled(&self) -> Result<Option<DeviceTransitionCompletedPayload>, Error> {
+        self.decode_payload("device.unfurled")
+    }
+
+    /// Decodes this event as `triangulation.started`, returning `None` for a
+    /// different event name.
+    pub fn triangulation_started(&self) -> Result<Option<TriangulationStartedPayload>, Error> {
+        self.decode_payload("triangulation.started")
+    }
+
+    /// Decodes this event as `triangulation.complete`, returning `None` for a
+    /// different event name.
+    pub fn triangulation_completed(
+        &self,
+    ) -> Result<Option<TriangulationCompletedPayload>, Error> {
+        self.decode_payload("triangulation.complete")
+    }
+
+    /// Decodes this event as `triangulation.failed`, returning `None` for a
+    /// different event name.
+    pub fn triangulation_failed(&self) -> Result<Option<TriangulationFailedPayload>, Error> {
+        self.decode_payload("triangulation.failed")
     }
 
     /// Decodes this event as `trade.completed`, returning `None` for a
@@ -482,13 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn print_started_exposes_completes_at() {
+    fn print_started_exposes_completes_at_and_tags() {
         let event = event(
             "print.started",
             serde_json::json!({
                 "device_type": "autofactory",
                 "print_mode": "autofactory",
-                "completes_at": "2026-08-02T00:05:00Z"
+                "completes_at": "2026-08-02T00:05:00Z",
+                "tags": ["fleet-a", "miner"]
             }),
         );
         let payload = event.print_started().unwrap().unwrap();
@@ -497,6 +641,103 @@ mod tests {
             payload.completes_at.as_deref(),
             Some("2026-08-02T00:05:00Z")
         );
+        assert_eq!(payload.tags, ["fleet-a".to_owned(), "miner".to_owned()]);
+    }
+
+    #[test]
+    fn print_completed_exposes_consumed_devices_and_tags() {
+        let event = event(
+            "print.completed",
+            serde_json::json!({
+                "device_type": "parallax_array",
+                "new_device_code": "A1B2C3D4",
+                "print_mode": "autofactory",
+                "consumed_device_codes": ["E5F6G7H8", "J9K0L1M2"],
+                "tags": ["fleet-a"]
+            }),
+        );
+        let payload = event.print_completed().unwrap().unwrap();
+        assert_eq!(payload.new_device_code.as_deref(), Some("A1B2C3D4"));
+        assert_eq!(
+            payload.consumed_device_codes,
+            ["E5F6G7H8".to_owned(), "J9K0L1M2".to_owned()]
+        );
+        assert_eq!(payload.tags, ["fleet-a".to_owned()]);
+    }
+
+    #[test]
+    fn modular_transition_payloads_decode_started_and_completed_events() {
+        let compacting = event(
+            "device.compacting",
+            serde_json::json!({"completes_at": "2026-08-06T15:22:00Z"}),
+        );
+        assert_eq!(
+            compacting
+                .device_compacting()
+                .unwrap()
+                .unwrap()
+                .completes_at
+                .as_deref(),
+            Some("2026-08-06T15:22:00Z")
+        );
+        assert!(event("device.compacted", serde_json::json!({}))
+            .device_compacted()
+            .unwrap()
+            .is_some());
+        assert!(event(
+            "device.unfurling",
+            serde_json::json!({"completes_at": "2026-08-06T15:23:00Z"}),
+        )
+        .device_unfurling()
+        .unwrap()
+        .is_some());
+        assert!(event("device.unfurled", serde_json::json!({}))
+            .device_unfurled()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn triangulation_payloads_decode_vectors_and_failure_reason() {
+        let started = event(
+            "triangulation.started",
+            serde_json::json!({
+                "signature": "a3f7c2e8b1d94f06",
+                "target": [5000, 14000, 100],
+                "completes_at": "2026-08-06T16:22:00Z"
+            }),
+        )
+        .triangulation_started()
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.target, [5000.0, 14_000.0, 100.0]);
+
+        let completed = event(
+            "triangulation.complete",
+            serde_json::json!({
+                "signature": "a3f7c2e8b1d94f06",
+                "target": [5000, 14000, 100],
+                "direction": [0.4, 0.9, 0.0]
+            }),
+        )
+        .triangulation_completed()
+        .unwrap()
+        .unwrap();
+        assert_eq!(completed.target, [5000.0, 14_000.0, 100.0]);
+        assert_eq!(completed.direction, [0.4, 0.9, 0.0]);
+
+        let failed = event(
+            "triangulation.failed",
+            serde_json::json!({
+                "signature": "a3f7c2e8b1d94f06",
+                "target": [5000, 14000, 100],
+                "reason": "signature_not_found"
+            }),
+        )
+        .triangulation_failed()
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.reason.as_deref(), Some("signature_not_found"));
     }
 
     #[test]

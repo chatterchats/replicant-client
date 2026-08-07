@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Contract and deprecation policy gate for replicant-client.
 
-Verifies the checked-in Replicant Space 2.3.3 OpenAPI corpus and explicit
-Replicant Space 2.3.5 rendered-document corrections:
+Verifies the checked-in Replicant Space 2.4.0 OpenAPI and rendered-document
+corpus:
 
-- the OpenAPI document checksum matches the recorded contract metadata;
+- the OpenAPI and documentation-manifest checksums match recorded provenance;
 - policy/operations.json is not stale relative to the live OpenAPI document;
 - the inventory totals are exactly 86 operations, 79 supported, 7 excluded
   (5 deprecated + 2 admin);
@@ -32,6 +32,7 @@ from generate_operation_inventory import build_inventory  # noqa: E402
 
 REFERENCE = ROOT / "reference" / "replicant-space"
 OPENAPI = REFERENCE / "openapi.json"
+MANIFEST = REFERENCE / "manifest.json"
 POLICY = ROOT / "policy"
 DOCUMENTED_DELTAS = POLICY / "documented-operation-deltas.json"
 
@@ -58,6 +59,7 @@ def check_openapi_checksum(metadata: dict) -> dict:
         if m.lower() in {"get", "post", "put", "patch", "delete"}
     )
     path_count = len(spec["paths"])
+    schema_count = len(spec.get("components", {}).get("schemas", {}))
     if op_count != metadata["openapi_operation_count"]:
         fail(
             f"operation count drift: metadata says "
@@ -69,7 +71,47 @@ def check_openapi_checksum(metadata: dict) -> dict:
             f"path count drift: metadata says {metadata['openapi_path_count']}, "
             f"openapi.json has {path_count}"
         )
+    if schema_count != metadata["openapi_schema_count"]:
+        fail(
+            f"schema count drift: metadata says {metadata['openapi_schema_count']}, "
+            f"openapi.json has {schema_count}"
+        )
     return spec
+
+
+def check_documentation_manifest(metadata: dict) -> None:
+    data = MANIFEST.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    expected = metadata["documentation_manifest_sha256"]
+    if actual != expected:
+        fail(f"manifest.json sha256 mismatch: expected {expected}, got {actual}")
+        return
+
+    manifest = json.loads(data)
+    pages = manifest.get("pages", [])
+    expected_pages = metadata["documentation_page_count"]
+    if manifest.get("page_count") != expected_pages or len(pages) != expected_pages:
+        fail(
+            "documentation page count drift: metadata/manifest/list are "
+            f"{expected_pages}/{manifest.get('page_count')}/{len(pages)}"
+        )
+
+    for page in pages:
+        local_path = page.get("local_path")
+        expected_hash = page.get("markdown_sha256")
+        if not local_path or not expected_hash:
+            fail(f"manifest page is missing local_path or markdown_sha256: {page!r}")
+            continue
+        path = REFERENCE / local_path
+        if not path.is_file():
+            fail(f"manifest page is missing from the corpus: {local_path}")
+            continue
+        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            fail(
+                f"documentation page sha256 mismatch for {local_path}: "
+                f"expected {expected_hash}, got {actual_hash}"
+            )
 
 
 def check_operation_inventory(spec: dict) -> None:
@@ -218,7 +260,7 @@ def check_no_old_crate_name() -> None:
         fail(f"'replicant-sdk' found outside historical notes: {rel_path}:{lineno}: {line.strip()}")
 
 
-def check_package_identity() -> None:
+def check_package_identity(metadata: dict) -> None:
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())
     package = cargo["package"]
 
@@ -251,11 +293,27 @@ def check_package_identity() -> None:
         if standalone not in features:
             fail(f"Cargo.toml is missing the '{standalone}' feature")
 
+    contract = package.get("metadata", {}).get("replicant-space", {})
+    expected_contract = {
+        "version": metadata["replicant_space_version"],
+        "documentation-version": metadata["documentation_version"],
+        "documentation-manifest-sha256": metadata["documentation_manifest_sha256"],
+        "openapi-version": metadata["openapi_version"],
+        "openapi-sha256": metadata["openapi_sha256"],
+    }
+    for key, expected in expected_contract.items():
+        if contract.get(key) != expected:
+            fail(
+                f"Cargo.toml package.metadata.replicant-space.{key} = "
+                f"{contract.get(key)!r}, expected {expected!r}"
+            )
+
 
 def main() -> None:
-    check_package_identity()
     metadata = json.loads((POLICY / "contract-metadata.json").read_text())
+    check_package_identity(metadata)
     spec = check_openapi_checksum(metadata)
+    check_documentation_manifest(metadata)
     check_contract_mismatches(metadata)
     check_operation_inventory(spec)
     check_documented_operation_deltas(metadata)
@@ -269,10 +327,11 @@ def main() -> None:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
 
-    print("contract policy check passed: 84 OpenAPI operations "
-          "(77 supported, 5 deprecated, 2 admin) plus 2 documented "
-          "leaderboard deltas; message_notify excluded; mining aliases "
-          "recorded; no stray replicant-sdk references.")
+    print("contract policy check passed: Replicant Space 2.4.0 corpus, "
+          "72 paths, 86 OpenAPI operations (79 supported, 5 deprecated, "
+          "2 admin), 160 schemas, 84 rendered documentation pages; "
+          "message_notify excluded; mining aliases recorded; no stray "
+          "replicant-sdk references.")
 
 
 if __name__ == "__main__":

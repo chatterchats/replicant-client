@@ -15,7 +15,7 @@ them to the feature that needs them.
 
 ## Contract authority
 
-The verified Replicant Space 2.3.3 OpenAPI corpus under
+The verified Replicant Space 2.4.0 OpenAPI and rendered-document corpus under
 [`reference/replicant-space/`](reference/replicant-space/) is the contract.
 Rendered documentation deprecation asides override missing OpenAPI
 `deprecated` flags — see `policy/contract-metadata.json`.

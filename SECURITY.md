@@ -12,7 +12,7 @@ requests, or commits. Use the repository's private security-advisory
 feature, or the maintainers' private contact method if that is unavailable.
 
 Include the affected commit or version, the Replicant Space version
-(`2.3.5`), impact, reproduction steps, and any known mitigation.
+(`2.4.0`), impact, reproduction steps, and any known mitigation.
 
 ## Consumer security responsibilities
 

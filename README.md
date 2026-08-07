@@ -5,8 +5,8 @@ API. It combines typed HTTP and SSE access with a managed client that
 normalizes remote observations, stores them in SQLite, publishes consistent
 snapshots, reconciles state, and journals mutations before sending them.
 
-The crate targets the Replicant Space documentation through **2.3.5**. Its
-machine-readable baseline is the checked-in, verified 2.3.3 OpenAPI document,
+The crate targets the Replicant Space documentation and OpenAPI contract through **2.4.0**. Its
+machine-readable baseline is the checked-in, verified 2.4.0 OpenAPI document,
 with later rendered-document changes recorded explicitly under
 [`docs/contract`](docs/contract).
 

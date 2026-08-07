@@ -1377,13 +1377,51 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
 fn device_command_expects_evidence(command: &raw::devices::DeviceCommand) -> bool {
     matches!(
         command,
-        raw::devices::DeviceCommand::Travel { .. }
+        raw::devices::DeviceCommand::Compact
+            | raw::devices::DeviceCommand::Travel { .. }
             | raw::devices::DeviceCommand::EnqueuePrint { .. }
             | raw::devices::DeviceCommand::Prospect { .. }
             | raw::devices::DeviceCommand::Repair { .. }
             | raw::devices::DeviceCommand::Scan
             | raw::devices::DeviceCommand::SystemScan
+            | raw::devices::DeviceCommand::Triangulate { .. }
+            | raw::devices::DeviceCommand::Unfurl
     )
+}
+
+fn operation_evidence(adapter: &MutationAdapter) -> Value {
+    let default = || {
+        serde_json::json!({
+            "event_names": [],
+            "failure_event_names": [],
+            "payload": {},
+            "expected_state": null
+        })
+    };
+    let MutationAdapter::DeviceCommand { command, .. } = adapter else {
+        return default();
+    };
+    match command {
+        raw::devices::DeviceCommand::Compact => serde_json::json!({
+            "event_names": ["device.compacted"],
+            "failure_event_names": [],
+            "payload": {},
+            "expected_state": null
+        }),
+        raw::devices::DeviceCommand::Unfurl => serde_json::json!({
+            "event_names": ["device.unfurled"],
+            "failure_event_names": [],
+            "payload": {},
+            "expected_state": null
+        }),
+        raw::devices::DeviceCommand::Triangulate { signature, target } => serde_json::json!({
+            "event_names": ["triangulation.complete"],
+            "failure_event_names": ["triangulation.failed"],
+            "payload": {"signature": signature, "target": target},
+            "expected_state": null
+        }),
+        _ => default(),
+    }
 }
 
 pub(crate) async fn device_command(
@@ -1747,10 +1785,7 @@ async fn create(client: &Client, adapter: MutationAdapter) -> Result<Operation> 
         "expects_evidence".into(),
         Value::Bool(adapter.expects_evidence()),
     );
-    intent_object.insert(
-        "evidence".into(),
-        serde_json::json!({ "event_names": [], "payload": {}, "expected_state": null }),
-    );
+    intent_object.insert("evidence".into(), operation_evidence(&adapter));
     intent_object.insert(
         "rate_limit_bucket".into(),
         Value::String(adapter.rate_limit_bucket().to_owned()),
@@ -2024,18 +2059,36 @@ fn mark_resolved(
             .read_operation(&operation_id)
             .map_err(persistence_error)?;
         let Some(entry) = entry else { continue };
-        if !event_evidence_matches(&entry, event) {
+        let next = if event_evidence_matches(&entry, event) {
+            Some(OperationStatus::Completed)
+        } else if event_failure_evidence_matches(&entry, event) {
+            Some(OperationStatus::Failed)
+        } else {
+            None
+        };
+        let Some(next) = next else {
             continue;
+        };
+        if next == OperationStatus::Failed {
+            client
+                .managed_state()
+                .append_operation_projection(
+                    &operation_id,
+                    next.as_str(),
+                    &serde_json::json!({
+                        "event_id": event.id.as_str(),
+                        "event": event.name.as_str(),
+                        "payload": event.payload.clone()
+                    }),
+                )
+                .map_err(persistence_error)?;
+        } else {
+            client
+                .managed_state()
+                .set_operation_state(&operation_id, next.as_str())
+                .map_err(persistence_error)?;
         }
-        client
-            .managed_state()
-            .set_operation_state(&operation_id, OperationStatus::Completed.as_str())
-            .map_err(persistence_error)?;
-        notify(
-            client,
-            &OperationId::new(operation_id),
-            OperationStatus::Completed,
-        );
+        notify(client, &OperationId::new(operation_id), next);
     }
     Ok(())
 }
@@ -2043,6 +2096,21 @@ fn mark_resolved(
 fn event_evidence_matches(
     entry: &super::store::OperationJournalEntry,
     event: &domain::Event,
+) -> bool {
+    event_matches_named_evidence(entry, event, "event_names")
+}
+
+fn event_failure_evidence_matches(
+    entry: &super::store::OperationJournalEntry,
+    event: &domain::Event,
+) -> bool {
+    event_matches_named_evidence(entry, event, "failure_event_names")
+}
+
+fn event_matches_named_evidence(
+    entry: &super::store::OperationJournalEntry,
+    event: &domain::Event,
+    names_key: &str,
 ) -> bool {
     let Some(cursor) = entry.submission_cursor.as_deref() else {
         // Without a durable cursor lower bound, an event cannot prove that it
@@ -2053,7 +2121,7 @@ fn event_evidence_matches(
         return false;
     }
     let evidence = entry.intent.get("evidence").unwrap_or(&Value::Null);
-    let Some(names) = evidence.get("event_names").and_then(Value::as_array) else {
+    let Some(names) = evidence.get(names_key).and_then(Value::as_array) else {
         return false;
     };
     if !names
@@ -2594,6 +2662,99 @@ mod tests {
         assert_eq!(events[0].designation.as_deref(), Some("SOL-4-EVT-001"));
 
         server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[test]
+    fn triangulate_uses_typed_success_and_failure_evidence() {
+        let evidence = operation_evidence(&MutationAdapter::DeviceCommand {
+            device_code: "OBS1".into(),
+            command: raw::devices::DeviceCommand::Triangulate {
+                signature: "a3f7c2e8b1d94f06".into(),
+                target: vec![5000.0, 14_000.0, 100.0],
+            },
+        });
+        assert_eq!(evidence["event_names"], serde_json::json!(["triangulation.complete"]));
+        assert_eq!(
+            evidence["failure_event_names"],
+            serde_json::json!(["triangulation.failed"])
+        );
+        assert_eq!(evidence["payload"]["signature"], "a3f7c2e8b1d94f06");
+        assert_eq!(
+            evidence["payload"]["target"],
+            serde_json::json!([5000.0, 14_000.0, 100.0])
+        );
+    }
+
+    #[tokio::test]
+    async fn triangulation_failed_marks_the_operation_failed() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        client
+            .managed_state()
+            .set_event_cursor("1-0")
+            .expect("set submission cursor");
+        client
+            .managed_state()
+            .record_operation(
+                "op-triangulate",
+                OperationStatus::Prepared.as_str(),
+                Some("live"),
+                Some("device"),
+                Some("OBS1"),
+                &serde_json::json!({
+                    "evidence": {
+                        "event_names": ["triangulation.complete"],
+                        "failure_event_names": ["triangulation.failed"],
+                        "payload": {
+                            "signature": "a3f7c2e8b1d94f06",
+                            "target": [5000.0, 14000.0, 100.0]
+                        }
+                    }
+                }),
+            )
+            .expect("record operation");
+        assert!(
+            client
+                .managed_state()
+                .claim_operation_submission("op-triangulate", "attempt-1")
+                .expect("claim submission")
+        );
+        client
+            .managed_state()
+            .set_operation_state(
+                "op-triangulate",
+                OperationStatus::AwaitingEvidence.as_str(),
+            )
+            .expect("await evidence");
+
+        let event = domain::Event {
+            id: crate::domain::EventId::new("2-0"),
+            realm: Some(Realm::Live),
+            name: domain::EventName::from("triangulation.failed"),
+            category: domain::EventCategory::from("device"),
+            device: Some(DeviceKey::live(DeviceId::from("OBS1"))),
+            replicant: None,
+            location: None,
+            star: None,
+            occurred_at: "2026-08-06T00:00:00Z".into(),
+            payload: std::collections::BTreeMap::from([
+                ("signature".into(), serde_json::json!("a3f7c2e8b1d94f06")),
+                ("target".into(), serde_json::json!([5000.0, 14000.0, 100.0])),
+                ("reason".into(), serde_json::json!("signature_not_found")),
+            ]),
+        };
+        resolve_awaiting_evidence(&client, &event).expect("resolve failure evidence");
+
+        let outcome = client
+            .operations()
+            .get(OperationId::new("op-triangulate"))
+            .outcome()
+            .await
+            .expect("outcome");
+        assert_eq!(outcome.status, OperationStatus::Failed);
+        let response = outcome.response.as_ref().expect("failure event projection");
+        assert_eq!(response["event"], "triangulation.failed");
         client.close().await.expect("close");
     }
 

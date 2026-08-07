@@ -47,7 +47,7 @@ impl Blueprint {
     #[must_use]
     pub fn is_modular(&self) -> bool {
         self.features.iter().any(|feature| feature == "modular")
-            || matches!(self.device_type.as_str(), "autofactory" | "system_hub")
+            || matches!(self.device_type.as_str(), "autofactory" | "system_hub" | "exotic_matter_injector")
     }
 }
 
