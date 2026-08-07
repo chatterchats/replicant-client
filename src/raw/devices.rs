@@ -320,7 +320,9 @@ pub struct DeviceStatus {
     pub location_name: Option<String>,
     /// In-progress mining operation, if any.
     pub mining: Option<MiningInfo>,
-    /// Current operational capacity as a fraction of maximum.
+    /// Current operational capacity. Most device endpoints report percentage
+    /// points (`0.0..=100.0`), while some legacy replicant-device responses use
+    /// a `0.0..=1.0` fraction.
     pub operational_capacity: Option<f64>,
     /// Queued print jobs, open-shaped.
     #[serde(default)]
@@ -499,6 +501,9 @@ pub enum DeviceCommand {
     Adopt(TargetsCommand),
     /// Attaches one or more devices to this device.
     Attach(TargetsCommand),
+    /// Cancels the device's current interruptible operation, such as an
+    /// Autofactory print.
+    Cancel,
     /// Transfers device ownership to another account.
     ChangeOwner {
         /// The receiving account or replicant code.
@@ -1123,6 +1128,12 @@ impl DevicesClient {
 #[cfg(test)]
 mod command_response_tests {
     use super::{DeviceCommand, DeviceCommandResponse};
+
+    #[test]
+    fn cancel_serializes_as_typed_device_command() {
+        let payload = serde_json::to_value(DeviceCommand::Cancel).expect("serialize cancel");
+        assert_eq!(payload, serde_json::json!({"command": "cancel"}));
+    }
 
     #[test]
     fn enqueue_print_serializes_optional_quantity() {
