@@ -1,7 +1,7 @@
 ---
 title: "Galactic Observatory"
 source_url: "https://replicant.space/docs/galactic-observatory/"
-crawled_at: "2026-07-28T00:53:12.239772+00:00"
+crawled_at: "2026-08-07T00:51:31.728116+00:00"
 ---
 
 Infrastructure
@@ -95,6 +95,57 @@ response 400 response
 ```
 
 `neighbours` is the total number of catalogued stars within the observation sphere. `outward_neighbours` is how many of those are in the hemisphere you're looking toward. If both numbers are high relative to `expected`, this isn't the fringe. Try somewhere more remote, or try a different direction.
+
+## Triangulation
+
+Galactic observatories can also perform remote triangulation, provided you have a spectral signature to track. Point the observatory at a chosen coordinate, [x, y, z], in deep space. Its sensors will perform subspace waveform interpolation to determine the direction of interference.
+
+The process takes one hour and returns a direction vector, such as [0.5, 1.0, 0.0]. This vector points from the scanned coordinates towards the source of the spectral signature.
+
+![Diagram showing how triangulation works: an observatory at SOL aims at a target point in deep space, and the sensors return a direction vector pointing toward the signal source](../_assets/images/docs/triangulation-diagram.svg)
+
+Repeating the process from different locations allows you to narrow down the target region by overlaying the resulting uncertainty cones. A good understanding of the coordinate system and direction vectors will help you select effective scan locations and reduce the total number of scans required.
+
+POST /v1/devices/{observatory_code}   200 ok
+
+```
+# triangulate a spectral signature from deep space
+$ curl -X POST https://api.replicant.space/v1/devices/OB44E1F7 \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "command": "triangulate",
+      "signature": "a3f7c2e8b1d94f06",
+      "target": [5000, 14000, 100]
+    }'
+```
+
+response 200 response
+
+```
+{
+  "status": "triangulating",
+  "signature": "a3f7c2e8b1d94f06",
+  "target": [5000, 14000, 100],
+  "started_at": "2026-08-05T10:30:00Z",
+  "completes_at": "2026-08-05T11:30:00Z"
+}
+```
+
+When the triangulation completes, the result is delivered as an event containing the direction vector. The more readings taken from different reference points, the more precisely the source can be localised.
+
+response triangulation.complete event
+
+```
+{
+  "event": "triangulation.complete",
+  "payload": {
+    "signature": "a3f7c2e8b1d94f06",
+    "target": [5000, 14000, 100],
+    "direction": [0.4, 0.9, 0.0]
+  }
+}
+```
 
 ## Relocation
 

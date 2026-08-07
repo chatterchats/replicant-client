@@ -1,7 +1,7 @@
 ---
 title: "Star catalogue"
 source_url: "https://replicant.space/docs/api/locations/star-catalogue/"
-crawled_at: "2026-07-28T00:53:11.331032+00:00"
+crawled_at: "2026-08-07T00:51:30.783073+00:00"
 ---
 
 API · Locations

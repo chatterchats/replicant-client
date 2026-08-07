@@ -1,7 +1,7 @@
 ---
 title: "AMI Mining Controller"
 source_url: "https://replicant.space/docs/ami/mining-controller/"
-crawled_at: "2026-07-28T00:53:10.326651+00:00"
+crawled_at: "2026-08-07T00:51:29.712291+00:00"
 ---
 
 AMI Controllers
@@ -76,7 +76,7 @@ $ curl -X POST https://api.replicant.space/v1/devices/MC91FF22 \
         "structural": 0.5,
         "conductive": 0.25,
         "silicates": 0.15,
-        "rare_earth": 0.1
+        "rares": 0.1
       }
     }'
 ```

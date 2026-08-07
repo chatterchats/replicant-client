@@ -1,7 +1,7 @@
 ---
 title: "Devices"
 source_url: "https://replicant.space/docs/concepts/devices/"
-crawled_at: "2026-07-28T00:53:11.915101+00:00"
+crawled_at: "2026-08-07T00:51:31.365494+00:00"
 ---
 
 Core Concepts

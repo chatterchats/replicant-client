@@ -1,7 +1,7 @@
 ---
 title: "FTL Beacons"
 source_url: "https://replicant.space/docs/ftl-beacons/"
-crawled_at: "2026-07-28T00:53:12.191962+00:00"
+crawled_at: "2026-08-07T00:51:31.666589+00:00"
 ---
 
 Infrastructure

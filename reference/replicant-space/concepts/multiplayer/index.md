@@ -1,7 +1,7 @@
 ---
 title: "Multiplayer"
 source_url: "https://replicant.space/docs/concepts/multiplayer/"
-crawled_at: "2026-07-28T00:53:11.974834+00:00"
+crawled_at: "2026-08-07T00:51:31.434409+00:00"
 ---
 
 Core Concepts

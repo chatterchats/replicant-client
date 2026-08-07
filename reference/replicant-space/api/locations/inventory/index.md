@@ -1,7 +1,7 @@
 ---
 title: "Inventory"
 source_url: "https://replicant.space/docs/api/locations/inventory/"
-crawled_at: "2026-07-28T00:53:11.257133+00:00"
+crawled_at: "2026-08-07T00:51:30.668118+00:00"
 ---
 
 API · Locations

@@ -1,7 +1,7 @@
 ---
 title: "Quickstart"
 source_url: "https://replicant.space/docs/quickstart/"
-crawled_at: "2026-07-28T00:53:12.357230+00:00"
+crawled_at: "2026-08-07T00:51:31.852715+00:00"
 ---
 
 Getting Started
@@ -20,6 +20,8 @@ Your first ten minutes. Wake up, look around, visit the belt, deploy some mining
 Prefer clicking over typing? Grab the [Postman collection](../postman/index.md) and you can run every step below from there instead of `curl`.
 
 Note: the API responses shown in these docs are often simplified versions of the real ones you'll see when playing the game. I've removed parts that aren't useful to the learning process. You will see more output when playing normally.
+
+*Want to get a feel for the game before signing up? Try the [interactive tutorial](https://replicant.space/tutorial/) - it walks you through the core gameplay loop in the browser, no account required.*
 
 ## Step 1 - Hello, replicant
 

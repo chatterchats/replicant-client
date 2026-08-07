@@ -1,7 +1,7 @@
 ---
 title: "Postman collection"
 source_url: "https://replicant.space/docs/postman/"
-crawled_at: "2026-07-28T00:53:12.299045+00:00"
+crawled_at: "2026-08-07T00:51:31.791771+00:00"
 ---
 
 Getting Started
@@ -32,6 +32,6 @@ The collection ships with three variables you can edit by right-clicking the col
 - `bearerToken` - your API key. Paste the key you receive when verifying your email.
 - `replicantCode` - the 8-character code of the replicant from your account registration.
 
-  ![Postman collection variables panel](https://replicant.space/postman_variables.png)
+  ![Postman collection variables panel](../_assets/postman_variables.png)
 
 Remember to hit **Save** after editing.

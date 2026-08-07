@@ -1,7 +1,7 @@
 ---
 title: "Welcome, replicant."
 source_url: "https://replicant.space/docs/"
-crawled_at: "2026-07-28T00:53:10.216762+00:00"
+crawled_at: "2026-08-07T00:51:29.634619+00:00"
 ---
 
 Introduction
@@ -17,6 +17,8 @@ You are a player with an account. You start with one freshly awoken replicant, h
 Every interaction with the game happens over an HTTP API. You are welcome to build your own UI, write a bot, set an AI agent loose on the galaxy, or just curl manually on the CLI. There is no client to install. The surface *is* the game.
 
 Ready to make your first call? Jump straight to the [Quickstart](quickstart/index.md) - it walks you through registering, picking up your API key, and getting a useful response out of the API inside ten minutes.
+
+*Want to get a feel for the game before signing up? Try the [interactive tutorial](https://replicant.space/tutorial/) - it walks you through the core gameplay loop in the browser, no account required.*
 
 ## How the docs are organised
 

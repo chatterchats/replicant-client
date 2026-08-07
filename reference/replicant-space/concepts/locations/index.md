@@ -1,7 +1,7 @@
 ---
 title: "Locations"
 source_url: "https://replicant.space/docs/concepts/locations/"
-crawled_at: "2026-07-28T00:53:11.962337+00:00"
+crawled_at: "2026-08-07T00:51:31.420643+00:00"
 ---
 
 Core Concepts
@@ -12,7 +12,11 @@ Star systems follow a consistent naming scheme. If you're in a system called BOO
 
 ## Galactic coordinates
 
-Every star has a set of fixed 3D coordinates in the galaxy, as an `(x, y, z)` offset from Sol in light years. Sol is the origin `(0, 0, 0)`. Interstellar distances are computed directly from these coordinates and are used in calculating surge travel time. Our known galactic region is roughly a 50ly radius from Sol.
+Every star has a set of fixed 3D coordinates in the galaxy, as an `(x, y, z)` offset from Sol in light years. Sol is the origin `(0, 0, 0)`. Interstellar distances are computed directly from these coordinates and are used in calculating surge travel time. Our known galactic region is roughly an 88ly radius from Sol.
+
+- **+x** - toward the Galactic Centre.
+- **+y** - direction of Galactic rotation, within the Galactic plane.
+- **+z** - Galactic north (up).
 
 New stars outside the known region can be discovered using a galactic observatory, which adds to the permanent galaxy catalogue.
 
@@ -40,7 +44,7 @@ Other persistent location in a system are known as system objects. These can inc
 
 Each planet has five Lagrange points that you can travel to, for example `BOOP-4-L3`. These are gravitationally stable (or semi-stable) positions along the orbit of a planet.
 
- ![Diagram of the five Lagrange points L1-L5 around a planet orbiting a star](https://replicant.space/lagrange.png)
+ ![Diagram of the five Lagrange points L1-L5 around a planet orbiting a star](../../_assets/lagrange.png)
 
 Lagrange point geometry. Diagram via [Wikipedia - Lagrange point](https://en.wikipedia.org/wiki/Lagrange_point).
 

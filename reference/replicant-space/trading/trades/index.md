@@ -1,7 +1,7 @@
 ---
 title: "Managing trades"
 source_url: "https://replicant.space/docs/trading/trades/"
-crawled_at: "2026-07-28T00:53:12.590715+00:00"
+crawled_at: "2026-08-07T00:51:32.098173+00:00"
 ---
 
 Trading

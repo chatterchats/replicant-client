@@ -1,7 +1,7 @@
 ---
 title: "Event catalogue"
 source_url: "https://replicant.space/docs/api/events/catalogue/"
-crawled_at: "2026-08-03T00:42:36.957318+00:00"
+crawled_at: "2026-08-07T00:51:30.505600+00:00"
 ---
 
 API · Events
@@ -170,6 +170,34 @@ response payload
 }
 ```
 
+### *device.compacted*
+
+A modular device finished compacting.
+
+Example
+
+response payload
+
+```
+{
+  // empty response
+}
+```
+
+### *device.compacting*
+
+A modular device started compacting.
+
+Example
+
+response payload
+
+```
+{
+  "completes_at": "2026-08-06T15:22:00Z"
+}
+```
+
 ### *device.decommissioned*
 
 A device was decommissioned. May recover resources or discover a blueprint.
@@ -211,6 +239,34 @@ response payload
 {
   "target_code": "A1B2C3D4",
   "target_type": "mining_drone"
+}
+```
+
+### *device.unfurled*
+
+A modular device finished unfurling.
+
+Example
+
+response payload
+
+```
+{
+  // empty response
+}
+```
+
+### *device.unfurling*
+
+A modular device started unfurling.
+
+Example
+
+response payload
+
+```
+{
+  "completes_at": "2026-08-06T15:22:00Z"
 }
 ```
 
@@ -590,7 +646,8 @@ response payload
 {
   "device_type": "mining_drone",
   "print_mode": "vessel",    // "vessel", or "autofactory"
-  "completes_at": "2026-08-02T14:30:00Z"
+  "completes_at": "2026-08-02T14:30:00Z",
+  "tags": ["fleet-a", "miner"]  // present when tags were set on the print job
 }
 ```
 
@@ -604,9 +661,11 @@ response payload
 
 ```
 {
-  "device_type": "mining_drone",
+  "device_type": "parallax_array",
   "new_device_code": "A1B2C3D4",
-  "print_mode": "vessel"  // "vessel", or "autofactory"
+  "print_mode": "autofactory",  // "vessel", or "autofactory"
+  "consumed_device_codes": ["E5F6G7H8", "J9K0L1M2", "N3P4Q5R6"],  // present when components were consumed
+  "tags": ["fleet-a", "miner"]  // present when tags were set on the print job
 }
 ```
 
@@ -1182,5 +1241,53 @@ response multi-leg payload
     { "type": "surge", "to": "CHAMAKUY" },
     { "type": "cruise", "to": "CHAMAKUY-3" }
   ]
+}
+```
+
+### *triangulation.complete*
+
+A spectral triangulation completed. The *direction* is a 3D vector pointing from the *target* coordinates toward the signal source.
+
+Example
+
+response payload
+
+```
+{
+  "signature": "a3f7c2e8b1d94f06",
+  "target": [5000, 14000, 100],
+  "direction": [0.4, 0.9, 0.0]
+}
+```
+
+### *triangulation.failed*
+
+A triangulation failed because the signature was no longer available when the observation completed.
+
+Example
+
+response payload
+
+```
+{
+  "signature": "a3f7c2e8b1d94f06",
+  "target": [5000, 14000, 100],
+  "reason": "signature_not_found"
+}
+```
+
+### *triangulation.started*
+
+A galactic observatory began a spectral triangulation routine.
+
+Example
+
+response payload
+
+```
+{
+  "signature": "a3f7c2e8b1d94f06",
+  "target": [5000, 14000, 100],
+  "completes_at": "2026-08-05T13:30:00Z"
 }
 ```

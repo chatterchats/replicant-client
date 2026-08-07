@@ -1,7 +1,7 @@
 ---
 title: "FTL Relays"
 source_url: "https://replicant.space/docs/ftl-relays/"
-crawled_at: "2026-07-28T00:53:12.212832+00:00"
+crawled_at: "2026-08-07T00:51:31.688489+00:00"
 ---
 
 Infrastructure
@@ -14,9 +14,9 @@ High-bandwidth FTL communication relays. Once you've built one, you can be prese
 
 When you travel off-system, you lose connection with any devices that you've left behind. An FTL beacon will keep you updated with what's happening, but without an active FTL relay, you won't be able to send commands and manage things remotely.
 
-## The relay retwork
+## The relay network
 
-A single relay has a finite 7.5 light year range. This was a deliberate design decision by earlier replicants to match the average distance between stars in our galaxy region. Relays will automatically form a chain when they detect each other. As long as you have an active relay network, you can remote control your devices from the other end of the galaxy.
+A single FTL relay has a 7.5 light year range. This was a deliberate design decision by earlier replicants to match the average distance between stars in our galaxy region. Relays will automatically form a chain when they detect each other. As long as you have an active relay network, you can remote control your devices from the other end of the galaxy.
 
 Ask any relay what neighbours it has linked up with and you'll get back the current connections, each relay's range, and whether it's actively passing traffic.
 
@@ -65,6 +65,10 @@ $ curl -X POST https://api.replicant.space/v1/devices/SR9023C1 \
 
 The moment you activate your first relay, you gain access to BobNet - the realtime comms channel. Join the galactic conversation with an IRC-style communication platform. Advertise your trades, listen out for NPC announcements, chat with other players. Mind your manners out there.
 
-## Hub bundling
+Any relay-capable device can handle BobNet comms.
 
-System Hubs include a powerful on-board FTL relay with a greater range. If you have a hub in a system, you don't need a separate relay.
+## Other relay-capable devices
+
+The FTL relay isn't the only device that can form part of your network. System Hubs include a powerful on-board relay with a 15 light year range. If you have a hub in a system, you don't need a separate relay.
+
+Other blueprints can be discovered that provide different relay ranges, enabling you to bridge gaps in your network that a standard relay can't reach.

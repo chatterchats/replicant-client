@@ -1,8 +1,8 @@
 # Replicant Space Documentation Mirror
 
 - Source: https://replicant.space/docs/
-- Generated: 2026-08-03T00:42:38.460301+00:00
-- Pages: 83
+- Generated: 2026-08-07T00:51:32.098378+00:00
+- Pages: 84
 
 ## Pages
 
@@ -53,6 +53,7 @@
 - [Travel](api/replicants/travel/index.md)
 - [Authentication](authentication/index.md)
 - [Autofactories](autofactories/index.md)
+- [Changelog](changelog/index.md)
 - [Replicant Cloning](cloning/index.md)
 - [Blueprints](concepts/blueprints/index.md)
 - [BobNet](concepts/bobnet/index.md)
