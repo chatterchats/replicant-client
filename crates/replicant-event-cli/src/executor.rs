@@ -13,6 +13,7 @@ use replicant_event_planner::{
     mission_tag, plan_event, role_tag,
 };
 use replicant_printing::managed::factory_queue_slots;
+use replicant_transport::{DeliveryOptions, PayloadDevice as TransportPayloadDevice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::time::{Instant, sleep, timeout};
@@ -1785,160 +1786,37 @@ async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) 
     .await
 }
 
-async fn unfurl_modular_devices(
-    client: &Client,
-    config: &Config,
-    codes: &[String],
-) -> AnyResult<()> {
-    for code in codes {
-        let mut detail = match client.raw().devices().get(code).await {
-            Ok(response) => response.value,
-            Err(error) if error.status() == Some(404) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if !is_modular_device(&detail) {
-            continue;
-        }
-        if status_is(&detail, "unfurling") {
-            wait_for_raw_device(client, config, code, |device| {
-                !status_is(device, "unfurling")
-            })
-            .await?;
-            detail = client.raw().devices().get(code).await?.value;
-        }
-        if !status_is(&detail, "compacted") && !command_available(&detail, "unfurl") {
-            continue;
-        }
-        if !command_available(&detail, "unfurl") {
-            return Err(app_error(
-                io::ErrorKind::Other,
-                format!(
-                    "modular payload {code} is compacted but does not currently advertise unfurl"
-                ),
-            ));
-        }
-        info!(device = %code, "unfurling modular event payload after delivery");
-        let operation = client.devices().get(code).await?.unfurl().await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
-        wait_for_raw_device(client, config, code, |device| {
-            !status_is(device, "compacted")
-                && !status_is(device, "compacting")
-                && !status_is(device, "unfurling")
-                && device.attached_to_device_code.is_none()
-                && device.stowed_in_device_code.is_none()
-        })
-        .await?;
-    }
-    Ok(())
-}
-
 async fn deliver_event_resources(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
+    let remaining = live_remaining_requirements(client, plan).await?.resources;
+    if remaining.is_empty() {
+        return Ok(());
+    }
     let cargo = cargo_codes(plan);
-    if cargo.is_empty() {
-        let remaining = live_remaining_requirements(client, plan).await?;
-        if remaining.resources.is_empty() {
-            return Ok(());
-        }
+    replicant_transport::deliver_resources_with(
+        client,
+        &plan.home_location,
+        &plan.event.location,
+        &remaining,
+        &cargo,
+        transport_options(config),
+    )
+    .await?;
+
+    let remaining = live_remaining_requirements(client, plan).await?.resources;
+    if !remaining.is_empty() {
         return Err(app_error(
-            io::ErrorKind::NotFound,
-            "event still requires resources but no Cargo Freighter is available",
+            io::ErrorKind::Other,
+            format!(
+                "transport delivery finished but the event still needs: {}",
+                format_resource_map(&remaining)
+            ),
         ));
     }
-
-    let deadline = Instant::now() + config.wait_timeout;
-    loop {
-        let mut remaining = live_remaining_requirements(client, plan).await?.resources;
-        if remaining.is_empty() {
-            return Ok(());
-        }
-        let before = sum_resources(&remaining);
-
-        for code in &cargo {
-            let mut detail = client.raw().devices().get(code).await?.value;
-            ensure_uncontrolled_cargo(&detail, code)?;
-            if detail.travel.is_some() {
-                let destination = planned_device_destination(&detail).ok_or_else(|| {
-                    app_error(
-                        io::ErrorKind::InvalidData,
-                        format!("cargo transport {code} is travelling without a destination"),
-                    )
-                })?;
-                if destination != plan.home_location && destination != plan.event.location {
-                    return Err(app_error(
-                        io::ErrorKind::Other,
-                        format!(
-                            "cargo transport {code} is travelling to unexpected destination {destination}"
-                        ),
-                    ));
-                }
-                ensure_device_at(client, config, code, &destination).await?;
-                detail = client.raw().devices().get(code).await?.value;
-                ensure_uncontrolled_cargo(&detail, code)?;
-            }
-            if detail.location.as_deref() == Some(plan.event.location.as_str())
-                && !cargo_map(&detail).is_empty()
-            {
-                deposit_all(client, config, code).await?;
-                remaining = live_remaining_requirements(client, plan).await?.resources;
-                if remaining.is_empty() {
-                    return Ok(());
-                }
-                detail = client.raw().devices().get(code).await?.value;
-            }
-
-            if detail.location.as_deref() != Some(plan.home_location.as_str()) {
-                ensure_device_at(client, config, code, &plan.home_location).await?;
-                detail = client.raw().devices().get(code).await?.value;
-            }
-            if !cargo_map(&detail).is_empty() {
-                deposit_all(client, config, code).await?;
-                detail = client.raw().devices().get(code).await?.value;
-            }
-
-            let capacity = detail.cargo_capacity.unwrap_or(0);
-            if capacity <= 0 {
-                return Err(app_error(
-                    io::ErrorKind::InvalidData,
-                    format!("cargo transport {code} has no usable cargo capacity"),
-                ));
-            }
-            let manifest = take_manifest(&remaining, capacity);
-            if manifest.is_empty() {
-                continue;
-            }
-            info!(
-                mission_id = %plan.mission_id,
-                transport = %code,
-                manifest = %format_resource_map(&manifest),
-                "collecting event material manifest"
-            );
-            collect_resources(client, config, code, &manifest).await?;
-            ensure_device_at(client, config, code, &plan.event.location).await?;
-            deposit_resources(client, config, code, Some(&manifest)).await?;
-            remaining = live_remaining_requirements(client, plan).await?.resources;
-            if remaining.is_empty() {
-                return Ok(());
-            }
-            ensure_device_at(client, config, code, &plan.home_location).await?;
-        }
-
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out delivering event materials; still needed: {}",
-                    format_resource_map(&remaining)
-                ),
-            ));
-        }
-        if sum_resources(&remaining) >= before {
-            sleep(POLL_INTERVAL).await;
-        }
-    }
+    Ok(())
 }
 
 async fn dispatch_replicant_outbound(client: &Client, plan: &EventMissionPlan) -> AnyResult<()> {
@@ -1952,188 +1830,78 @@ async fn dispatch_replicant_outbound(client: &Client, plan: &EventMissionPlan) -
     Ok(())
 }
 
-async fn unfurl_delivered_modular_payload(
-    client: &Client,
-    config: &Config,
-    plan: &EventMissionPlan,
-) -> AnyResult<()> {
-    let mut codes = Vec::new();
-    for payload in &plan.execution.payload_devices {
-        if payload.role != "payload" {
-            continue;
-        }
-        let detail = match client.raw().devices().get(&payload.code).await {
-            Ok(response) => response.value,
-            Err(error) if error.status() == Some(404) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if detail.location.as_deref() == Some(plan.event.location.as_str())
-            && detail.attached_to_device_code.is_none()
-            && detail.stowed_in_device_code.is_none()
-            && is_modular_device(&detail)
-        {
-            codes.push(payload.code.clone());
-        }
-    }
-    unfurl_modular_devices(client, config, &codes).await
-}
-
 async fn stage_event_devices(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
-    let carriers = carrier_codes(plan);
-    let deadline = Instant::now() + config.wait_timeout;
+    let remaining = live_remaining_requirements(client, plan).await?.devices;
+    if remaining.is_empty() {
+        mark_delivered_payload(client, plan).await?;
+        save_plan(&config.plan_path, plan)?;
+        return Ok(());
+    }
 
-    loop {
-        unfurl_delivered_modular_payload(client, config, plan).await?;
-        let remaining = live_remaining_requirements(client, plan).await?.devices;
-        if remaining.is_empty() {
-            mark_delivered_payload(client, plan).await?;
-            save_plan(&config.plan_path, plan)?;
-            return Ok(());
-        }
-        if carriers.is_empty() {
-            return Err(app_error(
-                io::ErrorKind::NotFound,
-                format!(
-                    "event still requires devices ({}) but no Surge Carrier is available",
-                    format_device_requirements(&remaining)
-                ),
-            ));
-        }
+    let needed = remaining
+        .iter()
+        .map(|item| (item.device_type.clone(), item.count))
+        .collect::<BTreeMap<_, _>>();
+    let selected = select_payload_for_trip(plan, &needed, i64::MAX);
+    if selected.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "no planned payload devices can satisfy {}",
+                format_device_requirements(&remaining)
+            ),
+        ));
+    }
 
-        let needed = remaining
-            .iter()
-            .map(|item| (item.device_type.clone(), item.count))
-            .collect::<BTreeMap<_, _>>();
-        let mut made_progress = false;
-
-        for carrier in &carriers {
-            let mut detail = client.raw().devices().get(carrier).await?.value;
-            if detail.travel.is_some() {
-                let destination = planned_device_destination(&detail).ok_or_else(|| {
-                    app_error(
-                        io::ErrorKind::InvalidData,
-                        format!("carrier {carrier} is travelling without a destination"),
-                    )
-                })?;
-                if destination != plan.home_location && destination != plan.event.location {
-                    return Err(app_error(
-                        io::ErrorKind::Other,
-                        format!(
-                            "carrier {carrier} is travelling to unexpected destination {destination}"
-                        ),
-                    ));
-                }
-                ensure_device_at(client, config, carrier, &destination).await?;
-                detail = client.raw().devices().get(carrier).await?.value;
-            }
-            if detail.location.as_deref() == Some(plan.event.location.as_str())
-                && !detail.attached_devices.is_empty()
-            {
-                let attached = detail
-                    .attached_devices
-                    .iter()
-                    .filter_map(reference_code)
-                    .collect::<Vec<_>>();
-                detach_devices(client, config, carrier, &attached).await?;
-                unfurl_modular_devices(client, config, &attached).await?;
-                made_progress = true;
-            }
-
-            let remaining = live_remaining_requirements(client, plan).await?.devices;
-            if remaining.is_empty() {
-                mark_delivered_payload(client, plan).await?;
-                save_plan(&config.plan_path, plan)?;
-                return Ok(());
-            }
-
-            ensure_device_at(client, config, carrier, &plan.home_location).await?;
-            let detail = client.raw().devices().get(carrier).await?.value;
-            if !detail.attached_devices.is_empty() {
-                let attached = detail
-                    .attached_devices
-                    .iter()
-                    .filter_map(reference_code)
-                    .collect::<Vec<_>>();
-                detach_devices(client, config, carrier, &attached).await?;
-            }
-            let capacity = detail.attach_capacity.unwrap_or(0);
-            if capacity <= 0 {
-                continue;
-            }
-
-            let current_needed = remaining
-                .iter()
-                .map(|item| (item.device_type.clone(), item.count))
-                .collect::<BTreeMap<_, _>>();
-            let selected = select_payload_for_trip(plan, &current_needed, capacity);
-            if selected.is_empty() {
-                continue;
-            }
-            for code in &selected {
-                ensure_attachable_device(client, config, code).await?;
-            }
-            attach_devices(client, config, carrier, &selected).await?;
-            ensure_device_at(client, config, carrier, &plan.event.location).await?;
-            detach_devices(client, config, carrier, &selected).await?;
-            unfurl_modular_devices(client, config, &selected).await?;
-            for payload in &mut plan.execution.payload_devices {
-                if selected.contains(&payload.code) {
-                    payload.delivered = true;
-                }
-            }
-            save_plan(&config.plan_path, plan)?;
-            made_progress = true;
-
-            let remaining = live_remaining_requirements(client, plan).await?.devices;
-            if remaining.is_empty() {
-                return Ok(());
-            }
-            ensure_device_at(client, config, carrier, &plan.home_location).await?;
-        }
-
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out staging event devices; still needed: {}",
-                    format_device_requirements(
-                        &live_remaining_requirements(client, plan).await?.devices
-                    )
-                ),
-            ));
-        }
-        if !made_progress {
-            let available = plan
-                .execution
+    let payloads = selected
+        .iter()
+        .filter_map(|code| {
+            plan.execution
                 .payload_devices
                 .iter()
-                .filter(|device| !device.delivered)
-                .map(|device| format!("{} ({})", device.code, device.device_type))
-                .collect::<Vec<_>>();
-            return Err(app_error(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no planned payload devices can satisfy {}; available payload: {}",
-                    format_device_requirements(&remaining),
-                    available.join(", ")
-                ),
-            ));
-        }
+                .find(|payload| payload.code == *code)
+                .map(|payload| TransportPayloadDevice {
+                    code: payload.code.clone(),
+                    device_type: payload.device_type.clone(),
+                    origin: plan.home_location.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
 
-        let new_remaining = live_remaining_requirements(client, plan).await?.devices;
-        if device_requirement_total(&new_remaining) >= device_requirement_total(&remaining)
-            && needed
-                == new_remaining
-                    .iter()
-                    .map(|item| (item.device_type.clone(), item.count))
-                    .collect::<BTreeMap<_, _>>()
-        {
-            sleep(POLL_INTERVAL).await;
-        }
+    replicant_transport::deliver_devices_with(
+        client,
+        &plan.event.location,
+        &payloads,
+        &carrier_codes(plan),
+        transport_options(config),
+    )
+    .await?;
+
+    mark_delivered_payload(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
+    let remaining = live_remaining_requirements(client, plan).await?.devices;
+    if !remaining.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "transport delivery finished but the event still needs devices: {}",
+                format_device_requirements(&remaining)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn transport_options(config: &Config) -> DeliveryOptions {
+    DeliveryOptions {
+        wait_timeout: config.wait_timeout,
+        poll_interval: POLL_INTERVAL,
+        unfurl_modular_payload: true,
+        return_transports: false,
     }
 }
 

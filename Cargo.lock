@@ -1219,6 +1219,7 @@ dependencies = [
  "replicant-client",
  "replicant-event-planner",
  "replicant-printing",
+ "replicant-transport",
  "serde",
  "serde_json",
  "tokio",
@@ -1323,6 +1324,29 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "replicant-transport"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "replicant-transport-cli"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "replicant-transport",
+ "serde_json",
+ "tokio",
  "tracing-subscriber",
 ]
 

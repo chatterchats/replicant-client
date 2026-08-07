@@ -2,7 +2,8 @@
 
 `replicant-events` plans and executes restart-safe Replicant Space civilisation
 event logistics. It combines `replicant-event-planner` with the managed client,
-distributed printing, durable operations, and a persisted mission file.
+distributed printing, `replicant-transport` for generic outbound delivery,
+durable operations, and a persisted mission file.
 
 The binary is an auxiliary repository tool and is not published.
 
