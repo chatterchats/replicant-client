@@ -35,12 +35,9 @@ include = [
   "/README.md",
   "/CONTRIBUTING.md",
   "/SECURITY.md",
-  "/docs/contract/**",
-  "/docs/observability.md",
   "/src/**",
   "/migrations/**",
   "/examples/**",
-  "/benches/**",
   "/tests/**",
 ]
 
@@ -121,10 +118,6 @@ required-features = ["managed"]
 [[example]]
 name = "fluent_queries"
 required-features = ["managed"]
-
-[[bench]]
-name = "state_snapshot"
-harness = false
 
 [lints.rust]
 missing_docs = "warn"

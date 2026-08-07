@@ -179,9 +179,8 @@ impl Config {
                 "--origin is required (or set RS_TRANSPORT_ORIGIN)",
             )
         })?;
-        let destination = destination.ok_or_else(|| {
-            app_error(io::ErrorKind::InvalidInput, "--destination is required")
-        })?;
+        let destination = destination
+            .ok_or_else(|| app_error(io::ErrorKind::InvalidInput, "--destination is required"))?;
         if resources.is_empty() && devices.is_empty() {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,

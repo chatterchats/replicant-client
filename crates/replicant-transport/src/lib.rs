@@ -500,14 +500,14 @@ fn select_payload_devices(
         let mut candidates = devices
             .iter()
             .filter(|device| {
-                device
-                    .device_type
+                device.device_type.as_ref().is_some_and(|device_type| {
+                    device_type
+                        .as_str()
+                        .eq_ignore_ascii_case(&request.device_type)
+                }) && device
+                    .location
                     .as_ref()
-                    .is_some_and(|device_type| device_type.as_str().eq_ignore_ascii_case(&request.device_type))
-                    && device
-                        .location
-                        .as_ref()
-                        .is_some_and(|location| scope_matches(origin, location.id.as_str()))
+                    .is_some_and(|location| scope_matches(origin, location.id.as_str()))
                     && inactive_payload(device)
                     && device.relationships.attached_to.is_none()
                     && device.relationships.stowed_in.is_none()
@@ -517,8 +517,16 @@ fn select_payload_devices(
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            let left_location = left.location.as_ref().map(|item| item.id.as_str()).unwrap_or("");
-            let right_location = right.location.as_ref().map(|item| item.id.as_str()).unwrap_or("");
+            let left_location = left
+                .location
+                .as_ref()
+                .map(|item| item.id.as_str())
+                .unwrap_or("");
+            let right_location = right
+                .location
+                .as_ref()
+                .map(|item| item.id.as_str())
+                .unwrap_or("");
             origin_location_rank(origin, left_location)
                 .cmp(&origin_location_rank(origin, right_location))
                 .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
@@ -712,7 +720,8 @@ async fn deliver_resource_pickups(
         while !remaining.is_empty() {
             let before = sum_resources(&remaining);
             for code in transports {
-                settle_transport_between(client, code, &pickup.location, destination, options).await?;
+                settle_transport_between(client, code, &pickup.location, destination, options)
+                    .await?;
                 ensure_device_at(client, code, &pickup.location, options).await?;
                 let mut detail = client.raw().devices().get(code).await?.value;
                 ensure_uncontrolled(&detail, code)?;
@@ -915,11 +924,7 @@ async fn deliver_payload_devices(
     delivered.dedup();
     Ok(delivered)
 }
-async fn device_already_delivered(
-    client: &Client,
-    code: &str,
-    destination: &str,
-) -> Result<bool> {
+async fn device_already_delivered(client: &Client, code: &str, destination: &str) -> Result<bool> {
     let detail = client.raw().devices().get(code).await?.value;
     Ok(detail.travel.is_none()
         && detail.location.as_deref() == Some(destination)
@@ -941,10 +946,17 @@ async fn settle_transport_between(
     let planned = detail
         .travel
         .as_ref()
-        .and_then(|travel| travel.final_destination.as_ref().or(travel.destination.as_ref()))
+        .and_then(|travel| {
+            travel
+                .final_destination
+                .as_ref()
+                .or(travel.destination.as_ref())
+        })
         .cloned()
         .ok_or_else(|| {
-            TransportError::Invalid(format!("transport {code} is travelling without a destination"))
+            TransportError::Invalid(format!(
+                "transport {code} is travelling without a destination"
+            ))
         })?;
     if planned != origin && planned != destination {
         return Err(TransportError::Invalid(format!(
@@ -1383,8 +1395,11 @@ fn inactive_payload(device: &Device) -> bool {
 }
 
 fn workflow_reserved(tags: &[String]) -> bool {
-    tags.iter()
-        .any(|tag| RESERVED_TAG_PREFIXES.iter().any(|prefix| tag.starts_with(prefix)))
+    tags.iter().any(|tag| {
+        RESERVED_TAG_PREFIXES
+            .iter()
+            .any(|prefix| tag.starts_with(prefix))
+    })
 }
 
 fn scope_matches(origin: &str, location: &str) -> bool {

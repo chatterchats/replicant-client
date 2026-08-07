@@ -2389,12 +2389,7 @@ mod tests {
             .expect("seed device");
         let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
         store
-            .enqueue_reconciliation(
-                "device:d1",
-                &Realm::Live,
-                "device",
-                &json!({"id": "d1"}),
-            )
+            .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
             .expect("queue stale reconciliation");
 
         let mut decommission_event = event();
@@ -2426,12 +2421,7 @@ mod tests {
             .expect("seed device");
         let key = DeviceKey::live(crate::domain::DeviceId::new("d1"));
         store
-            .enqueue_reconciliation(
-                "device:d1",
-                &Realm::Live,
-                "device",
-                &json!({"id": "d1"}),
-            )
+            .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
             .expect("queue reconciliation");
         store.fail_next_commit();
         assert!(matches!(
@@ -2455,12 +2445,7 @@ mod tests {
             .persist_devices(&[device(Realm::Live, "d1")])
             .expect("seed device");
         store
-            .enqueue_reconciliation(
-                "device:d1",
-                &Realm::Live,
-                "device",
-                &json!({"id": "d1"}),
-            )
+            .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
             .expect("queue reconciliation");
 
         store
@@ -2481,12 +2466,7 @@ mod tests {
             )
             .expect("seed tombstone");
         store
-            .enqueue_reconciliation(
-                "device:d1",
-                &Realm::Live,
-                "device",
-                &json!({"id": "d1"}),
-            )
+            .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
             .expect("queue stale reconciliation");
         assert_eq!(reconciliation_count(&store, "device:d1"), 1);
 
