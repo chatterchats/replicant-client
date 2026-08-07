@@ -1,42 +1,57 @@
 # replicant-client
 
-`replicant-client` is a durable, stateful Rust client for the Replicant Space
-API. It combines typed HTTP and SSE access with a managed client that
-normalizes remote observations, stores them in SQLite, publishes consistent
-snapshots, reconciles state, and journals mutations before sending them.
+`replicant-client` is a local Rust workspace for building and running
+Replicant Space automation. The root package is a durable, stateful client;
+the packages under [`crates/`](crates) add reusable planners, transport and
+printing helpers, and one consolidated command-line interface.
 
-The crate targets the Replicant Space documentation and OpenAPI contract through **2.4.0**. Its
-machine-readable baseline is the checked-in, verified 2.4.0 OpenAPI document,
-with later rendered-document changes recorded explicitly under
-[`docs/contract`](docs/contract).
+This project is not published to crates.io. Build it from this checkout or use
+local path dependencies.
 
 ## Requirements
 
 - Rust 1.94 or newer
-- Tokio when using the asynchronous client
-- A Replicant Space API token for authenticated requests
+- A Replicant Space API token for authenticated examples and CLI commands
+- SQLite storage for the managed client (bundled through `rusqlite`)
+
+From the repository root:
+
+```sh
+cargo check --workspace
+cargo test --workspace --all-features
+cargo run -p replicant-cli -- --help
+```
+
+## Use the client locally
+
+From another project next to this checkout:
 
 ```toml
 [dependencies]
-replicant-client = "1.0.0"
+replicant-client = { path = "../replicant-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The default features enable the managed client and rustls TLS.
+Workspace crates use the root package with:
 
-## Managed client
+```toml
+replicant-client = { path = "../.." }
+```
 
-`replicant_client::Client` is the normal entry point. A file-backed client
-restores its last committed snapshot before applying its startup policy.
+### Managed client
+
+`replicant_client::Client` is the normal application entry point. It owns the
+HTTP transport, SQLite store, normalized state, event processing,
+synchronization, and durable operation journal.
 
 ```rust,no_run
 use replicant_client::{Client, SecretString, StartupPolicy};
 
 #[tokio::main]
 async fn main() -> replicant_client::Result<()> {
-    let token = std::env::var("REPLICANT_API_KEY")
+    let token = std::env::var("RS_API_TOKEN")
         .map_err(|_| replicant_client::Error::Configuration {
-            message: "set REPLICANT_API_KEY".into(),
+            message: "set RS_API_TOKEN".into(),
         })?;
 
     let client = Client::builder()
@@ -47,55 +62,28 @@ async fn main() -> replicant_client::Result<()> {
         .await?;
 
     client.ready().await?;
-    println!("account: {:?}", client.account().get().await?);
+    let account = client.account().get().await?;
+    println!("{account:?}");
     client.close().await
 }
 ```
 
-Use `ClientBuilder::in_memory()` for tests or temporary applications. The
-builder also configures the base URL, request timeout, rate-limit policies,
-event streaming, reconciliation, and startup behavior.
+Use `in_memory()` instead of `sqlite(...)` for tests and disposable programs.
 
-### Startup policies
+### Consistency rules
 
-| Policy | Behavior |
-| --- | --- |
-| `RestoreOnly` | Restore SQLite state without network activity. |
-| `Essential` | Bind the account, establish the essential baseline, catch up events, and connect the live event stream. This is the default. |
-| `Full` | Require all bounded account-domain baselines before startup is ready. |
+- Managed remote reads normalize, commit, and publish before returning.
+- `find()`, `cached()`, and state snapshots are local-only and never hide
+  network requests.
+- `get()`, `refresh()`, and `sync()` make network work explicit.
+- Managed mutations are journaled before their single submission attempt.
+- Ambiguous mutation outcomes are reconciled from later evidence, not blindly
+  retried.
+- Live and simulation entities are isolated by realm.
+- Public directory observations cannot erase richer account-owned data.
+- `client.raw()` bypasses managed persistence and publication.
 
-`status()`, `readiness()`, and `watch_status()` expose lifecycle health.
-`ready()` waits for the configured policy. `close()` is idempotent across all
-clones and flushes the store after stopping background work.
-
-## The consistency model
-
-The managed client follows four rules that matter to callers:
-
-1. A successful managed remote read has already been normalized, committed to
-   SQLite, and published to the local snapshot before it returns.
-2. Fluent queries and cached lookups are local-only. They never hide network
-   requests.
-3. Unsafe mutations are durably registered before transmission and are never
-   blindly retried after an ambiguous transport failure.
-4. Live and simulation data are isolated by `Realm`; public directory data
-   cannot erase richer account-owned data.
-
-Use explicit methods to choose where data comes from:
-
-- `get()` or `refresh()` performs a targeted remote read.
-- `find()`, `cached()`, and `state()` read committed local state.
-- `sync()` performs bounded REST reconciliation.
-- `events()` combines durable event-log catch-up with low-latency SSE.
-- `raw()` bypasses managed persistence and publication entirely.
-
-## Gateways and handles
-
-The client groups behavior by game domain. Gateways cover accounts, devices,
-owned and directory replicants, galaxy data, inventories, messages, BobNet,
-location events, trading, simulations, synchronization, events, and durable
-operations. Entity handles keep an ID and realm attached to targeted reads and
-mutations.
+### Local queries
 
 ```rust,no_run
 use replicant_client::{Client, DeviceStatus, DeviceType};
@@ -110,136 +98,114 @@ async fn idle_miners(client: &Client) -> replicant_client::Result<()> {
         .await?;
 
     for miner in miners {
-        println!("{}", miner.key.id);
+        println!("{}", miner.id().as_str());
     }
     Ok(())
 }
 ```
 
-The query runs against the latest committed snapshot. Call
-`client.devices().get(code).await?` or `client.sync().essential().await?`
-first when freshness is required.
+Refresh a target or run synchronization before the query when current server
+state is required.
 
-## Synchronization and events
+### Raw client
 
-REST synchronization is the correctness mechanism; SSE is an observation
-channel. On startup the managed client restores its durable cursor, catches up
-through the unfiltered event log, and then connects SSE. If continuity cannot
-be proven, it schedules REST reconciliation.
-
-```rust,no_run
-use replicant_client::Client;
-
-async fn reconcile(client: &Client) -> replicant_client::Result<()> {
-    let report = client.sync().full().await?;
-    println!("completed: {:?}", report.completed);
-    Ok(())
-}
-```
-
-Managed event watches are deduplicated and only publish events after their
-effects and cursor are durable. Use `client.raw().events()` when an unmanaged
-history page or SSE stream is intentionally preferred.
-
-## Durable operations
-
-Managed mutations return an `Operation`. The operation journal records intent
-before sending, then classifies the result as accepted, rejected, ambiguous,
-or resolved by later evidence. Inspect previous operations through
-`client.operations()` after a restart. Do not repeat an ambiguous mutation by
-hand unless application-specific evidence proves that it is safe.
-
-## Raw client
-
-Enable only `raw` when SQLite, managed state, and background workers are not
-needed:
+For transport DTOs and response metadata without SQLite or managed state:
 
 ```toml
-replicant-client = { version = "1.0.0", default-features = false, features = ["raw", "rustls-tls"] }
+replicant-client = {
+  path = "../replicant-client",
+  default-features = false,
+  features = ["raw", "rustls-tls"]
+}
 ```
 
 ```rust,no_run
 use replicant_client::raw::{Client, SecretString};
 
-async fn account(token: String) -> replicant_client::Result<()> {
+async fn read_account(token: String) -> replicant_client::Result<()> {
     let client = Client::builder()
         .authentication_token(SecretString::from(token))
         .build()?;
     let response = client.accounts().me().await?;
     println!("status: {}", response.metadata.status);
-    println!("account: {:?}", response.value);
+    println!("{:?}", response.value);
     Ok(())
 }
 ```
 
-Raw responses contain transport DTOs plus status, request ID, and rate-limit
-metadata. Safe reads may use bounded retries; mutating requests are never
-automatically retried. Raw calls do not update managed state, even when the raw
-client came from `Client::raw()`.
+Safe reads may use bounded retries. Mutations are never automatically retried.
 
-## Features
+## Feature tiers
 
-| Feature | Includes |
+| Feature | Provides |
 | --- | --- |
-| `raw` | Typed HTTP transport, authentication, DTOs, pagination, and rate-limit metadata. |
+| `raw` | HTTP transport, authentication, DTOs, pagination, and rate-limit metadata. |
 | `events` | `raw` plus SSE framing and raw event streaming. |
-| `managed` | `events` plus SQLite, normalized state, synchronization, durable operations, and `Client`. Enabled by default. |
-| `rustls-tls` | rustls with native root certificates. Enabled by default. |
-| `native-tls` | The platform native-TLS backend. |
+| `managed` | `events` plus SQLite, normalized state, synchronization, operations, and `Client`. Enabled by default. |
+| `rustls-tls` | rustls and native root certificates. Enabled by default. |
+| `native-tls` | Platform native TLS. |
 
-Examples:
+## Workspace packages
+
+| Package | Purpose |
+| --- | --- |
+| [`replicant-cli`](crates/replicant-cli) | Unified CLI for printing, transport, survey, relay, mining, events, bootstrap, and Riker reports. |
+| [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules. |
+| [`replicant-event-planner`](crates/replicant-event-planner) | Pure civilisation-event logistics planning. |
+| [`replicant-mining-planner`](crates/replicant-mining-planner) | Pure mining-network bills of materials and resource expansion. |
+| [`replicant-printing`](crates/replicant-printing) | Pure print scheduling plus optional managed Autofactory workflows. |
+| [`replicant-route-planner`](crates/replicant-route-planner) | Pure survey-route and FTL relay-network algorithms. |
+| [`replicant-transport`](crates/replicant-transport) | Managed point-to-point resource and device delivery. |
+
+Run the consolidated CLI locally:
 
 ```sh
-cargo run --example raw_read --no-default-features --features raw,rustls-tls
-cargo run --example raw_events --no-default-features --features events,rustls-tls
-cargo run --example managed_sync
-cargo run --example fluent_queries
+export RS_API_TOKEN='your-token'
+cargo run -p replicant-cli -- help print
+cargo run -p replicant-cli -- print status --system SCEPTURUM
 ```
 
-## Auxiliary automations
+## Examples
 
-The workspace also contains a single user-facing [`replicant-cli`](crates/replicant-cli/README.md)
-command crate for events, distributed printing, transport, mining expansion,
-FTL relay expansion, survey routes, colony candidate analysis, and autonomous
-regional bootstraps. The planner and reusable workflow crates remain separate
-libraries, while all executable command surfaces live under `replicant-cli`.
+The root [`examples/`](examples) directory contains runnable tools and
+compile-checked API sketches. See [`examples/README.md`](examples/README.md)
+for prerequisites, safety notes, and a command for every example.
+
+```sh
+cargo run --example raw_read
+cargo run --example nearby_belt_report -- SCEPTURUM 25
+cargo check --example fluent_queries
+```
 
 ## Persistence and security
 
-SQLite stores account binding, normalized projections, simulation realms,
-event history and cursor state, reconciliation work, and the operation journal.
-Tokens are held through secrecy-aware wrappers and are never persisted.
-Debug output redacts credentials; request instrumentation must not include
-authorization headers or private message bodies.
+The managed SQLite database stores account binding, normalized projections,
+simulation realms, event cursor/history, reconciliation work, and durable
+operation outcomes. API tokens are never persisted. Use a separate database
+per account and close the client before copying or removing the database.
 
-Use a separate database per account. The managed store rejects an authenticated
-account that does not match its durable binding. Back up or remove the SQLite
-database only while the client is closed.
+Do not log tokens, authorization headers, private message bodies, or databases
+containing user data.
 
-## Contract boundaries
+## Contract boundary
 
-The public surface includes current, non-deprecated, non-administrative
-operations from the verified OpenAPI baseline plus explicit rendered-document
-deltas. Deprecated and admin-only endpoints are intentionally unavailable,
-including through `raw`. Unknown JSON fields are ignored, and open server
-vocabularies preserve unknown values for forward compatibility.
+The client follows the checked-in Replicant Space 2.4.0 documentation and
+OpenAPI corpus. Deprecated and administrative operations are intentionally
+absent, including from the raw client. Unknown fields and open vocabularies
+remain forward compatible.
 
 ## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cargo check --no-default-features --features raw
 cargo check --no-default-features --features events
 python3 scripts/contract_policy_check.py
 ```
 
-Run `make ci` for the complete formatting, lint, test, feature, documentation,
-package, and contract-policy suite. See [`CONTRIBUTING.md`](CONTRIBUTING.md),
-[`SECURITY.md`](SECURITY.md), and
-[`docs/observability.md`](docs/observability.md) for repository-specific
-guidance.
+`make ci` runs the complete repository gate.
 
 ## License
 

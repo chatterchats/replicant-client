@@ -1,16 +1,71 @@
 # replicant-transport
 
-Reusable point-to-point logistics for Replicant Space.
+Reusable point-to-point resource and device delivery for Replicant Space. The
+crate separates what to move from event, mining, relay, and bootstrap-specific
+completion logic.
 
-The crate owns generic delivery mechanics: source resolution, payload selection,
-transport selection, resource collection/deposit, device attachment/detachment,
-travel, repeated trips, and optional modular-device unfurling. Event-specific
-logic such as requirement progress, achievements, beacons, and reward recovery
-stays outside this crate.
+Unlike the pure planners, this package uses the managed client for discovery,
+travel, inventory operations, and durable mutations. It is unpublished.
 
-The `replicant-cli transport` command accepts either a system-wide origin
-(`SCEPTURUM`) or an exact source location (`SCEPTURUM-BELT-1`).
+## Use locally
 
-Device payloads can be selected either by type/count or by tag. A tag selector
-includes every eligible device carrying that tag inside the origin scope.
-Repeated tag/type selectors are deduplicated by device code.
+From another workspace crate:
+
+```toml
+[dependencies]
+replicant-transport = { path = "../replicant-transport" }
+replicant-client = { path = "../.." }
+```
+
+```rust,ignore
+use replicant_transport::{DeliveryOptions, DeliveryRequest, plan_delivery, execute_delivery};
+
+let request = DeliveryRequest {
+    origin: "SCEPTURUM-BELT-1".into(),
+    destination: "THYFFAWFF-BELT-1".into(),
+    resources: [("iron".into(), 500)].into_iter().collect(),
+    devices: vec![],
+    device_tags: vec![],
+    carrier: None,
+};
+
+let plan = plan_delivery(&client, &request).await?;
+let report = execute_delivery(&client, &plan, DeliveryOptions::default()).await?;
+println!("{report:?}");
+```
+
+## Planning
+
+`plan_delivery` resolves a location or system origin into concrete resource
+pickup locations, payload device codes, and suitable cargo/device carriers.
+
+- `DeliveryRequest` declares resource quantities, device quantities, optional
+  device tags, and carrier preferences.
+- `DeviceRequest` identifies device types and counts.
+- `CarrierPreference` restricts carrier type/count when required.
+- `DeliveryPlan` is explicit and serializable for inspection or persistence.
+
+Planning reads live state but performs no gameplay mutation.
+
+## Execution
+
+`execute_delivery` collects, carries, delivers, optionally unfolds modular
+payload, and optionally returns transports. `DeliveryOptions` controls wait
+timeouts, polling, unfolding, and return behavior. `DeliveryReport` records
+the resources and devices delivered.
+
+`deliver_resources_with` and `deliver_devices_with` are narrower convenience
+entry points when the caller already owns the surrounding workflow.
+
+Mutations use `replicant-client` durable operations. `TransportError` preserves
+planning, managed-client, timeout, inventory, carrier, and operation failures.
+
+Use `replicant-cli transport` for mission-file persistence and restart-safe
+command-line orchestration.
+
+## Verify
+
+```sh
+cargo test -p replicant-transport
+cargo clippy -p replicant-transport --all-targets -- -D warnings
+```

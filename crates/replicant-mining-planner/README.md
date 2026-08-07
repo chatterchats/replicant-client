@@ -1,12 +1,13 @@
 # replicant-mining-planner
 
-Pure, deterministic planning helpers for repeatable Replicant Space mining
-network expansion. It contains the arithmetic and naming rules shared by the
-mining CLI without depending on HTTP, SQLite, Tokio, or managed state.
+Pure planning helpers for repeatable Replicant Space mining-network expansion.
+The crate owns quantity arithmetic, the canonical mining-site bill of
+materials, recursive blueprint costing, and stable site/role tags.
 
-The crate is private to this repository (`publish = false`).
+It has no HTTP, SQLite, Tokio, or managed-state behavior. This is an
+unpublished workspace crate.
 
-## Use
+## Use locally
 
 ```toml
 [dependencies]
@@ -17,28 +18,23 @@ replicant-mining-planner = { path = "../replicant-mining-planner" }
 use replicant_mining_planner::{mining_site_requirements, shortages};
 
 let required = mining_site_requirements();
-let reusable = [("Mining Drone".to_owned(), 2)].into_iter().collect();
+let reusable = [("mining_drone".to_owned(), 2)].into_iter().collect();
 let missing = shortages(&required, &reusable);
 assert!(missing.values().all(|quantity| *quantity >= 0));
 ```
 
-## Public API
+## API
 
-- `mining_site_requirements()` returns the canonical nine-device site bill of
-  materials.
-- `shortages(required, reusable)` subtracts reusable device stock without
-  producing negative quantities.
-- `multiply` and `add_quantities` combine quantity maps for multiple sites.
-- `blueprint_resource_cost` recursively expands device and component
-  blueprints into raw resource requirements.
-- `site_tag` and `role_tag` produce stable tags within the upstream length
-  limit.
-- `BlueprintSpec`, `QuantityMap`, and `PlannerError` are the core data and
-  error types.
+- `mining_site_requirements` returns the canonical nine-device site.
+- `shortages` subtracts reusable stock without negative results.
+- `multiply` and `add_quantities` combine requirements across sites.
+- `blueprint_resource_cost` recursively expands components into raw-resource
+  requirements.
+- `site_tag` and `role_tag` create stable API-safe tags.
+- `BlueprintSpec`, `QuantityMap`, and `PlannerError` are the core types.
 
-The planner does not decide which belt is best, inspect live stock, schedule
-Autofactories, transport equipment, or configure devices. Those orchestration
-steps belong to `replicant-cli mining` and `replicant-printing`.
+Live belt selection, inventory, printing, deployment, and device configuration
+belong to `replicant-cli mining`.
 
 ## Verify
 

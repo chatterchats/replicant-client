@@ -1,14 +1,12 @@
 # replicant-route-planner
 
-A pure relay-network planner for Replicant Space. Given a star catalogue,
-target systems, existing account-owned relays, and a hop limit, it computes a
-connected network that minimizes newly manufactured relay sites first and
-graph hops second.
+Pure route and FTL relay-network algorithms for Replicant Space. Callers supply
+a star catalogue and current relay facts; the crate performs no HTTP,
+persistence, managed-state access, or gameplay mutations.
 
-The crate knows nothing about HTTP, SQLite, devices, or managed-client state.
-It is private to this repository (`publish = false`).
+This is an unpublished workspace crate.
 
-## Use
+## Use locally
 
 ```toml
 [dependencies]
@@ -32,23 +30,22 @@ println!("new relays: {:?}", plan.new_relay_systems);
 
 ## Model
 
-- `Position` and `Star` describe the catalogue.
-- `StarGraph` validates unique designations and builds reachable edges.
-- `RelayNetworkRequest` distinguishes active and inactive owned relays from
-  targets and the anchored start system.
-- `RelayNetworkPlan` contains selected nodes and edges, new/activated relay
-  sites, dependency-safe execution order, hop counts, distances, and whether
-  the execution order is proven optimal.
-- `NetworkNode`, `NetworkEdge`, and `RelayAvailability` make the result
-  inspectable without application-specific types.
+- `Position` and `Star` represent the catalogue.
+- `StarGraph` validates unique designations and reachable edges.
+- `RelayNetworkRequest` separates the anchored start, targets, active relays,
+  inactive reusable relays, and hop range.
+- `RelayNetworkPlan` reports selected nodes/edges, new and activated sites,
+  dependency-safe execution order, hop counts, and distances.
+- `NetworkNode`, `NetworkEdge`, and `RelayAvailability` expose the result
+  without application-specific state.
+- `PlannerError` reports invalid ranges, duplicate/unknown stars, unreachable
+  targets, and solver limits.
 
-The exact solver is bounded: network optimization accepts at most 20 terminals.
-Execution-order optimization is exact through 16 stops; larger valid networks
-use a deterministic, dependency-safe ordering heuristic and report that the
-order is not proven optimal.
+The minimum-new-relay network solver accepts at most 20 terminals. Execution
+order is exact through 16 stops; larger valid networks use a deterministic,
+dependency-safe heuristic and say that the order is not proven optimal.
 
-`PlannerError` covers duplicate or unknown stars, invalid hop ranges,
-unreachable targets, and other inconsistent inputs.
+Use `replicant-cli relay` for live discovery and durable execution.
 
 ## Verify
 
