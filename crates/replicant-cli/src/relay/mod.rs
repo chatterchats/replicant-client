@@ -23,6 +23,7 @@
 //! - `RS_RELAY_HUB=SCEPTURUM-BELT-1`
 //! - `RS_RELAY_PLAN=ftl-relay-expansion.json`
 //! - `RS_RELAY_REPLACE_PLAN=1`
+//! - `RS_RELAY_REUSE_ACCOUNT_RELAYS=1`
 //! - `RS_RELAY_WAIT_TIMEOUT_SECS=21600`
 
 use std::{
@@ -51,6 +52,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 const PLAN_VERSION: u32 = 1;
 const DEFAULT_MAX_HOP_LY: f64 = 7.499;
+const RELAY_DISTANCE_EPSILON: f64 = 1e-9;
 const FTL_RELAY: &str = "ftl_relay";
 const AUTOFACTORY: &str = "autofactory";
 const RELAYING: &str = "relaying";
@@ -87,6 +89,7 @@ struct Config {
     plan_path: PathBuf,
     max_hop_ly: f64,
     replace_plan: bool,
+    reuse_account_relays: bool,
     wait_timeout: Duration,
     targets: Vec<String>,
     verbose: bool,
@@ -122,6 +125,7 @@ impl Config {
         let mut max_hop_ly = DEFAULT_MAX_HOP_LY;
         let mut replace_plan =
             env_flag("RS_RELAY_REPLACE_PLAN") || env_flag("RS_RELAY_REBUILD_PLAN");
+        let mut reuse_account_relays = env_flag("RS_RELAY_REUSE_ACCOUNT_RELAYS");
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_RELAY_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -135,6 +139,7 @@ impl Config {
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--replace-plan" | "--rebuild-plan" => replace_plan = true,
+                "--reuse-account-relays" => reuse_account_relays = true,
                 "--replicant" => replicant = required_argument(&mut arguments, "--replicant")?,
                 "--hub" => hub = required_argument(&mut arguments, "--hub")?,
                 "--plan" => plan_path = PathBuf::from(required_argument(&mut arguments, "--plan")?),
@@ -207,6 +212,12 @@ impl Config {
                 "--replace-plan belongs on the plan command",
             ));
         }
+        if command != Command::Plan && reuse_account_relays {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--reuse-account-relays belongs on the plan command",
+            ));
+        }
         Ok(Self {
             command,
             database,
@@ -215,6 +226,7 @@ impl Config {
             plan_path,
             max_hop_ly,
             replace_plan,
+            reuse_account_relays,
             wait_timeout,
             targets,
             verbose,
@@ -243,7 +255,7 @@ fn print_help() {
     println!(
         "FTL relay expansion\n\n\
 Usage:\n  replicant-cli relay --plan [SYSTEM ...] [OPTIONS]\n  replicant-cli relay --run [OPTIONS]\n  replicant-cli relay --status [OPTIONS]\n\n\
-Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               Uniform relay range (default: 7.499)\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               Uniform relay range (default: 7.499)\n  --reuse-account-relays     Reuse disconnected account relay islands too\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
 Targets are system designations, not planet locations. Plan is read-only. Run\n\
 always reconciles and continues the persisted mission; there is no separate\n\
 resume command or --execute confirmation."
@@ -295,6 +307,8 @@ struct MissionPlan {
     stops: Vec<RelayStop>,
     hub_stock_relays: Vec<String>,
     print_jobs: Vec<PrintJob>,
+    #[serde(default)]
+    planned_transport_capacity: i64,
     returned_to_hub: bool,
 }
 
@@ -602,20 +616,90 @@ async fn create_plan(
             })
         })
         .collect::<Vec<_>>();
+    let account_active_relays = census
+        .active_relay_codes
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let account_inactive_relays = census
+        .inactive_relay_codes
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let (active_relay_systems, inactive_relay_systems) = if config.reuse_account_relays {
+        (
+            account_active_relays.clone(),
+            account_inactive_relays.clone(),
+        )
+    } else {
+        relay_reuse_scope(
+            &stars,
+            &start_system,
+            &config.targets,
+            &account_active_relays,
+            &account_inactive_relays,
+            config.max_hop_ly,
+        )
+    };
+    let ignored_active = account_active_relays
+        .len()
+        .saturating_sub(active_relay_systems.len());
+    let ignored_inactive = account_inactive_relays
+        .len()
+        .saturating_sub(inactive_relay_systems.len());
+    let excluded_relay_systems = account_active_relays
+        .union(&account_inactive_relays)
+        .filter(|system| {
+            !active_relay_systems.contains(system.as_str())
+                && !inactive_relay_systems.contains(system.as_str())
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let planning_stars = stars
+        .into_iter()
+        .filter(|star| !excluded_relay_systems.contains(&star.designation))
+        .collect::<Vec<_>>();
+    info!(
+        start = %start_system,
+        reusable_active = active_relay_systems.len(),
+        reusable_inactive = inactive_relay_systems.len(),
+        ignored_active,
+        ignored_inactive,
+        account_wide = config.reuse_account_relays,
+        "selected existing relay reuse scope"
+    );
+    if !config.reuse_account_relays && (ignored_active != 0 || ignored_inactive != 0) {
+        println!(
+            "Relay reuse scope: start island rooted at {start_system}; ignoring {ignored_active} active and {ignored_inactive} inactive relay site(s) in disconnected account islands."
+        );
+    }
+
     let network = plan_relay_network(
-        stars,
+        planning_stars,
         RelayNetworkRequest {
             start: start_system.clone(),
             targets: config.targets.clone(),
-            active_relay_systems: census.active_relay_codes.keys().cloned().collect(),
-            inactive_relay_systems: census.inactive_relay_codes.keys().cloned().collect(),
+            active_relay_systems,
+            inactive_relay_systems,
             max_hop_ly: config.max_hop_ly,
         },
     )?;
 
     let mission_id = format!("{}-{}", start_system.to_lowercase(), uuid::Uuid::new_v4());
     let mut hub_stock = census.hub_stock.clone();
-    hub_stock.sort();
+    // Assign relays that are already aboard the transport to the earliest new
+    // deployment stops. That keeps the first multi-trip load executable even
+    // when some of the vessel's stow capacity is already occupied by hub stock.
+    hub_stock.sort_by_key(|code| {
+        let stowed_in_transport = census.devices.get(code).is_some_and(|device| {
+            device
+                .relationships
+                .stowed_in
+                .as_ref()
+                .is_some_and(|container| container.id.as_str() == vessel_code)
+        });
+        (stowed_in_transport, code.clone())
+    });
     let mut factory_load = census
         .factories
         .iter()
@@ -738,13 +822,23 @@ async fn create_plan(
         .count();
     let transport_capacity = free_slots.saturating_add(i64::try_from(already_stowed)?);
     let transport_required = i64::try_from(network.new_relay_systems.len())?;
-    if transport_required > transport_capacity {
+    if transport_required > 0 && transport_capacity <= 0 {
         return Err(app_error(
             io::ErrorKind::Other,
             format!(
-                "vessel {vessel_code} can carry {transport_capacity} mission relays in its current configuration, but {transport_required} are required; multi-trip deployment is not implemented"
+                "vessel {vessel_code} has no usable stow capacity for the {transport_required} mission relay(s)"
             ),
         ));
+    }
+    if transport_required > transport_capacity {
+        let trips = (transport_required + transport_capacity - 1) / transport_capacity;
+        info!(
+            vessel = %vessel_code,
+            transport_capacity,
+            transport_required,
+            trips,
+            "relay expansion will use multiple deployment trips"
+        );
     }
 
     ensure_manufacturing_resources(client, &config.hub, print_jobs.len()).await?;
@@ -761,8 +855,69 @@ async fn create_plan(
         stops,
         hub_stock_relays: used_hub_stock,
         print_jobs,
+        planned_transport_capacity: transport_capacity,
         returned_to_hub: false,
     })
+}
+
+fn relay_reuse_scope(
+    stars: &[PlannerStar],
+    start: &str,
+    targets: &[String],
+    active: &BTreeSet<String>,
+    inactive: &BTreeSet<String>,
+    max_hop_ly: f64,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let positions = stars
+        .iter()
+        .map(|star| (star.designation.clone(), star.position))
+        .collect::<BTreeMap<_, _>>();
+    let existing = active
+        .union(inactive)
+        .filter(|system| positions.contains_key(system.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut reachable = BTreeSet::new();
+    let mut pending = std::collections::VecDeque::new();
+    if existing.contains(start) && positions.contains_key(start) {
+        reachable.insert(start.to_owned());
+        pending.push_back(start.to_owned());
+    }
+
+    while let Some(current) = pending.pop_front() {
+        let Some(current_position) = positions.get(current.as_str()).copied() else {
+            continue;
+        };
+        for candidate in &existing {
+            if reachable.contains(candidate) {
+                continue;
+            }
+            let Some(candidate_position) = positions.get(candidate.as_str()).copied() else {
+                continue;
+            };
+            if current_position.distance(candidate_position) <= max_hop_ly + RELAY_DISTANCE_EPSILON
+            {
+                reachable.insert(candidate.clone());
+                pending.push_back(candidate.clone());
+            }
+        }
+    }
+
+    // An explicit target that already contains a relay remains reusable even if
+    // it belongs to another disconnected island. This lets callers deliberately
+    // bridge to that relay without making every relay in the remote island a
+    // zero-cost waypoint.
+    for target in targets {
+        if existing.contains(target) {
+            reachable.insert(target.clone());
+        }
+    }
+
+    (
+        active.intersection(&reachable).cloned().collect(),
+        inactive.intersection(&reachable).cloned().collect(),
+    )
 }
 
 fn least_loaded_factory(loads: &mut BTreeMap<String, usize>) -> AnyResult<String> {
@@ -1457,6 +1612,124 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
     Ok(())
 }
 
+fn next_trip_stop_indices(stops: &[RelayStop], transport_capacity: usize) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut deploy_count = 0usize;
+
+    for (index, stop) in stops.iter().enumerate() {
+        if stop.completed {
+            continue;
+        }
+        if stop.action == StopAction::DeployAndActivate {
+            if deploy_count >= transport_capacity {
+                break;
+            }
+            deploy_count += 1;
+        }
+        indices.push(index);
+    }
+
+    indices
+}
+
+fn trip_relays_ready(stops: &[RelayStop], indices: &[usize]) -> bool {
+    indices.iter().all(|index| {
+        let stop = &stops[*index];
+        stop.action != StopAction::DeployAndActivate || stop.relay_code.is_some()
+    })
+}
+
+fn trip_deploy_count(stops: &[RelayStop], indices: &[usize]) -> usize {
+    indices
+        .iter()
+        .filter(|index| stops[**index].action == StopAction::DeployAndActivate)
+        .count()
+}
+
+async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyResult<usize> {
+    let vessel = client
+        .devices()
+        .get(&plan.vessel_code)
+        .await?
+        .snapshot()
+        .await?;
+    let free = vessel
+        .stow_capacity
+        .unwrap_or(0)
+        .saturating_sub(vessel.stow_used.unwrap_or(0));
+
+    let mut stowed_mission_relays = 0usize;
+    let mission_codes = plan
+        .stops
+        .iter()
+        .filter(|stop| stop.action == StopAction::DeployAndActivate && !stop.completed)
+        .filter_map(|stop| stop.relay_code.as_deref())
+        .collect::<BTreeSet<_>>();
+    for code in mission_codes {
+        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        if snapshot
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_some_and(|container| container.id.as_str() == plan.vessel_code.as_str())
+        {
+            stowed_mission_relays += 1;
+        }
+    }
+
+    let total = free.saturating_add(i64::try_from(stowed_mission_relays)?);
+    Ok(usize::try_from(total)?)
+}
+
+async fn wait_for_trip_relays(
+    client: &Client,
+    config: &Config,
+    plan: &mut MissionPlan,
+    indices: &[usize],
+) -> AnyResult<()> {
+    if trip_relays_ready(&plan.stops, indices) {
+        return Ok(());
+    }
+
+    let mut watch = client.events().watch().await?;
+    let deadline = Instant::now() + config.wait_timeout;
+    loop {
+        reconcile_plan(client, plan).await?;
+        save_plan(&config.plan_path, plan)?;
+        if trip_relays_ready(&plan.stops, indices) {
+            return Ok(());
+        }
+
+        if plan.print_jobs.iter().any(|job| !job.submitted) {
+            ensure_manufacturing_resources(
+                client,
+                &plan.hub_location,
+                plan.print_jobs.iter().filter(|job| !job.submitted).count(),
+            )
+            .await?;
+            submit_print_jobs(client, config, plan).await?;
+            continue;
+        }
+
+        if Instant::now() >= deadline {
+            let waiting = indices
+                .iter()
+                .filter_map(|index| {
+                    let stop = &plan.stops[*index];
+                    (stop.action == StopAction::DeployAndActivate && stop.relay_code.is_none())
+                        .then_some(stop.system.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(app_error(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for next relay deployment load: {waiting}"),
+            ));
+        }
+        wait_for_relevant_event(&mut watch, deadline, &["print.completed"]).await?;
+    }
+}
+
 async fn execute_plan(client: &Client, config: &Config, plan: &mut MissionPlan) -> AnyResult<()> {
     ensure_manufacturing_resources(
         client,
@@ -1464,26 +1737,107 @@ async fn execute_plan(client: &Client, config: &Config, plan: &mut MissionPlan) 
         plan.print_jobs.iter().filter(|job| !job.submitted).count(),
     )
     .await?;
+
+    // Queue every planned relay as early as the Autofactory queues permit. Once
+    // accepted, those jobs continue manufacturing while the transport is away.
     submit_print_jobs(client, config, plan).await?;
-    wait_for_printed_relays(client, config, plan).await?;
-    assign_printed_relays(plan)?;
-    save_plan(&config.plan_path, plan)?;
 
-    transfer_mission_relays(client, config, plan).await?;
-    stow_transport_relays(client, config, plan).await?;
+    let total_deploys = plan
+        .stops
+        .iter()
+        .filter(|stop| stop.action == StopAction::DeployAndActivate)
+        .count();
+    let mut trip_number = 0usize;
 
-    for index in 0..plan.stops.len() {
-        if plan.stops[index].completed {
-            continue;
-        }
-        execute_stop(client, config, plan, index).await?;
+    while plan.stops.iter().any(|stop| !stop.completed) {
+        reconcile_plan(client, plan).await?;
         save_plan(&config.plan_path, plan)?;
+        if plan.stops.iter().all(|stop| stop.completed) {
+            break;
+        }
+
+        // A restart in the middle of a trip intentionally returns to the hub
+        // before rebuilding the next load. This is slower than reconstructing a
+        // partial route in place, but keeps recovery deterministic and safe.
+        travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
+        let transport_capacity = current_transport_capacity(client, plan).await?;
+        let pending_deploys = plan
+            .stops
+            .iter()
+            .filter(|stop| stop.action == StopAction::DeployAndActivate && !stop.completed)
+            .count();
+        if pending_deploys > 0 && transport_capacity == 0 {
+            return Err(app_error(
+                io::ErrorKind::Other,
+                format!(
+                    "vessel {} has no usable stow capacity for {pending_deploys} remaining mission relay(s)",
+                    plan.vessel_code
+                ),
+            ));
+        }
+
+        let trip_indices = next_trip_stop_indices(&plan.stops, transport_capacity);
+        if trip_indices.is_empty() {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                "relay mission has incomplete stops but no executable next trip",
+            ));
+        }
+
+        wait_for_trip_relays(client, config, plan, &trip_indices).await?;
+        transfer_trip_relays(client, config, plan, &trip_indices).await?;
+        stow_trip_relays(client, config, plan, &trip_indices).await?;
+
+        trip_number += 1;
+        let carried = trip_deploy_count(&plan.stops, &trip_indices);
+        let completed_deploys = plan
+            .stops
+            .iter()
+            .filter(|stop| stop.action == StopAction::DeployAndActivate && stop.completed)
+            .count();
+        info!(
+            trip = trip_number,
+            carried,
+            capacity = transport_capacity,
+            completed_deploys,
+            total_deploys,
+            stops = trip_indices.len(),
+            "departing relay deployment trip"
+        );
+        println!(
+            "Relay deployment trip {trip_number}: carrying {carried}/{transport_capacity} relay slot(s) for {} stop(s).",
+            trip_indices.len()
+        );
+        plan.returned_to_hub = false;
+        save_plan(&config.plan_path, plan)?;
+
+        for index in trip_indices {
+            if plan.stops[index].completed {
+                continue;
+            }
+            execute_stop(client, config, plan, index).await?;
+            save_plan(&config.plan_path, plan)?;
+        }
+
+        if plan.stops.iter().any(|stop| !stop.completed) {
+            travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
+            save_plan(&config.plan_path, plan)?;
+            info!(
+                trip = trip_number,
+                hub = %plan.hub_location,
+                "relay transport returned for the next load"
+            );
+        }
     }
 
     travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
     plan.returned_to_hub = true;
     save_plan(&config.plan_path, plan)?;
-    info!(hub = %plan.hub_location, "relay expansion completed and transport returned");
+    info!(
+        trips = trip_number,
+        hub = %plan.hub_location,
+        "relay expansion completed and transport returned"
+    );
     Ok(())
 }
 
@@ -1568,61 +1922,16 @@ async fn submit_print_jobs(
     Ok(())
 }
 
-async fn wait_for_printed_relays(
-    client: &Client,
-    config: &Config,
-    plan: &mut MissionPlan,
-) -> AnyResult<()> {
-    if plan.print_jobs.is_empty() {
-        return Ok(());
-    }
-    let mut watch = client.events().watch().await?;
-    let deadline = Instant::now() + config.wait_timeout;
-    loop {
-        reconcile_plan(client, plan).await?;
-        save_plan(&config.plan_path, plan)?;
-        if plan.print_jobs.iter().all(|job| job.relay_code.is_some()) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                "timed out waiting for FTL relay printing",
-            ));
-        }
-        wait_for_relevant_event(&mut watch, deadline, &["print.completed"]).await?;
-    }
-}
-
-fn assign_printed_relays(plan: &mut MissionPlan) -> AnyResult<()> {
-    for stop in &mut plan.stops {
-        if stop.action != StopAction::DeployAndActivate || stop.relay_code.is_some() {
-            continue;
-        }
-        stop.relay_code = plan
-            .print_jobs
-            .iter()
-            .find(|job| job.system == stop.system)
-            .and_then(|job| job.relay_code.clone());
-        if stop.relay_code.is_none() {
-            return Err(app_error(
-                io::ErrorKind::NotFound,
-                format!("no printed relay was identified for {}", stop.system),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn transfer_mission_relays(
+async fn transfer_trip_relays(
     client: &Client,
     config: &Config,
     plan: &MissionPlan,
+    indices: &[usize],
 ) -> AnyResult<()> {
-    let codes = plan
-        .stops
+    let codes = indices
         .iter()
-        .filter_map(|stop| stop.relay_code.clone())
+        .filter(|index| plan.stops[**index].action == StopAction::DeployAndActivate)
+        .filter_map(|index| plan.stops[*index].relay_code.clone())
         .collect::<BTreeSet<_>>();
     for code in codes {
         let handle = client.devices().get(&code).await?;
@@ -1648,18 +1957,18 @@ async fn transfer_mission_relays(
     Ok(())
 }
 
-async fn stow_transport_relays(
+async fn stow_trip_relays(
     client: &Client,
     config: &Config,
     plan: &MissionPlan,
+    indices: &[usize],
 ) -> AnyResult<()> {
-    let pending = plan
-        .stops
-        .iter()
-        .filter(|stop| stop.action == StopAction::DeployAndActivate && !stop.completed)
-        .collect::<Vec<_>>();
     let mut to_stow = Vec::new();
-    for stop in pending {
+    for index in indices {
+        let stop = &plan.stops[*index];
+        if stop.completed || stop.action != StopAction::DeployAndActivate {
+            continue;
+        }
         let code = stop.relay_code.as_deref().ok_or_else(|| {
             app_error(
                 io::ErrorKind::NotFound,
@@ -1724,7 +2033,7 @@ async fn stow_transport_relays(
         return Err(app_error(
             io::ErrorKind::Other,
             format!(
-                "vessel {} has {free} free stow slots but {} are required",
+                "vessel {} has {free} free stow slots but the next trip needs {} additional relay(s)",
                 plan.vessel_code,
                 to_stow.len()
             ),
@@ -2051,12 +2360,24 @@ fn print_plan(plan: &MissionPlan) {
         plan.hub_stock_relays.len()
     );
     println!("  Relays to print: {}", plan.print_jobs.len());
+    if plan.planned_transport_capacity > 0 {
+        let required = i64::try_from(plan.network.new_relay_systems.len()).unwrap_or(i64::MAX);
+        let trips = if required == 0 {
+            0
+        } else {
+            (required + plan.planned_transport_capacity - 1) / plan.planned_transport_capacity
+        };
+        println!(
+            "  Planned vessel capacity: {} mission relay(s); deployment trips: {trips}",
+            plan.planned_transport_capacity
+        );
+    }
     println!(
         "  Total tree distance: {:.4} ly",
         plan.network.total_edge_distance_ly
     );
     println!(
-        "  Deployment trip: {} hops, {:.4} routed ly including return ({})",
+        "  Single-pass planner traversal: {} hops, {:.4} routed ly including one return ({})",
         plan.network.execution_hops,
         plan.network.execution_distance_ly,
         if plan.network.execution_order_optimal {
@@ -2065,6 +2386,12 @@ fn print_plan(plan: &MissionPlan) {
             "precedence-safe heuristic"
         }
     );
+    if plan.planned_transport_capacity > 0
+        && i64::try_from(plan.network.new_relay_systems.len()).unwrap_or(i64::MAX)
+            > plan.planned_transport_capacity
+    {
+        println!("  Multi-trip execution adds a hub return between vessel loads.");
+    }
     println!();
     println!("Execution order:");
     for (index, stop) in plan.stops.iter().enumerate() {
@@ -2201,6 +2528,7 @@ pub async fn execute_expansion(
         plan_path: request.mission_file.clone(),
         max_hop_ly: request.max_hop_ly,
         replace_plan: false,
+        reuse_account_relays: false,
         wait_timeout: request.wait_timeout,
         targets: request
             .targets
@@ -2237,6 +2565,18 @@ mod tests {
         }
     }
 
+    fn relay_stop(system: &str, action: StopAction, completed: bool) -> RelayStop {
+        RelayStop {
+            system: system.to_owned(),
+            location: format!("{system}-1-L4"),
+            parent_system: "ROOT".to_owned(),
+            action,
+            relay_code: (action == StopAction::ActivateExisting)
+                .then_some(format!("relay-{system}")),
+            completed,
+        }
+    }
+
     #[test]
     fn generated_relay_tags_fit_the_api_limit() {
         let mission = relay_mission_tag("scepturum-12345678-1234-1234-1234-123456789abc");
@@ -2253,6 +2593,97 @@ mod tests {
             shortened_site,
             relay_site_tag("A-SYSTEM-DESIGNATION-THAT-IS-LONGER-THAN-THE-TAG-LIMIU")
         );
+    }
+
+    fn planner_star(name: &str, x: f64, y: f64) -> PlannerStar {
+        PlannerStar {
+            designation: name.to_owned(),
+            position: Position { x, y, z: 0.0 },
+            entry_point: Some(format!("{name}-1-L4")),
+        }
+    }
+
+    #[test]
+    fn relay_reuse_scope_excludes_disconnected_account_islands() {
+        let stars = vec![
+            planner_star("BETA-ROOT", 0.0, 0.0),
+            planner_star("BETA-OLD", 6.0, 0.0),
+            planner_star("ALPHA-ONE", 30.0, 0.0),
+            planner_star("ALPHA-TWO", 36.0, 0.0),
+        ];
+        let active = BTreeSet::from([
+            "BETA-ROOT".to_owned(),
+            "ALPHA-ONE".to_owned(),
+            "ALPHA-TWO".to_owned(),
+        ]);
+        let inactive = BTreeSet::from(["BETA-OLD".to_owned()]);
+
+        let (scoped_active, scoped_inactive) = relay_reuse_scope(
+            &stars,
+            "BETA-ROOT",
+            &[],
+            &active,
+            &inactive,
+            DEFAULT_MAX_HOP_LY,
+        );
+
+        assert_eq!(scoped_active, BTreeSet::from(["BETA-ROOT".to_owned()]));
+        assert_eq!(scoped_inactive, BTreeSet::from(["BETA-OLD".to_owned()]));
+    }
+
+    #[test]
+    fn relay_reuse_scope_keeps_an_explicit_remote_relay_target() {
+        let stars = vec![
+            planner_star("BETA-ROOT", 0.0, 0.0),
+            planner_star("ALPHA-TARGET", 30.0, 0.0),
+            planner_star("ALPHA-OTHER", 36.0, 0.0),
+        ];
+        let active = BTreeSet::from([
+            "BETA-ROOT".to_owned(),
+            "ALPHA-TARGET".to_owned(),
+            "ALPHA-OTHER".to_owned(),
+        ]);
+
+        let (scoped_active, scoped_inactive) = relay_reuse_scope(
+            &stars,
+            "BETA-ROOT",
+            &["ALPHA-TARGET".to_owned()],
+            &active,
+            &BTreeSet::new(),
+            DEFAULT_MAX_HOP_LY,
+        );
+
+        assert_eq!(
+            scoped_active,
+            BTreeSet::from(["ALPHA-TARGET".to_owned(), "BETA-ROOT".to_owned(),])
+        );
+        assert!(scoped_inactive.is_empty());
+        assert!(!scoped_active.contains("ALPHA-OTHER"));
+    }
+
+    #[test]
+    fn trip_batch_caps_carried_relays_and_keeps_interleaved_activation_stops() {
+        let stops = vec![
+            relay_stop("A", StopAction::DeployAndActivate, false),
+            relay_stop("B", StopAction::ActivateExisting, false),
+            relay_stop("C", StopAction::DeployAndActivate, false),
+            relay_stop("D", StopAction::ActivateExisting, false),
+            relay_stop("E", StopAction::DeployAndActivate, false),
+        ];
+
+        assert_eq!(next_trip_stop_indices(&stops, 2), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn trip_batch_skips_completed_stops_before_filling_the_next_load() {
+        let stops = vec![
+            relay_stop("A", StopAction::DeployAndActivate, true),
+            relay_stop("B", StopAction::DeployAndActivate, false),
+            relay_stop("C", StopAction::DeployAndActivate, false),
+            relay_stop("D", StopAction::DeployAndActivate, false),
+        ];
+
+        assert_eq!(next_trip_stop_indices(&stops, 2), vec![1, 2]);
     }
 
     #[test]
