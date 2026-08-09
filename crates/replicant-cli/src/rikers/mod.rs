@@ -210,9 +210,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     Ok(())
 }
 
-async fn print_location_pipeline_diagnostics(
-    client: &Client,
-) -> crate::AnyResult<()> {
+async fn print_location_pipeline_diagnostics(client: &Client) -> crate::AnyResult<()> {
     eprintln!();
     eprintln!("local location-query diagnostics:");
 
