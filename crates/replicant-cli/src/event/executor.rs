@@ -17,6 +17,7 @@ use replicant_printing::{
     managed::{
         QueueOptions, discover_factories, factory_queue_slots,
         fetch_blueprints as fetch_print_blueprints, queue_print_prerequisites,
+        queue_print_prerequisites_ahead,
     },
 };
 use replicant_transport::{DeliveryOptions, PayloadDevice as TransportPayloadDevice};
@@ -50,6 +51,14 @@ pub(crate) struct ExecutionState {
     #[serde(default)]
     pub(crate) reward_accounting_initialized: bool,
     #[serde(default)]
+    pub(crate) resources_staged: bool,
+    #[serde(default)]
+    pub(crate) devices_staged: bool,
+    #[serde(default)]
+    pub(crate) prestage_complete: bool,
+    #[serde(default)]
+    pub(crate) printer_lanes: Vec<String>,
+    #[serde(default)]
     pub(crate) event_resolved: bool,
     #[serde(default)]
     pub(crate) beacon_completed: bool,
@@ -64,6 +73,8 @@ pub(crate) struct ExecutionPrintBatch {
     pub(crate) quantity: i64,
     pub(crate) role: String,
     pub(crate) batch_tag: String,
+    #[serde(default)]
+    pub(crate) prerequisites_queued: bool,
     #[serde(default)]
     pub(crate) submission_started: bool,
     #[serde(default)]
@@ -125,6 +136,283 @@ pub(crate) async fn kickoff_printing(
         .filter(|batch| !batch.submitted)
         .count();
     Ok(PrintKickoff { submitted, pending })
+}
+
+/// Prepares an event's existing Cargo Freighters for independent resource staging.
+///
+/// This performs the durable claim/checkpoint work before a background transport
+/// task starts. Once it returns `true`, the transport can run without mutating
+/// the mission JSON, allowing the print feeder to keep checkpointing the same
+/// mission concurrently.
+pub(crate) async fn prepare_campaign_resource_stage(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    if plan.phase.is_terminal() || plan.execution.event_resolved {
+        return Ok(false);
+    }
+    let remaining = live_remaining_requirements(client, plan).await?.resources;
+    if remaining.is_empty() {
+        plan.execution.resources_staged = true;
+        save_plan(&config.plan_path, plan)?;
+        return Ok(false);
+    }
+    if plan
+        .selected_criterion
+        .cargo
+        .transports
+        .iter()
+        .any(|transport| transport.code.starts_with("<print:"))
+    {
+        return Ok(false);
+    }
+
+    for code in cargo_codes(plan) {
+        claim_device(client, config, plan, &code, "cargo").await?;
+        ensure_device_at(client, config, &code, &plan.home_location).await?;
+        let detail = client.raw().devices().get(&code).await?.value;
+        ensure_uncontrolled_cargo(&detail, &code)?;
+        if !cargo_map(&detail).is_empty() {
+            deposit_all(client, config, &code).await?;
+        }
+    }
+    Ok(true)
+}
+
+/// Performs only the physical outbound resource delivery. This deliberately
+/// does not save the mission file; the campaign scheduler checkpoints the
+/// result after the worker joins.
+pub(crate) async fn deliver_campaign_resources(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+) -> AnyResult<()> {
+    deliver_event_resources(client, config, plan).await
+}
+
+/// Verifies and checkpoints completion of a background resource feeder.
+pub(crate) async fn confirm_campaign_resources_staged(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    let remaining = live_remaining_requirements(client, plan).await?.resources;
+    if !remaining.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::Other,
+            format!(
+                "background transport finished but event {} still needs materials: {}",
+                plan.event.designation,
+                format_resource_map(&remaining)
+            ),
+        ));
+    }
+    plan.execution.resources_staged = true;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        mission = %plan.mission_id,
+        event = %plan.event.designation,
+        "event resources prestaged independently"
+    );
+    Ok(())
+}
+
+/// Sends an event's resource payload independently of device manufacturing.
+///
+/// This combined form is used when a mission is being prestaged synchronously.
+/// Campaign background workers use the split prepare/deliver/confirm functions
+/// above so print checkpointing can continue while the freighter is travelling.
+pub(crate) async fn stage_campaign_resources(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    if plan.execution.resources_staged {
+        if live_remaining_requirements(client, plan)
+            .await?
+            .resources
+            .is_empty()
+        {
+            return Ok(true);
+        }
+        plan.execution.resources_staged = false;
+        save_plan(&config.plan_path, plan)?;
+    }
+    if !prepare_campaign_resource_stage(client, config, plan).await? {
+        return Ok(plan.execution.resources_staged);
+    }
+    deliver_campaign_resources(client, config, plan).await?;
+    confirm_campaign_resources_staged(client, config, plan).await?;
+    Ok(true)
+}
+
+/// Advances one campaign mission through manufacturing reconciliation and
+/// independent device logistics, but deliberately leaves the selected
+/// replicant free.
+///
+/// Returns `true` once all event materials/devices (and a transported beacon,
+/// when applicable) are physically staged at the event location. A `false`
+/// result means printing or a printed transport is still in progress.
+pub(crate) async fn prestage_campaign_mission(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    if plan.phase.is_terminal() || plan.execution.event_resolved {
+        return Ok(true);
+    }
+    if plan.execution.prestage_complete {
+        let remaining = live_remaining_requirements(client, plan).await?;
+        if remaining.resources.is_empty() && remaining.devices.is_empty() {
+            return Ok(true);
+        }
+        plan.execution.prestage_complete = false;
+        save_plan(&config.plan_path, plan)?;
+    }
+
+    let resources_ready = stage_campaign_resources(client, config, plan).await?;
+
+    initialize_execution(plan);
+    split_pending_print_batches(plan);
+    reconcile_print_batches(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
+
+    if plan
+        .execution
+        .print_batches
+        .iter()
+        .any(|batch| i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity))
+    {
+        return Ok(false);
+    }
+
+    assign_printed_outputs(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
+    if replan_nonlocal_assets(client, config, plan).await? {
+        return Ok(false);
+    }
+
+    if !plan.execution.devices_staged {
+        claim_mission_assets(client, config, plan).await?;
+        prepare_device_fleet(client, config, plan).await?;
+        stage_event_devices(client, config, plan).await?;
+        plan.execution.devices_staged = true;
+        save_plan(&config.plan_path, plan)?;
+    }
+
+    let resources_ready = resources_ready || stage_campaign_resources(client, config, plan).await?;
+    if !resources_ready {
+        return Ok(false);
+    }
+    verify_event_requirements(client, plan).await?;
+    plan.execution.resources_staged = true;
+    plan.execution.devices_staged = true;
+    plan.execution.prestage_complete = true;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        mission = %plan.mission_id,
+        event = %plan.event.designation,
+        "event payload prestaged; replicant may resolve when selected"
+    );
+    Ok(true)
+}
+
+/// Resolves a campaign event whose logistics have already been prestaged.
+/// Reward recovery and asset return are intentionally left to an independent
+/// campaign worker so the replicant can immediately continue to another event.
+pub(crate) async fn resolve_prestaged_campaign_mission(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    if plan.phase.is_terminal() || plan.execution.event_resolved {
+        return Ok(());
+    }
+    if !prestage_campaign_mission(client, config, plan).await? {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "event {} is not ready for the replicant yet",
+                plan.event.designation
+            ),
+        ));
+    }
+
+    set_phase(config, plan, MissionPhase::Outbound)?;
+    dispatch_replicant_outbound(client, plan).await?;
+
+    set_phase(config, plan, MissionPhase::InstallingBeacon)?;
+    if let Err(error) = install_beacon(client, config, plan).await {
+        let warning = format!("FTL beacon objective failed: {error}");
+        warn!(warning = %warning, "continuing event mission without beacon");
+        if !plan.execution.warnings.contains(&warning) {
+            plan.execution.warnings.push(warning);
+        }
+        save_plan(&config.plan_path, plan)?;
+    }
+
+    set_phase(config, plan, MissionPhase::ReadyToResolve)?;
+    verify_event_requirements(client, plan).await?;
+    set_phase(config, plan, MissionPhase::Resolving)?;
+    resolve_event(client, config, plan).await?;
+    set_phase(config, plan, MissionPhase::CollectingRewards)?;
+    Ok(())
+}
+
+/// Finishes a resolved campaign event without moving the campaign replicant.
+/// Cargo Freighters recover rewards independently, carriers return after their
+/// payload has been consumed, and mission claims are then released.
+pub(crate) async fn finish_resolved_campaign_mission(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    if plan.phase.is_terminal() {
+        return Ok(());
+    }
+    if !plan.execution.event_resolved
+        && fetch_event_definition(client, &plan.event.designation, "completed")
+            .await?
+            .is_none()
+    {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!("event {} has not resolved yet", plan.event.designation),
+        ));
+    }
+    plan.execution.event_resolved = true;
+    save_plan(&config.plan_path, plan)?;
+
+    set_phase(config, plan, MissionPhase::CollectingRewards)?;
+    recover_rewards(client, config, plan).await?;
+    set_phase(config, plan, MissionPhase::Returning)?;
+    return_mission_assets_internal(client, config, plan, false).await?;
+    set_phase(config, plan, MissionPhase::CleaningUp)?;
+    cleanup_claims(client, config, plan).await?;
+
+    plan.phase = if plan.execution.warnings.is_empty() {
+        MissionPhase::Completed
+    } else {
+        MissionPhase::CompletedWithWarnings
+    };
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        mission = %plan.mission_id,
+        event = %plan.event.designation,
+        "campaign event logistics finished independently of replicant"
+    );
+    Ok(())
+}
+
+/// Returns the campaign replicant home once no unresolved event needs it.
+pub(crate) async fn return_campaign_replicant_home(
+    client: &Client,
+    config: &Config,
+    replicant: &str,
+    home: &str,
+) -> AnyResult<()> {
+    travel_replicant_to(client, config, replicant, home).await
 }
 
 pub(crate) async fn execute_saved_plan(
@@ -603,6 +891,7 @@ fn initialize_execution(plan: &mut EventMissionPlan) {
                         batch.sequence,
                         &batch.device_type,
                     ),
+                    prerequisites_queued: false,
                     submission_started: false,
                     submitted: false,
                     operation_id: None,
@@ -666,6 +955,10 @@ fn print_batch_tag(
             "{mission_id}:{factory_code}:{sequence}:{device_type}"
         ))
     )
+}
+
+fn component_bundle_tag(batch_tag: &str) -> String {
+    format!("evt-p:{:016x}", stable_hash(batch_tag))
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -748,7 +1041,11 @@ async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -
             jobs.iter()
                 .any(|tags| tags.contains(&plan.mission_tag) && tags.contains(&batch.batch_tag))
         });
-        if queued || i64::try_from(batch.produced_codes.len())? == batch.quantity {
+        let produced = i64::try_from(batch.produced_codes.len())? == batch.quantity;
+        if queued || produced {
+            if produced {
+                batch.prerequisites_queued = true;
+            }
             batch.submission_started = true;
             batch.submitted = true;
             continue;
@@ -1090,16 +1387,28 @@ async fn submit_available_print_batches(
         return Ok(0);
     }
     if pending.is_empty() {
-        if plan.execution.print_batches.iter().any(|batch| {
+        let legacy_or_unknown_topology = plan.execution.print_batches.iter().any(|batch| {
             i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity)
-        }) {
-            prepare_print_prerequisites(client, config, plan, &[]).await?;
+                && !batch.prerequisites_queued
+        });
+        if legacy_or_unknown_topology {
+            let _ = prepare_print_prerequisites(client, config, plan, &[]).await?;
         }
         return Ok(0);
     }
 
     let printing_blueprints = fetch_print_blueprints(client).await?;
-    let factories = discover_factories(client, &plan.home_location, &printing_blueprints).await?;
+    let allowed_lanes = plan
+        .execution
+        .printer_lanes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let factories = discover_factories(client, &plan.home_location, &printing_blueprints)
+        .await?
+        .into_iter()
+        .filter(|factory| allowed_lanes.is_empty() || allowed_lanes.contains(&factory.code))
+        .collect::<Vec<_>>();
     let mut preparation_slots = factories
         .iter()
         .map(|factory| (factory.code.clone(), factory.available_slots()))
@@ -1116,11 +1425,7 @@ async fn submit_available_print_batches(
         let Some(factory_code) = projected_work
             .iter()
             .filter_map(|(factory_code, work)| {
-                (preparation_slots
-                    .get(factory_code)
-                    .copied()
-                    .unwrap_or(0)
-                    > 0)
+                (preparation_slots.get(factory_code).copied().unwrap_or(0) > 0)
                     .then_some((factory_code, *work))
             })
             .min_by(|(left_code, left_work), (right_code, right_work)| {
@@ -1158,10 +1463,11 @@ async fn submit_available_print_batches(
     }
     save_plan(&config.plan_path, plan)?;
 
-    prepare_print_prerequisites(client, config, plan, &prepared).await?;
+    let parent_ready = prepare_print_prerequisites(client, config, plan, &prepared).await?;
 
     let prepared_factories = prepared
         .iter()
+        .filter(|index| parent_ready.contains(index))
         .map(|index| plan.execution.print_batches[*index].factory_code.clone())
         .collect::<BTreeSet<_>>();
     let mut queue_slots = BTreeMap::new();
@@ -1179,6 +1485,9 @@ async fn submit_available_print_batches(
 
     let mut submitted = 0usize;
     for index in prepared {
+        if !parent_ready.contains(&index) {
+            continue;
+        }
         let factory_code = plan.execution.print_batches[index].factory_code.clone();
         let slots = queue_slots.get(&factory_code).copied().unwrap_or(0);
         if slots == 0 {
@@ -1229,43 +1538,104 @@ async fn submit_available_print_batches(
 async fn prepare_print_prerequisites(
     client: &Client,
     config: &Config,
-    plan: &EventMissionPlan,
+    plan: &mut EventMissionPlan,
     batch_indexes: &[usize],
-) -> AnyResult<()> {
-    let requests = batch_indexes
-        .iter()
-        .map(|index| {
-            let batch = &plan.execution.print_batches[*index];
-            PrintRequest::new(batch.device_type.clone(), batch.quantity)
-        })
-        .collect::<Vec<_>>();
-    let mut options = QueueOptions::at(plan.home_location.clone());
-    options.tags = vec![plan.mission_tag.clone(), role_tag("component")];
-    options.poll_interval = POLL_INTERVAL;
-    options.wait_timeout = config.wait_timeout;
-
-    if requests.is_empty() {
+) -> AnyResult<BTreeSet<usize>> {
+    if batch_indexes.is_empty() {
+        let mut options = QueueOptions::at(plan.home_location.clone());
+        options.tags = vec![plan.mission_tag.clone(), role_tag("component")];
+        options.poll_interval = POLL_INTERVAL;
+        options.wait_timeout = config.wait_timeout;
         info!(
             mission = %plan.mission_id,
             "checking blocked Autofactory prerequisites before waiting for event outputs"
         );
-    } else {
+        let report = queue_print_prerequisites(client, &[], &options).await?;
+        if !report.components_queued.is_empty() {
+            info!(
+                mission = %plan.mission_id,
+                components = ?report.components_queued,
+                reused = ?report.components_reused,
+                "recovered blocked event print prerequisites"
+            );
+        }
+        return Ok(BTreeSet::new());
+    }
+
+    let printing_blueprints = fetch_print_blueprints(client).await?;
+    let factories = discover_factories(client, &plan.home_location, &printing_blueprints).await?;
+    let mut ready = BTreeSet::new();
+
+    for index in batch_indexes {
+        if plan.execution.print_batches[*index].prerequisites_queued {
+            ready.insert(*index);
+            continue;
+        }
+        let batch = plan.execution.print_batches[*index].clone();
+        let request = PrintRequest::new(batch.device_type.clone(), batch.quantity);
+        let bundle_tag = component_bundle_tag(&batch.batch_tag);
+        let mut options = QueueOptions::at(plan.home_location.clone());
+        options.tags = vec![
+            plan.mission_tag.clone(),
+            role_tag("component"),
+            bundle_tag.clone(),
+        ];
+        options.poll_interval = POLL_INTERVAL;
+        options.wait_timeout = config.wait_timeout;
+
+        let mut lanes = plan
+            .execution
+            .printer_lanes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if lanes.is_empty() {
+            lanes.insert(batch.factory_code.clone());
+            if let Some(partner) = factories
+                .iter()
+                .filter(|factory| factory.code != batch.factory_code)
+                .filter(|factory| factory.available_slots() > 0)
+                .min_by(|left, right| {
+                    left.remaining_seconds
+                        .total_cmp(&right.remaining_seconds)
+                        .then_with(|| left.code.cmp(&right.code))
+                })
+            {
+                lanes.insert(partner.code.clone());
+            }
+        }
+        options.factory_codes = Some(lanes.clone());
+
         info!(
             mission = %plan.mission_id,
-            requests = ?requests,
-            "ensuring event print prerequisites before parent submission"
+            batch = %batch.batch_tag,
+            device_type = %batch.device_type,
+            lanes = ?lanes,
+            "queueing event prerequisite bundle ahead of parent"
         );
+        let report = queue_print_prerequisites_ahead(client, &[request], &options).await?;
+        if !report.queue.components_queued.is_empty() {
+            info!(
+                mission = %plan.mission_id,
+                batch = %batch.batch_tag,
+                components = ?report.queue.components_queued,
+                "queued event prerequisite bundle work"
+            );
+        }
+        if report.ready_for_parent {
+            plan.execution.print_batches[*index].prerequisites_queued = true;
+            save_plan(&config.plan_path, plan)?;
+            ready.insert(*index);
+        } else {
+            info!(
+                mission = %plan.mission_id,
+                batch = %batch.batch_tag,
+                "prerequisite bundle is only partially queued; parent remains pending"
+            );
+        }
     }
-    let report = queue_print_prerequisites(client, &requests, &options).await?;
-    if !report.components_queued.is_empty() {
-        info!(
-            mission = %plan.mission_id,
-            components = ?report.components_queued,
-            reused = ?report.components_reused,
-            "event print prerequisites completed"
-        );
-    }
-    Ok(())
+
+    Ok(ready)
 }
 
 async fn wait_for_print_outputs(
@@ -1673,6 +2043,15 @@ async fn prepare_initial_fleet(
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
+    prepare_resource_cargo(client, config, plan).await?;
+    prepare_device_fleet(client, config, plan).await
+}
+
+async fn prepare_resource_cargo(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+) -> AnyResult<()> {
     for code in cargo_codes(plan) {
         ensure_device_at(client, config, &code, &plan.home_location).await?;
         let detail = client.raw().devices().get(&code).await?.value;
@@ -1681,7 +2060,14 @@ async fn prepare_initial_fleet(
             deposit_all(client, config, &code).await?;
         }
     }
+    Ok(())
+}
 
+async fn prepare_device_fleet(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
     gather_remote_payload(client, config, plan).await?;
     prepare_home_payload_for_attachment(client, config, plan).await?;
 
@@ -1898,7 +2284,7 @@ async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) 
 async fn deliver_event_resources(
     client: &Client,
     config: &Config,
-    plan: &mut EventMissionPlan,
+    plan: &EventMissionPlan,
 ) -> AnyResult<()> {
     let remaining = live_remaining_requirements(client, plan).await?.resources;
     if remaining.is_empty() {
@@ -1945,7 +2331,25 @@ async fn stage_event_devices(
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
     let remaining = live_remaining_requirements(client, plan).await?.devices;
-    if remaining.is_empty() {
+    let beacon_needs_transport = if let Some(beacon_code) =
+        plan.selected_criterion.beacon.device_code.as_ref()
+        && matches!(
+            plan.selected_criterion.beacon.action,
+            BeaconAction::TransportExisting | BeaconAction::PrintAndTransport
+        ) {
+        client
+            .raw()
+            .devices()
+            .get(beacon_code)
+            .await?
+            .value
+            .location
+            .as_deref()
+            != Some(plan.event.location.as_str())
+    } else {
+        false
+    };
+    if remaining.is_empty() && !beacon_needs_transport {
         mark_delivered_payload(client, plan).await?;
         save_plan(&config.plan_path, plan)?;
         return Ok(());
@@ -1955,7 +2359,17 @@ async fn stage_event_devices(
         .iter()
         .map(|item| (item.device_type.clone(), item.count))
         .collect::<BTreeMap<_, _>>();
-    let selected = select_payload_for_trip(plan, &needed, i64::MAX);
+    let mut selected = select_payload_for_trip(plan, &needed, i64::MAX);
+    if let Some(beacon_code) = plan.selected_criterion.beacon.device_code.as_ref()
+        && matches!(
+            plan.selected_criterion.beacon.action,
+            BeaconAction::TransportExisting | BeaconAction::PrintAndTransport
+        )
+        && !selected.contains(beacon_code)
+        && beacon_needs_transport
+    {
+        selected.push(beacon_code.clone());
+    }
     if selected.is_empty() {
         return Err(app_error(
             io::ErrorKind::NotFound,
@@ -2429,7 +2843,7 @@ async fn recover_rewards(
             carrying_rewards |= !cargo_map(&detail).is_empty();
         }
         if carrying_rewards {
-            return_event_fleet_home(client, config, plan, &cargo).await?;
+            return_reward_cargo_home(client, config, plan, &cargo).await?;
             checkpoint_and_deposit_rewards(client, config, plan, &cargo).await?;
         }
 
@@ -2505,7 +2919,7 @@ async fn recover_rewards(
             .await,
         )?;
 
-        return_event_fleet_home(client, config, plan, &cargo).await?;
+        return_reward_cargo_home(client, config, plan, &cargo).await?;
         checkpoint_and_deposit_rewards(client, config, plan, &cargo).await?;
         if reward_remaining(plan).is_empty() {
             return Ok(());
@@ -2643,24 +3057,13 @@ async fn deposit_all_devices(client: &Client, config: &Config, codes: &[String])
     finish_all(join_all(codes.iter().map(|code| deposit_all(client, config, code))).await)
 }
 
-async fn return_event_fleet_home(
+async fn return_reward_cargo_home(
     client: &Client,
     config: &Config,
     plan: &EventMissionPlan,
     cargo: &[String],
 ) -> AnyResult<()> {
-    let mut devices = cargo.to_vec();
-    devices.extend(carrier_codes(plan));
-    devices.sort();
-    devices.dedup();
-    travel_fleet_to(
-        client,
-        config,
-        &devices,
-        Some(&plan.selected_replicant),
-        &plan.home_location,
-    )
-    .await
+    travel_fleet_to(client, config, cargo, None, &plan.home_location).await
 }
 
 fn reward_remaining(plan: &EventMissionPlan) -> ResourceMap {
@@ -2686,6 +3089,15 @@ async fn return_mission_assets(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
+) -> AnyResult<()> {
+    return_mission_assets_internal(client, config, plan, true).await
+}
+
+async fn return_mission_assets_internal(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    return_replicant: bool,
 ) -> AnyResult<()> {
     let cargo = cargo_codes(plan);
     for code in &cargo {
@@ -2723,7 +3135,7 @@ async fn return_mission_assets(
         client,
         config,
         &devices,
-        Some(&plan.selected_replicant),
+        return_replicant.then_some(plan.selected_replicant.as_str()),
         &plan.home_location,
     )
     .await?;
@@ -2916,10 +3328,19 @@ async fn cleanup_component_tags(
         if !snapshot.tags.iter().any(|tag| tag == &component_tag) {
             continue;
         }
-        let removable = [plan.mission_tag.clone(), component_tag.clone()]
+        let mut removable = [plan.mission_tag.clone(), component_tag.clone()]
             .into_iter()
             .filter(|tag| snapshot.tags.contains(tag))
             .collect::<Vec<_>>();
+        removable.extend(
+            snapshot
+                .tags
+                .iter()
+                .filter(|tag| tag.starts_with("evt-p:"))
+                .cloned(),
+        );
+        removable.sort();
+        removable.dedup();
         if removable.is_empty() {
             continue;
         }

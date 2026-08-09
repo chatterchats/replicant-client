@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use replicant_client::Client;
@@ -10,7 +11,11 @@ use replicant_event_planner::{
     BeaconAction, CriterionAssessment, EventDefinition, FactoryWorkload, PlanningContext,
     ResourceMap, mission_tag, plan_event,
 };
+use replicant_printing::managed::{
+    discover_factories as discover_print_factories, fetch_blueprints as fetch_print_blueprints,
+};
 use serde::{Deserialize, Serialize};
+use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
 use super::{
@@ -22,6 +27,7 @@ use super::{
 
 const CAMPAIGN_VERSION: u32 = 1;
 const CAMPAIGN_KIND: &str = "all_events_campaign";
+const CAMPAIGN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct EventCampaignPlan {
@@ -75,6 +81,7 @@ struct CampaignMissionStatus {
     recommendation_badges: usize,
     prints_produced: usize,
     prints_total: usize,
+    prestaged: bool,
 }
 
 struct PlanningPool {
@@ -89,6 +96,27 @@ struct PlanningPool {
 enum PlannedEvent {
     Mission(CampaignMission),
     Blocked(BlockedEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CampaignWorkerKind {
+    ResourceStage,
+    Prestage,
+    Finish,
+}
+
+struct CampaignWorker {
+    kind: CampaignWorkerKind,
+    assets: BTreeSet<String>,
+    handle: Option<JoinHandle<AnyResult<()>>>,
+}
+
+impl Drop for CampaignWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
 }
 
 pub(crate) fn is_campaign_file(path: &Path) -> AnyResult<bool> {
@@ -351,6 +379,19 @@ fn reserve_mission(pool: &mut PlanningPool, mission: &EventMissionPlan) {
     {
         consumed_devices.insert(code.clone());
     }
+    // All-events campaigns intentionally reserve transport devices across
+    // missions so resource feeders, device carriers, and reward recovery can
+    // run concurrently without two missions fighting over the same vessel.
+    for transport in mission
+        .selected_criterion
+        .cargo
+        .transports
+        .iter()
+        .chain(mission.selected_criterion.carriers.transports.iter())
+        .filter(|transport| !transport.must_print)
+    {
+        consumed_devices.insert(transport.code.clone());
+    }
     pool.devices
         .retain(|device| !consumed_devices.contains(&device.code));
 
@@ -433,44 +474,81 @@ pub(crate) async fn execute_campaign(
     config: &Config,
     campaign: &mut EventCampaignPlan,
 ) -> AnyResult<()> {
-    loop {
-        prefill_print_queues(client, config, campaign).await?;
+    let mut workers = BTreeMap::<PathBuf, CampaignWorker>::new();
 
-        let mut material_only = Vec::new();
-        let mut printing_required = Vec::new();
-        for (index, record) in campaign.missions.iter().enumerate() {
-            let mission = load_plan(&record.mission_path)?;
-            if mission.phase.is_terminal() {
+    loop {
+        reap_finished_campaign_workers(client, config, &mut workers).await?;
+        let busy_paths = worker_paths(&workers);
+        prefill_print_queues(client, config, campaign, &busy_paths).await?;
+        reap_finished_campaign_workers(client, config, &mut workers).await?;
+        spawn_campaign_workers(client, config, campaign, &mut workers, None).await?;
+
+        if let Some(record) = next_replicant_ready_mission(campaign, &workers)? {
+            let path = record.mission_path.clone();
+            let mut mission = load_plan(&path)?;
+            let assets = mission_transport_codes(&mission);
+            if !worker_assets(&workers).is_disjoint(&assets) {
+                sleep(CAMPAIGN_POLL_INTERVAL).await;
                 continue;
             }
-            if mission.selected_criterion.print_schedule.batches.is_empty() {
-                material_only.push(index);
-            } else {
-                printing_required.push((
-                    index,
-                    mission.selected_criterion.print_schedule.makespan_seconds,
-                ));
+
+            info!(
+                event = %record.event_designation,
+                "dispatching campaign replicant to prestaged event"
+            );
+            let mission_config = mission_config(config, &path);
+            let mut feeder_skip = worker_paths(&workers);
+            feeder_skip.insert(path.clone());
+            let feeder_client = client.clone();
+            let feeder_config = config.clone();
+            let feeder_campaign = campaign.clone();
+            let feeder: JoinHandle<AnyResult<()>> = tokio::spawn(async move {
+                loop {
+                    prefill_print_queues(
+                        &feeder_client,
+                        &feeder_config,
+                        &feeder_campaign,
+                        &feeder_skip,
+                    )
+                    .await?;
+                    sleep(CAMPAIGN_POLL_INTERVAL).await;
+                }
+            });
+            let resolve_result =
+                executor::resolve_prestaged_campaign_mission(client, &mission_config, &mut mission)
+                    .await;
+            let feeder_finished = feeder.is_finished();
+            if !feeder_finished {
+                feeder.abort();
             }
-        }
-
-        for index in material_only {
-            prefill_print_queues(client, config, campaign).await?;
-            execute_campaign_mission(client, config, &campaign.missions[index]).await?;
-        }
-
-        printing_required.sort_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        for (index, _) in printing_required {
-            prefill_print_queues(client, config, campaign).await?;
-            execute_campaign_mission(client, config, &campaign.missions[index]).await?;
-        }
-
-        if campaign_has_incomplete_missions(campaign)? {
+            let feeder_result = feeder.await;
+            resolve_result?;
+            if feeder_finished {
+                feeder_result.map_err(|error| {
+                    app_error(
+                        io::ErrorKind::Other,
+                        format!("campaign print feeder failed to join: {error}"),
+                    )
+                })??;
+            }
+            // On the next scheduler turn this resolved mission becomes an
+            // independent reward/return worker while the replicant moves on.
             continue;
         }
+
+        if campaign_has_incomplete_missions(campaign)? || !workers.is_empty() {
+            sleep(CAMPAIGN_POLL_INTERVAL).await;
+            continue;
+        }
+
+        executor::return_campaign_replicant_home(
+            client,
+            config,
+            &campaign.selected_replicant,
+            &campaign.home_location,
+        )
+        .await?;
+
         if campaign.blocked_events.is_empty() {
             save_campaign(&config.plan_path, campaign)?;
             println!(
@@ -492,13 +570,263 @@ pub(crate) async fn execute_campaign(
     }
 }
 
+async fn spawn_campaign_workers(
+    client: &Client,
+    config: &Config,
+    campaign: &EventCampaignPlan,
+    workers: &mut BTreeMap<PathBuf, CampaignWorker>,
+    exclude: Option<&Path>,
+) -> AnyResult<()> {
+    let mut busy_assets = worker_assets(workers);
+    for (record_index, record) in campaign.missions.iter().enumerate() {
+        if exclude.is_some_and(|path| path == record.mission_path.as_path())
+            || workers.contains_key(&record.mission_path)
+        {
+            continue;
+        }
+        let mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal() {
+            continue;
+        }
+
+        let finish = mission.execution.event_resolved;
+        let prints_complete = persisted_prints_complete(&mission);
+        let stage_resources = !finish && !mission.execution.resources_staged && !prints_complete;
+        let prestage = !finish && !mission.execution.prestage_complete && prints_complete;
+        if !finish && !stage_resources && !prestage {
+            continue;
+        }
+
+        let mut mission = mission;
+        let assets = if stage_resources {
+            mission_resource_transport_codes(&mission)
+        } else {
+            mission_transport_codes(&mission)
+        };
+        if has_prior_incomplete_transport_conflict(campaign, record_index, &assets)? {
+            info!(
+                event = %record.event_designation,
+                "campaign worker deferred behind an older mission sharing a transport"
+            );
+            continue;
+        }
+        if !busy_assets.is_disjoint(&assets) {
+            info!(
+                event = %record.event_designation,
+                assets = %assets.iter().cloned().collect::<Vec<_>>().join(","),
+                "campaign worker deferred because a transport is already busy"
+            );
+            continue;
+        }
+        if stage_resources
+            && !executor::prepare_campaign_resource_stage(
+                client,
+                &mission_config(config, &record.mission_path),
+                &mut mission,
+            )
+            .await?
+        {
+            continue;
+        }
+        busy_assets.extend(assets.iter().cloned());
+
+        let path = record.mission_path.clone();
+        let worker_path = path.clone();
+        let worker_client = client.clone();
+        let worker_config = mission_config(config, &path);
+        let event = record.event_designation.clone();
+        let kind = if finish {
+            CampaignWorkerKind::Finish
+        } else if stage_resources {
+            CampaignWorkerKind::ResourceStage
+        } else {
+            CampaignWorkerKind::Prestage
+        };
+        let handle = tokio::spawn(async move {
+            if kind == CampaignWorkerKind::ResourceStage {
+                let mission = load_plan(&worker_path)?;
+                info!(event = %event, "starting independent event resource feeder");
+                executor::deliver_campaign_resources(&worker_client, &worker_config, &mission).await
+            } else {
+                let mut mission = load_plan(&worker_path)?;
+                if kind == CampaignWorkerKind::Finish {
+                    info!(event = %event, "starting independent event reward/return worker");
+                    executor::finish_resolved_campaign_mission(
+                        &worker_client,
+                        &worker_config,
+                        &mut mission,
+                    )
+                    .await
+                } else {
+                    info!(event = %event, "starting independent event device prestaging worker");
+                    let _ = executor::prestage_campaign_mission(
+                        &worker_client,
+                        &worker_config,
+                        &mut mission,
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        });
+        workers.insert(
+            path,
+            CampaignWorker {
+                kind,
+                assets,
+                handle: Some(handle),
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn reap_finished_campaign_workers(
+    client: &Client,
+    config: &Config,
+    workers: &mut BTreeMap<PathBuf, CampaignWorker>,
+) -> AnyResult<()> {
+    let finished = workers
+        .iter()
+        .filter_map(|(path, worker)| {
+            worker
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+                .then_some(path.clone())
+        })
+        .collect::<Vec<_>>();
+    for path in finished {
+        let mut worker = workers
+            .remove(&path)
+            .ok_or_else(|| app_error(io::ErrorKind::NotFound, "campaign worker disappeared"))?;
+        let handle = worker
+            .handle
+            .take()
+            .ok_or_else(|| app_error(io::ErrorKind::NotFound, "campaign worker handle missing"))?;
+        handle.await.map_err(|error| {
+            app_error(
+                io::ErrorKind::Other,
+                format!("campaign background worker failed to join: {error}"),
+            )
+        })??;
+        if worker.kind == CampaignWorkerKind::ResourceStage {
+            let mut mission = load_plan(&path)?;
+            let worker_config = mission_config(config, &path);
+            executor::confirm_campaign_resources_staged(client, &worker_config, &mut mission)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn worker_assets(workers: &BTreeMap<PathBuf, CampaignWorker>) -> BTreeSet<String> {
+    workers
+        .values()
+        .flat_map(|worker| worker.assets.iter().cloned())
+        .collect()
+}
+
+fn worker_paths(workers: &BTreeMap<PathBuf, CampaignWorker>) -> BTreeSet<PathBuf> {
+    workers
+        .iter()
+        .filter_map(|(path, worker)| {
+            (worker.kind != CampaignWorkerKind::ResourceStage).then_some(path.clone())
+        })
+        .collect()
+}
+
+fn persisted_prints_complete(mission: &EventMissionPlan) -> bool {
+    if mission.selected_criterion.print_schedule.batches.is_empty() {
+        return true;
+    }
+    !mission.execution.print_batches.is_empty()
+        && mission
+            .execution
+            .print_batches
+            .iter()
+            .all(|batch| i64::try_from(batch.produced_codes.len()).ok() == Some(batch.quantity))
+}
+
+fn mission_resource_transport_codes(mission: &EventMissionPlan) -> BTreeSet<String> {
+    mission
+        .selected_criterion
+        .cargo
+        .transports
+        .iter()
+        .filter(|transport| !transport.code.starts_with("<print:"))
+        .map(|transport| transport.code.clone())
+        .collect()
+}
+
+fn mission_transport_codes(mission: &EventMissionPlan) -> BTreeSet<String> {
+    mission
+        .selected_criterion
+        .cargo
+        .transports
+        .iter()
+        .chain(mission.selected_criterion.carriers.transports.iter())
+        .filter(|transport| !transport.code.starts_with("<print:"))
+        .map(|transport| transport.code.clone())
+        .collect()
+}
+
+fn has_prior_incomplete_transport_conflict(
+    campaign: &EventCampaignPlan,
+    record_index: usize,
+    assets: &BTreeSet<String>,
+) -> AnyResult<bool> {
+    if assets.is_empty() {
+        return Ok(false);
+    }
+    for prior in &campaign.missions[..record_index] {
+        let mission = load_plan(&prior.mission_path)?;
+        if mission.phase.is_terminal() {
+            continue;
+        }
+        if !assets.is_disjoint(&mission_transport_codes(&mission)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn next_replicant_ready_mission<'a>(
+    campaign: &'a EventCampaignPlan,
+    workers: &BTreeMap<PathBuf, CampaignWorker>,
+) -> AnyResult<Option<&'a CampaignMission>> {
+    let busy = worker_assets(workers);
+    for (record_index, record) in campaign.missions.iter().enumerate() {
+        if workers.contains_key(&record.mission_path) {
+            continue;
+        }
+        let mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal()
+            || mission.execution.event_resolved
+            || !mission.execution.prestage_complete
+        {
+            continue;
+        }
+        let assets = mission_transport_codes(&mission);
+        if has_prior_incomplete_transport_conflict(campaign, record_index, &assets)? {
+            continue;
+        }
+        if busy.is_disjoint(&assets) {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
 async fn prefill_print_queues(
     client: &Client,
     config: &Config,
     campaign: &EventCampaignPlan,
+    skip_paths: &BTreeSet<PathBuf>,
 ) -> AnyResult<()> {
+    ensure_campaign_printer_lanes(client, campaign, skip_paths).await?;
     loop {
-        let progress = prefill_print_round(client, config, campaign).await?;
+        let progress = prefill_print_round(client, config, campaign, skip_paths).await?;
         if progress.submitted == 0 {
             if progress.pending > 0 {
                 info!(
@@ -511,13 +839,122 @@ async fn prefill_print_queues(
     }
 }
 
+async fn ensure_campaign_printer_lanes(
+    client: &Client,
+    campaign: &EventCampaignPlan,
+    skip_paths: &BTreeSet<PathBuf>,
+) -> AnyResult<()> {
+    let blueprints = fetch_print_blueprints(client).await?;
+    let mut factories =
+        discover_print_factories(client, &campaign.home_location, &blueprints).await?;
+    factories.sort_by(|left, right| {
+        left.waiting_for_resources
+            .cmp(&right.waiting_for_resources)
+            .then_with(|| left.remaining_seconds.total_cmp(&right.remaining_seconds))
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    let factory_codes = factories
+        .iter()
+        .map(|factory| factory.code.clone())
+        .collect::<BTreeSet<_>>();
+    let mut reserved = BTreeSet::<String>::new();
+
+    // Preserve active reservations first, including missions currently owned by
+    // a logistics worker. This prevents a newly scheduled event from leasing a
+    // factory that is already part of another event's dependency lanes.
+    for record in &campaign.missions {
+        let mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal()
+            || mission.selected_criterion.print_schedule.batches.is_empty()
+            || persisted_prints_complete(&mission)
+        {
+            continue;
+        }
+        for code in &mission.execution.printer_lanes {
+            if factory_codes.contains(code) {
+                reserved.insert(code.clone());
+            }
+        }
+    }
+
+    for record in &campaign.missions {
+        if skip_paths.contains(&record.mission_path) {
+            continue;
+        }
+        let mut mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal()
+            || mission.selected_criterion.print_schedule.batches.is_empty()
+            || persisted_prints_complete(&mission)
+            || !mission.execution.printer_lanes.is_empty()
+        {
+            continue;
+        }
+
+        let total_units = mission
+            .selected_criterion
+            .print_devices
+            .iter()
+            .map(|item| item.count.max(0))
+            .sum::<i64>();
+        let has_components = mission.selected_criterion.print_devices.iter().any(|item| {
+            blueprints
+                .get(&item.device_type)
+                .is_some_and(|blueprint| !blueprint.components.is_empty())
+        });
+        let desired: usize = if has_components || total_units > 1 {
+            2
+        } else {
+            1
+        };
+        let mut lanes = mission
+            .execution
+            .print_batches
+            .iter()
+            .filter(|batch| batch.submitted)
+            .filter(|batch| i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity))
+            .map(|batch| batch.factory_code.clone())
+            .filter(|code| factory_codes.contains(code))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let needed = desired.saturating_sub(lanes.len());
+        let additional_lanes = factories
+            .iter()
+            .filter(|factory| !factory.waiting_for_resources)
+            .filter(|factory| !reserved.contains(&factory.code))
+            .filter(|factory| !lanes.contains(&factory.code))
+            .take(needed)
+            .map(|factory| factory.code.clone())
+            .collect::<Vec<_>>();
+        lanes.extend(additional_lanes);
+        if lanes.is_empty() {
+            continue;
+        }
+        lanes.sort();
+        lanes.dedup();
+        reserved.extend(lanes.iter().cloned());
+        mission.execution.printer_lanes = lanes.clone();
+        save_plan(&record.mission_path, &mission)?;
+        info!(
+            event = %record.event_designation,
+            lanes = %lanes.join(","),
+            "reserved event Autofactory lane(s)"
+        );
+    }
+    Ok(())
+}
+
 async fn prefill_print_round(
     client: &Client,
     config: &Config,
     campaign: &EventCampaignPlan,
+    skip_paths: &BTreeSet<PathBuf>,
 ) -> AnyResult<executor::PrintKickoff> {
     let mut progress = executor::PrintKickoff::default();
     for record in &campaign.missions {
+        if skip_paths.contains(&record.mission_path) {
+            continue;
+        }
         let mut mission = load_plan(&record.mission_path)?;
         if mission.phase.is_terminal()
             || mission.selected_criterion.print_schedule.batches.is_empty()
@@ -531,24 +968,6 @@ async fn prefill_print_round(
         progress.pending += mission_progress.pending;
     }
     Ok(progress)
-}
-
-async fn execute_campaign_mission(
-    client: &Client,
-    config: &Config,
-    record: &CampaignMission,
-) -> AnyResult<()> {
-    let mut mission = load_plan(&record.mission_path)?;
-    if mission.phase.is_terminal() {
-        return Ok(());
-    }
-    info!(
-        event = %record.event_designation,
-        phase = ?mission.phase,
-        "executing campaign event"
-    );
-    let mission_config = mission_config(config, &record.mission_path);
-    executor::execute_saved_plan(client, &mission_config, &mut mission).await
 }
 
 fn mission_config(config: &Config, path: &Path) -> Config {
@@ -634,6 +1053,7 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
                 .iter()
                 .filter_map(|batch| usize::try_from(batch.quantity).ok())
                 .sum(),
+            prestaged: mission.execution.prestage_complete,
         });
     }
     let completed = statuses
@@ -664,14 +1084,15 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
     for mission in report.missions {
         let phase = format!("{:?}", mission.phase);
         println!(
-            "  {:<25} {:<25} {:<12} badges={} prints={}/{}{}",
+            "  {:<25} {:<25} {:<12} badges={} prints={}/{}{}{}",
             mission.event_designation,
             mission.criterion,
             phase,
             mission.recommendation_badges,
             mission.prints_produced,
             mission.prints_total,
-            if mission.achievement { " NEW ACH" } else { "" }
+            if mission.achievement { " NEW ACH" } else { "" },
+            if mission.prestaged { " READY" } else { "" }
         );
     }
     if !report.blocked_events.is_empty() {
