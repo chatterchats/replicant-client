@@ -293,6 +293,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
                 flatpack: config.flatpack,
                 poll_interval: config.poll_interval,
                 wait_timeout: config.wait_timeout,
+                factory_codes: None,
             };
             let result = queue_prints_with_components(&client, &config.requests, &options).await;
             let close_result = client.close().await;

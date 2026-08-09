@@ -72,6 +72,9 @@ pub struct QueueOptions {
     pub poll_interval: Duration,
     /// Maximum time allowed to queue every requested unit.
     pub wait_timeout: Duration,
+    /// Optional explicit Autofactory set. When present, queueing is confined to
+    /// these factories so higher-level workflows can build dependency-safe lanes.
+    pub factory_codes: Option<BTreeSet<String>>,
 }
 
 impl QueueOptions {
@@ -84,6 +87,7 @@ impl QueueOptions {
             flatpack: false,
             poll_interval: Duration::from_secs(5),
             wait_timeout: Duration::from_secs(21_600),
+            factory_codes: None,
         }
     }
 }
@@ -107,6 +111,16 @@ pub struct QueueReport {
     pub operation_ids: Vec<String>,
     /// Whether the accepted jobs requested compacted modular output.
     pub flatpack: bool,
+}
+
+/// One non-blocking prerequisite queue pass.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct PrerequisiteQueueReport {
+    /// Work accepted during this pass and the dependency waves still being tracked.
+    pub queue: QueueReport,
+    /// True when every prerequisite for the requested parent is either already
+    /// present/in-flight under the supplied tags or was accepted during this pass.
+    pub ready_for_parent: bool,
 }
 
 /// Result of clearing all queued and active work from one Autofactory.
@@ -525,6 +539,60 @@ pub async fn queue_prints(
     queue_print_batch(client, &requested, options, &blueprints, options.flatpack).await
 }
 
+/// Queues prerequisite devices ahead of a higher-level parent without waiting
+/// for physical completion.
+///
+/// Only completed and in-flight component devices carrying `options.tags` are
+/// credited to this bundle. This lets callers give every parent a unique
+/// component-bundle tag, making the operation restart-safe without allowing
+/// another event's queued components to satisfy the same dependency twice.
+///
+/// The function is deliberately non-blocking with respect to queue capacity: it
+/// makes one live scheduling pass and returns `ready_for_parent = false` when a
+/// dependency wave cannot be fully accepted yet. Later waves are never queued
+/// until every unit of the preceding wave is already present/in-flight or has
+/// been accepted, preserving a deadlock-free queue topology.
+pub async fn queue_print_prerequisites_ahead(
+    client: &Client,
+    requests: &[PrintRequest],
+    options: &QueueOptions,
+) -> Result<PrerequisiteQueueReport, PrintingError> {
+    let requested = normalize_requests(requests)?;
+    let blueprints = fetch_blueprints(client).await?;
+    let status = printing_status_in_system(client, &options.hub, requests, &options.tags).await?;
+    let mut report = QueueReport {
+        requested,
+        component_waves: status.missing_component_waves.clone(),
+        ..QueueReport::default()
+    };
+
+    if status.missing_component_waves.is_empty() {
+        return Ok(PrerequisiteQueueReport {
+            queue: report,
+            ready_for_parent: true,
+        });
+    }
+
+    for wave in &status.missing_component_waves {
+        let (wave_report, complete) =
+            queue_print_batch_once(client, wave, options, &blueprints, false).await?;
+        merge_quantities(&mut report.components_queued, &wave_report.queued);
+        merge_quantities(&mut report.by_factory, &wave_report.by_factory);
+        report.operation_ids.extend(wave_report.operation_ids);
+        if !complete {
+            return Ok(PrerequisiteQueueReport {
+                queue: report,
+                ready_for_parent: false,
+            });
+        }
+    }
+
+    Ok(PrerequisiteQueueReport {
+        queue: report,
+        ready_for_parent: true,
+    })
+}
+
 /// Manufactures only the recursive prerequisite devices needed by `requests`.
 ///
 /// This is useful for higher-level workflows that need to retain ownership of
@@ -573,19 +641,12 @@ pub async fn queue_prints_with_components(
         }
     }
 
-    let mut report =
-        queue_dependency_waves(client, options, &blueprints, &dependency_plan).await?;
+    let mut report = queue_dependency_waves(client, options, &blueprints, &dependency_plan).await?;
     report.requested = requested.clone();
     report.flatpack = options.flatpack;
 
-    let requested_report = queue_print_batch(
-        client,
-        &requested,
-        options,
-        &blueprints,
-        options.flatpack,
-    )
-    .await?;
+    let requested_report =
+        queue_print_batch(client, &requested, options, &blueprints, options.flatpack).await?;
     report.queued = requested_report.queued;
     merge_quantities(&mut report.by_factory, &requested_report.by_factory);
     report.operation_ids.extend(requested_report.operation_ids);
@@ -654,6 +715,103 @@ async fn queue_dependency_waves(
     Ok(report)
 }
 
+async fn queue_print_batch_once(
+    client: &Client,
+    requested: &QuantityMap,
+    options: &QueueOptions,
+    blueprints: &BTreeMap<String, Blueprint>,
+    flatpack: bool,
+) -> Result<(QueueReport, bool), PrintingError> {
+    let mut remaining = requested.clone();
+    remaining.retain(|_, quantity| *quantity > 0);
+    let mut report = QueueReport {
+        requested: requested.clone(),
+        flatpack,
+        ..QueueReport::default()
+    };
+    if remaining.is_empty() {
+        return Ok((report, true));
+    }
+
+    let factories = discover_factories(client, &options.hub, blueprints).await?;
+    if factories.is_empty() {
+        return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
+    }
+    let available_factories = factories
+        .iter()
+        .filter(|factory| factory.available_slots() > 0)
+        .filter(|factory| {
+            options
+                .factory_codes
+                .as_ref()
+                .is_none_or(|codes| codes.contains(&factory.code))
+        })
+        .collect::<Vec<_>>();
+    if available_factories.is_empty() {
+        return Ok((report, false));
+    }
+
+    let workloads = available_factories
+        .iter()
+        .map(|factory| factory.workload())
+        .collect::<Vec<_>>();
+    let schedule = schedule_prints(&remaining, blueprints, &workloads)?;
+    let mut slots = available_factories
+        .iter()
+        .map(|factory| (factory.code.clone(), factory.available_slots()))
+        .collect::<BTreeMap<_, _>>();
+
+    for batch in schedule.batches {
+        let available = slots.get(&batch.factory_code).copied().unwrap_or(0);
+        let quantity =
+            usize::try_from(batch.quantity).map_err(|_| ScheduleError::InvalidQuantity {
+                device_type: batch.device_type.clone(),
+                quantity: batch.quantity,
+            })?;
+        let to_submit = available.min(quantity);
+        for _ in 0..to_submit {
+            let operation = if flatpack {
+                enqueue_print_flatpacked(
+                    client,
+                    &batch.factory_code,
+                    &batch.device_type,
+                    1,
+                    &options.tags,
+                )
+                .await?
+            } else {
+                enqueue_print(
+                    client,
+                    &batch.factory_code,
+                    &batch.device_type,
+                    1,
+                    &options.tags,
+                )
+                .await?
+            };
+            *remaining.entry(batch.device_type.clone()).or_default() -= 1;
+            *report.queued.entry(batch.device_type.clone()).or_default() += 1;
+            *report
+                .by_factory
+                .entry(batch.factory_code.clone())
+                .or_default() += 1;
+            report
+                .operation_ids
+                .push(operation.id().as_str().to_owned());
+            info!(
+                factory = %batch.factory_code,
+                device_type = %batch.device_type,
+                flatpacked = flatpack,
+                "queued dependency-safe print unit"
+            );
+        }
+        slots.insert(batch.factory_code, available.saturating_sub(to_submit));
+    }
+
+    remaining.retain(|_, quantity| *quantity > 0);
+    Ok((report, remaining.is_empty()))
+}
+
 async fn queue_print_batch(
     client: &Client,
     requested: &QuantityMap,
@@ -685,6 +843,12 @@ async fn queue_print_batch(
         let available_factories = factories
             .iter()
             .filter(|factory| factory.available_slots() > 0)
+            .filter(|factory| {
+                options
+                    .factory_codes
+                    .as_ref()
+                    .is_none_or(|codes| codes.contains(&factory.code))
+            })
             .collect::<Vec<_>>();
         if available_factories.is_empty() {
             if Instant::now() >= deadline {
