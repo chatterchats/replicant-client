@@ -12,7 +12,13 @@ use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
     mission_tag, plan_event, role_tag,
 };
-use replicant_printing::managed::factory_queue_slots;
+use replicant_printing::{
+    PrintRequest,
+    managed::{
+        QueueOptions, discover_factories, factory_queue_slots,
+        fetch_blueprints as fetch_print_blueprints, queue_print_prerequisites,
+    },
+};
 use replicant_transport::{DeliveryOptions, PayloadDevice as TransportPayloadDevice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1080,38 +1086,99 @@ async fn submit_available_print_batches(
         .enumerate()
         .filter_map(|(index, batch)| (!batch.submitted).then_some(index))
         .collect::<Vec<_>>();
-    if pending.is_empty() || submission_limit == 0 {
+    if submission_limit == 0 {
+        return Ok(0);
+    }
+    if pending.is_empty() {
+        if plan.execution.print_batches.iter().any(|batch| {
+            i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity)
+        }) {
+            prepare_print_prerequisites(client, config, plan, &[]).await?;
+        }
         return Ok(0);
     }
 
-    let factory_codes = pending
+    let printing_blueprints = fetch_print_blueprints(client).await?;
+    let factories = discover_factories(client, &plan.home_location, &printing_blueprints).await?;
+    let mut preparation_slots = factories
+        .iter()
+        .map(|factory| (factory.code.clone(), factory.available_slots()))
+        .collect::<BTreeMap<_, _>>();
+    let mut projected_work = factories
+        .iter()
+        .map(|factory| (factory.code.clone(), factory.remaining_seconds.max(0.0)))
+        .collect::<BTreeMap<_, _>>();
+    let mut prepared = Vec::new();
+    for index in pending {
+        if prepared.len() >= submission_limit {
+            break;
+        }
+        let Some(factory_code) = projected_work
+            .iter()
+            .filter_map(|(factory_code, work)| {
+                (preparation_slots
+                    .get(factory_code)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0)
+                    .then_some((factory_code, *work))
+            })
+            .min_by(|(left_code, left_work), (right_code, right_work)| {
+                left_work
+                    .total_cmp(right_work)
+                    .then_with(|| left_code.cmp(right_code))
+            })
+            .map(|(factory_code, _)| factory_code.clone())
+        else {
+            break;
+        };
+        let slots = preparation_slots.get(&factory_code).copied().unwrap_or(0);
+        let batch_device_type = plan.execution.print_batches[index].device_type.clone();
+        let previous_factory = plan.execution.print_batches[index].factory_code.clone();
+        let batch_tag = plan.execution.print_batches[index].batch_tag.clone();
+        let duration = printing_blueprints
+            .get(&batch_device_type)
+            .map_or(0.0, |blueprint| blueprint.print_time_seconds.max(0.0));
+        if previous_factory != factory_code {
+            info!(
+                mission = %plan.mission_id,
+                batch = %batch_tag,
+                from_factory = %previous_factory,
+                to_factory = %factory_code,
+                "reassigning unsubmitted event print batch to live Autofactory"
+            );
+            plan.execution.print_batches[index].factory_code = factory_code.clone();
+        }
+        prepared.push(index);
+        preparation_slots.insert(factory_code.clone(), slots - 1);
+        *projected_work.entry(factory_code).or_default() += duration;
+    }
+    if prepared.is_empty() {
+        return Ok(0);
+    }
+    save_plan(&config.plan_path, plan)?;
+
+    prepare_print_prerequisites(client, config, plan, &prepared).await?;
+
+    let prepared_factories = prepared
         .iter()
         .map(|index| plan.execution.print_batches[*index].factory_code.clone())
         .collect::<BTreeSet<_>>();
     let mut queue_slots = BTreeMap::new();
-    for factory_code in factory_codes {
+    for factory_code in prepared_factories {
         queue_slots.insert(
             factory_code.clone(),
             factory_queue_slots(client, &factory_code).await?,
         );
     }
 
-    let modular_device_types = fetch_blueprints(client)
-        .await?
+    let modular_device_types = printing_blueprints
         .into_iter()
-        .filter_map(|(device_type, blueprint)| {
-            blueprint
-                .features
-                .contains("modular")
-                .then_some(device_type)
-        })
+        .filter_map(|(device_type, blueprint)| blueprint.is_modular().then_some(device_type))
         .collect::<BTreeSet<_>>();
 
     let mut submitted = 0usize;
-    for index in pending {
-        if submitted >= submission_limit {
-            break;
-        }
+    for index in prepared {
         let factory_code = plan.execution.print_batches[index].factory_code.clone();
         let slots = queue_slots.get(&factory_code).copied().unwrap_or(0);
         if slots == 0 {
@@ -1157,6 +1224,48 @@ async fn submit_available_print_batches(
         submitted += 1;
     }
     Ok(submitted)
+}
+
+async fn prepare_print_prerequisites(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+    batch_indexes: &[usize],
+) -> AnyResult<()> {
+    let requests = batch_indexes
+        .iter()
+        .map(|index| {
+            let batch = &plan.execution.print_batches[*index];
+            PrintRequest::new(batch.device_type.clone(), batch.quantity)
+        })
+        .collect::<Vec<_>>();
+    let mut options = QueueOptions::at(plan.home_location.clone());
+    options.tags = vec![plan.mission_tag.clone(), role_tag("component")];
+    options.poll_interval = POLL_INTERVAL;
+    options.wait_timeout = config.wait_timeout;
+
+    if requests.is_empty() {
+        info!(
+            mission = %plan.mission_id,
+            "checking blocked Autofactory prerequisites before waiting for event outputs"
+        );
+    } else {
+        info!(
+            mission = %plan.mission_id,
+            requests = ?requests,
+            "ensuring event print prerequisites before parent submission"
+        );
+    }
+    let report = queue_print_prerequisites(client, &requests, &options).await?;
+    if !report.components_queued.is_empty() {
+        info!(
+            mission = %plan.mission_id,
+            components = ?report.components_queued,
+            reused = ?report.components_reused,
+            "event print prerequisites completed"
+        );
+    }
+    Ok(())
 }
 
 async fn wait_for_print_outputs(
@@ -2784,6 +2893,54 @@ async fn cleanup_claims(
         }
         plan.claimed_devices[index].released = true;
         save_plan(&config.plan_path, plan)?;
+    }
+    cleanup_component_tags(client, config, plan).await?;
+    Ok(())
+}
+
+async fn cleanup_component_tags(
+    client: &Client,
+    config: &Config,
+    plan: &EventMissionPlan,
+) -> AnyResult<()> {
+    let component_tag = role_tag("component");
+    let handles = client
+        .devices()
+        .refresh_many()
+        .with_tag(plan.mission_tag.clone())
+        .page_size(50)
+        .collect()
+        .await?;
+    for handle in handles {
+        let snapshot = handle.snapshot().await?;
+        if !snapshot.tags.iter().any(|tag| tag == &component_tag) {
+            continue;
+        }
+        let removable = [plan.mission_tag.clone(), component_tag.clone()]
+            .into_iter()
+            .filter(|tag| snapshot.tags.contains(tag))
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            continue;
+        }
+        let code = handle.id().as_str().to_owned();
+        let operation = client
+            .devices()
+            .get(&code)
+            .await?
+            .configure(raw::devices::DeviceConfiguration {
+                add_tags: None,
+                remove_tags: Some(removable.clone()),
+                tags: None,
+            })
+            .await?;
+        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        wait_for_device_snapshot(client, config, &code, |device| {
+            removable
+                .iter()
+                .all(|tag| !device.tags.iter().any(|existing| existing == tag))
+        })
+        .await?;
     }
     Ok(())
 }

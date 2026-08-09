@@ -32,6 +32,8 @@ pub struct FactoryState {
     pub queued_units: usize,
     /// Whether one print is actively running.
     pub printing: bool,
+    /// Whether the factory's current head job is blocked on missing inputs.
+    pub waiting_for_resources: bool,
     /// Estimated seconds until work newly appended now would finish waiting.
     pub remaining_seconds: f64,
 }
@@ -40,7 +42,11 @@ impl FactoryState {
     /// Number of print units that can be submitted immediately.
     #[must_use]
     pub fn available_slots(&self) -> usize {
-        self.queue_size.saturating_sub(self.queued_units)
+        if self.waiting_for_resources {
+            0
+        } else {
+            self.queue_size.saturating_sub(self.queued_units)
+        }
     }
 
     /// Converts this live state into pure scheduler input.
@@ -400,6 +406,7 @@ pub async fn inspect_factory<B: PrintTime>(
         queue_size,
         queued_units,
         printing: detail.printing.is_some(),
+        waiting_for_resources: detail.status.as_deref() == Some("waiting_for_resources"),
         remaining_seconds: active_seconds + queued_seconds,
     })
 }
@@ -410,6 +417,9 @@ pub async fn factory_queue_slots(
     factory_code: &str,
 ) -> Result<usize, PrintingError> {
     let detail = client.raw().devices().get(factory_code).await?.value;
+    if detail.status.as_deref() == Some("waiting_for_resources") {
+        return Ok(0);
+    }
     let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1)).map_err(|_| {
         PrintingError::InvalidQueuedQuantity {
             factory_code: factory_code.to_owned(),
@@ -515,6 +525,28 @@ pub async fn queue_prints(
     queue_print_batch(client, &requested, options, &blueprints, options.flatpack).await
 }
 
+/// Manufactures only the recursive prerequisite devices needed by `requests`.
+///
+/// This is useful for higher-level workflows that need to retain ownership of
+/// how the requested parent devices themselves are tagged, assigned to
+/// factories, reconciled after restart, or otherwise submitted. Existing free
+/// component stock at the hub is reserved first. Missing components are queued
+/// leaf-first and every wave is allowed to physically finish before this
+/// function returns.
+pub async fn queue_print_prerequisites(
+    client: &Client,
+    requests: &[PrintRequest],
+    options: &QueueOptions,
+) -> Result<QueueReport, PrintingError> {
+    let blueprints = fetch_blueprints(client).await?;
+    let requested = normalize_requests(requests)?;
+    let dependency_plan =
+        prepare_dependency_plan(client, requests, options, &blueprints, true).await?;
+    let mut report = queue_dependency_waves(client, options, &blueprints, &dependency_plan).await?;
+    report.requested = requested;
+    Ok(report)
+}
+
 /// Queues requested devices after recursively manufacturing their subdevices.
 ///
 /// Printable subdevices declared by blueprint `components` are expanded
@@ -529,12 +561,10 @@ pub async fn queue_prints_with_components(
 ) -> Result<QueueReport, PrintingError> {
     let blueprints = fetch_blueprints(client).await?;
     let requested = normalize_requests(requests)?;
-    let component_types = component_dependency_types(&requested, &blueprints)?;
-    wait_for_existing_component_work(client, &options.hub, &component_types, options).await?;
-    let available_components = discover_component_stock(client, &options.hub).await?;
-    let dependency_plan = plan_print_dependencies(requests, &blueprints, &available_components)?;
+    let dependency_plan =
+        prepare_dependency_plan(client, requests, options, &blueprints, false).await?;
 
-    for device_type in dependency_plan.requested.keys() {
+    for device_type in requested.keys() {
         let blueprint = blueprints
             .get(device_type)
             .ok_or_else(|| ScheduleError::MissingBlueprint(device_type.clone()))?;
@@ -543,32 +573,14 @@ pub async fn queue_prints_with_components(
         }
     }
 
-    let mut report = QueueReport {
-        requested: dependency_plan.requested.clone(),
-        components_reused: dependency_plan.reused_components.clone(),
-        component_waves: dependency_plan.component_waves.clone(),
-        flatpack: options.flatpack,
-        ..QueueReport::default()
-    };
-
-    for (index, wave) in dependency_plan.component_waves.iter().enumerate() {
-        let wave_report = queue_print_batch(client, wave, options, &blueprints, false).await?;
-        merge_quantities(&mut report.components_queued, &wave_report.queued);
-        merge_quantities(&mut report.by_factory, &wave_report.by_factory);
-        report.operation_ids.extend(wave_report.operation_ids);
-        wait_for_component_wave(
-            client,
-            &blueprints,
-            wave_report.by_factory.keys().cloned().collect(),
-            options,
-            index.saturating_add(1),
-        )
-        .await?;
-    }
+    let mut report =
+        queue_dependency_waves(client, options, &blueprints, &dependency_plan).await?;
+    report.requested = requested.clone();
+    report.flatpack = options.flatpack;
 
     let requested_report = queue_print_batch(
         client,
-        &dependency_plan.requested,
+        &requested,
         options,
         &blueprints,
         options.flatpack,
@@ -577,6 +589,68 @@ pub async fn queue_prints_with_components(
     report.queued = requested_report.queued;
     merge_quantities(&mut report.by_factory, &requested_report.by_factory);
     report.operation_ids.extend(requested_report.operation_ids);
+    Ok(report)
+}
+
+async fn prepare_dependency_plan(
+    client: &Client,
+    requests: &[PrintRequest],
+    options: &QueueOptions,
+    blueprints: &BTreeMap<String, Blueprint>,
+    include_waiting_parents: bool,
+) -> Result<crate::PrintDependencyPlan, PrintingError> {
+    let mut prerequisite_requests = requests.to_vec();
+    if include_waiting_parents {
+        let blocked = waiting_parent_requests(client, &options.hub).await?;
+        if !blocked.is_empty() {
+            info!(
+                requests = ?blocked,
+                "including prerequisites for Autofactory jobs already waiting for resources"
+            );
+            prerequisite_requests.extend(blocked);
+        }
+    }
+    if prerequisite_requests.is_empty() {
+        return Ok(crate::PrintDependencyPlan::default());
+    }
+    let prerequisite_requested = normalize_requests(&prerequisite_requests)?;
+    let component_types = component_dependency_types(&prerequisite_requested, blueprints)?;
+    wait_for_existing_component_work(client, &options.hub, &component_types, options).await?;
+    let available_components = discover_component_stock(client, &options.hub).await?;
+    Ok(plan_print_dependencies(
+        &prerequisite_requests,
+        blueprints,
+        &available_components,
+    )?)
+}
+
+async fn queue_dependency_waves(
+    client: &Client,
+    options: &QueueOptions,
+    blueprints: &BTreeMap<String, Blueprint>,
+    dependency_plan: &crate::PrintDependencyPlan,
+) -> Result<QueueReport, PrintingError> {
+    let mut report = QueueReport {
+        requested: dependency_plan.requested.clone(),
+        components_reused: dependency_plan.reused_components.clone(),
+        component_waves: dependency_plan.component_waves.clone(),
+        ..QueueReport::default()
+    };
+
+    for (index, wave) in dependency_plan.component_waves.iter().enumerate() {
+        let wave_report = queue_print_batch(client, wave, options, blueprints, false).await?;
+        merge_quantities(&mut report.components_queued, &wave_report.queued);
+        merge_quantities(&mut report.by_factory, &wave_report.by_factory);
+        report.operation_ids.extend(wave_report.operation_ids);
+        wait_for_component_wave(
+            client,
+            blueprints,
+            wave_report.by_factory.keys().cloned().collect(),
+            options,
+            index.saturating_add(1),
+        )
+        .await?;
+    }
     Ok(report)
 }
 
@@ -608,12 +682,24 @@ async fn queue_print_batch(
         if factories.is_empty() {
             return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
         }
-        let workloads = factories
+        let available_factories = factories
             .iter()
-            .map(FactoryState::workload)
+            .filter(|factory| factory.available_slots() > 0)
+            .collect::<Vec<_>>();
+        if available_factories.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(PrintingError::TimedOut { remaining });
+            }
+            info!("waiting for Autofactory queue capacity");
+            sleep(options.poll_interval).await;
+            continue;
+        }
+        let workloads = available_factories
+            .iter()
+            .map(|factory| factory.workload())
             .collect::<Vec<_>>();
         let schedule = schedule_prints(&remaining, blueprints, &workloads)?;
-        let mut slots = factories
+        let mut slots = available_factories
             .iter()
             .map(|factory| (factory.code.clone(), factory.available_slots()))
             .collect::<BTreeMap<_, _>>();
@@ -734,6 +820,53 @@ fn collect_component_types(
     Ok(())
 }
 
+async fn waiting_parent_requests(
+    client: &Client,
+    hub: &str,
+) -> Result<Vec<PrintRequest>, PrintingError> {
+    let handles = client
+        .devices()
+        .refresh_many()
+        .page_size(50)
+        .collect()
+        .await?;
+    let mut factory_codes = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await?;
+        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
+            factory_codes.push(handle.id().as_str().to_owned());
+        }
+    }
+    factory_codes.sort();
+
+    let mut requests = Vec::new();
+    for factory_code in factory_codes {
+        let detail = client.raw().devices().get(&factory_code).await?.value;
+        if detail.status.as_deref() != Some("waiting_for_resources") {
+            continue;
+        }
+        if let Some(device_type) = detail
+            .printing
+            .as_ref()
+            .and_then(|printing| printing.device_type.as_deref())
+        {
+            requests.push(PrintRequest::new(device_type, 1));
+            continue;
+        }
+        let Some(head) = detail.print_queue.first() else {
+            continue;
+        };
+        let Some(device_type) = string_field(head, &["device_type", "type"]) else {
+            continue;
+        };
+        let quantity = integer_field(head, &["quantity", "count"])
+            .unwrap_or(1)
+            .max(1);
+        requests.push(PrintRequest::new(device_type, quantity));
+    }
+    Ok(requests)
+}
+
 async fn wait_for_existing_component_work(
     client: &Client,
     hub: &str,
@@ -768,6 +901,9 @@ async fn wait_for_existing_component_work(
         let mut pending_types = BTreeSet::new();
         for factory_code in factory_codes {
             let detail = client.raw().devices().get(&factory_code).await?.value;
+            if detail.status.as_deref() == Some("waiting_for_resources") {
+                continue;
+            }
             if let Some(device_type) = detail
                 .printing
                 .as_ref()
@@ -1458,6 +1594,20 @@ mod tests {
             queue_size: 3,
             queued_units: 5,
             printing: true,
+            waiting_for_resources: false,
+            remaining_seconds: 100.0,
+        };
+        assert_eq!(factory.available_slots(), 0);
+    }
+
+    #[test]
+    fn waiting_for_resources_factory_has_no_available_slots() {
+        let factory = FactoryState {
+            code: "AF1".into(),
+            queue_size: 4,
+            queued_units: 1,
+            printing: false,
+            waiting_for_resources: true,
             remaining_seconds: 100.0,
         };
         assert_eq!(factory.available_slots(), 0);
