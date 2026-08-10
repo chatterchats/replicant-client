@@ -6,7 +6,7 @@ use std::{
 };
 
 use replicant_client::{
-    AutofactoryPrintOptions, Client, Operation, OperationStatus, domain::Device, raw,
+    AutofactoryPrintOptions, Client, DeviceType, Operation, OperationStatus, domain::Device, raw,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -355,20 +355,20 @@ pub async fn discover_factories<B: PrintTime>(
 ) -> Result<Vec<FactoryState>, PrintingError> {
     let handles = client
         .devices()
-        .refresh_many()
-        .page_size(50)
+        .find()
+        .owned()
+        .of_type(DeviceType::from(AUTOFACTORY))
+        .at(hub)
         .collect()
         .await?;
     let mut factory_codes = Vec::new();
     for handle in handles {
         let snapshot = handle.snapshot().await?;
-        if device_type(&snapshot) == Some(AUTOFACTORY)
-            && device_location(&snapshot) == Some(hub)
-            && snapshot
-                .available_commands
-                .iter()
-                .any(|command| command.as_str() == "enqueue_print")
-        {
+        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
+            // The local projection is used only to identify candidate factory
+            // codes. `inspect_factory` below is authoritative for current
+            // queue/status, so a stale cached `available_commands` list cannot
+            // hide a factory that has just become usable again.
             factory_codes.push(handle.id().as_str().to_owned());
         }
     }
@@ -990,8 +990,10 @@ async fn waiting_parent_requests(
 ) -> Result<Vec<PrintRequest>, PrintingError> {
     let handles = client
         .devices()
-        .refresh_many()
-        .page_size(50)
+        .find()
+        .owned()
+        .of_type(DeviceType::from(AUTOFACTORY))
+        .at(hub)
         .collect()
         .await?;
     let mut factory_codes = Vec::new();
@@ -1046,8 +1048,10 @@ async fn wait_for_existing_component_work(
     loop {
         let handles = client
             .devices()
-            .refresh_many()
-            .page_size(50)
+            .find()
+            .owned()
+            .of_type(DeviceType::from(AUTOFACTORY))
+            .at(hub)
             .collect()
             .await?;
         let mut factory_codes = Vec::new();
@@ -1120,6 +1124,7 @@ async fn discover_component_stock(
     let handles = client
         .devices()
         .refresh_many()
+        .at(hub)
         .page_size(50)
         .collect()
         .await?;
@@ -1195,8 +1200,9 @@ pub async fn printing_status_in_system(
     let system = system_from_location(system_or_location);
     let handles = client
         .devices()
-        .refresh_many()
-        .page_size(50)
+        .find()
+        .owned()
+        .in_system(system.clone())
         .collect()
         .await?;
     let mut inventory_quantities = QuantityMap::new();
@@ -1488,8 +1494,10 @@ pub async fn clear_factories_in_system(
     let system = system_from_location(system_or_location);
     let handles = client
         .devices()
-        .refresh_many()
-        .page_size(50)
+        .find()
+        .owned()
+        .of_type(DeviceType::from(AUTOFACTORY))
+        .in_system(system.clone())
         .collect()
         .await?;
     let mut factories = Vec::<(String, Option<String>)>::new();
