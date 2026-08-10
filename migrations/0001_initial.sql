@@ -206,6 +206,11 @@ CREATE TABLE reconciliation_queue (
     attempts INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'queued'
 );
+CREATE TABLE reconciliation_leader (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    owner TEXT NOT NULL,
+    lease_until INTEGER NOT NULL
+);
 CREATE TABLE reconciliation_runs (
     run_id TEXT PRIMARY KEY NOT NULL,
     work_id TEXT NOT NULL,
