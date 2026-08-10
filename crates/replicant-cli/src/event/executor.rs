@@ -6,7 +6,8 @@ use std::{
 
 use futures::future::{join_all, try_join_all};
 use replicant_client::{
-    AutofactoryPrintOptions, Client, Device, Operation, OperationId, OperationStatus, raw,
+    AutofactoryPrintOptions, Client, Device, Operation, OperationId, OperationStatus,
+    domain::AccessScope, raw,
 };
 use replicant_event_planner::{
     BeaconAction, DeviceRequirement, DeviceStock, ResourceMap, blueprint_resource_cost,
@@ -35,6 +36,13 @@ use super::{
 const CARGO_FREIGHTER: &str = "cargo_freighter";
 const FTL_BEACON: &str = "ftl_beacon";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CampaignReplanReservations {
+    pub(crate) device_codes: BTreeSet<String>,
+    pub(crate) home_resources: ResourceMap,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ExecutionState {
@@ -118,7 +126,7 @@ pub(crate) async fn kickoff_printing(
     }
 
     set_phase(config, plan, MissionPhase::Manufacturing)?;
-    reconcile_print_batches(client, plan).await?;
+    reconcile_print_batches(client, plan, false).await?;
     save_plan(&config.plan_path, plan)?;
     if !plan
         .execution
@@ -258,8 +266,12 @@ pub(crate) async fn prestage_campaign_mission(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
+    reservations: &CampaignReplanReservations,
 ) -> AnyResult<bool> {
     if plan.phase.is_terminal() || plan.execution.event_resolved {
+        return Ok(true);
+    }
+    if reconcile_remote_event_completion(client, config, plan).await? {
         return Ok(true);
     }
     if plan.execution.prestage_complete {
@@ -275,7 +287,7 @@ pub(crate) async fn prestage_campaign_mission(
 
     initialize_execution(plan);
     split_pending_print_batches(plan);
-    reconcile_print_batches(client, plan).await?;
+    reconcile_print_batches(client, plan, false).await?;
     save_plan(&config.plan_path, plan)?;
 
     if plan
@@ -287,11 +299,14 @@ pub(crate) async fn prestage_campaign_mission(
         return Ok(false);
     }
 
-    assign_printed_outputs(client, plan).await?;
-    save_plan(&config.plan_path, plan)?;
-    if replan_nonlocal_assets(client, config, plan).await? {
+    if !campaign_device_staging_started(plan)
+        && replan_nonlocal_assets_with_reservations(client, config, plan, reservations).await?
+    {
         return Ok(false);
     }
+
+    assign_printed_outputs(client, plan).await?;
+    save_plan(&config.plan_path, plan)?;
 
     if !plan.execution.devices_staged {
         claim_mission_assets(client, config, plan).await?;
@@ -325,11 +340,15 @@ pub(crate) async fn resolve_prestaged_campaign_mission(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
+    reservations: &CampaignReplanReservations,
 ) -> AnyResult<()> {
     if plan.phase.is_terminal() || plan.execution.event_resolved {
         return Ok(());
     }
-    if !prestage_campaign_mission(client, config, plan).await? {
+    if reconcile_remote_event_completion(client, config, plan).await? {
+        return Ok(());
+    }
+    if !prestage_campaign_mission(client, config, plan, reservations).await? {
         return Err(app_error(
             io::ErrorKind::WouldBlock,
             format!(
@@ -372,9 +391,14 @@ pub(crate) async fn finish_resolved_campaign_mission(
         return Ok(());
     }
     if !plan.execution.event_resolved
-        && fetch_event_definition(client, &plan.event.designation, "completed")
-            .await?
-            .is_none()
+        && fetch_event_definition(
+            client,
+            &plan.event.location,
+            &plan.event.designation,
+            "completed",
+        )
+        .await?
+        .is_none()
     {
         return Err(app_error(
             io::ErrorKind::WouldBlock,
@@ -402,6 +426,10 @@ pub(crate) async fn finish_resolved_campaign_mission(
         event = %plan.event.designation,
         "campaign event logistics finished independently of replicant"
     );
+    println!(
+        "Mission {} ({}) completed.",
+        plan.mission_id, plan.event.designation
+    );
     Ok(())
 }
 
@@ -427,6 +455,7 @@ pub(crate) async fn execute_saved_plan(
         );
         return Ok(());
     }
+    let _ = reconcile_remote_event_completion(client, config, plan).await?;
 
     let mut home_scope_replans = 0usize;
     loop {
@@ -436,7 +465,7 @@ pub(crate) async fn execute_saved_plan(
 
         if phase_rank(plan.phase) <= phase_rank(MissionPhase::Manufacturing) {
             set_phase(config, plan, MissionPhase::Manufacturing)?;
-            reconcile_print_batches(client, plan).await?;
+            reconcile_print_batches(client, plan, false).await?;
             save_plan(&config.plan_path, plan)?;
             if !plan
                 .execution
@@ -546,10 +575,148 @@ pub(crate) async fn execute_saved_plan(
     Ok(())
 }
 
+pub(crate) async fn reconcile_campaign_asset_plan(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    reservations: &CampaignReplanReservations,
+) -> AnyResult<bool> {
+    if plan.phase.is_terminal() {
+        return Ok(false);
+    }
+    if reconcile_remote_event_completion(client, config, plan).await? {
+        return Ok(false);
+    }
+    if campaign_device_staging_started(plan) {
+        return Ok(false);
+    }
+
+    if !plan.execution.resources_staged
+        && live_remaining_requirements(client, plan)
+            .await?
+            .resources
+            .is_empty()
+    {
+        plan.execution.resources_staged = true;
+        save_plan(&config.plan_path, plan)?;
+        info!(
+            mission = %plan.mission_id,
+            event = %plan.event.designation,
+            "reconciled already-prestaged event resources before asset replanning"
+        );
+    }
+    if !plan.execution.resources_staged
+        && plan
+            .claimed_devices
+            .iter()
+            .any(|claim| !claim.released && claim.role == "cargo")
+    {
+        // An interrupted resource feeder owns its Cargo Freighter already. Let
+        // prestaging reconcile/finish that delivery before judging whether the
+        // mission's device reservations need to be replanned.
+        return Ok(false);
+    }
+
+    initialize_execution(plan);
+    split_pending_print_batches(plan);
+    reconcile_print_batches(client, plan, false).await?;
+    save_plan(&config.plan_path, plan)?;
+    if plan
+        .execution
+        .print_batches
+        .iter()
+        .any(|batch| i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity))
+    {
+        return Ok(false);
+    }
+
+    replan_nonlocal_assets_with_reservations(client, config, plan, reservations).await
+}
+
+fn campaign_device_staging_started(plan: &EventMissionPlan) -> bool {
+    !plan.execution.payload_devices.is_empty()
+        || plan.claimed_devices.iter().any(|claim| {
+            !claim.released && matches!(claim.role.as_str(), "payload" | "carrier" | "beacon")
+        })
+}
+
+async fn reconcile_remote_event_completion(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    if plan.phase.is_terminal() {
+        return Ok(true);
+    }
+    if plan.execution.event_resolved {
+        if phase_rank(plan.phase) < phase_rank(MissionPhase::CollectingRewards) {
+            plan.phase = MissionPhase::CollectingRewards;
+            save_plan(&config.plan_path, plan)?;
+        }
+        return Ok(true);
+    }
+    if phase_rank(plan.phase) < phase_rank(MissionPhase::Resolving) {
+        return Ok(false);
+    }
+    if fetch_event_definition(
+        client,
+        &plan.event.location,
+        &plan.event.designation,
+        "completed",
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(false);
+    }
+
+    plan.execution.event_resolved = true;
+    if phase_rank(plan.phase) < phase_rank(MissionPhase::CollectingRewards) {
+        plan.phase = MissionPhase::CollectingRewards;
+    }
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        mission = %plan.mission_id,
+        event = %plan.event.designation,
+        "reconciled remotely completed event before validating consumed payload"
+    );
+    Ok(true)
+}
+
+fn subtract_reserved_resources(inventory: &mut ResourceMap, reserved: &ResourceMap) {
+    for (resource, quantity) in reserved {
+        let remaining = inventory
+            .get(resource)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub((*quantity).max(0));
+        if remaining == 0 {
+            inventory.remove(resource);
+        } else {
+            inventory.insert(resource.clone(), remaining);
+        }
+    }
+}
+
 async fn replan_nonlocal_assets(
     client: &Client,
     config: &Config,
     plan: &mut EventMissionPlan,
+) -> AnyResult<bool> {
+    replan_nonlocal_assets_with_reservations(
+        client,
+        config,
+        plan,
+        &CampaignReplanReservations::default(),
+    )
+    .await
+}
+
+async fn replan_nonlocal_assets_with_reservations(
+    client: &Client,
+    config: &Config,
+    plan: &mut EventMissionPlan,
+    reservations: &CampaignReplanReservations,
 ) -> AnyResult<bool> {
     let violations = nonlocal_asset_violations(client, plan).await?;
     if violations.is_empty() {
@@ -562,13 +729,30 @@ async fn replan_nonlocal_assets(
         "replanning event mission to keep assets at the home hub"
     );
 
-    let event = fetch_event_definition(client, &plan.event.designation, "active")
-        .await?
-        .unwrap_or_else(|| plan.event.clone());
+    let event = fetch_event_definition(
+        client,
+        &plan.event.location,
+        &plan.event.designation,
+        "active",
+    )
+    .await?
+    .unwrap_or_else(|| plan.event.clone());
     let earned = fetch_earned_achievements(client).await?;
     let mut context = build_context(client, &event, &earned, &plan.home_location).await?;
     for device in &mut context.devices {
         device.tags.remove(&plan.mission_tag);
+    }
+    context
+        .devices
+        .retain(|device| !reservations.device_codes.contains(&device.code));
+    subtract_reserved_resources(&mut context.home_inventory, &reservations.home_resources);
+    if !reservations.device_codes.is_empty() || !reservations.home_resources.is_empty() {
+        info!(
+            mission = %plan.mission_id,
+            protected_devices = reservations.device_codes.len(),
+            protected_resources = %format_resource_map(&reservations.home_resources),
+            "protecting sibling campaign reservations during event replan"
+        );
     }
     let event_plan = plan_event(event, &context)?;
     let criterion_name = plan.selected_criterion.criterion_name.clone();
@@ -623,7 +807,7 @@ async fn nonlocal_asset_violations(
     plan: &EventMissionPlan,
 ) -> AnyResult<Vec<String>> {
     let blueprints = fetch_blueprints(client).await?;
-    let devices = fetch_devices(client, &blueprints).await?;
+    let devices = fetch_devices(client, &blueprints, &plan.home_location).await?;
     let stocks = devices
         .into_iter()
         .map(|device| (device.stock.code.clone(), device.stock))
@@ -643,10 +827,29 @@ async fn nonlocal_asset_violations(
 
     for transport in &plan.selected_criterion.cargo.transports {
         if transport.code.starts_with("<print:") {
-            violations.push(format!(
-                "cargo transport placeholder {} was not assigned",
-                transport.code
-            ));
+            // Campaign prestaging validates existing assets before printed
+            // transport placeholders are assigned to their completed outputs.
+            continue;
+        }
+        if plan.execution.resources_staged {
+            // Resource feeders intentionally leave Cargo Freighters at the
+            // event so they can collect rewards later. `stocks` is deliberately
+            // home-scoped now, so verify continued ownership from the global
+            // local projection instead of mistaking "away from home" for
+            // "missing" and triggering a destructive replan.
+            let visible = match client.devices().cached(&transport.code) {
+                Some(handle) => handle
+                    .snapshot()
+                    .await
+                    .is_ok_and(|device| matches!(device.access, AccessScope::Owned)),
+                None => false,
+            };
+            if !visible {
+                violations.push(format!(
+                    "cargo transport {} is no longer visible",
+                    transport.code
+                ));
+            }
             continue;
         }
         match stocks.get(&transport.code) {
@@ -667,10 +870,8 @@ async fn nonlocal_asset_violations(
 
     for transport in &plan.selected_criterion.carriers.transports {
         if transport.code.starts_with("<print:") {
-            violations.push(format!(
-                "device carrier placeholder {} was not assigned",
-                transport.code
-            ));
+            // See the Cargo Freighter case above. The completed print is
+            // assigned immediately after this preflight validation.
             continue;
         }
         let Some(device) = stocks.get(&transport.code) else {
@@ -798,6 +999,14 @@ async fn release_preflight_claims(
             continue;
         }
         let claim = plan.claimed_devices[index].clone();
+        if claim.role == "payload" && plan.execution.event_resolved {
+            // Event requirement devices are consumed by successful resolution.
+            // Their disappearance is terminal evidence, not a reason to issue
+            // one guaranteed-404 detail request per payload during cleanup.
+            plan.claimed_devices[index].released = true;
+            save_plan(&config.plan_path, plan)?;
+            continue;
+        }
         let detail = match client.raw().devices().get(&claim.device_code).await {
             Ok(response) => response.value,
             Err(error) if error.status() == Some(404) => {
@@ -814,10 +1023,11 @@ async fn release_preflight_claims(
             .cloned()
             .collect::<Vec<_>>();
         if !removable.is_empty() {
-            let operation = client
-                .devices()
-                .get(&claim.device_code)
-                .await?
+            let handle = match client.devices().cached(&claim.device_code) {
+                Some(handle) => handle,
+                None => client.devices().get(&claim.device_code).await?,
+            };
+            let operation = handle
                 .configure(raw::devices::DeviceConfiguration {
                     add_tags: None,
                     remove_tags: Some(removable.clone()),
@@ -970,20 +1180,34 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
-async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -> AnyResult<()> {
+async fn reconcile_print_batches(
+    client: &Client,
+    plan: &mut EventMissionPlan,
+    authoritative: bool,
+) -> AnyResult<()> {
     let batch_tags = plan
         .execution
         .print_batches
         .iter()
         .map(|batch| batch.batch_tag.clone())
         .collect::<BTreeSet<_>>();
-    let handles = client
-        .devices()
-        .refresh_many()
-        .with_tag(plan.mission_tag.clone())
-        .page_size(50)
-        .collect()
-        .await?;
+    let handles = if authoritative {
+        client
+            .devices()
+            .refresh_many()
+            .with_tag(plan.mission_tag.clone())
+            .page_size(50)
+            .collect()
+            .await?
+    } else {
+        client
+            .devices()
+            .find()
+            .owned()
+            .with_tag(plan.mission_tag.clone())
+            .collect()
+            .await?
+    };
     let mut produced = BTreeMap::<String, Vec<String>>::new();
     for handle in handles {
         let snapshot = handle.snapshot().await?;
@@ -1010,10 +1234,21 @@ async fn reconcile_print_batches(client: &Client, plan: &mut EventMissionPlan) -
         }
     }
 
+    // Queue inspection is only needed for the tiny crash window where a
+    // submission began but no durable operation ID/submitted checkpoint made
+    // it to disk. Normal submitted batches are tracked by persisted operation
+    // state and local tagged outputs, so do not GET every Autofactory on every
+    // scheduler pass.
     let factory_codes = plan
         .execution
         .print_batches
         .iter()
+        .filter(|batch| {
+            batch.submission_started
+                && !batch.submitted
+                && batch.operation_id.is_none()
+                && i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity)
+        })
         .map(|batch| batch.factory_code.clone())
         .collect::<BTreeSet<_>>();
     let mut factory_jobs = BTreeMap::<String, Vec<BTreeSet<String>>>::new();
@@ -1331,7 +1566,7 @@ async fn submit_print_batches(
     config: &Config,
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
-    reconcile_print_batches(client, plan).await?;
+    reconcile_print_batches(client, plan, false).await?;
     save_plan(&config.plan_path, plan)?;
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
@@ -1347,7 +1582,7 @@ async fn submit_print_batches(
             return Ok(());
         }
         if submitted > 0 {
-            reconcile_print_batches(client, plan).await?;
+            reconcile_print_batches(client, plan, false).await?;
             save_plan(&config.plan_path, plan)?;
             continue;
         }
@@ -1357,13 +1592,17 @@ async fn submit_print_batches(
                 "timed out waiting for autofactory queue capacity",
             ));
         }
-        wait_for_relevant_event(
+        let wake = wait_for_relevant_event(
             &mut watch,
             deadline,
             &["print.completed", "device.print_completed"],
         )
         .await?;
-        reconcile_print_batches(client, plan).await?;
+        if matches!(wake, WaitWake::Poll | WaitWake::Gap) {
+            reconcile_print_batches(client, plan, true).await?;
+            save_plan(&config.plan_path, plan)?;
+        }
+        reconcile_print_batches(client, plan, false).await?;
         save_plan(&config.plan_path, plan)?;
     }
 }
@@ -1374,7 +1613,7 @@ async fn submit_available_print_batches(
     plan: &mut EventMissionPlan,
     submission_limit: usize,
 ) -> AnyResult<usize> {
-    reconcile_print_batches(client, plan).await?;
+    reconcile_print_batches(client, plan, false).await?;
     save_plan(&config.plan_path, plan)?;
     let pending = plan
         .execution
@@ -1649,7 +1888,7 @@ async fn wait_for_print_outputs(
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
-        reconcile_print_batches(client, plan).await?;
+        reconcile_print_batches(client, plan, false).await?;
         save_plan(&config.plan_path, plan)?;
         if plan
             .execution
@@ -1685,12 +1924,16 @@ async fn wait_for_print_outputs(
                 ),
             ));
         }
-        wait_for_relevant_event(
+        let wake = wait_for_relevant_event(
             &mut watch,
             deadline,
             &["print.completed", "device.print_completed"],
         )
         .await?;
+        if matches!(wake, WaitWake::Poll | WaitWake::Gap) {
+            reconcile_print_batches(client, plan, true).await?;
+            save_plan(&config.plan_path, plan)?;
+        }
     }
 }
 
@@ -1740,7 +1983,12 @@ async fn assign_printed_outputs(client: &Client, plan: &mut EventMissionPlan) ->
         return Ok(());
     }
 
-    let live_devices = fetch_devices(client, &fetch_blueprints(client).await?).await?;
+    let live_devices = fetch_devices(
+        client,
+        &fetch_blueprints(client).await?,
+        &plan.home_location,
+    )
+    .await?;
     let types = live_devices
         .into_iter()
         .map(|device| (device.stock.code, device.stock.device_type))
@@ -1985,11 +2233,12 @@ async fn claim_device(
     }
     save_plan(&config.plan_path, plan)?;
 
+    // One managed detail read supplies the durable command handle for both
+    // tag and ownership changes. The old code repeated this GET up to three
+    // times while claiming a single device.
+    let handle = client.devices().get(code).await?;
     if !missing_tags.is_empty() {
-        let operation = client
-            .devices()
-            .get(code)
-            .await?
+        let operation = handle
             .configure(raw::devices::DeviceConfiguration {
                 add_tags: Some(missing_tags),
                 remove_tags: None,
@@ -2005,19 +2254,14 @@ async fn claim_device(
         .await?;
     }
 
-    let snapshot = client.devices().get(code).await?.snapshot().await?;
+    let snapshot = handle.snapshot().await?;
     let assigned = snapshot
         .relationships
         .assigned_replicant
         .as_ref()
         .map(|replicant| replicant.id.as_str());
     if assigned != Some(plan.selected_replicant.as_str()) {
-        let operation = client
-            .devices()
-            .get(code)
-            .await?
-            .change_owner(plan.selected_replicant.clone())
-            .await?;
+        let operation = handle.change_owner(plan.selected_replicant.clone()).await?;
         ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
         wait_for_device_snapshot(client, config, code, |device| {
             device
@@ -2597,11 +2841,22 @@ async fn live_remaining_requirements(
     client: &Client,
     plan: &EventMissionPlan,
 ) -> AnyResult<replicant_event_planner::RemainingRequirements> {
-    let Some(event) = fetch_event_definition(client, &plan.event.designation, "active").await?
+    let Some(event) = fetch_event_definition(
+        client,
+        &plan.event.location,
+        &plan.event.designation,
+        "active",
+    )
+    .await?
     else {
-        if fetch_event_definition(client, &plan.event.designation, "completed")
-            .await?
-            .is_some()
+        if fetch_event_definition(
+            client,
+            &plan.event.location,
+            &plan.event.designation,
+            "completed",
+        )
+        .await?
+        .is_some()
         {
             return Ok(replicant_event_planner::RemainingRequirements::default());
         }
@@ -2622,38 +2877,24 @@ async fn live_remaining_requirements(
 
 async fn fetch_event_definition(
     client: &Client,
+    location: &str,
     designation: &str,
     status: &str,
 ) -> AnyResult<Option<replicant_event_planner::EventDefinition>> {
-    let mut cursor = None;
-    for _ in 0..100 {
-        let response = client
-            .raw()
-            .accounts()
-            .events(&raw::accounts::AccountEventsQuery {
-                status: Some(status.to_owned()),
-                cursor,
-                limit: Some(100),
-            })
-            .await?
-            .value;
-        if let Some(event) = response.events.iter().find(|event| {
+    let events = client
+        .location_events()
+        .list(location, Some(status))
+        .await?;
+    events
+        .iter()
+        .find(|event| {
             event
                 .designation
                 .as_deref()
                 .is_some_and(|value| value == designation)
-        }) {
-            return Ok(Some(normalize_event(event)?));
-        }
-        let Some(next) = response.next_cursor else {
-            return Ok(None);
-        };
-        cursor = Some(next);
-    }
-    Err(app_error(
-        io::ErrorKind::InvalidData,
-        "event lookup exceeded the 100-page safety bound",
-    ))
+        })
+        .map(normalize_event)
+        .transpose()
 }
 
 async fn fetch_location_device_stock(
@@ -2741,9 +2982,14 @@ async fn resolve_event(
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
     if plan.execution.event_resolved
-        || fetch_event_definition(client, &plan.event.designation, "completed")
-            .await?
-            .is_some()
+        || fetch_event_definition(
+            client,
+            &plan.event.location,
+            &plan.event.designation,
+            "completed",
+        )
+        .await?
+        .is_some()
     {
         plan.execution.event_resolved = true;
         save_plan(&config.plan_path, plan)?;
@@ -2774,7 +3020,13 @@ async fn resolve_event(
         .resolve(&plan.event.location, &plan.event.designation)
         .await?;
     ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
-    wait_for_event_completion(client, config, &plan.event.designation).await?;
+    wait_for_event_completion(
+        client,
+        config,
+        &plan.event.location,
+        &plan.event.designation,
+    )
+    .await?;
     plan.execution.event_resolved = true;
     save_plan(&config.plan_path, plan)?;
     Ok(())
@@ -2783,12 +3035,13 @@ async fn resolve_event(
 async fn wait_for_event_completion(
     client: &Client,
     config: &Config,
+    location: &str,
     designation: &str,
 ) -> AnyResult<()> {
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
-        if fetch_event_definition(client, designation, "completed")
+        if fetch_event_definition(client, location, designation, "completed")
             .await?
             .is_some()
         {
@@ -2800,7 +3053,31 @@ async fn wait_for_event_completion(
                 format!("timed out waiting for event {designation} to complete"),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &["event.completed"]).await?;
+        let poll_deadline = Instant::now() + AUTHORITATIVE_POLL_INTERVAL;
+        loop {
+            let wake_deadline = deadline.min(poll_deadline);
+            let remaining = wake_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, watch.next()).await {
+                Ok(Ok(event))
+                    if event.name.as_str() == "event.completed"
+                        && event
+                            .location
+                            .as_ref()
+                            .is_some_and(|value| value.id.as_str() == location) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => {
+                    warn!(error = %error, "event watcher gap; checking completion authoritatively");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -3050,7 +3327,10 @@ async fn settle_reward_transport(
             format!("cargo transport {code} is travelling to unexpected destination {destination}"),
         ));
     }
-    ensure_device_at(client, config, code, &destination).await
+    // The raw detail above already proved that this transport is actively
+    // travelling to an allowed destination. Do not re-enter ensure_device_at(),
+    // which would issue another authoritative device read before waiting.
+    wait_for_device_at(client, config, code, &destination).await
 }
 
 async fn deposit_all_devices(client: &Client, config: &Config, codes: &[String]) -> AnyResult<()> {
@@ -3222,6 +3502,14 @@ async fn cleanup_claims(
             continue;
         }
         let claim = plan.claimed_devices[index].clone();
+        if claim.role == "payload" && plan.execution.event_resolved {
+            // Event requirement devices are consumed by successful resolution.
+            // Their disappearance is terminal evidence, not a reason to issue
+            // one guaranteed-404 detail request per payload during cleanup.
+            plan.claimed_devices[index].released = true;
+            save_plan(&config.plan_path, plan)?;
+            continue;
+        }
         let detail = match client.raw().devices().get(&claim.device_code).await {
             Ok(response) => response.value,
             Err(error) if claim.role == "payload" && error.status() == Some(404) => {
@@ -3285,10 +3573,11 @@ async fn cleanup_claims(
             .cloned()
             .collect::<Vec<_>>();
         if !removable.is_empty() {
-            let operation = client
-                .devices()
-                .get(&claim.device_code)
-                .await?
+            let handle = match client.devices().cached(&claim.device_code) {
+                Some(handle) => handle,
+                None => client.devices().get(&claim.device_code).await?,
+            };
+            let operation = handle
                 .configure(raw::devices::DeviceConfiguration {
                     add_tags: None,
                     remove_tags: Some(removable.clone()),
@@ -3318,9 +3607,9 @@ async fn cleanup_component_tags(
     let component_tag = role_tag("component");
     let handles = client
         .devices()
-        .refresh_many()
+        .find()
+        .owned()
         .with_tag(plan.mission_tag.clone())
-        .page_size(50)
         .collect()
         .await?;
     for handle in handles {
@@ -3345,10 +3634,7 @@ async fn cleanup_component_tags(
             continue;
         }
         let code = handle.id().as_str().to_owned();
-        let operation = client
-            .devices()
-            .get(&code)
-            .await?
+        let operation = handle
             .configure(raw::devices::DeviceConfiguration {
                 add_tags: None,
                 remove_tags: Some(removable.clone()),
@@ -3414,15 +3700,26 @@ async fn ensure_device_at(
 }
 
 async fn start_device_travel_to(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
-    let detail = client.raw().devices().get(code).await?.value;
-    if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
+    // One authoritative managed read is enough both to decide whether travel
+    // is necessary and to obtain the durable command handle. The old path did
+    // a raw detail GET and then another managed detail GET before every
+    // departure.
+    let handle = client.devices().get(code).await?;
+    let detail = handle.snapshot().await?;
+    if detail.travel.is_none()
+        && detail
+            .location
+            .as_ref()
+            .is_some_and(|location| location.id.as_str() == destination)
+    {
         return Ok(());
     }
     if let Some(travel) = &detail.travel {
         let planned = travel
             .final_destination
-            .as_deref()
-            .or(travel.destination.as_deref());
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str());
         if planned != Some(destination) {
             return Err(app_error(
                 io::ErrorKind::Other,
@@ -3438,10 +3735,7 @@ async fn start_device_travel_to(client: &Client, code: &str, destination: &str) 
             destination = %destination,
             "dispatching device travel"
         );
-        let operation = client
-            .devices()
-            .get(code)
-            .await?
+        let operation = handle
             .command(raw::devices::DeviceCommand::Travel {
                 destination: destination.to_owned(),
                 dry_run: None,
@@ -3459,10 +3753,7 @@ async fn wait_for_device_at(
     code: &str,
     destination: &str,
 ) -> AnyResult<()> {
-    wait_for_raw_device(client, config, code, |device| {
-        device.travel.is_none() && device.location.as_deref() == Some(destination)
-    })
-    .await
+    wait_for_devices_at(client, config, &[code.to_owned()], destination).await
 }
 
 async fn dispatch_devices_to(
@@ -3486,13 +3777,76 @@ async fn wait_for_devices_at(
     codes: &[String],
     destination: &str,
 ) -> AnyResult<()> {
-    try_join_all(
-        codes
-            .iter()
-            .map(|code| wait_for_device_at(client, config, code, destination)),
-    )
-    .await?;
-    Ok(())
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let mut pending = codes.iter().cloned().collect::<BTreeSet<_>>();
+    let mut watch = client.events().watch().await?;
+    let deadline = Instant::now() + config.wait_timeout;
+
+    loop {
+        let mut eta_seconds = None::<i64>;
+        let current = pending.iter().cloned().collect::<Vec<_>>();
+        for code in current {
+            let handle = match client.devices().cached(&code) {
+                Some(handle) => handle,
+                None => client.devices().get(&code).await?,
+            };
+            let snapshot = handle.snapshot().await?;
+            if snapshot.travel.is_none()
+                && snapshot
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.id.as_str() == destination)
+            {
+                pending.remove(&code);
+                continue;
+            }
+            if let Some(eta) = snapshot
+                .travel
+                .as_ref()
+                .and_then(|travel| travel.eta_seconds)
+            {
+                eta_seconds = Some(eta_seconds.map_or(eta, |current| current.min(eta)));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(app_error(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for devices at {destination}: {}",
+                    pending.iter().cloned().collect::<Vec<_>>().join(",")
+                ),
+            ));
+        }
+
+        let wake = wait_for_device_travel_event(
+            &mut watch,
+            deadline,
+            &pending,
+            travel_poll_interval(eta_seconds),
+        )
+        .await?;
+        if matches!(wake, WaitWake::Poll | WaitWake::Gap) {
+            // Target only the devices still in flight. The previous
+            // implementation spawned one independent polling loop per device,
+            // multiplying GETs by fleet size.
+            let refreshes = pending
+                .iter()
+                .cloned()
+                .map(|code| {
+                    let client = client.clone();
+                    async move { client.devices().get(&code).await.map(|_| ()) }
+                })
+                .collect::<Vec<_>>();
+            for result in join_all(refreshes).await {
+                result?;
+            }
+        }
+    }
 }
 
 async fn travel_devices_to(
@@ -3568,15 +3922,14 @@ async fn wait_for_replicant_at(
     destination: &str,
     mut departure_origin: Option<String>,
 ) -> AnyResult<()> {
+    let mut handle = match client.replicants().cached(replicant_code) {
+        Some(handle) => handle,
+        None => client.replicants().get_owned(replicant_code).await?,
+    };
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
-        let snapshot = client
-            .replicants()
-            .get_owned(replicant_code)
-            .await?
-            .snapshot()
-            .await?;
+        let snapshot = handle.snapshot().await?;
         let location = snapshot
             .location
             .as_ref()
@@ -3600,6 +3953,7 @@ async fn wait_for_replicant_at(
                 );
                 departure_origin =
                     start_replicant_travel_to(client, replicant_code, destination).await?;
+                handle = client.replicants().cached(replicant_code).unwrap_or(handle);
                 continue;
             }
             ReplicantTravelDecision::Wait => {}
@@ -3610,7 +3964,20 @@ async fn wait_for_replicant_at(
                 format!("timed out travelling replicant to {destination}"),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &["travel.arrived"]).await?;
+        let eta = snapshot
+            .travel
+            .as_ref()
+            .and_then(|travel| travel.eta_seconds);
+        let wake = wait_for_replicant_travel_event(
+            &mut watch,
+            deadline,
+            replicant_code,
+            travel_poll_interval(eta),
+        )
+        .await?;
+        if matches!(wake, WaitWake::Poll | WaitWake::Gap) {
+            handle = handle.refresh().await?;
+        }
     }
 }
 
@@ -3844,10 +4211,14 @@ async fn wait_for_device_snapshot(
     code: &str,
     predicate: impl Fn(&Device) -> bool,
 ) -> AnyResult<()> {
-    let mut watch = client.events().watch().await?;
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let mut watch = handle.watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
-        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        let snapshot = handle.snapshot().await?;
         if predicate(&snapshot) {
             return Ok(());
         }
@@ -3857,7 +4228,23 @@ async fn wait_for_device_snapshot(
                 format!("timed out waiting for device {code}"),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &[]).await?;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining.min(AUTHORITATIVE_POLL_INTERVAL), watch.next()).await {
+            Ok(Some(snapshot)) if predicate(&snapshot) => return Ok(()),
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                warn!(device = %code, "device projection watcher closed; falling back to refresh");
+                let _ = handle.refresh().await?;
+                watch = handle.watch().await?;
+            }
+            Err(_) => {
+                // SSE/projection updates are the fast path. A sparse
+                // authoritative refresh is only a fallback against a missed
+                // or delayed event.
+                let _ = handle.refresh().await?;
+            }
+        }
     }
 }
 
@@ -3880,25 +4267,161 @@ async fn wait_for_raw_device(
                 format!("timed out waiting for device {code}"),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &[]).await?;
+
+        // Cargo, queue, and other raw-only fields do not necessarily change
+        // the normalized Device value. Use the local account event stream as
+        // the fast signal, but only for this exact device. Unrelated events are
+        // consumed without another GET; a sparse authoritative fallback still
+        // protects against muted or missed events.
+        let poll_deadline = Instant::now() + AUTHORITATIVE_POLL_INTERVAL;
+        loop {
+            let wake_deadline = deadline.min(poll_deadline);
+            let remaining = wake_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, watch.next()).await {
+                Ok(Ok(event))
+                    if event
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| device.id.as_str() == code) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => {
+                    warn!(
+                        error = %error,
+                        device = %code,
+                        "event watcher gap; refreshing raw device"
+                    );
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
+}
+
+async fn wait_for_device_travel_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    pending: &BTreeSet<String>,
+    poll_interval: Duration,
+) -> AnyResult<WaitWake> {
+    let poll_deadline = Instant::now() + poll_interval;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(WaitWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event.name.as_str() == "travel.arrived"
+                    && event
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| pending.contains(device.id.as_str())) =>
+            {
+                return Ok(WaitWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(WaitWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing pending device travel");
+                return Ok(WaitWake::Gap);
+            }
+        }
+    }
+}
+
+async fn wait_for_replicant_travel_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    replicant_code: &str,
+    poll_interval: Duration,
+) -> AnyResult<WaitWake> {
+    let poll_deadline = Instant::now() + poll_interval;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(WaitWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event.name.as_str() == "travel.arrived"
+                    && event
+                        .replicant
+                        .as_ref()
+                        .is_some_and(|replicant| replicant.id.as_str() == replicant_code) =>
+            {
+                return Ok(WaitWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(WaitWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing replicant travel");
+                return Ok(WaitWake::Gap);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitWake {
+    Event,
+    Poll,
+    Gap,
 }
 
 async fn wait_for_relevant_event(
     watch: &mut replicant_client::EventWatch,
     deadline: Instant,
     names: &[&str],
-) -> AnyResult<()> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let interval = remaining.min(POLL_INTERVAL);
-    match timeout(interval, watch.next()).await {
-        Ok(Ok(event)) if names.is_empty() || names.contains(&event.name.as_str()) => Ok(()),
-        Ok(Ok(_)) | Err(_) => Ok(()),
-        Ok(Err(error)) => {
-            warn!(error = %error, "event watcher gap; falling back to authoritative refresh");
-            sleep(Duration::from_millis(250)).await;
-            Ok(())
+) -> AnyResult<WaitWake> {
+    wait_for_relevant_event_with_interval(watch, deadline, names, AUTHORITATIVE_POLL_INTERVAL).await
+}
+
+async fn wait_for_relevant_event_with_interval(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    names: &[&str],
+    poll_interval: Duration,
+) -> AnyResult<WaitWake> {
+    let poll_deadline = Instant::now() + poll_interval;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(WaitWake::Poll);
         }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event)) if names.is_empty() || names.contains(&event.name.as_str()) => {
+                return Ok(WaitWake::Event);
+            }
+            // The previous implementation returned here, so every unrelated
+            // SSE event triggered another authoritative GET. Consume it and
+            // keep waiting for something relevant instead.
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(WaitWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; falling back to authoritative refresh");
+                sleep(Duration::from_millis(250)).await;
+                return Ok(WaitWake::Gap);
+            }
+        }
+    }
+}
+
+fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
+    match eta_seconds.unwrap_or(0) {
+        eta if eta >= 300 => Duration::from_secs(60),
+        eta if eta >= 60 => Duration::from_secs(30),
+        eta if eta > 0 => Duration::from_secs(10),
+        _ => AUTHORITATIVE_POLL_INTERVAL,
     }
 }
 

@@ -232,7 +232,8 @@ async fn build_planning_pool(
     earned: &BTreeSet<String>,
 ) -> AnyResult<PlanningPool> {
     let blueprints = fetch_blueprints(client).await?;
-    let live_devices = fetch_devices(client, &blueprints).await?;
+    let mut live_devices = fetch_devices(client, &blueprints, home).await?;
+    super::hydrate_factory_workloads(client, &mut live_devices, home).await?;
     let factories = build_factory_workloads(&live_devices, &blueprints, home);
     Ok(PlanningPool {
         home_inventory: fetch_inventory(client, home).await?,
@@ -514,9 +515,14 @@ pub(crate) async fn execute_campaign(
                     sleep(CAMPAIGN_POLL_INTERVAL).await;
                 }
             });
-            let resolve_result =
-                executor::resolve_prestaged_campaign_mission(client, &mission_config, &mut mission)
-                    .await;
+            let reservations = campaign_replan_reservations(campaign, &path)?;
+            let resolve_result = executor::resolve_prestaged_campaign_mission(
+                client,
+                &mission_config,
+                &mut mission,
+                &reservations,
+            )
+            .await;
             let feeder_finished = feeder.is_finished();
             if !feeder_finished {
                 feeder.abort();
@@ -584,11 +590,68 @@ async fn spawn_campaign_workers(
         {
             continue;
         }
-        let mission = load_plan(&record.mission_path)?;
+        let mut mission = load_plan(&record.mission_path)?;
         if mission.phase.is_terminal() {
             continue;
         }
 
+        // Check persisted transport conflicts before doing any live asset
+        // reconciliation. A deferred mission used to spend network requests
+        // every scheduler tick only to discover a conflict already visible in
+        // the campaign JSON.
+        let preliminary_finish = mission.execution.event_resolved;
+        let preliminary_prints_complete = persisted_prints_complete(&mission);
+        let preliminary_stage_resources = !preliminary_finish
+            && !mission.execution.resources_staged
+            && !preliminary_prints_complete;
+        let preliminary_prestage = !preliminary_finish
+            && !mission.execution.prestage_complete
+            && preliminary_prints_complete;
+        if !preliminary_finish && !preliminary_stage_resources && !preliminary_prestage {
+            continue;
+        }
+        let preliminary_assets = if preliminary_stage_resources {
+            mission_resource_transport_codes(&mission)
+        } else {
+            mission_transport_codes(&mission)
+        };
+        if has_prior_incomplete_transport_conflict(campaign, record_index, &preliminary_assets)? {
+            info!(
+                event = %record.event_designation,
+                "campaign worker deferred behind an older mission sharing a transport"
+            );
+            continue;
+        }
+        if !busy_assets.is_disjoint(&preliminary_assets) {
+            info!(
+                event = %record.event_designation,
+                assets = %preliminary_assets.iter().cloned().collect::<Vec<_>>().join(","),
+                "campaign worker deferred because a transport is already busy"
+            );
+            continue;
+        }
+
+        let reservations = campaign_replan_reservations(campaign, &record.mission_path)?;
+        if !mission.execution.event_resolved
+            && !mission.execution.prestage_complete
+            && persisted_prints_complete(&mission)
+            && executor::reconcile_campaign_asset_plan(
+                client,
+                &mission_config(config, &record.mission_path),
+                &mut mission,
+                &reservations,
+            )
+            .await?
+        {
+            // The mission's stale logical reservations were replaced against
+            // current live stock while protecting sibling campaign claims.
+            // Re-enter the scheduler so printer lanes/resource workers can be
+            // recalculated from the new plan before any concurrent work starts.
+            continue;
+        }
+
+        // Reconciliation can repair resource-staging state, so derive the
+        // final worker intent again before dispatch.
         let finish = mission.execution.event_resolved;
         let prints_complete = persisted_prints_complete(&mission);
         let stage_resources = !finish && !mission.execution.resources_staged && !prints_complete;
@@ -597,25 +660,15 @@ async fn spawn_campaign_workers(
             continue;
         }
 
-        let mut mission = mission;
         let assets = if stage_resources {
             mission_resource_transport_codes(&mission)
         } else {
             mission_transport_codes(&mission)
         };
         if has_prior_incomplete_transport_conflict(campaign, record_index, &assets)? {
-            info!(
-                event = %record.event_designation,
-                "campaign worker deferred behind an older mission sharing a transport"
-            );
             continue;
         }
         if !busy_assets.is_disjoint(&assets) {
-            info!(
-                event = %record.event_designation,
-                assets = %assets.iter().cloned().collect::<Vec<_>>().join(","),
-                "campaign worker deferred because a transport is already busy"
-            );
             continue;
         }
         if stage_resources
@@ -663,6 +716,7 @@ async fn spawn_campaign_workers(
                         &worker_client,
                         &worker_config,
                         &mut mission,
+                        &reservations,
                     )
                     .await?;
                     Ok(())
@@ -771,6 +825,71 @@ fn mission_transport_codes(mission: &EventMissionPlan) -> BTreeSet<String> {
         .collect()
 }
 
+fn campaign_replan_reservations(
+    campaign: &EventCampaignPlan,
+    current_path: &Path,
+) -> AnyResult<executor::CampaignReplanReservations> {
+    let mut reservations = executor::CampaignReplanReservations::default();
+    for record in &campaign.missions {
+        if record.mission_path.as_path() == current_path {
+            continue;
+        }
+        let mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal() {
+            continue;
+        }
+
+        reservations
+            .device_codes
+            .extend(mission.selected_criterion.reused_devices.iter().cloned());
+        reservations
+            .device_codes
+            .extend(mission_transport_codes(&mission));
+        reservations.device_codes.extend(
+            mission
+                .claimed_devices
+                .iter()
+                .filter(|claim| !claim.released)
+                .map(|claim| claim.device_code.clone()),
+        );
+        reservations.device_codes.extend(
+            mission
+                .execution
+                .payload_devices
+                .iter()
+                .map(|payload| payload.code.clone()),
+        );
+        for batch in &mission.execution.print_batches {
+            reservations
+                .device_codes
+                .extend(batch.produced_codes.iter().cloned());
+        }
+        if !matches!(
+            mission.selected_criterion.beacon.action,
+            BeaconAction::AlreadyActive | BeaconAction::Unavailable
+        ) && let Some(code) = &mission.selected_criterion.beacon.device_code
+        {
+            reservations.device_codes.insert(code.clone());
+        }
+
+        if !mission.execution.event_resolved {
+            if !mission.execution.resources_staged {
+                merge_resources(
+                    &mut reservations.home_resources,
+                    &mission.selected_criterion.remaining_resources,
+                );
+            }
+            if !persisted_prints_complete(&mission) {
+                merge_resources(
+                    &mut reservations.home_resources,
+                    &mission.selected_criterion.manufacturing_resources,
+                );
+            }
+        }
+    }
+    Ok(reservations)
+}
+
 fn has_prior_incomplete_transport_conflict(
     campaign: &EventCampaignPlan,
     record_index: usize,
@@ -844,6 +963,27 @@ async fn ensure_campaign_printer_lanes(
     campaign: &EventCampaignPlan,
     skip_paths: &BTreeSet<PathBuf>,
 ) -> AnyResult<()> {
+    // Do not perform remote factory discovery on scheduler turns where every
+    // mission is already done manufacturing. This used to trigger a complete
+    // Autofactory scan even during pure reward recovery/return phases.
+    let mut needs_lanes = false;
+    for record in &campaign.missions {
+        if skip_paths.contains(&record.mission_path) {
+            continue;
+        }
+        let mission = load_plan(&record.mission_path)?;
+        if !mission.phase.is_terminal()
+            && !mission.selected_criterion.print_schedule.batches.is_empty()
+            && !persisted_prints_complete(&mission)
+        {
+            needs_lanes = true;
+            break;
+        }
+    }
+    if !needs_lanes {
+        return Ok(());
+    }
+
     let blueprints = fetch_print_blueprints(client).await?;
     let mut factories =
         discover_print_factories(client, &campaign.home_location, &blueprints).await?;
@@ -958,6 +1098,7 @@ async fn prefill_print_round(
         let mut mission = load_plan(&record.mission_path)?;
         if mission.phase.is_terminal()
             || mission.selected_criterion.print_schedule.batches.is_empty()
+            || persisted_prints_complete(&mission)
         {
             continue;
         }

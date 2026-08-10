@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use replicant_client::{Client, Replicant, SecretString, Star, StartupPolicy, raw};
+use replicant_client::{Client, Replicant, SecretString, Star, StartupPolicy, SyncDomain, raw};
 use replicant_event_planner::{
     BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
     OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
@@ -580,8 +580,15 @@ fn init_logging(config: &Config) -> AnyResult<()> {
 }
 
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
-    let sync = client.sync().full().await?;
-    info!(readiness = ?sync.readiness, "full managed synchronization completed");
+    // `Essential` startup already performs the authoritative Account + Devices
+    // baseline and event-log catch-up used by every event command. Avoid a
+    // second full sync: walking every known Location is unrelated to event
+    // execution and can collide with survey scans in another workflow.
+    client.ready().await?;
+    info!(
+        readiness = ?client.readiness(),
+        "managed essential startup completed for event command"
+    );
 
     if config.command == Command::Run {
         if campaign::is_campaign_file(&config.plan_path)? {
@@ -592,6 +599,18 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         let mut plan = load_plan(&config.plan_path)?;
         executor::execute_saved_plan(client, config, &mut plan).await?;
         return Ok(());
+    }
+
+    // Planning needs the owned replicant roster, but event discovery,
+    // inventories, blueprints, and scoped star-catalogue data are already read
+    // through their targeted APIs below. Listing does not need replicants at
+    // all, so it can stay on the Essential baseline alone.
+    if config.command != Command::List {
+        let sync = client.sync().domain(SyncDomain::Replicants).await?;
+        info!(
+            readiness = ?sync.readiness,
+            "refreshed owned replicants for event planning"
+        );
     }
 
     let event_scope = config.event_scope();
@@ -1078,7 +1097,8 @@ async fn build_context(
     home: &str,
 ) -> AnyResult<PlanningContext> {
     let blueprints = fetch_blueprints(client).await?;
-    let devices = fetch_devices(client, &blueprints).await?;
+    let mut devices = fetch_devices(client, &blueprints, home).await?;
+    hydrate_factory_workloads(client, &mut devices, home).await?;
     let home_inventory = fetch_inventory(client, home).await?;
     let event_inventory = fetch_inventory(client, &event.location).await?;
     let factories = build_factory_workloads(&devices, &blueprints, home);
@@ -1104,71 +1124,92 @@ struct LiveDevice {
 async fn fetch_devices(
     client: &Client,
     blueprints: &BTreeMap<String, BlueprintSpec>,
+    home: &str,
 ) -> AnyResult<Vec<LiveDevice>> {
-    let mut cursor = None;
-    let mut devices = Vec::new();
-    for _ in 0..100 {
-        let response = client
-            .raw()
-            .devices()
-            .list(&raw::devices::DeviceListQuery {
-                replicant_code: None,
-                device_type: None,
-                tag: None,
-                untagged: None,
-                location: None,
-                cursor,
-                limit: Some(50),
-            })
-            .await?
-            .value;
-        for device in response.devices {
-            let Some(code) = device.device_code.clone() else {
-                continue;
-            };
-            let Some(device_type) = device.device_type.clone() else {
-                continue;
-            };
-            let blueprint = blueprints.get(&device_type);
-            devices.push(LiveDevice {
-                stock: DeviceStock {
-                    code,
-                    device_type,
-                    status: device.status,
-                    location: device.location,
-                    assigned_replicant: device.replicant_code,
-                    tags: device.tags.into_iter().collect(),
-                    cargo_capacity: device
-                        .cargo_capacity
-                        .or_else(|| blueprint.map(|item| item.cargo_capacity))
-                        .unwrap_or(0),
-                    attach_capacity: device
-                        .attach_capacity
-                        .or_else(|| blueprint.map(|item| item.attach_capacity))
-                        .unwrap_or(0),
-                    attach_used: i64::try_from(device.attached_devices.len())?,
-                    attached_to_device_code: device.attached_to_device_code,
-                    stowed_in_device_code: device.stowed_in_device_code,
-                    controlled_by_ami: device.controller_device_code.is_some(),
-                    travelling: device.travel.is_some(),
-                },
-                printing_eta_seconds: device
-                    .printing
-                    .and_then(|printing| printing.eta_seconds)
-                    .unwrap_or(0.0),
-                print_queue: device.print_queue,
-            });
-        }
-        let Some(next) = response.next_cursor else {
-            devices.sort_by(|left, right| left.stock.code.cmp(&right.stock.code));
-            return Ok(devices);
+    // Event planning and runtime replanning are home-system scoped by policy:
+    // payload stock must be at the exact hub, while eligible transports may
+    // start elsewhere in that same system. The Essential managed startup has
+    // already refreshed owned devices, so use the committed projection rather
+    // than paging the entire account again.
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .in_system(system_from_location(home))
+        .collect()
+        .await?;
+    let mut devices = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let device = handle.snapshot().await?;
+        let Some(device_type) = device
+            .device_type
+            .as_ref()
+            .map(|value| value.as_str().to_owned())
+        else {
+            continue;
         };
-        cursor = Some(next);
+        let blueprint = blueprints.get(&device_type);
+        devices.push(LiveDevice {
+            stock: DeviceStock {
+                code: handle.id().as_str().to_owned(),
+                device_type,
+                status: device
+                    .status
+                    .as_ref()
+                    .map(|value| value.as_str().to_owned()),
+                location: device
+                    .location
+                    .as_ref()
+                    .map(|value| value.id.as_str().to_owned()),
+                assigned_replicant: device
+                    .relationships
+                    .assigned_replicant
+                    .as_ref()
+                    .map(|value| value.id.as_str().to_owned()),
+                tags: device.tags.into_iter().collect(),
+                cargo_capacity: blueprint.map_or(0, |item| item.cargo_capacity),
+                attach_capacity: device
+                    .attach_capacity
+                    .or_else(|| blueprint.map(|item| item.attach_capacity))
+                    .unwrap_or(0),
+                attach_used: i64::try_from(device.relationships.attached_devices.len())?,
+                attached_to_device_code: device
+                    .relationships
+                    .attached_to
+                    .as_ref()
+                    .map(|value| value.id.as_str().to_owned()),
+                stowed_in_device_code: device
+                    .relationships
+                    .stowed_in
+                    .as_ref()
+                    .map(|value| value.id.as_str().to_owned()),
+                controlled_by_ami: device.relationships.controller.is_some(),
+                travelling: device.travel.is_some(),
+            },
+            printing_eta_seconds: 0.0,
+            print_queue: Vec::new(),
+        });
     }
-    Err(app_error(
-        io::ErrorKind::InvalidData,
-        "device listing exceeded the 100-page safety bound",
-    ))
+    devices.sort_by(|left, right| left.stock.code.cmp(&right.stock.code));
+    Ok(devices)
+}
+
+async fn hydrate_factory_workloads(
+    client: &Client,
+    devices: &mut [LiveDevice],
+    home: &str,
+) -> AnyResult<()> {
+    for device in devices.iter_mut().filter(|device| {
+        device.stock.device_type == AUTOFACTORY && device.stock.location.as_deref() == Some(home)
+    }) {
+        let detail = client.raw().devices().get(&device.stock.code).await?.value;
+        device.printing_eta_seconds = detail
+            .printing
+            .and_then(|printing| printing.eta_seconds)
+            .unwrap_or(0.0);
+        device.print_queue = detail.print_queue;
+    }
+    Ok(())
 }
 
 async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, BlueprintSpec>> {
