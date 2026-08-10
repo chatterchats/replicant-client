@@ -18,6 +18,18 @@ use crate::domain::{
 
 use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
 
+fn same_projected_observation<T: PartialEq>(
+    existing: &Observation<T>,
+    incoming: &Observation<T>,
+) -> bool {
+    existing.value == incoming.value
+        && existing.metadata.source == incoming.metadata.source
+        && existing.metadata.authority == incoming.metadata.authority
+        && existing.metadata.access == incoming.metadata.access
+        && existing.metadata.reachability == incoming.metadata.reachability
+        && existing.metadata.stale == incoming.metadata.stale
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StateSnapshot {
     revision: u64,
@@ -857,28 +869,64 @@ impl StateEngine {
     ) -> Result<Arc<StateSnapshot>, StoreError> {
         let previous = self.snapshot();
         let mut next_devices = previous.devices.clone();
-        let devices: Vec<_> = devices
-            .iter()
-            .cloned()
-            .map(
-                |device| match next_devices.get(&device.value.key).cloned() {
-                    Some(existing) => match merge_device(existing, device) {
-                        MergeOutcome::Replaced(device) | MergeOutcome::Retained(device, _) => {
-                            device
-                        }
-                    },
-                    None => device,
+        let mut changed = Vec::new();
+        let mut touches = Vec::new();
+
+        for incoming in devices.iter().cloned() {
+            let mut merged = match next_devices.get(&incoming.value.key).cloned() {
+                Some(existing) => match merge_device(existing, incoming) {
+                    MergeOutcome::Replaced(device) | MergeOutcome::Retained(device, _) => device,
                 },
-            )
-            .collect();
+                None => incoming,
+            };
+            let existing = previous.devices.get(&merged.value.key);
+            let unchanged =
+                existing.is_some_and(|existing| same_projected_observation(existing, &merged));
+            if unchanged && let Some(existing) = existing {
+                // A touch only durably advances the high-watermark timestamp;
+                // keep the existing provenance document consistent with what
+                // remains serialized in SQLite.
+                merged.metadata.source_document = existing.metadata.source_document.clone();
+            }
+            next_devices.insert(merged.value.key.clone(), merged.clone());
+            if unchanged {
+                touches.push((merged.value.key.clone(), merged.metadata.observed_at));
+            } else {
+                changed.push(merged);
+            }
+        }
+
+        if changed.is_empty() && touches.is_empty() {
+            return Ok(previous);
+        }
+
         self.store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .persist_devices(&devices)?;
-        for device in &devices {
-            next_devices.insert(device.value.key.clone(), device.clone());
+            .persist_devices_and_touch(&changed, &touches)?;
+
+        if changed.is_empty() {
+            // Refresh high-watermark metadata without waking projection
+            // subscribers. The normalized device values did not change, so a
+            // new semantic revision would only cause unrelated waiters to
+            // spin; the newer observation time still protects merge ordering.
+            let next = Arc::new(StateSnapshot {
+                revision: previous.revision,
+                devices: next_devices,
+                account: previous.account.clone(),
+                replicants: previous.replicants.clone(),
+                locations: previous.locations.clone(),
+                inventories: previous.inventories.clone(),
+                simulations: previous.simulations.clone(),
+            });
+            *self
+                .snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&next);
+            return Ok(next);
         }
+
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
             devices: next_devices,
@@ -890,8 +938,6 @@ impl StateEngine {
         }))
     }
 
-    /// Applies absence reconciliation after a complete unfiltered owned-device
-    /// traversal. Inaccessible historical observations remain cached.
     pub(crate) fn reconcile_owned_devices(
         &self,
         present: &BTreeSet<DeviceKey>,
@@ -1065,6 +1111,70 @@ mod tests {
         assert!(engine.persist_devices(&[device("d1")]).is_err());
         assert_eq!(engine.snapshot().revision(), 0);
         assert!(!receiver.has_changed().expect("watch is open"));
+    }
+
+    #[test]
+    fn identical_device_refresh_does_not_publish_another_revision() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let first = device("D1");
+        engine
+            .persist_devices(std::slice::from_ref(&first))
+            .expect("persist first observation");
+        let revision = engine.snapshot().revision();
+
+        let mut refreshed = first;
+        refreshed.metadata.observed_at = "2026-07-26T00:00:00Z".into();
+        refreshed.metadata.source_document.request_id = Some("new-request".into());
+        engine
+            .persist_devices(&[refreshed])
+            .expect("ignore volatile-only refresh");
+
+        assert_eq!(engine.snapshot().revision(), revision);
+    }
+
+    #[test]
+    fn identical_device_refresh_persists_observation_high_watermark() {
+        let path = test_path();
+        let engine = StateEngine::open_file(&path).expect("open engine");
+        let first = device("D1");
+        engine
+            .persist_devices(std::slice::from_ref(&first))
+            .expect("persist first observation");
+        let mut refreshed = first;
+        let refreshed_at = crate::domain::ObservationTime::from("2026-07-26T00:00:00Z");
+        refreshed.metadata.observed_at = refreshed_at;
+        refreshed.metadata.source_document.request_id = Some("new-request".into());
+        engine
+            .persist_devices(&[refreshed])
+            .expect("touch identical observation");
+        drop(engine);
+
+        let restored = StateEngine::open_file(&path).expect("restore engine");
+        let observation = restored
+            .device(&DeviceKey::live("D1".into()))
+            .expect("restored device");
+        assert_eq!(observation.metadata.observed_at, refreshed_at);
+        drop(restored);
+        fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn device_reachability_change_still_publishes_a_revision() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let first = device("D1");
+        engine
+            .persist_devices(std::slice::from_ref(&first))
+            .expect("persist first observation");
+        let revision = engine.snapshot().revision();
+
+        let mut changed = first;
+        changed.metadata.observed_at = "2026-07-26T00:00:00Z".into();
+        changed.metadata.reachability = Reachability::OutOfRange;
+        engine
+            .persist_devices(&[changed])
+            .expect("persist reachability change");
+
+        assert_eq!(engine.snapshot().revision(), revision + 1);
     }
 
     #[test]

@@ -401,9 +401,7 @@ impl SyncClient {
         self.client
             .managed_state()
             .persist_location(observation)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         Ok(completed_report(SyncDomain::Locations))
     }
 
@@ -636,7 +634,7 @@ impl SyncClient {
             self.client
                 .managed_state()
                 .persist_devices(&collection.members)
-                .map_err(|_| SyncDomainError {
+                .map_err(|error| SyncDomainError {
                     outcome: SyncOutcome {
                         pages: page,
                         items: present.len(),
@@ -644,9 +642,7 @@ impl SyncClient {
                         complete: false,
                         reconciliation_queued: false,
                     },
-                    error: Error::Persistence {
-                        message: "SQLite store operation failed".into(),
-                    },
+                    error: super::client::store_error(error),
                 })?;
             info!(
                 target: "replicant_client::sync",
@@ -669,7 +665,7 @@ impl SyncClient {
                     self.client
                         .managed_state()
                         .reconcile_owned_devices(&present)
-                        .map_err(|_| SyncDomainError {
+                        .map_err(|error| SyncDomainError {
                             outcome: SyncOutcome {
                                 pages: page + 1,
                                 items: present.len(),
@@ -677,9 +673,7 @@ impl SyncClient {
                                 complete: false,
                                 reconciliation_queued: false,
                             },
-                            error: Error::Persistence {
-                                message: "SQLite store operation failed".into(),
-                            },
+                            error: super::client::store_error(error),
                         })?;
                     info!(
                         target: "replicant_client::sync",
@@ -859,7 +853,7 @@ impl SyncClient {
             self.client
                 .managed_state()
                 .persist_location(observation)
-                .map_err(|_| SyncDomainError {
+                .map_err(|error| SyncDomainError {
                     outcome: SyncOutcome {
                         pages: usize::from(completed > 0),
                         items: completed,
@@ -867,9 +861,7 @@ impl SyncClient {
                         complete: false,
                         reconciliation_queued: false,
                     },
-                    error: Error::Persistence {
-                        message: "SQLite store operation failed".into(),
-                    },
+                    error: super::client::store_error(error),
                 })?;
             completed += 1;
             info!(

@@ -50,9 +50,9 @@ use crate::{Client, Result};
 
 use super::store::StoreError;
 
-fn persistence_error(_: StoreError) -> Error {
+fn persistence_error(error: StoreError) -> Error {
     Error::Persistence {
-        message: "SQLite store operation failed".into(),
+        message: error.to_string(),
     }
 }
 

@@ -287,6 +287,8 @@ pub struct ClientBuilder {
     action_rate_limit_policy: Option<RateLimitPolicy>,
     event_stream_options: EventStreamOptions,
     reconciliation_policy: ReconciliationPolicy,
+    #[cfg(feature = "shared-rate-limit")]
+    shared_rate_limit_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -321,6 +323,8 @@ impl ClientBuilder {
             action_rate_limit_policy: None,
             event_stream_options: EventStreamOptions::default(),
             reconciliation_policy: ReconciliationPolicy::default(),
+            #[cfg(feature = "shared-rate-limit")]
+            shared_rate_limit_path: None,
         }
     }
 
@@ -349,6 +353,17 @@ impl ClientBuilder {
     #[must_use]
     pub fn in_memory(mut self) -> Self {
         self.storage = Storage::Memory;
+        self
+    }
+
+    /// Overrides the SQLite file used to coordinate API rate limits between
+    /// separate processes. Managed clients otherwise honor
+    /// `REPLICANT_RATE_LIMIT_DB`, then fall back to a sibling derived from the
+    /// state path (for example `replicant-client.rate-limit.sqlite`).
+    #[cfg(feature = "shared-rate-limit")]
+    #[must_use]
+    pub fn shared_rate_limit_sqlite(mut self, path: impl AsRef<Path>) -> Self {
+        self.shared_rate_limit_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -437,7 +452,34 @@ impl ClientBuilder {
             "starting managed client"
         );
         let raw_started = Instant::now();
+        #[cfg(feature = "shared-rate-limit")]
+        let shared_rate_limit_path = self
+            .shared_rate_limit_path
+            .clone()
+            .or_else(|| std::env::var_os("REPLICANT_RATE_LIMIT_DB").map(PathBuf::from))
+            .or_else(|| match &self.storage {
+                Storage::File(path) => Some(path.with_extension("rate-limit.sqlite")),
+                Storage::Memory => None,
+            });
         let raw = self.raw.build()?;
+        #[cfg(feature = "shared-rate-limit")]
+        if let Some(path) = shared_rate_limit_path {
+            raw.rate_limits()
+                .enable_shared_sqlite(&path)
+                .await
+                .map_err(|message| Error::Configuration {
+                    message: format!(
+                        "could not open shared rate-limit database {}: {message}",
+                        path.display()
+                    ),
+                })?;
+            info!(
+                target: "replicant_client::raw::rate_limit",
+                event = "rate_limit.shared_enabled",
+                path = %path.display(),
+                "enabled cross-process SQLite rate-limit coordination"
+            );
+        }
         debug!(
             target: "replicant_client::client",
             event = "client.raw_built",
@@ -496,6 +538,9 @@ impl ClientBuilder {
                 elapsed_ms = identity_started.elapsed().as_millis() as u64,
                 "loaded authenticated account identity"
             );
+            #[cfg(feature = "shared-rate-limit")]
+            raw.rate_limits()
+                .set_shared_scope(account.as_str().to_owned());
             let binding_started = Instant::now();
             let binding = {
                 let mut store = store.lock();
@@ -610,7 +655,7 @@ async fn account_identity(raw: &RawClient) -> Result<AccountId> {
         })
 }
 
-fn store_error(error: StoreError) -> Error {
+pub(super) fn store_error(error: StoreError) -> Error {
     match error {
         StoreError::AccountMismatch {
             stored_account_id,
@@ -619,8 +664,8 @@ fn store_error(error: StoreError) -> Error {
             stored_account_id,
             supplied_account_id,
         },
-        _ => Error::Persistence {
-            message: "SQLite store operation failed".into(),
+        error => Error::Persistence {
+            message: error.to_string(),
         },
     }
 }
@@ -650,7 +695,7 @@ struct Lifecycle {
 #[derive(Clone)]
 enum CloseCompletion {
     Complete,
-    Failed,
+    Failed(String),
 }
 
 impl Lifecycle {
@@ -737,10 +782,8 @@ impl Lifecycle {
             let current = completion.borrow().clone();
             match current {
                 Some(CloseCompletion::Complete) => return Ok(()),
-                Some(CloseCompletion::Failed) => {
-                    return Err(Error::Persistence {
-                        message: "SQLite store operation failed during close".into(),
-                    });
+                Some(CloseCompletion::Failed(message)) => {
+                    return Err(Error::Persistence { message });
                 }
                 None => completion.changed().await.map_err(|_| Error::Closed)?,
             }
@@ -749,10 +792,9 @@ impl Lifecycle {
 
     fn finish(&self, result: &Result<()>) {
         self.closed.store(true, Ordering::Release);
-        self.completion.send_replace(Some(if result.is_ok() {
-            CloseCompletion::Complete
-        } else {
-            CloseCompletion::Failed
+        self.completion.send_replace(Some(match result {
+            Ok(()) => CloseCompletion::Complete,
+            Err(error) => CloseCompletion::Failed(error.to_string()),
         }));
     }
 }

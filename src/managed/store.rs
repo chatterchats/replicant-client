@@ -370,6 +370,16 @@ impl StoreProxy {
         let values = values.to_vec();
         self.0.execute_blocking(move |s| s.persist_devices(&values))
     }
+    pub(crate) fn persist_devices_and_touch(
+        &mut self,
+        changed: &[Observation<Device>],
+        touches: &[(DeviceKey, crate::domain::ObservationTime)],
+    ) -> Result<(), StoreError> {
+        let changed = changed.to_vec();
+        let touches = touches.to_vec();
+        self.0
+            .execute_blocking(move |s| s.persist_devices_and_touch(&changed, &touches))
+    }
     pub(crate) fn persist_simulation_and_devices(
         &mut self,
         simulation: &Observation<Simulation>,
@@ -645,11 +655,11 @@ impl Store {
 
     fn configure(connection: &Connection, file_database: bool) -> Result<(), StoreError> {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(Duration::from_secs(15))?;
         if file_database {
             connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
-        connection.execute_batch("PRAGMA synchronous = FULL;")?;
+        connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
         Ok(())
     }
 
@@ -796,13 +806,23 @@ impl Store {
     pub(crate) fn restore_devices(
         &self,
     ) -> Result<BTreeMap<DeviceKey, Observation<Device>>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT observation_json FROM devices ORDER BY realm, device_id")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = self.connection.prepare(
+            "SELECT observation_json, observed_at FROM devices ORDER BY realm, device_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         let mut devices = BTreeMap::new();
         for row in rows {
-            let observation = serde_json::from_str::<Observation<Device>>(&row?)?;
+            let (serialized, observed_at) = row?;
+            let mut observation = serde_json::from_str::<Observation<Device>>(&serialized)?;
+            observation.metadata.observed_at = crate::domain::ObservationTime::from_unix_millis(
+                observation
+                    .metadata
+                    .observed_at
+                    .unix_millis()
+                    .max(observed_at),
+            );
             devices.insert(observation.value.key.clone(), observation);
         }
         Ok(devices)
@@ -985,10 +1005,34 @@ impl Store {
         &mut self,
         devices: &[Observation<Device>],
     ) -> Result<(), StoreError> {
+        self.persist_devices_and_touch(devices, &[])
+    }
+
+    pub(crate) fn persist_devices_and_touch(
+        &mut self,
+        changed: &[Observation<Device>],
+        touches: &[(DeviceKey, crate::domain::ObservationTime)],
+    ) -> Result<(), StoreError> {
+        if changed.is_empty() && touches.is_empty() {
+            return Ok(());
+        }
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        for device in devices {
+        for device in changed {
             persist_device(&transaction, device)?;
+        }
+        if !touches.is_empty() {
+            let mut statement = transaction.prepare(
+                "UPDATE devices SET observed_at = MAX(observed_at, ?3) \
+                 WHERE realm = ?1 AND device_id = ?2",
+            )?;
+            for (key, observed_at) in touches {
+                statement.execute(params![
+                    realm_key(&key.realm),
+                    key.id.as_str(),
+                    observed_at.unix_millis(),
+                ])?;
+            }
         }
         Self::commit(transaction, fail_commit)
     }
@@ -1980,7 +2024,7 @@ mod tests {
             let store = Store::open_file(&path).expect("open fresh store");
             assert_eq!(store.foreign_keys_enabled().expect("foreign key pragma"), 1);
             assert_eq!(store.journal_mode().expect("journal mode"), "wal");
-            assert_eq!(store.busy_timeout().expect("busy timeout"), 5_000);
+            assert_eq!(store.busy_timeout().expect("busy timeout"), 15_000);
         }
         let store = Store::open_file(&path).expect("reopen migrated store");
         assert_eq!(store.device_count().expect("device count"), 0);

@@ -251,7 +251,10 @@ impl RateLimitCoordinator {
     #[cfg(feature = "shared-rate-limit")]
     pub async fn enable_shared_sqlite(&self, path: impl AsRef<Path>) -> Result<(), String> {
         let shared = SharedRateLimit::open(path.as_ref()).await?;
-        *self.shared.write().expect("shared rate-limit lock poisoned") = Some(shared);
+        *self
+            .shared
+            .write()
+            .expect("shared rate-limit lock poisoned") = Some(shared);
         Ok(())
     }
 
@@ -354,21 +357,26 @@ impl RateLimitCoordinator {
         }
 
         #[cfg(feature = "shared-rate-limit")]
-        if let Some(shared) = self.shared.read().expect("shared rate-limit lock poisoned").clone() {
-            let policy = self
-                .buckets
-                .lock()
-                .await
-                .get(&kind)
-                .map_or_else(|| RateLimitPolicy::default_for(kind), |bucket| bucket.policy);
-            if let Err(error) = shared.acquire(kind, policy).await {
-                warn!(
-                    target: "replicant_client::raw::rate_limit",
-                    event = "rate_limit.shared_failed",
-                    ?kind,
-                    error = %error,
-                    "shared SQLite rate limiter failed; continuing with in-process limiting"
+        {
+            let shared = self
+                .shared
+                .read()
+                .expect("shared rate-limit lock poisoned")
+                .clone();
+            if let Some(shared) = shared {
+                let policy = self.buckets.lock().await.get(&kind).map_or_else(
+                    || RateLimitPolicy::default_for(kind),
+                    |bucket| bucket.policy,
                 );
+                if let Err(error) = shared.acquire(kind, policy).await {
+                    warn!(
+                        target: "replicant_client::raw::rate_limit",
+                        event = "rate_limit.shared_failed",
+                        ?kind,
+                        error = %error,
+                        "shared SQLite rate limiter failed; continuing with in-process limiting"
+                    );
+                }
             }
         }
     }
@@ -457,7 +465,6 @@ impl RateLimitCoordinator {
             .and_then(|bucket| bucket.server.clone())
     }
 }
-
 
 #[cfg(feature = "shared-rate-limit")]
 #[derive(Clone)]

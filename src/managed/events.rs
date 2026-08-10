@@ -48,9 +48,9 @@ fn observed_at() -> crate::domain::ObservationTime {
     crate::domain::ObservationTime::now()
 }
 
-fn persistence_error(_: StoreError) -> Error {
+fn persistence_error(error: StoreError) -> Error {
     Error::Persistence {
-        message: "SQLite store operation failed".into(),
+        message: error.to_string(),
     }
 }
 

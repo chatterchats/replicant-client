@@ -7,9 +7,9 @@ use crate::raw;
 use crate::{Client, Error, Result};
 use tracing::info;
 
-fn persistence_error(_: super::store::StoreError) -> Error {
+fn persistence_error(error: super::store::StoreError) -> Error {
     Error::Persistence {
-        message: "SQLite store operation failed".into(),
+        message: error.to_string(),
     }
 }
 

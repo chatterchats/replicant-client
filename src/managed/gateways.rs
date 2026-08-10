@@ -29,34 +29,46 @@ const MAX_DEVICE_TAG_CHARACTERS: usize = 32;
 pub struct DeviceWatch {
     receiver: watch::Receiver<std::sync::Arc<super::state::StateSnapshot>>,
     key: DeviceKey,
+    last_seen: Option<Device>,
 }
 
 impl DeviceWatch {
-    /// Returns the latest published snapshot for this device, if one is available now.
-    pub fn try_next(&mut self) -> Option<Device> {
-        self.receiver
-            .has_changed()
-            .ok()
-            .filter(|changed| *changed)
-            .and_then(|_| {
-                self.receiver
-                    .borrow_and_update()
-                    .devices()
-                    .get(&self.key)
-                    .cloned()
-            })
-            .map(|observation| observation.value)
-    }
-
-    /// Waits for the newest committed value. Intermediate revisions coalesce.
-    pub async fn next(&mut self) -> Option<Device> {
-        self.receiver.changed().await.ok()?;
-        self.receiver
+    fn take_device_change(&mut self) -> (bool, Option<Device>) {
+        let current = self
+            .receiver
             .borrow_and_update()
             .devices()
             .get(&self.key)
-            .cloned()
-            .map(|observation| observation.value)
+            .map(|observation| observation.value.clone());
+        if current == self.last_seen {
+            return (false, None);
+        }
+        self.last_seen = current.clone();
+        (true, current)
+    }
+
+    /// Returns the latest published snapshot for this device only when that
+    /// device actually changed. Unrelated global state revisions are ignored.
+    pub fn try_next(&mut self) -> Option<Device> {
+        if !self.receiver.has_changed().ok()? {
+            return None;
+        }
+        let (changed, current) = self.take_device_change();
+        changed.then_some(current).flatten()
+    }
+
+    /// Waits for the newest committed value of this device. Intermediate
+    /// revisions coalesce and unrelated global state revisions are ignored.
+    /// `None` retains the existing meaning that the watched device disappeared
+    /// or the underlying state stream closed.
+    pub async fn next(&mut self) -> Option<Device> {
+        loop {
+            self.receiver.changed().await.ok()?;
+            let (changed, current) = self.take_device_change();
+            if changed {
+                return current;
+            }
+        }
     }
 }
 
@@ -749,9 +761,7 @@ impl AccountGateway {
         self.client
             .managed_state()
             .persist_account(observation)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         let persist_ms = persist_started_at.elapsed().as_millis() as u64;
 
         info!(
@@ -796,9 +806,7 @@ impl AccountGateway {
         self.client
             .managed_state()
             .rebind_account_and_persist(&AccountId::from(previous_email), observation)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         Ok(value)
     }
 
@@ -929,6 +937,11 @@ impl DeviceHandle {
         Ok(DeviceWatch {
             receiver: self.client.managed_state().subscribe(),
             key: self.key.clone(),
+            last_seen: self
+                .client
+                .managed_state()
+                .device(&self.key)
+                .map(|observation| observation.value),
         })
     }
 
@@ -1831,9 +1844,7 @@ impl DeviceRefreshQuery {
             self.client
                 .managed_state()
                 .persist_devices(&collection.members)
-                .map_err(|_| Error::Persistence {
-                    message: "SQLite store operation failed".into(),
-                })?;
+                .map_err(super::client::store_error)?;
             pages += 1;
 
             match next_cursor {
@@ -1853,9 +1864,7 @@ impl DeviceRefreshQuery {
             self.client
                 .managed_state()
                 .reconcile_owned_devices(&keys)
-                .map_err(|_| Error::Persistence {
-                    message: "SQLite store operation failed".into(),
-                })?;
+                .map_err(super::client::store_error)?;
         }
 
         info!(
@@ -1933,9 +1942,7 @@ impl DevicesGateway {
         self.client
             .managed_state()
             .persist_devices(&[observation])
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         let persist_ms = persist_started_at.elapsed().as_millis() as u64;
 
         info!(
@@ -1982,9 +1989,7 @@ impl DevicesGateway {
         self.client
             .managed_state()
             .persist_devices(&collection.members)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         let persist_ms = persist_started_at.elapsed().as_millis() as u64;
 
         info!(
@@ -2115,6 +2120,20 @@ impl ReplicantsGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
+    /// Returns a local-only handle when this owned replicant is already cached.
+    /// No network request is performed.
+    #[must_use]
+    pub fn cached(&self, code: &str) -> Option<ReplicantHandle> {
+        let key = ReplicantKey::live(ReplicantId::from(code));
+        self.client
+            .managed_state()
+            .replicant(&key)
+            .map(|_| ReplicantHandle {
+                client: self.client.clone(),
+                key,
+            })
+    }
+
     /// Starts a local query over committed replicant snapshots.
     #[must_use]
     pub fn find(&self) -> ReplicantQuery {
@@ -2139,9 +2158,7 @@ impl ReplicantsGateway {
         self.client
             .managed_state()
             .persist_replicant(observation)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         let persist_ms = persist_started_at.elapsed().as_millis() as u64;
 
         info!(
@@ -2184,9 +2201,15 @@ impl ReplicantHandle {
     }
     pub async fn watch(&self) -> Result<DeviceWatch> {
         self.client.ensure_open()?;
+        let key = DeviceKey::live(DeviceId::from(self.id().as_str()));
         Ok(DeviceWatch {
             receiver: self.client.managed_state().subscribe(),
-            key: DeviceKey::live(DeviceId::from(self.id().as_str())),
+            last_seen: self
+                .client
+                .managed_state()
+                .device(&key)
+                .map(|observation| observation.value),
+            key,
         })
     }
 
@@ -2269,9 +2292,7 @@ impl DirectoryGateway {
         self.client
             .managed_state()
             .persist_replicant(observation)
-            .map_err(|_| Error::Persistence {
-                message: "SQLite store operation failed".into(),
-            })?;
+            .map_err(super::client::store_error)?;
         Ok(value)
     }
     pub async fn search(
@@ -2329,9 +2350,7 @@ impl InventoryGateway {
             self.client
                 .managed_state()
                 .persist_inventory(observation)
-                .map_err(|_| Error::Persistence {
-                    message: "SQLite store operation failed".into(),
-                })?;
+                .map_err(super::client::store_error)?;
             inventories.push(value);
         }
         Ok((inventories, response.value.next_cursor))
@@ -2369,9 +2388,7 @@ impl InventoryGateway {
             self.client
                 .managed_state()
                 .persist_inventory(observation)
-                .map_err(|_| Error::Persistence {
-                    message: "SQLite store operation failed".into(),
-                })?;
+                .map_err(super::client::store_error)?;
             inventories.push(value);
         }
         Ok(inventories)
