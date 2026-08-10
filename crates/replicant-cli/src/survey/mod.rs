@@ -2,7 +2,7 @@
 //!
 //! This CLI:
 //!
-//! 1. synchronizes managed state and star knowledge;
+//! 1. restores the essential managed baseline and refreshes only route-relevant state;
 //! 2. selects one idle AMI survey controller and the configured survey drones;
 //! 3. adopts the drones, configures `survey_system`, and stows the fleet in
 //!    the racing vessel;
@@ -85,7 +85,7 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
-    SecretString, StartupPolicy, SurveyDirective, domain::GalacticPosition, raw,
+    SecretString, StartupPolicy, SurveyDirective, SyncDomain, domain::GalacticPosition, raw,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -106,23 +106,6 @@ async fn refresh_device_snapshot(client: &Client, code: &str) -> AnyResult<Devic
     Ok(handle.snapshot().await?)
 }
 
-async fn refresh_owned_device_snapshots(
-    client: &Client,
-) -> Result<BTreeMap<String, Device>, ClientError> {
-    let handles = client
-        .devices()
-        .refresh_many()
-        .page_size(50)
-        .collect()
-        .await?;
-    let mut devices = BTreeMap::new();
-    for handle in handles {
-        let device = handle.snapshot().await?;
-        devices.insert(handle.id().as_str().to_owned(), device);
-    }
-    Ok(devices)
-}
-
 async fn refresh_assigned_device_snapshots(
     client: &Client,
     replicant_code: &str,
@@ -138,6 +121,31 @@ async fn refresh_assigned_device_snapshots(
     for handle in handles {
         let device = handle.snapshot().await?;
         devices.insert(handle.id().as_str().to_owned(), device);
+    }
+    Ok(devices)
+}
+
+async fn cached_survey_fleet_snapshots(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+) -> AnyResult<BTreeMap<String, Device>> {
+    let controller = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
+    let mut devices = BTreeMap::new();
+    for code in std::iter::once(config.vessel.as_str())
+        .chain(std::iter::once(controller))
+        .chain(plan.drones.iter().map(String::as_str))
+    {
+        let handle = client.devices().cached(code).ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                format!("managed state omitted survey-fleet device {code}"),
+            )
+        })?;
+        devices.insert(code.to_owned(), handle.snapshot().await?);
     }
     Ok(devices)
 }
@@ -1024,14 +1032,14 @@ fn show_status(config: &Config) -> AnyResult<()> {
 }
 
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
-    let sync_started = Instant::now();
-    let sync = client.sync().full().await?;
+    client.ready().await?;
+    let replicants = client.sync().domain(SyncDomain::Replicants).await?;
     info!(
         target: "replicant_client::explore",
-        event = "explore.full_sync_completed",
-        readiness = ?sync.readiness,
-        elapsed_ms = sync_started.elapsed().as_millis() as u64,
-        "full synchronization completed"
+        event = "explore.startup_ready",
+        readiness = ?client.readiness(),
+        replicants_readiness = ?replicants.readiness,
+        "managed essential startup and targeted replicant refresh completed"
     );
 
     let mut plan = load_or_create_plan(client, config).await?;
@@ -1766,7 +1774,15 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
     plan.phase = RunPhase::PreparingFleet;
     save_plan(&config.plan_path, plan)?;
 
-    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let replicant = client
+        .replicants()
+        .cached(&config.replicant)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                format!("managed state omitted replicant {}", config.replicant),
+            )
+        })?;
     let replicant_snapshot = replicant.snapshot().await?;
     let hosted_vessel = replicant_snapshot
         .hosted_device
@@ -2114,7 +2130,7 @@ async fn verify_fleet(
         ));
     }
 
-    let devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    let devices = cached_survey_fleet_snapshots(client, config, plan).await?;
     let vessel = required_device(&devices, &config.vessel, "racing vessel")?;
     ensure_device_type(vessel, &config.vessel, "racing_vessel")?;
     ensure_device_replicant(vessel, &config.vessel, &config.replicant)?;
@@ -2565,7 +2581,7 @@ async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyRe
         ensure_device_stowed_idempotently(client, config, &code).await?;
     }
 
-    let verified = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    let verified = cached_survey_fleet_snapshots(client, config, plan).await?;
     for code in &codes {
         let device = required_device(&verified, code, "survey-fleet device")?;
         ensure_device_replicant(device, code, &config.replicant)?;
@@ -2748,7 +2764,11 @@ fn stow_operation_is_terminal_failure(status: OperationStatus) -> bool {
 
 async fn wait_immediate_operation(label: &str, operation: &Operation) -> AnyResult<()> {
     let started = Instant::now();
-    let outcome = operation.wait_timeout(Duration::from_secs(60)).await?;
+    // Operation construction already durably records the single submission
+    // attempt. Survey commands verify their gameplay result from managed state
+    // or event evidence immediately afterward, so waiting a fixed minute for
+    // the journal to leave ReconciliationRequired only adds latency.
+    let outcome = operation.outcome().await?;
     info!(
         target: "replicant_client::explore",
         event = "operation.observed",
@@ -2784,12 +2804,17 @@ async fn fleet_capacity_snapshot(
     client: &Client,
     plan: &RoutePlan,
 ) -> AnyResult<Vec<(String, Option<f64>)>> {
-    let mut capacities = Vec::new();
-    for code in survey_fleet_codes(plan) {
-        let device = refresh_device_snapshot(client, code).await?;
-        capacities.push((code.to_owned(), operational_capacity_percent(&device)));
-    }
-    Ok(capacities)
+    // Capacity is a raw device field, so keep this check authoritative, but
+    // refresh the replicant's assigned set once instead of issuing one GET per
+    // controller/drone. The survey fleet is then selected from that snapshot.
+    let devices = refresh_assigned_device_snapshots(client, &plan.replicant).await?;
+    survey_fleet_codes(plan)
+        .into_iter()
+        .map(|code| {
+            let device = required_device(&devices, code, "survey-fleet device")?;
+            Ok((code.to_owned(), operational_capacity_percent(device)))
+        })
+        .collect()
 }
 
 async fn fleet_below_maintenance_threshold(
@@ -2845,6 +2870,22 @@ async fn current_replicant_location(
     client: &Client,
     replicant_code: &str,
 ) -> AnyResult<Option<String>> {
+    let handle = client.replicants().cached(replicant_code).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("managed state omitted replicant {replicant_code}"),
+        )
+    })?;
+    let snapshot = handle.snapshot().await?;
+    Ok(snapshot
+        .location
+        .map(|location| location.id.as_str().to_owned()))
+}
+
+async fn refresh_replicant_location(
+    client: &Client,
+    replicant_code: &str,
+) -> AnyResult<Option<String>> {
     let handle = client.replicants().get_owned(replicant_code).await?;
     let snapshot = handle.snapshot().await?;
     Ok(snapshot
@@ -2865,7 +2906,15 @@ async fn travel_replicant_to_location(
         return Ok(());
     }
 
-    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let replicant = client
+        .replicants()
+        .cached(&config.replicant)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                format!("managed state omitted replicant {}", config.replicant),
+            )
+        })?;
     let snapshot = replicant.snapshot().await?;
     let already_traveling = snapshot.travel.as_ref().is_some_and(|travel| {
         travel
@@ -2886,6 +2935,8 @@ async fn travel_replicant_to_location(
     }
 
     let started = Instant::now();
+    let mut watch = client.events().watch().await?;
+    let mut last_authoritative = Instant::now() - Duration::from_secs(60);
     loop {
         if current_replicant_location(client, &config.replicant)
             .await?
@@ -2903,7 +2954,35 @@ async fn travel_replicant_to_location(
                 ),
             ));
         }
-        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        let until_fallback = Duration::from_secs(60).saturating_sub(last_authoritative.elapsed());
+        match tokio::time::timeout(until_fallback, watch.next()).await {
+            Ok(Ok(event))
+                if is_travel_event_for(&event, config, star_from_designation(destination)) =>
+            {
+                if event.name.as_str() == "travel.arrived"
+                    && refresh_replicant_location(client, &config.replicant)
+                        .await?
+                        .as_deref()
+                        == Some(destination)
+                {
+                    return Ok(());
+                }
+                last_authoritative = Instant::now();
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                last_authoritative = Instant::now();
+                if refresh_replicant_location(client, &config.replicant)
+                    .await?
+                    .as_deref()
+                    == Some(destination)
+                {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
@@ -3021,21 +3100,29 @@ async fn maintenance_drone_at_home(
     plan: &RoutePlan,
 ) -> AnyResult<(String, String)> {
     let home_star = star_from_designation(&plan.maintenance_home);
-    let devices = refresh_owned_device_snapshots(client).await?;
-    let mut candidates = devices
-        .into_iter()
-        .filter_map(|(code, device)| {
-            let location = device_location(&device)?.to_owned();
-            (device_type_name(&device) == Some("maintenance_drone")
-                && designation_in_star(&location, home_star)
-                && device_stowed_in(&device).is_none()
-                && device_attached_to(&device).is_none()
-                && !device.is_traveling()
-                && operational_capacity_percent(&device)
-                    .is_none_or(|capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT))
-            .then_some((code, location))
-        })
-        .collect::<Vec<_>>();
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(DeviceType::from("maintenance_drone"))
+        .in_system(home_star)
+        .collect()
+        .await?;
+    let mut candidates = Vec::new();
+    for handle in handles {
+        let device = handle.snapshot().await?;
+        let Some(location) = device_location(&device).map(str::to_owned) else {
+            continue;
+        };
+        if device_stowed_in(&device).is_none()
+            && device_attached_to(&device).is_none()
+            && !device.is_traveling()
+            && operational_capacity_percent(&device)
+                .is_none_or(|capacity| capacity > DEVICE_FUNCTIONAL_FLOOR_PCT)
+        {
+            candidates.push((handle.id().as_str().to_owned(), location));
+        }
+    }
     candidates.sort_by(|left, right| {
         let left_exact = left.1 == plan.maintenance_home;
         let right_exact = right.1 == plan.maintenance_home;
@@ -3454,7 +3541,15 @@ async fn travel_to(
         return Ok(());
     }
 
-    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let replicant = client
+        .replicants()
+        .cached(&config.replicant)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                format!("managed state omitted replicant {}", config.replicant),
+            )
+        })?;
     let replicant_snapshot = replicant.snapshot().await?;
     let already_traveling_to_target = replicant_snapshot.travel.as_ref().is_some_and(|travel| {
         travel
@@ -3490,7 +3585,15 @@ async fn travel_to(
             destination = target,
             "requesting interstellar travel"
         );
-        let replicant = client.replicants().get_owned(&config.replicant).await?;
+        let replicant = client
+            .replicants()
+            .cached(&config.replicant)
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::NotFound,
+                    format!("managed state omitted replicant {}", config.replicant),
+                )
+            })?;
         let operation = replicant.travel().to(target).depart().await?;
         debug!(
             target: "replicant_client::explore",
@@ -3511,7 +3614,11 @@ async fn travel_to(
     let started = Instant::now();
     loop {
         if started.elapsed() >= config.travel_timeout {
-            if current_star(client, &config.replicant).await?.as_deref() == Some(target) {
+            if refresh_current_star(client, &config.replicant)
+                .await?
+                .as_deref()
+                == Some(target)
+            {
                 return Ok(());
             }
             return Err(app_error(
@@ -3520,7 +3627,7 @@ async fn travel_to(
             ));
         }
 
-        let wait_for = (config.travel_timeout - started.elapsed()).min(Duration::from_secs(30));
+        let wait_for = (config.travel_timeout - started.elapsed()).min(Duration::from_secs(60));
         match tokio::time::timeout(wait_for, watch.next()).await {
             Ok(Ok(event)) => {
                 if is_travel_event_for(&event, config, target) {
@@ -3534,7 +3641,10 @@ async fn travel_to(
                         "observed relevant travel event"
                     );
                     if event.name.as_str() == "travel.arrived"
-                        && current_star(client, &config.replicant).await?.as_deref() == Some(target)
+                        && refresh_current_star(client, &config.replicant)
+                            .await?
+                            .as_deref()
+                            == Some(target)
                     {
                         info!(
                             target: "replicant_client::explore",
@@ -3549,7 +3659,7 @@ async fn travel_to(
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
-                let current = current_star(client, &config.replicant).await?;
+                let current = refresh_current_star(client, &config.replicant).await?;
                 info!(
                     target: "replicant_client::explore",
                     event = "travel.waiting",
@@ -3586,22 +3696,6 @@ async fn run_system_scan(client: &Client, config: &Config, target: &str) -> AnyR
         return Ok(());
     }
 
-    let refreshed = client
-        .galaxy()
-        .refresh_replicant_star(&config.replicant, target)
-        .await?;
-    if refreshed.explored == Some(true) {
-        info!(
-            target: "replicant_client::explore",
-            event = "system_scan.already_completed",
-            replicant = %config.replicant,
-            star = target,
-            source = "targeted_refresh",
-            "authoritative star knowledge confirms the system scan already completed"
-        );
-        return Ok(());
-    }
-
     info!(
         target: "replicant_client::explore",
         event = "system_scan.started",
@@ -3611,7 +3705,15 @@ async fn run_system_scan(client: &Client, config: &Config, target: &str) -> AnyR
         "starting instant replicant system scan"
     );
 
-    let replicant = client.replicants().get_owned(&config.replicant).await?;
+    let replicant = client
+        .replicants()
+        .cached(&config.replicant)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                format!("managed state omitted replicant {}", config.replicant),
+            )
+        })?;
     let operation = replicant.scan().await?;
     let outcome = operation.outcome().await?;
 
@@ -3724,19 +3826,20 @@ fn system_scan_response_was_ok(status: OperationStatus) -> bool {
     )
 }
 
-async fn latest_event_history_cursor(client: &Client) -> AnyResult<Option<String>> {
-    const MAX_PAGES: usize = 500;
-
-    let report = client.events().catch_up(MAX_PAGES).await?;
-    if !report.complete {
-        return Err(app_error(
-            io::ErrorKind::TimedOut,
-            format!(
-                "managed event catch-up did not reach the terminal cursor within {MAX_PAGES} pages; refusing to start a survey without a trustworthy history baseline"
-            ),
-        ));
-    }
-    Ok(report.cursor)
+async fn latest_event_history_cursor(
+    client: &Client,
+    controller: &str,
+) -> AnyResult<Option<String>> {
+    // Essential startup owns network catch-up. Survey-specific recovery reads
+    // only the already-durable journal so it never starts a second event-log
+    // poll lane.
+    let events = client
+        .events()
+        .history()
+        .for_device(controller)
+        .collect()
+        .await?;
+    Ok(events.last().map(|event| event.id.as_str().to_owned()))
 }
 
 async fn poll_survey_completion_history(
@@ -3745,10 +3848,7 @@ async fn poll_survey_completion_history(
     controller: &str,
     target: &str,
 ) -> AnyResult<Option<(String, String, SurveyCompletionProof)>> {
-    const MAX_PAGES: usize = 10;
-
     let requested_cursor = cursor.clone();
-    let report = client.events().catch_up(MAX_PAGES).await?;
     let mut query = client.events().history().for_device(controller);
     if let Some(after) = requested_cursor.as_deref() {
         query = query.after(after);
@@ -3761,10 +3861,8 @@ async fn poll_survey_completion_history(
         controller,
         star = target,
         events = events.len(),
-        complete = report.complete,
         cursor = requested_cursor.as_deref().unwrap_or(""),
-        applied_cursor = report.cursor.as_deref().unwrap_or(""),
-        "checked managed durable event history for survey completion"
+        "checked local durable event history for survey completion"
     );
 
     for event in &events {
@@ -3780,20 +3878,6 @@ async fn poll_survey_completion_history(
 
     if let Some(last) = events.last() {
         *cursor = Some(last.id.as_str().to_owned());
-    } else if report.cursor.is_some() {
-        *cursor = report.cursor;
-    }
-
-    if !report.complete {
-        warn!(
-            target: "replicant_client::explore",
-            event = "survey.history_page_bound_hit",
-            controller,
-            star = target,
-            max_pages = MAX_PAGES,
-            cursor = cursor.as_deref().unwrap_or(""),
-            "managed survey-history catch-up reached its page bound"
-        );
     }
     Ok(None)
 }
@@ -3983,7 +4067,7 @@ async fn run_survey(
     // Capture a durable history watermark before opening the local live watch.
     // If a completion lands during an SSE disconnect or between this request
     // and watch subscription, the unfiltered-history fallback can still find it.
-    let mut history_cursor = latest_event_history_cursor(client).await?;
+    let mut history_cursor = latest_event_history_cursor(client, controller_code).await?;
     let mut watch = client.events().watch().await?;
     debug!(
         target: "replicant_client::explore",
@@ -4019,7 +4103,10 @@ async fn run_survey(
     }
 
     let started = Instant::now();
+    let mut last_history_check = Instant::now();
     let mut last_capacity_check = Instant::now();
+    const HISTORY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
     loop {
         if started.elapsed() >= config.survey_timeout {
             if fleet_below_maintenance_threshold(client, plan, config.maintenance_threshold_pct)
@@ -4043,7 +4130,16 @@ async fn run_survey(
             ));
         }
 
-        let wait_for = (config.survey_timeout - started.elapsed()).min(Duration::from_secs(30));
+        // History and maintenance deadlines advance independently of the live
+        // account event stream. Unrelated events therefore cannot postpone
+        // either fallback indefinitely.
+        let until_timeout = config.survey_timeout - started.elapsed();
+        let until_history = HISTORY_CHECK_INTERVAL.saturating_sub(last_history_check.elapsed());
+        let until_capacity = config
+            .maintenance_check_interval
+            .saturating_sub(last_capacity_check.elapsed());
+        let wait_for = until_timeout.min(until_history).min(until_capacity);
+
         match tokio::time::timeout(wait_for, watch.next()).await {
             Ok(Ok(event)) => {
                 if is_survey_digest_for(&event, controller_code, target) {
@@ -4081,40 +4177,46 @@ async fn run_survey(
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
-                match poll_survey_completion_history(
-                    client,
-                    &mut history_cursor,
-                    controller_code,
-                    target,
-                )
-                .await
-                {
-                    Ok(Some((event_id, event_name, proof))) => {
-                        info!(
-                            target: "replicant_client::explore",
-                            event = "survey.completion_history_observed",
-                            event_id,
-                            event_name,
-                            proof = ?proof,
-                            controller = controller_code,
-                            star = target,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "found missed survey completion in unfiltered event history"
-                        );
-                        confirm_survey_completion(client, config, target).await?;
-                        return Ok(SurveyRunOutcome::Completed);
+                let mut logged_wait = false;
+
+                if last_history_check.elapsed() >= HISTORY_CHECK_INTERVAL {
+                    last_history_check = Instant::now();
+                    match poll_survey_completion_history(
+                        client,
+                        &mut history_cursor,
+                        controller_code,
+                        target,
+                    )
+                    .await
+                    {
+                        Ok(Some((event_id, event_name, proof))) => {
+                            info!(
+                                target: "replicant_client::explore",
+                                event = "survey.completion_history_observed",
+                                event_id,
+                                event_name,
+                                proof = ?proof,
+                                controller = controller_code,
+                                star = target,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "found missed survey completion in local durable event history"
+                            );
+                            confirm_survey_completion(client, config, target).await?;
+                            return Ok(SurveyRunOutcome::Completed);
+                        }
+                        Ok(None) => {}
+                        Err(history_error) => {
+                            warn!(
+                                target: "replicant_client::explore",
+                                event = "survey.history_poll_failed",
+                                controller = controller_code,
+                                star = target,
+                                error = %history_error,
+                                "could not inspect local durable event history; continuing the live wait"
+                            );
+                        }
                     }
-                    Ok(None) => {}
-                    Err(history_error) => {
-                        warn!(
-                            target: "replicant_client::explore",
-                            event = "survey.history_poll_failed",
-                            controller = controller_code,
-                            star = target,
-                            error = %history_error,
-                            "could not check unfiltered event history; continuing the live wait"
-                        );
-                    }
+                    logged_wait = true;
                 }
 
                 if last_capacity_check.elapsed() >= config.maintenance_check_interval {
@@ -4136,17 +4238,20 @@ async fn run_survey(
                         );
                         return Ok(SurveyRunOutcome::MaintenanceRequired);
                     }
+                    logged_wait = true;
                 }
 
-                info!(
-                    target: "replicant_client::explore",
-                    event = "survey.waiting",
-                    controller = controller_code,
-                    star = target,
-                    history_cursor = history_cursor.as_deref().unwrap_or(""),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "still waiting for survey completion"
-                );
+                if logged_wait {
+                    info!(
+                        target: "replicant_client::explore",
+                        event = "survey.waiting",
+                        controller = controller_code,
+                        star = target,
+                        history_cursor = history_cursor.as_deref().unwrap_or(""),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "still waiting for survey completion"
+                    );
+                }
             }
         }
     }
@@ -4374,13 +4479,13 @@ async fn wait_for_fleet_return(
     withdraw_operation: Option<&Operation>,
 ) -> AnyResult<()> {
     const RETURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-    const INITIAL_DELAY: Duration = Duration::from_secs(5);
-    const MAX_DELAY: Duration = Duration::from_secs(15);
+    const AUTHORITATIVE_FALLBACK: Duration = Duration::from_secs(60);
 
     let started = Instant::now();
-    let mut delay = INITIAL_DELAY;
     let mut attempts = 0_u32;
     let mut check = initial;
+    let mut watch = client.events().watch().await?;
+    let mut last_authoritative = Instant::now();
 
     loop {
         attempts += 1;
@@ -4442,6 +4547,7 @@ async fn wait_for_fleet_return(
             ));
         }
 
+        let until_fallback = AUTHORITATIVE_FALLBACK.saturating_sub(last_authoritative.elapsed());
         info!(
             target: "replicant_client::explore",
             event = "survey.recall_waiting",
@@ -4451,43 +4557,47 @@ async fn wait_for_fleet_return(
             recall_in_progress = check.recall_in_progress,
             withdraw_status = ?operation_status,
             attempts,
-            next_poll_ms = delay.as_millis() as u64,
+            next_poll_ms = until_fallback.as_millis() as u64,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "waiting for managed survey-fleet state to report physical return before stowing"
+            "waiting for survey-fleet events; authoritative refresh is only a fallback"
         );
 
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(MAX_DELAY);
-
-        loop {
-            match inspect_fleet_return_state(client, config, plan).await? {
-                FleetReturnInspection::Available(next) => {
-                    check = next;
-                    break;
-                }
-                FleetReturnInspection::RateLimited { retry_after } => {
-                    if started.elapsed() >= RETURN_TIMEOUT {
-                        return Err(app_error(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "survey fleet return inspection remained rate limited for {RETURN_TIMEOUT:?}; last known pending={:?}",
-                                check.pending
-                            ),
-                        ));
-                    }
-                    warn!(
-                        target: "replicant_client::explore",
-                        event = "survey.recall_poll_rate_limited",
-                        vessel = %config.vessel,
-                        pending = ?check.pending,
-                        retry_after_ms = retry_after.as_millis() as u64,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "managed fleet refresh was rate limited; backing off without failing the route"
-                    );
-                    tokio::time::sleep(retry_after).await;
-                    delay = MAX_DELAY;
-                }
+        match tokio::time::timeout(until_fallback, watch.next()).await {
+            Ok(Ok(event)) if event_mentions_survey_fleet(&event, config, plan) => {
+                check = inspect_fleet_return_state_local(client, config, plan).await?;
             }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => loop {
+                match inspect_fleet_return_state(client, config, plan).await? {
+                    FleetReturnInspection::Available(next) => {
+                        check = next;
+                        last_authoritative = Instant::now();
+                        break;
+                    }
+                    FleetReturnInspection::RateLimited { retry_after } => {
+                        if started.elapsed() >= RETURN_TIMEOUT {
+                            return Err(app_error(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "survey fleet return inspection remained rate limited for {RETURN_TIMEOUT:?}; last known pending={:?}",
+                                    check.pending
+                                ),
+                            ));
+                        }
+                        warn!(
+                            target: "replicant_client::explore",
+                            event = "survey.recall_poll_rate_limited",
+                            vessel = %config.vessel,
+                            pending = ?check.pending,
+                            retry_after_ms = retry_after.as_millis() as u64,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "managed fleet refresh was rate limited; backing off without failing the route"
+                        );
+                        tokio::time::sleep(retry_after).await;
+                    }
+                }
+            },
         }
     }
 }
@@ -4497,11 +4607,6 @@ async fn inspect_fleet_return_state(
     config: &Config,
     plan: &RoutePlan,
 ) -> AnyResult<FleetReturnInspection> {
-    let controller = plan
-        .controller
-        .as_deref()
-        .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
-
     let devices = match refresh_assigned_device_snapshots(client, &config.replicant).await {
         Ok(devices) => devices,
         Err(error) if error.status() == Some(429) => {
@@ -4511,8 +4616,31 @@ async fn inspect_fleet_return_state(
         }
         Err(error) => return Err(error.into()),
     };
+    Ok(FleetReturnInspection::Available(
+        inspect_fleet_return_state_from_devices(config, plan, &devices)?,
+    ))
+}
 
-    let vessel = required_device(&devices, &config.vessel, "racing vessel")?;
+async fn inspect_fleet_return_state_local(
+    client: &Client,
+    config: &Config,
+    plan: &RoutePlan,
+) -> AnyResult<FleetReturnCheck> {
+    let devices = cached_survey_fleet_snapshots(client, config, plan).await?;
+    inspect_fleet_return_state_from_devices(config, plan, &devices)
+}
+
+fn inspect_fleet_return_state_from_devices(
+    config: &Config,
+    plan: &RoutePlan,
+    devices: &BTreeMap<String, Device>,
+) -> AnyResult<FleetReturnCheck> {
+    let controller = plan
+        .controller
+        .as_deref()
+        .ok_or_else(|| app_error(io::ErrorKind::Other, "route plan has no survey controller"))?;
+
+    let vessel = required_device(devices, &config.vessel, "racing vessel")?;
     ensure_device_replicant(vessel, &config.vessel, &config.replicant)?;
     let vessel_location = device_location(vessel).ok_or_else(|| {
         app_error(
@@ -4521,7 +4649,7 @@ async fn inspect_fleet_return_state(
         )
     })?;
 
-    let controller_device = required_device(&devices, controller, "survey controller")?;
+    let controller_device = required_device(devices, controller, "survey controller")?;
     ensure_device_replicant(controller_device, controller, &config.replicant)?;
 
     let mut pending = Vec::new();
@@ -4529,7 +4657,7 @@ async fn inspect_fleet_return_state(
     let mut recall_in_progress = false;
 
     for code in std::iter::once(controller).chain(plan.drones.iter().map(String::as_str)) {
-        let device = required_device(&devices, code, "survey-fleet device")?;
+        let device = required_device(devices, code, "survey-fleet device")?;
         ensure_device_replicant(device, code, &config.replicant)?;
 
         if device_has_returned_to_vessel(
@@ -4558,14 +4686,23 @@ async fn inspect_fleet_return_state(
         ));
     }
 
-    Ok(FleetReturnInspection::Available(FleetReturnCheck {
+    Ok(FleetReturnCheck {
         vessel_location: vessel_location.to_owned(),
         pending,
         pending_codes,
         recall_in_progress,
         controller_directive_status: active_directive_status(controller_device).map(str::to_owned),
         controller_withdraw_available: device_has_command(controller_device, "withdraw"),
-    }))
+    })
+}
+
+fn event_mentions_survey_fleet(event: &Event, config: &Config, plan: &RoutePlan) -> bool {
+    event.device.as_ref().is_some_and(|device| {
+        let code = device.id.as_str();
+        code == config.vessel
+            || plan.controller.as_deref() == Some(code)
+            || plan.drones.iter().any(|drone| drone == code)
+    })
 }
 
 fn device_has_returned_to_vessel(
@@ -4592,6 +4729,20 @@ fn device_state_indicates_recall(
 }
 
 async fn current_star(client: &Client, replicant_code: &str) -> AnyResult<Option<String>> {
+    let handle = client.replicants().cached(replicant_code).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("managed state omitted replicant {replicant_code}"),
+        )
+    })?;
+    let replicant = handle.snapshot().await?;
+    Ok(replicant
+        .location
+        .as_ref()
+        .map(|location| star_from_designation(location.id.as_str()).to_owned()))
+}
+
+async fn refresh_current_star(client: &Client, replicant_code: &str) -> AnyResult<Option<String>> {
     let handle = client.replicants().get_owned(replicant_code).await?;
     let replicant = handle.snapshot().await?;
     Ok(replicant
