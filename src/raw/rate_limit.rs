@@ -1,8 +1,9 @@
 //! Shared, token-scoped request rate limiting.
 //!
-//! One coordinator is shared by every clone of a [`crate::raw::Client`] (and,
-//! later, by the managed scheduler built on top of it). It enforces the
-//! contract's documented budgets locally and retains server-observed
+//! One coordinator is shared by every clone of a [`crate::raw::Client`].
+//! Managed file-backed clients additionally coordinate peer processes through
+//! a small SQLite schedule. It enforces the contract's documented budgets and
+//! retains server-observed
 //! `X-RateLimit-*`/`Retry-After` state. Server countdowns become mandatory
 //! only after an actual 429 response or when the reported window is exhausted;
 //! successful responses with remaining quota keep the normal local schedule.
@@ -15,6 +16,17 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(feature = "shared-rate-limit")]
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex as StdMutex, RwLock as StdRwLock},
+};
+
+#[cfg(feature = "shared-rate-limit")]
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+#[cfg(feature = "shared-rate-limit")]
+use tracing::warn;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -177,11 +189,14 @@ impl Drop for QueueTicket {
     }
 }
 
-/// In-process rate-limit coordinator shared by all clones of a raw client.
+/// Rate-limit coordinator shared by all clones of a raw client, with optional
+/// cross-process SQLite scheduling.
 #[derive(Clone, Debug)]
 pub struct RateLimitCoordinator {
     buckets: Arc<Mutex<HashMap<RateLimitBucket, Bucket>>>,
     queues: Arc<Mutex<HashMap<RateLimitBucket, RequestQueue>>>,
+    #[cfg(feature = "shared-rate-limit")]
+    shared: Arc<StdRwLock<Option<SharedRateLimit>>>,
 }
 
 const ALL_BUCKETS: [RateLimitBucket; 7] = [
@@ -216,6 +231,8 @@ impl RateLimitCoordinator {
         Self {
             buckets: Arc::new(Mutex::new(buckets)),
             queues: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "shared-rate-limit")]
+            shared: Arc::new(StdRwLock::new(None)),
         }
     }
 
@@ -226,8 +243,41 @@ impl RateLimitCoordinator {
         }
     }
 
+    /// Enables cross-process coordination through a small SQLite database.
+    ///
+    /// The database contains only anonymous permit timestamps and server block
+    /// deadlines. It is intentionally separate from the managed state database
+    /// so request scheduling cannot contend with projection/journal writes.
+    #[cfg(feature = "shared-rate-limit")]
+    pub async fn enable_shared_sqlite(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let shared = SharedRateLimit::open(path.as_ref()).await?;
+        *self.shared.write().expect("shared rate-limit lock poisoned") = Some(shared);
+        Ok(())
+    }
+
+    /// Changes the anonymous scope used by the shared permit ledger. Managed
+    /// clients set this to the authenticated account identity after login.
+    #[cfg(feature = "shared-rate-limit")]
+    pub fn set_shared_scope(&self, scope: impl Into<String>) {
+        let scope = scope.into();
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in scope.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        if let Some(shared) = self
+            .shared
+            .read()
+            .expect("shared rate-limit lock poisoned")
+            .as_ref()
+        {
+            shared.set_scope(format!("account:{hash:016x}"));
+        }
+    }
+
     /// Waits for a permit. Dropping the future cancels waiting without
-    /// consuming a future permit.
+    /// consuming a future in-process permit. A cross-process permit may already
+    /// have been recorded if cancellation happens during its final sleep.
     pub async fn acquire(&self, kind: RateLimitBucket) {
         self.acquire_with_priority(kind, RequestPriority::Foreground)
             .await;
@@ -289,7 +339,7 @@ impl RateLimitCoordinator {
                         queue.background.pop_front();
                         queue.foreground_streak = 0;
                     }
-                    return;
+                    break;
                 }
                 bucket.next.saturating_duration_since(now)
             };
@@ -301,6 +351,25 @@ impl RateLimitCoordinator {
                 "waiting for rate-limit permit"
             );
             tokio::time::sleep(wait).await;
+        }
+
+        #[cfg(feature = "shared-rate-limit")]
+        if let Some(shared) = self.shared.read().expect("shared rate-limit lock poisoned").clone() {
+            let policy = self
+                .buckets
+                .lock()
+                .await
+                .get(&kind)
+                .map_or_else(|| RateLimitPolicy::default_for(kind), |bucket| bucket.policy);
+            if let Err(error) = shared.acquire(kind, policy).await {
+                warn!(
+                    target: "replicant_client::raw::rate_limit",
+                    event = "rate_limit.shared_failed",
+                    ?kind,
+                    error = %error,
+                    "shared SQLite rate limiter failed; continuing with in-process limiting"
+                );
+            }
         }
     }
 
@@ -321,13 +390,13 @@ impl RateLimitCoordinator {
         status: reqwest::StatusCode,
         snapshot: RateLimitSnapshot,
     ) {
-        let mut all = self.buckets.lock().await;
-        if let Some(bucket) = all.get_mut(&kind) {
-            let exhausted = snapshot.remaining == Some(0);
-            let enforce_delay = status == reqwest::StatusCode::TOO_MANY_REQUESTS || exhausted;
-
-            if enforce_delay {
-                if let Some(delay) = snapshot.delay() {
+        let exhausted = snapshot.remaining == Some(0);
+        let enforce_delay = status == reqwest::StatusCode::TOO_MANY_REQUESTS || exhausted;
+        let enforced_delay = enforce_delay.then(|| snapshot.delay()).flatten();
+        {
+            let mut all = self.buckets.lock().await;
+            if let Some(bucket) = all.get_mut(&kind) {
+                if let Some(delay) = enforced_delay {
                     debug!(
                         target: "replicant_client::raw::rate_limit",
                         event = "rate_limit.schedule_updated",
@@ -338,21 +407,44 @@ impl RateLimitCoordinator {
                         "enforced server rate-limit delay"
                     );
                     bucket.next = Instant::now() + delay;
+                } else if snapshot.delay().is_some() {
+                    debug!(
+                        target: "replicant_client::raw::rate_limit",
+                        event = "rate_limit.delay_informational",
+                        ?kind,
+                        status = status.as_u16(),
+                        remaining = ?snapshot.remaining,
+                        retry_after_ms = ?snapshot
+                            .retry_after
+                            .map(|value| value.delay().as_millis() as u64),
+                        reset_delay_ms = ?snapshot
+                            .reset
+                            .map(|value| value.delay().as_millis() as u64),
+                        "retained informational rate-limit countdown without delaying requests"
+                    );
                 }
-            } else if snapshot.delay().is_some() {
-                debug!(
+                bucket.server = Some(snapshot);
+            }
+        }
+
+        #[cfg(feature = "shared-rate-limit")]
+        {
+            let shared = self
+                .shared
+                .read()
+                .expect("shared rate-limit lock poisoned")
+                .clone();
+            if let (Some(delay), Some(shared)) = (enforced_delay, shared)
+                && let Err(error) = shared.block_for(kind, delay).await
+            {
+                warn!(
                     target: "replicant_client::raw::rate_limit",
-                    event = "rate_limit.delay_informational",
+                    event = "rate_limit.shared_observe_failed",
                     ?kind,
-                    status = status.as_u16(),
-                    remaining = ?snapshot.remaining,
-                    retry_after_ms = ?snapshot.retry_after.map(|value| value.delay().as_millis() as u64),
-                    reset_delay_ms = ?snapshot.reset.map(|value| value.delay().as_millis() as u64),
-                    "retained informational rate-limit countdown without delaying requests"
+                    error = %error,
+                    "could not publish server rate-limit delay to peer processes"
                 );
             }
-
-            bucket.server = Some(snapshot);
         }
     }
 
@@ -363,6 +455,198 @@ impl RateLimitCoordinator {
             .await
             .get(&kind)
             .and_then(|bucket| bucket.server.clone())
+    }
+}
+
+
+#[cfg(feature = "shared-rate-limit")]
+#[derive(Clone)]
+struct SharedRateLimit {
+    path: PathBuf,
+    connection: Arc<StdMutex<Connection>>,
+    scope: Arc<StdRwLock<String>>,
+}
+
+#[cfg(feature = "shared-rate-limit")]
+impl std::fmt::Debug for SharedRateLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedRateLimit")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "shared-rate-limit")]
+impl SharedRateLimit {
+    async fn open(path: &Path) -> Result<Self, String> {
+        let path = path.to_path_buf();
+        let opened_path = path.clone();
+        let connection = tokio::task::spawn_blocking(move || -> Result<Connection, String> {
+            if let Some(parent) = opened_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let connection = Connection::open(&opened_path).map_err(|error| error.to_string())?;
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|error| error.to_string())?;
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .map_err(|error| error.to_string())?;
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|error| error.to_string())?;
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS rate_limit_schedule (\
+                       scope TEXT NOT NULL,\
+                       bucket TEXT NOT NULL,\
+                       next_permit_ms INTEGER NOT NULL DEFAULT 0,\
+                       blocked_until_ms INTEGER NOT NULL DEFAULT 0,\
+                       PRIMARY KEY(scope, bucket)\
+                     );",
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(connection)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(Self {
+            path,
+            connection: Arc::new(StdMutex::new(connection)),
+            scope: Arc::new(StdRwLock::new("bootstrap".into())),
+        })
+    }
+
+    fn set_scope(&self, scope: String) {
+        *self
+            .scope
+            .write()
+            .expect("shared rate-limit scope lock poisoned") = scope;
+    }
+
+    async fn acquire(&self, kind: RateLimitBucket, policy: RateLimitPolicy) -> Result<(), String> {
+        let connection = Arc::clone(&self.connection);
+        let scope = self
+            .scope
+            .read()
+            .expect("shared rate-limit scope lock poisoned")
+            .clone();
+        let bucket = bucket_name(kind).to_owned();
+        let spacing_ms = duration_millis_i64(policy.refill_every)
+            .checked_div(i64::from(policy.capacity.max(1)))
+            .unwrap_or(0)
+            .max(1);
+        let wait_ms = tokio::task::spawn_blocking(move || -> Result<i64, String> {
+            let now_ms = unix_millis();
+            let mut connection = connection
+                .lock()
+                .map_err(|_| "shared rate-limit SQLite lock poisoned".to_owned())?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let current = transaction
+                .query_row(
+                    "SELECT next_permit_ms, blocked_until_ms FROM rate_limit_schedule \
+                     WHERE scope = ?1 AND bucket = ?2",
+                    params![&scope, &bucket],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let (next_permit_ms, blocked_until_ms) = current.unwrap_or((0, 0));
+            let grant_at_ms = now_ms.max(next_permit_ms).max(blocked_until_ms);
+            let following_permit_ms = grant_at_ms.saturating_add(spacing_ms);
+            transaction
+                .execute(
+                    "INSERT INTO rate_limit_schedule(\
+                       scope, bucket, next_permit_ms, blocked_until_ms\
+                     ) VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(scope, bucket) DO UPDATE SET \
+                       next_permit_ms = excluded.next_permit_ms",
+                    params![&scope, &bucket, following_permit_ms, blocked_until_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            Ok(grant_at_ms.saturating_sub(now_ms))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+
+        if wait_ms > 0 {
+            debug!(
+                target: "replicant_client::raw::rate_limit",
+                event = "rate_limit.shared_wait",
+                ?kind,
+                path = %self.path.display(),
+                delay_ms = wait_ms as u64,
+                "waiting for cross-process rate-limit permit"
+            );
+            tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
+        }
+        Ok(())
+    }
+
+    async fn block_for(&self, kind: RateLimitBucket, delay: Duration) -> Result<(), String> {
+        let connection = Arc::clone(&self.connection);
+        let scope = self
+            .scope
+            .read()
+            .expect("shared rate-limit scope lock poisoned")
+            .clone();
+        let bucket = bucket_name(kind).to_owned();
+        let blocked_until_ms = unix_millis().saturating_add(duration_millis_i64(delay));
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let connection = connection
+                .lock()
+                .map_err(|_| "shared rate-limit SQLite lock poisoned".to_owned())?;
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_schedule(\
+                       scope, bucket, next_permit_ms, blocked_until_ms\
+                     ) VALUES (?1, ?2, ?3, ?3) \
+                     ON CONFLICT(scope, bucket) DO UPDATE SET \
+                       blocked_until_ms = MAX(blocked_until_ms, excluded.blocked_until_ms), \
+                       next_permit_ms = MAX(next_permit_ms, excluded.blocked_until_ms)",
+                    params![&scope, &bucket, blocked_until_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "shared-rate-limit")]
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+#[cfg(feature = "shared-rate-limit")]
+fn duration_millis_i64(duration: Duration) -> i64 {
+    duration.as_millis().try_into().unwrap_or(i64::MAX)
+}
+
+#[cfg(feature = "shared-rate-limit")]
+const fn bucket_name(kind: RateLimitBucket) -> &'static str {
+    match kind {
+        RateLimitBucket::Read => "read",
+        RateLimitBucket::Action => "action",
+        RateLimitBucket::Registration => "registration",
+        RateLimitBucket::Verification => "verification",
+        RateLimitBucket::Feedback => "feedback",
+        RateLimitBucket::StarCatalogue => "star_catalogue",
+        RateLimitBucket::Sse => "sse",
     }
 }
 
