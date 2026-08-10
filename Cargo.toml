@@ -66,7 +66,11 @@ events = ["raw", "dep:eventsource-stream", "dep:tokio-stream", "reqwest/stream"]
 
 # SQLite-backed durable state, synchronization, durable operations, and the
 # managed `Client`, on top of `events`.
-managed = ["events", "dep:rusqlite"]
+managed = ["events", "dep:rusqlite", "shared-rate-limit"]
+
+# Cross-process SQLite rate-limit coordination. Enabled by managed clients by default,
+# and available to raw-only users explicitly without forcing managed state.
+shared-rate-limit = ["dep:rusqlite"]
 
 # reqwest rustls TLS backend.
 rustls-tls = ["reqwest?/rustls", "reqwest?/rustls-native-certs"]
