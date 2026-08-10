@@ -17,7 +17,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -43,6 +46,7 @@ const APPLIER_QUEUE_CAPACITY: usize = 256;
 /// Slow event subscribers receive a lag error once they fall this many events
 /// behind; delivery never grows an unbounded queue.
 const EVENT_SUBSCRIPTION_CAPACITY: usize = 256;
+static RECONCILIATION_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn observed_at() -> crate::domain::ObservationTime {
     crate::domain::ObservationTime::now()
@@ -883,10 +887,37 @@ async fn process_reconciliation_work(client: &Client, work: &ReconciliationWork)
 
 /// Drains the durable reconciliation queue for as long as the client lives.
 async fn run_reconciliation_worker(weak: WeakClient, idle_interval: Duration) {
+    const LEASE_SECONDS: i64 = 180;
+    let worker = RECONCILIATION_WORKER_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let owner = format!("{}:{worker}", std::process::id());
+
     loop {
         let Some(client) = weak.upgrade() else {
             return;
         };
+        match client
+            .managed_state()
+            .acquire_reconciliation_leadership(&owner, LEASE_SECONDS)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(client);
+                tokio::time::sleep(idle_interval).await;
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    target: "replicant_client::events",
+                    event = "reconciliation.leader_failed",
+                    error = %error,
+                    "could not acquire the shared reconciliation-worker lease"
+                );
+                drop(client);
+                tokio::time::sleep(idle_interval).await;
+                continue;
+            }
+        }
+
         match client.managed_state().claim_reconciliation_work() {
             Ok(Some(work)) => {
                 let outcome = process_reconciliation_work(&client, &work).await;

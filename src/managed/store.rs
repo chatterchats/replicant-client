@@ -18,7 +18,7 @@ std::thread_local! {
     static INTERRUPT_NEXT_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -32,7 +32,9 @@ use crate::domain::{
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
 const DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA: &str =
     include_str!("../../migrations/0002_device_relationship_semantics.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const RECONCILIATION_LEADER_SCHEMA: &str =
+    include_str!("../../migrations/0003_reconciliation_leader.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -495,6 +497,16 @@ impl StoreProxy {
         self.0
             .execute_blocking(move |s| s.enqueue_reconciliation(&id, &realm, &kind, &payload))
     }
+    pub(crate) fn acquire_reconciliation_leadership(
+        &mut self,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, StoreError> {
+        let owner = owner.to_owned();
+        self.0
+            .execute_blocking(move |s| s.acquire_reconciliation_leadership(&owner, lease_seconds))
+    }
+
     pub(crate) fn claim_reconciliation_work(
         &mut self,
     ) -> Result<Option<ReconciliationWork>, StoreError> {
@@ -693,8 +705,21 @@ impl Store {
             let transaction = connection.transaction()?;
             transaction.execute_batch(DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA)?;
             migrate_device_relationship_observations(&transaction)?;
+            transaction.execute_batch(RECONCILIATION_LEADER_SCHEMA)?;
             transaction.execute(
                 "UPDATE schema_migrations SET version = ?1 WHERE version = 1",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [CURRENT_SCHEMA_VERSION.to_string()],
+            )?;
+            transaction.commit()?;
+        } else if version == Some(2) {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(RECONCILIATION_LEADER_SCHEMA)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = ?1 WHERE version = 2",
                 [CURRENT_SCHEMA_VERSION],
             )?;
             transaction.execute(
@@ -708,12 +733,6 @@ impl Store {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        // A process may stop after claiming work but before reporting its
-        // outcome. Requeue it on open so durable reconciliation is recoverable.
-        connection.execute(
-            "UPDATE reconciliation_queue SET state = 'queued' WHERE state = 'running'",
-            [],
-        )?;
         Ok(Self {
             connection,
             #[cfg(test)]
@@ -1496,8 +1515,58 @@ impl Store {
         Ok(())
     }
 
-    /// Claims due work atomically enough for this single-store client and
-    /// marks it running before the network request begins.
+    /// Acquires or renews the single cross-process reconciliation-worker lease.
+    /// When a previous leader's lease has expired, its in-flight work is
+    /// returned to the queue before the new leader begins draining it.
+    pub(crate) fn acquire_reconciliation_leadership(
+        &mut self,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now =
+            transaction.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let current = transaction
+            .query_row(
+                "SELECT owner, lease_until FROM reconciliation_leader WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let can_lead = current.as_ref().is_none_or(|(current_owner, lease_until)| {
+            current_owner == owner || *lease_until <= now
+        });
+        if !can_lead {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let replacing_expired_leader = current.is_none()
+            || current
+                .as_ref()
+                .is_some_and(|(current_owner, lease_until)| {
+                    current_owner != owner && *lease_until <= now
+                });
+        if replacing_expired_leader {
+            transaction.execute(
+                "UPDATE reconciliation_queue SET state = 'queued' WHERE state = 'running'",
+                [],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO reconciliation_leader(singleton, owner, lease_until) VALUES (1, ?1, ?2) \
+             ON CONFLICT(singleton) DO UPDATE SET owner = excluded.owner, lease_until = excluded.lease_until",
+            params![owner, now.saturating_add(lease_seconds.max(1))],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Claims due work and marks it running before the network request begins.
+    /// Cross-process exclusivity is provided by `acquire_reconciliation_leadership`.
     pub(crate) fn claim_reconciliation_work(
         &mut self,
     ) -> Result<Option<ReconciliationWork>, StoreError> {
@@ -2084,14 +2153,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (3);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (4);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
         fs::remove_file(path).expect("remove test database");
@@ -2555,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_queue_coalesces_and_recovers_running_work() {
+    fn reconciliation_queue_coalesces_and_recovers_after_leader_expiry() {
         let path = test_path("queue");
         let mut store = Store::open_file(&path).expect("open file store");
         store
@@ -2569,6 +2638,11 @@ mod tests {
                 &json!({"id": "d1-new"}),
             )
             .expect("coalesce");
+        assert!(
+            store
+                .acquire_reconciliation_leadership("worker-a", 30)
+                .expect("acquire leader")
+        );
         let claimed = store
             .claim_reconciliation_work()
             .expect("claim")
@@ -2576,11 +2650,31 @@ mod tests {
         assert_eq!(claimed.payload, json!({"id": "d1-new"}));
         drop(store);
 
-        let mut restored = Store::open_file(&path).expect("restart store");
+        let mut restored = Store::open_file(&path).expect("second process opens store");
+        assert!(
+            restored
+                .claim_reconciliation_work()
+                .expect("running work stays claimed")
+                .is_none()
+        );
+        assert!(
+            !restored
+                .acquire_reconciliation_leadership("worker-b", 30)
+                .expect("live leader blocks takeover")
+        );
+        restored
+            .connection
+            .execute("UPDATE reconciliation_leader SET lease_until = 0", [])
+            .expect("expire leader");
+        assert!(
+            restored
+                .acquire_reconciliation_leadership("worker-b", 30)
+                .expect("take over expired leader")
+        );
         let recovered = restored
             .claim_reconciliation_work()
             .expect("claim recovered")
-            .expect("running work requeued");
+            .expect("expired leader work requeued");
         restored
             .retry_reconciliation_work(&recovered.work_id)
             .expect("backoff");

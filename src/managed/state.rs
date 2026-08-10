@@ -669,6 +669,19 @@ impl StateEngine {
             .enqueue_reconciliation(work_id, realm, kind, payload)
     }
 
+    /// Acquires or renews the single cross-process reconciliation worker lease.
+    pub(crate) fn acquire_reconciliation_leadership(
+        &self,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .acquire_reconciliation_leadership(owner, lease_seconds)
+    }
+
     /// Claims the next due reconciliation work item, if any.
     pub(crate) fn claim_reconciliation_work(
         &self,
