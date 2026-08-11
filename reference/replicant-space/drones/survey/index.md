@@ -1,7 +1,7 @@
 ---
 title: "Survey drone"
 source_url: "https://replicant.space/docs/drones/survey/"
-crawled_at: "2026-08-07T00:51:31.592820+00:00"
+crawled_at: "2026-08-11T15:11:29.680354+00:00"
 ---
 
 Drones

@@ -260,10 +260,10 @@
             "description": "Message categories to receive as email (e.g. 'alert', 'progression')",
             "items": {
               "enum": [
+                "alert",
                 "progression",
                 "social",
-                "simulation",
-                "alert"
+                "simulation"
               ],
               "type": "string"
             },
@@ -1693,6 +1693,10 @@
           "device_code": {
             "type": "string"
           },
+          "linked_device": {
+            "nullable": true,
+            "type": "string"
+          },
           "tags": {
             "items": {
               "type": "string"
@@ -1713,6 +1717,12 @@
             },
             "nullable": true,
             "type": "array"
+          },
+          "linked_device": {
+            "default": null,
+            "description": "Device code to link to this device (e.g. an empty_replicant_matrix for a slingshot).",
+            "nullable": true,
+            "type": "string"
           },
           "remove_tags": {
             "default": null,
@@ -1771,6 +1781,10 @@
           },
           "in_control_range": {
             "type": "boolean"
+          },
+          "linked_device": {
+            "nullable": true,
+            "type": "string"
           },
           "location": {
             "description": "Location code (e.g. 'LACASAW-3'); null when undeployed or in motion",
@@ -1966,6 +1980,10 @@
           },
           "is_prospecting": {
             "type": "boolean"
+          },
+          "linked_device": {
+            "nullable": true,
+            "type": "string"
           },
           "location": {
             "description": "Location code (e.g. 'LACASAW-3'); null when undeployed or in deep space",
@@ -6226,6 +6244,59 @@
         ]
       }
     },
+    "/v1/devices/{device_code}/retrieve": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "device_code",
+          "required": true,
+          "schema": {
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app_schemas_devices_DeviceCommandResponseSchema"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app_schemas_common_ErrorSchema"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app_schemas_common_ErrorSchema"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "default": {
+            "$ref": "#/components/responses/DEFAULT_ERROR"
+          }
+        },
+        "tags": [
+          "devices"
+        ]
+      }
+    },
     "/v1/devices/{device_code}/simulate": {
       "get": {
         "responses": {
@@ -8955,6 +9026,41 @@
           "stars"
         ]
       }
+    },
+    "/v1/tutorials": {
+      "get": {
+        "responses": {
+          "default": {
+            "$ref": "#/components/responses/DEFAULT_ERROR"
+          }
+        },
+        "tags": [
+          "tutorials"
+        ]
+      }
+    },
+    "/v1/tutorials/{slug}": {
+      "get": {
+        "responses": {
+          "default": {
+            "$ref": "#/components/responses/DEFAULT_ERROR"
+          }
+        },
+        "tags": [
+          "tutorials"
+        ]
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "slug",
+          "required": true,
+          "schema": {
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      ]
     }
   },
   "security": [
@@ -9042,6 +9148,10 @@
     {
       "description": "Player feedback",
       "name": "feedback"
+    },
+    {
+      "description": "Tutorial progression",
+      "name": "tutorials"
     },
     {
       "description": "Admin operations",

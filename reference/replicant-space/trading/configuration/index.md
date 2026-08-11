@@ -1,7 +1,7 @@
 ---
 title: "Shop configuration"
 source_url: "https://replicant.space/docs/trading/configuration/"
-crawled_at: "2026-08-07T00:51:32.045610+00:00"
+crawled_at: "2026-08-11T15:11:30.220019+00:00"
 ---
 
 Trading

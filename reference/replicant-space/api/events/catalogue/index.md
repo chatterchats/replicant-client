@@ -1,7 +1,7 @@
 ---
 title: "Event catalogue"
 source_url: "https://replicant.space/docs/api/events/catalogue/"
-crawled_at: "2026-08-07T00:51:30.505600+00:00"
+crawled_at: "2026-08-11T15:11:28.592839+00:00"
 ---
 
 API · Events
@@ -1289,5 +1289,33 @@ response payload
   "signature": "a3f7c2e8b1d94f06",
   "target": [5000, 14000, 100],
   "completes_at": "2026-08-05T13:30:00Z"
+}
+```
+
+### *ward.activated*
+
+A system ward was activated, locking down mining and location events for all except the ward owner.
+
+Example
+
+response payload
+
+```
+{
+  // empty response
+}
+```
+
+### *ward.deactivated*
+
+A system ward was deactivated, releasing the system lock.
+
+Example
+
+response payload
+
+```
+{
+  // empty response
 }
 ```

@@ -1,7 +1,7 @@
 ---
 title: "Device details"
 source_url: "https://replicant.space/docs/api/devices/retrieve/"
-crawled_at: "2026-08-07T00:51:30.143333+00:00"
+crawled_at: "2026-08-11T15:11:28.224488+00:00"
 ---
 
 API · Devices

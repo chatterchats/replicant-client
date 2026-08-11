@@ -1,7 +1,7 @@
 ---
 title: "Registration"
 source_url: "https://replicant.space/docs/api/accounts/registration/"
-crawled_at: "2026-08-07T00:51:29.922084+00:00"
+crawled_at: "2026-08-11T15:11:28.000746+00:00"
 ---
 
 API · Accounts

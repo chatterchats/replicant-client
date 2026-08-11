@@ -1,7 +1,7 @@
 ---
 title: "Your details"
 source_url: "https://replicant.space/docs/api/replicants/"
-crawled_at: "2026-08-07T00:51:30.804573+00:00"
+crawled_at: "2026-08-11T15:11:28.893889+00:00"
 ---
 
 API · Replicants

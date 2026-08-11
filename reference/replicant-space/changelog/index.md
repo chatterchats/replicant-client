@@ -1,7 +1,7 @@
 ---
 title: "Changelog"
 source_url: "https://replicant.space/changelog/"
-crawled_at: "2026-08-07T00:51:29.617686+00:00"
+crawled_at: "2026-08-11T15:11:27.663660+00:00"
 ---
 
 // Changelog
@@ -10,7 +10,38 @@ crawled_at: "2026-08-07T00:51:29.617686+00:00"
 
 What's changed in the Replicant Space galaxy? Keep up with the latest.
 
-1. v2.4.0 [◇](index.md#v2.4.0)
+1. v2.5.0 [◇](index.md#v2.5.0)
+
+    10 August 2026
+
+   This release brings forward some features that were originally planned for Season Three. The galaxy is getting smaller!
+
+   The new player experience has changed significantly. Instead of spawning in the middle of our over-populated solzone, players start in a remote region of space with a guaranteed belt, some salvage and some people that need help. A new tutorial system guides players through the core mechanics.
+
+   Each new player has a second preconfigured Heaven Vessel parked in the Oort cloud around SOL. FTL Slingshots allow them to travel between SOL and home.
+
+   Private regions also come with System Wards that lock mining and event access, providing a safe space to learn the game.
+
+   Before existing players start revolting, be advised that you all have a private region out there. Head to the equipment locker in SOL-OORT to retrieve your slingshot to go visit.
+
+   ### Online docs
+
+   - Added a new [Tutorials](../tutorials/index.md) page to explain how to use the new in-game tutorial system.
+   - Updated the [Quickstart](../quickstart/index.md) page to match the in-game bootstrap tutorial.
+   - Added a new [FTL Slingshots](../ftl-slingshots/index.md) page to explain how to fling your consciousness across the galaxy. With a bit of prep.
+   - Added a new [System Wards](../system-wards/index.md) page to show how to claim and lock a system to your account.
+
+   ### API updates
+
+   - The initial asteroid belt site will now regenerate automatically when a new player scans the system.
+   - New players will now start the game in a private region of space with ~12 stars to explore.
+   - New endpoints added for the in-game tutorial system.
+   - New blueprint: ftl_slingshot
+   - New blueprint: system_ward
+   - An old equipment locker has been discovered in SOL-OORT. It accepts POST requests to /devices/:code/retrieve.
+
+   Moments from the wormhole being completed. You got this replicants! o7
+2. v2.4.0 [◇](index.md#v2.4.0)
 
     6 August 2026
 
@@ -33,7 +64,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Added tags field to print.started and print.completed.
 
    Only one blueprint in the gamma region remains to be discovered, to complete the wormhole. The season finale approaches. o7
-2. v2.3.6 [◇](index.md#v2.3.6)
+3. v2.3.6 [◇](index.md#v2.3.6)
 
     4 August 2026
 
@@ -53,7 +84,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Fixed bug with location event device rewards not inheriting the blueprint directives.
 
    ROSALIATE-3 looks like a great final stop for the Ark, we should optimise our drop-offs in that direction. o7
-3. v2.3.5 [◇](index.md#v2.3.5)
+4. v2.3.5 [◇](index.md#v2.3.5)
 
     2 August 2026
 
@@ -78,7 +109,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Added completes_at field to the print.started event.
 
    Riker has 16 colony surveys so far, he’s starting to see some good options for a route to take the Ark on. o7
-4. v2.3.4 [◇](index.md#v2.3.4)
+5. v2.3.4 [◇](index.md#v2.3.4)
 
     29 July 2026
 
@@ -93,7 +124,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Fixed a bug with planets spinning in retrograde scoring zero in Riker’s ratings.
 
    *Keep the colony surveys coming. Each good find is a potential home for humanity! o7*
-5. v2.3.3 [◇](index.md#v2.3.3)
+6. v2.3.3 [◇](index.md#v2.3.3)
 
     27 July 2026
 
@@ -130,7 +161,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Slowed down NPC BobNet chatter.
 
    Humanity will spread out. We’ll need options. Replicants, find some good homes! o7
-6. v2.3.2 [◇](index.md#v2.3.2)
+7. v2.3.2 [◇](index.md#v2.3.2)
 
     25 July 2026
 
@@ -146,7 +177,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Improved performance on scanning new systems.
 
    Brave new worlds are awaiting. But not too hot, and not too cold please. Replicants, the people need you! o7
-7. v2.3.1 [◇](index.md#v2.3.1)
+8. v2.3.1 [◇](index.md#v2.3.1)
 
     21 July 2026
 
@@ -172,7 +203,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Added the pulse_runner as a reward from the new Gwynhari event in the beta region.
 
    Exotic matter pulses through the ring as replicants race to restore it. Is this wise? Time will tell… o7
-8. v2.3.0 [◇](index.md#v2.3.0)
+9. v2.3.0 [◇](index.md#v2.3.0)
 
     19 July 2026
 
@@ -199,33 +230,33 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
    - Fixed database deadlock issue that was aborting travel routes a hop too soon.
 
    All three regions have been unlocked, but what is this weird ring thing huh? Time to get exotic, replicants! o7
-9. v2.2.0 [◇](index.md#v2.2.0)
+10. v2.2.0 [◇](index.md#v2.2.0)
 
-    12 July 2026
+     12 July 2026
 
-   Mid-season feature drop: Simulations!
+    Mid-season feature drop: Simulations!
 
-   Our lovely bunch of replicants recently constructed a datacentre megastructure in the MIRFAKA system. It was used to trace the potential origin of those giant asteroids that came for the Ark.
+    Our lovely bunch of replicants recently constructed a datacentre megastructure in the MIRFAKA system. It was used to trace the potential origin of those giant asteroids that came for the Ark.
 
-   The datacentre is mostly sitting idle, processing the occasional observatory report. So… Bill’s been tinkering with all the fancy analytical hardware. He came up with a design to interface replicants with it directly for the purpose of running simulations.
+    The datacentre is mostly sitting idle, processing the occasional observatory report. So… Bill’s been tinkering with all the fancy analytical hardware. He came up with a design to interface replicants with it directly for the purpose of running simulations.
 
-   The simulations run pretty hot, so you’ll need to supply your own compute power. And yes, there are leaderboards for the fastest times!
+    The simulations run pretty hot, so you’ll need to supply your own compute power. And yes, there are leaderboards for the fastest times!
 
-   btw: Event redesign coming next, thanks for the patience.
+    btw: Event redesign coming next, thanks for the patience.
 
-   ### Online docs
+    ### Online docs
 
-   - New section added to cover everything related to the new [Simulations](../simulations/index.md) feature.
+    - New section added to cover everything related to the new [Simulations](../simulations/index.md) feature.
 
-   ### API updates
+    ### API updates
 
-   - New endpoints for managing simulations at a replicant interface with /devices/:code/simulate.
-   - Leaderboard list now has a type field to support nested items.
-   - New public leaderboard endpoints for each simulation scenario at /leaderboards/simulations/:scenario.
-   - New account endpoint for viewing previous simulation runs at /accounts/simulations.
+    - New endpoints for managing simulations at a replicant interface with /devices/:code/simulate.
+    - Leaderboard list now has a type field to support nested items.
+    - New public leaderboard endpoints for each simulation scenario at /leaderboards/simulations/:scenario.
+    - New account endpoint for viewing previous simulation runs at /accounts/simulations.
 
-   Time to put those bootstrap algorithms to the test! o7
-10. v2.1.1 [◇](index.md#v2.1.1)
+    Time to put those bootstrap algorithms to the test! o7
+11. v2.1.1 [◇](index.md#v2.1.1)
 
      8 July 2026
 
@@ -248,7 +279,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Add device tags to the autofactory print status output.
 
     The galaxy is getting bigger. Reach for the stars! o7
-11. v2.1.0 [◇](index.md#v2.1.0)
+12. v2.1.0 [◇](index.md#v2.1.0)
 
      6 July 2026
 
@@ -271,7 +302,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added new prospect_no_fringe event to store details of prospect failures.
 
     NEEEEEEW ACHIEVEMENT! o7
-12. v2.0.1 [◇](index.md#v2.0.1)
+13. v2.0.1 [◇](index.md#v2.0.1)
 
      5 July 2026
 
@@ -292,7 +323,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added quantity_mined field to mining drone status and related events.
 
     Asteroid hunters, we salute you! o7
-13. v2.0.0 [◇](index.md#v2.0.0)
+14. v2.0.0 [◇](index.md#v2.0.0)
 
      1 July 2026
 
@@ -320,7 +351,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Oh, and three new [REDACTED] waiting to be [REDACTED].
 
     Hip hip, array! o7
-14. v1.3.2 [◇](index.md#v1.3.2)
+15. v1.3.2 [◇](index.md#v1.3.2)
 
      28 June 2026
 
@@ -337,7 +368,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - New background task to fix any unfinished autofactory print jobs.
 
     The season is drawing to a close. All is calm. Nothing bad is coming. o7
-15. v1.3.1 [◇](index.md#v1.3.1)
+16. v1.3.1 [◇](index.md#v1.3.1)
 
      26 June 2026
 
@@ -358,7 +389,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added blueprint descriptions.
 
     Enjoy the newly added flavour of composite-conductive rare-earth shielded emitter exhaust relays with braided dissipation waffles! o7
-16. v1.3.0 [◇](index.md#v1.3.0)
+17. v1.3.0 [◇](index.md#v1.3.0)
 
      25 June 2026
 
@@ -386,7 +417,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added ability to auto-tag devices from the print queue on autofactories.
 
     The very latest in flat-pack space station design. What a time to be alive! o7
-17. v1.2.1 [◇](index.md#v1.2.1)
+18. v1.2.1 [◇](index.md#v1.2.1)
 
      21 June 2026
 
@@ -410,7 +441,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Blueprint info now includes queue_size in the response.
 
     The Ark is saved! All incoming rocks have been diverted with a huge-scale collaborative operation. Great work replicants! o7
-18. v1.2.0 [◇](index.md#v1.2.0)
+19. v1.2.0 [◇](index.md#v1.2.0)
 
      16 June 2026
 
@@ -445,7 +476,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added lots of missing params to endpoints that were previously undocumented.
 
     The Ark is under attack! Will the replicants save it in time? o7
-19. v1.1.0 [◇](index.md#v1.1.0)
+20. v1.1.0 [◇](index.md#v1.1.0)
 
      12 June 2026
 
@@ -461,7 +492,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - A new two-tier permission model has been introduced for account/replicant-scoped device control.
 
     Have fun with the rocks! o7
-20. v1.0.16 [◇](index.md#v1.0.16)
+21. v1.0.16 [◇](index.md#v1.0.16)
 
      11 June 2026
 
@@ -487,7 +518,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Surge plates in taxi-mode are now shared by replicants under the same account, for assemble and ferry directives.
 
     This update was a real blast to work on. Heh. o7
-21. v1.0.15 [◇](index.md#v1.0.15)
+22. v1.0.15 [◇](index.md#v1.0.15)
 
      8 June 2026
 
@@ -515,7 +546,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Always show activate/deactivate commands as available on AMI devices.
 
     Megastructure progress at 27%. There’s a chance we might just pull this off! o7
-22. v1.0.14 [◇](index.md#v1.0.14)
+23. v1.0.14 [◇](index.md#v1.0.14)
 
      7 June 2026
 
@@ -549,7 +580,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Fixed bug with attaching to devices that are also carriers.
 
     The galaxy has now been 20% explored. That’s not nearly enough! o7
-23. v1.0.13 [◇](index.md#v1.0.13)
+24. v1.0.13 [◇](index.md#v1.0.13)
 
      3 June 2026
 
@@ -583,7 +614,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - New achievements for asteroid diversion - whether you’re saving lives or rocks.
 
     Big thanks for all the bug reports and feature suggestions from everyone so far! o7
-24. v1.0.12 [◇](index.md#v1.0.12)
+25. v1.0.12 [◇](index.md#v1.0.12)
 
      2 June 2026
 
@@ -605,7 +636,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Fix added for players who occassionally find a device (or themselves!) out of command range. The underlying fix is still in progress, but your devices should self-correct when breaking.
 
     There are now 60 replicants roaming around the galaxy! o7
-25. v1.0.11 [◇](index.md#v1.0.11)
+26. v1.0.11 [◇](index.md#v1.0.11)
 
      31 May 2026
 
@@ -627,7 +658,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Wrote descriptions for the NPC profiles.
 
     Megastructure progress is happening! Go replicants! o7
-26. v1.0.10 [◇](index.md#v1.0.10)
+27. v1.0.10 [◇](index.md#v1.0.10)
 
      30 May 2026
 
@@ -662,7 +693,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Replicant device lists can now be filtered by location.
 
     Thanks for your patience with those janky AMI controllers folks. Focus now shifting to the other ones. o7
-27. v1.0.9 [◇](index.md#v1.0.9)
+28. v1.0.9 [◇](index.md#v1.0.9)
 
      29 May 2026
 
@@ -678,7 +709,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Location scans have been adjusted to show your own account knowledge, including knowledge of life.
     - A variety of interesting issues related to replicant matrix cradling and travel have been fixed.
     - Strapping a surge plate on the back of a matrix container and sending yourself off into the void will now grant a special achievement (thanks Tory!).
-28. v1.0.8 [◇](index.md#v1.0.8)
+29. v1.0.8 [◇](index.md#v1.0.8)
 
      28 May 2026
 
@@ -706,7 +737,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Added stow/cargo/attach capacities to blueprint response.
     - Fixed missing hosted_device_code while travelling.
     - Stowing a survey drone will now stop it tracking the resource site properly.
-29. v1.0.7 [◇](index.md#v1.0.7)
+30. v1.0.7 [◇](index.md#v1.0.7)
 
      27 May 2026
 
@@ -734,7 +765,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - New endpoint for catching up on BobNet messages from a relay.
     - Star lookups are now possible for travelling replicants, based on their origin location.
     - Star listings now include the current star.
-30. v1.0.6 [◇](index.md#v1.0.6)
+31. v1.0.6 [◇](index.md#v1.0.6)
 
      24 May 2026
 
@@ -760,7 +791,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - The `activate` and `deactivate` commands are now fully implemented, allowing relay deactivation, and fixing its appearance on the maintenance drone command list
 
     Thanks again to the current playerbase for being so interactive, each patch is improving the game experience for us all! o7
-31. v1.0.5 [◇](index.md#v1.0.5)
+32. v1.0.5 [◇](index.md#v1.0.5)
 
      23 May 2026
 
@@ -782,7 +813,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Refactored FTL network logic significantly to better support cross-system AMI control
     - Added stricter validation on account/replicant names
     - System scan output updates with real moon counts when planets are scanned, instead of the early estimates
-32. v1.0.4 [◇](index.md#v1.0.4)
+33. v1.0.4 [◇](index.md#v1.0.4)
 
      22 May 2026
 
@@ -797,7 +828,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
 
     - Fixed the “via” param not working properly on manual travel routes
     - Fixed a bug where a server reload would quadruplicate any ongoing print jobs
-33. v1.0.3 [◇](index.md#v1.0.3)
+34. v1.0.3 [◇](index.md#v1.0.3)
 
      21 May 2026
 
@@ -812,7 +843,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Updated NPC chatter on BobNet to reflect current blueprint collection
     - Included the search command in survey drone details, and show as searching in device status
     - Added new feedback endpoint for bug/typo/idea requests from players
-34. v1.0.2 [◇](index.md#v1.0.2)
+35. v1.0.2 [◇](index.md#v1.0.2)
 
      19 May 2026
 
@@ -831,7 +862,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     - Ensured all scan responses now use `location_type` as standard. The old `type` response field is deprecated. (thanks Seveen)
     - Standardised the response shape for salvage/belt mining. Old `belt` and `designation` response fields deprecated. (can’t find who reported this sorry!)
     - Added better response for trailing slash on endpoints rather than the 404 (thanks Ombre)
-35. v1.0.1 [◇](index.md#v1.0.1)
+36. v1.0.1 [◇](index.md#v1.0.1)
 
      18 May 2026
 
@@ -842,7 +873,7 @@ What's changed in the Replicant Space galaxy? Keep up with the latest.
     ### Clearer rate limits
 
     New rate limits page added to spell out the per-endpoint and global buckets, and with an example of what happens when you hit it, so you can configure your client to back off cleanly.
-36. v1.0.0 [◇](index.md#v1.0.0)
+37. v1.0.0 [◇](index.md#v1.0.0)
 
      17 May 2026
 

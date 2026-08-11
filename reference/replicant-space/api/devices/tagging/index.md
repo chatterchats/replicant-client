@@ -1,7 +1,7 @@
 ---
 title: "Tagging"
 source_url: "https://replicant.space/docs/api/devices/tagging/"
-crawled_at: "2026-08-07T00:51:30.177204+00:00"
+crawled_at: "2026-08-11T15:11:28.259452+00:00"
 ---
 
 API · Devices

@@ -1,7 +1,7 @@
 ---
 title: "AMI Survey Controller"
 source_url: "https://replicant.space/docs/ami/survey-controller/"
-crawled_at: "2026-08-07T00:51:29.730572+00:00"
+crawled_at: "2026-08-11T15:11:27.799654+00:00"
 ---
 
 AMI Controllers

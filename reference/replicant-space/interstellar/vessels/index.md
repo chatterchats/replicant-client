@@ -1,7 +1,7 @@
 ---
 title: "Vessels"
 source_url: "https://replicant.space/docs/interstellar/vessels/"
-crawled_at: "2026-08-07T00:51:31.777529+00:00"
+crawled_at: "2026-08-11T15:11:29.890764+00:00"
 ---
 
 Interstellar Transport

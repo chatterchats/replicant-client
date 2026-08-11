@@ -1,7 +1,7 @@
 ---
 title: "Blueprints"
 source_url: "https://replicant.space/docs/concepts/blueprints/"
-crawled_at: "2026-08-07T00:51:31.256273+00:00"
+crawled_at: "2026-08-11T15:11:29.347731+00:00"
 ---
 
 Core Concepts

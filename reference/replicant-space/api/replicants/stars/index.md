@@ -1,7 +1,7 @@
 ---
 title: "Nearest stars"
 source_url: "https://replicant.space/docs/api/replicants/stars/"
-crawled_at: "2026-08-07T00:51:31.074435+00:00"
+crawled_at: "2026-08-11T15:11:29.162455+00:00"
 ---
 
 API · Replicants

@@ -1,7 +1,7 @@
 ---
 title: "Autofactories"
 source_url: "https://replicant.space/docs/autofactories/"
-crawled_at: "2026-08-07T00:51:31.194863+00:00"
+crawled_at: "2026-08-11T15:11:29.281532+00:00"
 ---
 
 Infrastructure

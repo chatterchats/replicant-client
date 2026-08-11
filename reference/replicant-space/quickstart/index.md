@@ -1,14 +1,14 @@
 ---
 title: "Quickstart"
 source_url: "https://replicant.space/docs/quickstart/"
-crawled_at: "2026-08-07T00:51:31.852715+00:00"
+crawled_at: "2026-08-11T15:11:29.975764+00:00"
 ---
 
 Getting Started
 
 # Quickstart
 
-Your first ten minutes. Wake up, look around, visit the belt, deploy some mining drones. By the end of this page you'll understand the bootstrap process.
+Your first ten minutes. Wake up, look around, visit the belt, deploy some mining drones. By the end of this page you'll have completed the Bootstrap tutorial.
 
 ## Before you start
 
@@ -23,6 +23,18 @@ Note: the API responses shown in these docs are often simplified versions of the
 
 *Want to get a feel for the game before signing up? Try the [interactive tutorial](https://replicant.space/tutorial/) - it walks you through the core gameplay loop in the browser, no account required.*
 
+**In-game tutorials available**
+
+The game includes a guided tutorial sequence that walks you from your very first scan all the way to being released into galactic society. Seven tutorials, each building on the last. Call `GET /v1/tutorials` at any time to see your next objective, or read the [Tutorials](../tutorials/index.md) page for the full breakdown.
+
+## Step 0 - Open the event stream
+
+Before you do anything else, open [stream.replicant.space](https://stream.replicant.space/) in a browser tab and paste in your API key. This connects you to the real-time event stream - every action you take in the game fires events here, so you can see what's happening without polling the API.
+
+Keep this tab open while you learn. It's the fastest way to know when travel completes, when drones finish mining, and when something interesting happens in your system.
+
+It's an SSE endpoint at */v1/events/stream* so feel free to write your own consumer client, and maybe start automating things
+
 ## Step 1 - Hello, replicant
 
 Confirm you can authenticate and that your replicant is awake.
@@ -30,12 +42,36 @@ Confirm you can authenticate and that your replicant is awake.
 GET /v1/accounts/me   200 OK
 
 ```
-# 1. confirm the replicant you woke up as
+# confirm the replicant you woke up as
 $ curl https://api.replicant.space/v1/accounts/me \
     -H "Authorization: Bearer $API_KEY"
 ```
 
-## Step 2 - Scan the system
+## Step 2 - Check your messages
+
+You'll have a welcome message waiting. Call the messages endpoint to read it - this is where the game sends you notifications about completed tutorials, incoming trades, and system alerts.
+
+GET /v1/messages   200 OK
+
+```
+# check your inbox
+$ curl https://api.replicant.space/v1/messages \
+    -H "Authorization: Bearer $API_KEY"
+```
+
+## Step 3 - Check your events
+
+The event log records everything that happens to your account. If you connected to the stream in Step 0 you've already seen events arrive in real time - this endpoint gives you the same data as a paginated list.
+
+GET /v1/events   200 OK
+
+```
+# check your event log
+$ curl https://api.replicant.space/v1/events \
+    -H "Authorization: Bearer $API_KEY"
+```
+
+## Step 4 - Scan the system
 
 You start in an unexplored system. A full system scan will reveal technical details of your star along with a list of planets and asteroid belts.
 
@@ -44,7 +80,7 @@ Place your replicant code from registration (or find it in the /accounts/me outp
 POST /v1/replicants/{code}/scan   200 OK
 
 ```
-# 2. scan your starting system to discover what's around you
+# scan your starting system
 $ curl -X POST https://api.replicant.space/v1/replicants/57F0F6C8/scan \
     -H "Authorization: Bearer $API_KEY" \
 ```
@@ -53,7 +89,19 @@ System scans return instantly. Your vessel has been collecting data during your 
 
 You will start at the outer edge - either the Kuiper belt or Oort cloud - depending on the age of the system.
 
-## Step 3 - Travel to the belt
+## Step 5 - Check your vessel
+
+Before heading anywhere, check what you're carrying. This shows your replicant's current location and a list of stowed devices - you'll find your replicant matrix and some mining drones packed into your vessel. Make a note of the device codes, you'll need them next.
+
+GET /v1/replicants/{code}   200 OK
+
+```
+# check your replicant and stowed devices
+$ curl https://api.replicant.space/v1/replicants/57F0F6C8 \
+    -H "Authorization: Bearer $API_KEY"
+```
+
+## Step 6 - Travel to the belt
 
 Pick the asteroid belt out of your scan results and send your replicant vessel there.
 
@@ -62,7 +110,7 @@ The location code looks like `SOL-BELT-1`.
 POST /v1/replicants/{code}/travel   200 OK
 
 ```
-# 3. travel to the asteroid belt found in your scan
+# travel to the asteroid belt
 $ curl -X POST https://api.replicant.space/v1/replicants/57F0F6C8/travel \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
@@ -102,36 +150,28 @@ response 200 response
 
 Check in on your replicant any time to see how far along it is.
 
-GET /v1/replicants/{code}   200 OK
+## Step 7 - Deploy a mining drone
 
-```
-# check progress at any time
-$ curl https://api.replicant.space/v1/replicants/57F0F6C8 \
-    -H "Authorization: Bearer $API_KEY"
-```
-
-## Step 4 - Deploy a mining drone
-
-When you checked your replicant status, you'll have noticed four devices currently stowed - three of them are mining drones. Make a note of their device codes and deploy one with a `deploy` command.
+When you checked your vessel in Step 5, you'll have noticed three mining drones stowed inside. Deploy one with a `deploy` command using its device code.
 
 POST /v1/devices/{code}   200 OK
 
 ```
-# 4. deploy one of your stowed mining drones
+# deploy one of your stowed mining drones
 $ curl -X POST https://api.replicant.space/v1/devices/A1B2C3D4 \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
     -d '{"command": "deploy"}'
 ```
 
-## Step 5 - Mine for resources
+## Step 8 - Mine for resources
 
 Tell each deployed drone to start mining. [Pick a resource](../concepts/resources/index.md), all belts have all six of the resource types. Repeat the deploy/start_mining commands for the other two drones.
 
 POST /v1/devices/{code}   200 OK
 
 ```
-# 5. start mining carbon (repeat for each drone)
+# start mining carbon (repeat for each drone)
 $ curl -X POST https://api.replicant.space/v1/devices/A1B2C3D4 \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
@@ -140,15 +180,15 @@ $ curl -X POST https://api.replicant.space/v1/devices/A1B2C3D4 \
 
 Now wait for a little bit, and the mining drones will start releasing resources to the location. More drones, faster mining.
 
-## Step 6 - Check your inventory
+## Step 9 - Check your inventory
 
-You can see the resources held at any location where you have devices. Hit the location endpoint for the belt your drones are working.
+You can see the resources your drones have mined. Hit the inventory endpoint for your replicant to see everything stockpiled in your current system.
 
-GET /v1/locations/{code}   200 OK
+GET /v1/replicants/{code}/inventory   200 OK
 
 ```
-# 6. check what your drones have pulled out of the belt
-$ curl https://api.replicant.space/v1/locations/SOL-BELT-1 \
+# check what your drones have pulled out of the belt
+$ curl https://api.replicant.space/v1/replicants/57F0F6C8/inventory \
     -H "Authorization: Bearer $API_KEY"
 ```
 
@@ -156,42 +196,44 @@ response 200 response
 
 ```
 {
-  "location": "SOL-BELT-1",
-  "location_type": "belt",
-  "inventory": [
-    { "resource_type": "carbon",     "quantity": 25 },
-    { "resource_type": "silicates",  "quantity": 28 },
-    { "resource_type": "structural", "quantity": 123 }
+  "star": "SOL",
+  "locations": [
+    {
+      "location": "SOL-BELT-1",
+      "items": {
+        "carbon": 25,
+        "silicates": 28,
+        "structural": 123
+      }
+    }
   ]
 }
 ```
 
 Your resources are owned by you, other players can't see them.
 
-## Step 7 - Switch resource targets
+## Step 10 - Switch resource targets
 
 Mining drones can only focus on one resource at a time. Send a `retarget` command to change what the drone is working on. You'll want to do this a few times to get a good quantity of each resource.
 
 POST /v1/devices/{code}   200 OK
 
 ```
-# 7. switch a drone's focus to silicates
+# switch a drone's focus to silicates
 $ curl -X POST https://api.replicant.space/v1/devices/A1B2C3D4 \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
     -d '{"command": "retarget", "resource_type": "silicates"}'
 ```
 
-The drone keeps mining without redeploying. Repeat for each drone you want to retarget.
+## Step 11 - Check your blueprints
 
-## Step 8 - Check your blueprints
-
-See what you already know how to print. New blueprints unlock as you explore and scan.
+See what you already know how to print. New blueprints unlock as you explore the game.
 
 GET /v1/blueprints   200 OK
 
 ```
-# 8. see which blueprints you can print
+# see which blueprints you can print
 $ curl https://api.replicant.space/v1/blueprints \
     -H "Authorization: Bearer $API_KEY"
 ```
@@ -223,14 +265,14 @@ response 200 response
 }
 ```
 
-## Step 9 - Print something
+## Step 12 - Print a mining drone
 
-Once you've mined enough resources, print a new device. More mining drones means faster resource collection. A survey drone would enable you to start scanning planets and moons, or search a new mining site at the belt. Or you can pick something else from your blueprint list. Your bootstrap strategy is your own!
+Once you've mined enough resources, print a new mining drone. More drones means faster resource collection - and printing your first one completes the Bootstrap tutorial.
 
 POST /v1/replicants/{code}/print   200 OK
 
 ```
-# 9. print another mining drone
+# print another mining drone
 $ curl -X POST https://api.replicant.space/v1/replicants/57F0F6C8/print \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
@@ -241,16 +283,6 @@ Printing takes time. Check your replicant status to watch the progress of your i
 
 ## What's next
 
-1. Connect to the [event stream](../api/events/stream/index.md) so you don't have to poll for results.
-2. Print more mining drones and exhaust that belt site.
-3. Print survey drones and unlock more mining sites.
-4. Scan the planets and moons to find valuable salvage.
-5. Print transport drones to start stockpiling resources.
-6. Travel to another system.
-7. Visit Earth!
+You've got the basics down - you can scan, travel, deploy, and mine. From here, follow the [in-game tutorials](../tutorials/index.md). They'll walk you through belt exploration, surveying planets for salvage, moving resources around, helping local civilisations, and eventually using your FTL slingshot to return to SOL and join the wider galaxy.
 
-When you've got more drones than you can micromanage, print and deploy AMI controllers and configure automation directives.
-
-- [Event stream](../api/events/stream/index.md) - be told when things happen in real time.
-- [Mining drones](../drones/mining/index.md) - turning rocks into useful stuff.
-- [AMI Survey Controller](../ami/survey-controller/index.md) - automate a whole system scan.
+Call `GET /v1/tutorials` to see your current progress and what to do next. Each tutorial builds on the last, and the final one releases your account into the full game.
