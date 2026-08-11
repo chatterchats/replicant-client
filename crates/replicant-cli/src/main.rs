@@ -7,6 +7,7 @@ mod printing;
 mod relay;
 mod rikers;
 mod survey;
+mod trade;
 mod transport;
 
 type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -43,6 +44,7 @@ async fn main() -> AnyResult<()> {
             .await
         }
         "transport" | "deliver" | "delivery" => transport::run_cli(arguments).await,
+        "trade" | "trades" | "shop" | "shops" => trade::run_cli(arguments).await,
         "survey" => {
             survey::run_cli(normalize_operation_flag(
                 arguments,
@@ -94,6 +96,7 @@ async fn dispatch_help(mut arguments: Vec<String>) -> AnyResult<()> {
     match command.as_str() {
         "print" | "printing" => printing::run_cli(arguments).await,
         "transport" | "deliver" | "delivery" => transport::run_cli(arguments).await,
+        "trade" | "trades" | "shop" | "shops" => trade::run_cli(arguments).await,
         "survey" => survey::run_cli(arguments).await,
         "relay" | "relays" => relay::run_cli(arguments).await,
         "mining" | "mine" => mining::run_cli(arguments).await,
@@ -121,9 +124,9 @@ fn print_help() {
     println!(
         "Replicant Space CLI\n\n\
 Usage:\n  replicant-cli COMMAND [OPERATION] [OPTIONS]\n\n\
-Commands:\n  print       Distributed Autofactory queueing, status, and clearing\n  transport   Point-to-point resource and device delivery\n  survey      Survey-route planning and execution\n  relay       FTL relay-network expansion\n  mining      Mining-network expansion\n  event       Civilisation-event planning and execution\n  bootstrap   Regional bootstrap automation\n  rikers      Local Riker colony-candidate report\n\n\
+Commands:\n  print       Distributed Autofactory queueing, status, and clearing\n  transport   Point-to-point resource and device delivery\n  trade       Interactive player-run shop directory and trade viewer\n  survey      Survey-route planning and execution\n  relay       FTL relay-network expansion\n  mining      Mining-network expansion\n  event       Civilisation-event planning and execution\n  bootstrap   Regional bootstrap automation\n  rikers      Local Riker colony-candidate report\n\n\
 Operation syntax:\n  Stateful commands accept either an operation word or its flag form.\n  For example, `survey plan ...` and `survey --plan ...` are equivalent.\n\n\
-Examples:\n  replicant-cli print --status --system SCEPTURUM \\\n    --print 17 exotic_matter_injector --tag twaffy-ring-001\n\n  replicant-cli survey --plan --replicant B7AF4A8C \\\n    --vessel 6592B774 --center THYFFAWFF --radius 30\n\n  replicant-cli bootstrap --run \\\n    --mission-file regional-bootstrap-beta.json \\\n    --log-file logs/regional-bootstrap-beta.log\n\n\
+Examples:\n  replicant-cli print --status --system SCEPTURUM \\\n    --print 17 exotic_matter_injector --tag twaffy-ring-001\n\n  replicant-cli trade --replicant Chats-1\n\n  replicant-cli survey --plan --replicant B7AF4A8C \\\n    --vessel 6592B774 --center THYFFAWFF --radius 30\n\n  replicant-cli bootstrap --run \\\n    --mission-file regional-bootstrap-beta.json \\\n    --log-file logs/regional-bootstrap-beta.log\n\n\
 Help:\n  replicant-cli help COMMAND\n  replicant-cli COMMAND --help\n  -h, --help       Show this help\n  -V, --version    Show version"
     );
 }
