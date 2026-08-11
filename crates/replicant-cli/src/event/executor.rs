@@ -1032,6 +1032,7 @@ async fn release_preflight_claims(
                     add_tags: None,
                     remove_tags: Some(removable.clone()),
                     tags: None,
+                    ..Default::default()
                 })
                 .await?;
             ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
@@ -2243,6 +2244,7 @@ async fn claim_device(
                 add_tags: Some(missing_tags),
                 remove_tags: None,
                 tags: None,
+                ..Default::default()
             })
             .await?;
         ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
@@ -3582,6 +3584,7 @@ async fn cleanup_claims(
                     add_tags: None,
                     remove_tags: Some(removable.clone()),
                     tags: None,
+                    ..Default::default()
                 })
                 .await?;
             ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
@@ -3639,6 +3642,7 @@ async fn cleanup_component_tags(
                 add_tags: None,
                 remove_tags: Some(removable.clone()),
                 tags: None,
+                ..Default::default()
             })
             .await?;
         ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;

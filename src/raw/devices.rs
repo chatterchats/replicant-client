@@ -16,7 +16,7 @@ use reqwest::Method;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::error::Error;
-use crate::raw::common::{encode_path_segment, with_query};
+use crate::raw::common::{UpdateField, encode_path_segment, with_query};
 use crate::raw::{Client, JsonObject, RawResponse, RequestSafety};
 
 fn deserialize_optional_reference<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -311,6 +311,9 @@ pub struct DeviceStatus {
     pub is_prospecting: Option<bool>,
     /// Current location designation.
     pub location: Option<String>,
+    /// Device linked to this device through configuration, for example the
+    /// empty replicant matrix paired with an FTL slingshot.
+    pub linked_device: Option<String>,
     /// Human-readable current location name.
     pub location_name: Option<String>,
     /// In-progress mining operation, if any.
@@ -421,11 +424,15 @@ pub struct DeviceTagListQuery {
 /// Request body for `PATCH /v1/devices/{device_code}`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeviceConfigurationRequest {
-    /// The tag changes to apply.
+    /// The configuration changes to apply.
     pub configuration: DeviceConfiguration,
 }
 
-/// Tag changes to apply to a device.
+/// Configuration changes to apply to a device.
+///
+/// `linked_device` is tri-state because Replicant Space 2.5.0 distinguishes
+/// an omitted field (leave the current link unchanged), JSON `null` (clear
+/// the link), and a device code (establish or replace the link).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeviceConfiguration {
     /// Tags to add.
@@ -437,6 +444,26 @@ pub struct DeviceConfiguration {
     /// Tags to set outright, replacing the current set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Device code linked to this device. `Null` explicitly clears an
+    /// existing link while `Omitted` leaves it unchanged.
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
+    pub linked_device: UpdateField<String>,
+}
+
+impl DeviceConfiguration {
+    /// Configures this device to link to `device_code`.
+    #[must_use]
+    pub fn link_device(mut self, device_code: impl Into<String>) -> Self {
+        self.linked_device = UpdateField::Value(device_code.into());
+        self
+    }
+
+    /// Explicitly clears this device's configured device link.
+    #[must_use]
+    pub fn unlink_device(mut self) -> Self {
+        self.linked_device = UpdateField::Null;
+        self
+    }
 }
 
 /// Response body for `PATCH /v1/devices/{device_code}`.
@@ -448,6 +475,11 @@ pub struct DeviceConfigurationResponse {
     /// Tags after the update.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Device linked after the update, if any.
+    pub linked_device: Option<String>,
+    /// Any other fields the server returns.
+    #[serde(flatten)]
+    pub extra: JsonObject,
 }
 
 /// Shared payload for the `adopt`, `attach`, `detach`, and `release`
@@ -835,6 +867,14 @@ pub struct DeviceCommandResponse {
     pub status: Option<String>,
     /// Device this device was stowed inside by a `stow` command.
     pub stowed_in: Option<String>,
+    /// Whether the system ward is active after an activate/deactivate command.
+    pub warding: Option<bool>,
+    /// Open activation kind returned by device activation, e.g. `ward`.
+    pub activated: Option<String>,
+    /// Open deactivation kind returned by device deactivation, e.g. `ward`.
+    pub deactivated: Option<String>,
+    /// Number of foreign miners evicted when a system ward activates.
+    pub evicted_miners: Option<i64>,
     /// Tags after a print- or configuration-related command.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -1004,7 +1044,7 @@ impl DevicesClient {
             .await
     }
 
-    /// Updates a device's tags.
+    /// Updates a device's configuration.
     pub async fn configure(
         &self,
         device_code: &str,
@@ -1013,6 +1053,18 @@ impl DevicesClient {
         let path = format!("v1/devices/{}", encode_path_segment(device_code));
         self.client
             .execute_json(Method::PATCH, &path, true, RequestSafety::Mutating, request)
+            .await
+    }
+
+    /// Retrieves a one-time equipment-locker device. This is an unsafe
+    /// mutation and is never retried automatically after transmission.
+    pub async fn retrieve(
+        &self,
+        device_code: &str,
+    ) -> Result<RawResponse<DeviceCommandResponse>, Error> {
+        let path = format!("v1/devices/{}/retrieve", encode_path_segment(device_code));
+        self.client
+            .execute(Method::POST, &path, true, RequestSafety::Mutating)
             .await
     }
 

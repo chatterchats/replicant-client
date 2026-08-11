@@ -76,6 +76,9 @@ enum MutationAdapter {
         device_code: String,
         request: raw::devices::DeviceConfigurationRequest,
     },
+    DeviceRetrieve {
+        device_code: String,
+    },
     DeviceCommand {
         device_code: String,
         command: raw::devices::DeviceCommand,
@@ -180,6 +183,7 @@ impl TypedMutationAdapter for MutationAdapter {
             Self::AccountUpdate { .. } => "account_update",
             Self::AccountWipe => "account_wipe",
             Self::DeviceConfigure { .. } => "device_configure",
+            Self::DeviceRetrieve { .. } => "device_retrieve",
             Self::DeviceCommand { .. } => "device_command",
             Self::DeviceDynamicCommand { .. } => "device_dynamic_command",
             Self::DeviceGrantPermission { .. } => "device_grant_permission",
@@ -212,6 +216,7 @@ impl TypedMutationAdapter for MutationAdapter {
     fn target(&self) -> Option<(&'static str, String)> {
         match self {
             Self::AccountUpdate { .. } | Self::AccountWipe => Some(("account", String::new())),
+            Self::DeviceRetrieve { .. } => None,
             Self::DeviceConfigure { device_code, .. }
             | Self::DeviceCommand { device_code, .. }
             | Self::DeviceDynamicCommand { device_code, .. }
@@ -284,6 +289,7 @@ impl TypedMutationAdapter for MutationAdapter {
                 device_code,
                 request,
             } => response!(raw.devices().configure(device_code, request)),
+            Self::DeviceRetrieve { device_code } => response!(raw.devices().retrieve(device_code)),
             Self::DeviceCommand {
                 device_code,
                 command,
@@ -573,6 +579,20 @@ impl Operation {
     pub async fn reconcile(&self) -> Result<OperationOutcome> {
         self.client.ensure_open()?;
         let entry = load(&self.client, &self.id)?;
+        let current_status = OperationStatus::parse(&entry.state);
+        if current_status == OperationStatus::ReconciliationRequired
+            && entry.intent.get("kind").and_then(Value::as_str) == Some("device_retrieve")
+        {
+            if self.client.devices().refresh_many().collect().await.is_ok() {
+                self.client
+                    .managed_state()
+                    .set_operation_state(self.id.as_str(), OperationStatus::Completed.as_str())
+                    .map_err(persistence_error)?;
+                notify(&self.client, &self.id, OperationStatus::Completed);
+            }
+            return self.outcome().await;
+        }
+
         let snapshot = match (entry.target_kind.as_deref(), entry.target_id.as_deref()) {
             (Some("device"), Some(code)) if self.client.sync().device(code).await.is_ok() => self
                 .client
@@ -1482,6 +1502,16 @@ pub(crate) async fn device_configure(
     .await
 }
 
+pub(crate) async fn device_retrieve(client: &Client, device_code: &str) -> Result<Operation> {
+    create(
+        client,
+        MutationAdapter::DeviceRetrieve {
+            device_code: device_code.to_owned(),
+        },
+    )
+    .await
+}
+
 pub(crate) async fn device_grant_permission(
     client: &Client,
     device_code: &str,
@@ -1969,7 +1999,35 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
                 .append_operation_projection(id.as_str(), next.as_str(), &response)
                 .map_err(persistence_error)?;
             notify(client, id, next);
-            if let (Some(target_realm), Some(target_kind), Some(target_id)) = (
+
+            if matches!(adapter, MutationAdapter::DeviceRetrieve { .. }) {
+                // The retrieve response does not identify the newly granted
+                // slingshot. A complete, unfiltered device traversal is the
+                // authoritative post-mutation observation. This safe read may
+                // be retried normally, but the one-time retrieve POST above is
+                // never replayed because a refresh fails.
+                match client.devices().refresh_many().collect().await {
+                    Ok(_) => {
+                        client
+                            .managed_state()
+                            .set_operation_state(
+                                id.as_str(),
+                                OperationStatus::Completed.as_str(),
+                            )
+                            .map_err(persistence_error)?;
+                        notify(client, id, OperationStatus::Completed);
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "replicant_client::ops",
+                            event = "device.retrieve_refresh_failed",
+                            operation_id = %id.as_str(),
+                            error = %error,
+                            "equipment retrieval was accepted but the authoritative device refresh failed"
+                        );
+                    }
+                }
+            } else if let (Some(target_realm), Some(target_kind), Some(target_id)) = (
                 entry.target_realm.as_deref(),
                 entry.target_kind.as_deref(),
                 entry.target_id.as_deref(),
@@ -3095,13 +3153,80 @@ mod tests {
             .collect();
         assert_eq!(
             unsafe_ops.len(),
-            24,
-            "expected exactly 24 durable operations"
+            25,
+            "expected exactly 25 durable operations"
         );
 
         let source = include_str!("operation.rs");
         assert!(!source.contains(&format!("dispatch_{}", "target")));
         assert!(source.matches("Self::").count() >= unsafe_ops.len());
+    }
+
+    #[tokio::test]
+    async fn equipment_retrieval_is_durable_and_completes_after_device_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/LOCKER/retrieve"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"status": "retrieved"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [{
+                    "device_code": "SLING1",
+                    "device_type": "ftl_slingshot",
+                    "linked_device": "MATRIX1"
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let operation = device_retrieve(&client, "LOCKER")
+            .await
+            .expect("retrieval operation");
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::Completed
+        );
+        let entry = client
+            .managed_state()
+            .read_operation(operation.id().as_str())
+            .expect("read operation")
+            .expect("operation row");
+        assert_eq!(entry.intent["kind"], "device_retrieve");
+        assert_eq!(entry.intent["device_code"], "LOCKER");
+        assert!(entry.target_kind.is_none());
+        assert!(client.devices().cached("SLING1").is_some());
+
+        client.close().await.expect("close");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn equipment_retrieval_transport_failure_stays_ambiguous_without_refresh() {
+        let client = client_at(&unreachable_base_url()).await;
+        let operation = device_retrieve(&client, "LOCKER")
+            .await
+            .expect("retrieval remains durably inspectable");
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::Ambiguous
+        );
+        let entry = client
+            .managed_state()
+            .read_operation(operation.id().as_str())
+            .expect("read operation")
+            .expect("operation row");
+        assert_eq!(entry.intent["kind"], "device_retrieve");
+        client.close().await.expect("close");
     }
 
     #[test]

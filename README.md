@@ -189,10 +189,28 @@ containing user data.
 
 ## Contract boundary
 
-The client follows the checked-in Replicant Space 2.4.0 documentation and
+The client follows the checked-in Replicant Space 2.5.0 documentation and
 OpenAPI corpus. Deprecated and administrative operations are intentionally
 absent, including from the raw client. Unknown fields and open vocabularies
 remain forward compatible.
+
+The 2.5.0 surface includes tutorial progress, one-time equipment-locker
+retrieval, FTL slingshot device linking, and typed System Ward responses/events.
+Slingshot firing intentionally reuses the normal teleport operation rather than
+introducing a parallel transport API:
+
+```rust
+let tutorials = client.tutorials().list().await?;
+let slingshot = client.devices().get("SLINGSHOT-CODE").await?;
+slingshot.link_device("EMPTY-MATRIX-CODE").await?;
+
+let replicant = client.replicants().get_owned("REPLICANT-CODE").await?;
+replicant.teleport_via_slingshot("SLINGSHOT-CODE").await?;
+
+// Existing accounts can claim the one-time equipment-locker device through
+// the durable operation journal. A successful claim refreshes owned devices.
+let retrieval = client.devices().retrieve("LOCKER-CODE").await?;
+```
 
 ## Development
 

@@ -723,6 +723,32 @@ mod location_predicate_tests {
     }
 }
 
+/// State-neutral tutorial progress gateway. Tutorial progression is
+/// authoritative server-owned onboarding state and is intentionally not
+/// projected into the managed SQLite store.
+#[derive(Clone, Debug)]
+pub struct TutorialsGateway {
+    client: Client,
+}
+
+impl TutorialsGateway {
+    pub(crate) fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Lists every tutorial and the authenticated account's current progress.
+    pub async fn list(&self) -> Result<raw::tutorials::TutorialListResponse> {
+        self.client.ensure_open()?;
+        Ok(self.client.managed_raw().tutorials().list().await?.value)
+    }
+
+    /// Fetches one tutorial's detailed step progress by slug.
+    pub async fn get(&self, slug: &str) -> Result<raw::tutorials::TutorialDetail> {
+        self.client.ensure_open()?;
+        Ok(self.client.managed_raw().tutorials().get(slug).await?.value)
+    }
+}
+
 /// Gateway for the authenticated account. `get` is explicit remote I/O.
 #[derive(Clone, Debug)]
 pub struct AccountGateway {
@@ -1097,7 +1123,7 @@ impl DeviceHandle {
         operation::device_dynamic_command(&self.client, self.id().as_str(), command).await
     }
 
-    /// Updates this device's tags as a durable operation.
+    /// Updates this device's configuration as a durable operation.
     pub async fn configure(
         &self,
         configuration: raw::devices::DeviceConfiguration,
@@ -1108,6 +1134,20 @@ impl DeviceHandle {
             raw::devices::DeviceConfigurationRequest { configuration },
         )
         .await
+    }
+
+    /// Links this device to another device through the 2.5.0
+    /// `linked_device` configuration field. FTL slingshots use this to bind
+    /// their remote empty replicant matrix.
+    pub async fn link_device(&self, device_code: impl Into<String>) -> Result<Operation> {
+        self.configure(raw::devices::DeviceConfiguration::default().link_device(device_code))
+            .await
+    }
+
+    /// Clears this device's configured `linked_device` relationship.
+    pub async fn unlink_device(&self) -> Result<Operation> {
+        self.configure(raw::devices::DeviceConfiguration::default().unlink_device())
+            .await
     }
 
     /// Grants a permission on this device to another account.
@@ -1914,6 +1954,14 @@ impl DevicesGateway {
     pub fn refresh_many(&self) -> DeviceRefreshQuery {
         DeviceRefreshQuery::new(self.client.clone())
     }
+
+    /// Retrieves a one-time device from an equipment locker through the
+    /// durable mutation journal. The locker code need not identify an owned
+    /// device, so retrieval lives on the collection gateway rather than a
+    /// [`DeviceHandle`].
+    pub async fn retrieve(&self, device_code: &str) -> Result<Operation> {
+        operation::device_retrieve(&self.client, device_code).await
+    }
     /// Starts a local query for devices of a controller type.
     #[must_use]
     pub fn controllers(&self, controller_type: DeviceType) -> DeviceQuery {
@@ -2252,6 +2300,19 @@ impl ReplicantHandle {
     /// Teleports this replicant to a new matrix, incurring offline time.
     pub async fn teleport(&self, request: raw::replicants::TeleportRequest) -> Result<Operation> {
         operation::replicant_teleport(&self.client, self.id().as_str(), request).await
+    }
+
+    /// Teleports through an FTL slingshot. The server resolves the
+    /// slingshot's configured linked matrix; this is the same durable
+    /// teleport operation as direct matrix teleportation.
+    pub async fn teleport_via_slingshot(
+        &self,
+        slingshot_code: impl Into<String>,
+    ) -> Result<Operation> {
+        self.teleport(raw::replicants::TeleportRequest {
+            target: slingshot_code.into(),
+        })
+        .await
     }
 
     /// Transfers this replicant to a new hosting device or account.

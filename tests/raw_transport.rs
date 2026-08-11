@@ -399,3 +399,62 @@ async fn every_raw_service_family_decodes_a_contract_fixture() {
         .unwrap();
     assert_eq!(device_request.url.query(), Some("cursor=7"));
 }
+
+#[tokio::test]
+async fn tutorial_routes_use_the_documented_authenticated_get_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/tutorials"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tutorials": [{"slug": "bootstrap", "completed": false}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/tutorials/bootstrap"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "slug": "bootstrap",
+            "steps": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&server, fast_retry());
+    let list = client.tutorials().list().await.unwrap();
+    assert_eq!(list.value.tutorials[0].slug.as_deref(), Some("bootstrap"));
+    let detail = client.tutorials().get("bootstrap").await.unwrap();
+    assert_eq!(detail.value.slug.as_deref(), Some("bootstrap"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn equipment_retrieval_is_mutating_and_never_retried_after_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/devices/LOCKER/retrieve"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_json(serde_json::json!({"status": "retrieved"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Client::builder()
+        .base_url(Url::parse(&server.uri()).unwrap())
+        .authentication_token(SecretString::from("test-token".to_string()))
+        .request_timeout(Duration::from_millis(20))
+        .retry_policy(fast_retry())
+        .build()
+        .unwrap();
+
+    let error = client.devices().retrieve("LOCKER").await.unwrap_err();
+    assert!(error.is_ambiguous_transport_failure());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}

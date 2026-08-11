@@ -33,7 +33,8 @@
         "controllers"
       ],
       "durable_mutation": [
-        "DeviceHandle::* command/configure/permission methods"
+        "DeviceHandle::* command/configure/permission methods",
+        "DevicesGateway::retrieve"
       ],
       "local_watch": [
         "DeviceHandle::snapshot",
@@ -43,7 +44,8 @@
         "stow/attachment/controller relationships",
         "capacities",
         "active AMI directive",
-        "active travel"
+        "active travel",
+        "linked_device relationship"
       ]
     },
     "replicants": {
@@ -160,6 +162,13 @@
         "resolve"
       ],
       "note": "returns contract DTOs because no durable location-event projection exists"
+    },
+    "tutorials": {
+      "state_neutral_managed_read": [
+        "list",
+        "get"
+      ],
+      "note": "tutorial progress remains authoritative server-owned onboarding state and is not persisted"
     }
   },
   "full_sync_excludes": [

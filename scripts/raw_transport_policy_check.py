@@ -16,7 +16,7 @@ EXPECTED = {
     "src/raw/achievements.rs": {"list", "get"},
     "src/raw/blueprints.rs": {"list"},
     "src/raw/bobnet.rs": {"channels", "messages"},
-    "src/raw/devices.rs": {"list", "list_by_tag", "get", "configure", "command", "audit", "logs", "network", "list_permissions", "grant_permission", "revoke_permission"},
+    "src/raw/devices.rs": {"list", "list_by_tag", "get", "configure", "retrieve", "command", "audit", "logs", "network", "list_permissions", "grant_permission", "revoke_permission"},
     "src/raw/feedback.rs": {"submit"},
     "src/raw/galaxy.rs": {"stars_near", "catalogue"},
     "src/raw/inventory.rs": {"list", "for_replicant"},
@@ -29,6 +29,7 @@ EXPECTED = {
     "src/raw/simulations.rs": {"scenarios", "enter", "active", "cancel"},
     "src/raw/species.rs": {"list"},
     "src/raw/trading.rs": {"list", "create", "delete", "fulfill", "visible_to_replicant"},
+    "src/raw/tutorials.rs": {"list", "get"},
     "src/events.rs": {"list", "stream"},
 }
 

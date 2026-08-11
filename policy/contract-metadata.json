@@ -1,12 +1,12 @@
 {
-  "$schema_note": "Provenance for the verified Replicant Space 2.4.0 OpenAPI and rendered-document corpus.",
-  "replicant_space_version": "2.4.0",
-  "crawl_timestamp": "2026-08-07T00:51:32.098451+00:00",
+  "$schema_note": "Provenance for the verified Replicant Space 2.5.0 OpenAPI and rendered-document corpus.",
+  "replicant_space_version": "2.5.0",
+  "crawl_timestamp": "2026-08-11T15:11:30.311486+00:00",
   "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
-  "openapi_fetched_at": "2026-08-07T00:51:32.098451+00:00",
-  "openapi_sha256": "9f5498b2229e9aea6c20840b61267b09a0fffcc7ac87804b6c80db98fc058e31",
-  "openapi_operation_count": 86,
-  "openapi_path_count": 72,
+  "openapi_fetched_at": "2026-08-11T15:11:30.311486+00:00",
+  "openapi_sha256": "9987d07e66ddc7035915900b06c8196c80464b4ea4dab6428e9d06a8f0a546b0",
+  "openapi_operation_count": 89,
+  "openapi_path_count": 75,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
   "openapi_documentation_mismatches": [
     {
@@ -26,18 +26,48 @@
       "difference": "OpenAPI declares no request or success-response schemas for device trades or replicant-visible traders.",
       "raw_policy": "Expose opaque JSON request/response values; do not invent fields from prose examples.",
       "evidence": "openapi.json"
+    },
+    {
+      "scope": "GET /v1/tutorials and GET /v1/tutorials/{slug}",
+      "difference": "OpenAPI declares the tutorial routes but no successful response schema; rendered 2.5.0 documentation supplies the only response examples.",
+      "raw_policy": "Model the rendered tutorial response fields conservatively with optional fields and flattened unknown-field maps; keep tutorial state server-authoritative rather than inventing persistence semantics.",
+      "evidence": "tutorials/index.md"
+    },
+    {
+      "scope": "POST /v1/replicants/{replicant_code}/teleport",
+      "difference": "OpenAPI continues to describe target as a destination empty_replicant_matrix, while the 2.5.0 FTL Slingshot documentation allows an ftl_slingshot device code whose linked matrix is resolved server-side.",
+      "raw_policy": "Keep the existing string target wire shape and document both matrix and slingshot device codes; do not add a duplicate slingshot transport endpoint.",
+      "evidence": "ftl-slingshots/index.md"
+    },
+    {
+      "scope": "POST /v1/devices/{device_code} system ward activate/deactivate responses",
+      "difference": "Rendered System Wards documentation adds warding, activated/deactivated, and evicted_miners response fields that are absent from DeviceCommandResponseSchema.",
+      "raw_policy": "Promote the documented ward response fields while retaining the existing flattened extra object for forward compatibility.",
+      "evidence": "system-wards/index.md"
+    },
+    {
+      "scope": "POST /v1/devices/{device_code}/retrieve",
+      "difference": "OpenAPI declares the one-time equipment-locker mutation and its DeviceCommandResponse schema, but the rendered api/devices/retrieve page remains the ordinary device-details GET page and does not document this POST.",
+      "raw_policy": "Treat OpenAPI as authoritative for the route, no-body mutation shape, response type, and non-retryable mutation safety; use the changelog and FTL Slingshots/System Wards pages only for equipment-locker gameplay semantics.",
+      "evidence": "openapi.json"
+    },
+    {
+      "scope": "Quickstart GET /v1/replicants/{replicant_code}/inventory example",
+      "difference": "The updated Quickstart renders inventory items as an object map while the unchanged OpenAPI schema still declares the established array shape.",
+      "raw_policy": "Retain the OpenAPI-backed inventory model until authoritative endpoint output confirms a contract change; record the rendered example as a documentation discrepancy rather than guessing a new wire shape.",
+      "evidence": "quickstart/index.md"
     }
   ],
   "notes": [
     "reference/replicant-space/.source-html and .crawl-cache.json are crawler-internal artifacts, not contract content; they may be removed by a future housekeeping change without affecting contract authority.",
     "reference/replicant-space/manifest.json and openapi.json SHA-256 values are verified by scripts/contract_policy_check.py on every run.",
-    "Replicant Space 2.4.0 keeps the route inventory at 72 paths and 86 operations while adding one device-command request schema, bringing the schema total to 160."
+    "Replicant Space 2.5.0 adds three paths/operations (tutorial list/detail and equipment-locker retrieval), keeps the schema count at 160, adds linked_device to four existing device schemas, and documents two new ward events."
   ],
-  "documentation_version": "2.4.0",
-  "documentation_crawled_at": "2026-08-07T00:51:32.098451+00:00",
-  "openapi_version": "2.4.0",
+  "documentation_version": "2.5.0",
+  "documentation_crawled_at": "2026-08-11T15:11:30.311486+00:00",
+  "openapi_version": "2.5.0",
   "documented_operation_delta_count": 0,
-  "documentation_manifest_sha256": "54d5b394a5eb9f0ba54afb9eb1aae9bbad4d55a634a4299c1e7ab6c97c601f15",
-  "documentation_page_count": 84,
+  "documentation_manifest_sha256": "ca133e42a017e0814dc7651ca19a15b2a16bb8b8aad1a83e74a49bab59090a3c",
+  "documentation_page_count": 87,
   "openapi_schema_count": 160
 }

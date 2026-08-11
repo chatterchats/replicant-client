@@ -19,6 +19,8 @@ OVERRIDES = {
     ("GET", "/v1/devices"): ("collection_member", "unfiltered_traversal_only", "full_unfiltered_only"),
     ("GET", "/v1/devices/tags/{tag}"): ("collection_member", "filtered", "never"),
     ("GET", "/v1/devices/{device_code}"): ("entity_snapshot", "complete_entity", "never"),
+    ("GET", "/v1/tutorials"): ("state_neutral", "server_owned_progress", "never"),
+    ("GET", "/v1/tutorials/{slug}"): ("state_neutral", "server_owned_progress", "never"),
     ("GET", "/v1/replicants"): ("public_profile", "public_directory", "never"),
     ("GET", "/v1/replicants/{replicant_code}"): ("authorization_dependent", "owned_or_public_entity", "never"),
     ("GET", "/v1/replicants/{replicant_code}/devices"): ("collection_member", "range_scoped", "never"),
@@ -58,6 +60,6 @@ operations.sort(key=lambda entry: (entry["path"], entry["method"]))
 (ROOT / "policy/authority-matrix.json").write_text(json.dumps({
     "version": 1,
     "sync_domain_policy": "policy/sync-domains.json",
-    "contract": "Verified Replicant Space 2.4.0 OpenAPI corpus",
+    "contract": "Verified Replicant Space 2.5.0 OpenAPI corpus",
     "operations": operations,
 }, indent=2) + "\n")

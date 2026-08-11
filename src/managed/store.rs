@@ -1904,6 +1904,15 @@ fn persist_device(
             target.id.as_str(),
         )?;
     }
+    if let Some(target) = &device.relationships.linked_device {
+        persist_relationship(
+            transaction,
+            device,
+            "linked_device",
+            &target.realm,
+            target.id.as_str(),
+        )?;
+    }
     if let Some(target) = &device.relationships.assigned_replicant {
         persist_relationship(
             transaction,
@@ -2330,6 +2339,41 @@ mod tests {
                 .expect("restored operational device")
                 .value,
             expected
+        );
+    }
+
+    #[test]
+    fn linked_device_relationship_survives_store_round_trip_without_schema_change() {
+        let mut store = Store::open_memory().expect("open memory store");
+        let mut observation = device(Realm::Live, "SLING1");
+        observation.value.device_type = Some(DeviceType::FtlSlingshot);
+        observation.value.relationships.linked_device = Some(DeviceKey::live("MATRIX1".into()));
+
+        store
+            .persist_devices(&[observation])
+            .expect("persist linked slingshot");
+        let restored = store.restore_devices().expect("restore devices");
+        assert_eq!(
+            restored
+                .get(&DeviceKey::live("SLING1".into()))
+                .expect("restored slingshot")
+                .value
+                .relationships
+                .linked_device
+                .as_ref()
+                .map(|key| key.id.as_str()),
+            Some("MATRIX1")
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT target_id FROM device_relationships WHERE realm = 'live' AND device_id = 'SLING1' AND relationship = 'linked_device'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("linked relationship row"),
+            "MATRIX1"
         );
     }
 

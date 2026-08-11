@@ -125,3 +125,73 @@ fn public_observations_do_not_erase_owned_device_relationships() {
         Some("MATRIX")
     );
 }
+
+
+#[test]
+fn linked_device_is_normalized_and_survives_public_merge() {
+    let linked: raw::devices::DeviceStatus = serde_json::from_value(json!({
+        "device_code": "SLING1",
+        "device_type": "ftl_slingshot",
+        "linked_device": "MATRIX1",
+        "replicant_code": "OWNER"
+    }))
+    .expect("linked slingshot fixture");
+    let owned = domain::device_detail(
+        &linked,
+        Realm::Live,
+        AccessScope::Owned,
+        "2026-08-11T00:00:00Z",
+    )
+    .expect("linked device normalizes");
+    assert_eq!(
+        owned
+            .value
+            .relationships
+            .linked_device
+            .as_ref()
+            .map(|key| key.id.as_str()),
+        Some("MATRIX1")
+    );
+
+    let public_raw: raw::devices::DeviceStatus = serde_json::from_value(json!({
+        "device_code": "SLING1",
+        "device_type": "ftl_slingshot"
+    }))
+    .expect("public slingshot fixture");
+    let public = domain::device_detail(
+        &public_raw,
+        Realm::Live,
+        AccessScope::Public,
+        "2026-08-12T00:00:00Z",
+    )
+    .expect("public device normalizes");
+    let merged = match domain::merge_device(owned, public) {
+        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
+        _ => panic!("unknown device merge outcome"),
+    };
+    assert_eq!(
+        merged
+            .value
+            .relationships
+            .linked_device
+            .as_ref()
+            .map(|key| key.id.as_str()),
+        Some("MATRIX1")
+    );
+}
+
+#[test]
+fn pre_2_5_relationship_json_deserializes_without_linked_device() {
+    let relationships: domain::DeviceRelationships = serde_json::from_value(json!({
+        "attached_to": null,
+        "stowed_in": null,
+        "controller": null,
+        "attached_devices": [],
+        "controlled_devices": [],
+        "stowed_devices": [],
+        "assigned_replicant": null,
+        "hosting_replicant": null
+    }))
+    .expect("pre-2.5 relationships remain compatible");
+    assert!(relationships.linked_device.is_none());
+}

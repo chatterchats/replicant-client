@@ -28,7 +28,8 @@ open_value!(EventName {
     SimulationCompleted => "simulation.completed", TradeCompleted => "trade.completed",
     TriangulationComplete => "triangulation.complete",
     TriangulationFailed => "triangulation.failed",
-    TriangulationStarted => "triangulation.started"
+    TriangulationStarted => "triangulation.started",
+    WardActivated => "ward.activated", WardDeactivated => "ward.deactivated"
 });
 open_value!(DeviceCommand {
     Activate => "activate", Deactivate => "deactivate", Deploy => "deploy", Stow => "stow",
@@ -49,7 +50,12 @@ open_value!(DeviceType {
     TransportController => "ami_transport_controller",
     FleetController => "ami_fleet_controller",
     ReplicantInterface => "replicant_interface",
-    FtlRelay => "ftl_relay"
+    FtlRelay => "ftl_relay",
+    FtlSlingshot => "ftl_slingshot",
+    SystemWard => "system_ward",
+    GalacticObservatory => "galactic_observatory",
+    EmptyReplicantMatrix => "empty_replicant_matrix",
+    HeavenVessel => "heaven_vessel"
 });
 // Directive wire values from `reference/replicant-space/ami/*-controller/index.md`.
 open_value!(DeviceDirective {

@@ -592,7 +592,9 @@ pub struct StarDetailResponse {
 /// Request body for `POST /v1/replicants/{replicant_code}/teleport`.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct TeleportRequest {
-    /// The destination matrix code.
+    /// Destination empty replicant matrix code, or an FTL slingshot device
+    /// code whose configured `linked_device` identifies the destination
+    /// matrix.
     pub target: String,
 }
 

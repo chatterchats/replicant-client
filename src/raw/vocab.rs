@@ -148,6 +148,8 @@ open_vocab! {
         TravelArrived => "travel.arrived",
         TravelCancelled => "travel.cancelled",
         TravelDeparted => "travel.departed",
+        WardActivated => "ward.activated",
+        WardDeactivated => "ward.deactivated",
     }
 }
 

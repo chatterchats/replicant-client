@@ -1,7 +1,7 @@
 //! `replicant-client` is a durable, stateful Rust client for building
 //! Replicant Space applications.
 //!
-//! The crate targets the verified Replicant Space `2.4.0` rendered and
+//! The crate targets the verified Replicant Space `2.5.0` rendered and
 //! OpenAPI contract. Contract provenance, operation classifications, and
 //! release-specific schema decisions are recorded under `policy/` and
 //! `docs/contract/`.
@@ -85,7 +85,7 @@ pub mod managed {
         DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
         InventoryGateway, LocationDiagnostic, LocationPredicateDiagnostic,
         LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, ReplicantHandle,
-        ReplicantQuery, ReplicantsGateway,
+        ReplicantQuery, ReplicantsGateway, TutorialsGateway,
     };
     pub use operation::{
         ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationHydration,
@@ -116,8 +116,8 @@ pub use managed::{
     ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
     SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
     SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
-    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
-    TravelPreview, TravelVia,
+    TradeControllerHandle, TradingGateway, TransportController, TransportDirective,
+    TutorialsGateway, TravelBuilder, TravelPreview, TravelVia,
 };
 
 #[cfg(feature = "raw")]

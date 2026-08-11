@@ -864,6 +864,13 @@ impl Client {
         super::gateways::AccountGateway::new(self.clone())
     }
 
+    /// Account tutorial progress. Reads are state-neutral and remain
+    /// authoritative on the server rather than entering durable projections.
+    #[must_use]
+    pub fn tutorials(&self) -> super::gateways::TutorialsGateway {
+        super::gateways::TutorialsGateway::new(self.clone())
+    }
+
     /// Managed device observations commit and publish before this gateway returns.
     #[must_use]
     pub fn devices(&self) -> super::gateways::DevicesGateway {

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Contract and deprecation policy gate for replicant-client.
 
-Verifies the checked-in Replicant Space 2.4.0 OpenAPI and rendered-document
+Verifies the checked-in Replicant Space 2.5.0 OpenAPI and rendered-document
 corpus:
 
 - the OpenAPI and documentation-manifest checksums match recorded provenance;
 - policy/operations.json is not stale relative to the live OpenAPI document;
-- the inventory totals are exactly 86 operations, 79 supported, 7 excluded
+- the inventory totals are exactly 89 operations, 82 supported, 7 excluded
   (5 deprecated + 2 admin);
 - every excluded operation has a reason and evidence file, and its
   method/path actually exists in the OpenAPI document;
@@ -127,8 +127,8 @@ def check_operation_inventory(spec: dict) -> None:
 
     totals = checked_in["totals"]
     expected_totals = {
-        "total_operations": 86,
-        "supported": 79,
+        "total_operations": 89,
+        "supported": 82,
         "deprecated": 5,
         "admin": 2,
         "excluded": 7,
@@ -211,6 +211,11 @@ def check_contract_mismatches(metadata: dict) -> None:
         "GET /v1/events/stream",
         "GET /v1/devices/{device_code}/audit and GET/POST/DELETE /v1/devices/{device_code}/permissions",
         "Five current trading operations",
+        "GET /v1/tutorials and GET /v1/tutorials/{slug}",
+        "POST /v1/replicants/{replicant_code}/teleport",
+        "POST /v1/devices/{device_code} system ward activate/deactivate responses",
+        "POST /v1/devices/{device_code}/retrieve",
+        "Quickstart GET /v1/replicants/{replicant_code}/inventory example",
     }
     if not required.issubset(scopes):
         fail("policy/contract-metadata.json is missing raw transport contract mismatches")
@@ -327,9 +332,9 @@ def main() -> None:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
 
-    print("contract policy check passed: Replicant Space 2.4.0 corpus, "
-          "72 paths, 86 OpenAPI operations (79 supported, 5 deprecated, "
-          "2 admin), 160 schemas, 84 rendered documentation pages; "
+    print("contract policy check passed: Replicant Space 2.5.0 corpus, "
+          "75 paths, 89 OpenAPI operations (82 supported, 5 deprecated, "
+          "2 admin), 160 schemas, 87 rendered documentation pages; "
           "message_notify excluded; mining aliases recorded; no stray "
           "replicant-sdk references.")
 

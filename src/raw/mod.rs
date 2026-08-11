@@ -61,6 +61,7 @@ pub mod reputation;
 pub mod simulations;
 pub mod species;
 pub mod trading;
+pub mod tutorials;
 
 pub use client::{
     Client, ClientBuilder, ClientConfig, MutableTokenProvider, RawResponse, RequestId,
@@ -165,6 +166,12 @@ impl Client {
     #[must_use]
     pub fn species(&self) -> species::SpeciesClient {
         species::SpeciesClient::new(self.clone())
+    }
+
+    /// Tutorial progress for the authenticated account.
+    #[must_use]
+    pub fn tutorials(&self) -> tutorials::TutorialsClient {
+        tutorials::TutorialsClient::new(self.clone())
     }
 
     /// Device-hosted and replicant-visible trade operations.

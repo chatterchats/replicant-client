@@ -2158,6 +2158,7 @@ async fn ensure_claim(
                     add_tags: Some(missing),
                     remove_tags: None,
                     tags: None,
+                    ..Default::default()
                 })
                 .await?,
         )
@@ -2187,6 +2188,7 @@ async fn remove_tag(client: &Client, code: &str, tag: &str) -> AnyResult<()> {
                     add_tags: None,
                     remove_tags: Some(vec![tag.to_owned()]),
                     tags: None,
+                    ..Default::default()
                 })
                 .await?,
         )

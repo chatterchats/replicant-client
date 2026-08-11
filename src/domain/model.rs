@@ -21,6 +21,10 @@ pub struct DeviceRelationships {
     #[serde(default)]
     pub stowed_in: Option<DeviceKey>,
     pub controller: Option<DeviceKey>,
+    /// Device linked through configuration, such as an FTL slingshot's
+    /// destination empty replicant matrix.
+    #[serde(default)]
+    pub linked_device: Option<DeviceKey>,
     #[serde(default)]
     pub attached_devices: Vec<DeviceKey>,
     #[serde(default)]

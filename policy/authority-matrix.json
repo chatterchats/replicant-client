@@ -1,7 +1,7 @@
 {
   "version": 1,
   "sync_domain_policy": "policy/sync-domains.json",
-  "contract": "Verified Replicant Space 2.4.0 OpenAPI corpus",
+  "contract": "Verified Replicant Space 2.5.0 OpenAPI corpus",
   "operations": [
     {
       "method": "POST",
@@ -181,6 +181,13 @@
     {
       "method": "POST",
       "path": "/v1/devices/{device_code}/permissions",
+      "authority": "operation_result",
+      "completeness": "mutation_response",
+      "tombstone": "never"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/devices/{device_code}/retrieve",
       "authority": "operation_result",
       "completeness": "mutation_response",
       "tombstone": "never"
@@ -555,6 +562,20 @@
       "authority": "complete_collection",
       "completeness": "complete_catalogue",
       "tombstone": "atomic_replace"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tutorials",
+      "authority": "state_neutral",
+      "completeness": "server_owned_progress",
+      "tombstone": "never"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tutorials/{slug}",
+      "authority": "state_neutral",
+      "completeness": "server_owned_progress",
+      "tombstone": "never"
     }
   ]
 }

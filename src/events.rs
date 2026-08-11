@@ -347,6 +347,19 @@ pub struct BlueprintUnlockedPayload {
     pub extra: JsonObject,
 }
 
+/// Typed payload for `ward.activated` and `ward.deactivated`.
+///
+/// Replicant Space 2.5.0 currently documents these events with an empty
+/// payload. Unknown fields are retained so future ward metadata does not
+/// require a breaking decoder change.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct WardTransitionPayload {
+    /// Future ward-transition fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
 /// One account-wide game event.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -468,6 +481,18 @@ impl GameEvent {
     /// different event name.
     pub fn triangulation_failed(&self) -> Result<Option<TriangulationFailedPayload>, Error> {
         self.decode_payload("triangulation.failed")
+    }
+
+    /// Decodes this event as `ward.activated`, returning `None` for a
+    /// different event name.
+    pub fn ward_activated(&self) -> Result<Option<WardTransitionPayload>, Error> {
+        self.decode_payload("ward.activated")
+    }
+
+    /// Decodes this event as `ward.deactivated`, returning `None` for a
+    /// different event name.
+    pub fn ward_deactivated(&self) -> Result<Option<WardTransitionPayload>, Error> {
+        self.decode_payload("ward.deactivated")
     }
 
     /// Decodes this event as `trade.completed`, returning `None` for a

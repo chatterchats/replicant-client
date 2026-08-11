@@ -88,6 +88,7 @@ pub fn merge_device(
             existing.value.relationships.assigned_replicant;
         incoming.value.relationships.hosting_replicant =
             existing.value.relationships.hosting_replicant;
+        incoming.value.relationships.linked_device = existing.value.relationships.linked_device;
         incoming.value.relationships.stowed_in = existing.value.relationships.stowed_in;
         incoming.value.relationships.attached_devices =
             existing.value.relationships.attached_devices;

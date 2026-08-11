@@ -293,6 +293,7 @@ fn device(
             attached_to: related(&raw.attached_to_device_code),
             stowed_in: related(&raw.stowed_in_device_code),
             controller: related(&raw.controller_device_code),
+            linked_device: related(&raw.linked_device),
             attached_devices: related_device_list(&raw.attached_devices, &realm),
             controlled_devices: related_device_list(&raw.controlled_devices, &realm),
             stowed_devices: related_device_list(&raw.stowed_devices, &realm),

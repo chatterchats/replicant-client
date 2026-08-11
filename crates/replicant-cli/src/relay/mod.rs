@@ -2310,6 +2310,7 @@ async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -
                 add_tags: Some(vec![mission_tag]),
                 remove_tags: None,
                 tags: None,
+                ..Default::default()
             })
             .await?;
         ensure_operation_accepted(&operation).await?;
@@ -2327,6 +2328,7 @@ async fn release_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) 
                 add_tags: None,
                 remove_tags: Some(vec![mission_tag]),
                 tags: None,
+                ..Default::default()
             })
             .await?;
         ensure_operation_accepted(&operation).await?;
