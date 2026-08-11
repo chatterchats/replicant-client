@@ -33,3 +33,5 @@ logs/
 mining-expansion*
 *.lock
 !cargo.lock
+*.log
+*.txt
