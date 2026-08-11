@@ -2,7 +2,7 @@ SHELL := /bin/sh
 CARGO ?= cargo
 PYTHON ?= python3
 
-.PHONY: help fmt fmt-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci
+.PHONY: help fmt fmt-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci zip
 
 help:
 	@printf '%s\n' \
@@ -19,7 +19,8 @@ help:
 	  'contract-policy-check  		Verify the Replicant Space 2.4.0 operation inventory and exclusions' \
 	  'observability-policy-check 	Verify tracing targets, timing events, and secret guards' \
 	  'policy-checks          		Run all checked-in policy gates' \
-	  'ci                    		Run the full local CI-equivalent suite'
+	  'ci                    		Run the full local CI-equivalent suite' \
+	  'zip                    		Create a clean working-tree ZIP for handoff'
 
 clean:
 	$(CARGO) clean
@@ -58,3 +59,6 @@ policy-checks: contract-policy-check
 	$(PYTHON) scripts/authority_matrix_check.py
 
 ci: fmt-check lint test check-all doc policy-checks
+
+zip:
+	$(PYTHON) scripts/repo_zip.py $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
