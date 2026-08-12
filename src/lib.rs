@@ -116,8 +116,8 @@ pub use managed::{
     ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
     SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
     SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
-    TradeControllerHandle, TradingGateway, TransportController, TransportDirective,
-    TutorialsGateway, TravelBuilder, TravelPreview, TravelVia,
+    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
+    TravelPreview, TravelVia, TutorialsGateway,
 };
 
 #[cfg(feature = "raw")]

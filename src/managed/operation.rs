@@ -411,9 +411,14 @@ fn ensure_no_secrets(value: &Value) -> Result<()> {
 }
 
 fn sanitize_error(error: &Error) -> Value {
+    let server = error
+        .details()
+        .and_then(|details| details.body_excerpt.as_deref())
+        .and_then(|body| serde_json::from_str::<Value>(body).ok());
     serde_json::json!({
         "message": error.to_string(),
         "status": error.status(),
+        "server": server,
     })
 }
 
@@ -1434,6 +1439,12 @@ fn operation_evidence(adapter: &MutationAdapter) -> Value {
             "payload": {},
             "expected_state": null
         }),
+        raw::devices::DeviceCommand::Prospect { .. } => serde_json::json!({
+            "event_names": ["prospect.completed"],
+            "failure_event_names": [],
+            "payload": {},
+            "expected_state": null
+        }),
         raw::devices::DeviceCommand::Triangulate { signature, target } => serde_json::json!({
             "event_names": ["triangulation.complete"],
             "failure_event_names": ["triangulation.failed"],
@@ -2010,10 +2021,7 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
                     Ok(_) => {
                         client
                             .managed_state()
-                            .set_operation_state(
-                                id.as_str(),
-                                OperationStatus::Completed.as_str(),
-                            )
+                            .set_operation_state(id.as_str(), OperationStatus::Completed.as_str())
                             .map_err(persistence_error)?;
                         notify(client, id, OperationStatus::Completed);
                     }
@@ -2396,10 +2404,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/v1/devices/D1"))
-            .respond_with(
-                ResponseTemplate::new(422)
-                    .set_body_json(serde_json::json!({"error": "invalid tag"})),
-            )
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "error": "invalid tag",
+                "detail": {"field": "tags", "reason": "reserved"}
+            })))
             .mount(&server)
             .await;
         let client = client_at(&server.uri()).await;
@@ -2413,7 +2421,16 @@ mod tests {
         .expect("operation created");
         let outcome = operation.outcome().await.expect("outcome");
         assert_eq!(outcome.status, OperationStatus::Rejected);
-        assert!(outcome.response.is_some());
+        assert_eq!(
+            outcome
+                .response
+                .as_ref()
+                .and_then(|response| response.get("server"))
+                .and_then(|server| server.get("detail"))
+                .and_then(|detail| detail.get("reason"))
+                .and_then(Value::as_str),
+            Some("reserved")
+        );
         client.close().await.expect("close");
     }
 
@@ -2721,6 +2738,21 @@ mod tests {
 
         server.verify().await;
         client.close().await.expect("close");
+    }
+
+    #[test]
+    fn prospect_uses_completed_event_as_typed_evidence() {
+        let evidence = operation_evidence(&MutationAdapter::DeviceCommand {
+            device_code: "OBS1".into(),
+            command: raw::devices::DeviceCommand::Prospect {
+                direction: Some(vec![0.0, -1.0, 0.0]),
+            },
+        });
+        assert_eq!(
+            evidence["event_names"],
+            serde_json::json!(["prospect.completed"])
+        );
+        assert_eq!(evidence["failure_event_names"], serde_json::json!([]));
     }
 
     #[test]

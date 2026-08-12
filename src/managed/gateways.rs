@@ -1025,6 +1025,19 @@ impl DeviceHandle {
         self.command(raw::devices::DeviceCommand::Unfurl).await
     }
 
+    /// Begins a galactic-observatory prospect in an optional direction vector.
+    ///
+    /// Passing `None` uses the server's documented default: outward from Sol.
+    /// Any non-zero vector is accepted by the wire contract; normalization is
+    /// deliberately left to callers because vector magnitude has no semantic
+    /// meaning for prospecting.
+    pub async fn prospect(&self, direction: Option<[f64; 3]>) -> Result<Operation> {
+        self.command(raw::devices::DeviceCommand::Prospect {
+            direction: direction.map(Vec::from),
+        })
+        .await
+    }
+
     /// Triangulates a spectral signature from a three-dimensional reference point.
     pub async fn triangulate(
         &self,
@@ -2586,6 +2599,39 @@ mod tests {
                 .any(|inventory| inventory.location.as_ref().unwrap().id.as_str() == "SOL-BELT-1")
         );
 
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn prospect_serializes_the_documented_direction_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/OBS1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "prospecting",
+                "completes_at": "2026-08-11T18:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        let device = DeviceHandle::for_test(client.clone(), DeviceKey::live("OBS1".into()));
+
+        device
+            .prospect(Some([0.0, -1.0, 0.0]))
+            .await
+            .expect("durable prospect operation");
+
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = requests[0].body_json().expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "command": "prospect",
+                "direction": [0.0, -1.0, 0.0]
+            })
+        );
         server.verify().await;
         client.close().await.expect("close");
     }
