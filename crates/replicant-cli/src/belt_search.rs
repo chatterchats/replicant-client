@@ -51,8 +51,8 @@ impl Config {
         let mut database = env::var_os("REPLICANT_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE));
-        let mut replicant = env::var("RS_BELT_SEARCH_REPLICANT")
-            .unwrap_or_else(|_| DEFAULT_REPLICANT.to_owned());
+        let mut replicant =
+            env::var("RS_BELT_SEARCH_REPLICANT").unwrap_or_else(|_| DEFAULT_REPLICANT.to_owned());
         let mut systems = Vec::new();
         let mut route_start = env::var("RS_BELT_SEARCH_START")
             .ok()
@@ -115,7 +115,9 @@ impl Config {
                 "--wait-timeout-secs" => {
                     let value = next_value(&mut arguments, "--wait-timeout-secs")?;
                     let seconds = value.parse::<u64>().map_err(|_| {
-                        app_error(format!("--wait-timeout-secs must be an integer, got {value:?}"))
+                        app_error(format!(
+                            "--wait-timeout-secs must be an integer, got {value:?}"
+                        ))
                     })?;
                     if seconds == 0 {
                         return Err(app_error("--wait-timeout-secs must be greater than zero"));
@@ -209,10 +211,7 @@ struct BeltRoutePlan {
 
 impl BeltRoutePlan {
     fn systems(&self) -> Vec<String> {
-        self.stops
-            .iter()
-            .map(|stop| stop.system.clone())
-            .collect()
+        self.stops.iter().map(|stop| stop.system.clone()).collect()
     }
 }
 
@@ -284,23 +283,22 @@ async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
         );
     }
 
-    let route_plan = if let (Some(start), Some(radius_ly)) =
-        (config.route_start.as_deref(), config.radius_ly)
-    {
-        Some(
-            plan_belt_route(
-                client,
-                &replicant_code,
-                start,
-                radius_ly,
-                config.system_limit,
-                config.include_explored,
+    let route_plan =
+        if let (Some(start), Some(radius_ly)) = (config.route_start.as_deref(), config.radius_ly) {
+            Some(
+                plan_belt_route(
+                    client,
+                    &replicant_code,
+                    start,
+                    radius_ly,
+                    config.system_limit,
+                    config.include_explored,
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let systems = route_plan
         .as_ref()
         .map(BeltRoutePlan::systems)
@@ -365,7 +363,11 @@ async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
 
         println!(
             "  scan: {}",
-            if scanned_now { "completed" } else { "already known" }
+            if scanned_now {
+                "completed"
+            } else {
+                "already known"
+            }
         );
         if belts.is_empty() {
             println!("  belts: none");
@@ -652,10 +654,7 @@ fn print_route_plan(plan: &BeltRoutePlan, include_explored: bool) {
     }
 }
 
-async fn resolve_owned_replicant(
-    client: &Client,
-    requested: &str,
-) -> crate::AnyResult<Replicant> {
+async fn resolve_owned_replicant(client: &Client, requested: &str) -> crate::AnyResult<Replicant> {
     let handles = client.replicants().find().owned().collect().await?;
     let mut matches = Vec::new();
     for handle in handles {
@@ -713,9 +712,7 @@ async fn travel_to_system(
             .as_ref()
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
-        if !planned_destination
-            .is_some_and(|planned| designation_in_system(planned, destination))
-        {
+        if !planned_destination.is_some_and(|planned| designation_in_system(planned, destination)) {
             return Err(app_error(format!(
                 "replicant {replicant_code} is already traveling to {planned_destination:?}, not system {destination}"
             )));
@@ -827,11 +824,7 @@ async fn system_is_explored(
         == Some(true))
 }
 
-async fn scan_system(
-    client: &Client,
-    replicant_code: &str,
-    system: &str,
-) -> crate::AnyResult<()> {
+async fn scan_system(client: &Client, replicant_code: &str, system: &str) -> crate::AnyResult<()> {
     info!(
         replicant = %replicant_code,
         system,
@@ -1071,9 +1064,11 @@ fn parse_positive_f64(option: &str, value: &str) -> crate::AnyResult<f64> {
 }
 
 fn parse_positive_usize(option: &str, value: &str) -> crate::AnyResult<usize> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| app_error(format!("{option} must be a positive integer, got {value:?}")))?;
+    let parsed = value.parse::<usize>().map_err(|_| {
+        app_error(format!(
+            "{option} must be a positive integer, got {value:?}"
+        ))
+    })?;
     if parsed == 0 {
         return Err(app_error(format!("{option} must be greater than zero")));
     }
@@ -1134,7 +1129,10 @@ fn init_logging(config: &Config) -> crate::AnyResult<()> {
             .try_init()
             .map_err(|error| app_error(error.to_string()))?,
         (Some(path), verbose) => {
-            if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
                 fs::create_dir_all(parent)?;
             }
             let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -1252,7 +1250,10 @@ mod tests {
     }
     #[test]
     fn route_start_accepts_child_location_designations() {
-        let catalogue = vec![star("SCEPTURUM", [0.0, 0.0, 0.0]), star("SOL", [1.0, 0.0, 0.0])];
+        let catalogue = vec![
+            star("SCEPTURUM", [0.0, 0.0, 0.0]),
+            star("SOL", [1.0, 0.0, 0.0]),
+        ];
         let resolved = resolve_route_start(&catalogue, "SCEPTURUM-BELT-1").unwrap();
         assert_eq!(resolved.key.id.as_str(), "SCEPTURUM");
     }
@@ -1309,5 +1310,4 @@ mod tests {
         assert!(parse_positive_f64("--range", "0").is_err());
         assert!(parse_positive_f64("--range", "NaN").is_err());
     }
-
 }

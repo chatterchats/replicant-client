@@ -124,9 +124,7 @@ impl Config {
                     config.profile.hub_maintenance_drones = parse(&mut args, &arg)?
                 }
                 "--root-relays" => config.profile.root_relays = parse(&mut args, &arg)?,
-                "--expansion-relays" => {
-                    config.profile.expansion_relays = parse(&mut args, &arg)?
-                }
+                "--expansion-relays" => config.profile.expansion_relays = parse(&mut args, &arg)?,
                 "--ftl-beacons" => config.profile.ftl_beacons = parse(&mut args, &arg)?,
                 "--seed-quantity" => config.seed_quantity = parse(&mut args, &arg)?,
                 "--quick-scout-radius" => config.quick_scout_radius_ly = parse(&mut args, &arg)?,

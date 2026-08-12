@@ -147,9 +147,7 @@ fn parse_config(arguments: Vec<String>) -> crate::AnyResult<Config> {
                 insert_region_list(&mut config.ignore_regions, &value)?;
             }
             "--execute" | "--apply" => config.execute = true,
-            "--database" => {
-                config.database = PathBuf::from(required(&mut arguments, &argument)?)
-            }
+            "--database" => config.database = PathBuf::from(required(&mut arguments, &argument)?),
             "--verbose" => config.verbose = true,
             "--log-file" => {
                 config.log_file = Some(PathBuf::from(required(&mut arguments, &argument)?))
@@ -400,7 +398,9 @@ fn resolve_selected_regions(
         selected.remove(ignored);
     }
     if selected.is_empty() {
-        return Err(app_error("region selection is empty after applying exclusions"));
+        return Err(app_error(
+            "region selection is empty after applying exclusions",
+        ));
     }
     Ok(selected)
 }
@@ -556,8 +556,9 @@ fn region_for_location(catalogue: &[Star], location: &str) -> Option<String> {
 
 fn canonical_region(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
-        "sol" | "sol-region" | "sol_region" | "solregion" | "sol-zone" | "sol_zone"
-        | "solzone" => "solzone".to_owned(),
+        "sol" | "sol-region" | "sol_region" | "solregion" | "sol-zone" | "sol_zone" | "solzone" => {
+            "solzone".to_owned()
+        }
         value => value.to_owned(),
     }
 }
@@ -611,7 +612,10 @@ fn print_selection(selection: &SelectionSummary, json: bool) -> crate::AnyResult
         selection.already_target_owned
     );
     println!("  In transit: {}", selection.in_transit.len());
-    println!("  Unresolved location: {}", selection.unresolved_location.len());
+    println!(
+        "  Unresolved location: {}",
+        selection.unresolved_location.len()
+    );
     println!("  Unregioned: {}", selection.unregioned.len());
     println!(
         "  No change_owner command: {}",
@@ -765,8 +769,8 @@ fn app_error(message: impl Into<String>) -> crate::AnyError {
 mod tests {
     use super::*;
     use replicant_client::domain::{
-        AccessScope, DeviceId, DeviceKey, DeviceRelationships, LocationId, LocationKey, ReplicantId,
-        ReplicantKey, StarId, StarKey,
+        AccessScope, DeviceId, DeviceKey, DeviceRelationships, LocationId, LocationKey,
+        ReplicantId, ReplicantKey, StarId, StarKey,
     };
 
     fn device(code: &str, location: Option<&str>, owner: Option<&str>) -> Device {
@@ -780,8 +784,7 @@ mod tests {
             available_directives: Vec::new(),
             tags: Vec::new(),
             relationships: DeviceRelationships {
-                assigned_replicant: owner
-                    .map(|value| ReplicantKey::live(ReplicantId::from(value))),
+                assigned_replicant: owner.map(|value| ReplicantKey::live(ReplicantId::from(value))),
                 ..DeviceRelationships::default()
             },
             attach_capacity: None,
@@ -880,10 +883,7 @@ mod tests {
         vessel.travel = Some(replicant_client::domain::TravelState::default());
         let mut cargo = device("CARGO", None, Some("R3"));
         cargo.relationships.stowed_in = Some(vessel.key.clone());
-        let devices = BTreeMap::from([
-            ("VESSEL".to_owned(), vessel),
-            ("CARGO".to_owned(), cargo),
-        ]);
+        let devices = BTreeMap::from([("VESSEL".to_owned(), vessel), ("CARGO".to_owned(), cargo)]);
         let selected = BTreeSet::from(["alpha".to_owned()]);
 
         let result = select_candidates(
@@ -901,14 +901,10 @@ mod tests {
     fn replicant_hosting_vessels_are_never_selected_but_their_cargo_can_be() {
         let catalogue = vec![star("SCEPTURUM", Some("alpha"))];
         let mut vessel = device("VESSEL", Some("SCEPTURUM-OORT"), Some("R3"));
-        vessel.relationships.hosting_replicant =
-            Some(ReplicantKey::live(ReplicantId::from("R3")));
+        vessel.relationships.hosting_replicant = Some(ReplicantKey::live(ReplicantId::from("R3")));
         let mut cargo = device("CARGO", None, Some("R3"));
         cargo.relationships.stowed_in = Some(vessel.key.clone());
-        let devices = BTreeMap::from([
-            ("VESSEL".to_owned(), vessel),
-            ("CARGO".to_owned(), cargo),
-        ]);
+        let devices = BTreeMap::from([("VESSEL".to_owned(), vessel), ("CARGO".to_owned(), cargo)]);
         let selected = BTreeSet::from(["alpha".to_owned()]);
 
         let result = select_candidates(

@@ -100,7 +100,9 @@ pub enum PlannerError {
     #[error("Surge Carrier attach capacity must be positive")]
     MissingCarrierCapacity,
     /// A Surge Carrier is too small to keep one complete mining setup together.
-    #[error("Surge Carrier attach capacity {actual} cannot hold a complete {required}-device mining setup")]
+    #[error(
+        "Surge Carrier attach capacity {actual} cannot hold a complete {required}-device mining setup"
+    )]
     CarrierCapacityTooSmall {
         /// Required capacity for one mining setup.
         required: i64,

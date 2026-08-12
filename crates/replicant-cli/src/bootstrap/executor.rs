@@ -401,7 +401,8 @@ async fn manufacture_ark(
 
     let required_carriers = required_role_carriers(&mission.profile, &desired, carrier_capacity)?;
     let current_carriers = i64::try_from(mission.assets.get(SURGE_CARRIER).map_or(0, Vec::len))?;
-    let additional_reuse_needed = usize::try_from(required_carriers.saturating_sub(current_carriers))?;
+    let additional_reuse_needed =
+        usize::try_from(required_carriers.saturating_sub(current_carriers))?;
     let mut candidates = devices
         .iter()
         .filter(|device| eligible_idle(device, &mission.mission_tag))
@@ -698,9 +699,8 @@ async fn wait_for_printed_assets(
                         .get("tags")
                         .and_then(serde_json::Value::as_array)
                         .is_some_and(|tags| {
-                            tags.iter().any(|tag| {
-                                tag.as_str() == Some(mission.mission_tag.as_str())
-                            })
+                            tags.iter()
+                                .any(|tag| tag.as_str() == Some(mission.mission_tag.as_str()))
                         })
                     {
                         break;
@@ -889,13 +889,7 @@ async fn load_ark(
         .collect::<BTreeMap<_, _>>();
     let collect_results = join_all(mission.seed_freighters.iter().map(|seed| {
         let cargo = cargo_by_device.get(&seed.code).cloned().unwrap_or_default();
-        collect_resource_with_cargo(
-            client,
-            &seed.code,
-            &seed.resource,
-            seed.quantity,
-            cargo,
-        )
+        collect_resource_with_cargo(client, &seed.code, &seed.resource, seed.quantity, cargo)
     }))
     .await;
     finish_all(collect_results)?;
@@ -936,7 +930,9 @@ async fn queue_borrowed_carrier_replacements(
     mission.carrier_replacement_print.targets =
         [(SURGE_CARRIER.to_owned(), target)].into_iter().collect();
     mission.carrier_replacement_print.requirements = if remaining > 0 {
-        [(SURGE_CARRIER.to_owned(), remaining)].into_iter().collect()
+        [(SURGE_CARRIER.to_owned(), remaining)]
+            .into_iter()
+            .collect()
     } else {
         BTreeMap::new()
     };
@@ -945,7 +941,10 @@ async fn queue_borrowed_carrier_replacements(
     save_mission(&config.mission_file, mission)?;
 
     if remaining == 0 {
-        info!(target, completed, pending, "source-hub carrier replacements already accounted for");
+        info!(
+            target,
+            completed, pending, "source-hub carrier replacements already accounted for"
+        );
         return Ok(());
     }
 
@@ -1034,7 +1033,11 @@ async fn append_missing_carrier_loads(
     carriers.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
 
     if mission.carrier_loads.is_empty() {
-        let role_capacity = carriers.iter().map(|(_, capacity)| *capacity).max().unwrap_or(9);
+        let role_capacity = carriers
+            .iter()
+            .map(|(_, capacity)| *capacity)
+            .max()
+            .unwrap_or(9);
         let (reserved, general) = fresh_role_payloads(
             &mission.profile,
             &mission.assets,
@@ -1207,7 +1210,11 @@ fn append_general_carrier_loads(
     let existing_general = mission
         .carrier_loads
         .iter()
-        .filter(|load| load.role.as_deref().is_some_and(|role| role.starts_with("general-")))
+        .filter(|load| {
+            load.role
+                .as_deref()
+                .is_some_and(|role| role.starts_with("general-"))
+        })
         .count();
     for (offset, (carrier, capacity)) in carriers.into_iter().enumerate() {
         let take = usize::try_from(capacity.max(0))?.min(payload.len().saturating_sub(cursor));
@@ -2872,11 +2879,7 @@ async fn start_device_travel_matching(
     .await
 }
 
-fn managed_device_at(
-    device: &Device,
-    destination: &str,
-    destination_system: Option<&str>,
-) -> bool {
+fn managed_device_at(device: &Device, destination: &str, destination_system: Option<&str>) -> bool {
     device.travel.is_none()
         && device.location.as_ref().is_some_and(|location| {
             destination_matches(location.id.as_str(), destination, destination_system)
