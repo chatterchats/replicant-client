@@ -1203,6 +1203,9 @@ async fn hydrate_factory_workloads(
         device.stock.device_type == AUTOFACTORY && device.stock.location.as_deref() == Some(home)
     }) {
         let detail = client.raw().devices().get(&device.stock.code).await?.value;
+        if detail.status.is_some() {
+            device.stock.status = detail.status.clone();
+        }
         device.printing_eta_seconds = detail
             .printing
             .and_then(|printing| printing.eta_seconds)
@@ -1277,6 +1280,7 @@ fn build_factory_workloads(
         .filter(|device| {
             device.stock.device_type == AUTOFACTORY
                 && device.stock.location.as_deref() == Some(home)
+                && !factory_status_blocks_printing(device.stock.status.as_deref())
         })
         .map(|device| {
             let queued = device
@@ -1534,6 +1538,14 @@ fn display_name(value: &str) -> String {
         .join(" ")
 }
 
+fn factory_status_blocks_printing(status: Option<&str>) -> bool {
+    status.is_some_and(|status| {
+        status.eq_ignore_ascii_case("compacted")
+            || status.eq_ignore_ascii_case("compacting")
+            || status.eq_ignore_ascii_case("unfurling")
+    })
+}
+
 fn system_from_location(location: &str) -> String {
     location
         .split('-')
@@ -1686,6 +1698,17 @@ mod tests {
             "location": location,
         }))
         .expect("location event")
+    }
+
+    #[test]
+    fn compacted_autofactories_are_not_event_print_workloads() {
+        assert!(factory_status_blocks_printing(Some("compacted")));
+        assert!(factory_status_blocks_printing(Some("compacting")));
+        assert!(factory_status_blocks_printing(Some("unfurling")));
+        assert!(!factory_status_blocks_printing(Some("idle")));
+        assert!(!factory_status_blocks_printing(Some(
+            "waiting_for_resources"
+        )));
     }
 
     #[test]

@@ -383,7 +383,6 @@ async fn submit_print_batches(
     purpose: PrintPurpose,
 ) -> AnyResult<()> {
     let blueprints = fetch_blueprints(client).await?;
-    let devices = refresh_device_snapshots(client).await?;
     let deadline = Instant::now() + config.wait_timeout;
     let mut reported_factories = false;
     loop {
@@ -391,8 +390,7 @@ async fn submit_print_batches(
         if purpose == PrintPurpose::Site {
             progress_site_pipeline(client, config, mission).await?;
         }
-        let factories =
-            factory_workloads(client, &devices, &blueprints, &mission.hub_location).await?;
+        let factories = factory_workloads(client, &blueprints, &mission.hub_location).await?;
         let reassigned =
             rebalance_pending_print_batches(mission, purpose, &blueprints, &factories)?;
         if !reported_factories {

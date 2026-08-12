@@ -18,7 +18,7 @@ use replicant_mining_planner::{
     add_quantities, blueprint_resource_cost, mining_site_requirements, schedule_prints, shortages,
     site_tag,
 };
-use replicant_printing::managed::inspect_factory;
+use replicant_printing::managed::discover_factories;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::info;
@@ -30,7 +30,6 @@ const PLAN_VERSION: u32 = 1;
 const DEFAULT_REPLICANT: &str = "Chats-1";
 const DEFAULT_HUB: &str = "SCEPTURUM-BELT-1";
 const DEFAULT_PLAN_PATH: &str = "mining-expansion.json";
-const AUTOFACTORY: &str = "autofactory";
 const DEFAULT_WAIT_SECONDS: u64 = 21_600;
 
 /// Error type returned by the reusable mining workflow.
@@ -588,7 +587,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
     let systems = config.requested_systems()?;
     let devices = refresh_device_snapshots(client).await?;
     let blueprints = fetch_blueprints(client).await?;
-    let factories = factory_workloads(client, &devices, &blueprints, &config.hub).await?;
+    let factories = factory_workloads(client, &blueprints, &config.hub).await?;
 
     let mut sites = Vec::new();
     for system in systems {
@@ -1130,20 +1129,14 @@ async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, Bluepri
 
 async fn factory_workloads(
     client: &Client,
-    devices: &[Device],
     blueprints: &BTreeMap<String, BlueprintSpec>,
     hub: &str,
 ) -> AnyResult<Vec<FactoryWorkload>> {
-    let mut factories = Vec::new();
-    for device in devices.iter().filter(|device| {
-        device_type(device) == Some(AUTOFACTORY) && device_location(device) == Some(hub)
-    }) {
-        factories.push(
-            inspect_factory(client, device.key.id.as_str(), blueprints)
-                .await?
-                .workload(),
-        );
-    }
+    let mut factories = discover_factories(client, hub, blueprints)
+        .await?
+        .into_iter()
+        .map(|factory| factory.workload())
+        .collect::<Vec<_>>();
     factories.sort_by(|left, right| left.code.cmp(&right.code));
     Ok(factories)
 }

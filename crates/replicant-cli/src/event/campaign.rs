@@ -1025,11 +1025,11 @@ async fn ensure_campaign_printer_lanes(
         if mission.phase.is_terminal()
             || mission.selected_criterion.print_schedule.batches.is_empty()
             || persisted_prints_complete(&mission)
-            || !mission.execution.printer_lanes.is_empty()
         {
             continue;
         }
 
+        let previous_lanes = mission.execution.printer_lanes.clone();
         let total_units = mission
             .selected_criterion
             .print_devices
@@ -1046,17 +1046,26 @@ async fn ensure_campaign_printer_lanes(
         } else {
             1
         };
-        let mut lanes = mission
+        let mut lane_set = mission
             .execution
-            .print_batches
+            .printer_lanes
             .iter()
-            .filter(|batch| batch.submitted)
-            .filter(|batch| i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity))
-            .map(|batch| batch.factory_code.clone())
-            .filter(|code| factory_codes.contains(code))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .filter(|code| factory_codes.contains(*code))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        lane_set.extend(
+            mission
+                .execution
+                .print_batches
+                .iter()
+                .filter(|batch| batch.submitted)
+                .filter(|batch| {
+                    i64::try_from(batch.produced_codes.len()).ok() != Some(batch.quantity)
+                })
+                .map(|batch| batch.factory_code.clone())
+                .filter(|code| factory_codes.contains(code)),
+        );
+        let mut lanes = lane_set.into_iter().collect::<Vec<_>>();
         let needed = desired.saturating_sub(lanes.len());
         let additional_lanes = factories
             .iter()
@@ -1067,19 +1076,26 @@ async fn ensure_campaign_printer_lanes(
             .map(|factory| factory.code.clone())
             .collect::<Vec<_>>();
         lanes.extend(additional_lanes);
-        if lanes.is_empty() {
-            continue;
-        }
         lanes.sort();
         lanes.dedup();
         reserved.extend(lanes.iter().cloned());
-        mission.execution.printer_lanes = lanes.clone();
-        save_plan(&record.mission_path, &mission)?;
-        info!(
-            event = %record.event_designation,
-            lanes = %lanes.join(","),
-            "reserved event Autofactory lane(s)"
-        );
+        if previous_lanes != lanes {
+            mission.execution.printer_lanes = lanes.clone();
+            save_plan(&record.mission_path, &mission)?;
+            if lanes.is_empty() {
+                info!(
+                    event = %record.event_designation,
+                    previous_lanes = %previous_lanes.join(","),
+                    "released unavailable event Autofactory lane(s); waiting for a live printer"
+                );
+            } else {
+                info!(
+                    event = %record.event_designation,
+                    lanes = %lanes.join(","),
+                    "reconciled event Autofactory lane(s)"
+                );
+            }
+        }
     }
     Ok(())
 }

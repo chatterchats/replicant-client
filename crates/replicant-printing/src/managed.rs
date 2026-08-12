@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     Blueprint, FactoryWorkload, PrintRequest, PrintTime, QuantityMap, ScheduleError,
@@ -263,8 +263,8 @@ pub enum PrintingError {
     /// The managed Replicant client failed.
     #[error(transparent)]
     Client(#[from] replicant_client::Error),
-    /// No owned Autofactory was found at the requested hub.
-    #[error("no account-owned Autofactory is available at `{0}`")]
+    /// No currently usable owned Autofactory was found at the requested hub.
+    #[error("no usable account-owned Autofactory is available at `{0}`")]
     NoFactoryAtHub(String),
     /// Flatpack output was requested for a non-modular device blueprint.
     #[error("flatpack output requires the `modular` feature, but `{0}` is not modular")]
@@ -381,7 +381,13 @@ pub async fn fetch_blueprints(
         .collect())
 }
 
-/// Discovers account-owned Autofactories at `hub` and reads their live queues.
+/// Discovers account-owned, currently printable Autofactories at `hub` and
+/// reads their live queues.
+///
+/// Modular Autofactories cannot accept print commands while compacted (or
+/// while transitioning into/out of that state). Those devices remain valid
+/// account stock, but are deliberately omitted from printer scheduling until
+/// they are fully unfurled again.
 pub async fn discover_factories<B: PrintTime>(
     client: &Client,
     hub: &str,
@@ -400,9 +406,9 @@ pub async fn discover_factories<B: PrintTime>(
         let snapshot = handle.snapshot().await?;
         if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
             // The local projection is used only to identify candidate factory
-            // codes. `inspect_factory` below is authoritative for current
-            // queue/status, so a stale cached `available_commands` list cannot
-            // hide a factory that has just become usable again.
+            // codes. The raw detail read below is authoritative for current
+            // queue/status, so stale cached state cannot make a compacted
+            // factory look printable (or hide one that has just unfurled).
             factory_codes.push(handle.id().as_str().to_owned());
         }
     }
@@ -410,18 +416,39 @@ pub async fn discover_factories<B: PrintTime>(
 
     let mut factories = Vec::with_capacity(factory_codes.len());
     for code in factory_codes {
-        factories.push(inspect_factory(client, &code, blueprints).await?);
+        let detail = client.raw().devices().get(&code).await?.value;
+        if factory_status_blocks_printing(detail.status.as_deref()) {
+            debug!(
+                factory = %code,
+                status = ?detail.status,
+                "ignoring Autofactory that cannot currently accept print jobs"
+            );
+            continue;
+        }
+        factories.push(factory_state_from_detail(&code, &detail, blueprints)?);
     }
     Ok(factories)
 }
 
 /// Reads one Autofactory's queue capacity and projected workload.
+///
+/// This inspection primitive reports the observed workload even for a factory
+/// that is not currently printable. Scheduling callers should normally use
+/// [`discover_factories`], which filters compacted/transitional factories.
 pub async fn inspect_factory<B: PrintTime>(
     client: &Client,
     factory_code: &str,
     blueprints: &BTreeMap<String, B>,
 ) -> Result<FactoryState, PrintingError> {
     let detail = client.raw().devices().get(factory_code).await?.value;
+    factory_state_from_detail(factory_code, &detail, blueprints)
+}
+
+fn factory_state_from_detail<B: PrintTime>(
+    factory_code: &str,
+    detail: &raw::devices::DeviceStatus,
+    blueprints: &BTreeMap<String, B>,
+) -> Result<FactoryState, PrintingError> {
     let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1)).map_err(|_| {
         PrintingError::InvalidQueuedQuantity {
             factory_code: factory_code.to_owned(),
@@ -465,7 +492,9 @@ pub async fn factory_queue_slots(
     factory_code: &str,
 ) -> Result<usize, PrintingError> {
     let detail = client.raw().devices().get(factory_code).await?.value;
-    if detail.status.as_deref() == Some("waiting_for_resources") {
+    if detail.status.as_deref() == Some("waiting_for_resources")
+        || factory_status_blocks_printing(detail.status.as_deref())
+    {
         return Ok(0);
     }
     let queue_size = usize::try_from(detail.queue_size.unwrap_or(1).max(1)).map_err(|_| {
@@ -1748,6 +1777,14 @@ fn has_command(commands: &[String], expected: &str) -> bool {
     commands.iter().any(|command| command == expected)
 }
 
+fn factory_status_blocks_printing(status: Option<&str>) -> bool {
+    status.is_some_and(|status| {
+        status.eq_ignore_ascii_case("compacted")
+            || status.eq_ignore_ascii_case("compacting")
+            || status.eq_ignore_ascii_case("unfurling")
+    })
+}
+
 fn system_from_location(location: &str) -> String {
     location
         .split('-')
@@ -1861,6 +1898,20 @@ mod tests {
             Map::new(),
         ];
         assert_eq!(queued_print_units("AF1", &jobs).unwrap(), 6);
+    }
+
+    #[test]
+    fn compacted_and_transitioning_autofactories_are_not_print_targets() {
+        assert!(factory_status_blocks_printing(Some("compacted")));
+        assert!(factory_status_blocks_printing(Some("compacting")));
+        assert!(factory_status_blocks_printing(Some("unfurling")));
+        assert!(factory_status_blocks_printing(Some("COMPACTED")));
+        assert!(!factory_status_blocks_printing(Some("idle")));
+        assert!(!factory_status_blocks_printing(Some("printing")));
+        assert!(!factory_status_blocks_printing(Some(
+            "waiting_for_resources"
+        )));
+        assert!(!factory_status_blocks_printing(None));
     }
 
     #[test]
