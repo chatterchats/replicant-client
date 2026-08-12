@@ -123,7 +123,7 @@ pub struct PrerequisiteQueueReport {
     pub ready_for_parent: bool,
 }
 
-/// Result of clearing all queued and active work from one Autofactory.
+/// Result of clearing queued work and, unless preserved, active work from one Autofactory.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct ClearedFactory {
     /// Autofactory device code.
@@ -134,6 +134,8 @@ pub struct ClearedFactory {
     pub queue_cleared: bool,
     /// Whether `deactivate` was submitted to stop an active print.
     pub active_print_stopped: bool,
+    /// Whether an active print was deliberately left running for this factory.
+    pub active_print_preserved: bool,
 }
 
 /// Summary of a system-wide Autofactory clear operation.
@@ -145,6 +147,28 @@ pub struct ClearReport {
     pub factories: Vec<ClearedFactory>,
     /// Durable operation identifiers for clear/deactivate commands.
     pub operation_ids: Vec<String>,
+}
+
+/// Options controlling a system-wide Autofactory clear operation.
+#[derive(Clone, Debug)]
+pub struct ClearOptions {
+    /// Delay between live-state checks while queued work is settling.
+    pub poll_interval: Duration,
+    /// Maximum time allowed for each Autofactory to reach its requested clear state.
+    pub wait_timeout: Duration,
+    /// Autofactory codes whose currently active print must not be deactivated.
+    /// Queued work on these factories is still cleared normally.
+    pub preserve_active_factory_codes: BTreeSet<String>,
+}
+
+impl Default for ClearOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(5),
+            wait_timeout: Duration::from_secs(21_600),
+            preserve_active_factory_codes: BTreeSet::new(),
+        }
+    }
 }
 
 /// One device-type inventory summary within a system.
@@ -302,6 +326,16 @@ pub enum PrintingError {
     /// No account-owned Autofactory exists in the requested system.
     #[error("no account-owned Autofactory was found in system `{0}`")]
     NoFactoryInSystem(String),
+    /// A requested active-print exclusion did not match an Autofactory in the target system.
+    #[error(
+        "cannot preserve active print on Autofactory {factory_code}: no such account-owned Autofactory was found in system `{system}`"
+    )]
+    PreservedFactoryNotFound {
+        /// Requested Autofactory device code.
+        factory_code: String,
+        /// Canonical target system.
+        system: String,
+    },
     /// A factory cannot perform the requested queue-clear or print-stop transition.
     #[error("Autofactory {factory_code} does not advertise `{command}` while status is {status:?}")]
     FactoryCommandUnavailable {
@@ -1477,6 +1511,13 @@ fn manufacturing_gap(required: i64, available: i64, active: i64, queued: i64) ->
     )
 }
 
+fn canonical_factory_codes(codes: &BTreeSet<String>) -> BTreeSet<String> {
+    codes
+        .iter()
+        .map(|code| code.trim().to_ascii_uppercase())
+        .collect()
+}
+
 /// Clears queued and active work from every account-owned Autofactory in one
 /// system.
 ///
@@ -1490,6 +1531,45 @@ pub async fn clear_factories_in_system(
     system_or_location: &str,
     poll_interval: Duration,
     wait_timeout: Duration,
+) -> Result<ClearReport, PrintingError> {
+    clear_factories_in_system_with_options(
+        client,
+        system_or_location,
+        &ClearOptions {
+            poll_interval,
+            wait_timeout,
+            ..ClearOptions::default()
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivePrintClearAction {
+    None,
+    Preserve,
+    Deactivate,
+}
+
+fn active_print_clear_action(printing: bool, preserve_active: bool) -> ActivePrintClearAction {
+    match (printing, preserve_active) {
+        (false, _) => ActivePrintClearAction::None,
+        (true, true) => ActivePrintClearAction::Preserve,
+        (true, false) => ActivePrintClearAction::Deactivate,
+    }
+}
+
+/// Clears queued work from every account-owned Autofactory in one system and
+/// stops active prints except on explicitly preserved factories.
+///
+/// Excluded factories still receive `clear_queue`; only their currently active
+/// print is protected from the subsequent `deactivate`. All requested factory
+/// codes are validated before any mutation is submitted so a typo cannot cause
+/// an intended-to-be-preserved print to be stopped accidentally.
+pub async fn clear_factories_in_system_with_options(
+    client: &Client,
+    system_or_location: &str,
+    options: &ClearOptions,
 ) -> Result<ClearReport, PrintingError> {
     let system = system_from_location(system_or_location);
     let handles = client
@@ -1519,13 +1599,31 @@ pub async fn clear_factories_in_system(
         return Err(PrintingError::NoFactoryInSystem(system));
     }
 
+    let preserve_active_factory_codes =
+        canonical_factory_codes(&options.preserve_active_factory_codes);
+    let factory_codes = factories
+        .iter()
+        .map(|(code, _)| code.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    if let Some(factory_code) = preserve_active_factory_codes
+        .iter()
+        .find(|code| !factory_codes.contains(*code))
+    {
+        return Err(PrintingError::PreservedFactoryNotFound {
+            factory_code: factory_code.clone(),
+            system: system.clone(),
+        });
+    }
+
     let mut report = ClearReport {
         system,
         ..ClearReport::default()
     };
     for (factory_code, location) in factories {
         let handle = client.devices().get(&factory_code).await?;
-        let deadline = Instant::now() + wait_timeout;
+        let deadline = Instant::now() + options.wait_timeout;
+        let preserve_active =
+            preserve_active_factory_codes.contains(&factory_code.to_ascii_uppercase());
         let mut detail = client.raw().devices().get(&factory_code).await?.value;
         let mut cleared = ClearedFactory {
             code: factory_code.clone(),
@@ -1552,10 +1650,9 @@ pub async fn clear_factories_in_system(
             info!(factory = %factory_code, "cleared Autofactory print queue");
         }
 
-        // `clear_queue` can also remove the current print, and the raw device
-        // projection may briefly retain the old `printing (...)` status. Wait
-        // for the queue itself to settle before deciding whether `deactivate`
-        // is still needed.
+        // `clear_queue` removes queued jobs but leaves the active print alone.
+        // Wait for the queue projection to settle before deciding whether the
+        // active print should be deactivated or explicitly preserved.
         loop {
             detail = client.raw().devices().get(&factory_code).await?.value;
             if detail.print_queue.is_empty() {
@@ -1564,58 +1661,65 @@ pub async fn clear_factories_in_system(
             if Instant::now() >= deadline {
                 return Err(PrintingError::FactoryClearTimedOut { factory_code });
             }
-            sleep(poll_interval).await;
+            sleep(options.poll_interval).await;
         }
 
-        if detail.printing.is_some() {
-            if !has_command(&detail.available_commands, "deactivate") {
-                return Err(PrintingError::FactoryCommandUnavailable {
-                    factory_code,
-                    command: "deactivate".into(),
-                    status: detail.status,
-                });
+        match active_print_clear_action(detail.printing.is_some(), preserve_active) {
+            ActivePrintClearAction::None => {}
+            ActivePrintClearAction::Preserve => {
+                cleared.active_print_preserved = true;
+                info!(factory = %factory_code, "preserved active Autofactory print");
             }
-            let operation = client
-                .devices()
-                .get(&factory_code)
-                .await?
-                .deactivate()
-                .await?;
-            match ensure_submission_accepted(&operation).await {
-                Ok(()) => {
-                    report
-                        .operation_ids
-                        .push(operation.id().as_str().to_owned());
-                    cleared.active_print_stopped = true;
-                    info!(factory = %factory_code, "stopped active Autofactory print");
+            ActivePrintClearAction::Deactivate => {
+                if !has_command(&detail.available_commands, "deactivate") {
+                    return Err(PrintingError::FactoryCommandUnavailable {
+                        factory_code,
+                        command: "deactivate".into(),
+                        status: detail.status,
+                    });
                 }
-                Err(error) => {
-                    let already_stopped = matches!(
-                        &error,
-                        PrintingError::SubmissionRejected { response, .. }
-                            if nothing_to_deactivate(response.as_ref())
-                    );
-                    if !already_stopped {
-                        return Err(error);
+                let operation = client
+                    .devices()
+                    .get(&factory_code)
+                    .await?
+                    .deactivate()
+                    .await?;
+                match ensure_submission_accepted(&operation).await {
+                    Ok(()) => {
+                        report
+                            .operation_ids
+                            .push(operation.id().as_str().to_owned());
+                        cleared.active_print_stopped = true;
+                        info!(factory = %factory_code, "stopped active Autofactory print");
                     }
-                    info!(
-                        factory = %factory_code,
-                        operation_id = %operation.id().as_str(),
-                        "active print ended before deactivate reached the server"
-                    );
+                    Err(error) => {
+                        let already_stopped = matches!(
+                            &error,
+                            PrintingError::SubmissionRejected { response, .. }
+                                if nothing_to_deactivate(response.as_ref())
+                        );
+                        if !already_stopped {
+                            return Err(error);
+                        }
+                        info!(
+                            factory = %factory_code,
+                            operation_id = %operation.id().as_str(),
+                            "active print ended before deactivate reached the server"
+                        );
+                    }
                 }
             }
         }
 
         loop {
             detail = client.raw().devices().get(&factory_code).await?.value;
-            if detail.print_queue.is_empty() && detail.printing.is_none() {
+            if detail.print_queue.is_empty() && (preserve_active || detail.printing.is_none()) {
                 break;
             }
             if Instant::now() >= deadline {
                 return Err(PrintingError::FactoryClearTimedOut { factory_code });
             }
-            sleep(poll_interval).await;
+            sleep(options.poll_interval).await;
         }
         report.factories.push(cleared);
     }
@@ -1809,6 +1913,26 @@ mod tests {
     }
 
     #[test]
+    fn preserved_active_print_never_selects_deactivate() {
+        assert_eq!(
+            active_print_clear_action(true, true),
+            ActivePrintClearAction::Preserve
+        );
+        assert_eq!(
+            active_print_clear_action(true, false),
+            ActivePrintClearAction::Deactivate
+        );
+        assert_eq!(
+            active_print_clear_action(false, true),
+            ActivePrintClearAction::None
+        );
+        assert_eq!(
+            active_print_clear_action(false, false),
+            ActivePrintClearAction::None
+        );
+    }
+
+    #[test]
     fn nothing_to_deactivate_rejection_is_reconciled_as_empty_work() {
         let response = serde_json::json!({
             "message": "unexpected HTTP status 400: Nothing to deactivate",
@@ -1973,5 +2097,19 @@ mod tests {
         assert_eq!(job.quantity, 2);
         assert_eq!(job.eta_seconds, Some(123.0));
         assert!(job.matches_filter);
+    }
+
+    #[test]
+    fn preserved_factory_codes_are_canonicalized_before_clear() {
+        let codes = BTreeSet::from([
+            " ff259175 ".to_owned(),
+            "E71BC14B".to_owned(),
+            "e71bc14b".to_owned(),
+        ]);
+
+        assert_eq!(
+            canonical_factory_codes(&codes),
+            BTreeSet::from(["E71BC14B".to_owned(), "FF259175".to_owned()])
+        );
     }
 }
