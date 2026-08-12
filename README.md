@@ -149,7 +149,7 @@ Safe reads may use bounded retries. Mutations are never automatically retried.
 
 | Package | Purpose |
 | --- | --- |
-| [`replicant-cli`](crates/replicant-cli) | Unified CLI for printing, transport, survey, relay, mining, observatory operations, events, bootstrap, and Riker reports. |
+| [`replicant-cli`](crates/replicant-cli) | Unified CLI for printing, transport, survey, relay, mining, regional ownership reassignment, observatory operations, events, bootstrap, and Riker reports. |
 | [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules. |
 | [`replicant-event-planner`](crates/replicant-event-planner) | Pure civilisation-event logistics planning. |
 | [`replicant-mining-planner`](crates/replicant-mining-planner) | Pure mining-network bills of materials and resource expansion. |

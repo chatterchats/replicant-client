@@ -30,6 +30,7 @@ cargo build -p replicant-cli
 | `survey` | `plan`, `run`, `status` | Plan and execute durable survey routes. |
 | `relay` | `plan`, `run`, `status` | Expand an account-owned FTL relay network. |
 | `mining` | `plan`, `run`, `status` | Build repeatable mining sites and routes. |
+| `ownership` | `reassign` | Preview or bulk-reassign non-vessel devices by catalogue region. |
 | `observatory` | `status`, `prospect`, `triangulate` | Automate Galactic Observatory fringe prospecting and spectral triangulation. |
 | `event` | `list`, `plan`, `run`, `status` | Plan one or all civilisation events and execute logistics. |
 | `bootstrap` | `plan`, `stage`, `run`, `status` | Stage and deploy a regional bootstrap mission. |
@@ -65,6 +66,19 @@ cargo run -p replicant-cli -- survey plan \
   --vessel 6592B774 \
   --center THYFFAWFF \
   --radius 30
+
+# Preview every non-replicant-vessel device in the established regions that
+# is not already assigned to Chats-1. `solregion` aliases catalogue `solzone`.
+cargo run -p replicant-cli -- ownership reassign \
+  --region solregion,alpha,beta,gamma
+
+# Once a new region is known, select every named region except that one.
+# Add --execute only after reviewing the preview.
+cargo run -p replicant-cli -- ownership reassign \
+  --all-regions \
+  --ignore-region delta \
+  --owner Chats-1 \
+  --execute
 
 # Automatic fringe prospecting. The CLI scores sparse hemispheres locally and
 # reports the server's fringe diagnostics if a direction is blocked.
@@ -118,6 +132,8 @@ Common configuration:
 - `REPLICANT_DB` — managed SQLite path.
 - command-specific variables use `RS_PRINTING_*`, `RS_TRANSPORT_*`,
   `RS_EXPLORE_*`, `RS_RELAY_*`, `RS_MINING_*`, and `RS_EVENT_*` prefixes.
+- `RS_OWNERSHIP_TARGET`, `RS_OWNERSHIP_REGIONS`, `RS_OWNERSHIP_ALL_REGIONS`, and
+  `RS_OWNERSHIP_IGNORE_REGIONS` configure the regional ownership utility.
 - `RS_OBSERVATORY_SIGNATURE` overrides the default spectral signature used by
   `observatory triangulate` (currently `934d3ac4dcc918ad`).
 - `--verbose` and `--log-file PATH` enable diagnostics where supported.

@@ -5,6 +5,7 @@ mod bootstrap;
 mod event;
 mod mining;
 mod observatory;
+mod ownership;
 mod printing;
 mod relay;
 mod rikers;
@@ -69,6 +70,9 @@ async fn main() -> AnyResult<()> {
             ))
             .await
         }
+        "ownership" | "owner" | "owners" => {
+            ownership::run_cli(normalize_operation_flag(arguments, &["reassign"])).await
+        }
         "observatory" | "observatories" | "obs" => {
             observatory::run_cli(normalize_operation_flag(
                 arguments,
@@ -111,6 +115,7 @@ async fn dispatch_help(mut arguments: Vec<String>) -> AnyResult<()> {
         "survey" => survey::run_cli(arguments).await,
         "relay" | "relays" => relay::run_cli(arguments).await,
         "mining" | "mine" => mining::run_cli(arguments).await,
+        "ownership" | "owner" | "owners" => ownership::run_cli(arguments).await,
         "observatory" | "observatories" | "obs" => observatory::run_cli(arguments).await,
         "event" | "events" => event::run_cli(arguments).await,
         "bootstrap" => bootstrap::run_cli(arguments).await,
@@ -136,9 +141,9 @@ fn print_help() {
     println!(
         "Replicant Space CLI\n\n\
 Usage:\n  replicant-cli COMMAND [OPERATION] [OPTIONS]\n\n\
-Commands:\n  print       Distributed Autofactory queueing, status, and clearing\n  transport   Point-to-point resource and device delivery\n  trade       Interactive player-run shop directory and trade viewer\n  belt-search Fast Replicant-only system scans for asteroid belts\n  survey      Survey-route planning and execution\n  relay       FTL relay-network expansion\n  mining      Mining-network expansion\n  observatory Galactic Observatory prospecting and triangulation\n  event       Civilisation-event planning and execution\n  bootstrap   Regional bootstrap and landing delivery automation\n  rikers      Local Riker colony-candidate report\n\n\
+Commands:\n  print       Distributed Autofactory queueing, status, and clearing\n  transport   Point-to-point resource and device delivery\n  trade       Interactive player-run shop directory and trade viewer\n  belt-search Fast Replicant-only system scans for asteroid belts\n  survey      Survey-route planning and execution\n  relay       FTL relay-network expansion\n  mining      Mining-network expansion\n  ownership   Bulk device ownership reassignment by catalogue region\n  observatory Galactic Observatory prospecting and triangulation\n  event       Civilisation-event planning and execution\n  bootstrap   Regional bootstrap and landing delivery automation\n  rikers      Local Riker colony-candidate report\n\n\
 Operation syntax:\n  Stateful commands accept either an operation word or its flag form.\n  For example, `survey plan ...` and `survey --plan ...` are equivalent.\n\n\
-Examples:\n  replicant-cli print --status --system SCEPTURUM \\\n    --print 17 exotic_matter_injector --tag twaffy-ring-001\n\n  replicant-cli trade --replicant Chats-1\n\n  replicant-cli belt-search SOL YINU MENKUNT\n\n  replicant-cli survey --plan --replicant B7AF4A8C \\\n    --vessel 6592B774 --center THYFFAWFF --radius 30\n\n  replicant-cli observatory triangulate --all\n\n  replicant-cli bootstrap --deliver --landing-star LUMBUNGA \\\n    --mission-file bootstrap-lumbunga.json \\\n    --log-file logs/bootstrap-lumbunga.log\n\n\
+Examples:\n  replicant-cli print --status --system SCEPTURUM \\\n    --print 17 exotic_matter_injector --tag twaffy-ring-001\n\n  replicant-cli trade --replicant Chats-1\n\n  replicant-cli belt-search SOL YINU MENKUNT\n\n  replicant-cli survey --plan --replicant B7AF4A8C \\\n    --vessel 6592B774 --center THYFFAWFF --radius 30\n\n  replicant-cli ownership reassign --region alpha --region beta --owner Chats-1\n\n  replicant-cli observatory triangulate --all\n\n  replicant-cli bootstrap --deliver --landing-star LUMBUNGA \\\n    --mission-file bootstrap-lumbunga.json \\\n    --log-file logs/bootstrap-lumbunga.log\n\n\
 Help:\n  replicant-cli help COMMAND\n  replicant-cli COMMAND --help\n  -h, --help       Show this help\n  -V, --version    Show version"
     );
 }
