@@ -28,6 +28,7 @@ const DEFAULT_WAIT_SECONDS: u64 = 21_600;
 enum Command {
     Plan,
     Stage,
+    Deliver,
     Run,
     Status,
 }
@@ -35,7 +36,7 @@ enum Command {
 #[derive(Debug)]
 struct Config {
     command: Command,
-    region: String,
+    region: Option<String>,
     landing_star: Option<String>,
     source_hub: String,
     operator: String,
@@ -62,6 +63,7 @@ impl Config {
         let command = match args.next().as_deref() {
             Some("plan") => Command::Plan,
             Some("stage") => Command::Stage,
+            Some("deliver") => Command::Deliver,
             Some("run") => Command::Run,
             Some("status") => Command::Status,
             Some("-h" | "--help") | None => {
@@ -77,7 +79,7 @@ impl Config {
         };
         let mut config = Self {
             command,
-            region: "beta".into(),
+            region: None,
             landing_star: None,
             source_hub: "SCEPTURUM-BELT-1".into(),
             operator: "Chats-1".into(),
@@ -101,7 +103,7 @@ impl Config {
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--region" => config.region = required(&mut args, &arg)?.to_ascii_lowercase(),
+                "--region" => config.region = Some(required(&mut args, &arg)?.to_ascii_lowercase()),
                 "--landing-star" => {
                     config.landing_star = Some(required(&mut args, &arg)?.to_ascii_uppercase())
                 }
@@ -143,7 +145,11 @@ impl Config {
                 }
             }
         }
-        if !matches!(config.region.as_str(), "beta" | "gamma") {
+        if config
+            .region
+            .as_deref()
+            .is_some_and(|region| !matches!(region, "beta" | "gamma"))
+        {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,
                 "--region must be beta or gamma",
@@ -175,12 +181,13 @@ impl Config {
     }
 
     fn landing_star(&self) -> String {
-        self.landing_star
-            .clone()
-            .unwrap_or_else(|| match self.region.as_str() {
-                "gamma" => "OWLOAEI".into(),
-                _ => "RHWYRHYR".into(),
-            })
+        self.landing_star.clone().unwrap_or_else(|| {
+            if self.region.as_deref() == Some("gamma") {
+                "OWLOAEI".into()
+            } else {
+                "RHWYRHYR".into()
+            }
+        })
     }
 }
 
@@ -211,7 +218,7 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
 
 fn print_help() {
     println!(
-        "Regional bootstrap automation\n\nUsage:\n  replicant-cli bootstrap --plan [OPTIONS]\n  replicant-cli bootstrap --stage [OPTIONS]\n  replicant-cli bootstrap --run [OPTIONS]\n  replicant-cli bootstrap --status [OPTIONS]\n\nCore options:\n  --region beta|gamma       Regional island (default: beta)\n  --landing-star STAR       Ark rendezvous (defaults: RHWYRHYR/OWLOAEI)\n  --operator NAME_OR_CODE   Existing or future capital replicant (default: Chats-1)\n  --explorer NAME_OR_CODE   Existing or future explorer (default: Chats-2)\n  --source-hub LOCATION     Source manufacturing hub\n  --mission-file PATH       Durable parent mission\n  --mining-setups N         Initial complete setups (5-10, default: 8)\n  --autofactories N         Regional factories (3-6, default: 6)\n  --freighters N            Seed/route freighters (6-12, default: 6)\n  --transport-controllers N Initial AMI transport controllers\n  --seed-quantity N         Resource units in each seed freighter (default: 500)\n  --quick-scout-radius LY   Visit-and-scan dense-belt search radius\n  --survey-radius LY        Regional survey radius (default: 30)\n  --min-sites N             Minimum dense mining systems (default: 5)\n  --max-sites N             Maximum dense mining systems (default: 9)\n  --max-concurrency N       Concurrent dispatch limit (default: 8)\n  --wait-timeout-secs N     Per-stage timeout\n  --replace-plan            Replace an incomplete plan\n  --database PATH           Managed SQLite database\n  --verbose                 Log to stderr\n  --log-file PATH           Append detailed logs to a file\n  --json                    Machine-readable plan/status\n\n`stage` prints, loads, assembles, and moves the ark to the source system entry point without requiring the planned replicants. `run` resolves those replicants, reconciles the mission, and continues deployment. There is no --execute or resume command."
+        "Regional bootstrap automation\n\nUsage:\n  replicant-cli bootstrap --plan [OPTIONS]\n  replicant-cli bootstrap --stage [OPTIONS]\n  replicant-cli bootstrap --deliver [OPTIONS]\n  replicant-cli bootstrap --run [OPTIONS]\n  replicant-cli bootstrap --status [OPTIONS]\n\nCore options:\n  --landing-star STAR       Ark rendezvous; its region is inferred automatically\n  --region beta|gamma       Optional region constraint/default landing selector\n  --operator NAME_OR_CODE   Existing or future capital replicant (default: Chats-1)\n  --explorer NAME_OR_CODE   Existing or future explorer (default: Chats-2)\n  --source-hub LOCATION     Source manufacturing hub\n  --mission-file PATH       Durable parent mission\n  --mining-setups N         Initial complete setups (5-10, default: 8)\n  --autofactories N         Regional factories (3-6, default: 6)\n  --freighters N            Seed/route freighters (6-12, default: 6)\n  --transport-controllers N Initial AMI transport controllers\n  --seed-quantity N         Resource units in each seed freighter (default: 500)\n  --quick-scout-radius LY   Visit-and-scan dense-belt search radius\n  --survey-radius LY        Regional survey radius (default: 30)\n  --min-sites N             Minimum dense mining systems (default: 5)\n  --max-sites N             Maximum dense mining systems (default: 9)\n  --max-concurrency N       Concurrent dispatch limit (default: 8)\n  --wait-timeout-secs N     Per-stage timeout\n  --replace-plan            Replace an incomplete plan\n  --database PATH           Managed SQLite database\n  --verbose                 Log to stderr\n  --log-file PATH           Append detailed logs to a file\n  --json                    Machine-readable plan/status\n\n`stage` prints, loads, assembles, and moves the ark to the source system entry point without requiring the planned replicants. `deliver` creates a plan when needed, manufactures and loads the ark, sends only the ark devices to the landing star entry point (or the star itself when no entry point is known), and stops before regional deployment. `run` resolves the planned replicants and continues the full regional workflow. There is no --execute or resume command."
     );
     println!(
         "\nDefault ark reserve: 1 root relay, 18 expansion relays, 9 monitoring beacons, and 3 newly provisioned Surge Carriers. Re-running `stage` reconciles and catches up an already-staged mission."
@@ -247,11 +254,14 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         Command::Stage => {
             let _lock = MissionLock::acquire(&config.mission_file)?;
             let mut mission = load_mission(&config.mission_file)?;
+            validate_mission_constraints(&config, &mission)?;
             executor::stage(&client, &config, &mut mission).await
         }
+        Command::Deliver => deliver_command(&client, &config).await,
         Command::Run => {
             let _lock = MissionLock::acquire(&config.mission_file)?;
             let mut mission = load_mission(&config.mission_file)?;
+            validate_mission_constraints(&config, &mission)?;
             executor::execute(&client, &config, &mut mission).await
         }
         Command::Status => unreachable!(),
@@ -262,6 +272,42 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     Ok(())
 }
 
+async fn deliver_command(client: &Client, config: &Config) -> AnyResult<()> {
+    if !config.mission_file.exists() {
+        create_plan(client, config).await?;
+    }
+    let _lock = MissionLock::acquire(&config.mission_file)?;
+    let mut mission = load_mission(&config.mission_file)?;
+    validate_mission_constraints(config, &mission)?;
+    executor::deliver(client, config, &mut mission).await
+}
+
+fn validate_mission_constraints(config: &Config, mission: &BootstrapMission) -> AnyResult<()> {
+    if let Some(landing_star) = config.landing_star.as_deref()
+        && !mission.landing_star.eq_ignore_ascii_case(landing_star)
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "saved mission lands at {}, not requested {landing_star}; use --replace-plan to create a new mission",
+                mission.landing_star
+            ),
+        ));
+    }
+    if let Some(region) = config.region.as_deref()
+        && !mission.region.eq_ignore_ascii_case(region)
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "saved mission is for region {}, not requested {region}; use --replace-plan to create a new mission",
+                mission.region
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
     if config.mission_file.exists() && !config.replace_plan {
         let existing = load_mission(&config.mission_file)?;
@@ -269,7 +315,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
             return Err(app_error(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "incomplete mission {} exists; use run, status, or --replace-plan",
+                    "incomplete mission {} exists; use deliver, run, status, or --replace-plan",
                     existing.mission_id
                 ),
             ));
@@ -291,16 +337,19 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
         ));
     }
     let landing_star = config.landing_star();
-    let (landing_entry, region) = executor::resolve_star(client, &landing_star).await?;
-    if !region.eq_ignore_ascii_case(&config.region) {
+    let (landing_entry, resolved_region) = executor::resolve_star(client, &landing_star).await?;
+    if let Some(region) = config.region.as_deref()
+        && !resolved_region.eq_ignore_ascii_case(region)
+    {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
-            format!(
-                "{landing_star} is in region {region}, not {}",
-                config.region
-            ),
+            format!("{landing_star} is in region {resolved_region}, not {region}"),
         ));
     }
+    let region = config
+        .region
+        .clone()
+        .unwrap_or_else(|| resolved_region.to_ascii_lowercase());
     let mission_id = uuid::Uuid::new_v4().simple().to_string();
     let parent = config
         .mission_file
@@ -316,10 +365,10 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
     let mut mission = BootstrapMission {
         version: PLAN_VERSION,
         mission_tag: mission_tag(&mission_id),
-        region_tag: format!("region:{}", config.region),
+        region_tag: format!("region:{region}"),
         mission_id,
         phase: MissionPhase::Planned,
-        region: config.region.clone(),
+        region,
         source_hub: config.source_hub.clone(),
         source_system: String::new(),
         source_entry: String::new(),
@@ -550,4 +599,42 @@ pub(crate) fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(args: &[&str]) -> Config {
+        Config::from_args(args.iter().map(|value| (*value).to_owned())).expect("valid config")
+    }
+
+    #[test]
+    fn landing_star_does_not_require_a_region() {
+        let config = config(&["plan", "--landing-star", "lumbunga"]);
+        assert_eq!(config.landing_star.as_deref(), Some("LUMBUNGA"));
+        assert_eq!(config.region.as_deref(), None);
+        assert_eq!(config.landing_star(), "LUMBUNGA");
+    }
+
+    #[test]
+    fn region_still_selects_the_legacy_default_landing() {
+        let config = config(&["plan", "--region", "gamma"]);
+        assert_eq!(config.region.as_deref(), Some("gamma"));
+        assert_eq!(config.landing_star(), "OWLOAEI");
+    }
+
+    #[test]
+    fn deliver_is_a_first_class_bootstrap_operation() {
+        let config = config(&["deliver", "--landing-star", "waneame"]);
+        assert_eq!(config.command, Command::Deliver);
+        assert_eq!(config.landing_star(), "WANEAME");
+    }
+
+    #[test]
+    fn explicit_regions_remain_limited_to_supported_names() {
+        let error = Config::from_args(["plan", "--region", "alpha"].into_iter().map(str::to_owned))
+            .expect_err("alpha is not an explicit regional-bootstrap selector");
+        assert!(error.to_string().contains("--region must be beta or gamma"));
+    }
 }

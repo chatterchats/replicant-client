@@ -130,14 +130,17 @@ pub async fn resolve_star(client: &Client, designation: &str) -> AnyResult<(Stri
                 format!("star {designation} is not in the catalogue"),
             )
         })?;
-    let entry = star.entry_point.as_ref().ok_or_else(|| {
-        app_error(
-            io::ErrorKind::InvalidData,
-            format!("star {designation} has no known entry point"),
-        )
-    })?;
+    let entry_point = star.entry_point.as_ref().map(|entry| entry.id.as_str());
+    let destination = preferred_star_destination(star.key.id.as_str(), entry_point);
+    if entry_point.is_none() {
+        info!(
+            star = %star.key.id.as_str(),
+            destination = %destination,
+            "landing star has no catalogue entry point; using the star designation so the server can select the default arrival zone"
+        );
+    }
     Ok((
-        entry.id.as_str().to_owned(),
+        destination,
         star.region.clone().unwrap_or_else(|| "unknown".into()),
     ))
 }
@@ -174,6 +177,39 @@ pub async fn execute(
     expand_relays(client, config, mission).await?;
     expand_mining(client, config, mission).await?;
     cleanup(client, config, mission).await
+}
+
+pub async fn deliver(
+    client: &Client,
+    config: &Config,
+    mission: &mut BootstrapMission,
+) -> AnyResult<()> {
+    if phase_after(mission.phase, MissionPhase::Outbound) {
+        info!(phase=?mission.phase, "bootstrap ark has already reached the landing star");
+        return Ok(());
+    }
+    let sync = client.sync().full().await?;
+    info!(readiness=?sync.readiness, phase=?mission.phase, "reconciled managed state for landing delivery");
+    client.galaxy().refresh_catalogue().await?;
+    ensure_source_entry(client, config, mission).await?;
+    resolve_operator(client, config, mission).await?;
+    claim_staged_ark_for_operator(client, mission).await?;
+
+    manufacture_ark(client, config, mission).await?;
+    load_ark(client, config, mission).await?;
+    if matches!(
+        mission.phase,
+        MissionPhase::StagingAtSource | MissionPhase::StagedAtSource
+    ) {
+        stage_at_source_entry(client, config, mission).await?;
+    }
+    dispatch_devices_to_landing(client, config, mission).await?;
+    info!(
+        landing_star=%mission.landing_star,
+        landing_entry=%mission.landing_entry,
+        "bootstrap ark delivery complete; regional deployment was not started"
+    );
+    Ok(())
 }
 
 pub async fn stage(
@@ -243,10 +279,7 @@ async fn resolve_required_replicants(
     config: &Config,
     mission: &mut BootstrapMission,
 ) -> AnyResult<()> {
-    let operator_query = mission.operator.query().to_owned();
-    mission.operator = resolve_replicant(client, &operator_query).await?
-        .ok_or_else(|| app_error(io::ErrorKind::NotFound,
-            format!("planned operator {operator_query:?} does not exist with a hosted vessel yet; use `stage` to prepare the ark without it")))?;
+    resolve_operator(client, config, mission).await?;
     let explorer_query = mission.explorer.query().to_owned();
     mission.explorer = resolve_replicant(client, &explorer_query).await?
         .ok_or_else(|| app_error(io::ErrorKind::NotFound,
@@ -257,6 +290,18 @@ async fn resolve_required_replicants(
             "operator and explorer resolved to the same replicant",
         ));
     }
+    save_mission(&config.mission_file, mission)
+}
+
+async fn resolve_operator(
+    client: &Client,
+    config: &Config,
+    mission: &mut BootstrapMission,
+) -> AnyResult<()> {
+    let operator_query = mission.operator.query().to_owned();
+    mission.operator = resolve_replicant(client, &operator_query).await?
+        .ok_or_else(|| app_error(io::ErrorKind::NotFound,
+            format!("planned operator {operator_query:?} does not exist with a hosted vessel yet; use `stage` to prepare the ark without it")))?;
     save_mission(&config.mission_file, mission)
 }
 
@@ -1000,19 +1045,7 @@ async fn stage_at_source_entry(
         info!(source_entry=%mission.source_entry,
             "checking the staged ark for newly manufactured catch-up loads");
     }
-    let devices = mission
-        .carrier_loads
-        .iter()
-        .map(|load| load.carrier.clone())
-        .chain(
-            mission
-                .assets
-                .get(CARGO_FREIGHTER)
-                .into_iter()
-                .flatten()
-                .cloned(),
-        )
-        .collect::<Vec<_>>();
+    let devices = ark_transport_devices(mission);
     info!(devices=devices.len(), destination=%mission.source_entry,
         "moving the assembled ark to the source system entry point concurrently");
     finish_all(
@@ -1034,7 +1067,7 @@ async fn stage_at_source_entry(
     set_phase(config, mission, MissionPhase::StagedAtSource).await
 }
 
-async fn dispatch_to_landing(
+async fn dispatch_devices_to_landing(
     client: &Client,
     config: &Config,
     mission: &mut BootstrapMission,
@@ -1043,7 +1076,49 @@ async fn dispatch_to_landing(
         return Ok(());
     }
     set_phase(config, mission, MissionPhase::Outbound).await?;
-    let devices = mission
+    let devices = ark_transport_devices(mission);
+    let departures = devices
+        .iter()
+        .map(|code| (code.clone(), mission.landing_entry.clone()))
+        .collect::<Vec<_>>();
+    let landing_system_fallback = landing_system_fallback(mission);
+    ensure_operator_in_comms_for_departures(
+        client,
+        &mission.operator.code,
+        &departures,
+        landing_system_fallback,
+        config.wait_timeout,
+    )
+    .await?;
+    info!(devices=devices.len(), destination=%mission.landing_entry,
+        "submitting ark device travel to the landing star without regional deployment");
+    finish_all(
+        join_all(devices.iter().map(|code| {
+            start_device_travel_matching(
+                client,
+                code,
+                &mission.landing_entry,
+                landing_system_fallback,
+            )
+        }))
+        .await,
+    )?;
+    finish_all(
+        join_all(devices.iter().map(|code| {
+            wait_device_at_matching(
+                client,
+                code,
+                &mission.landing_entry,
+                landing_system_fallback,
+                config.wait_timeout,
+            )
+        }))
+        .await,
+    )
+}
+
+fn ark_transport_devices(mission: &BootstrapMission) -> Vec<String> {
+    mission
         .carrier_loads
         .iter()
         .map(|load| load.carrier.clone())
@@ -1055,31 +1130,58 @@ async fn dispatch_to_landing(
                 .flatten()
                 .cloned(),
         )
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+async fn dispatch_to_landing(
+    client: &Client,
+    config: &Config,
+    mission: &mut BootstrapMission,
+) -> AnyResult<()> {
+    if phase_after(mission.phase, MissionPhase::Outbound) {
+        return Ok(());
+    }
+    set_phase(config, mission, MissionPhase::Outbound).await?;
+    let devices = ark_transport_devices(mission);
     let departures = devices
         .iter()
         .map(|code| (code.clone(), mission.landing_entry.clone()))
         .collect::<Vec<_>>();
+    let landing_system_fallback = landing_system_fallback(mission);
     ensure_operator_in_comms_for_departures(
         client,
         &mission.operator.code,
         &departures,
+        landing_system_fallback,
         config.wait_timeout,
     )
     .await?;
     info!(devices=devices.len(), destination=%mission.landing_entry,
         "submitting complete ark travel before the controlling replicant departs");
     finish_all(
-        join_all(
-            devices
-                .iter()
-                .map(|code| start_device_travel(client, code, &mission.landing_entry)),
-        )
+        join_all(devices.iter().map(|code| {
+            start_device_travel_matching(
+                client,
+                code,
+                &mission.landing_entry,
+                landing_system_fallback,
+            )
+        }))
         .await,
     )?;
     let (operator_start, explorer_start) = tokio::join!(
-        start_replicant_travel(client, &mission.operator.code, &mission.landing_entry),
-        start_replicant_travel(client, &mission.explorer.code, &mission.landing_entry),
+        start_replicant_travel_matching(
+            client,
+            &mission.operator.code,
+            &mission.landing_entry,
+            landing_system_fallback,
+        ),
+        start_replicant_travel_matching(
+            client,
+            &mission.explorer.code,
+            &mission.landing_entry,
+            landing_system_fallback,
+        ),
     );
     operator_start?;
     explorer_start?;
@@ -1087,21 +1189,29 @@ async fn dispatch_to_landing(
         async {
             finish_all(
                 join_all(devices.iter().map(|code| {
-                    wait_device_at(client, code, &mission.landing_entry, config.wait_timeout)
+                    wait_device_at_matching(
+                        client,
+                        code,
+                        &mission.landing_entry,
+                        landing_system_fallback,
+                        config.wait_timeout,
+                    )
                 }))
                 .await,
             )
         },
-        wait_replicant_at(
+        wait_replicant_at_matching(
             client,
             &mission.operator.code,
             &mission.landing_entry,
+            landing_system_fallback,
             config.wait_timeout
         ),
-        wait_replicant_at(
+        wait_replicant_at_matching(
             client,
             &mission.explorer.code,
             &mission.landing_entry,
+            landing_system_fallback,
             config.wait_timeout
         ),
     );
@@ -1690,11 +1800,27 @@ async fn wait_devices_stowed_in_vessel(
     }
 }
 
+fn preferred_star_destination(system: &str, entry_point: Option<&str>) -> String {
+    entry_point.unwrap_or(system).to_owned()
+}
+
 fn designation_in_system(designation: &str, system: &str) -> bool {
     designation == system
         || designation
             .strip_prefix(system)
             .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn landing_system_fallback(mission: &BootstrapMission) -> Option<&str> {
+    mission
+        .landing_entry
+        .eq_ignore_ascii_case(&mission.landing_star)
+        .then_some(mission.landing_star.as_str())
+}
+
+fn destination_matches(actual: &str, requested: &str, destination_system: Option<&str>) -> bool {
+    actual == requested
+        || destination_system.is_some_and(|system| designation_in_system(actual, system))
 }
 
 async fn establish_capital(
@@ -1771,6 +1897,7 @@ async fn establish_capital(
         client,
         &mission.operator.code,
         &departures,
+        None,
         config.wait_timeout,
     )
     .await?;
@@ -2368,13 +2495,18 @@ async fn ensure_operator_in_comms_for_departures(
     client: &Client,
     operator: &str,
     departures: &[(String, String)],
+    destination_system: Option<&str>,
     timeout: Duration,
 ) -> AnyResult<()> {
     let mut pending = Vec::new();
     let mut origins = BTreeSet::new();
     for (code, destination) in departures {
         let detail = client.raw().devices().get(code).await?.value;
-        if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
+        if detail.travel.is_none()
+            && detail.location.as_deref().is_some_and(|location| {
+                destination_matches(location, destination, destination_system)
+            })
+        {
             continue;
         }
         if let Some(travel) = &detail.travel {
@@ -2382,7 +2514,9 @@ async fn ensure_operator_in_comms_for_departures(
                 .final_destination
                 .as_deref()
                 .or(travel.destination.as_deref());
-            if planned == Some(destination) {
+            if planned.is_some_and(|planned| {
+                destination_matches(planned, destination, destination_system)
+            }) {
                 continue;
             }
             return Err(app_error(
@@ -2426,8 +2560,22 @@ async fn ensure_operator_in_comms_for_departures(
 }
 
 async fn start_device_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
+    start_device_travel_matching(client, code, destination, None).await
+}
+
+async fn start_device_travel_matching(
+    client: &Client,
+    code: &str,
+    destination: &str,
+    destination_system: Option<&str>,
+) -> AnyResult<()> {
     let detail = client.raw().devices().get(code).await?.value;
-    if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
+    if detail.travel.is_none()
+        && detail
+            .location
+            .as_deref()
+            .is_some_and(|location| destination_matches(location, destination, destination_system))
+    {
         return Ok(());
     }
     if let Some(travel) = &detail.travel {
@@ -2435,7 +2583,9 @@ async fn start_device_travel(client: &Client, code: &str, destination: &str) -> 
             .final_destination
             .as_deref()
             .or(travel.destination.as_deref());
-        if planned == Some(destination) {
+        if planned
+            .is_some_and(|planned| destination_matches(planned, destination, destination_system))
+        {
             return Ok(());
         }
         return Err(app_error(
@@ -2464,10 +2614,24 @@ async fn wait_device_at(
     destination: &str,
     timeout: Duration,
 ) -> AnyResult<()> {
+    wait_device_at_matching(client, code, destination, None, timeout).await
+}
+
+async fn wait_device_at_matching(
+    client: &Client,
+    code: &str,
+    destination: &str,
+    destination_system: Option<&str>,
+    timeout: Duration,
+) -> AnyResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let detail = client.raw().devices().get(code).await?.value;
-        if detail.travel.is_none() && detail.location.as_deref() == Some(destination) {
+        if detail.travel.is_none()
+            && detail.location.as_deref().is_some_and(|location| {
+                destination_matches(location, destination, destination_system)
+            })
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -2481,13 +2645,21 @@ async fn wait_device_at(
 }
 
 async fn start_replicant_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
+    start_replicant_travel_matching(client, code, destination, None).await
+}
+
+async fn start_replicant_travel_matching(
+    client: &Client,
+    code: &str,
+    destination: &str,
+    destination_system: Option<&str>,
+) -> AnyResult<()> {
     let handle = client.replicants().get_owned(code).await?;
     let snapshot = handle.snapshot().await?;
     if snapshot.travel.is_none()
-        && snapshot
-            .location
-            .as_ref()
-            .is_some_and(|location| location.id.as_str() == destination)
+        && snapshot.location.as_ref().is_some_and(|location| {
+            destination_matches(location.id.as_str(), destination, destination_system)
+        })
     {
         return Ok(());
     }
@@ -2497,7 +2669,9 @@ async fn start_replicant_travel(client: &Client, code: &str, destination: &str) 
             .as_ref()
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
-        if planned == Some(destination) {
+        if planned
+            .is_some_and(|planned| destination_matches(planned, destination, destination_system))
+        {
             return Ok(());
         }
         return Err(app_error(
@@ -2514,6 +2688,16 @@ async fn wait_replicant_at(
     destination: &str,
     timeout: Duration,
 ) -> AnyResult<()> {
+    wait_replicant_at_matching(client, code, destination, None, timeout).await
+}
+
+async fn wait_replicant_at_matching(
+    client: &Client,
+    code: &str,
+    destination: &str,
+    destination_system: Option<&str>,
+    timeout: Duration,
+) -> AnyResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let snapshot = client
@@ -2523,15 +2707,14 @@ async fn wait_replicant_at(
             .snapshot()
             .await?;
         if snapshot.travel.is_none()
-            && snapshot
-                .location
-                .as_ref()
-                .is_some_and(|location| location.id.as_str() == destination)
+            && snapshot.location.as_ref().is_some_and(|location| {
+                destination_matches(location.id.as_str(), destination, destination_system)
+            })
         {
             return Ok(());
         }
         if snapshot.travel.is_none() {
-            start_replicant_travel(client, code, destination).await?;
+            start_replicant_travel_matching(client, code, destination, destination_system).await?;
         }
         if Instant::now() >= deadline {
             return Err(app_error(
@@ -2811,6 +2994,33 @@ mod tests {
         assert!(designation_in_system("RHWYRHYR", "RHWYRHYR"));
         assert!(designation_in_system("RHWYRHYR-5-L4", "RHWYRHYR"));
         assert!(!designation_in_system("RHWYRHYRA-5-L4", "RHWYRHYR"));
+    }
+
+    #[test]
+    fn landing_destination_prefers_known_entry_point() {
+        assert_eq!(
+            preferred_star_destination("DELTA", Some("DELTA-4-L4")),
+            "DELTA-4-L4"
+        );
+    }
+
+    #[test]
+    fn landing_destination_falls_back_to_star_designation() {
+        assert_eq!(preferred_star_destination("DELTA", None), "DELTA");
+    }
+
+    #[test]
+    fn system_level_destination_accepts_default_arrival_zone() {
+        assert!(destination_matches("DELTA-OORT", "DELTA", Some("DELTA")));
+        assert!(destination_matches("DELTA-KUIPER", "DELTA", Some("DELTA")));
+        assert!(destination_matches("DELTA", "DELTA", Some("DELTA")));
+        assert!(!destination_matches("DELTAE-OORT", "DELTA", Some("DELTA")));
+    }
+
+    #[test]
+    fn exact_destination_does_not_accept_another_location_in_system() {
+        assert!(destination_matches("DELTA-4-L4", "DELTA-4-L4", None));
+        assert!(!destination_matches("DELTA-OORT", "DELTA-4-L4", None));
     }
     #[test]
     fn mobile_fleets_are_attachment_carriers() {
