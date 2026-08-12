@@ -38,9 +38,8 @@ impl Config {
         let mut command = Command::Interactive;
         let mut replicant = env::var("RS_TRADE_REPLICANT").ok();
         let mut controller = None;
-        let mut database = PathBuf::from(
-            env::var("REPLICANT_DB").unwrap_or_else(|_| DEFAULT_DATABASE.to_owned()),
-        );
+        let mut database =
+            PathBuf::from(env::var("REPLICANT_DB").unwrap_or_else(|_| DEFAULT_DATABASE.to_owned()));
         let terminal = io::stdout().is_terminal();
         let mut color = terminal && env::var_os("NO_COLOR").is_none();
         let mut clear = terminal;
@@ -379,7 +378,11 @@ async fn select_replicant(
             replicant.name.as_deref().unwrap_or("<unnamed>"),
             replicant.key.id.as_str(),
             location,
-            if index == default_index { "  [default]" } else { "" }
+            if index == default_index {
+                "  [default]"
+            } else {
+                ""
+            }
         );
     }
     let selected = prompt_index("Select replicant", replicants.len(), default_index + 1)?;
@@ -407,7 +410,10 @@ fn resolve_replicant(replicants: &[Replicant], requested: &str) -> crate::AnyRes
     }
 }
 
-async fn fetch_directory(client: &Client, replicant_code: &str) -> crate::AnyResult<Vec<TraderSummary>> {
+async fn fetch_directory(
+    client: &Client,
+    replicant_code: &str,
+) -> crate::AnyResult<Vec<TraderSummary>> {
     let value = client.trading().visible_to(replicant_code).await?;
     let mut traders = value
         .get("traders")
@@ -425,7 +431,11 @@ fn compare_traders(left: &TraderSummary, right: &TraderSummary) -> Ordering {
     right
         .is_local
         .cmp(&left.is_local)
-        .then_with(|| left.display_name().to_ascii_lowercase().cmp(&right.display_name().to_ascii_lowercase()))
+        .then_with(|| {
+            left.display_name()
+                .to_ascii_lowercase()
+                .cmp(&right.display_name().to_ascii_lowercase())
+        })
         .then_with(|| left.controller_code.cmp(&right.controller_code))
 }
 
@@ -533,7 +543,9 @@ async fn interactive_shop(
             "b" | "back" => return Ok(ShopLoopResult::Back),
             "q" | "quit" | "exit" => return Ok(ShopLoopResult::Quit),
             "?" | "help" => {
-                notice = Some("/text=search trades • /=clear search • r=refresh • b=back • q=quit".to_owned());
+                notice = Some(
+                    "/text=search trades • /=clear search • r=refresh • b=back • q=quit".to_owned(),
+                );
             }
             "r" | "refresh" => match fetch_trades(client, &trader.controller_code).await {
                 Ok(updated) => {
@@ -603,8 +615,12 @@ fn render_directory(
                 truncate(trader.display_name(), 28),
                 truncate(trader.owner(), 15),
                 truncate(trader.place(), 22),
-                trader.trade_count.map_or_else(|| "?".to_owned(), |value| value.to_string()),
-                trader.total_stock.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+                trader
+                    .trade_count
+                    .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+                trader
+                    .total_stock
+                    .map_or_else(|| "?".to_owned(), |value| value.to_string()),
                 access
             );
         }
@@ -660,8 +676,14 @@ fn render_shop(
                 ui.style("1", &title),
                 ui.style("1;32", &format!("[stock {}]", trade.stock()))
             );
-            println!("     You give  {}", exchange_summary(trade.criteria.as_ref()));
-            println!("     You get   {}", exchange_summary(trade.rewards.as_ref()));
+            println!(
+                "     You give  {}",
+                exchange_summary(trade.criteria.as_ref())
+            );
+            println!(
+                "     You get   {}",
+                exchange_summary(trade.rewards.as_ref())
+            );
             println!(
                 "     {}",
                 ui.style(
@@ -688,7 +710,10 @@ fn render_shop(
     }
     println!(
         "  {}",
-        ui.style("2", "/text search   r refresh stock   b back   ? help   q quit")
+        ui.style(
+            "2",
+            "/text search   r refresh stock   b back   ? help   q quit"
+        )
     );
 }
 
@@ -699,7 +724,10 @@ fn render_shop_error(ui: &Ui, trader: &TraderSummary, error: &str) {
     println!("│ Location: {}", trader.place());
     ui.bottom_rule();
     println!();
-    println!("  {}", ui.style("1;31", "Unable to inspect this shop right now."));
+    println!(
+        "  {}",
+        ui.style("1;31", "Unable to inspect this shop right now.")
+    );
     println!("  {error}");
     println!();
     println!(
@@ -728,8 +756,12 @@ fn render_directory_plain(replicant: &Replicant, traders: &[TraderSummary]) {
             truncate(trader.display_name(), 30),
             truncate(trader.owner(), 18),
             truncate(trader.place(), 24),
-            trader.trade_count.map_or_else(|| "?".to_owned(), |value| value.to_string()),
-            trader.total_stock.map_or_else(|| "?".to_owned(), |value| value.to_string()),
+            trader
+                .trade_count
+                .map_or_else(|| "?".to_owned(), |value| value.to_string()),
+            trader
+                .total_stock
+                .map_or_else(|| "?".to_owned(), |value| value.to_string()),
             if trader.is_local { "local" } else { "network" },
         );
     }
@@ -985,5 +1017,4 @@ mod tests {
         });
         assert_eq!(trades[0].display_name(), "Available");
     }
-
 }

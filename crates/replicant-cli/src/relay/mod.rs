@@ -1,18 +1,21 @@
 //! Plans and runs an account-owned FTL relay expansion.
 //!
 //! This CLI uses the pure `replicant-route-planner` workspace crate for an
-//! exact minimum-new-relay Steiner tree over a uniform 7.499 ly graph. Managed
-//! client operations perform all mutations. The raw escape hatch is used only
+//! exact minimum-new-relay Steiner tree. Newly manufactured FTL relays use the
+//! configured conventional range (7.499 ly by default), while already deployed
+//! relay-capable devices can extend individual systems using their advertised
+//! `/network` range. Managed client operations perform all mutations. The raw
+//! escape hatch is used only
 //! for blueprint costs and autofactory queue details that are not represented
 //! by the normalized managed projection.
 //!
 //! ```text
-//! cargo run --quiet -p replicant-cli -- relay --plan \
+//! cargo run --quiet -p replicant-cli -- relay plan \
 //!   --replicant Chats-1 \
 //!   --hub SCEPTURUM-BELT-1 \
 //!   WIHAX ILPHARD KRAKHUX XHAKKWUKKXHU XIHAKHXA XHAKHKHU
 //!
-//! cargo run --quiet -p replicant-cli -- relay --run
+//! cargo run --quiet -p replicant-cli -- relay run
 //! ```
 //!
 //! Environment:
@@ -24,6 +27,7 @@
 //! - `RS_RELAY_PLAN=ftl-relay-expansion.json`
 //! - `RS_RELAY_REPLACE_PLAN=1`
 //! - `RS_RELAY_REUSE_ACCOUNT_RELAYS=1`
+//! - `RS_RELAY_IGNORE_PRINTERS=FF259175,E71BC14B`
 //! - `RS_RELAY_SUPPLY_STRATEGY=auto`
 //! - `RS_RELAY_WAIT_TIMEOUT_SECS=21600`
 
@@ -43,7 +47,7 @@ use replicant_client::{
 };
 use replicant_route_planner::{
     NetworkNode, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
-    Star as PlannerStar, plan_relay_network,
+    Star as PlannerStar, plan_relay_network_with_ranges,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +59,7 @@ const PLAN_VERSION: u32 = 2;
 const DEFAULT_MAX_HOP_LY: f64 = 7.499;
 const RELAY_DISTANCE_EPSILON: f64 = 1e-9;
 const FTL_RELAY: &str = "ftl_relay";
+const SYSTEM_HUB: &str = "system_hub";
 const AUTOFACTORY: &str = "autofactory";
 const RELAYING: &str = "relaying";
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
@@ -65,8 +70,8 @@ const RELAY_BATCH_TAG_PREFIX: &str = "relay-b:";
 const LEGACY_RELAY_MISSION_TAG_PREFIX: &str = "relay-expansion:";
 const LEGACY_RELAY_SITE_TAG_PREFIX: &str = "relay-site:";
 const RESERVED_WORKFLOW_TAG_PREFIXES: &[&str] = &[
-    "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:",
-    "mine-r:", "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
+    "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
+    "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
 ];
 
 /// Error type returned by the reusable relay workflow.
@@ -119,6 +124,7 @@ struct Config {
     max_hop_ly: f64,
     replace_plan: bool,
     reuse_account_relays: bool,
+    ignore_printers: BTreeSet<String>,
     supply_strategy: RequestedSupplyStrategy,
     wait_timeout: Duration,
     targets: Vec<String>,
@@ -156,6 +162,14 @@ impl Config {
         let mut replace_plan =
             env_flag("RS_RELAY_REPLACE_PLAN") || env_flag("RS_RELAY_REBUILD_PLAN");
         let mut reuse_account_relays = env_flag("RS_RELAY_REUSE_ACCOUNT_RELAYS");
+        let mut ignore_printers = if command == Command::Plan {
+            env::var("RS_RELAY_IGNORE_PRINTERS")
+                .ok()
+                .map(|value| parse_code_list(&value))
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
         let mut supply_strategy = env::var("RS_RELAY_SUPPLY_STRATEGY")
             .ok()
             .map(|value| RequestedSupplyStrategy::parse(&value))
@@ -175,6 +189,10 @@ impl Config {
             match argument.as_str() {
                 "--replace-plan" | "--rebuild-plan" => replace_plan = true,
                 "--reuse-account-relays" => reuse_account_relays = true,
+                "--ignore-printer" | "--exclude-printer" => {
+                    let value = required_argument(&mut arguments, &argument)?;
+                    ignore_printers.extend(parse_code_list(&value));
+                }
                 "--supply-strategy" => {
                     supply_strategy = RequestedSupplyStrategy::parse(&required_argument(
                         &mut arguments,
@@ -259,6 +277,12 @@ impl Config {
                 "--reuse-account-relays belongs on the plan command",
             ));
         }
+        if command != Command::Plan && !ignore_printers.is_empty() {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                "--ignore-printer belongs on the plan command",
+            ));
+        }
         Ok(Self {
             command,
             database,
@@ -268,6 +292,7 @@ impl Config {
             max_hop_ly,
             replace_plan,
             reuse_account_relays,
+            ignore_printers,
             supply_strategy,
             wait_timeout,
             targets,
@@ -293,11 +318,20 @@ fn env_flag(name: &str) -> bool {
     env::var(name).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+fn parse_code_list(value: &str) -> BTreeSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
 fn print_help() {
     println!(
         "FTL relay expansion\n\n\
-Usage:\n  replicant-cli relay --plan [SYSTEM ...] [OPTIONS]\n  replicant-cli relay --run [OPTIONS]\n  replicant-cli relay --status [OPTIONS]\n\n\
-Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               Uniform relay range (default: 7.499)\n  --reuse-account-relays     Reuse disconnected account relay islands too\n  --supply-strategy MODE     auto, staged, minimal, or hub (default: auto)\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Usage:\n  replicant-cli relay plan [OPTIONS] SYSTEM ...\n  replicant-cli relay run [OPTIONS]\n  replicant-cli relay status [OPTIONS]\n\n\
+Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               New FTL relay range (default: 7.499); existing relay-capable devices use advertised ranges\n  --reuse-account-relays     Reuse disconnected account relay islands too\n  --ignore-printer CODE      Exclude an Autofactory from relay print assignment; repeatable and comma-separated\n  --supply-strategy MODE     auto, staged, minimal, or hub (default: auto)\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
 Targets are system designations, not planet locations. Plan is read-only. Run\n\
 always reconciles and continues the persisted mission; there is no separate\n\
 resume command or --execute confirmation."
@@ -407,6 +441,7 @@ struct DeviceCensus {
     devices: BTreeMap<String, Device>,
     active_relay_codes: BTreeMap<String, Vec<String>>,
     inactive_relay_codes: BTreeMap<String, Vec<String>>,
+    relay_ranges_ly: BTreeMap<String, f64>,
     hub_stock: Vec<String>,
     factories: Vec<FactoryState>,
     supply_carriers: Vec<SupplyCarrierCandidate>,
@@ -590,8 +625,29 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         })?;
 
     let mut plan = if config.plan_path.exists() && !config.replace_plan {
-        let plan = load_plan(&config.plan_path)?;
+        let mut plan = load_plan(&config.plan_path)?;
         validate_loaded_plan(&plan, config, &replicant_code, &vessel_code)?;
+        if config.command == Command::Plan && !config.ignore_printers.is_empty() {
+            let factories = refresh_factory_states_at_hub(client, &config.hub).await?;
+            let mission_id = plan.mission_id.clone();
+            let reassigned = reassign_ignored_print_jobs(
+                &mut plan.print_jobs,
+                &mission_id,
+                &factories,
+                &config.ignore_printers,
+                &config.hub,
+            )?;
+            if reassigned != 0 {
+                println!(
+                    "Reassigned {reassigned} unsubmitted relay print job(s) away from ignored Autofactor{}.",
+                    if config.ignore_printers.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                );
+            }
+        }
         plan
     } else {
         if config.targets.is_empty() {
@@ -681,11 +737,29 @@ async fn create_plan(
             ),
         ));
     }
+    validate_ignored_printers(&census.factories, &config.ignore_printers, &config.hub)?;
+    if !config.ignore_printers.is_empty() {
+        info!(
+            ignored_printers = ?config.ignore_printers,
+            hub = %config.hub,
+            "excluding autofactories from relay print assignment"
+        );
+        println!(
+            "Ignoring {} Autofactory printer(s) for this relay plan: {}",
+            config.ignore_printers.len(),
+            config
+                .ignore_printers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if !census.active_relay_codes.contains_key(&start_system) {
         return Err(app_error(
             io::ErrorKind::InvalidData,
             format!(
-                "starting system {start_system} does not currently have an account-owned FTL relay in relaying status"
+                "starting system {start_system} does not currently have an active account-owned relay-capable device"
             ),
         ));
     }
@@ -729,6 +803,7 @@ async fn create_plan(
             &config.targets,
             &account_active_relays,
             &account_inactive_relays,
+            &census.relay_ranges_ly,
             config.max_hop_ly,
         )
     };
@@ -750,6 +825,26 @@ async fn create_plan(
         .into_iter()
         .filter(|star| !excluded_relay_systems.contains(&star.designation))
         .collect::<Vec<_>>();
+    let planning_relay_ranges = census
+        .relay_ranges_ly
+        .iter()
+        .filter(|(system, _)| {
+            active_relay_systems.contains(system.as_str())
+                || inactive_relay_systems.contains(system.as_str())
+        })
+        .map(|(system, range)| (system.clone(), *range))
+        .collect::<BTreeMap<_, _>>();
+    for (system, range_ly) in planning_relay_ranges
+        .iter()
+        .filter(|(_, range)| **range > config.max_hop_ly + RELAY_DISTANCE_EPSILON)
+    {
+        info!(
+            system = %system,
+            range_ly = *range_ly,
+            conventional_range_ly = config.max_hop_ly,
+            "using extended relay-capable device range"
+        );
+    }
     info!(
         start = %start_system,
         reusable_active = active_relay_systems.len(),
@@ -765,7 +860,7 @@ async fn create_plan(
         );
     }
 
-    let network = plan_relay_network(
+    let network = plan_relay_network_with_ranges(
         planning_stars,
         RelayNetworkRequest {
             start: start_system.clone(),
@@ -774,6 +869,7 @@ async fn create_plan(
             inactive_relay_systems,
             max_hop_ly: config.max_hop_ly,
         },
+        planning_relay_ranges,
     )?;
 
     let mission_id = format!("{}-{}", start_system.to_lowercase(), uuid::Uuid::new_v4());
@@ -791,16 +887,7 @@ async fn create_plan(
         });
         (stowed_in_transport, code.clone())
     });
-    let mut factory_load = census
-        .factories
-        .iter()
-        .map(|factory| {
-            (
-                factory.code.clone(),
-                factory.queue_depth + if factory.printing { 1 } else { 0 },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut factory_load = factory_loads(&census.factories, &config.ignore_printers);
 
     let nodes = network
         .nodes
@@ -864,6 +951,26 @@ async fn create_plan(
                     used_hub_stock.push(code.clone());
                 });
                 if relay_code.is_none() {
+                    if factory_load.is_empty() {
+                        let message = if config.ignore_printers.is_empty() {
+                            format!(
+                                "relay printing is required but no account-owned Autofactory is available at {}",
+                                config.hub
+                            )
+                        } else {
+                            format!(
+                                "relay printing is required but no non-ignored Autofactory is available at {}; ignored: {}",
+                                config.hub,
+                                config
+                                    .ignore_printers
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
+                        return Err(app_error(io::ErrorKind::NotFound, message));
+                    }
                     let factory_code = least_loaded_factory(&mut factory_load)?;
                     let mission_tag = relay_mission_tag(&mission_id);
                     let site_tag = relay_site_tag(system);
@@ -980,6 +1087,7 @@ fn relay_reuse_scope(
     targets: &[String],
     active: &BTreeSet<String>,
     inactive: &BTreeSet<String>,
+    relay_ranges_ly: &BTreeMap<String, f64>,
     max_hop_ly: f64,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
     let positions = stars
@@ -1010,7 +1118,19 @@ fn relay_reuse_scope(
             let Some(candidate_position) = positions.get(candidate.as_str()).copied() else {
                 continue;
             };
-            if current_position.distance(candidate_position) <= max_hop_ly + RELAY_DISTANCE_EPSILON
+            let available_range = relay_ranges_ly
+                .get(current.as_str())
+                .copied()
+                .unwrap_or(max_hop_ly)
+                .max(
+                    relay_ranges_ly
+                        .get(candidate.as_str())
+                        .copied()
+                        .unwrap_or(max_hop_ly),
+                )
+                .max(max_hop_ly);
+            if current_position.distance(candidate_position)
+                <= available_range + RELAY_DISTANCE_EPSILON
             {
                 reachable.insert(candidate.clone());
                 pending.push_back(candidate.clone());
@@ -1034,6 +1154,51 @@ fn relay_reuse_scope(
     )
 }
 
+fn factory_loads(
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+) -> BTreeMap<String, usize> {
+    factories
+        .iter()
+        .filter(|factory| !ignored.contains(&factory.code))
+        .map(|factory| {
+            (
+                factory.code.clone(),
+                factory.queue_depth + if factory.printing { 1 } else { 0 },
+            )
+        })
+        .collect()
+}
+
+fn validate_ignored_printers(
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+    hub: &str,
+) -> AnyResult<()> {
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    let available = factories
+        .iter()
+        .map(|factory| factory.code.as_str())
+        .collect::<BTreeSet<_>>();
+    let unknown = ignored
+        .iter()
+        .filter(|code| !available.contains(code.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(app_error(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "ignored printer(s) {} are not account-owned Autofactories at {hub}",
+            unknown.join(", ")
+        ),
+    ))
+}
+
 fn least_loaded_factory(loads: &mut BTreeMap<String, usize>) -> AnyResult<String> {
     let code = loads
         .iter()
@@ -1048,7 +1213,6 @@ fn least_loaded_factory(loads: &mut BTreeMap<String, usize>) -> AnyResult<String
     Ok(code)
 }
 
-
 fn deployment_batches(
     stops: &[RelayStop],
     transport_capacity: usize,
@@ -1059,9 +1223,7 @@ fn deployment_batches(
     let deploy_indices = stops
         .iter()
         .enumerate()
-        .filter_map(|(index, stop)| {
-            (stop.action == StopAction::DeployAndActivate).then_some(index)
-        })
+        .filter_map(|(index, stop)| (stop.action == StopAction::DeployAndActivate).then_some(index))
         .collect::<Vec<_>>();
     let initial = deploy_indices
         .iter()
@@ -1165,16 +1327,14 @@ fn staged_supply_assignment(
     let mut unused = candidates.to_vec();
     let mut assignments = vec![usize::MAX; quantities.len()];
     let mut chosen = Vec::<SupplyCarrierCandidate>::new();
-    let mut batches = quantities
-        .iter()
-        .copied()
-        .enumerate()
-        .collect::<Vec<_>>();
-    batches.sort_by(|(left_index, left_quantity), (right_index, right_quantity)| {
-        right_quantity
-            .cmp(left_quantity)
-            .then_with(|| left_index.cmp(right_index))
-    });
+    let mut batches = quantities.iter().copied().enumerate().collect::<Vec<_>>();
+    batches.sort_by(
+        |(left_index, left_quantity), (right_index, right_quantity)| {
+            right_quantity
+                .cmp(left_quantity)
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
     for (batch_index, quantity) in batches {
         let needed = i64::try_from(quantity).ok()?;
         let candidate_index = unused
@@ -1263,10 +1423,8 @@ fn build_supply_plan(
 
     let mut restocks = Vec::with_capacity(batches.len());
     let mut carrier_restock_indices = vec![Vec::<usize>::new(); selected.len()];
-    for (restock_index, ((boundary_stop_index, relay_stop_indices), carrier_index)) in batches
-        .into_iter()
-        .zip(assignments.into_iter())
-        .enumerate()
+    for (restock_index, ((boundary_stop_index, relay_stop_indices), carrier_index)) in
+        batches.into_iter().zip(assignments.into_iter()).enumerate()
     {
         carrier_restock_indices[carrier_index].push(restock_index);
         restocks.push(RelayRestock {
@@ -1355,6 +1513,8 @@ async fn refresh_device_census(
 
     let mut active_relay_codes = BTreeMap::<String, Vec<String>>::new();
     let mut inactive_relay_codes = BTreeMap::<String, Vec<String>>::new();
+    let mut relay_range_devices = Vec::<(String, String, String)>::new();
+    let mut relay_code_ranges_ly = BTreeMap::<String, f64>::new();
     let mut hub_stock = Vec::new();
     let mut factory_codes = Vec::new();
     let mut supply_carriers = Vec::new();
@@ -1386,61 +1546,154 @@ async fn refresh_device_census(
             });
         }
 
-        match device_type(device) {
-            Some(FTL_RELAY) => {
-                let Some(location) = device_location(device) else {
-                    continue;
-                };
-                let stowed_in_transport = device
-                    .relationships
-                    .stowed_in
-                    .as_ref()
-                    .is_some_and(|container| container.id.as_str() == vessel_code);
-                if location == hub
-                    && (device.relationships.stowed_in.is_none() || stowed_in_transport)
-                    && device.relationships.attached_to.is_none()
-                    && device_status(device) != Some(RELAYING)
-                    && (stowed_in_transport || device_has_command(device, "stow"))
-                {
-                    hub_stock.push(code.clone());
-                    continue;
-                }
-                if device.relationships.stowed_in.is_some()
-                    || device.relationships.attached_to.is_some()
-                {
-                    continue;
-                }
-                let Some(system) = resolve_system(location, systems) else {
-                    continue;
-                };
-                if device_status(device) == Some(RELAYING) {
-                    active_relay_codes
-                        .entry(system)
-                        .or_default()
-                        .push(code.clone());
-                } else if device_has_command(device, "activate") {
-                    inactive_relay_codes
-                        .entry(system)
-                        .or_default()
-                        .push(code.clone());
-                }
+        let kind = device_type(device);
+        let relay_capable = device_has_feature(device, "relay")
+            || kind == Some(FTL_RELAY)
+            || kind == Some(SYSTEM_HUB);
+        if relay_capable {
+            let Some(location) = device_location(device) else {
+                continue;
+            };
+            let stowed_in_transport = device
+                .relationships
+                .stowed_in
+                .as_ref()
+                .is_some_and(|container| container.id.as_str() == vessel_code);
+
+            // Only ordinary FTL relays are fungible hub stock for this workflow.
+            // System Hubs and other relay-capable infrastructure remain fixed
+            // network nodes and are never silently repurposed as cargo.
+            if kind == Some(FTL_RELAY)
+                && location == hub
+                && (device.relationships.stowed_in.is_none() || stowed_in_transport)
+                && device.relationships.attached_to.is_none()
+                && !relay_device_active(device)
+                && (stowed_in_transport || device_has_command(device, "stow"))
+            {
+                hub_stock.push(code.clone());
+                continue;
             }
-            Some(AUTOFACTORY) if device_location(device) == Some(hub) => {
-                factory_codes.push(code.clone());
+            if device.relationships.stowed_in.is_some()
+                || device.relationships.attached_to.is_some()
+            {
+                continue;
             }
-            _ => {}
+            let Some(system) = resolve_system(location, systems) else {
+                continue;
+            };
+            let usable = if relay_device_active(device) {
+                active_relay_codes
+                    .entry(system.clone())
+                    .or_default()
+                    .push(code.clone());
+                true
+            } else if device_has_command(device, "activate") {
+                inactive_relay_codes
+                    .entry(system.clone())
+                    .or_default()
+                    .push(code.clone());
+                true
+            } else {
+                false
+            };
+            if usable && kind != Some(FTL_RELAY) {
+                relay_range_devices.push((
+                    code.clone(),
+                    system,
+                    kind.unwrap_or("unknown").to_owned(),
+                ));
+            }
+            continue;
+        }
+
+        if kind == Some(AUTOFACTORY) && device_location(device) == Some(hub) {
+            factory_codes.push(code.clone());
         }
     }
+    // Standard FTL relays continue to use the configured conventional
+    // `--max-hop`. For other relay-capable devices, ask the authoritative
+    // network endpoint for the device's actual advertised range. This keeps
+    // System Hubs (15 ly), Deep Space Relay Stations (10 ly), and future
+    // relay hardware from being flattened to the ordinary relay range.
+    for (code, system, relay_type) in relay_range_devices {
+        let range = match client.devices().get(&code).await {
+            Ok(handle) => match handle.network().await {
+                Ok(network) => network
+                    .range_ly
+                    .filter(|range| range.is_finite() && *range > 0.0),
+                Err(error) => {
+                    warn!(
+                        device = %code,
+                        system = %system,
+                        device_type = %relay_type,
+                        %error,
+                        "could not read relay-capable device network range; using documented fallback when available"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(
+                    device = %code,
+                    system = %system,
+                    device_type = %relay_type,
+                    %error,
+                    "could not open relay-capable device for network range lookup; using documented fallback when available"
+                );
+                None
+            }
+        }
+        .or_else(|| documented_relay_range_ly(&relay_type));
+
+        if let Some(range_ly) = range {
+            relay_code_ranges_ly.insert(code, range_ly);
+        }
+    }
+
     for codes in active_relay_codes.values_mut() {
         codes.sort();
     }
     for (system, codes) in &mut inactive_relay_codes {
-        codes.sort();
+        // If activation is required, prefer the device with the greatest known
+        // relay range so the executed stop matches the range the planner may
+        // rely on. Ordinary FTL relays have no override and therefore sort
+        // behind an extended-range System Hub/other relay-capable device.
+        codes.sort_by(|left, right| {
+            let left_range = relay_code_ranges_ly.get(left).copied().unwrap_or(0.0);
+            let right_range = relay_code_ranges_ly.get(right).copied().unwrap_or(0.0);
+            right_range
+                .total_cmp(&left_range)
+                .then_with(|| left.cmp(right))
+        });
         if active_relay_codes.contains_key(system) {
             codes.clear();
         }
     }
     inactive_relay_codes.retain(|_, codes| !codes.is_empty());
+
+    // A system's extended planning range must be backed by the device that is
+    // actually usable at execution time. If the system already has active
+    // coverage, only active devices contribute. If it has no active coverage,
+    // the longest-range inactive device is the one selected for activation.
+    let mut relay_ranges_ly = BTreeMap::<String, f64>::new();
+    for (system, codes) in &active_relay_codes {
+        if let Some(range_ly) = codes
+            .iter()
+            .filter_map(|code| relay_code_ranges_ly.get(code).copied())
+            .max_by(f64::total_cmp)
+        {
+            relay_ranges_ly.insert(system.clone(), range_ly);
+        }
+    }
+    for (system, codes) in &inactive_relay_codes {
+        if let Some(range_ly) = codes
+            .iter()
+            .filter_map(|code| relay_code_ranges_ly.get(code).copied())
+            .max_by(f64::total_cmp)
+        {
+            relay_ranges_ly.insert(system.clone(), range_ly);
+        }
+    }
     hub_stock.sort();
     supply_carriers.sort_by(|left, right| {
         left.attach_capacity
@@ -1457,10 +1710,125 @@ async fn refresh_device_census(
         devices,
         active_relay_codes,
         inactive_relay_codes,
+        relay_ranges_ly,
         hub_stock,
         factories,
         supply_carriers,
     })
+}
+
+async fn refresh_factory_states_at_hub(client: &Client, hub: &str) -> AnyResult<Vec<FactoryState>> {
+    let handles = client.devices().find().collect().await?;
+    let mut factory_codes = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await?;
+        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
+            factory_codes.push(handle.id().as_str().to_owned());
+        }
+    }
+    factory_codes.sort();
+    factory_codes.dedup();
+
+    let mut factories = Vec::with_capacity(factory_codes.len());
+    for code in factory_codes {
+        factories.push(fetch_factory_state(client, &code).await?);
+    }
+    factories.sort_by_key(|factory| (factory.printing, factory.queue_depth, factory.code.clone()));
+    Ok(factories)
+}
+
+fn reassign_ignored_print_jobs(
+    print_jobs: &mut [PrintJob],
+    mission_id: &str,
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+    hub: &str,
+) -> AnyResult<usize> {
+    validate_ignored_printers(factories, ignored, hub)?;
+    if ignored.is_empty() {
+        return Ok(0);
+    }
+
+    let mut committed = Vec::new();
+    for job in print_jobs.iter() {
+        if !ignored.contains(&job.factory_code) || job.relay_code.is_some() {
+            continue;
+        }
+        if job.submission_started || job.operation_id.is_some() || job.submitted {
+            committed.push(format!("{} via {}", job.system, job.factory_code));
+        }
+    }
+    if !committed.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot ignore printer(s) {} for the saved plan because relay print job(s) have already been submitted or may be in flight: {}; let those jobs finish or recreate the plan with --replace-plan",
+                ignored.iter().cloned().collect::<Vec<_>>().join(", "),
+                committed.join(", ")
+            ),
+        ));
+    }
+
+    let mut loads = factory_loads(factories, ignored);
+    if loads.is_empty()
+        && print_jobs.iter().any(|job| {
+            job.relay_code.is_none()
+                && ignored.contains(&job.factory_code)
+                && !job.submission_started
+                && job.operation_id.is_none()
+                && !job.submitted
+        })
+    {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "saved relay plan has unsubmitted print jobs on ignored printer(s), but no non-ignored Autofactory is available at {hub}"
+            ),
+        ));
+    }
+
+    // Preserve the existing assignment load of all other unsubmitted jobs so
+    // moving an ignored printer's work does not pile it onto a factory that is
+    // already heavily represented in the saved plan. Submitted jobs are
+    // already reflected in the live queue/printing depth where relevant.
+    for job in print_jobs.iter() {
+        if job.relay_code.is_some()
+            || ignored.contains(&job.factory_code)
+            || job.submission_started
+            || job.operation_id.is_some()
+            || job.submitted
+        {
+            continue;
+        }
+        let Some(load) = loads.get_mut(&job.factory_code) else {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "saved relay plan assigns unsubmitted print work to Autofactory {}, but that factory is no longer available at {hub}; recreate the plan with --replace-plan",
+                    job.factory_code
+                ),
+            ));
+        };
+        *load += 1;
+    }
+
+    let mut reassigned = 0usize;
+    for job in print_jobs.iter_mut() {
+        if job.relay_code.is_some()
+            || !ignored.contains(&job.factory_code)
+            || job.submission_started
+            || job.operation_id.is_some()
+            || job.submitted
+        {
+            continue;
+        }
+        job.factory_code = least_loaded_factory(&mut loads)?;
+        if job.batch_tag.is_some() {
+            job.batch_tag = Some(relay_batch_tag(mission_id, &job.factory_code, job.flatpack));
+        }
+        reassigned += 1;
+    }
+    Ok(reassigned)
 }
 
 async fn fetch_factory_state(client: &Client, code: &str) -> AnyResult<FactoryState> {
@@ -1567,11 +1935,7 @@ fn normalize_relay_print_jobs(jobs: &mut [PrintJob]) {
 fn assign_new_plan_print_batches(mission_id: &str, jobs: &mut [PrintJob]) {
     normalize_relay_print_jobs(jobs);
     for job in jobs {
-        job.batch_tag = Some(relay_batch_tag(
-            mission_id,
-            &job.factory_code,
-            job.flatpack,
-        ));
+        job.batch_tag = Some(relay_batch_tag(mission_id, &job.factory_code, job.flatpack));
     }
 }
 
@@ -1589,9 +1953,7 @@ fn assign_safe_legacy_print_batches(plan: &mut MissionPlan) {
     }
     for (factory_code, flatpack) in groups {
         if plan.print_jobs.iter().any(|job| {
-            job.factory_code == factory_code
-                && job.flatpack == flatpack
-                && job.batch_tag.is_some()
+            job.factory_code == factory_code && job.flatpack == flatpack && job.batch_tag.is_some()
         }) {
             continue;
         }
@@ -2095,9 +2457,10 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         .await?
         .snapshot()
         .await?;
-    let supply_home = plan.supply.as_ref().is_none_or(|supply| {
-        supply.carriers.iter().all(|carrier| carrier.returned_home)
-    });
+    let supply_home = plan
+        .supply
+        .as_ref()
+        .is_none_or(|supply| supply.carriers.iter().all(|carrier| carrier.returned_home));
     plan.returned_to_hub = plan.stops.iter().all(|stop| stop.completed)
         && replicant.travel.is_none()
         && replicant
@@ -2251,7 +2614,10 @@ fn restock_relay_indices_for_carrier(plan: &MissionPlan, carrier_code: &str) -> 
         .collect()
 }
 
-fn next_restock_for_carrier(plan: &MissionPlan, carrier_code: &str) -> Option<(usize, RelayRestock)> {
+fn next_restock_for_carrier(
+    plan: &MissionPlan,
+    carrier_code: &str,
+) -> Option<(usize, RelayRestock)> {
     let supply = plan.supply.as_ref()?;
     let carrier = supply
         .carriers
@@ -2265,9 +2631,14 @@ fn next_restock_for_carrier(plan: &MissionPlan, carrier_code: &str) -> Option<(u
 
 fn due_restock(plan: &MissionPlan) -> Option<usize> {
     let supply = plan.supply.as_ref()?;
-    supply.restocks.iter().enumerate().find_map(|(index, restock)| {
-        (!restock.completed && plan.stops[restock.boundary_stop_index].completed).then_some(index)
-    })
+    supply
+        .restocks
+        .iter()
+        .enumerate()
+        .find_map(|(index, restock)| {
+            (!restock.completed && plan.stops[restock.boundary_stop_index].completed)
+                .then_some(index)
+        })
 }
 
 fn carrier_all_assigned_relay_codes(plan: &MissionPlan, carrier_code: &str) -> BTreeSet<String> {
@@ -2290,9 +2661,7 @@ async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -
     let conflicting = snapshot
         .tags
         .iter()
-        .filter(|tag| {
-            tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str())
-        })
+        .filter(|tag| tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if !conflicting.is_empty() {
@@ -2411,7 +2780,9 @@ async fn wait_device_at_location(
         }
         match timeout(remaining.min(Duration::from_secs(60)), watch.next()).await {
             Ok(Some(device)) if device_at(&device, destination) => return Ok(()),
-            Ok(Some(device)) if device.travel.is_some() && travel_destination(&device) != Some(destination) => {
+            Ok(Some(device))
+                if device.travel.is_some() && travel_destination(&device) != Some(destination) =>
+            {
                 return Err(app_error(
                     io::ErrorKind::Other,
                     format!(
@@ -2445,23 +2816,19 @@ async fn wait_for_carrier_payload(
     Ok(indices)
 }
 
-async fn ensure_relay_attachable(
-    client: &Client,
-    config: &Config,
-    code: &str,
-) -> AnyResult<()> {
+async fn ensure_relay_attachable(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
     let handle = client.devices().get(code).await?;
     let mut snapshot = handle.snapshot().await?;
     let modular = snapshot
         .features
         .iter()
         .any(|feature| feature.as_str() == "modular")
-        || snapshot.available_commands.iter().any(|command| {
-            matches!(command.as_str(), "compact" | "unfurl")
-        })
-        || device_status(&snapshot).is_some_and(|status| {
-            matches!(status, "compacting" | "compacted" | "unfurling")
-        });
+        || snapshot
+            .available_commands
+            .iter()
+            .any(|command| matches!(command.as_str(), "compact" | "unfurl"))
+        || device_status(&snapshot)
+            .is_some_and(|status| matches!(status, "compacting" | "compacted" | "unfurling"));
     if !modular || device_status(&snapshot) == Some("compacted") {
         return Ok(());
     }
@@ -2499,11 +2866,7 @@ async fn ensure_relay_attachable(
     .await
 }
 
-async fn ensure_relay_unfurled(
-    client: &Client,
-    config: &Config,
-    code: &str,
-) -> AnyResult<()> {
+async fn ensure_relay_unfurled(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
     let handle = client.devices().get(code).await?;
     let mut snapshot = handle.snapshot().await?;
     if device_status(&snapshot) == Some(RELAYING) {
@@ -2520,9 +2883,7 @@ async fn ensure_relay_unfurled(
         if !device_has_command(&snapshot, "unfurl") {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "relay {code} is compacted after deployment and does not advertise unfurl"
-                ),
+                format!("relay {code} is compacted after deployment and does not advertise unfurl"),
             ));
         }
         info!(relay = %code, "unfurling carrier-transported FTL relay before activation");
@@ -2637,7 +2998,8 @@ async fn attach_carrier_payload(
                 io::ErrorKind::InvalidData,
                 format!(
                     "relay {code} is at {:?}; expected hub {} before supply-carrier loading",
-                    device_location(&device), plan.hub_location
+                    device_location(&device),
+                    plan.hub_location
                 ),
             ));
         }
@@ -2820,7 +3182,8 @@ async fn ensure_carrier_dispatched(
                 io::ErrorKind::InvalidData,
                 format!(
                     "supply carrier {carrier_code} is travelling to {:?} without its complete planned payload; expected it to return to {}",
-                    travel_destination(&carrier), plan.hub_location
+                    travel_destination(&carrier),
+                    plan.hub_location
                 ),
             ));
         }
@@ -3021,7 +3384,8 @@ async fn stow_restock_payload(
                 io::ErrorKind::InvalidData,
                 format!(
                     "relay {code} is at {:?}; expected restock location {}",
-                    device_location(&device), restock.location
+                    device_location(&device),
+                    restock.location
                 ),
             ));
         }
@@ -3033,7 +3397,12 @@ async fn stow_restock_payload(
         }
         to_stow.push(code.to_owned());
     }
-    let vessel = client.devices().get(&plan.vessel_code).await?.snapshot().await?;
+    let vessel = client
+        .devices()
+        .get(&plan.vessel_code)
+        .await?
+        .snapshot()
+        .await?;
     let free = vessel
         .stow_capacity
         .unwrap_or(0)
@@ -3164,7 +3533,13 @@ async fn finish_supply_carriers(
     let carriers = plan
         .supply
         .as_ref()
-        .map(|supply| supply.carriers.iter().map(|carrier| carrier.code.clone()).collect::<Vec<_>>())
+        .map(|supply| {
+            supply
+                .carriers
+                .iter()
+                .map(|carrier| carrier.code.clone())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     for code in &carriers {
         start_device_travel(client, code, &plan.hub_location).await?;
@@ -3173,7 +3548,10 @@ async fn finish_supply_carriers(
         wait_device_at_location(client, config, code, &plan.hub_location).await?;
         release_carrier_claim(client, plan, code).await?;
         if let Some(supply) = plan.supply.as_mut()
-            && let Some(carrier) = supply.carriers.iter_mut().find(|carrier| carrier.code.as_str() == code.as_str())
+            && let Some(carrier) = supply
+                .carriers
+                .iter_mut()
+                .find(|carrier| carrier.code.as_str() == code.as_str())
         {
             carrier.returned_home = true;
         }
@@ -3270,7 +3648,11 @@ async fn execute_plan(client: &Client, config: &Config, plan: &mut MissionPlan) 
     }
 }
 
-async fn execute_hub_return_plan(client: &Client, config: &Config, plan: &mut MissionPlan) -> AnyResult<()> {
+async fn execute_hub_return_plan(
+    client: &Client,
+    config: &Config,
+    plan: &mut MissionPlan,
+) -> AnyResult<()> {
     ensure_manufacturing_resources(
         client,
         &plan.hub_location,
@@ -3427,11 +3809,9 @@ async fn submit_print_jobs(
                 save_plan(&config.plan_path, plan)?;
 
                 let factory = client.devices().get(&state.code).await?;
-                let options = AutofactoryPrintOptions::new(quantity)
-                    .tags([mission_tag, correlation_tag]);
-                let operation = factory
-                    .enqueue_print_configured(FTL_RELAY, options)
-                    .await?;
+                let options =
+                    AutofactoryPrintOptions::new(quantity).tags([mission_tag, correlation_tag]);
+                let operation = factory.enqueue_print_configured(FTL_RELAY, options).await?;
                 let operation_id = operation.id().as_str().to_owned();
                 for index in &job_indices {
                     plan.print_jobs[*index].operation_id = Some(operation_id.clone());
@@ -4009,7 +4389,7 @@ fn print_plan(plan: &MissionPlan) {
     println!("  Replicant: {}", plan.replicant_code);
     println!("  Vessel: {}", plan.vessel_code);
     println!("  Targets: {}", plan.targets.join(", "));
-    println!("  Maximum hop: {:.3} ly", plan.max_hop_ly);
+    println!("  Conventional/new-relay hop: {:.3} ly", plan.max_hop_ly);
     println!(
         "  Network sites after start: {}",
         plan.network.nodes.len().saturating_sub(1)
@@ -4053,6 +4433,24 @@ fn print_plan(plan: &MissionPlan) {
         "  Total tree distance: {:.4} ly",
         plan.network.total_edge_distance_ly
     );
+    let extended_links = plan
+        .network
+        .edges
+        .iter()
+        .filter(|edge| edge.distance_ly > plan.max_hop_ly + RELAY_DISTANCE_EPSILON)
+        .collect::<Vec<_>>();
+    if !extended_links.is_empty() {
+        println!(
+            "  Extended-range links: {} (provided by existing relay-capable infrastructure)",
+            extended_links.len()
+        );
+        for edge in extended_links {
+            println!(
+                "    {} -> {}: {:.3} ly",
+                edge.parent, edge.child, edge.distance_ly
+            );
+        }
+    }
     println!(
         "  Single-pass planner traversal: {} hops, {:.4} routed ly including one return ({})",
         plan.network.execution_hops,
@@ -4194,6 +4592,25 @@ fn device_has_command(device: &Device, command: &str) -> bool {
         .any(|available| available.as_str() == command)
 }
 
+fn device_has_feature(device: &Device, feature: &str) -> bool {
+    device
+        .features
+        .iter()
+        .any(|available| available.as_str() == feature)
+}
+
+fn relay_device_active(device: &Device) -> bool {
+    device_status(device).is_some_and(|status| status == RELAYING || status == "active")
+        || device_has_command(device, "deactivate")
+}
+
+fn documented_relay_range_ly(device_type: &str) -> Option<f64> {
+    match device_type {
+        SYSTEM_HUB => Some(15.0),
+        _ => None,
+    }
+}
+
 fn device_type(device: &Device) -> Option<&str> {
     device.device_type.as_ref().map(DeviceType::as_str)
 }
@@ -4278,6 +4695,7 @@ pub async fn execute_expansion(
         max_hop_ly: request.max_hop_ly,
         replace_plan: false,
         reuse_account_relays: false,
+        ignore_printers: BTreeSet::new(),
         supply_strategy: RequestedSupplyStrategy::Auto,
         wait_timeout: request.wait_timeout,
         targets: request
@@ -4329,6 +4747,151 @@ mod tests {
     }
 
     #[test]
+    fn ignored_printers_are_excluded_from_relay_factory_loads() {
+        let factories = vec![
+            FactoryState {
+                code: "KEEPBUSY".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+            FactoryState {
+                code: "AVAILABLE".into(),
+                queue_size: 5,
+                queue_depth: 2,
+                printing: true,
+                observed_job_tags: Vec::new(),
+            },
+        ];
+        let ignored = BTreeSet::from(["KEEPBUSY".to_owned()]);
+
+        let loads = factory_loads(&factories, &ignored);
+
+        assert!(!loads.contains_key("KEEPBUSY"));
+        assert_eq!(loads.get("AVAILABLE"), Some(&3));
+
+        let mut loads = loads;
+        assert_eq!(least_loaded_factory(&mut loads).unwrap(), "AVAILABLE");
+    }
+
+    #[test]
+    fn saved_plan_unsubmitted_jobs_are_reassigned_away_from_ignored_printers() {
+        let factories = vec![
+            FactoryState {
+                code: "IGNORED".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+            FactoryState {
+                code: "A".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+            FactoryState {
+                code: "B".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+        ];
+        let ignored = BTreeSet::from(["IGNORED".to_owned()]);
+        let mut jobs = vec![
+            print_job("ONE", "IGNORED", Some("relay-b:ignored")),
+            print_job("TWO", "A", Some("relay-b:a")),
+            print_job("THREE", "IGNORED", Some("relay-b:ignored")),
+        ];
+
+        let moved = reassign_ignored_print_jobs(
+            &mut jobs,
+            "mission-test",
+            &factories,
+            &ignored,
+            "SCEPTURUM-BELT-1",
+        )
+        .expect("unsubmitted jobs should be safely reassigned");
+
+        assert_eq!(moved, 2);
+        assert!(jobs.iter().all(|job| job.factory_code != "IGNORED"));
+        assert_eq!(jobs.iter().filter(|job| job.factory_code == "A").count(), 2);
+        assert_eq!(jobs.iter().filter(|job| job.factory_code == "B").count(), 1);
+        assert!(jobs.iter().filter(|job| job.system != "TWO").all(|job| {
+            let expected = relay_batch_tag("mission-test", &job.factory_code, false);
+            job.batch_tag.as_deref() == Some(expected.as_str())
+        }));
+    }
+
+    #[test]
+    fn saved_plan_does_not_reassign_in_flight_jobs_from_ignored_printers() {
+        let factories = vec![
+            FactoryState {
+                code: "IGNORED".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+            FactoryState {
+                code: "AVAILABLE".into(),
+                queue_size: 5,
+                queue_depth: 0,
+                printing: false,
+                observed_job_tags: Vec::new(),
+            },
+        ];
+        let ignored = BTreeSet::from(["IGNORED".to_owned()]);
+        let mut job = print_job("ONE", "IGNORED", None);
+        job.submission_started = true;
+        let mut jobs = vec![job];
+
+        let error = reassign_ignored_print_jobs(
+            &mut jobs,
+            "mission-test",
+            &factories,
+            &ignored,
+            "SCEPTURUM-BELT-1",
+        )
+        .expect_err("in-flight work must not be reassigned");
+
+        let message = error.to_string();
+        assert!(message.contains("already been submitted or may be in flight"));
+        assert!(message.contains("--replace-plan"));
+        assert_eq!(jobs[0].factory_code, "IGNORED");
+    }
+
+    #[test]
+    fn ignored_printer_validation_rejects_codes_outside_the_hub_factory_set() {
+        let factories = vec![FactoryState {
+            code: "KNOWN".into(),
+            queue_size: 5,
+            queue_depth: 0,
+            printing: false,
+            observed_job_tags: Vec::new(),
+        }];
+        let ignored = BTreeSet::from(["TYPO".to_owned()]);
+
+        let error = validate_ignored_printers(&factories, &ignored, "SCEPTURUM-BELT-1")
+            .expect_err("unknown ignored printer should fail validation");
+
+        let message = error.to_string();
+        assert!(message.contains("TYPO"));
+        assert!(message.contains("SCEPTURUM-BELT-1"));
+    }
+
+    #[test]
+    fn printer_code_lists_are_canonicalized_and_deduplicated() {
+        assert_eq!(
+            parse_code_list("ff259175, E71bc14b,ff259175"),
+            BTreeSet::from(["E71BC14B".to_owned(), "FF259175".to_owned()])
+        );
+    }
+
+    #[test]
     fn generated_relay_tags_fit_the_api_limit() {
         let mission = relay_mission_tag("scepturum-12345678-1234-1234-1234-123456789abc");
         let direct_site = relay_site_tag("XHAKKWUKKXHU");
@@ -4375,6 +4938,7 @@ mod tests {
             &[],
             &active,
             &inactive,
+            &BTreeMap::new(),
             DEFAULT_MAX_HOP_LY,
         );
 
@@ -4401,6 +4965,7 @@ mod tests {
             &["ALPHA-TARGET".to_owned()],
             &active,
             &BTreeSet::new(),
+            &BTreeMap::new(),
             DEFAULT_MAX_HOP_LY,
         );
 
@@ -4410,6 +4975,29 @@ mod tests {
         );
         assert!(scoped_inactive.is_empty());
         assert!(!scoped_active.contains("ALPHA-OTHER"));
+    }
+
+    #[test]
+    fn relay_reuse_scope_honors_extended_system_hub_range() {
+        let stars = vec![
+            planner_star("HUB", 0.0, 0.0),
+            planner_star("REMOTE", 12.0, 0.0),
+        ];
+        let active = BTreeSet::from(["HUB".to_owned(), "REMOTE".to_owned()]);
+        let ranges = BTreeMap::from([("HUB".to_owned(), 15.0)]);
+
+        let (scoped_active, scoped_inactive) = relay_reuse_scope(
+            &stars,
+            "HUB",
+            &[],
+            &active,
+            &BTreeSet::new(),
+            &ranges,
+            DEFAULT_MAX_HOP_LY,
+        );
+
+        assert_eq!(scoped_active, active);
+        assert!(scoped_inactive.is_empty());
     }
 
     #[test]
@@ -4440,13 +5028,46 @@ mod tests {
     #[test]
     fn forty_relay_route_places_restocks_after_each_nine_deployments() {
         let systems = [
-            "ATHEBIYNE", "MESURTHIM", "MPUNGO", "ALIOTHON", "SOGIN", "BRACHIOM",
-            "PARADYSON", "KOMONDORIS", "OLRESCHA", "HASOSALEH", "MAZAR", "ALULABORA",
-            "BAJAMUR", "NUSHOGAK", "MIZIR", "AMEKBUDA", "MAHASIMAR", "TIANIGUAN",
-            "XIH", "TERIBELLUM", "FUYIE", "EDELTOTON", "CIDALA", "ACOBENS",
-            "RANUGIFER", "UMONTUNO", "NEMBUS", "NEKKARON", "ENTARES", "GORUMIUN",
-            "PAREMLEO", "AREKABPRI", "HATYSU", "ALKARABON", "TIMAR", "ELKES",
-            "MENKUNT", "NASTO", "SOL", "YINU",
+            "ATHEBIYNE",
+            "MESURTHIM",
+            "MPUNGO",
+            "ALIOTHON",
+            "SOGIN",
+            "BRACHIOM",
+            "PARADYSON",
+            "KOMONDORIS",
+            "OLRESCHA",
+            "HASOSALEH",
+            "MAZAR",
+            "ALULABORA",
+            "BAJAMUR",
+            "NUSHOGAK",
+            "MIZIR",
+            "AMEKBUDA",
+            "MAHASIMAR",
+            "TIANIGUAN",
+            "XIH",
+            "TERIBELLUM",
+            "FUYIE",
+            "EDELTOTON",
+            "CIDALA",
+            "ACOBENS",
+            "RANUGIFER",
+            "UMONTUNO",
+            "NEMBUS",
+            "NEKKARON",
+            "ENTARES",
+            "GORUMIUN",
+            "PAREMLEO",
+            "AREKABPRI",
+            "HATYSU",
+            "ALKARABON",
+            "TIMAR",
+            "ELKES",
+            "MENKUNT",
+            "NASTO",
+            "SOL",
+            "YINU",
         ];
         let stops = systems
             .iter()
@@ -4486,7 +5107,10 @@ mod tests {
             staged_supply_assignment(&quantities, &carriers).expect("staged assignment");
 
         assert_eq!(selected.len(), 4);
-        assert_eq!(assignments.iter().copied().collect::<BTreeSet<_>>().len(), 4);
+        assert_eq!(
+            assignments.iter().copied().collect::<BTreeSet<_>>().len(),
+            4
+        );
     }
 
     #[test]

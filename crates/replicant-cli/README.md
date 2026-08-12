@@ -30,6 +30,7 @@ cargo build -p replicant-cli
 | `survey` | `plan`, `run`, `status` | Plan and execute durable survey routes. |
 | `relay` | `plan`, `run`, `status` | Expand an account-owned FTL relay network. |
 | `mining` | `plan`, `run`, `status` | Build repeatable mining sites and routes. |
+| `observatory` | `status`, `prospect`, `triangulate` | Automate Galactic Observatory fringe prospecting and spectral triangulation. |
 | `event` | `list`, `plan`, `run`, `status` | Plan one or all civilisation events and execute logistics. |
 | `bootstrap` | `plan`, `stage`, `run`, `status` | Stage and deploy a regional bootstrap mission. |
 | `rikers` | — | Produce a read-only local colony-candidate report. |
@@ -46,6 +47,12 @@ cargo run -p replicant-cli -- print status \
   --print 17 exotic_matter_injector \
   --tag twaffy-ring-001
 
+# Clear system-wide Autofactory queues and stop active prints, except for the
+# active job currently running on FF259175.
+cargo run -p replicant-cli -- print clear \
+  --system SCEPTURUM \
+  --exclude-active FF259175
+
 # Point-to-point delivery
 cargo run -p replicant-cli -- transport --plan \
   --origin SCEPTURUM-BELT-1 \
@@ -59,10 +66,35 @@ cargo run -p replicant-cli -- survey plan \
   --center THYFFAWFF \
   --radius 30
 
-# Regional bootstrap continuation
+# Automatic fringe prospecting. The CLI scores sparse hemispheres locally and
+# reports the server's fringe diagnostics if a direction is blocked.
+cargo run -p replicant-cli -- observatory prospect
+
+# Explicit prospect directions are also available.
+cargo run -p replicant-cli -- observatory prospect \
+  --direction toward-star --star SCEPTURUM
+
+# Current ring-event triangulation. With --all, targets are spread over a
+# deterministic deep-space sphere seeded by the selected observatories,
+# instead of clustering on one coordinate.
+cargo run -p replicant-cli -- observatory triangulate --all
+
+# Plan a bootstrap directly from a landing star; the region is inferred.
+cargo run -p replicant-cli -- bootstrap plan \
+  --landing-star LUMBUNGA \
+  --mission-file bootstrap-lumbunga.json
+
+# Manufacture/load the ark and send only its devices to the landing entry.
+# If the mission file does not exist yet, `deliver` creates it first.
+cargo run -p replicant-cli -- bootstrap deliver \
+  --landing-star LUMBUNGA \
+  --mission-file bootstrap-lumbunga.json \
+  --log-file logs/bootstrap-lumbunga.log
+
+# Later, the same durable mission can continue into the full regional workflow.
 cargo run -p replicant-cli -- bootstrap run \
-  --mission-file regional-bootstrap-beta.json \
-  --log-file logs/regional-bootstrap-beta.log
+  --mission-file bootstrap-lumbunga.json \
+  --log-file logs/bootstrap-lumbunga.log
 ```
 
 Use `cargo run -p replicant-cli -- COMMAND --help` before executing a workflow;
@@ -75,9 +107,10 @@ also write mission JSON. SQLite records normalized observations and durable
 operation outcomes; mission files record workflow phases. Keep both when
 backing up or moving active work.
 
-Planning commands do not perform gameplay mutations. `run` reconciles saved
-state and continues the first incomplete phase. There is no global `--execute`
-or separate resume command.
+Planning commands do not perform gameplay mutations. `deliver` reconciles a saved
+bootstrap mission through arrival at its landing entry and stops before regional
+deployment; `run` continues the first incomplete regional phase. There is no
+global `--execute` or separate resume command.
 
 Common configuration:
 
@@ -85,6 +118,8 @@ Common configuration:
 - `REPLICANT_DB` — managed SQLite path.
 - command-specific variables use `RS_PRINTING_*`, `RS_TRANSPORT_*`,
   `RS_EXPLORE_*`, `RS_RELAY_*`, `RS_MINING_*`, and `RS_EVENT_*` prefixes.
+- `RS_OBSERVATORY_SIGNATURE` overrides the default spectral signature used by
+  `observatory triangulate` (currently `934d3ac4dcc918ad`).
 - `--verbose` and `--log-file PATH` enable diagnostics where supported.
 - `--json` selects machine-readable output where supported.
 
