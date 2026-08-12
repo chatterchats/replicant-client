@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env,
     error::Error as StdError,
     fs::{self, OpenOptions},
@@ -11,9 +12,9 @@ use replicant_client::{Client, SecretString, StartupPolicy};
 use replicant_printing::{
     PrintRequest,
     managed::{
-        ClearReport, FactoryPrintJobStatus, ManufacturingStatusLine, QueueOptions, QueueReport,
-        SystemPrintingStatus, clear_factories_in_system, printing_status_in_system,
-        queue_prints_with_components,
+        ClearOptions, ClearReport, FactoryPrintJobStatus, ManufacturingStatusLine, QueueOptions,
+        QueueReport, SystemPrintingStatus, clear_factories_in_system_with_options,
+        printing_status_in_system, queue_prints_with_components,
     },
 };
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -44,6 +45,7 @@ struct Config {
     database: PathBuf,
     requests: Vec<PrintRequest>,
     tags: Vec<String>,
+    preserve_active_factory_codes: BTreeSet<String>,
     flatpack: bool,
     wait_timeout: Duration,
     poll_interval: Duration,
@@ -79,6 +81,7 @@ impl Config {
         );
         let mut requests = Vec::new();
         let mut tags = Vec::new();
+        let mut preserve_active_factory_codes = BTreeSet::new();
         let mut flatpack = env_flag("RS_PRINTING_FLATPACK");
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_PRINTING_WAIT_TIMEOUT_SECS")
@@ -135,6 +138,19 @@ impl Config {
                     return Err(app_error(
                         io::ErrorKind::InvalidInput,
                         "--tag is only valid with the queue or status command",
+                    ));
+                }
+                "--exclude-active" | "--keep-active" if command == Command::Clear => {
+                    preserve_active_factory_codes.insert(
+                        required_argument(&mut arguments, argument.as_str())?
+                            .trim()
+                            .to_ascii_uppercase(),
+                    );
+                }
+                "--exclude-active" | "--keep-active" => {
+                    return Err(app_error(
+                        io::ErrorKind::InvalidInput,
+                        format!("{argument} is only valid with the clear command"),
                     ));
                 }
                 "--flatpack" if command == Command::Queue => flatpack = true,
@@ -219,6 +235,7 @@ impl Config {
             database,
             requests,
             tags,
+            preserve_active_factory_codes,
             flatpack,
             wait_timeout,
             poll_interval,
@@ -259,13 +276,14 @@ fn print_help() {
         "Replicant distributed printing\n\n\
 Usage:\n  replicant-cli print [--queue] --print QUANTITY DEVICE_TYPE [OPTIONS]\n  replicant-cli print --clear [--system SYSTEM] [OPTIONS]\n  replicant-cli print --status [--system SYSTEM] [--print N DEVICE_TYPE] [OPTIONS]\n\n\
 Queue options:\n  --print N DEVICE_TYPE    Queue N devices (repeatable)\n  --hub LOCATION           Autofactory location (default: SCEPTURUM-BELT-1)\n  --tag TAG                Tag every printed device and prerequisite (repeatable)\n  --flatpack               Print requested modular devices compacted for transport\n\n\
-Clear options:\n  --system SYSTEM          Clear all Autofactories in this system\n  --hub LOCATION           Derive the clear system from this location\n\n\
+Clear options:\n  --system SYSTEM          Clear all Autofactories in this system\n  --hub LOCATION           Derive the clear system from this location\n  --exclude-active CODE   Clear this factory's queue but preserve its active print (repeatable)\n  --keep-active CODE      Alias for --exclude-active\n\n\
 Status options:\n  --system SYSTEM          Inspect devices and Autofactories in this system\n  --hub LOCATION           Derive the status system from this location\n  --print N DEVICE_TYPE    Compare live state with a desired quantity (repeatable)\n  --tag TAG                Count only matching completed/in-flight devices (repeatable)\n\n\
 Shared options:\n  --database PATH          Managed SQLite database\n  --wait-timeout-secs N    Capacity/completion wait timeout (default: 21600)\n  --poll-seconds N          State poll interval (default: 5)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit the final report as JSON\n  -h, --help                Show this help\n\n\
 Queueing recursively prints blueprint subdevices in leaf-first waves and waits\n\
 for each prerequisite wave to physically finish before queueing its parent.\n\
 The final requested devices return after their submissions are accepted. The\n\
-clear command removes queued work and stops only factories with active prints.\n\
+clear command removes queued work and stops active prints unless their factory\n\
+code is protected with --exclude-active.\n\
 The status command is read-only and reconstructs missing outputs and components\n\
 from live inventory and Autofactory queues."
     );
@@ -302,11 +320,14 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
             print_queue_report(&config, &report)?;
         }
         Command::Clear => {
-            let result = clear_factories_in_system(
+            let result = clear_factories_in_system_with_options(
                 &client,
                 &config.system,
-                config.poll_interval,
-                config.wait_timeout,
+                &ClearOptions {
+                    poll_interval: config.poll_interval,
+                    wait_timeout: config.wait_timeout,
+                    preserve_active_factory_codes: config.preserve_active_factory_codes.clone(),
+                },
             )
             .await;
             let close_result = client.close().await;
@@ -382,7 +403,9 @@ fn print_clear_report(config: &Config, report: &ClearReport) -> AnyResult<()> {
         } else {
             "queue already unavailable/empty"
         };
-        let active = if factory.active_print_stopped {
+        let active = if factory.active_print_preserved {
+            "active print preserved"
+        } else if factory.active_print_stopped {
             "active print stopped"
         } else {
             "no active print"
@@ -580,5 +603,24 @@ mod tests {
         assert_eq!(system_from_location("SCEPTURUM"), "SCEPTURUM");
         assert_eq!(system_from_location("SCEPTURUM-BELT-1"), "SCEPTURUM");
         assert_eq!(system_from_location("THYFFAWFF-1-L4"), "THYFFAWFF");
+    }
+
+    #[test]
+    fn clear_accepts_repeatable_active_print_exclusions() {
+        let config = Config::from_args_and_env([
+            "clear".to_owned(),
+            "--system".to_owned(),
+            "SCEPTURUM".to_owned(),
+            "--exclude-active".to_owned(),
+            "abc123".to_owned(),
+            "--keep-active".to_owned(),
+            "DEF456".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.preserve_active_factory_codes,
+            BTreeSet::from(["ABC123".to_owned(), "DEF456".to_owned()])
+        );
     }
 }
