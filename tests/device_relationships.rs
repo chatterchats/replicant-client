@@ -126,7 +126,6 @@ fn public_observations_do_not_erase_owned_device_relationships() {
     );
 }
 
-
 #[test]
 fn linked_device_is_normalized_and_survives_public_merge() {
     let linked: raw::devices::DeviceStatus = serde_json::from_value(json!({
