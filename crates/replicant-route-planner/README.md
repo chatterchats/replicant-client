@@ -33,7 +33,10 @@ println!("new relays: {:?}", plan.new_relay_systems);
 - `Position` and `Star` represent the catalogue.
 - `StarGraph` validates unique designations and reachable edges.
 - `RelayNetworkRequest` separates the anchored start, targets, active relays,
-  inactive reusable relays, and hop range.
+  inactive reusable relays, and conventional relay hop range.
+- `plan_relay_network_with_ranges` accepts per-system range overrides for
+  already deployed relay-capable infrastructure such as System Hubs; ordinary
+  candidate/new relay sites continue to use the conventional hop range.
 - `RelayNetworkPlan` reports selected nodes/edges, new and activated sites,
   dependency-safe execution order, hop counts, and distances.
 - `NetworkNode`, `NetworkEdge`, and `RelayAvailability` expose the result

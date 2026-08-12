@@ -2,7 +2,7 @@
 //!
 //! The crate intentionally knows nothing about HTTP, SQLite, devices, or
 //! managed-client state. Callers provide a star catalogue plus the systems
-//! that already contain account-owned FTL relays. The exact solver minimizes
+//! that already contain account-owned relay-capable devices. The exact solver minimizes
 //! newly manufactured relay sites first and total graph hops second.
 
 use std::{
@@ -135,12 +135,55 @@ pub struct RelayNetworkRequest {
     pub start: String,
     /// Systems that must be connected.
     pub targets: Vec<String>,
-    /// Account-owned relays currently in `relaying` state.
+    /// Systems with account-owned relay-capable devices already providing coverage.
     pub active_relay_systems: BTreeSet<String>,
-    /// Account-owned deployed relays that can be restored by activation.
+    /// Systems with account-owned relay-capable devices that can be restored by activation.
     pub inactive_relay_systems: BTreeSet<String>,
     /// Maximum straight-line hop.
     pub max_hop_ly: f64,
+}
+
+/// One unsupported bridge considered while diagnosing a disconnected relay graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisconnectedBridge {
+    /// Boundary system on the upstream connected component.
+    pub from: String,
+    /// Boundary system on the downstream connected component.
+    pub to: String,
+    /// Straight-line distance between the boundary systems.
+    pub distance_ly: f64,
+    /// Maximum relay range currently available across the two boundary systems.
+    pub available_range_ly: f64,
+    /// Additional range required to make this bridge usable.
+    pub shortfall_ly: f64,
+}
+
+/// Detailed route-around analysis for a disconnected relay graph.
+#[derive(Debug, Error, PartialEq)]
+#[error(
+    "no relay network connects {start} to {target}; closest start-to-target component gap is {direct_from} -> {direct_to} at {direct_distance_ly:.3} ly (range {direct_available_range_ly:.3} ly, short by {direct_shortfall_ly:.3} ly). A route-around through disconnected catalogue islands is closer to viable: {route_summary}; worst remaining shortfall {bottleneck_shortfall_ly:.3} ly. No fully valid detour exists at the current relay ranges"
+)]
+pub struct DisconnectedRouteAroundDetails {
+    /// Requested network start.
+    pub start: String,
+    /// Requested target that is unreachable from the start component.
+    pub target: String,
+    /// Closest boundary system in the start component to the target component.
+    pub direct_from: String,
+    /// Closest boundary system in the target component to the start component.
+    pub direct_to: String,
+    /// Distance across the closest start-to-target component gap.
+    pub direct_distance_ly: f64,
+    /// Available range across the closest start-to-target component gap.
+    pub direct_available_range_ly: f64,
+    /// Shortfall across the closest start-to-target component gap.
+    pub direct_shortfall_ly: f64,
+    /// Worst shortfall on the best route-around candidate.
+    pub bottleneck_shortfall_ly: f64,
+    /// Human-readable boundary sequence for the best route-around candidate.
+    pub route_summary: String,
+    /// Structured unsupported bridges on the route-around candidate.
+    pub bridges: Vec<DisconnectedBridge>,
 }
 
 /// Planning failure.
@@ -169,24 +212,123 @@ pub enum PlannerError {
     /// No connected network exists in the supplied graph.
     #[error("no relay network connects every requested system")]
     Disconnected,
+    /// The start and a requested target are separated by an unbridgeable gap.
+    #[error(
+        "no relay network connects {start} to {target}; closest gap is {from} -> {to} at {distance_ly:.3} ly, but the available relay range is {available_range_ly:.3} ly (short by {shortfall_ly:.3} ly); alternate catalogue routes were checked and none reduce the required range"
+    )]
+    DisconnectedGap {
+        /// Requested network start.
+        start: String,
+        /// Requested target that is unreachable from the start component.
+        target: String,
+        /// Closest star on the start-side connected component.
+        from: String,
+        /// Closest star on the target-side connected component.
+        to: String,
+        /// Straight-line distance between `from` and `to`.
+        distance_ly: f64,
+        /// Maximum relay range available across the two boundary systems.
+        available_range_ly: f64,
+        /// Additional range required to bridge the closest gap.
+        shortfall_ly: f64,
+    },
+    /// No valid route exists, but traversing other disconnected catalogue
+    /// islands reduces the largest unsupported gap compared with bridging the
+    /// start and target components directly.
+    #[error(transparent)]
+    DisconnectedRouteAround(Box<DisconnectedRouteAroundDetails>),
     /// Internal reconstruction failed.
     #[error("failed to reconstruct exact relay network")]
     Reconstruction,
 }
 
-/// Immutable star graph with a uniform maximum edge length.
+/// Immutable star graph with a conventional relay range plus optional
+/// per-system extended relay ranges supplied by already deployed devices.
 #[derive(Clone, Debug)]
 pub struct StarGraph {
     stars: Vec<Star>,
     index: BTreeMap<String, usize>,
+    relay_ranges_ly: Vec<f64>,
     adjacency: Vec<Vec<(usize, f64)>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BridgeCandidate {
+    from: usize,
+    to: usize,
+    distance_ly: f64,
+    available_range_ly: f64,
+    shortfall_ly: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetourCost {
+    bottleneck_shortfall_ly: f64,
+    total_shortfall_ly: f64,
+    total_distance_ly: f64,
+    bridges: usize,
+}
+
+impl DetourCost {
+    const INF: Self = Self {
+        bottleneck_shortfall_ly: f64::INFINITY,
+        total_shortfall_ly: f64::INFINITY,
+        total_distance_ly: f64::INFINITY,
+        bridges: usize::MAX,
+    };
+
+    const ZERO: Self = Self {
+        bottleneck_shortfall_ly: 0.0,
+        total_shortfall_ly: 0.0,
+        total_distance_ly: 0.0,
+        bridges: 0,
+    };
+
+    fn extend(self, bridge: BridgeCandidate) -> Self {
+        Self {
+            bottleneck_shortfall_ly: self.bottleneck_shortfall_ly.max(bridge.shortfall_ly),
+            total_shortfall_ly: self.total_shortfall_ly + bridge.shortfall_ly,
+            total_distance_ly: self.total_distance_ly + bridge.distance_ly,
+            bridges: self.bridges.saturating_add(1),
+        }
+    }
+
+    fn better_than(self, other: Self) -> bool {
+        self.bottleneck_shortfall_ly
+            .total_cmp(&other.bottleneck_shortfall_ly)
+            .then_with(|| self.total_shortfall_ly.total_cmp(&other.total_shortfall_ly))
+            .then_with(|| self.bridges.cmp(&other.bridges))
+            .then_with(|| self.total_distance_ly.total_cmp(&other.total_distance_ly))
+            .is_lt()
+    }
+}
+
 impl StarGraph {
-    /// Builds a deterministic graph. Stars are sorted by designation before
-    /// edges are generated, so equal-cost exact solutions are repeatable.
-    pub fn new(mut stars: Vec<Star>, max_hop_ly: f64) -> Result<Self, PlannerError> {
+    /// Builds a deterministic graph using one uniform relay range. Stars are
+    /// sorted by designation before edges are generated, so equal-cost exact
+    /// solutions are repeatable.
+    pub fn new(stars: Vec<Star>, max_hop_ly: f64) -> Result<Self, PlannerError> {
+        Self::with_relay_ranges(stars, max_hop_ly, &BTreeMap::new())
+    }
+
+    /// Builds a deterministic graph while allowing already deployed relay-
+    /// capable systems to advertise a longer range than a conventional relay.
+    ///
+    /// An edge is usable when either endpoint can span the separation. This
+    /// models relay-capable infrastructure such as a 15 ly System Hub or a
+    /// 10 ly Deep Space Relay Station bridging to an ordinary FTL relay.
+    pub fn with_relay_ranges(
+        mut stars: Vec<Star>,
+        max_hop_ly: f64,
+        relay_ranges_ly: &BTreeMap<String, f64>,
+    ) -> Result<Self, PlannerError> {
         if !max_hop_ly.is_finite() || max_hop_ly <= 0.0 {
+            return Err(PlannerError::InvalidMaximumHop);
+        }
+        if relay_ranges_ly
+            .values()
+            .any(|range| !range.is_finite() || *range <= 0.0)
+        {
             return Err(PlannerError::InvalidMaximumHop);
         }
         stars.sort_by(|left, right| left.designation.cmp(&right.designation));
@@ -197,11 +339,25 @@ impl StarGraph {
             }
         }
 
+        // Every catalogue star can host a newly manufactured conventional
+        // relay, so the baseline range remains `max_hop_ly`. Existing devices
+        // only enlarge that range; they never make a candidate site worse.
+        let node_ranges = stars
+            .iter()
+            .map(|star| {
+                relay_ranges_ly
+                    .get(&star.designation)
+                    .copied()
+                    .unwrap_or(max_hop_ly)
+                    .max(max_hop_ly)
+            })
+            .collect::<Vec<_>>();
+        let bucket_size = node_ranges.iter().copied().fold(max_hop_ly, f64::max);
         let cell = |position: Position| {
             (
-                (position.x / max_hop_ly).floor() as i64,
-                (position.y / max_hop_ly).floor() as i64,
-                (position.z / max_hop_ly).floor() as i64,
+                (position.x / bucket_size).floor() as i64,
+                (position.y / bucket_size).floor() as i64,
+                (position.z / bucket_size).floor() as i64,
             )
         };
         let mut buckets = BTreeMap::<(i64, i64, i64), Vec<usize>>::new();
@@ -225,7 +381,8 @@ impl StarGraph {
                                 continue;
                             }
                             let distance = stars[left].position.distance(stars[*right].position);
-                            if distance <= max_hop_ly + EPSILON {
+                            let available_range = node_ranges[left].max(node_ranges[*right]);
+                            if distance <= available_range + EPSILON {
                                 adjacency[left].push((*right, distance));
                                 adjacency[*right].push((left, distance));
                             }
@@ -240,6 +397,7 @@ impl StarGraph {
         Ok(Self {
             stars,
             index,
+            relay_ranges_ly: node_ranges,
             adjacency,
         })
     }
@@ -248,6 +406,208 @@ impl StarGraph {
     #[must_use]
     pub fn stars(&self) -> &[Star] {
         &self.stars
+    }
+
+    fn relay_range(&self, index: usize) -> f64 {
+        self.relay_ranges_ly[index]
+    }
+
+    fn disconnected_gap_error(&self, start: usize, targets: &[usize]) -> PlannerError {
+        let (component_of, components) = self.connected_components();
+        let start_component = component_of[start];
+        let Some(target) = targets
+            .iter()
+            .copied()
+            .find(|target| component_of[*target] != start_component)
+        else {
+            return PlannerError::Disconnected;
+        };
+        let target_component = component_of[target];
+
+        let Some(direct) =
+            self.best_component_bridge(&components[start_component], &components[target_component])
+        else {
+            return PlannerError::Disconnected;
+        };
+
+        if let Some((detour_cost, bridges)) =
+            self.best_component_detour(start_component, target_component, &components)
+            && bridges.len() > 1
+            && detour_cost.bottleneck_shortfall_ly + EPSILON < direct.shortfall_ly
+        {
+            let route_summary = bridges
+                .iter()
+                .map(|bridge| {
+                    format!(
+                        "{} -> {} {:.3} ly (range {:.3}, short {:.3})",
+                        self.stars[bridge.from].designation,
+                        self.stars[bridge.to].designation,
+                        bridge.distance_ly,
+                        bridge.available_range_ly,
+                        bridge.shortfall_ly,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; then ");
+            return PlannerError::DisconnectedRouteAround(Box::new(
+                DisconnectedRouteAroundDetails {
+                    start: self.stars[start].designation.clone(),
+                    target: self.stars[target].designation.clone(),
+                    direct_from: self.stars[direct.from].designation.clone(),
+                    direct_to: self.stars[direct.to].designation.clone(),
+                    direct_distance_ly: direct.distance_ly,
+                    direct_available_range_ly: direct.available_range_ly,
+                    direct_shortfall_ly: direct.shortfall_ly,
+                    bottleneck_shortfall_ly: detour_cost.bottleneck_shortfall_ly,
+                    route_summary,
+                    bridges: bridges
+                        .into_iter()
+                        .map(|bridge| DisconnectedBridge {
+                            from: self.stars[bridge.from].designation.clone(),
+                            to: self.stars[bridge.to].designation.clone(),
+                            distance_ly: bridge.distance_ly,
+                            available_range_ly: bridge.available_range_ly,
+                            shortfall_ly: bridge.shortfall_ly,
+                        })
+                        .collect(),
+                },
+            ));
+        }
+
+        PlannerError::DisconnectedGap {
+            start: self.stars[start].designation.clone(),
+            target: self.stars[target].designation.clone(),
+            from: self.stars[direct.from].designation.clone(),
+            to: self.stars[direct.to].designation.clone(),
+            distance_ly: direct.distance_ly,
+            available_range_ly: direct.available_range_ly,
+            shortfall_ly: direct.shortfall_ly,
+        }
+    }
+
+    fn connected_components(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let mut component_of = vec![usize::MAX; self.stars.len()];
+        let mut components = Vec::<Vec<usize>>::new();
+        for seed in 0..self.stars.len() {
+            if component_of[seed] != usize::MAX {
+                continue;
+            }
+            let component_index = components.len();
+            let mut members = Vec::new();
+            let mut queue = VecDeque::from([seed]);
+            component_of[seed] = component_index;
+            while let Some(current) = queue.pop_front() {
+                members.push(current);
+                for (neighbor, _) in &self.adjacency[current] {
+                    if component_of[*neighbor] == usize::MAX {
+                        component_of[*neighbor] = component_index;
+                        queue.push_back(*neighbor);
+                    }
+                }
+            }
+            members.sort_unstable();
+            components.push(members);
+        }
+        (component_of, components)
+    }
+
+    fn best_component_bridge(&self, left: &[usize], right: &[usize]) -> Option<BridgeCandidate> {
+        let mut best = None::<BridgeCandidate>;
+        for from in left {
+            for to in right {
+                let distance_ly = self.stars[*from]
+                    .position
+                    .distance(self.stars[*to].position);
+                let available_range_ly = self.relay_range(*from).max(self.relay_range(*to));
+                let candidate = BridgeCandidate {
+                    from: *from,
+                    to: *to,
+                    distance_ly,
+                    available_range_ly,
+                    shortfall_ly: (distance_ly - available_range_ly).max(0.0),
+                };
+                if best.is_none_or(|current| self.bridge_better(candidate, current)) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best
+    }
+
+    fn bridge_better(&self, candidate: BridgeCandidate, current: BridgeCandidate) -> bool {
+        candidate.shortfall_ly + EPSILON < current.shortfall_ly
+            || ((candidate.shortfall_ly - current.shortfall_ly).abs() <= EPSILON
+                && (candidate.distance_ly + EPSILON < current.distance_ly
+                    || ((candidate.distance_ly - current.distance_ly).abs() <= EPSILON
+                        && (
+                            self.stars[candidate.from].designation.as_str(),
+                            self.stars[candidate.to].designation.as_str(),
+                        ) < (
+                            self.stars[current.from].designation.as_str(),
+                            self.stars[current.to].designation.as_str(),
+                        ))))
+    }
+
+    fn best_component_detour(
+        &self,
+        start_component: usize,
+        target_component: usize,
+        components: &[Vec<usize>],
+    ) -> Option<(DetourCost, Vec<BridgeCandidate>)> {
+        let count = components.len();
+        let mut costs = vec![DetourCost::INF; count];
+        let mut previous = vec![None::<(usize, BridgeCandidate)>; count];
+        let mut visited = vec![false; count];
+        costs[start_component] = DetourCost::ZERO;
+
+        loop {
+            let current = (0..count)
+                .filter(|index| {
+                    !visited[*index] && costs[*index].bottleneck_shortfall_ly.is_finite()
+                })
+                .min_by(|left, right| {
+                    if costs[*left].better_than(costs[*right]) {
+                        std::cmp::Ordering::Less
+                    } else if costs[*right].better_than(costs[*left]) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        left.cmp(right)
+                    }
+                })?;
+            if current == target_component {
+                break;
+            }
+            visited[current] = true;
+
+            for next in 0..count {
+                if next == current || visited[next] {
+                    continue;
+                }
+                let Some(bridge) =
+                    self.best_component_bridge(&components[current], &components[next])
+                else {
+                    continue;
+                };
+                let candidate = costs[current].extend(bridge);
+                if candidate.better_than(costs[next]) {
+                    costs[next] = candidate;
+                    previous[next] = Some((current, bridge));
+                }
+            }
+        }
+
+        if !costs[target_component].bottleneck_shortfall_ly.is_finite() {
+            return None;
+        }
+        let mut current = target_component;
+        let mut reversed = Vec::new();
+        while current != start_component {
+            let (prior, bridge) = previous[current]?;
+            reversed.push(bridge);
+            current = prior;
+        }
+        reversed.reverse();
+        Some((costs[target_component], reversed))
     }
 
     fn resolve(&self, designation: &str) -> Result<usize, PlannerError> {
@@ -314,10 +674,22 @@ pub fn plan_relay_network(
     stars: Vec<Star>,
     request: RelayNetworkRequest,
 ) -> Result<RelayNetworkPlan, PlannerError> {
+    plan_relay_network_with_ranges(stars, request, BTreeMap::new())
+}
+
+/// Solves the relay network while honoring the advertised ranges of existing
+/// relay-capable systems. Values in `relay_ranges_ly` only extend the
+/// conventional `request.max_hop_ly`; candidate systems can always receive a
+/// newly manufactured conventional relay.
+pub fn plan_relay_network_with_ranges(
+    stars: Vec<Star>,
+    request: RelayNetworkRequest,
+    relay_ranges_ly: BTreeMap<String, f64>,
+) -> Result<RelayNetworkPlan, PlannerError> {
     if request.targets.is_empty() {
         return Err(PlannerError::NoTargets);
     }
-    let graph = StarGraph::new(stars, request.max_hop_ly)?;
+    let graph = StarGraph::with_relay_ranges(stars, request.max_hop_ly, &relay_ranges_ly)?;
     let start = graph.resolve(&request.start)?;
 
     let mut target_names = request.targets;
@@ -395,7 +767,7 @@ pub fn plan_relay_network(
 
     let full_mask = mask_count - 1;
     if dp[full_mask][start] == Cost::INF {
-        return Err(PlannerError::Disconnected);
+        return Err(graph.disconnected_gap_error(start, &targets));
     }
 
     let mut reconstructed = BTreeSet::new();
@@ -571,7 +943,7 @@ fn orient(
         }
     }
     if targets.iter().any(|target| !parents.contains_key(target)) {
-        return Err(PlannerError::Disconnected);
+        return Err(graph.disconnected_gap_error(start, targets));
     }
 
     let availability = |index: usize| {
@@ -879,9 +1251,13 @@ mod tests {
     use super::*;
 
     fn star(name: &str, x: f64) -> Star {
+        star_at(name, x, 0.0, 0.0)
+    }
+
+    fn star_at(name: &str, x: f64, y: f64, z: f64) -> Star {
         Star {
             designation: name.to_owned(),
-            position: Position { x, y: 0.0, z: 0.0 },
+            position: Position { x, y, z },
             entry_point: Some(format!("{name}-1-L4")),
         }
     }
@@ -1038,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_graph_is_rejected() {
+    fn disconnected_graph_reports_the_closest_gap() {
         let error = plan_relay_network(
             vec![star("A", 0.0), star("B", 20.0)],
             RelayNetworkRequest {
@@ -1050,6 +1426,140 @@ mod tests {
             },
         )
         .expect_err("disconnected");
-        assert_eq!(error, PlannerError::Disconnected);
+        let PlannerError::DisconnectedGap {
+            start,
+            target,
+            from,
+            to,
+            distance_ly,
+            available_range_ly,
+            shortfall_ly,
+        } = error
+        else {
+            panic!("expected detailed disconnected gap");
+        };
+        assert_eq!(start, "A");
+        assert_eq!(target, "B");
+        assert_eq!(from, "A");
+        assert_eq!(to, "B");
+        assert!((distance_ly - 20.0).abs() < EPSILON);
+        assert!((available_range_ly - 7.499).abs() < EPSILON);
+        assert!((shortfall_ly - 12.501).abs() < EPSILON);
+    }
+
+    #[test]
+    fn planner_automatically_routes_around_an_oversized_direct_hop() {
+        let plan = plan_relay_network(
+            vec![
+                star_at("A", 0.0, 0.0, 0.0),
+                star_at("B", 5.0, 5.0, 0.0),
+                star_at("C", 10.0, 0.0, 0.0),
+            ],
+            RelayNetworkRequest {
+                start: "A".into(),
+                targets: vec!["C".into()],
+                active_relay_systems: BTreeSet::new(),
+                inactive_relay_systems: BTreeSet::new(),
+                max_hop_ly: 7.499,
+            },
+        )
+        .expect("a valid off-axis detour should be selected automatically");
+
+        assert_eq!(plan.edges.len(), 2);
+        assert!(
+            plan.edges.iter().any(|edge| {
+                edge.parent == "A" && edge.child == "B" && edge.distance_ly < 7.499
+            })
+        );
+        assert!(
+            plan.edges.iter().any(|edge| {
+                edge.parent == "B" && edge.child == "C" && edge.distance_ly < 7.499
+            })
+        );
+        assert!(
+            !plan
+                .edges
+                .iter()
+                .any(|edge| edge.parent == "A" && edge.child == "C")
+        );
+    }
+
+    #[test]
+    fn disconnected_graph_reports_a_better_route_around_through_other_islands() {
+        let error = plan_relay_network(
+            vec![
+                star("A", 0.0),
+                star("B", 8.0),
+                star("C", 16.0),
+                star("D", 20.0),
+            ],
+            RelayNetworkRequest {
+                start: "A".into(),
+                targets: vec!["D".into()],
+                active_relay_systems: BTreeSet::new(),
+                inactive_relay_systems: BTreeSet::new(),
+                max_hop_ly: 7.499,
+            },
+        )
+        .expect_err("the two 8 ly gaps are still too large for standard relays");
+
+        let PlannerError::DisconnectedRouteAround(details) = error else {
+            panic!("expected route-around diagnostics");
+        };
+        assert_eq!(details.direct_from, "A");
+        assert_eq!(details.direct_to, "C");
+        assert!((details.direct_shortfall_ly - 8.501).abs() < EPSILON);
+        assert!((details.bottleneck_shortfall_ly - 0.501).abs() < EPSILON);
+        assert_eq!(details.bridges.len(), 2);
+        assert_eq!(details.bridges[0].from, "A");
+        assert_eq!(details.bridges[0].to, "B");
+        assert_eq!(details.bridges[1].from, "B");
+        assert_eq!(details.bridges[1].to, "C");
+        assert!(details.route_summary.contains("A -> B"));
+        assert!(details.route_summary.contains("B -> C"));
+    }
+
+    #[test]
+    fn extended_existing_relay_range_bridges_a_standard_relay_gap() {
+        let plan = plan_relay_network_with_ranges(
+            vec![star("HUB", 0.0), star("REMOTE", 12.0)],
+            RelayNetworkRequest {
+                start: "HUB".into(),
+                targets: vec!["REMOTE".into()],
+                active_relay_systems: BTreeSet::from(["HUB".to_owned(), "REMOTE".to_owned()]),
+                inactive_relay_systems: BTreeSet::new(),
+                max_hop_ly: 7.499,
+            },
+            BTreeMap::from([("HUB".to_owned(), 15.0)]),
+        )
+        .expect("15 ly hub should bridge a 12 ly gap");
+
+        assert!(plan.new_relay_systems.is_empty());
+        assert_eq!(plan.edges.len(), 1);
+        assert_eq!(plan.edges[0].parent, "HUB");
+        assert_eq!(plan.edges[0].child, "REMOTE");
+        assert_eq!(plan.edges[0].distance_ly, 12.0);
+    }
+
+    #[test]
+    fn extended_range_can_reach_a_new_standard_relay_site() {
+        let plan = plan_relay_network_with_ranges(
+            vec![star("HUB", 0.0), star("BRIDGE", 12.0), star("TARGET", 18.0)],
+            RelayNetworkRequest {
+                start: "HUB".into(),
+                targets: vec!["TARGET".into()],
+                active_relay_systems: BTreeSet::from(["HUB".to_owned()]),
+                inactive_relay_systems: BTreeSet::new(),
+                max_hop_ly: 7.499,
+            },
+            BTreeMap::from([("HUB".to_owned(), 15.0)]),
+        )
+        .expect("extended hub should reach the first conventional relay site");
+
+        assert_eq!(
+            plan.new_relay_systems,
+            vec!["BRIDGE".to_owned(), "TARGET".to_owned()]
+        );
+        assert_eq!(plan.edges.len(), 2);
     }
 }
