@@ -50,8 +50,9 @@ pub struct BootstrapProfile {
     /// Monitoring beacons carried for intelligent-life worlds.
     #[serde(default = "default_ftl_beacons")]
     pub ftl_beacons: i64,
-    /// Newly printed Surge Carriers reserved for relay and beacon payloads.
-    #[serde(default = "default_dedicated_surge_carriers")]
+    /// Legacy fixed carrier reserve. Retained for mission/profile compatibility;
+    /// current planning derives the required Surge Carrier count from payload roles.
+    #[serde(default)]
     pub dedicated_surge_carriers: i64,
 }
 
@@ -61,10 +62,6 @@ const fn default_ftl_beacons() -> i64 {
 
 const fn default_expansion_relays() -> i64 {
     18
-}
-
-const fn default_dedicated_surge_carriers() -> i64 {
-    3
 }
 
 impl Default for BootstrapProfile {
@@ -79,7 +76,7 @@ impl Default for BootstrapProfile {
             root_relays: 1,
             expansion_relays: default_expansion_relays(),
             ftl_beacons: default_ftl_beacons(),
-            dedicated_surge_carriers: default_dedicated_surge_carriers(),
+            dedicated_surge_carriers: 0,
         }
     }
 }
@@ -102,6 +99,14 @@ pub enum PlannerError {
     /// Carrier capacity cannot be derived from the unlocked blueprint.
     #[error("Surge Carrier attach capacity must be positive")]
     MissingCarrierCapacity,
+    /// A Surge Carrier is too small to keep one complete mining setup together.
+    #[error("Surge Carrier attach capacity {actual} cannot hold a complete {required}-device mining setup")]
+    CarrierCapacityTooSmall {
+        /// Required capacity for one mining setup.
+        required: i64,
+        /// Available carrier capacity.
+        actual: i64,
+    },
     /// The survey did not find enough dense belts.
     #[error("survey found {found} dense belts, but at least {required} are required")]
     InsufficientDenseBelts {
@@ -137,13 +142,7 @@ pub fn validate_profile(profile: &BootstrapProfile) -> Result<(), PlannerError> 
     )?;
     validate_count("root_relays", profile.root_relays, 1, 4)?;
     validate_count("expansion_relays", profile.expansion_relays, 0, 36)?;
-    validate_count("ftl_beacons", profile.ftl_beacons, 0, 18)?;
-    validate_count(
-        "dedicated_surge_carriers",
-        profile.dedicated_surge_carriers,
-        0,
-        12,
-    )
+    validate_count("ftl_beacons", profile.ftl_beacons, 0, 18)
 }
 
 fn validate_count(
@@ -200,6 +199,51 @@ pub fn attachment_slots(requirements: &QuantityMap) -> i64 {
         .filter(|(device_type, _)| device_type.as_str() != CARGO_FREIGHTER)
         .map(|(_, quantity)| (*quantity).max(0))
         .sum()
+}
+
+/// Number of Surge Carriers required when payload roles are kept together.
+///
+/// Every mining setup receives its own carrier, expansion relays and beacons
+/// are packed into dedicated carrier-sized groups, and the remaining payload
+/// is packed normally. This intentionally derives the convoy size from the
+/// profile instead of requiring callers to maintain a separate carrier count.
+pub fn required_role_carriers(
+    profile: &BootstrapProfile,
+    requirements: &QuantityMap,
+    carrier_capacity: i64,
+) -> Result<i64, PlannerError> {
+    if carrier_capacity <= 0 {
+        return Err(PlannerError::MissingCarrierCapacity);
+    }
+    let mining_slots_per_setup = mining_site_requirements().values().copied().sum::<i64>();
+    if carrier_capacity < mining_slots_per_setup {
+        return Err(PlannerError::CarrierCapacityTooSmall {
+            required: mining_slots_per_setup,
+            actual: carrier_capacity,
+        });
+    }
+    let mining_slots = mining_slots_per_setup.saturating_mul(profile.mining_setups.max(0));
+    let expansion_relays = profile.expansion_relays.max(0);
+    let beacons = profile.ftl_beacons.max(0);
+    let general_slots = attachment_slots(requirements)
+        .saturating_sub(mining_slots)
+        .saturating_sub(expansion_relays)
+        .saturating_sub(beacons);
+
+    Ok(profile
+        .mining_setups
+        .max(0)
+        .saturating_add(div_ceil(expansion_relays, carrier_capacity))
+        .saturating_add(div_ceil(beacons, carrier_capacity))
+        .saturating_add(div_ceil(general_slots, carrier_capacity)))
+}
+
+const fn div_ceil(value: i64, divisor: i64) -> i64 {
+    if value <= 0 {
+        0
+    } else {
+        (value + divisor - 1) / divisor
+    }
 }
 
 /// Number of additional Surge Carriers required for the attachment payload.
@@ -358,9 +402,39 @@ mod tests {
     }
 
     #[test]
-    fn carrier_provisioning_does_not_claim_unused_existing_carriers() {
+    fn legacy_carrier_provisioning_helper_remains_stable() {
         assert_eq!(carrier_provisioning(45, &[9, 9, 9, 9], 9, 3), Ok((2, 3)));
         assert_eq!(carrier_provisioning(27, &[9, 9], 9, 3), Ok((0, 3)));
+    }
+
+    #[test]
+    fn default_role_packing_derives_fourteen_carriers() {
+        let profile = BootstrapProfile::default();
+        let requirements = ark_device_requirements(&profile);
+        assert_eq!(required_role_carriers(&profile, &requirements, 9), Ok(14));
+    }
+
+    #[test]
+    fn role_packing_rejects_a_carrier_that_cannot_hold_one_mining_setup() {
+        let profile = BootstrapProfile::default();
+        let requirements = ark_device_requirements(&profile);
+        assert_eq!(
+            required_role_carriers(&profile, &requirements, 8),
+            Err(PlannerError::CarrierCapacityTooSmall {
+                required: 9,
+                actual: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn carrier_count_tracks_profile_changes_without_a_manual_reserve() {
+        let mut profile = BootstrapProfile::default();
+        profile.mining_setups = 10;
+        profile.expansion_relays = 9;
+        profile.ftl_beacons = 0;
+        let requirements = ark_device_requirements(&profile);
+        assert_eq!(required_role_carriers(&profile, &requirements, 9), Ok(14));
     }
 
     #[test]
@@ -380,7 +454,7 @@ mod tests {
 
         assert_eq!(profile.expansion_relays, 18);
         assert_eq!(profile.ftl_beacons, 9);
-        assert_eq!(profile.dedicated_surge_carriers, 3);
+        assert_eq!(profile.dedicated_surge_carriers, 0);
     }
 
     #[test]

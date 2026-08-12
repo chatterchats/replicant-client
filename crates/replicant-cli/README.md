@@ -33,7 +33,7 @@ cargo build -p replicant-cli
 | `ownership` | `reassign` | Preview or bulk-reassign non-vessel devices by catalogue region. |
 | `observatory` | `status`, `prospect`, `triangulate` | Automate Galactic Observatory fringe prospecting and spectral triangulation. |
 | `event` | `list`, `plan`, `run`, `status` | Plan one or all civilisation events and execute logistics. |
-| `bootstrap` | `plan`, `stage`, `run`, `status` | Stage and deploy a regional bootstrap mission. |
+| `bootstrap` | `plan`, `stage`, `deliver`, `run`, `status` | Stage, deliver, or fully deploy a regional bootstrap mission. |
 | `rikers` | — | Produce a read-only local colony-candidate report. |
 
 Stateful commands accept an operation word or its flag form. For example,
@@ -123,8 +123,12 @@ backing up or moving active work.
 
 Planning commands do not perform gameplay mutations. `deliver` reconciles a saved
 bootstrap mission through arrival at its landing entry and stops before regional
-deployment; `run` continues the first incomplete regional phase. There is no
-global `--execute` or separate resume command.
+deployment; `run` continues the first incomplete regional phase. Bootstrap derives
+its Surge Carrier requirement from the payload: each mining setup stays together,
+expansion relays and beacons use dedicated carrier groups, and the remaining ark
+payload is packed into additional Surge Carriers. Idle source-hub Surge Carriers
+are borrowed first; equivalent replacement prints are queued after loading.
+There is no global `--execute` or separate resume command.
 
 Common configuration:
 

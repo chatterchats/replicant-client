@@ -15,7 +15,7 @@ use model::{BootstrapMission, ChildMissions, MissionPhase, PLAN_VERSION, PrintSt
 use replicant_bootstrap_planner::{
     BootstrapProfile, ark_device_requirements, mission_tag, validate_profile,
 };
-use replicant_client::{Client, SecretString, StartupPolicy};
+use replicant_client::{Client, SecretString, StartupPolicy, SyncDomain};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
@@ -120,6 +120,14 @@ impl Config {
                 "--transport-controllers" => {
                     config.profile.transport_controllers = parse(&mut args, &arg)?
                 }
+                "--hub-maintenance-drones" => {
+                    config.profile.hub_maintenance_drones = parse(&mut args, &arg)?
+                }
+                "--root-relays" => config.profile.root_relays = parse(&mut args, &arg)?,
+                "--expansion-relays" => {
+                    config.profile.expansion_relays = parse(&mut args, &arg)?
+                }
+                "--ftl-beacons" => config.profile.ftl_beacons = parse(&mut args, &arg)?,
                 "--seed-quantity" => config.seed_quantity = parse(&mut args, &arg)?,
                 "--quick-scout-radius" => config.quick_scout_radius_ly = parse(&mut args, &arg)?,
                 "--survey-radius" => config.survey_radius_ly = parse(&mut args, &arg)?,
@@ -218,10 +226,10 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
 
 fn print_help() {
     println!(
-        "Regional bootstrap automation\n\nUsage:\n  replicant-cli bootstrap --plan [OPTIONS]\n  replicant-cli bootstrap --stage [OPTIONS]\n  replicant-cli bootstrap --deliver [OPTIONS]\n  replicant-cli bootstrap --run [OPTIONS]\n  replicant-cli bootstrap --status [OPTIONS]\n\nCore options:\n  --landing-star STAR       Ark rendezvous; its region is inferred automatically\n  --region beta|gamma       Optional region constraint/default landing selector\n  --operator NAME_OR_CODE   Existing or future capital replicant (default: Chats-1)\n  --explorer NAME_OR_CODE   Existing or future explorer (default: Chats-2)\n  --source-hub LOCATION     Source manufacturing hub\n  --mission-file PATH       Durable parent mission\n  --mining-setups N         Initial complete setups (5-10, default: 8)\n  --autofactories N         Regional factories (3-6, default: 6)\n  --freighters N            Seed/route freighters (6-12, default: 6)\n  --transport-controllers N Initial AMI transport controllers\n  --seed-quantity N         Resource units in each seed freighter (default: 500)\n  --quick-scout-radius LY   Visit-and-scan dense-belt search radius\n  --survey-radius LY        Regional survey radius (default: 30)\n  --min-sites N             Minimum dense mining systems (default: 5)\n  --max-sites N             Maximum dense mining systems (default: 9)\n  --max-concurrency N       Concurrent dispatch limit (default: 8)\n  --wait-timeout-secs N     Per-stage timeout\n  --replace-plan            Replace an incomplete plan\n  --database PATH           Managed SQLite database\n  --verbose                 Log to stderr\n  --log-file PATH           Append detailed logs to a file\n  --json                    Machine-readable plan/status\n\n`stage` prints, loads, assembles, and moves the ark to the source system entry point without requiring the planned replicants. `deliver` creates a plan when needed, manufactures and loads the ark, sends only the ark devices to the landing star entry point (or the star itself when no entry point is known), and stops before regional deployment. `run` resolves the planned replicants and continues the full regional workflow. There is no --execute or resume command."
+        "Regional bootstrap automation\n\nUsage:\n  replicant-cli bootstrap --plan [OPTIONS]\n  replicant-cli bootstrap --stage [OPTIONS]\n  replicant-cli bootstrap --deliver [OPTIONS]\n  replicant-cli bootstrap --run [OPTIONS]\n  replicant-cli bootstrap --status [OPTIONS]\n\nCore options:\n  --landing-star STAR       Ark rendezvous; its region is inferred automatically\n  --region beta|gamma       Optional region constraint/default landing selector\n  --operator NAME_OR_CODE   Existing or future capital replicant (default: Chats-1)\n  --explorer NAME_OR_CODE   Existing or future explorer (default: Chats-2)\n  --source-hub LOCATION     Source manufacturing hub\n  --mission-file PATH       Durable parent mission\n  --mining-setups N         Initial complete setups (5-10, default: 8)\n  --autofactories N         Regional factories (3-6, default: 6)\n  --freighters N            Seed/route freighters (6-12, default: 6)\n  --transport-controllers N Initial AMI transport controllers\n  --hub-maintenance-drones N Capital maintenance reserve (1-4, default: 2)\n  --root-relays N            Relays reserved for the regional root (1-4, default: 1)\n  --expansion-relays N       Expansion relays (0-36, default: 18)\n  --ftl-beacons N            Monitoring beacons (0-18, default: 9)\n  --seed-quantity N         Resource units in each seed freighter (default: 500)\n  --quick-scout-radius LY   Visit-and-scan dense-belt search radius\n  --survey-radius LY        Regional survey radius (default: 30)\n  --min-sites N             Minimum dense mining systems (default: 5)\n  --max-sites N             Maximum dense mining systems (default: 9)\n  --max-concurrency N       Concurrent dispatch limit (default: 8)\n  --wait-timeout-secs N     Per-stage timeout\n  --replace-plan            Replace an incomplete plan\n  --database PATH           Managed SQLite database\n  --verbose                 Log to stderr\n  --log-file PATH           Append detailed logs to a file\n  --json                    Machine-readable plan/status\n\n`stage` prints, loads, assembles, and moves the ark to the source system entry point without requiring the planned replicants. `deliver` creates a plan when needed, manufactures and loads the ark, sends only the ark devices to the landing star entry point (or the star itself when no entry point is known), and stops before regional deployment. `run` resolves the planned replicants and continues the full regional workflow. There is no --execute or resume command."
     );
     println!(
-        "\nDefault ark reserve: 1 root relay, 18 expansion relays, 9 monitoring beacons, and 3 newly provisioned Surge Carriers. Re-running `stage` reconciles and catches up an already-staged mission."
+        "\nDefault ark reserve: 8 complete mining setups, 1 root relay, 18 expansion relays, and 9 monitoring beacons. Surge Carrier count is derived automatically from the payload; idle source-hub carriers are reused first and replacement carriers are queued after loading."
     );
 }
 
@@ -321,8 +329,9 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
             ));
         }
     }
-    let sync = client.sync().full().await?;
-    info!(readiness=?sync.readiness, "full managed synchronization completed");
+    client.ready().await?;
+    let sync = client.sync().domain(SyncDomain::Replicants).await?;
+    info!(readiness=?sync.readiness, "refreshed owned replicants for bootstrap planning");
     client.galaxy().refresh_catalogue().await?;
     let operator = executor::resolve_replicant(client, &config.operator)
         .await?
@@ -387,6 +396,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
             requirements,
             ..PrintState::default()
         },
+        carrier_replacement_print: PrintState::default(),
         assets: Default::default(),
         carrier_target: 0,
         reused_carrier_target: 0,
@@ -464,6 +474,20 @@ fn print_mission(mission: &BootstrapMission, path: &Path, json: bool) -> AnyResu
         mission.selected_belts.len(),
         path.display()
     );
+    if mission.carrier_target > 0 {
+        println!(
+            "Ark Surge Carriers: {} total ({} reused from source); replacement prints: {}",
+            mission.carrier_target,
+            mission.reused_carrier_target,
+            if mission.carrier_replacement_print.queued {
+                "queued"
+            } else if mission.carrier_replacement_print.submission_started {
+                "submission pending reconciliation"
+            } else {
+                "not queued yet"
+            }
+        );
+    }
     if !mission.warnings.is_empty() {
         println!("Warnings:\n  - {}", mission.warnings.join("\n  - "));
     }
@@ -629,6 +653,29 @@ mod tests {
         let config = config(&["deliver", "--landing-star", "waneame"]);
         assert_eq!(config.command, Command::Deliver);
         assert_eq!(config.landing_star(), "WANEAME");
+    }
+
+    #[test]
+    fn payload_counts_do_not_require_manual_carrier_configuration() {
+        let config = config(&[
+            "plan",
+            "--mining-setups",
+            "10",
+            "--hub-maintenance-drones",
+            "4",
+            "--root-relays",
+            "2",
+            "--expansion-relays",
+            "27",
+            "--ftl-beacons",
+            "18",
+        ]);
+        assert_eq!(config.profile.mining_setups, 10);
+        assert_eq!(config.profile.hub_maintenance_drones, 4);
+        assert_eq!(config.profile.root_relays, 2);
+        assert_eq!(config.profile.expansion_relays, 27);
+        assert_eq!(config.profile.ftl_beacons, 18);
+        assert_eq!(config.profile.dedicated_surge_carriers, 0);
     }
 
     #[test]

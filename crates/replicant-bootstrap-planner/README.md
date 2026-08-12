@@ -25,12 +25,13 @@ cargo test -p replicant-bootstrap-planner
 ## API
 
 - `BootstrapProfile` describes mining setups, Autofactories, freighters,
-  controllers, maintenance and survey drones, relays, beacons, and dedicated
-  Surge Carriers.
+  controllers, maintenance and survey drones, relays, and beacons. Surge
+  Carrier requirements are derived automatically from those payload roles.
 - `validate_profile` enforces the supported operational ranges.
 - `ark_device_requirements` expands a profile into device quantities.
-- `attachment_slots`, `missing_carriers`, and `carrier_provisioning` calculate
-  the transport capacity needed for the payload.
+- `attachment_slots` and `required_role_carriers` calculate the transport
+  capacity needed for role-preserving carrier loads. Legacy generic carrier
+  helpers remain available for compatibility.
 - `BeltCandidate` and `select_dense_belts` rank known belts for the first
   regional mining sites.
 - `mission_tag` and `role_tag` produce stable API-safe tags.
@@ -51,7 +52,7 @@ let profile = BootstrapProfile {
     root_relays: 1,
     expansion_relays: 18,
     ftl_beacons: 9,
-    dedicated_surge_carriers: 3,
+    dedicated_surge_carriers: 0, // legacy compatibility field; ignored by current planning
 };
 validate_profile(&profile)?;
 let payload = ark_device_requirements(&profile);

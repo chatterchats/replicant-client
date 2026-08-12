@@ -6,6 +6,7 @@
 //! survey drones are required.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, OpenOptions},
@@ -15,8 +16,8 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Operation, OperationStatus, Replicant, SecretString, StartupPolicy, SyncDomain,
-    domain::Location,
+    Client, Operation, OperationStatus, Replicant, SecretString, Star, StartupPolicy, SyncDomain,
+    domain::{GalacticPosition, Location},
 };
 use serde_json::Value;
 use tokio::time::{Instant, timeout};
@@ -26,6 +27,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 const DEFAULT_REPLICANT: &str = "Chats-4";
 const DEFAULT_DATABASE: &str = "replicant-client.sqlite";
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const DEFAULT_SYSTEM_LIMIT: usize = 80;
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
@@ -33,6 +35,11 @@ struct Config {
     database: PathBuf,
     replicant: String,
     systems: Vec<String>,
+    route_start: Option<String>,
+    radius_ly: Option<f64>,
+    system_limit: usize,
+    include_explored: bool,
+    plan_only: bool,
     wait_timeout: Duration,
     log_file: Option<PathBuf>,
     verbose: bool,
@@ -47,6 +54,21 @@ impl Config {
         let mut replicant = env::var("RS_BELT_SEARCH_REPLICANT")
             .unwrap_or_else(|_| DEFAULT_REPLICANT.to_owned());
         let mut systems = Vec::new();
+        let mut route_start = env::var("RS_BELT_SEARCH_START")
+            .ok()
+            .map(|value| normalize_system(&value))
+            .transpose()?;
+        let mut radius_ly = env::var("RS_BELT_SEARCH_RADIUS_LY")
+            .ok()
+            .map(|value| parse_positive_f64("RS_BELT_SEARCH_RADIUS_LY", &value))
+            .transpose()?;
+        let mut system_limit = env::var("RS_BELT_SEARCH_SYSTEM_LIMIT")
+            .ok()
+            .map(|value| parse_positive_usize("RS_BELT_SEARCH_SYSTEM_LIMIT", &value))
+            .transpose()?
+            .unwrap_or(DEFAULT_SYSTEM_LIMIT);
+        let mut include_explored = env_bool("RS_BELT_SEARCH_INCLUDE_EXPLORED", false)?;
+        let mut plan_only = env_bool("RS_BELT_SEARCH_PLAN_ONLY", false)?;
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_BELT_SEARCH_WAIT_TIMEOUT_SECS")
                 .ok()
@@ -64,6 +86,19 @@ impl Config {
                     std::process::exit(0);
                 }
                 "--replicant" => replicant = next_value(&mut arguments, "--replicant")?,
+                "--start" | "--center" | "--centre" => {
+                    route_start = Some(normalize_system(&next_value(&mut arguments, &argument)?)?);
+                }
+                "--range" | "--radius" | "--radius-ly" => {
+                    let value = next_value(&mut arguments, &argument)?;
+                    radius_ly = Some(parse_positive_f64(&argument, &value)?);
+                }
+                "--system-limit" => {
+                    let value = next_value(&mut arguments, "--system-limit")?;
+                    system_limit = parse_positive_usize("--system-limit", &value)?;
+                }
+                "--include-explored" => include_explored = true,
+                "--plan-only" | "--plan" => plan_only = true,
                 "--systems-file" => {
                     let path = PathBuf::from(next_value(&mut arguments, "--systems-file")?);
                     let contents = fs::read_to_string(&path).map_err(|error| {
@@ -101,9 +136,21 @@ impl Config {
         }
 
         systems = unique_preserving_order(systems);
-        if systems.is_empty() {
+        let auto_route_requested = route_start.is_some() || radius_ly.is_some();
+        if auto_route_requested {
+            if route_start.is_none() || radius_ly.is_none() {
+                return Err(app_error(
+                    "automatic belt-search routing requires both --start LOCATION|SYSTEM and --range LY",
+                ));
+            }
+            if !systems.is_empty() {
+                return Err(app_error(
+                    "explicit SYSTEM arguments/--systems-file cannot be combined with --start/--range automatic routing",
+                ));
+            }
+        } else if systems.is_empty() {
             return Err(app_error(
-                "belt-search requires at least one SYSTEM or --systems-file PATH",
+                "belt-search requires SYSTEM..., --systems-file PATH, or --start LOCATION|SYSTEM --range LY",
             ));
         }
 
@@ -111,6 +158,11 @@ impl Config {
             database,
             replicant,
             systems,
+            route_start,
+            radius_ly,
+            system_limit,
+            include_explored,
+            plan_only,
             wait_timeout,
             log_file,
             verbose,
@@ -126,6 +178,42 @@ struct BeltReport {
     inner_radius_au: Option<f64>,
     outer_radius_au: Option<f64>,
     resources: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct RouteCandidate {
+    system: String,
+    position: GalacticPosition,
+    distance_from_start_ly: f64,
+    explored: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedStop {
+    system: String,
+    distance_from_start_ly: f64,
+    leg_distance_ly: f64,
+    explored: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BeltRoutePlan {
+    requested_start: String,
+    start_system: String,
+    radius_ly: f64,
+    stops: Vec<PlannedStop>,
+    nearest_neighbor_distance_ly: f64,
+    optimized_distance_ly: f64,
+    two_opt_swaps: usize,
+}
+
+impl BeltRoutePlan {
+    fn systems(&self) -> Vec<String> {
+        self.stops
+            .iter()
+            .map(|stop| stop.system.clone())
+            .collect()
+    }
 }
 
 impl BeltReport {
@@ -196,30 +284,73 @@ async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
         );
     }
 
-    println!("Belt search");
-    println!("Replicant: {replicant_name} ({replicant_code})");
-    println!("Systems: {}", config.systems.join(" -> "));
-    println!();
-
-    let mut all_belts = Vec::new();
-    for (index, system) in config.systems.iter().enumerate() {
-        println!("[{}/{}] {system}", index + 1, config.systems.len());
-        let already_explored = system_is_explored(client, &replicant_code, system).await?;
-        let scanned_now = if already_explored {
-            info!(
-                replicant = %replicant_code,
-                system,
-                "belt-search system is already explored; skipping travel and duplicate scan"
-            );
-            false
-        } else {
-            travel_to_system(
+    let route_plan = if let (Some(start), Some(radius_ly)) =
+        (config.route_start.as_deref(), config.radius_ly)
+    {
+        Some(
+            plan_belt_route(
                 client,
                 &replicant_code,
-                system,
-                config.wait_timeout,
+                start,
+                radius_ly,
+                config.system_limit,
+                config.include_explored,
             )
-            .await?;
+            .await?,
+        )
+    } else {
+        None
+    };
+    let systems = route_plan
+        .as_ref()
+        .map(BeltRoutePlan::systems)
+        .unwrap_or_else(|| config.systems.clone());
+
+    println!("Belt search");
+    println!("Replicant: {replicant_name} ({replicant_code})");
+    if let Some(plan) = &route_plan {
+        print_route_plan(plan, config.include_explored);
+    } else {
+        println!("Systems: {}", systems.join(" -> "));
+    }
+    println!();
+
+    if config.plan_only {
+        if route_plan.is_none() {
+            println!("Plan only: {} explicit system(s)", systems.len());
+            for (index, system) in systems.iter().enumerate() {
+                println!("  {:>3}. {system}", index + 1);
+            }
+        }
+        return Ok(());
+    }
+
+    let auto_route = route_plan.is_some();
+    let mut all_belts = Vec::new();
+    for (index, system) in systems.iter().enumerate() {
+        println!("[{}/{}] {system}", index + 1, systems.len());
+        let already_explored = system_is_explored(client, &replicant_code, system).await?;
+        let scanned_now = if already_explored {
+            if auto_route {
+                // Auto routes are anchored at the requested start and must stay
+                // physically faithful to the planned order. Known systems are
+                // therefore visited when present in the route, but never rescanned.
+                travel_to_system(client, &replicant_code, system, config.wait_timeout).await?;
+                info!(
+                    replicant = %replicant_code,
+                    system,
+                    "belt-search route stop is already explored; visited without duplicate scan"
+                );
+            } else {
+                info!(
+                    replicant = %replicant_code,
+                    system,
+                    "belt-search system is already explored; skipping travel and duplicate scan"
+                );
+            }
+            false
+        } else {
+            travel_to_system(client, &replicant_code, system, config.wait_timeout).await?;
             scan_system(client, &replicant_code, system).await?;
             true
         };
@@ -253,8 +384,272 @@ async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
         all_belts.extend(belts);
     }
 
-    print_summary(&config.systems, &all_belts);
+    print_summary(&systems, &all_belts);
     Ok(())
+}
+
+async fn plan_belt_route(
+    client: &Client,
+    replicant_code: &str,
+    requested_start: &str,
+    radius_ly: f64,
+    system_limit: usize,
+    include_explored: bool,
+) -> crate::AnyResult<BeltRoutePlan> {
+    let mut catalogue = client.galaxy().catalogue();
+    if catalogue.is_empty() {
+        info!("belt-search star catalogue is empty; refreshing it for route planning");
+        client.galaxy().refresh_catalogue().await?;
+        catalogue = client.galaxy().catalogue();
+    }
+
+    let start = resolve_route_start(&catalogue, requested_start)?;
+    let start_system = start.key.id.as_str().to_owned();
+    let start_position = start.position.ok_or_else(|| {
+        app_error(format!(
+            "belt-search start system {start_system} has no catalogue position"
+        ))
+    })?;
+
+    let explored_by_system = client
+        .galaxy()
+        .replicant_star_knowledge(replicant_code)
+        .into_iter()
+        .filter_map(|knowledge| {
+            knowledge
+                .explored
+                .map(|explored| (knowledge.star.id.as_str().to_owned(), explored))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut candidates = catalogue
+        .into_iter()
+        .filter_map(|star| {
+            let system = star.key.id.as_str().to_owned();
+            if system == start_system {
+                return None;
+            }
+            let position = star.position?;
+            let distance = position_distance(start_position, position);
+            if distance > radius_ly {
+                return None;
+            }
+            let explored = explored_by_system.get(&system).copied().unwrap_or(false);
+            if explored && !include_explored {
+                return None;
+            }
+            Some(RouteCandidate {
+                system,
+                position,
+                distance_from_start_ly: distance,
+                explored,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.system.cmp(&right.system));
+
+    let mut remaining = candidates;
+    let mut ordered = Vec::new();
+    let mut current = start_position;
+    while !remaining.is_empty() && ordered.len() + 1 < system_limit {
+        let (index, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, position_distance(current, candidate.position)))
+            .min_by(
+                |(left_index, left_distance), (right_index, right_distance)| {
+                    left_distance
+                        .partial_cmp(right_distance)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| {
+                            remaining[*left_index]
+                                .system
+                                .cmp(&remaining[*right_index].system)
+                        })
+                },
+            )
+            .expect("belt-search route candidate list is non-empty");
+        let candidate = remaining.remove(index);
+        current = candidate.position;
+        ordered.push(candidate);
+    }
+
+    let nearest_neighbor_distance_ly = candidate_route_distance(start_position, &ordered);
+    let two_opt_swaps = improve_candidate_route_2opt(start_position, &mut ordered, 8);
+    let optimized_distance_ly = candidate_route_distance(start_position, &ordered);
+
+    let mut stops = Vec::with_capacity(ordered.len() + 1);
+    stops.push(PlannedStop {
+        system: start_system.clone(),
+        distance_from_start_ly: 0.0,
+        leg_distance_ly: 0.0,
+        explored: explored_by_system
+            .get(&start_system)
+            .copied()
+            .unwrap_or(false),
+    });
+    let mut previous = start_position;
+    for candidate in ordered {
+        let leg_distance_ly = position_distance(previous, candidate.position);
+        previous = candidate.position;
+        stops.push(PlannedStop {
+            system: candidate.system,
+            distance_from_start_ly: candidate.distance_from_start_ly,
+            leg_distance_ly,
+            explored: candidate.explored,
+        });
+    }
+
+    info!(
+        replicant = %replicant_code,
+        requested_start = %requested_start,
+        start_system = %start_system,
+        radius_ly = radius_ly,
+        stops = stops.len(),
+        system_limit = system_limit,
+        include_explored = include_explored,
+        nearest_neighbor_distance_ly = nearest_neighbor_distance_ly,
+        optimized_distance_ly = optimized_distance_ly,
+        two_opt_swaps = two_opt_swaps,
+        "planned belt-search route"
+    );
+
+    Ok(BeltRoutePlan {
+        requested_start: requested_start.to_owned(),
+        start_system,
+        radius_ly,
+        stops,
+        nearest_neighbor_distance_ly,
+        optimized_distance_ly,
+        two_opt_swaps,
+    })
+}
+
+fn resolve_route_start<'a>(
+    catalogue: &'a [Star],
+    requested_start: &str,
+) -> crate::AnyResult<&'a Star> {
+    if let Some(star) = catalogue
+        .iter()
+        .find(|star| star.key.id.as_str().eq_ignore_ascii_case(requested_start))
+    {
+        return Ok(star);
+    }
+
+    catalogue
+        .iter()
+        .filter(|star| designation_in_system(requested_start, star.key.id.as_str()))
+        .max_by_key(|star| star.key.id.as_str().len())
+        .ok_or_else(|| {
+            app_error(format!(
+                "belt-search start {requested_start:?} does not resolve to a star in the catalogue"
+            ))
+        })
+}
+
+fn candidate_route_distance(start: GalacticPosition, route: &[RouteCandidate]) -> f64 {
+    let mut previous = start;
+    let mut total = 0.0;
+    for candidate in route {
+        total += position_distance(previous, candidate.position);
+        previous = candidate.position;
+    }
+    total
+}
+
+fn improve_candidate_route_2opt(
+    start: GalacticPosition,
+    route: &mut [RouteCandidate],
+    max_passes: usize,
+) -> usize {
+    if route.len() < 3 {
+        return 0;
+    }
+
+    let mut swaps = 0;
+    for _ in 0..max_passes {
+        let mut improved = false;
+        for left in 0..route.len() - 1 {
+            for right in left + 1..route.len() {
+                let previous = if left == 0 {
+                    start
+                } else {
+                    route[left - 1].position
+                };
+                let old_before = position_distance(previous, route[left].position);
+                let new_before = position_distance(previous, route[right].position);
+                let (old_after, new_after) = if right + 1 < route.len() {
+                    let next = route[right + 1].position;
+                    (
+                        position_distance(route[right].position, next),
+                        position_distance(route[left].position, next),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+                if new_before + new_after + 1e-9 < old_before + old_after {
+                    route[left..=right].reverse();
+                    swaps += 1;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    swaps
+}
+
+fn position_distance(left: GalacticPosition, right: GalacticPosition) -> f64 {
+    let dx = left.x - right.x;
+    let dy = left.y - right.y;
+    let dz = left.z - right.z;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn print_route_plan(plan: &BeltRoutePlan, include_explored: bool) {
+    let unexplored = plan.stops.iter().filter(|stop| !stop.explored).count();
+    let explored = plan.stops.len().saturating_sub(unexplored);
+    println!("Route plan:");
+    if plan.requested_start == plan.start_system {
+        println!("  Start: {}", plan.start_system);
+    } else {
+        println!(
+            "  Start: {} (system {})",
+            plan.requested_start, plan.start_system
+        );
+    }
+    println!("  Radius: {:.2} ly", plan.radius_ly);
+    println!("  Stops: {}", plan.stops.len());
+    println!("  New scans: {unexplored}");
+    if explored > 0 {
+        println!(
+            "  Known visits: {explored}{}",
+            if include_explored {
+                " (included by request)"
+            } else {
+                " (route anchor)"
+            }
+        );
+    }
+    println!("  Route distance: {:.2} ly", plan.optimized_distance_ly);
+    println!(
+        "  Optimization: {:.2} -> {:.2} ly ({} 2-opt swap(s))",
+        plan.nearest_neighbor_distance_ly, plan.optimized_distance_ly, plan.two_opt_swaps
+    );
+    println!("  Route:");
+    for (index, stop) in plan.stops.iter().enumerate() {
+        println!(
+            "    {:>3}. {:<18} leg {:>7.2} ly  radius {:>7.2} ly  {}",
+            index + 1,
+            stop.system,
+            stop.leg_distance_ly,
+            stop.distance_from_start_ly,
+            if stop.explored { "known" } else { "scan" }
+        );
+    }
 }
 
 async fn resolve_owned_replicant(
@@ -663,6 +1058,28 @@ fn normalize_system(value: &str) -> crate::AnyResult<String> {
     Ok(value.to_ascii_uppercase())
 }
 
+fn parse_positive_f64(option: &str, value: &str) -> crate::AnyResult<f64> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| app_error(format!("{option} must be a positive number, got {value:?}")))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(app_error(format!(
+            "{option} must be a finite number greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_usize(option: &str, value: &str) -> crate::AnyResult<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| app_error(format!("{option} must be a positive integer, got {value:?}")))?;
+    if parsed == 0 {
+        return Err(app_error(format!("{option} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
 fn parse_systems_text(value: &str) -> crate::AnyResult<Vec<String>> {
     value
         .split(|character: char| character.is_whitespace() || character == ',')
@@ -751,10 +1168,11 @@ fn init_logging(config: &Config) -> crate::AnyResult<()> {
 fn print_help() {
     println!(
         "Asteroid belt search\n\n\
-Usage:\n  replicant-cli belt-search [OPTIONS] SYSTEM...\n  replicant-cli belt-search [OPTIONS] --systems-file PATH\n\n\
-Visits each system in the supplied order, performs the Replicant's instant system scan when needed, prints any asteroid belts discovered, and immediately continues to the next system. No survey controller or drones are used. Already-explored systems are not rescanned.\n\n\
-Options:\n  --replicant NAME_OR_CODE  Scout replicant (default: Chats-4)\n  --systems-file PATH       Read whitespace/comma-separated systems; repeatable\n  --database PATH           Managed SQLite database [env: REPLICANT_DB]\n  --wait-timeout-secs N     Per-travel timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append detailed logs to a file\n  -h, --help                Show this help\n\n\
-Examples:\n  replicant-cli belt-search SOL YINU MENKUNT\n\n  replicant-cli belt-search --systems-file belt-targets.txt \\\n    --log-file logs/belt-search.log\n\n  replicant-cli belt-search --replicant Chats-3 SOL MENKUNT"
+Usage:\n  replicant-cli belt-search [OPTIONS] SYSTEM...\n  replicant-cli belt-search [OPTIONS] --systems-file PATH\n  replicant-cli belt-search [OPTIONS] --start LOCATION|SYSTEM --range LY\n\n\
+Fast Replicant-only asteroid-belt scouting. Explicit mode visits the supplied systems in order. Automatic route mode selects catalogue systems inside the requested radius, skips already-explored systems by default, builds the same nearest-neighbor + bounded 2-opt style route used by survey planning, anchors it at --start, and then quick-scans each route stop. No survey controller or drones are used.\n\n\
+Route planning:\n  --start LOCATION|SYSTEM    Route anchor and radius centre\n  --range LY                 Radius around --start in light years\n  --radius LY                Alias for --range\n  --system-limit N           Maximum route stops including start (default: 80)\n  --include-explored         Include known systems in an automatic route (never rescans them)\n  --plan-only, --plan        Print the planned route without travelling or scanning\n\n\
+General options:\n  --replicant NAME_OR_CODE  Scout replicant (default: Chats-4)\n  --systems-file PATH       Read whitespace/comma-separated explicit systems; repeatable\n  --database PATH           Managed SQLite database [env: REPLICANT_DB]\n  --wait-timeout-secs N     Per-travel timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append detailed logs to a file\n  -h, --help                Show this help\n\n\
+Examples:\n  replicant-cli belt-search SOL YINU MENKUNT\n\n  replicant-cli belt-search --start SCEPTURUM --range 30\n\n  replicant-cli belt-search --start SCEPTURUM-BELT-1 --range 30 \\\n    --system-limit 50 --plan-only\n\n  replicant-cli belt-search --start THYFFAWFF --range 20 \\\n    --replicant Chats-4 --log-file logs/belt-search.log"
     );
 }
 
@@ -765,6 +1183,23 @@ fn app_error(message: impl Into<String>) -> crate::AnyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use replicant_client::domain::{StarId, StarKey};
+
+    fn star(name: &str, position: [f64; 3]) -> Star {
+        Star {
+            key: StarKey::live(StarId::from(name)),
+            name: None,
+            spectral_type: None,
+            entry_point: None,
+            position: Some(GalacticPosition {
+                x: position[0],
+                y: position[1],
+                z: position[2],
+            }),
+            has_hub: None,
+            region: None,
+        }
+    }
 
     #[test]
     fn parses_and_deduplicates_system_lists() {
@@ -815,4 +1250,64 @@ mod tests {
         assert_eq!(belts[0].density_rank(), 3);
         assert_eq!(belts[0].resources["carbon"], "rich");
     }
+    #[test]
+    fn route_start_accepts_child_location_designations() {
+        let catalogue = vec![star("SCEPTURUM", [0.0, 0.0, 0.0]), star("SOL", [1.0, 0.0, 0.0])];
+        let resolved = resolve_route_start(&catalogue, "SCEPTURUM-BELT-1").unwrap();
+        assert_eq!(resolved.key.id.as_str(), "SCEPTURUM");
+    }
+
+    #[test]
+    fn two_opt_shortens_crossing_belt_route() {
+        let start = GalacticPosition {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let mut route = vec![
+            RouteCandidate {
+                system: "A".into(),
+                position: GalacticPosition {
+                    x: 10.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                distance_from_start_ly: 10.0,
+                explored: false,
+            },
+            RouteCandidate {
+                system: "B".into(),
+                position: GalacticPosition {
+                    x: 0.0,
+                    y: 10.0,
+                    z: 0.0,
+                },
+                distance_from_start_ly: 10.0,
+                explored: false,
+            },
+            RouteCandidate {
+                system: "C".into(),
+                position: GalacticPosition {
+                    x: 10.0,
+                    y: 10.0,
+                    z: 0.0,
+                },
+                distance_from_start_ly: 14.142_135_623_7,
+                explored: false,
+            },
+        ];
+        let before = candidate_route_distance(start, &route);
+        assert!(improve_candidate_route_2opt(start, &mut route, 8) > 0);
+        assert!(candidate_route_distance(start, &route) < before);
+    }
+
+    #[test]
+    fn positive_route_parameters_reject_zero_and_non_finite_values() {
+        assert_eq!(parse_positive_usize("--system-limit", "80").unwrap(), 80);
+        assert!(parse_positive_usize("--system-limit", "0").is_err());
+        assert_eq!(parse_positive_f64("--range", "30").unwrap(), 30.0);
+        assert!(parse_positive_f64("--range", "0").is_err());
+        assert!(parse_positive_f64("--range", "NaN").is_err());
+    }
+
 }

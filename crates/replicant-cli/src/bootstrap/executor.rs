@@ -9,23 +9,24 @@ use crate::relay::{RelayExpansionRequest, execute_expansion as execute_relays};
 use crate::survey::{SurveyRequest, execute_survey};
 use futures::future::join_all;
 use replicant_bootstrap_planner::{
-    AUTOFACTORY, BeltCandidate, FTL_RELAY, SEED_RESOURCES, SURGE_CARRIER, ark_device_requirements,
-    attachment_slots, carrier_provisioning, select_dense_belts,
+    AUTOFACTORY, BeltCandidate, FTL_BEACON, FTL_RELAY, SEED_RESOURCES, SURGE_CARRIER,
+    ark_device_requirements, attachment_slots, required_role_carriers, select_dense_belts,
 };
 use replicant_client::{
-    Client, Operation, OperationStatus, Replicant,
+    Client, Device, Operation, OperationStatus, Replicant, SyncDomain,
     domain::{GalacticPosition, Location},
     raw,
 };
 use replicant_mining_planner::{
-    CARGO_FREIGHTER, MAINTENANCE_DRONE, SURVEY_CONTROLLER, SURVEY_DRONE,
+    CARGO_FREIGHTER, MAINTENANCE_DRONE, MINING_CONTROLLER, MINING_DRONE, SURVEY_CONTROLLER,
+    SURVEY_DRONE,
 };
 use replicant_printing::{
     PrintRequest,
-    managed::{QueueOptions, fetch_blueprints, queue_prints},
+    managed::{QueueOptions, queue_prints},
 };
 use serde_json::{Map, Value};
-use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use super::{
@@ -37,8 +38,8 @@ use super::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const QUICK_SCOUT_SYSTEM_LIMIT: usize = 12;
-const MOBILE_FLEET: &str = "mobile_fleet";
 
 pub async fn resolve_replicant(
     client: &Client,
@@ -154,8 +155,9 @@ pub async fn execute(
         info!(phase=?mission.phase, "regional bootstrap is already complete");
         return Ok(());
     }
-    let sync = client.sync().full().await?;
-    info!(readiness=?sync.readiness, phase=?mission.phase, "reconciled managed state");
+    client.ready().await?;
+    let sync = client.sync().domain(SyncDomain::Replicants).await?;
+    info!(readiness=?sync.readiness, phase=?mission.phase, "refreshed owned replicants for bootstrap execution");
     client.galaxy().refresh_catalogue().await?;
     ensure_source_entry(client, config, mission).await?;
     resolve_required_replicants(client, config, mission).await?;
@@ -188,8 +190,9 @@ pub async fn deliver(
         info!(phase=?mission.phase, "bootstrap ark has already reached the landing star");
         return Ok(());
     }
-    let sync = client.sync().full().await?;
-    info!(readiness=?sync.readiness, phase=?mission.phase, "reconciled managed state for landing delivery");
+    client.ready().await?;
+    let sync = client.sync().domain(SyncDomain::Replicants).await?;
+    info!(readiness=?sync.readiness, phase=?mission.phase, "refreshed owned replicants for landing delivery");
     client.galaxy().refresh_catalogue().await?;
     ensure_source_entry(client, config, mission).await?;
     resolve_operator(client, config, mission).await?;
@@ -223,8 +226,8 @@ pub async fn stage(
             "the mission has already departed the source staging point; use `run` to continue it",
         ));
     }
-    let sync = client.sync().full().await?;
-    info!(readiness=?sync.readiness, phase=?mission.phase, "reconciled managed state for source staging");
+    client.ready().await?;
+    info!(readiness=?client.readiness(), phase=?mission.phase, "managed essential startup ready for source staging");
     client.galaxy().refresh_catalogue().await?;
     ensure_source_entry(client, config, mission).await?;
     manufacture_ark(client, config, mission).await?;
@@ -329,18 +332,31 @@ async fn manufacture_ark(
     if !phase_after(mission.phase, MissionPhase::ManufacturingArk) {
         set_phase(config, mission, MissionPhase::ManufacturingArk).await?;
     }
-    let blueprints = fetch_blueprints(client).await?;
-    let carrier_capacity = client
-        .raw()
-        .blueprints()
-        .list()
-        .await?
-        .value
-        .blueprints
-        .into_iter()
+    // Bootstrap previously fetched the unlocked blueprint catalogue twice:
+    // once through replicant-printing and once again just for carrier capacity.
+    // Keep the raw catalogue from the single authoritative request and derive
+    // both carrier capacity and modular-print classification from it.
+    let blueprint_catalogue = client.raw().blueprints().list().await?.value.blueprints;
+    let carrier_capacity = blueprint_catalogue
+        .iter()
         .find(|item| item.device_type.as_deref() == Some(SURGE_CARRIER))
         .and_then(|item| item.attach_capacity)
         .unwrap_or(0);
+    let modular_blueprints = blueprint_catalogue
+        .iter()
+        .filter_map(|blueprint| {
+            let device_type = blueprint.device_type.as_ref()?;
+            let modular = blueprint
+                .features
+                .as_ref()
+                .is_some_and(|features| features.iter().any(|feature| feature == "modular"))
+                || matches!(
+                    device_type.as_str(),
+                    "autofactory" | "system_hub" | "exotic_matter_injector"
+                );
+            modular.then_some(device_type.clone())
+        })
+        .collect::<BTreeSet<_>>();
     if carrier_capacity <= 0 {
         return Err(app_error(
             io::ErrorKind::InvalidData,
@@ -383,84 +399,40 @@ async fn manufacture_ark(
         }
     }
 
+    let required_carriers = required_role_carriers(&mission.profile, &desired, carrier_capacity)?;
     let current_carriers = i64::try_from(mission.assets.get(SURGE_CARRIER).map_or(0, Vec::len))?;
-    if mission.carrier_target == 0 {
-        if current_carriers > 0 || !mission.carrier_loads.is_empty() {
-            // Migration for an ark assembled by the older implementation: keep
-            // its recorded convoy and add the new three-carrier expansion reserve.
-            mission.carrier_target =
-                current_carriers.saturating_add(mission.profile.dedicated_surge_carriers);
-            mission.reused_carrier_target = mission.carrier_target;
-            info!(
-                existing = current_carriers,
-                target = mission.carrier_target,
-                "upgraded the staged ark with dedicated relay and beacon carriers"
-            );
-        } else {
-            let mut candidates = devices
-                .iter()
-                .filter(|device| eligible_idle(device, &mission.mission_tag))
-                .filter(|device| is_attachment_carrier(device.device_type.as_deref()))
-                .filter(|device| device.attached_devices.is_empty())
-                .filter_map(|device| {
-                    Some((
-                        device.device_code.clone()?,
-                        device.attach_capacity.unwrap_or(carrier_capacity),
-                    ))
-                })
-                .filter(|(code, _)| !used.contains(code))
-                .collect::<Vec<_>>();
-            candidates
-                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            let capacities = candidates
-                .iter()
-                .map(|(_, capacity)| *capacity)
-                .collect::<Vec<_>>();
-            let (reuse_count, print_count) = carrier_provisioning(
-                attachment_slots(&desired),
-                &capacities,
-                carrier_capacity,
-                mission.profile.dedicated_surge_carriers,
-            )?;
-            let carriers = mission.assets.entry(SURGE_CARRIER.into()).or_default();
-            for (code, _) in candidates.into_iter().take(reuse_count) {
-                used.insert(code.clone());
-                carriers.push(code);
-            }
-            mission.reused_carrier_target = i64::try_from(carriers.len())?;
-            mission.carrier_target = mission.reused_carrier_target.saturating_add(print_count);
-            info!(
-                reused = mission.reused_carrier_target,
-                printing = print_count,
-                target = mission.carrier_target,
-                "planned minimum attachment-carrier fleet"
-            );
-        }
-    }
-
-    // Older staged missions may be satisfied with manually printed carriers.
-    // New missions cap reuse at the exact count chosen above, so later resumes
-    // cannot silently consume every idle carrier at the source hub.
-    let current_carriers = i64::try_from(mission.assets.get(SURGE_CARRIER).map_or(0, Vec::len))?;
-    let reusable_missing = usize::try_from(
-        mission
-            .reused_carrier_target
-            .saturating_sub(current_carriers),
-    )?;
-    let carriers = mission.assets.entry(SURGE_CARRIER.into()).or_default();
-    let selected = devices
+    let additional_reuse_needed = usize::try_from(required_carriers.saturating_sub(current_carriers))?;
+    let mut candidates = devices
         .iter()
         .filter(|device| eligible_idle(device, &mission.mission_tag))
-        .filter(|device| is_attachment_carrier(device.device_type.as_deref()))
+        .filter(|device| device.device_type.as_deref() == Some(SURGE_CARRIER))
         .filter(|device| device.attached_devices.is_empty())
+        .filter(|device| device.attach_capacity.unwrap_or(carrier_capacity) >= carrier_capacity)
         .filter_map(|device| device.device_code.clone())
         .filter(|code| !used.contains(code))
-        .take(reusable_missing)
         .collect::<Vec<_>>();
-    for code in selected {
+    candidates.sort();
+
+    let carriers = mission.assets.entry(SURGE_CARRIER.into()).or_default();
+    let reused_before = mission.reused_carrier_target.max(0);
+    let mut newly_reused = 0_i64;
+    for code in candidates.into_iter().take(additional_reuse_needed) {
         used.insert(code.clone());
         carriers.push(code);
+        newly_reused = newly_reused.saturating_add(1);
     }
+    mission.reused_carrier_target = reused_before
+        .saturating_add(newly_reused)
+        .min(i64::try_from(carriers.len())?);
+    mission.carrier_target = required_carriers;
+    let printing = required_carriers.saturating_sub(i64::try_from(carriers.len())?);
+    info!(
+        reused = mission.reused_carrier_target,
+        printing,
+        target = mission.carrier_target,
+        mining_carriers = mission.profile.mining_setups,
+        "derived attachment-carrier fleet from role-based ark payload"
+    );
 
     mission.print.targets = desired.clone();
     mission
@@ -480,11 +452,7 @@ async fn manufacture_ark(
             .iter()
             .filter(|(_, quantity)| **quantity > 0)
             .map(|(device_type, quantity)| PrintRequest::new(device_type.clone(), *quantity))
-            .partition(|request| {
-                blueprints
-                    .get(&request.device_type)
-                    .is_some_and(|blueprint| blueprint.is_modular())
-            });
+            .partition(|request| modular_blueprints.contains(&request.device_type));
         let tags = vec![mission.mission_tag.clone(), mission.region_tag.clone()];
         if !standard.is_empty() {
             let mut options = QueueOptions::at(&mission.source_hub);
@@ -528,12 +496,11 @@ async fn reconcile_interrupted_print_submission(
     config: &Config,
     mission: &mut BootstrapMission,
 ) -> AnyResult<()> {
-    let tagged = list_devices(
-        client,
-        Some(&mission.source_hub),
-        Some(&mission.mission_tag),
-    )
-    .await?;
+    let hub_devices = list_devices(client, Some(&mission.source_hub), None).await?;
+    let tagged = hub_devices
+        .iter()
+        .filter(|device| device.tags.iter().any(|tag| tag == &mission.mission_tag))
+        .collect::<Vec<_>>();
     let recorded_codes = mission
         .assets
         .values()
@@ -541,7 +508,7 @@ async fn reconcile_interrupted_print_submission(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut completed = BTreeMap::<String, i64>::new();
-    for device in &tagged {
+    for device in tagged {
         let Some(code) = device.device_code.as_ref() else {
             continue;
         };
@@ -552,7 +519,7 @@ async fn reconcile_interrupted_print_submission(
             *completed.entry(device_type.clone()).or_default() += 1;
         }
     }
-    let pending = pending_tagged_prints(client, &mission.source_hub, &mission.mission_tag).await?;
+    let pending = pending_tagged_prints_from_devices(&hub_devices, &mission.mission_tag);
     let recorded = mission
         .assets
         .iter()
@@ -576,14 +543,12 @@ async fn reconcile_interrupted_print_submission(
     save_mission(&config.mission_file, mission)
 }
 
-async fn pending_tagged_prints(
-    client: &Client,
-    hub: &str,
+fn pending_tagged_prints_from_devices(
+    devices: &[raw::devices::DeviceStatus],
     mission_tag: &str,
-) -> AnyResult<BTreeMap<String, i64>> {
-    let factories = list_devices(client, Some(hub), None).await?;
+) -> BTreeMap<String, i64> {
     let mut pending = BTreeMap::<String, i64>::new();
-    for factory in factories
+    for factory in devices
         .iter()
         .filter(|device| device.device_type.as_deref() == Some(AUTOFACTORY))
     {
@@ -615,7 +580,7 @@ async fn pending_tagged_prints(
             *pending.entry(device_type.to_owned()).or_default() += quantity;
         }
     }
-    Ok(pending)
+    pending
 }
 
 fn remaining_print_requirements(
@@ -652,6 +617,7 @@ async fn wait_for_printed_assets(
     desired: &BTreeMap<String, i64>,
 ) -> AnyResult<()> {
     let deadline = Instant::now() + config.wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
         let tagged = list_devices(
             client,
@@ -688,7 +654,7 @@ async fn wait_for_printed_assets(
             .sum::<i64>();
         let hub_carriers = tagged
             .iter()
-            .filter(|device| is_attachment_carrier(device.device_type.as_deref()))
+            .filter(|device| device.device_type.as_deref() == Some(SURGE_CARRIER))
             .filter(|device| {
                 device
                     .device_code
@@ -714,7 +680,43 @@ async fn wait_for_printed_assets(
                 "timed out waiting for the regional ark to finish printing",
             ));
         }
-        sleep(POLL_INTERVAL).await;
+
+        // Printing can take hours. Use the account event stream as the normal
+        // wake-up path and only re-list the hub on a relevant completion or a
+        // sparse 60-second authoritative fallback. The old five-second list
+        // loop multiplied paginated /devices calls for the entire print window.
+        let poll_deadline = (Instant::now() + AUTHORITATIVE_POLL_INTERVAL).min(deadline);
+        loop {
+            let remaining = poll_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, watch.next()).await {
+                Ok(Ok(event)) if event.name.as_str() == "print.completed" => {
+                    match event.print_completed() {
+                        Ok(Some(payload))
+                            if payload
+                                .tags
+                                .iter()
+                                .any(|tag| tag == &mission.mission_tag) =>
+                        {
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(error) => {
+                            warn!(error = %error, "could not decode print.completed; refreshing bootstrap prints");
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => {
+                    warn!(error = %error, "event watcher gap; refreshing bootstrap print state");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -782,7 +784,7 @@ async fn allocate_printed_assets(
     );
     for device in tagged
         .iter()
-        .filter(|device| is_attachment_carrier(device.device_type.as_deref()))
+        .filter(|device| device.device_type.as_deref() == Some(SURGE_CARRIER))
     {
         if capacity >= attachment_slots(desired)
             && carriers.len() >= usize::try_from(mission.carrier_target)?
@@ -883,24 +885,103 @@ async fn load_ark(
             .collect();
         save_mission(&config.mission_file, mission)?;
     }
-    let collect_results = join_all(
-        mission
-            .seed_freighters
-            .iter()
-            .map(|seed| collect_resource(client, &seed.code, &seed.resource, seed.quantity)),
-    )
+    let hub_devices = list_devices(client, Some(&mission.source_hub), None).await?;
+    let cargo_by_device = hub_devices
+        .iter()
+        .filter_map(|device| Some((device.device_code.clone()?, cargo_map(device))))
+        .collect::<BTreeMap<_, _>>();
+    let collect_results = join_all(mission.seed_freighters.iter().map(|seed| {
+        let cargo = cargo_by_device.get(&seed.code).cloned().unwrap_or_default();
+        collect_resource_with_cargo(
+            client,
+            &seed.code,
+            &seed.resource,
+            seed.quantity,
+            cargo,
+        )
+    }))
     .await;
     finish_all(collect_results)?;
 
     append_missing_carrier_loads(client, config, mission).await?;
-    let attach_results = join_all(
-        mission
-            .carrier_loads
-            .iter()
-            .map(|load| attach_devices(client, &load.carrier, &load.devices)),
-    )
-    .await;
-    finish_all(attach_results)
+    attach_carrier_loads_at(client, &mission.source_hub, &mission.carrier_loads).await?;
+    queue_borrowed_carrier_replacements(client, config, mission).await
+}
+
+fn carrier_replacement_tag(mission_tag: &str) -> String {
+    let suffix = mission_tag.strip_prefix("boot-m:").unwrap_or(mission_tag);
+    format!("boot-repl:{suffix}")
+}
+
+async fn queue_borrowed_carrier_replacements(
+    client: &Client,
+    config: &Config,
+    mission: &mut BootstrapMission,
+) -> AnyResult<()> {
+    let target = mission.reused_carrier_target.max(0);
+    if target == 0 {
+        return Ok(());
+    }
+    let replacement_tag = carrier_replacement_tag(&mission.mission_tag);
+    let hub_devices = list_devices(client, Some(&mission.source_hub), None).await?;
+    let completed = hub_devices
+        .iter()
+        .filter(|device| device.device_type.as_deref() == Some(SURGE_CARRIER))
+        .filter(|device| device.tags.iter().any(|tag| tag == &replacement_tag))
+        .count();
+    let pending = pending_tagged_prints_from_devices(&hub_devices, &replacement_tag)
+        .get(SURGE_CARRIER)
+        .copied()
+        .unwrap_or(0);
+    let accounted = i64::try_from(completed)?.saturating_add(pending);
+    let remaining = target.saturating_sub(accounted);
+
+    mission.carrier_replacement_print.targets =
+        [(SURGE_CARRIER.to_owned(), target)].into_iter().collect();
+    mission.carrier_replacement_print.requirements = if remaining > 0 {
+        [(SURGE_CARRIER.to_owned(), remaining)].into_iter().collect()
+    } else {
+        BTreeMap::new()
+    };
+    mission.carrier_replacement_print.submission_started = false;
+    mission.carrier_replacement_print.queued = remaining == 0;
+    save_mission(&config.mission_file, mission)?;
+
+    if remaining == 0 {
+        info!(target, completed, pending, "source-hub carrier replacements already accounted for");
+        return Ok(());
+    }
+
+    mission.carrier_replacement_print.submission_started = true;
+    save_mission(&config.mission_file, mission)?;
+    let mut options = QueueOptions::at(&mission.source_hub);
+    options.tags = vec![replacement_tag];
+    options.wait_timeout = config.wait_timeout;
+    let request = [PrintRequest::new(SURGE_CARRIER, remaining)];
+    match queue_prints(client, &request, &options).await {
+        Ok(report) => {
+            mission
+                .carrier_replacement_print
+                .operation_ids
+                .extend(report.operation_ids);
+            mission.carrier_replacement_print.submission_started = false;
+            mission.carrier_replacement_print.queued = true;
+            mission.carrier_replacement_print.requirements.clear();
+            save_mission(&config.mission_file, mission)?;
+            info!(
+                borrowed = target,
+                queued = remaining,
+                "queued non-blocking Surge Carrier replacements for the source hub"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // Persist the uncertain submission marker. A rerun reconciles the
+            // dedicated replacement tag before attempting any additional work.
+            save_mission(&config.mission_file, mission)?;
+            Err(error.into())
+        }
+    }
 }
 
 async fn append_missing_carrier_loads(
@@ -913,7 +994,7 @@ async fn append_missing_carrier_loads(
         .iter()
         .flat_map(|load| load.devices.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let mut unassigned = mission
+    let unassigned = mission
         .assets
         .iter()
         .filter(|(device_type, _)| !matches!(device_type.as_str(), CARGO_FREIGHTER | SURGE_CARRIER))
@@ -924,89 +1005,214 @@ async fn append_missing_carrier_loads(
         return Ok(());
     }
 
+    // One authoritative list replaces the previous N+1 GET /devices/{carrier}
+    // loop while preserving the live attach capacity for every selected carrier.
+    let hub_devices = list_devices(client, Some(&mission.source_hub), None).await?;
+    let carrier_capacities = hub_devices
+        .iter()
+        .filter_map(|device| {
+            Some((
+                device.device_code.clone()?,
+                device.attach_capacity.unwrap_or(0).max(0),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
     let used_carriers = mission
         .carrier_loads
         .iter()
         .map(|load| load.carrier.clone())
         .collect::<BTreeSet<_>>();
-    let mut carriers = Vec::new();
-    for carrier in mission
+    let mut carriers = mission
         .assets
         .get(SURGE_CARRIER)
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .filter(|carrier| !used_carriers.contains(carrier))
-    {
-        let capacity = client
-            .raw()
-            .devices()
-            .get(&carrier)
-            .await?
-            .value
-            .attach_capacity
-            .unwrap_or(0);
-        carriers.push((carrier, capacity));
-    }
-    carriers.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        .map(|carrier| {
+            let capacity = carrier_capacities.get(&carrier).copied().unwrap_or(0);
+            (carrier, capacity)
+        })
+        .collect::<Vec<_>>();
+    carriers.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
 
-    // Keep the 18 expansion relays and nine beacons in three self-contained
-    // carrier loads. This makes the regional-network reserve easy to inspect
-    // and deploy without disturbing the rest of the ark.
-    let root_relay = first_asset(mission, FTL_RELAY)?;
-    let expansion_relays = mission
-        .assets
-        .get(FTL_RELAY)
-        .into_iter()
-        .flatten()
-        .filter(|code| code.as_str() != root_relay && unassigned.contains(*code))
-        .cloned()
-        .collect::<Vec<_>>();
-    let beacons = mission
-        .assets
-        .get(replicant_bootstrap_planner::FTL_BEACON)
-        .into_iter()
-        .flatten()
-        .filter(|code| unassigned.contains(*code))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut reserved_groups = expansion_relays
-        .chunks(9)
-        .map(|chunk| chunk.to_vec())
-        .chain(beacons.chunks(9).map(|chunk| chunk.to_vec()))
-        .collect::<Vec<_>>();
-    reserved_groups.retain(|group| !group.is_empty());
-    for group in reserved_groups {
-        let required = i64::try_from(group.len())?;
-        let Some(index) = carriers
-            .iter()
-            .position(|(_, capacity)| *capacity >= required)
-        else {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "no unused carrier can hold a reserved {required}-device relay/beacon load"
-                ),
-            ));
-        };
-        let (carrier, capacity) = carriers.remove(index);
-        for code in &group {
-            unassigned.remove(code);
+    if mission.carrier_loads.is_empty() {
+        let role_capacity = carriers.iter().map(|(_, capacity)| *capacity).max().unwrap_or(9);
+        let (reserved, general) = fresh_role_payloads(
+            &mission.profile,
+            &mission.assets,
+            &unassigned,
+            role_capacity,
+        )?;
+        for (role, devices) in reserved {
+            let required = i64::try_from(devices.len())?;
+            let Some(index) = carriers
+                .iter()
+                .position(|(_, capacity)| *capacity >= required)
+            else {
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("no unused Surge Carrier can hold role {role} ({required} devices)"),
+                ));
+            };
+            let (carrier, capacity) = carriers.remove(index);
+            mission.carrier_loads.push(CarrierLoad {
+                carrier,
+                capacity,
+                role: Some(role),
+                devices,
+            });
         }
-        mission.carrier_loads.push(CarrierLoad {
-            carrier,
-            capacity,
-            devices: group,
-        });
+        append_general_carrier_loads(mission, carriers, general)?;
+    } else {
+        // Legacy or interrupted missions may already have persisted attachment
+        // loads. Preserve those exact assignments and pack only the remainder.
+        append_general_carrier_loads(
+            mission,
+            carriers,
+            unassigned.into_iter().collect::<Vec<_>>(),
+        )?;
     }
 
-    let mut payload = unassigned.into_iter().collect::<Vec<_>>();
-    payload.sort();
-    if let Some(index) = payload.iter().position(|code| code == &root_relay) {
-        payload.swap(0, index);
+    save_mission(&config.mission_file, mission)
+}
+
+fn fresh_role_payloads(
+    profile: &replicant_bootstrap_planner::BootstrapProfile,
+    assets: &BTreeMap<String, Vec<String>>,
+    unassigned: &BTreeSet<String>,
+    carrier_capacity: i64,
+) -> AnyResult<(Vec<(String, Vec<String>)>, Vec<String>)> {
+    let mut pools = assets
+        .iter()
+        .filter(|(device_type, _)| !matches!(device_type.as_str(), CARGO_FREIGHTER | SURGE_CARRIER))
+        .map(|(device_type, codes)| {
+            let mut codes = codes
+                .iter()
+                .filter(|code| unassigned.contains(*code))
+                .cloned()
+                .collect::<Vec<_>>();
+            codes.sort();
+            (device_type.clone(), codes)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut reserved = Vec::<(String, Vec<String>)>::new();
+    let mut reserved_general = Vec::<String>::new();
+
+    // Preserve the exact tail assets used later by the explorer/capital roles.
+    // Mining carriers must not consume those devices just because their type
+    // also appears in each nine-device mining setup.
+    reserve_tail_assets(
+        &mut pools,
+        assets,
+        SURVEY_CONTROLLER,
+        1,
+        &mut reserved_general,
+    );
+    reserve_tail_assets(
+        &mut pools,
+        assets,
+        SURVEY_DRONE,
+        usize::try_from(profile.exploration_survey_drones.max(0))?,
+        &mut reserved_general,
+    );
+    reserve_tail_assets(
+        &mut pools,
+        assets,
+        MAINTENANCE_DRONE,
+        usize::try_from(profile.hub_maintenance_drones.max(0))?,
+        &mut reserved_general,
+    );
+
+    for index in 0..usize::try_from(profile.mining_setups.max(0))? {
+        let mut devices = Vec::with_capacity(9);
+        devices.extend(take_role_devices(&mut pools, MINING_CONTROLLER, 1)?);
+        devices.extend(take_role_devices(&mut pools, MINING_DRONE, 4)?);
+        devices.extend(take_role_devices(&mut pools, SURVEY_CONTROLLER, 1)?);
+        devices.extend(take_role_devices(&mut pools, SURVEY_DRONE, 2)?);
+        devices.extend(take_role_devices(&mut pools, MAINTENANCE_DRONE, 1)?);
+        reserved.push((format!("mining-{}", index + 1), devices));
     }
+
+    // Root relays remain in the general ark payload. Only the expansion reserve
+    // is kept in dedicated relay carriers.
+    let mut relays = pools.remove(FTL_RELAY).unwrap_or_default();
+    relays.sort();
+    let root_count = usize::try_from(profile.root_relays.max(0))?.min(relays.len());
+    let expansion_relays = relays.split_off(root_count);
+    pools.insert(FTL_RELAY.to_owned(), relays);
+
+    let role_capacity = usize::try_from(carrier_capacity.max(1))?;
+    for (index, chunk) in expansion_relays.chunks(role_capacity).enumerate() {
+        if !chunk.is_empty() {
+            reserved.push((format!("relays-{}", index + 1), chunk.to_vec()));
+        }
+    }
+    let beacons = pools.remove(FTL_BEACON).unwrap_or_default();
+    for (index, chunk) in beacons.chunks(role_capacity).enumerate() {
+        if !chunk.is_empty() {
+            reserved.push((format!("beacons-{}", index + 1), chunk.to_vec()));
+        }
+    }
+
+    let mut general = reserved_general;
+    general.extend(pools.into_values().flatten());
+    general.sort();
+    Ok((reserved, general))
+}
+
+fn reserve_tail_assets(
+    pools: &mut BTreeMap<String, Vec<String>>,
+    assets: &BTreeMap<String, Vec<String>>,
+    device_type: &str,
+    count: usize,
+    reserved_general: &mut Vec<String>,
+) {
+    let reserved = assets
+        .get(device_type)
+        .into_iter()
+        .flatten()
+        .rev()
+        .take(count)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(pool) = pools.get_mut(device_type) {
+        pool.retain(|code| !reserved.contains(code));
+    }
+    reserved_general.extend(reserved);
+}
+
+fn take_role_devices(
+    pools: &mut BTreeMap<String, Vec<String>>,
+    device_type: &str,
+    count: usize,
+) -> AnyResult<Vec<String>> {
+    let pool = pools.entry(device_type.to_owned()).or_default();
+    if pool.len() < count {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot build complete mining carrier: need {count} {device_type}, have {}",
+                pool.len()
+            ),
+        ));
+    }
+    Ok(pool.drain(..count).collect())
+}
+
+fn append_general_carrier_loads(
+    mission: &mut BootstrapMission,
+    carriers: Vec<(String, i64)>,
+    mut payload: Vec<String>,
+) -> AnyResult<()> {
+    payload.sort();
     let mut cursor = 0_usize;
-    for (carrier, capacity) in carriers {
+    let existing_general = mission
+        .carrier_loads
+        .iter()
+        .filter(|load| load.role.as_deref().is_some_and(|role| role.starts_with("general-")))
+        .count();
+    for (offset, (carrier, capacity)) in carriers.into_iter().enumerate() {
         let take = usize::try_from(capacity.max(0))?.min(payload.len().saturating_sub(cursor));
         if take == 0 {
             continue;
@@ -1016,6 +1222,7 @@ async fn append_missing_carrier_loads(
         mission.carrier_loads.push(CarrierLoad {
             carrier,
             capacity,
+            role: Some(format!("general-{}", existing_general + offset + 1)),
             devices,
         });
         if cursor == payload.len() {
@@ -1026,12 +1233,12 @@ async fn append_missing_carrier_loads(
         return Err(app_error(
             io::ErrorKind::InvalidData,
             format!(
-                "carrier capacity covers {cursor} of {} remaining payload devices",
+                "Surge Carrier capacity covers {cursor} of {} remaining payload devices",
                 payload.len()
             ),
         ));
     }
-    save_mission(&config.mission_file, mission)
+    Ok(())
 }
 
 async fn stage_at_source_entry(
@@ -1056,14 +1263,14 @@ async fn stage_at_source_entry(
         )
         .await,
     )?;
-    finish_all(
-        join_all(
-            devices.iter().map(|code| {
-                wait_device_at(client, code, &mission.source_entry, config.wait_timeout)
-            }),
-        )
-        .await,
-    )?;
+    wait_devices_at_matching(
+        client,
+        &devices,
+        &mission.source_entry,
+        None,
+        config.wait_timeout,
+    )
+    .await?;
     set_phase(config, mission, MissionPhase::StagedAtSource).await
 }
 
@@ -1103,18 +1310,14 @@ async fn dispatch_devices_to_landing(
         }))
         .await,
     )?;
-    finish_all(
-        join_all(devices.iter().map(|code| {
-            wait_device_at_matching(
-                client,
-                code,
-                &mission.landing_entry,
-                landing_system_fallback,
-                config.wait_timeout,
-            )
-        }))
-        .await,
+    wait_devices_at_matching(
+        client,
+        &devices,
+        &mission.landing_entry,
+        landing_system_fallback,
+        config.wait_timeout,
     )
+    .await
 }
 
 fn ark_transport_devices(mission: &BootstrapMission) -> Vec<String> {
@@ -1186,20 +1389,13 @@ async fn dispatch_to_landing(
     operator_start?;
     explorer_start?;
     let (device_waits, operator_wait, explorer_wait) = tokio::join!(
-        async {
-            finish_all(
-                join_all(devices.iter().map(|code| {
-                    wait_device_at_matching(
-                        client,
-                        code,
-                        &mission.landing_entry,
-                        landing_system_fallback,
-                        config.wait_timeout,
-                    )
-                }))
-                .await,
-            )
-        },
+        wait_devices_at_matching(
+            client,
+            &devices,
+            &mission.landing_entry,
+            landing_system_fallback,
+            config.wait_timeout,
+        ),
         wait_replicant_at_matching(
             client,
             &mission.operator.code,
@@ -1382,49 +1578,8 @@ async fn travel_replicant_to_system(
     destination: &str,
     timeout: Duration,
 ) -> AnyResult<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let handle = client.replicants().get_owned(code).await?;
-        let snapshot = handle.snapshot().await?;
-        if snapshot.travel.is_none()
-            && snapshot
-                .location
-                .as_ref()
-                .is_some_and(|location| designation_in_system(location.id.as_str(), destination))
-        {
-            return Ok(());
-        }
-
-        if let Some(travel) = &snapshot.travel {
-            let planned = travel
-                .final_destination
-                .as_ref()
-                .or(travel.destination.as_ref())
-                .map(|location| location.id.as_str());
-            if !planned.is_some_and(|location| designation_in_system(location, destination)) {
-                return Err(app_error(
-                    io::ErrorKind::Other,
-                    format!(
-                        "replicant {code} is travelling to {planned:?}, not system {destination}"
-                    ),
-                ));
-            }
-        } else {
-            info!(
-                replicant = code,
-                destination, "quick scout departing for system"
-            );
-            ensure_operation(&handle.travel().to(destination).depart().await?).await?;
-        }
-
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                format!("timed out waiting for replicant {code} in system {destination}"),
-            ));
-        }
-        sleep(POLL_INTERVAL).await;
-    }
+    start_replicant_travel_matching(client, code, destination, Some(destination)).await?;
+    wait_replicant_at_matching(client, code, destination, Some(destination), timeout).await
 }
 
 async fn scan_system(client: &Client, replicant_code: &str, system: &str) -> AnyResult<()> {
@@ -1719,13 +1874,18 @@ async fn wait_devices_returned_to_vessel(
     devices: &[String],
     vessel: &str,
     vessel_location: &str,
-    timeout: Duration,
+    wait_timeout: Duration,
 ) -> AnyResult<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
-        let mut pending = Vec::new();
+        let mut pending = BTreeSet::new();
         for code in devices {
-            let snapshot = client.devices().get(code).await?.snapshot().await?;
+            let handle = match client.devices().cached(code) {
+                Some(handle) => handle,
+                None => client.devices().get(code).await?,
+            };
+            let snapshot = handle.snapshot().await?;
             let stowed = snapshot
                 .relationships
                 .stowed_in
@@ -1737,7 +1897,7 @@ async fn wait_devices_returned_to_vessel(
                     .as_ref()
                     .is_some_and(|location| location.id.as_str() == vessel_location);
             if !stowed && !colocated {
-                pending.push(code.clone());
+                pending.insert(code.clone());
             }
         }
         if pending.is_empty() {
@@ -1756,7 +1916,10 @@ async fn wait_devices_returned_to_vessel(
             pending = ?pending,
             "waiting for legacy quick-scout devices to return"
         );
-        sleep(POLL_INTERVAL).await;
+        let wake = wait_for_pending_device_event(&mut watch, deadline, &pending).await?;
+        if matches!(wake, TravelWake::Poll | TravelWake::Gap) {
+            refresh_pending_devices(client, &pending).await?;
+        }
     }
 }
 
@@ -1764,20 +1927,25 @@ async fn wait_devices_stowed_in_vessel(
     client: &Client,
     devices: &[String],
     vessel: &str,
-    timeout: Duration,
+    wait_timeout: Duration,
 ) -> AnyResult<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
-        let mut pending = Vec::new();
+        let mut pending = BTreeSet::new();
         for code in devices {
-            let snapshot = client.devices().get(code).await?.snapshot().await?;
+            let handle = match client.devices().cached(code) {
+                Some(handle) => handle,
+                None => client.devices().get(code).await?,
+            };
+            let snapshot = handle.snapshot().await?;
             if snapshot
                 .relationships
                 .stowed_in
                 .as_ref()
                 .is_none_or(|target| target.id.as_str() != vessel)
             {
-                pending.push(code.clone());
+                pending.insert(code.clone());
             }
         }
         if pending.is_empty() {
@@ -1796,8 +1964,56 @@ async fn wait_devices_stowed_in_vessel(
             pending = ?pending,
             "waiting for legacy quick-scout devices to stow"
         );
-        sleep(POLL_INTERVAL).await;
+        let wake = wait_for_pending_device_event(&mut watch, deadline, &pending).await?;
+        if matches!(wake, TravelWake::Poll | TravelWake::Gap) {
+            refresh_pending_devices(client, &pending).await?;
+        }
     }
+}
+
+async fn wait_for_pending_device_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    pending: &BTreeSet<String>,
+) -> AnyResult<TravelWake> {
+    let poll_deadline = (Instant::now() + AUTHORITATIVE_POLL_INTERVAL).min(deadline);
+    loop {
+        let remaining = poll_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(TravelWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event
+                    .device
+                    .as_ref()
+                    .is_some_and(|device| pending.contains(device.id.as_str())) =>
+            {
+                return Ok(TravelWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(TravelWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing bootstrap device state");
+                return Ok(TravelWake::Gap);
+            }
+        }
+    }
+}
+
+async fn refresh_pending_devices(client: &Client, pending: &BTreeSet<String>) -> AnyResult<()> {
+    let refreshes = pending
+        .iter()
+        .cloned()
+        .map(|code| {
+            let client = client.clone();
+            async move { client.devices().get(&code).await.map(|_| ()) }
+        })
+        .collect::<Vec<_>>();
+    for result in join_all(refreshes).await {
+        result?;
+    }
+    Ok(())
 }
 
 fn preferred_star_destination(system: &str, entry_point: Option<&str>) -> String {
@@ -1935,46 +2151,37 @@ async fn establish_capital(
     );
     operator_start?;
     explorer_start?;
-    let (infra_wait, carriers_wait, freighters_wait, operator_wait, explorer_wait) =
-        tokio::join!(
-            wait_device_at(
-                client,
-                &infrastructure_carrier,
-                &capital_entry,
-                config.wait_timeout
-            ),
-            async {
-                finish_all(
-                    join_all(other_carriers.iter().map(|code| {
-                        wait_device_at(client, code, &capital_belt, config.wait_timeout)
-                    }))
-                    .await,
-                )
-            },
-            async {
-                finish_all(
-                    join_all(freighters.iter().map(|code| {
-                        wait_device_at(client, code, &capital_belt, config.wait_timeout)
-                    }))
-                    .await,
-                )
-            },
-            wait_replicant_at(
-                client,
-                &mission.operator.code,
-                &capital_belt,
-                config.wait_timeout
-            ),
-            wait_replicant_at(
-                client,
-                &mission.explorer.code,
-                &capital_belt,
-                config.wait_timeout
-            ),
-        );
+    let mut capital_devices = other_carriers.clone();
+    capital_devices.extend(freighters.iter().cloned());
+    let (infra_wait, capital_wait, operator_wait, explorer_wait) = tokio::join!(
+        wait_device_at(
+            client,
+            &infrastructure_carrier,
+            &capital_entry,
+            config.wait_timeout
+        ),
+        wait_devices_at_matching(
+            client,
+            &capital_devices,
+            &capital_belt,
+            None,
+            config.wait_timeout,
+        ),
+        wait_replicant_at(
+            client,
+            &mission.operator.code,
+            &capital_belt,
+            config.wait_timeout
+        ),
+        wait_replicant_at(
+            client,
+            &mission.explorer.code,
+            &capital_belt,
+            config.wait_timeout
+        ),
+    );
     infra_wait?;
-    carriers_wait?;
-    freighters_wait?;
+    capital_wait?;
     operator_wait?;
     explorer_wait?;
     detach_devices(client, &infrastructure_carrier, &infrastructure).await?;
@@ -1987,16 +2194,7 @@ async fn establish_capital(
         config.wait_timeout,
     )
     .await?;
-    let detach_results = join_all(mission.carrier_loads.iter().map(|load| async {
-        let detail = client.raw().devices().get(&load.carrier).await?.value;
-        let attached = attached_codes(&detail)
-            .into_iter()
-            .filter(|code| load.devices.contains(code))
-            .collect::<Vec<_>>();
-        detach_devices(client, &load.carrier, &attached).await
-    }))
-    .await;
-    finish_all(detach_results)?;
+    detach_carrier_loads_at(client, &capital_belt, &mission.carrier_loads).await?;
     let unfold_results = join_all(
         mission
             .assets
@@ -2258,20 +2456,16 @@ fn eligible_idle(device: &raw::devices::DeviceStatus, mission_tag: &str) -> bool
         })
 }
 
-fn is_attachment_carrier(device_type: Option<&str>) -> bool {
-    matches!(
-        device_type,
-        Some(SURGE_CARRIER | "surge_platform" | MOBILE_FLEET)
-    )
-}
-
 async fn ensure_claim(
     client: &Client,
     code: &str,
     owner: Option<&str>,
     tags: &[String],
 ) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let snapshot = handle.snapshot().await?;
     let missing = tags
         .iter()
@@ -2291,7 +2485,6 @@ async fn ensure_claim(
         )
         .await?;
     }
-    let snapshot = handle.refresh().await?.snapshot().await?;
     if let Some(owner) = owner
         && snapshot
             .relationships
@@ -2306,7 +2499,10 @@ async fn ensure_claim(
 }
 
 async fn remove_tag(client: &Client, code: &str, tag: &str) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let snapshot = handle.snapshot().await?;
     if snapshot.tags.iter().any(|existing| existing == tag) {
         ensure_operation(
@@ -2362,29 +2558,34 @@ async fn ensure_seed_inventory(client: &Client, mission: &BootstrapMission) -> A
     Ok(())
 }
 
-async fn collect_resource(
+async fn collect_resource_with_cargo(
     client: &Client,
     code: &str,
     resource: &str,
     quantity: i64,
+    cargo: BTreeMap<String, i64>,
 ) -> AnyResult<()> {
-    let detail = client.raw().devices().get(code).await?.value;
-    let cargo = cargo_map(&detail);
     let have = cargo.get(resource).copied().unwrap_or(0);
     if have >= quantity {
         return Ok(());
     }
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     if !cargo.is_empty() {
-        deposit_all(client, code).await?;
+        ensure_operation(
+            &handle
+                .command(raw::devices::DeviceCommand::DepositResources { resources: None })
+                .await?,
+        )
+        .await?;
     }
     let resources = [(resource.to_owned(), Value::from(quantity))]
         .into_iter()
         .collect();
     ensure_operation(
-        &client
-            .devices()
-            .get(code)
-            .await?
+        &handle
             .command(raw::devices::DeviceCommand::CollectResources { resources })
             .await?,
     )
@@ -2413,6 +2614,78 @@ fn cargo_map(device: &raw::devices::DeviceStatus) -> BTreeMap<String, i64> {
         .iter()
         .filter_map(|item| Some((item.resource_type.clone()?, item.quantity.unwrap_or(0))))
         .collect()
+}
+
+async fn attach_carrier_loads_at(
+    client: &Client,
+    location: &str,
+    loads: &[CarrierLoad],
+) -> AnyResult<()> {
+    let statuses = list_devices(client, Some(location), None).await?;
+    let attached_by_carrier = statuses
+        .iter()
+        .filter_map(|device| Some((device.device_code.clone()?, attached_codes(device))))
+        .collect::<BTreeMap<_, _>>();
+    finish_all(
+        join_all(loads.iter().map(|load| async {
+            let attached = attached_by_carrier.get(&load.carrier);
+            let missing = load
+                .devices
+                .iter()
+                .filter(|code| attached.is_none_or(|codes| !codes.contains(*code)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            let handle = match client.devices().cached(&load.carrier) {
+                Some(handle) => handle,
+                None => client.devices().get(&load.carrier).await?,
+            };
+            ensure_operation(&handle.attach(targets(&missing)).await?).await
+        }))
+        .await,
+    )
+}
+
+async fn detach_carrier_loads_at(
+    client: &Client,
+    location: &str,
+    loads: &[CarrierLoad],
+) -> AnyResult<()> {
+    let statuses = list_devices(client, Some(location), None).await?;
+    let attached_by_carrier = statuses
+        .iter()
+        .filter_map(|device| Some((device.device_code.clone()?, attached_codes(device))))
+        .collect::<BTreeMap<_, _>>();
+    finish_all(
+        join_all(loads.iter().map(|load| async {
+            let present = load
+                .devices
+                .iter()
+                .filter(|code| {
+                    attached_by_carrier
+                        .get(&load.carrier)
+                        .is_some_and(|codes| codes.contains(*code))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if present.is_empty() {
+                return Ok(());
+            }
+            let handle = match client.devices().cached(&load.carrier) {
+                Some(handle) => handle,
+                None => client.devices().get(&load.carrier).await?,
+            };
+            ensure_operation(
+                &handle
+                    .command(raw::devices::DeviceCommand::Detach(targets(&present)))
+                    .await?,
+            )
+            .await
+        }))
+        .await,
+    )
 }
 
 async fn attach_devices(client: &Client, carrier: &str, devices: &[String]) -> AnyResult<()> {
@@ -2501,22 +2774,18 @@ async fn ensure_operator_in_comms_for_departures(
     let mut pending = Vec::new();
     let mut origins = BTreeSet::new();
     for (code, destination) in departures {
-        let detail = client.raw().devices().get(code).await?.value;
-        if detail.travel.is_none()
-            && detail.location.as_deref().is_some_and(|location| {
-                destination_matches(location, destination, destination_system)
-            })
-        {
+        // Essential startup already populated the managed device projection.
+        // Reuse it here instead of issuing a raw GET for every ark device.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        let detail = handle.snapshot().await?;
+        if managed_device_at(&detail, destination, destination_system) {
             continue;
         }
-        if let Some(travel) = &detail.travel {
-            let planned = travel
-                .final_destination
-                .as_deref()
-                .or(travel.destination.as_deref());
-            if planned.is_some_and(|planned| {
-                destination_matches(planned, destination, destination_system)
-            }) {
+        if let Some(planned) = managed_travel_destination(&detail) {
+            if destination_matches(planned, destination, destination_system) {
                 continue;
             }
             return Err(app_error(
@@ -2524,12 +2793,16 @@ async fn ensure_operator_in_comms_for_departures(
                 format!("device {code} is travelling to {planned:?}, not {destination}"),
             ));
         }
-        let origin = detail.location.ok_or_else(|| {
-            app_error(
-                io::ErrorKind::InvalidData,
-                format!("device {code} needs to depart for {destination} but has no location"),
-            )
-        })?;
+        let origin = detail
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str().to_owned())
+            .ok_or_else(|| {
+                app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("device {code} needs to depart for {destination} but has no location"),
+                )
+            })?;
         origins.insert(origin);
         pending.push(code.clone());
     }
@@ -2569,23 +2842,20 @@ async fn start_device_travel_matching(
     destination: &str,
     destination_system: Option<&str>,
 ) -> AnyResult<()> {
-    let detail = client.raw().devices().get(code).await?.value;
-    if detail.travel.is_none()
-        && detail
-            .location
-            .as_deref()
-            .is_some_and(|location| destination_matches(location, destination, destination_system))
-    {
+    // Match the event/relay executors: one authoritative managed read is
+    // enough to inspect current travel state and obtain the durable handle.
+    // The old path did a raw detail GET and then another managed read before
+    // every departure.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let detail = handle.snapshot().await?;
+    if managed_device_at(&detail, destination, destination_system) {
         return Ok(());
     }
-    if let Some(travel) = &detail.travel {
-        let planned = travel
-            .final_destination
-            .as_deref()
-            .or(travel.destination.as_deref());
-        if planned
-            .is_some_and(|planned| destination_matches(planned, destination, destination_system))
-        {
+    if let Some(planned) = managed_travel_destination(&detail) {
+        if destination_matches(planned, destination, destination_system) {
             return Ok(());
         }
         return Err(app_error(
@@ -2594,10 +2864,7 @@ async fn start_device_travel_matching(
         ));
     }
     ensure_operation(
-        &client
-            .devices()
-            .get(code)
-            .await?
+        &handle
             .command(raw::devices::DeviceCommand::Travel {
                 destination: destination.into(),
                 dry_run: None,
@@ -2608,39 +2875,164 @@ async fn start_device_travel_matching(
     .await
 }
 
+fn managed_device_at(
+    device: &Device,
+    destination: &str,
+    destination_system: Option<&str>,
+) -> bool {
+    device.travel.is_none()
+        && device.location.as_ref().is_some_and(|location| {
+            destination_matches(location.id.as_str(), destination, destination_system)
+        })
+}
+
+fn managed_travel_destination(device: &Device) -> Option<&str> {
+    device.travel.as_ref().and_then(|travel| {
+        travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str())
+    })
+}
+
 async fn wait_device_at(
     client: &Client,
     code: &str,
     destination: &str,
     timeout: Duration,
 ) -> AnyResult<()> {
-    wait_device_at_matching(client, code, destination, None, timeout).await
+    wait_devices_at_matching(client, &[code.to_owned()], destination, None, timeout).await
 }
 
-async fn wait_device_at_matching(
+async fn wait_devices_at_matching(
     client: &Client,
-    code: &str,
+    codes: &[String],
     destination: &str,
     destination_system: Option<&str>,
-    timeout: Duration,
+    wait_timeout: Duration,
 ) -> AnyResult<()> {
-    let deadline = Instant::now() + timeout;
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let mut pending = codes.iter().cloned().collect::<BTreeSet<_>>();
+    let mut watch = client.events().watch().await?;
+    let deadline = Instant::now() + wait_timeout;
+
     loop {
-        let detail = client.raw().devices().get(code).await?.value;
-        if detail.travel.is_none()
-            && detail.location.as_deref().is_some_and(|location| {
-                destination_matches(location, destination, destination_system)
-            })
-        {
+        let mut eta_seconds = None::<i64>;
+        let current = pending.iter().cloned().collect::<Vec<_>>();
+        for code in current {
+            let handle = match client.devices().cached(&code) {
+                Some(handle) => handle,
+                None => client.devices().get(&code).await?,
+            };
+            let snapshot = handle.snapshot().await?;
+            if managed_device_at(&snapshot, destination, destination_system) {
+                pending.remove(&code);
+                continue;
+            }
+            if let Some(planned) = managed_travel_destination(&snapshot)
+                && !destination_matches(planned, destination, destination_system)
+            {
+                return Err(app_error(
+                    io::ErrorKind::Other,
+                    format!("device {code} is travelling to {planned:?}, not {destination}"),
+                ));
+            }
+            if let Some(eta) = snapshot
+                .travel
+                .as_ref()
+                .and_then(|travel| travel.eta_seconds)
+            {
+                eta_seconds = Some(eta_seconds.map_or(eta, |current| current.min(eta)));
+            }
+        }
+        if pending.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(app_error(
                 io::ErrorKind::TimedOut,
-                format!("timed out waiting for device {code} at {destination}"),
+                format!(
+                    "timed out waiting for devices at {destination}: {}",
+                    pending.iter().cloned().collect::<Vec<_>>().join(",")
+                ),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+
+        let wake = wait_for_device_travel_event(
+            &mut watch,
+            deadline,
+            &pending,
+            travel_poll_interval(eta_seconds),
+        )
+        .await?;
+        if matches!(wake, TravelWake::Poll | TravelWake::Gap) {
+            // SSE/projection updates are the fast path. On a sparse fallback,
+            // authoritatively refresh only the devices still in flight rather
+            // than polling every ark device every five seconds.
+            let refreshes = pending
+                .iter()
+                .cloned()
+                .map(|code| {
+                    let client = client.clone();
+                    async move { client.devices().get(&code).await.map(|_| ()) }
+                })
+                .collect::<Vec<_>>();
+            for result in join_all(refreshes).await {
+                result?;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TravelWake {
+    Event,
+    Poll,
+    Gap,
+}
+
+async fn wait_for_device_travel_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    pending: &BTreeSet<String>,
+    poll_interval: Duration,
+) -> AnyResult<TravelWake> {
+    let poll_deadline = Instant::now() + poll_interval;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(TravelWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event.name.as_str() == "travel.arrived"
+                    && event
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| pending.contains(device.id.as_str())) =>
+            {
+                return Ok(TravelWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(TravelWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing bootstrap device travel");
+                return Ok(TravelWake::Gap);
+            }
+        }
+    }
+}
+
+fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
+    match eta_seconds.unwrap_or(0) {
+        eta if eta >= 300 => Duration::from_secs(60),
+        eta if eta >= 60 => Duration::from_secs(30),
+        eta if eta > 0 => Duration::from_secs(10),
+        _ => POLL_INTERVAL,
     }
 }
 
@@ -2696,16 +3088,13 @@ async fn wait_replicant_at_matching(
     code: &str,
     destination: &str,
     destination_system: Option<&str>,
-    timeout: Duration,
+    wait_timeout: Duration,
 ) -> AnyResult<()> {
-    let deadline = Instant::now() + timeout;
+    let mut handle = client.replicants().get_owned(code).await?;
+    let mut watch = client.events().watch().await?;
+    let deadline = Instant::now() + wait_timeout;
     loop {
-        let snapshot = client
-            .replicants()
-            .get_owned(code)
-            .await?
-            .snapshot()
-            .await?;
+        let snapshot = handle.snapshot().await?;
         if snapshot.travel.is_none()
             && snapshot.location.as_ref().is_some_and(|location| {
                 destination_matches(location.id.as_str(), destination, destination_system)
@@ -2713,8 +3102,23 @@ async fn wait_replicant_at_matching(
         {
             return Ok(());
         }
-        if snapshot.travel.is_none() {
-            start_replicant_travel_matching(client, code, destination, destination_system).await?;
+        if let Some(travel) = &snapshot.travel {
+            let planned = travel
+                .final_destination
+                .as_ref()
+                .or(travel.destination.as_ref())
+                .map(|location| location.id.as_str());
+            if !planned.is_some_and(|planned| {
+                destination_matches(planned, destination, destination_system)
+            }) {
+                return Err(app_error(
+                    io::ErrorKind::Other,
+                    format!("replicant {code} is travelling to {planned:?}, not {destination}"),
+                ));
+            }
+        } else {
+            let operation = handle.travel().to(destination).depart().await?;
+            ensure_operation(&operation).await?;
         }
         if Instant::now() >= deadline {
             return Err(app_error(
@@ -2722,7 +3126,57 @@ async fn wait_replicant_at_matching(
                 format!("timed out waiting for replicant {code} at {destination}"),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+
+        let eta_seconds = snapshot
+            .travel
+            .as_ref()
+            .and_then(|travel| travel.eta_seconds);
+        match wait_for_replicant_travel_event(
+            &mut watch,
+            deadline,
+            code,
+            travel_poll_interval(eta_seconds),
+        )
+        .await?
+        {
+            TravelWake::Event => {}
+            TravelWake::Poll | TravelWake::Gap => {
+                handle = handle.refresh().await?;
+            }
+        }
+    }
+}
+
+async fn wait_for_replicant_travel_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    code: &str,
+    poll_interval: Duration,
+) -> AnyResult<TravelWake> {
+    let poll_deadline = Instant::now() + poll_interval;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(TravelWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event.name.as_str() == "travel.arrived"
+                    && event
+                        .replicant
+                        .as_ref()
+                        .is_some_and(|replicant| replicant.id.as_str() == code) =>
+            {
+                return Ok(TravelWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(TravelWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing bootstrap replicant travel");
+                return Ok(TravelWake::Gap);
+            }
+        }
     }
 }
 
@@ -3023,12 +3477,6 @@ mod tests {
         assert!(!destination_matches("DELTA-OORT", "DELTA-4-L4", None));
     }
     #[test]
-    fn mobile_fleets_are_attachment_carriers() {
-        assert!(is_attachment_carrier(Some("mobile_fleet")));
-        assert!(is_attachment_carrier(Some("surge_carrier")));
-        assert!(!is_attachment_carrier(Some("cargo_freighter")));
-    }
-    #[test]
     fn interrupted_print_reconciliation_does_not_duplicate_accounted_work() {
         let targets = [("autofactory".into(), 1), ("survey_drone".into(), 4)]
             .into_iter()
@@ -3045,7 +3493,7 @@ mod tests {
         let targets = [
             ("ftl_relay".into(), 19),
             ("ftl_beacon".into(), 9),
-            ("surge_carrier".into(), 12),
+            ("surge_carrier".into(), 14),
         ]
         .into_iter()
         .collect();
@@ -3058,7 +3506,72 @@ mod tests {
 
         assert_eq!(remaining.get("ftl_relay"), Some(&18));
         assert_eq!(remaining.get("ftl_beacon"), Some(&9));
-        assert_eq!(remaining.get("surge_carrier"), Some(&3));
+        assert_eq!(remaining.get("surge_carrier"), Some(&5));
+    }
+
+    #[test]
+    fn fresh_ark_role_packing_keeps_mining_relay_and_beacon_sets_together() {
+        let profile = replicant_bootstrap_planner::BootstrapProfile::default();
+        let requirements = ark_device_requirements(&profile);
+        let mut assets = BTreeMap::<String, Vec<String>>::new();
+        for (device_type, quantity) in requirements {
+            if device_type == CARGO_FREIGHTER {
+                continue;
+            }
+            assets.insert(
+                device_type.clone(),
+                (0..quantity)
+                    .map(|index| format!("{device_type}-{index:02}"))
+                    .collect(),
+            );
+        }
+        let unassigned = assets.values().flatten().cloned().collect::<BTreeSet<_>>();
+        let (reserved, general) =
+            fresh_role_payloads(&profile, &assets, &unassigned, 9).expect("role payloads");
+
+        let mining = reserved
+            .iter()
+            .filter(|(role, _)| role.starts_with("mining-"))
+            .collect::<Vec<_>>();
+        assert_eq!(mining.len(), 8);
+        for (_, devices) in mining {
+            let counts = devices
+                .iter()
+                .filter_map(|code| code.rsplit_once('-').map(|(device_type, _)| device_type))
+                .fold(BTreeMap::<&str, usize>::new(), |mut counts, device_type| {
+                    *counts.entry(device_type).or_default() += 1;
+                    counts
+                });
+            assert_eq!(counts.get(MINING_CONTROLLER), Some(&1));
+            assert_eq!(counts.get(MINING_DRONE), Some(&4));
+            assert_eq!(counts.get(SURVEY_CONTROLLER), Some(&1));
+            assert_eq!(counts.get(SURVEY_DRONE), Some(&2));
+            assert_eq!(counts.get(MAINTENANCE_DRONE), Some(&1));
+        }
+        assert_eq!(
+            reserved
+                .iter()
+                .filter(|(role, _)| role.starts_with("relays-"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            reserved
+                .iter()
+                .filter(|(role, _)| role.starts_with("beacons-"))
+                .count(),
+            1
+        );
+        assert!(reserved.iter().all(|(_, devices)| devices.len() == 9));
+        assert_eq!(general.len(), 19);
+    }
+
+    #[test]
+    fn replacement_tag_is_distinct_and_fits_server_limit() {
+        let tag = carrier_replacement_tag("boot-m:0123456789abcdef");
+        assert_eq!(tag, "boot-repl:0123456789abcdef");
+        assert!(tag.len() <= 32);
+        assert!(!reservation_tag(&tag));
     }
 
     #[test]

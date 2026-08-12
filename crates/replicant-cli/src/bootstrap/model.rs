@@ -98,6 +98,9 @@ pub struct SeedFreighter {
 pub struct CarrierLoad {
     pub carrier: String,
     pub capacity: i64,
+    /// Stable payload role, e.g. `mining-1`, `relays-1`, `beacons-1`, or `general-1`.
+    #[serde(default)]
+    pub role: Option<String>,
     #[serde(default)]
     pub devices: Vec<String>,
 }
@@ -137,12 +140,15 @@ pub struct BootstrapMission {
     pub maximum_sites: usize,
     pub max_concurrency: usize,
     pub print: PrintState,
+    /// Fire-and-forget replacement prints for source-hub Surge Carriers borrowed by this ark.
+    #[serde(default)]
+    pub carrier_replacement_print: PrintState,
     #[serde(default)]
     pub assets: BTreeMap<String, Vec<String>>,
     /// Total attachment-carrier count reserved for this ark.
     #[serde(default)]
     pub carrier_target: i64,
-    /// Maximum number of the carrier target that may be satisfied by idle stock.
+    /// Number of source-hub Surge Carriers borrowed from idle stock and later replaced.
     #[serde(default)]
     pub reused_carrier_target: i64,
     #[serde(default)]
