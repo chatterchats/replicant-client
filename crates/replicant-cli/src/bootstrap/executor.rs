@@ -693,20 +693,17 @@ async fn wait_for_printed_assets(
             }
             match timeout(remaining, watch.next()).await {
                 Ok(Ok(event)) if event.name.as_str() == "print.completed" => {
-                    match event.print_completed() {
-                        Ok(Some(payload))
-                            if payload
-                                .tags
-                                .iter()
-                                .any(|tag| tag == &mission.mission_tag) =>
-                        {
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(error) => {
-                            warn!(error = %error, "could not decode print.completed; refreshing bootstrap prints");
-                            break;
-                        }
+                    if event
+                        .payload
+                        .get("tags")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tags| {
+                            tags.iter().any(|tag| {
+                                tag.as_str() == Some(mission.mission_tag.as_str())
+                            })
+                        })
+                    {
+                        break;
                     }
                 }
                 Ok(Ok(_)) => continue,
