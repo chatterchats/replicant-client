@@ -25,6 +25,7 @@ cargo build -p replicant-cli
 
 | Command | Operations | Purpose |
 | --- | --- | --- |
+| `interactive` | — | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup. |
 | `print` | `queue`, `status`, `clear` | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
 | `transport` | `--plan` or execute | Deliver resources and devices between locations. |
 | `survey` | `plan`, `run`, `status` | Plan and execute durable survey routes. |
@@ -38,6 +39,29 @@ cargo build -p replicant-cli
 
 Stateful commands accept an operation word or its flag form. For example,
 `survey plan` and `survey --plan` are equivalent.
+
+### Interactive command builder
+
+Run the menu with:
+
+```sh
+cargo run -p replicant-cli -- interactive
+```
+
+You can also jump directly to a command or operation:
+
+```sh
+cargo run -p replicant-cli -- interactive relay plan
+cargo run -p replicant-cli -- interactive observatory triangulate
+```
+
+The builder selects the ordinary CLI command/operation, lets you add its options,
+previews the resulting command line, and then dispatches through the same handler
+as non-interactive use. SYSTEM and LOCATION values use the live star catalogue and
+location map for exact, prefix, substring, and typo-tolerant suggestions. For
+example, entering `SCEPT` for a SYSTEM offers `SCEPTURUM`; LOCATION prompts also
+include concrete matching locations. If catalogue lookup is unavailable, manual
+entry remains available.
 
 ## Examples
 

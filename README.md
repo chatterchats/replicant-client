@@ -161,6 +161,7 @@ Run the consolidated CLI locally:
 
 ```sh
 export RS_API_TOKEN='your-token'
+cargo run -p replicant-cli -- interactive
 cargo run -p replicant-cli -- help print
 cargo run -p replicant-cli -- print status --system SCEPTURUM
 ```
