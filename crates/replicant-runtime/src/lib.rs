@@ -9,14 +9,24 @@
 //! Workflow execution is intentionally outside this initial boundary.
 
 use replicant_client::Client;
+use std::error::Error;
+
+/// Error returned by an application report or action.
+pub type ApplicationError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Result of a read-only application report.
+pub type ReportResult<T> = Result<T, ApplicationError>;
+
+/// Result of a finite application action.
+pub type ActionResult<T> = Result<T, ApplicationError>;
 
 pub mod config;
 
 /// Read-only application queries and reports.
-pub mod reports {}
+pub mod reports;
 
 /// Finite application mutations and bounded operations.
-pub mod actions {}
+pub mod actions;
 
 /// Application-level events and user-facing notifications.
 pub mod notifications {}

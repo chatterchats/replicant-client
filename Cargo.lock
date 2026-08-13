@@ -1196,6 +1196,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "httpdate",
+ "replicant-runtime",
  "reqwest",
  "rusqlite",
  "secrecy",
@@ -1254,7 +1255,9 @@ dependencies = [
 name = "replicant-runtime"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "replicant-client",
+ "serde_json",
  "tokio",
 ]
 

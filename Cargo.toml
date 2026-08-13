@@ -97,6 +97,7 @@ url = { version = "2.5", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 
 [dev-dependencies]
+replicant-runtime = { path = "crates/replicant-runtime" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
