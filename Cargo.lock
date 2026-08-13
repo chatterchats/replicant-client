@@ -1257,10 +1257,14 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "replicant-client",
+ "replicant-printing",
+ "replicant-route-planner",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

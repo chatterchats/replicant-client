@@ -28,6 +28,9 @@ pub mod reports;
 /// Survey-route planning and execution.
 pub mod survey;
 
+/// Relay-network planning and restart-safe execution.
+pub mod relay;
+
 /// Replicant-only asteroid-belt scouting.
 pub mod belt_search;
 
