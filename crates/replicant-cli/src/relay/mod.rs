@@ -1415,7 +1415,7 @@ fn build_supply_plan(
     let mut restocks = Vec::with_capacity(batches.len());
     let mut carrier_restock_indices = vec![Vec::<usize>::new(); selected.len()];
     for (restock_index, ((boundary_stop_index, relay_stop_indices), carrier_index)) in
-        batches.into_iter().zip(assignments.into_iter()).enumerate()
+        batches.into_iter().zip(assignments).enumerate()
     {
         carrier_restock_indices[carrier_index].push(restock_index);
         restocks.push(RelayRestock {

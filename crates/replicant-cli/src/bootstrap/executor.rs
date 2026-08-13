@@ -40,6 +40,7 @@ use super::{
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const QUICK_SCOUT_SYSTEM_LIMIT: usize = 12;
+type RolePayloads = (Vec<(String, Vec<String>)>, Vec<String>);
 
 pub async fn resolve_replicant(
     client: &Client,
@@ -1082,7 +1083,7 @@ fn fresh_role_payloads(
     assets: &BTreeMap<String, Vec<String>>,
     unassigned: &BTreeSet<String>,
     carrier_capacity: i64,
-) -> AnyResult<(Vec<(String, Vec<String>)>, Vec<String>)> {
+) -> AnyResult<RolePayloads> {
     let mut pools = assets
         .iter()
         .filter(|(device_type, _)| !matches!(device_type.as_str(), CARGO_FREIGHTER | SURGE_CARRIER))
