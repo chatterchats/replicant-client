@@ -2477,9 +2477,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::managed::client::StartupPolicy;
-    use crate::raw::{SecretString, Url};
-
     fn cached_device(
         id: &str,
         device_type: DeviceType,
@@ -2532,16 +2529,7 @@ mod tests {
         }
     }
 
-    async fn client_at(base_url: &str) -> Client {
-        Client::builder()
-            .authentication_token(SecretString::from("token".to_string()))
-            .base_url(Url::parse(base_url).expect("mock URL"))
-            .in_memory()
-            .startup_policy(StartupPolicy::RestoreOnly)
-            .start()
-            .await
-            .expect("restore-only client")
-    }
+    use crate::managed::test_client_at as client_at;
 
     #[tokio::test]
     async fn refresh_many_page_size_clamps_to_raw_device_bounds() {

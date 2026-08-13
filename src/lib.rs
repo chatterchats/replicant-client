@@ -69,6 +69,18 @@ pub mod managed {
     mod trading;
     mod travel;
 
+    #[cfg(test)]
+    async fn test_client_at(base_url: &str) -> client::Client {
+        client::Client::builder()
+            .authentication_token(crate::raw::SecretString::from("token".to_string()))
+            .base_url(crate::raw::Url::parse(base_url).expect("mock URL"))
+            .in_memory()
+            .startup_policy(client::StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only client")
+    }
+
     pub use ami::{
         FleetController, MiningController, MiningDirective, SurveyController, SurveyDirective,
         TransportController, TransportDirective,

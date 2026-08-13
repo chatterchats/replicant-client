@@ -480,20 +480,9 @@ mod tests {
         DeviceStatus as DomainDeviceStatus, Observation, ObservationAuthority, ObservationMetadata,
         ObservationSource, Reachability, SourceDocument,
     };
-    use crate::managed::client::StartupPolicy;
-    use crate::raw::{SecretString, Url};
     use crate::{Client, Error};
 
-    async fn client_at(base_url: &str) -> Client {
-        Client::builder()
-            .authentication_token(SecretString::from("token".to_string()))
-            .base_url(Url::parse(base_url).expect("mock URL"))
-            .in_memory()
-            .startup_policy(StartupPolicy::RestoreOnly)
-            .start()
-            .await
-            .expect("restore-only client")
-    }
+    use crate::managed::test_client_at as client_at;
 
     fn seed_device(
         client: &Client,

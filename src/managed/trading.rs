@@ -129,20 +129,7 @@ mod tests {
         matchers::{method, path},
     };
 
-    use super::*;
-    use crate::managed::client::StartupPolicy;
-    use crate::raw::{SecretString, Url};
-
-    async fn client_at(base_url: &str) -> Client {
-        Client::builder()
-            .authentication_token(SecretString::from("token".to_string()))
-            .base_url(Url::parse(base_url).expect("mock URL"))
-            .in_memory()
-            .startup_policy(StartupPolicy::RestoreOnly)
-            .start()
-            .await
-            .expect("restore-only client")
-    }
+    use crate::managed::test_client_at as client_at;
 
     #[tokio::test]
     async fn trades_extracts_the_trades_array_from_the_untyped_response() {
