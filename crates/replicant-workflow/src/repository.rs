@@ -9,11 +9,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::{
-    NewWorkflow, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
+    NewWorkflow, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
+    WorkflowStatus,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 1;
+const ACTIVITY_SCHEMA: &str = include_str!("../migrations/0002_activity.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 2;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +137,13 @@ impl WorkflowRepository {
                 [],
             )?;
         }
+        if found < 2 {
+            transaction.execute_batch(ACTIVITY_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (2)",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -187,6 +196,47 @@ impl WorkflowRepository {
             "SELECT {COLUMNS} FROM workflow_instances ORDER BY created_at, id"
         ))?;
         let rows = statement.query_map([], row_to_instance)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Appends a durable activity message.
+    pub fn append_activity(
+        &self,
+        workflow_id: WorkflowId,
+        message: impl Into<String>,
+    ) -> Result<WorkflowActivity, RepositoryError> {
+        let created_at = now_millis()?;
+        let message = message.into();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO workflow_activity (workflow_id, created_at, message) VALUES (?1, ?2, ?3)",
+            params![workflow_id.to_string(), created_at, message],
+        )?;
+        Ok(WorkflowActivity {
+            id: connection.last_insert_rowid(),
+            workflow_id,
+            created_at,
+            message,
+        })
+    }
+
+    /// Lists durable activity for one workflow in emission order.
+    pub fn activity(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Vec<WorkflowActivity>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, created_at, message FROM workflow_activity WHERE workflow_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([workflow_id.to_string()], |row| {
+            Ok(WorkflowActivity {
+                id: row.get(0)?,
+                workflow_id,
+                created_at: row.get(1)?,
+                message: row.get(2)?,
+            })
+        })?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 

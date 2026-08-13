@@ -3,12 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{WorkflowInstance, WorkflowKind};
+use crate::{WorkflowExecutor, WorkflowInstance, WorkflowKind};
 
 /// Factory metadata required to load a persisted workflow kind.
 ///
-/// A later supervisor can extend implementations with executor construction;
-/// this phase only needs durable kind and schema compatibility lookup.
 pub trait WorkflowFactory: Send + Sync {
     /// Stable kind created by this factory.
     fn kind(&self) -> &WorkflowKind;
@@ -19,6 +17,13 @@ pub trait WorkflowFactory: Send + Sync {
     /// Returns whether this factory can load a persisted schema version.
     fn supports_schema_version(&self, version: u32) -> bool {
         version == self.current_schema_version()
+    }
+
+    /// Constructs an executor for one persisted invocation.
+    ///
+    /// Metadata-only factories may retain the default until they are runnable.
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        None
     }
 }
 

@@ -179,6 +179,19 @@ pub struct WorkflowState<P, R> {
     pub result: Option<R>,
 }
 
+/// One durable workflow activity message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowActivity {
+    /// Monotonic database identifier.
+    pub id: i64,
+    /// Workflow that emitted the message.
+    pub workflow_id: WorkflowId,
+    /// Creation time in Unix milliseconds.
+    pub created_at: i64,
+    /// Human-readable, non-secret activity message.
+    pub message: String,
+}
+
 /// Persisted workflow instance.
 ///
 /// Serialized payloads are intentionally omitted from `Debug`; callers decode

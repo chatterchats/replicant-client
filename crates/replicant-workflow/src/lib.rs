@@ -1,14 +1,17 @@
-//! Durable workflow state and registry primitives.
-//!
-//! The SQLite row is authoritative. This crate deliberately does not start or
-//! supervise workflow tasks.
+//! Durable workflow state, execution, and supervision primitives.
 
 mod model;
 mod registry;
 mod repository;
+mod supervisor;
 
 pub use model::{
-    NewWorkflow, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
+    NewWorkflow, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
+    WorkflowStatus,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowRegistry};
 pub use repository::{RepositoryError, WorkflowRepository};
+pub use supervisor::{
+    BoxWorkflowFuture, ControlRequest, SupervisorError, WorkflowContext, WorkflowExecutor,
+    WorkflowSupervisor,
+};
