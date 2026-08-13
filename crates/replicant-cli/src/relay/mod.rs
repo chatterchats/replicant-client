@@ -4,10 +4,10 @@
 //! exact minimum-new-relay Steiner tree. Newly manufactured FTL relays use the
 //! configured conventional range (7.499 ly by default), while already deployed
 //! relay-capable devices can extend individual systems using their advertised
-//! `/network` range. Managed client operations perform all mutations. The raw
-//! escape hatch is used only
-//! for blueprint costs and autofactory queue details that are not represented
-//! by the normalized managed projection.
+//! `/network` range. Managed client operations perform all mutations, and relay
+//! manufacturing is delegated to the shared `replicant-printing` crate. The raw
+//! escape hatch remains only for relay blueprint resource preflight data that is
+//! not represented by the normalized managed projection.
 //!
 //! ```text
 //! cargo run --quiet -p replicant-cli -- relay plan \
@@ -42,8 +42,18 @@ use std::{
 };
 
 use replicant_client::{
-    AutofactoryPrintOptions, Client, Device, DeviceType, Operation, OperationId, OperationStatus,
-    Replicant, SecretString, StartupPolicy, raw,
+    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, SecretString,
+    StartupPolicy, raw,
+};
+use replicant_printing::{
+    Blueprint as PrintingBlueprint, FactoryWorkload, QuantityMap,
+    managed::{
+        FactoryState, PrintingError, discover_factories as discover_print_factories,
+        discover_factory_codes as discover_print_factory_codes,
+        enqueue_print as enqueue_shared_print, fetch_blueprints as fetch_print_blueprints,
+        printing_status_in_system,
+    },
+    schedule_prints,
 };
 use replicant_route_planner::{
     NetworkNode, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
@@ -60,15 +70,12 @@ const DEFAULT_MAX_HOP_LY: f64 = 7.499;
 const RELAY_DISTANCE_EPSILON: f64 = 1e-9;
 const FTL_RELAY: &str = "ftl_relay";
 const SYSTEM_HUB: &str = "system_hub";
-const AUTOFACTORY: &str = "autofactory";
 const RELAYING: &str = "relaying";
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_DEVICE_TAG_CHARS: usize = 32;
 const RELAY_MISSION_TAG_PREFIX: &str = "relay-m:";
 const RELAY_SITE_TAG_PREFIX: &str = "relay-s:";
 const RELAY_BATCH_TAG_PREFIX: &str = "relay-b:";
-const LEGACY_RELAY_MISSION_TAG_PREFIX: &str = "relay-expansion:";
-const LEGACY_RELAY_SITE_TAG_PREFIX: &str = "relay-site:";
 const RESERVED_WORKFLOW_TAG_PREFIXES: &[&str] = &[
     "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
     "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
@@ -447,15 +454,6 @@ struct DeviceCensus {
     supply_carriers: Vec<SupplyCarrierCandidate>,
 }
 
-#[derive(Clone, Debug)]
-struct FactoryState {
-    code: String,
-    queue_size: usize,
-    queue_depth: usize,
-    printing: bool,
-    observed_job_tags: Vec<BTreeSet<String>>,
-}
-
 struct MissionLock {
     path: PathBuf,
 }
@@ -624,17 +622,26 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
             )
         })?;
 
+    let printing_blueprints = fetch_print_blueprints(client).await?;
+
     let mut plan = if config.plan_path.exists() && !config.replace_plan {
         let mut plan = load_plan(&config.plan_path)?;
         validate_loaded_plan(&plan, config, &replicant_code, &vessel_code)?;
         if config.command == Command::Plan && !config.ignore_printers.is_empty() {
-            let factories = refresh_factory_states_at_hub(client, &config.hub).await?;
+            let all_factory_codes = discover_print_factory_codes(client, &config.hub)
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let factories =
+                discover_print_factories(client, &config.hub, &printing_blueprints).await?;
             let mission_id = plan.mission_id.clone();
             let reassigned = reassign_ignored_print_jobs(
                 &mut plan.print_jobs,
                 &mission_id,
                 &factories,
+                &all_factory_codes,
                 &config.ignore_printers,
+                &printing_blueprints,
                 &config.hub,
             )?;
             if reassigned != 0 {
@@ -656,12 +663,33 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
                 "at least one system target is required when creating a plan",
             ));
         }
-        let plan = create_plan(client, config, &replicant_code, &vessel_code).await?;
+        let plan = create_plan(
+            client,
+            config,
+            &replicant_code,
+            &vessel_code,
+            &printing_blueprints,
+        )
+        .await?;
         save_plan(&config.plan_path, &plan)?;
         plan
     };
 
     reconcile_plan(client, &mut plan).await?;
+    let mission_id = plan.mission_id.clone();
+    let hub_location = plan.hub_location.clone();
+    let live_factories =
+        discover_print_factories(client, &hub_location, &printing_blueprints).await?;
+    let reassigned = reassign_unavailable_print_jobs(
+        &mut plan.print_jobs,
+        &mission_id,
+        &live_factories,
+        &printing_blueprints,
+        &hub_location,
+    )?;
+    if reassigned != 0 {
+        info!(reassigned, hub = %hub_location, "reassigned relay print jobs from unavailable Autofactories");
+    }
     save_plan(&config.plan_path, &plan)?;
     print_plan(&plan);
 
@@ -706,6 +734,7 @@ async fn create_plan(
     config: &Config,
     replicant_code: &str,
     vessel_code: &str,
+    printing_blueprints: &BTreeMap<String, PrintingBlueprint>,
 ) -> AnyResult<MissionPlan> {
     let catalogue = client.galaxy().catalogue();
     let system_names = catalogue
@@ -727,8 +756,19 @@ async fn create_plan(
         }
     }
 
-    let census = refresh_device_census(client, &config.hub, vessel_code, &system_names).await?;
-    if census.factories.is_empty() {
+    let factory_codes = discover_print_factory_codes(client, &config.hub)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let census = refresh_device_census(
+        client,
+        &config.hub,
+        vessel_code,
+        &system_names,
+        printing_blueprints,
+    )
+    .await?;
+    if factory_codes.is_empty() {
         return Err(app_error(
             io::ErrorKind::NotFound,
             format!(
@@ -737,7 +777,7 @@ async fn create_plan(
             ),
         ));
     }
-    validate_ignored_printers(&census.factories, &config.ignore_printers, &config.hub)?;
+    validate_ignored_printers(&factory_codes, &config.ignore_printers, &config.hub)?;
     if !config.ignore_printers.is_empty() {
         info!(
             ignored_printers = ?config.ignore_printers,
@@ -887,8 +927,6 @@ async fn create_plan(
         });
         (stowed_in_transport, code.clone())
     });
-    let mut factory_load = factory_loads(&census.factories, &config.ignore_printers);
-
     let nodes = network
         .nodes
         .iter()
@@ -951,32 +989,11 @@ async fn create_plan(
                     used_hub_stock.push(code.clone());
                 });
                 if relay_code.is_none() {
-                    if factory_load.is_empty() {
-                        let message = if config.ignore_printers.is_empty() {
-                            format!(
-                                "relay printing is required but no account-owned Autofactory is available at {}",
-                                config.hub
-                            )
-                        } else {
-                            format!(
-                                "relay printing is required but no non-ignored Autofactory is available at {}; ignored: {}",
-                                config.hub,
-                                config
-                                    .ignore_printers
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        };
-                        return Err(app_error(io::ErrorKind::NotFound, message));
-                    }
-                    let factory_code = least_loaded_factory(&mut factory_load)?;
                     let mission_tag = relay_mission_tag(&mission_id);
                     let site_tag = relay_site_tag(system);
                     print_jobs.push(PrintJob {
                         system: system.clone(),
-                        factory_code,
+                        factory_code: String::new(),
                         mission_tag,
                         site_tag,
                         batch_tag: None,
@@ -1059,6 +1076,14 @@ async fn create_plan(
         None
     };
 
+    assign_unsubmitted_print_jobs(
+        &mut print_jobs,
+        &census.factories,
+        &config.ignore_printers,
+        printing_blueprints,
+        &BTreeMap::new(),
+        &config.hub,
+    )?;
     assign_new_plan_print_batches(&mission_id, &mut print_jobs);
 
     ensure_manufacturing_resources(client, &config.hub, print_jobs.len()).await?;
@@ -1154,37 +1179,17 @@ fn relay_reuse_scope(
     )
 }
 
-fn factory_loads(
-    factories: &[FactoryState],
-    ignored: &BTreeSet<String>,
-) -> BTreeMap<String, usize> {
-    factories
-        .iter()
-        .filter(|factory| !ignored.contains(&factory.code))
-        .map(|factory| {
-            (
-                factory.code.clone(),
-                factory.queue_depth + if factory.printing { 1 } else { 0 },
-            )
-        })
-        .collect()
-}
-
 fn validate_ignored_printers(
-    factories: &[FactoryState],
+    factory_codes: &BTreeSet<String>,
     ignored: &BTreeSet<String>,
     hub: &str,
 ) -> AnyResult<()> {
     if ignored.is_empty() {
         return Ok(());
     }
-    let available = factories
-        .iter()
-        .map(|factory| factory.code.as_str())
-        .collect::<BTreeSet<_>>();
     let unknown = ignored
         .iter()
-        .filter(|code| !available.contains(code.as_str()))
+        .filter(|code| !factory_codes.contains(code.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if unknown.is_empty() {
@@ -1197,20 +1202,6 @@ fn validate_ignored_printers(
             unknown.join(", ")
         ),
     ))
-}
-
-fn least_loaded_factory(loads: &mut BTreeMap<String, usize>) -> AnyResult<String> {
-    let code = loads
-        .iter()
-        .min_by(|(left_code, left_load), (right_code, right_load)| {
-            left_load
-                .cmp(right_load)
-                .then_with(|| left_code.cmp(right_code))
-        })
-        .map(|(code, _)| code.clone())
-        .ok_or_else(|| app_error(io::ErrorKind::NotFound, "no autofactory is available"))?;
-    *loads.entry(code.clone()).or_default() += 1;
-    Ok(code)
 }
 
 fn deployment_batches(
@@ -1497,6 +1488,7 @@ async fn refresh_device_census(
     hub: &str,
     vessel_code: &str,
     systems: &BTreeSet<String>,
+    printing_blueprints: &BTreeMap<String, PrintingBlueprint>,
 ) -> AnyResult<DeviceCensus> {
     let handles = client
         .devices()
@@ -1516,7 +1508,6 @@ async fn refresh_device_census(
     let mut relay_range_devices = Vec::<(String, String, String)>::new();
     let mut relay_code_ranges_ly = BTreeMap::<String, f64>::new();
     let mut hub_stock = Vec::new();
-    let mut factory_codes = Vec::new();
     let mut supply_carriers = Vec::new();
     let hub_system = resolve_system(hub, systems).ok_or_else(|| {
         app_error(
@@ -1604,10 +1595,6 @@ async fn refresh_device_census(
                 ));
             }
             continue;
-        }
-
-        if kind == Some(AUTOFACTORY) && device_location(device) == Some(hub) {
-            factory_codes.push(code.clone());
         }
     }
     // Standard FTL relays continue to use the configured conventional
@@ -1701,11 +1688,7 @@ async fn refresh_device_census(
             .then_with(|| left.code.cmp(&right.code))
     });
 
-    let mut factories = Vec::new();
-    for code in factory_codes {
-        factories.push(fetch_factory_state(client, &code).await?);
-    }
-    factories.sort_by_key(|factory| (factory.printing, factory.queue_depth, factory.code.clone()));
+    let factories = discover_print_factories(client, hub, printing_blueprints).await?;
     Ok(DeviceCensus {
         devices,
         active_relay_codes,
@@ -1717,34 +1700,121 @@ async fn refresh_device_census(
     })
 }
 
-async fn refresh_factory_states_at_hub(client: &Client, hub: &str) -> AnyResult<Vec<FactoryState>> {
-    let handles = client.devices().find().collect().await?;
-    let mut factory_codes = Vec::new();
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
-        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
-            factory_codes.push(handle.id().as_str().to_owned());
+fn relay_print_workloads(
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+    blueprints: &BTreeMap<String, PrintingBlueprint>,
+    reserved: &BTreeMap<String, usize>,
+) -> AnyResult<Vec<FactoryWorkload>> {
+    let relay_seconds = blueprints
+        .get(FTL_RELAY)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::NotFound,
+                "FTL relay blueprint is not unlocked",
+            )
+        })?
+        .print_time_seconds
+        .max(0.0);
+    Ok(factories
+        .iter()
+        .filter(|factory| !ignored.contains(&factory.code))
+        .map(|factory| FactoryWorkload {
+            code: factory.code.clone(),
+            remaining_seconds: factory.remaining_seconds
+                + reserved.get(&factory.code).copied().unwrap_or_default() as f64 * relay_seconds,
+        })
+        .collect())
+}
+
+fn assign_job_indices_with_shared_scheduler(
+    print_jobs: &mut [PrintJob],
+    indices: &[usize],
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+    blueprints: &BTreeMap<String, PrintingBlueprint>,
+    reserved: &BTreeMap<String, usize>,
+    hub: &str,
+) -> AnyResult<()> {
+    if indices.is_empty() {
+        return Ok(());
+    }
+    let workloads = relay_print_workloads(factories, ignored, blueprints, reserved)?;
+    if workloads.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!("no eligible Autofactory is available at {hub}"),
+        ));
+    }
+    let mut required = QuantityMap::new();
+    required.insert(FTL_RELAY.to_owned(), i64::try_from(indices.len())?);
+    let schedule = schedule_prints(&required, blueprints, &workloads)?;
+    let mut assignments = Vec::with_capacity(indices.len());
+    for batch in schedule.batches {
+        if batch.device_type != FTL_RELAY {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shared print scheduler returned unexpected device type {}",
+                    batch.device_type
+                ),
+            ));
+        }
+        for _ in 0..batch.quantity {
+            assignments.push(batch.factory_code.clone());
         }
     }
-    factory_codes.sort();
-    factory_codes.dedup();
-
-    let mut factories = Vec::with_capacity(factory_codes.len());
-    for code in factory_codes {
-        factories.push(fetch_factory_state(client, &code).await?);
+    if assignments.len() != indices.len() {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "shared print scheduler assigned {} of {} relay print units",
+                assignments.len(),
+                indices.len()
+            ),
+        ));
     }
-    factories.sort_by_key(|factory| (factory.printing, factory.queue_depth, factory.code.clone()));
-    Ok(factories)
+    for (index, factory_code) in indices.iter().copied().zip(assignments) {
+        print_jobs[index].factory_code = factory_code;
+    }
+    Ok(())
+}
+
+fn assign_unsubmitted_print_jobs(
+    print_jobs: &mut [PrintJob],
+    factories: &[FactoryState],
+    ignored: &BTreeSet<String>,
+    blueprints: &BTreeMap<String, PrintingBlueprint>,
+    reserved: &BTreeMap<String, usize>,
+    hub: &str,
+) -> AnyResult<()> {
+    let indices = print_jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| {
+            job.relay_code.is_none()
+                && !job.submission_started
+                && job.operation_id.is_none()
+                && !job.submitted
+                && job.factory_code.is_empty()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assign_job_indices_with_shared_scheduler(
+        print_jobs, &indices, factories, ignored, blueprints, reserved, hub,
+    )
 }
 
 fn reassign_ignored_print_jobs(
     print_jobs: &mut [PrintJob],
     mission_id: &str,
     factories: &[FactoryState],
+    all_factory_codes: &BTreeSet<String>,
     ignored: &BTreeSet<String>,
+    blueprints: &BTreeMap<String, PrintingBlueprint>,
     hub: &str,
 ) -> AnyResult<usize> {
-    validate_ignored_printers(factories, ignored, hub)?;
+    validate_ignored_printers(all_factory_codes, ignored, hub)?;
     if ignored.is_empty() {
         return Ok(0);
     }
@@ -1769,113 +1839,108 @@ fn reassign_ignored_print_jobs(
         ));
     }
 
-    let mut loads = factory_loads(factories, ignored);
-    if loads.is_empty()
-        && print_jobs.iter().any(|job| {
+    let moving = print_jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| {
             job.relay_code.is_none()
                 && ignored.contains(&job.factory_code)
                 && !job.submission_started
                 && job.operation_id.is_none()
                 && !job.submitted
         })
-    {
-        return Err(app_error(
-            io::ErrorKind::NotFound,
-            format!(
-                "saved relay plan has unsubmitted print jobs on ignored printer(s), but no non-ignored Autofactory is available at {hub}"
-            ),
-        ));
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if moving.is_empty() {
+        return Ok(0);
     }
-
-    // Preserve the existing assignment load of all other unsubmitted jobs so
-    // moving an ignored printer's work does not pile it onto a factory that is
-    // already heavily represented in the saved plan. Submitted jobs are
-    // already reflected in the live queue/printing depth where relevant.
+    let available = factories
+        .iter()
+        .filter(|factory| !ignored.contains(&factory.code))
+        .map(|factory| factory.code.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut reserved = BTreeMap::<String, usize>::new();
     for job in print_jobs.iter() {
-        if job.relay_code.is_some()
-            || ignored.contains(&job.factory_code)
-            || job.submission_started
-            || job.operation_id.is_some()
-            || job.submitted
+        if job.relay_code.is_none()
+            && !job.submission_started
+            && job.operation_id.is_none()
+            && !job.submitted
+            && available.contains(job.factory_code.as_str())
         {
-            continue;
+            *reserved.entry(job.factory_code.clone()).or_default() += 1;
         }
-        let Some(load) = loads.get_mut(&job.factory_code) else {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "saved relay plan assigns unsubmitted print work to Autofactory {}, but that factory is no longer available at {hub}; recreate the plan with --replace-plan",
-                    job.factory_code
-                ),
+    }
+    assign_job_indices_with_shared_scheduler(
+        print_jobs, &moving, factories, ignored, blueprints, &reserved, hub,
+    )?;
+    for index in &moving {
+        if print_jobs[*index].batch_tag.is_some() {
+            print_jobs[*index].batch_tag = Some(relay_batch_tag(
+                mission_id,
+                &print_jobs[*index].factory_code,
+                print_jobs[*index].flatpack,
             ));
-        };
-        *load += 1;
+        }
     }
+    Ok(moving.len())
+}
 
-    let mut reassigned = 0usize;
-    for job in print_jobs.iter_mut() {
-        if job.relay_code.is_some()
-            || !ignored.contains(&job.factory_code)
-            || job.submission_started
-            || job.operation_id.is_some()
-            || job.submitted
+fn reassign_unavailable_print_jobs(
+    print_jobs: &mut [PrintJob],
+    mission_id: &str,
+    factories: &[FactoryState],
+    blueprints: &BTreeMap<String, PrintingBlueprint>,
+    hub: &str,
+) -> AnyResult<usize> {
+    let available = factories
+        .iter()
+        .map(|factory| factory.code.as_str())
+        .collect::<BTreeSet<_>>();
+    let moving = print_jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| {
+            job.relay_code.is_none()
+                && !job.submission_started
+                && job.operation_id.is_none()
+                && !job.submitted
+                && !available.contains(job.factory_code.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if moving.is_empty() {
+        return Ok(0);
+    }
+    let mut reserved = BTreeMap::<String, usize>::new();
+    for job in print_jobs.iter() {
+        if job.relay_code.is_none()
+            && !job.submission_started
+            && job.operation_id.is_none()
+            && !job.submitted
+            && available.contains(job.factory_code.as_str())
         {
-            continue;
+            *reserved.entry(job.factory_code.clone()).or_default() += 1;
         }
-        job.factory_code = least_loaded_factory(&mut loads)?;
-        if job.batch_tag.is_some() {
-            job.batch_tag = Some(relay_batch_tag(mission_id, &job.factory_code, job.flatpack));
-        }
-        reassigned += 1;
     }
-    Ok(reassigned)
-}
-
-async fn fetch_factory_state(client: &Client, code: &str) -> AnyResult<FactoryState> {
-    let detail = client.raw().devices().get(code).await?.value;
-    let mut observed_job_tags = Vec::new();
-    if let Some(printing) = &detail.printing {
-        observed_job_tags.push(printing.tags.iter().cloned().collect());
-    }
-    for queued in &detail.print_queue {
-        let mut tags = BTreeSet::new();
-        collect_relay_tags(&Value::Object(queued.clone()), &mut tags);
-        observed_job_tags.push(tags);
-    }
-    Ok(FactoryState {
-        code: code.to_owned(),
-        queue_size: usize::try_from(detail.queue_size.unwrap_or(1).max(1)).unwrap_or(1),
-        queue_depth: detail.print_queue.len(),
-        printing: detail.printing.is_some(),
-        observed_job_tags,
-    })
-}
-
-fn collect_relay_tags(value: &Value, tags: &mut BTreeSet<String>) {
-    match value {
-        Value::String(value) if is_relay_job_tag(value) => {
-            tags.insert(value.clone());
+    assign_job_indices_with_shared_scheduler(
+        print_jobs,
+        &moving,
+        factories,
+        &BTreeSet::new(),
+        blueprints,
+        &reserved,
+        hub,
+    )?;
+    for index in &moving {
+        if print_jobs[*index].batch_tag.is_some() {
+            print_jobs[*index].batch_tag = Some(relay_batch_tag(
+                mission_id,
+                &print_jobs[*index].factory_code,
+                print_jobs[*index].flatpack,
+            ));
         }
-        Value::Array(values) => {
-            for value in values {
-                collect_relay_tags(value, tags);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_relay_tags(value, tags);
-            }
-        }
-        _ => {}
     }
-}
-
-fn is_relay_job_tag(tag: &str) -> bool {
-    tag.starts_with(RELAY_MISSION_TAG_PREFIX)
-        || tag.starts_with(RELAY_SITE_TAG_PREFIX)
-        || tag.starts_with(RELAY_BATCH_TAG_PREFIX)
-        || tag.starts_with(LEGACY_RELAY_MISSION_TAG_PREFIX)
-        || tag.starts_with(LEGACY_RELAY_SITE_TAG_PREFIX)
+    Ok(moving.len())
 }
 
 fn stable_tag_hash(value: &str) -> u64 {
@@ -2346,16 +2411,24 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         }
     }
 
-    let factory_codes = plan
-        .print_jobs
-        .iter()
-        .map(|job| job.factory_code.clone())
-        .collect::<BTreeSet<_>>();
-    let mut factory_job_tags = BTreeMap::<String, Vec<BTreeSet<String>>>::new();
-    for code in factory_codes {
-        let state = fetch_factory_state(client, &code).await?;
-        factory_job_tags.insert(code, state.observed_job_tags);
-    }
+    let printing_status = printing_status_in_system(client, &plan.hub_location, &[], &[]).await?;
+    let factory_job_tags = printing_status
+        .factories
+        .into_iter()
+        .map(|factory| {
+            let mut jobs = Vec::<BTreeSet<String>>::new();
+            if let Some(active) = factory.active {
+                jobs.push(active.tags.into_iter().collect());
+            }
+            jobs.extend(
+                factory
+                    .queued
+                    .into_iter()
+                    .map(|job| job.tags.into_iter().collect()),
+            );
+            (factory.code, jobs)
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for index in 0..plan.print_jobs.len() {
         if plan.print_jobs[index].relay_code.is_some() {
@@ -3769,6 +3842,20 @@ async fn submit_print_jobs(
     plan: &mut MissionPlan,
 ) -> AnyResult<()> {
     reconcile_plan(client, plan).await?;
+    let blueprints = fetch_print_blueprints(client).await?;
+    let initial_factories =
+        discover_print_factories(client, &plan.hub_location, &blueprints).await?;
+    let mission_id = plan.mission_id.clone();
+    let reassigned = reassign_unavailable_print_jobs(
+        &mut plan.print_jobs,
+        &mission_id,
+        &initial_factories,
+        &blueprints,
+        &plan.hub_location,
+    )?;
+    if reassigned != 0 {
+        info!(reassigned, hub = %plan.hub_location, "reassigned relay print jobs before submission");
+    }
     save_plan(&config.plan_path, plan)?;
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
@@ -3779,61 +3866,99 @@ async fn submit_print_jobs(
                 "timed out waiting for autofactory queue capacity",
             ));
         }
-        let factory_codes = plan
-            .print_jobs
-            .iter()
-            .map(|job| job.factory_code.clone())
-            .collect::<BTreeSet<_>>();
-        let mut states = Vec::new();
-        for code in factory_codes {
-            states.push(fetch_factory_state(client, &code).await?);
+        let states = discover_print_factories(client, &plan.hub_location, &blueprints).await?;
+        let mission_id = plan.mission_id.clone();
+        let reassigned = reassign_unavailable_print_jobs(
+            &mut plan.print_jobs,
+            &mission_id,
+            &states,
+            &blueprints,
+            &plan.hub_location,
+        )?;
+        if reassigned != 0 {
+            save_plan(&config.plan_path, plan)?;
         }
-        states.sort_by_key(|state| (state.printing, state.queue_depth, state.code.clone()));
         let mut submitted_any = false;
+        let mut refresh_factories = false;
         for state in states {
-            let slots = state.queue_size.saturating_sub(state.queue_depth);
-            for job_indices in pending_print_groups(&plan.print_jobs, &state.code)
-                .into_iter()
-                .take(slots)
-            {
-                let first_index = *job_indices
+            let mut slots = state.available_slots();
+            for job_indices in pending_print_groups(&plan.print_jobs, &state.code) {
+                if slots == 0 {
+                    break;
+                }
+                let selected = job_indices.into_iter().take(slots).collect::<Vec<_>>();
+                if selected.is_empty() {
+                    continue;
+                }
+                let first_index = *selected
                     .first()
                     .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "empty print batch"))?;
                 let mission_tag = plan.print_jobs[first_index].mission_tag.clone();
                 let correlation_tag =
                     print_job_correlation_tag(&plan.print_jobs[first_index]).to_owned();
-                let quantity = i64::try_from(job_indices.len())?;
-                for index in &job_indices {
+                let quantity = i64::try_from(selected.len())?;
+                for index in &selected {
                     plan.print_jobs[*index].submission_started = true;
                 }
                 save_plan(&config.plan_path, plan)?;
 
-                let factory = client.devices().get(&state.code).await?;
-                let options =
-                    AutofactoryPrintOptions::new(quantity).tags([mission_tag, correlation_tag]);
-                let operation = factory.enqueue_print_configured(FTL_RELAY, options).await?;
-                let operation_id = operation.id().as_str().to_owned();
-                for index in &job_indices {
-                    plan.print_jobs[*index].operation_id = Some(operation_id.clone());
-                }
-                save_plan(&config.plan_path, plan)?;
-                ensure_operation_accepted(&operation).await?;
-                for index in &job_indices {
-                    plan.print_jobs[*index].submitted = true;
+                let tags = [mission_tag, correlation_tag];
+                match enqueue_shared_print(client, &state.code, FTL_RELAY, quantity, &tags).await {
+                    Ok(operation) => {
+                        let operation_id = operation.id().as_str().to_owned();
+                        for index in &selected {
+                            plan.print_jobs[*index].operation_id = Some(operation_id.clone());
+                            plan.print_jobs[*index].submitted = true;
+                        }
+                    }
+                    Err(error) => {
+                        let operation_id = match &error {
+                            PrintingError::SubmissionRejected { operation_id, .. }
+                            | PrintingError::SubmissionUnresolved { operation_id, .. } => {
+                                Some(operation_id.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(operation_id) = operation_id {
+                            for index in &selected {
+                                plan.print_jobs[*index].operation_id = Some(operation_id.clone());
+                            }
+                        }
+                        if error.is_factory_unavailable_rejection() {
+                            for index in &selected {
+                                plan.print_jobs[*index].submission_started = false;
+                                plan.print_jobs[*index].operation_id = None;
+                                plan.print_jobs[*index].submitted = false;
+                            }
+                            save_plan(&config.plan_path, plan)?;
+                            warn!(factory = %state.code, %error, "Autofactory became unavailable; refreshing relay print assignments");
+                            refresh_factories = true;
+                            break;
+                        }
+                        save_plan(&config.plan_path, plan)?;
+                        return Err(error.into());
+                    }
                 }
                 save_plan(&config.plan_path, plan)?;
                 info!(
                     factory = %state.code,
                     quantity,
-                    systems = %job_indices
+                    systems = %selected
                         .iter()
                         .map(|index| plan.print_jobs[*index].system.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    "queued FTL relay print batch"
+                    "queued FTL relay print batch through shared printing crate"
                 );
+                slots = slots.saturating_sub(selected.len());
                 submitted_any = true;
             }
+            if refresh_factories {
+                break;
+            }
+        }
+        if refresh_factories {
+            continue;
         }
         if !submitted_any {
             wait_for_relevant_event(&mut watch, deadline, &["print.completed"]).await?;
@@ -4746,60 +4871,55 @@ mod tests {
         }
     }
 
+    fn factory_state(code: &str, queued_units: usize, printing: bool) -> FactoryState {
+        FactoryState {
+            code: code.to_owned(),
+            queue_size: 5,
+            queued_units,
+            printing,
+            waiting_for_resources: false,
+            remaining_seconds: queued_units as f64 * 10.0,
+        }
+    }
+
+    fn relay_blueprints() -> BTreeMap<String, PrintingBlueprint> {
+        [(
+            FTL_RELAY.to_owned(),
+            PrintingBlueprint {
+                device_type: FTL_RELAY.to_owned(),
+                print_time_seconds: 10.0,
+                ..PrintingBlueprint::default()
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
     #[test]
-    fn ignored_printers_are_excluded_from_relay_factory_loads() {
+    fn ignored_printers_are_excluded_from_relay_workloads() {
         let factories = vec![
-            FactoryState {
-                code: "KEEPBUSY".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
-            FactoryState {
-                code: "AVAILABLE".into(),
-                queue_size: 5,
-                queue_depth: 2,
-                printing: true,
-                observed_job_tags: Vec::new(),
-            },
+            factory_state("KEEPBUSY", 0, false),
+            factory_state("AVAILABLE", 2, true),
         ];
         let ignored = BTreeSet::from(["KEEPBUSY".to_owned()]);
-
-        let loads = factory_loads(&factories, &ignored);
-
-        assert!(!loads.contains_key("KEEPBUSY"));
-        assert_eq!(loads.get("AVAILABLE"), Some(&3));
-
-        let mut loads = loads;
-        assert_eq!(least_loaded_factory(&mut loads).unwrap(), "AVAILABLE");
+        let workloads =
+            relay_print_workloads(&factories, &ignored, &relay_blueprints(), &BTreeMap::new())
+                .unwrap();
+        assert_eq!(workloads.len(), 1);
+        assert_eq!(workloads[0].code, "AVAILABLE");
     }
 
     #[test]
     fn saved_plan_unsubmitted_jobs_are_reassigned_away_from_ignored_printers() {
         let factories = vec![
-            FactoryState {
-                code: "IGNORED".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
-            FactoryState {
-                code: "A".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
-            FactoryState {
-                code: "B".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
+            factory_state("IGNORED", 0, false),
+            factory_state("A", 0, false),
+            factory_state("B", 0, false),
         ];
+        let all_factory_codes = factories
+            .iter()
+            .map(|factory| factory.code.clone())
+            .collect();
         let ignored = BTreeSet::from(["IGNORED".to_owned()]);
         let mut jobs = vec![
             print_job("ONE", "IGNORED", Some("relay-b:ignored")),
@@ -4811,7 +4931,9 @@ mod tests {
             &mut jobs,
             "mission-test",
             &factories,
+            &all_factory_codes,
             &ignored,
+            &relay_blueprints(),
             "SCEPTURUM-BELT-1",
         )
         .expect("unsubmitted jobs should be safely reassigned");
@@ -4829,21 +4951,13 @@ mod tests {
     #[test]
     fn saved_plan_does_not_reassign_in_flight_jobs_from_ignored_printers() {
         let factories = vec![
-            FactoryState {
-                code: "IGNORED".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
-            FactoryState {
-                code: "AVAILABLE".into(),
-                queue_size: 5,
-                queue_depth: 0,
-                printing: false,
-                observed_job_tags: Vec::new(),
-            },
+            factory_state("IGNORED", 0, false),
+            factory_state("AVAILABLE", 0, false),
         ];
+        let all_factory_codes = factories
+            .iter()
+            .map(|factory| factory.code.clone())
+            .collect();
         let ignored = BTreeSet::from(["IGNORED".to_owned()]);
         let mut job = print_job("ONE", "IGNORED", None);
         job.submission_started = true;
@@ -4853,7 +4967,9 @@ mod tests {
             &mut jobs,
             "mission-test",
             &factories,
+            &all_factory_codes,
             &ignored,
+            &relay_blueprints(),
             "SCEPTURUM-BELT-1",
         )
         .expect_err("in-flight work must not be reassigned");
@@ -4866,16 +4982,10 @@ mod tests {
 
     #[test]
     fn ignored_printer_validation_rejects_codes_outside_the_hub_factory_set() {
-        let factories = vec![FactoryState {
-            code: "KNOWN".into(),
-            queue_size: 5,
-            queue_depth: 0,
-            printing: false,
-            observed_job_tags: Vec::new(),
-        }];
+        let factory_codes = BTreeSet::from(["KNOWN".to_owned()]);
         let ignored = BTreeSet::from(["TYPO".to_owned()]);
 
-        let error = validate_ignored_printers(&factories, &ignored, "SCEPTURUM-BELT-1")
+        let error = validate_ignored_printers(&factory_codes, &ignored, "SCEPTURUM-BELT-1")
             .expect_err("unknown ignored printer should fail validation");
 
         let message = error.to_string();

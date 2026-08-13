@@ -354,6 +354,23 @@ pub enum PrintingError {
     },
 }
 
+impl PrintingError {
+    /// Whether this error is a definitive server rejection caused by an
+    /// Autofactory becoming physically unable to accept print work.
+    ///
+    /// Callers may safely choose a different factory after this returns true;
+    /// unresolved/ambiguous submissions deliberately never match.
+    #[must_use]
+    pub fn is_factory_unavailable_rejection(&self) -> bool {
+        match self {
+            Self::SubmissionRejected { response, .. } => response
+                .as_ref()
+                .is_some_and(value_mentions_factory_unavailable),
+            _ => false,
+        }
+    }
+}
+
 /// Fetches unlocked blueprints and their print durations.
 pub async fn fetch_blueprints(
     client: &Client,
@@ -381,18 +398,15 @@ pub async fn fetch_blueprints(
         .collect())
 }
 
-/// Discovers account-owned, currently printable Autofactories at `hub` and
-/// reads their live queues.
+/// Discovers account-owned Autofactory device codes at one exact hub location.
 ///
-/// Modular Autofactories cannot accept print commands while compacted (or
-/// while transitioning into/out of that state). Those devices remain valid
-/// account stock, but are deliberately omitted from printer scheduling until
-/// they are fully unfurled again.
-pub async fn discover_factories<B: PrintTime>(
+/// This inventory intentionally includes compacted and transitional factories.
+/// Use [`discover_factories`] when the caller needs only factories that can
+/// currently accept print work.
+pub async fn discover_factory_codes(
     client: &Client,
     hub: &str,
-    blueprints: &BTreeMap<String, B>,
-) -> Result<Vec<FactoryState>, PrintingError> {
+) -> Result<Vec<String>, PrintingError> {
     let handles = client
         .devices()
         .find()
@@ -405,14 +419,27 @@ pub async fn discover_factories<B: PrintTime>(
     for handle in handles {
         let snapshot = handle.snapshot().await?;
         if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
-            // The local projection is used only to identify candidate factory
-            // codes. The raw detail read below is authoritative for current
-            // queue/status, so stale cached state cannot make a compacted
-            // factory look printable (or hide one that has just unfurled).
             factory_codes.push(handle.id().as_str().to_owned());
         }
     }
     factory_codes.sort();
+    factory_codes.dedup();
+    Ok(factory_codes)
+}
+
+/// Discovers account-owned, currently printable Autofactories at `hub` and
+/// reads their live queues.
+///
+/// Modular Autofactories cannot accept print commands while compacted (or
+/// while transitioning into/out of that state). Those devices remain valid
+/// account stock, but are deliberately omitted from printer scheduling until
+/// they are fully unfurled again.
+pub async fn discover_factories<B: PrintTime>(
+    client: &Client,
+    hub: &str,
+    blueprints: &BTreeMap<String, B>,
+) -> Result<Vec<FactoryState>, PrintingError> {
+    let factory_codes = discover_factory_codes(client, hub).await?;
 
     let mut factories = Vec::with_capacity(factory_codes.len());
     for code in factory_codes {
@@ -1777,6 +1804,20 @@ fn has_command(commands: &[String], expected: &str) -> bool {
     commands.iter().any(|command| command == expected)
 }
 
+fn value_mentions_factory_unavailable(value: &Value) -> bool {
+    match value {
+        Value::String(value) => {
+            let value = value.to_ascii_lowercase();
+            value.contains("device is compacted")
+                || value.contains("device is compacting")
+                || value.contains("device is unfurling")
+        }
+        Value::Array(values) => values.iter().any(value_mentions_factory_unavailable),
+        Value::Object(values) => values.values().any(value_mentions_factory_unavailable),
+        _ => false,
+    }
+}
+
 fn factory_status_blocks_printing(status: Option<&str>) -> bool {
     status.is_some_and(|status| {
         status.eq_ignore_ascii_case("compacted")
@@ -1912,6 +1953,26 @@ mod tests {
             "waiting_for_resources"
         )));
         assert!(!factory_status_blocks_printing(None));
+    }
+
+    #[test]
+    fn compacted_submission_rejection_is_safe_to_reschedule() {
+        let error = PrintingError::SubmissionRejected {
+            operation_id: "operation-1".into(),
+            status: OperationStatus::Rejected,
+            response: Some(serde_json::json!({
+                "message": "unexpected HTTP status 400: Device is compacted",
+                "server": {"error": "Device is compacted"},
+            })),
+        };
+        assert!(error.is_factory_unavailable_rejection());
+
+        let other = PrintingError::SubmissionRejected {
+            operation_id: "operation-2".into(),
+            status: OperationStatus::Rejected,
+            response: Some(serde_json::json!({"message": "insufficient resources"})),
+        };
+        assert!(!other.is_factory_unavailable_rejection());
     }
 
     #[test]
