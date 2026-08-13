@@ -8,6 +8,7 @@ members = [
   "crates/replicant-printing",
   "crates/replicant-transport",
   "crates/replicant-runtime",
+  "crates/replicant-protocol",
   "crates/replicant-workflow",
   "crates/replicant-cli",
 ]
