@@ -1250,6 +1250,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "replicant-runtime"
+version = "0.1.0"
+dependencies = [
+ "replicant-client",
+ "tokio",
+]
+
+[[package]]
 name = "replicant-transport"
 version = "0.1.0"
 dependencies = [

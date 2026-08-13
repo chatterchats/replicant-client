@@ -7,6 +7,7 @@ members = [
   "crates/replicant-bootstrap-planner",
   "crates/replicant-printing",
   "crates/replicant-transport",
+  "crates/replicant-runtime",
   "crates/replicant-cli",
 ]
 resolver = "3"
