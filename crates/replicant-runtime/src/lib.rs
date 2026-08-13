@@ -34,6 +34,12 @@ pub mod relay;
 /// Mining-network expansion planning and restart-safe execution.
 pub mod mining;
 
+/// Event fulfillment planning and restart-safe campaign execution.
+pub mod event;
+
+/// Regional bootstrap planning and restart-safe execution.
+pub mod bootstrap;
+
 /// Replicant-only asteroid-belt scouting.
 pub mod belt_search;
 

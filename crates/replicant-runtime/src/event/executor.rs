@@ -426,10 +426,7 @@ pub(crate) async fn finish_resolved_campaign_mission(
         event = %plan.event.designation,
         "campaign event logistics finished independently of replicant"
     );
-    println!(
-        "Mission {} ({}) completed.",
-        plan.mission_id, plan.event.designation
-    );
+    info!(mission = %plan.mission_id, event = %plan.event.designation, "event mission completed");
     Ok(())
 }
 
@@ -449,10 +446,7 @@ pub(crate) async fn execute_saved_plan(
     plan: &mut EventMissionPlan,
 ) -> AnyResult<()> {
     if plan.phase.is_terminal() {
-        println!(
-            "Mission {} is already terminal ({:?}).",
-            plan.mission_id, plan.phase
-        );
+        info!(mission = %plan.mission_id, phase = ?plan.phase, "event mission is already terminal");
         return Ok(());
     }
     let _ = reconcile_remote_event_completion(client, config, plan).await?;
@@ -560,17 +554,9 @@ pub(crate) async fn execute_saved_plan(
         MissionPhase::CompletedWithWarnings
     };
     save_plan(&config.plan_path, plan)?;
-    println!(
-        "Mission {} completed{}.",
-        plan.mission_id,
-        if plan.execution.warnings.is_empty() {
-            ""
-        } else {
-            " with warnings"
-        }
-    );
+    info!(mission = %plan.mission_id, phase = ?plan.phase, "event mission completed");
     for warning in &plan.execution.warnings {
-        println!("Warning: {warning}");
+        warn!(mission = %plan.mission_id, warning, "event mission completed with warning");
     }
     Ok(())
 }
@@ -795,9 +781,11 @@ async fn replan_nonlocal_assets_with_reservations(
     plan.execution = ExecutionState::default();
     plan.phase = MissionPhase::Planned;
     save_plan(&config.plan_path, plan)?;
-    println!(
-        "Replanned mission {} as {} using free stock at {} and transports in its home system.",
-        previous_mission_id, plan.mission_id, plan.home_location
+    info!(
+        previous_mission = %previous_mission_id,
+        mission = %plan.mission_id,
+        home = %plan.home_location,
+        "replanned event mission using home-scoped free stock"
     );
     Ok(true)
 }

@@ -46,8 +46,9 @@ fn plan(event: EventDefinition, context: &PlanningContext) {
   `blueprint_resource_cost`, `mission_tag`, and `role_tag`.
 - Errors: `PlannerError` reports incomplete or inconsistent planning inputs.
 
-Use `replicant-cli event` when live discovery, persistence, printing,
-transport, and durable execution are needed.
+Use `replicant-runtime::event` for live discovery, persistence, printing,
+transport, and durable execution. `replicant-cli event` is its compatibility
+frontend.
 
 ## Verify
 

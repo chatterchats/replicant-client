@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use replicant_bootstrap_planner::{BeltCandidate, BootstrapProfile};

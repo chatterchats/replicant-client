@@ -61,7 +61,8 @@ println!("ark device types: {}", payload.len());
 ```
 
 The planner does not inspect live inventory or execute a mission. Use
-`replicant-cli bootstrap` for orchestration.
+`replicant-runtime::bootstrap` for durable stage, deliver, and run execution;
+`replicant-cli bootstrap` is its compatibility frontend.
 
 ## Verify
 

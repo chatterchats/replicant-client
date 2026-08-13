@@ -8,13 +8,13 @@ use std::{
     time::Duration,
 };
 
+use crate::{config::ManagedClientConfig, start_managed_client};
 use replicant_client::{Client, Replicant, Star, SyncDomain, raw};
 use replicant_event_planner::{
     BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
     OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
     role_tag,
 };
-use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -380,7 +380,9 @@ impl EventScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum MissionPhase {
+/// Durable phase of one event-fulfillment mission.
+#[allow(missing_docs)]
+pub enum MissionPhase {
     Planned,
     ClaimingTransports,
     Manufacturing,
@@ -434,6 +436,56 @@ struct EventMissionPlan {
     claimed_devices: Vec<ClaimedDevice>,
     #[serde(default)]
     execution: executor::ExecutionState,
+}
+
+/// Inputs for resuming a persisted event mission or campaign.
+#[derive(Clone, Debug)]
+pub struct EventExecutionRequest {
+    /// Durable event mission or campaign file.
+    pub plan_file: PathBuf,
+    /// Maximum wait for one print, travel, or SSE-backed event transition.
+    pub wait_timeout: Duration,
+}
+
+impl EventExecutionRequest {
+    /// Creates an execution request for a persisted event plan.
+    #[must_use]
+    pub fn new(plan_file: impl Into<PathBuf>, wait_timeout: Duration) -> Self {
+        Self {
+            plan_file: plan_file.into(),
+            wait_timeout,
+        }
+    }
+}
+
+/// Typed progress returned by reusable event executors.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventExecutionState {
+    /// One event mission and its durable phase.
+    Mission {
+        /// Stable mission identifier.
+        mission_id: String,
+        /// Event designation being fulfilled.
+        event: String,
+        /// Current durable phase.
+        phase: MissionPhase,
+        /// Non-fatal execution warnings.
+        warnings: Vec<String>,
+    },
+    /// An all-events campaign and aggregate progress.
+    Campaign {
+        /// Stable campaign identifier.
+        campaign_id: String,
+        /// Terminal missions.
+        completed: usize,
+        /// Planned plus currently blocked events.
+        total: usize,
+        /// Events that cannot currently be planned.
+        blocked: usize,
+        /// Non-fatal campaign warnings.
+        warnings: Vec<String>,
+    },
 }
 
 struct MissionLock {
@@ -494,7 +546,8 @@ impl Drop for MissionLock {
     }
 }
 
-pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
+/// Runs the legacy event CLI frontend against the reusable event services.
+pub async fn run_cli(arguments: Vec<String>) -> AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
     init_logging(&config)?;
     if config.command == Command::Status {
@@ -587,10 +640,12 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         if campaign::is_campaign_file(&config.plan_path)? {
             let mut plan = campaign::load_campaign(&config.plan_path)?;
             campaign::execute_campaign(client, config, &mut plan).await?;
+            render_execution_state(&campaign::execution_state(&plan)?);
             return Ok(());
         }
         let mut plan = load_plan(&config.plan_path)?;
         executor::execute_saved_plan(client, config, &mut plan).await?;
+        render_execution_state(&mission_state(&plan));
         return Ok(());
     }
 
@@ -1614,6 +1669,112 @@ fn save_plan(path: &Path, plan: &EventMissionPlan) -> AnyResult<()> {
 
 fn load_plan(path: &Path) -> AnyResult<EventMissionPlan> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn mission_state(plan: &EventMissionPlan) -> EventExecutionState {
+    EventExecutionState::Mission {
+        mission_id: plan.mission_id.clone(),
+        event: plan.event.designation.clone(),
+        phase: plan.phase,
+        warnings: plan.execution.warnings.clone(),
+    }
+}
+
+fn render_execution_state(state: &EventExecutionState) {
+    match state {
+        EventExecutionState::Mission {
+            mission_id,
+            phase,
+            warnings,
+            ..
+        } => {
+            println!(
+                "Mission {mission_id} completed{} ({phase:?}).",
+                if warnings.is_empty() {
+                    ""
+                } else {
+                    " with warnings"
+                }
+            );
+            for warning in warnings {
+                println!("Warning: {warning}");
+            }
+        }
+        EventExecutionState::Campaign {
+            campaign_id,
+            completed,
+            total,
+            blocked,
+            ..
+        } => println!("Campaign {campaign_id}: {completed}/{total} completed, {blocked} blocked."),
+    }
+}
+
+fn execution_config(request: &EventExecutionRequest) -> Config {
+    Config {
+        command: Command::Run,
+        event: None,
+        criterion: None,
+        replicant: None,
+        home: DEFAULT_HOME.into(),
+        database: PathBuf::new(),
+        plan_path: request.plan_file.clone(),
+        replace_plan: false,
+        all_events: false,
+        region: None,
+        center: None,
+        radius_ly: None,
+        wait_timeout: request.wait_timeout,
+        verbose: false,
+        log_file: None,
+        json: false,
+    }
+}
+
+/// Resumes either a persisted event mission or an all-events campaign.
+pub async fn execute_event(
+    client: &Client,
+    request: &EventExecutionRequest,
+) -> AnyResult<EventExecutionState> {
+    let _lock = MissionLock::acquire(&request.plan_file)?;
+    let mut config = execution_config(request);
+    if campaign::is_campaign_file(&request.plan_file)? {
+        let mut plan = campaign::load_campaign(&request.plan_file)?;
+        campaign::configure_execution(&plan, &mut config);
+        campaign::execute_campaign(client, &config, &mut plan).await?;
+        return campaign::execution_state(&plan);
+    }
+    let mut plan = load_plan(&request.plan_file)?;
+    executor::execute_saved_plan(client, &config, &mut plan).await?;
+    Ok(mission_state(&plan))
+}
+
+/// Resumes a persisted all-events campaign.
+pub async fn execute_event_campaign(
+    client: &Client,
+    request: &EventExecutionRequest,
+) -> AnyResult<EventExecutionState> {
+    if !campaign::is_campaign_file(&request.plan_file)? {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an event campaign", request.plan_file.display()),
+        ));
+    }
+    execute_event(client, request).await
+}
+
+/// Resumes one persisted event-fulfillment mission.
+pub async fn execute_event_mission(
+    client: &Client,
+    request: &EventExecutionRequest,
+) -> AnyResult<EventExecutionState> {
+    if campaign::is_campaign_file(&request.plan_file)? {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{} is an event campaign", request.plan_file.display()),
+        ));
+    }
+    execute_event(client, request).await
 }
 
 fn show_status(config: &Config) -> AnyResult<()> {

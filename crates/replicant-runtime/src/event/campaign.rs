@@ -19,11 +19,35 @@ use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
 use super::{
-    AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, EventScope,
-    MissionPhase, PLAN_VERSION, app_error, build_factory_workloads, executor,
-    fetch_active_events_in_scope, fetch_blueprints, fetch_devices, fetch_earned_achievements,
-    fetch_inventory, load_plan, normalize_event, save_plan, select_replicant,
+    AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventExecutionState,
+    EventMissionPlan, EventScope, MissionPhase, PLAN_VERSION, app_error, build_factory_workloads,
+    executor, fetch_active_events_in_scope, fetch_blueprints, fetch_devices,
+    fetch_earned_achievements, fetch_inventory, load_plan, normalize_event, save_plan,
+    select_replicant,
 };
+
+pub(super) fn configure_execution(campaign: &EventCampaignPlan, config: &mut Config) {
+    config.replicant = Some(campaign.selected_replicant.clone());
+    config.home = campaign.home_location.clone();
+}
+
+pub(super) fn execution_state(campaign: &EventCampaignPlan) -> AnyResult<EventExecutionState> {
+    let completed = campaign
+        .missions
+        .iter()
+        .map(|mission| load_plan(&mission.mission_path))
+        .collect::<AnyResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|mission| mission.phase.is_terminal())
+        .count();
+    Ok(EventExecutionState::Campaign {
+        campaign_id: campaign.campaign_id.clone(),
+        completed,
+        total: campaign.missions.len() + campaign.blocked_events.len(),
+        blocked: campaign.blocked_events.len(),
+        warnings: campaign.warnings.clone(),
+    })
+}
 
 const CAMPAIGN_VERSION: u32 = 1;
 const CAMPAIGN_KIND: &str = "all_events_campaign";
@@ -557,10 +581,7 @@ pub(crate) async fn execute_campaign(
 
         if campaign.blocked_events.is_empty() {
             save_campaign(&config.plan_path, campaign)?;
-            println!(
-                "Campaign {} completed every planned event.",
-                campaign.campaign_id
-            );
+            info!(campaign = %campaign.campaign_id, "event campaign completed every planned event");
             return Ok(());
         }
 

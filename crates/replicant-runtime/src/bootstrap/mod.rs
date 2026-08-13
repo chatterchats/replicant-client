@@ -11,12 +11,13 @@ use std::{
     time::Duration,
 };
 
-use model::{BootstrapMission, ChildMissions, MissionPhase, PLAN_VERSION, PrintState};
+use crate::{config::ManagedClientConfig, start_managed_client};
+pub use model::{BootstrapMission, MissionPhase};
+use model::{ChildMissions, PLAN_VERSION, PrintState};
 use replicant_bootstrap_planner::{
     BootstrapProfile, ark_device_requirements, mission_tag, validate_profile,
 };
 use replicant_client::{Client, SyncDomain};
-use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
@@ -223,6 +224,26 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
 }
 
+/// Inputs shared by the reusable bootstrap stage, deliver, and run operations.
+#[derive(Clone, Debug)]
+pub struct BootstrapExecutionRequest {
+    /// Durable bootstrap mission file.
+    pub mission_file: PathBuf,
+    /// Maximum wait for one manufacturing, travel, or SSE-backed state transition.
+    pub wait_timeout: Duration,
+}
+
+impl BootstrapExecutionRequest {
+    /// Creates an execution request for a persisted bootstrap mission.
+    #[must_use]
+    pub fn new(mission_file: impl Into<PathBuf>, wait_timeout: Duration) -> Self {
+        Self {
+            mission_file: mission_file.into(),
+            wait_timeout,
+        }
+    }
+}
+
 fn print_help() {
     println!(
         "Regional bootstrap automation\n\nUsage:\n  replicant-cli bootstrap --plan [OPTIONS]\n  replicant-cli bootstrap --stage [OPTIONS]\n  replicant-cli bootstrap --deliver [OPTIONS]\n  replicant-cli bootstrap --run [OPTIONS]\n  replicant-cli bootstrap --status [OPTIONS]\n\nCore options:\n  --landing-star STAR       Ark rendezvous; its region is inferred automatically\n  --region beta|gamma       Optional region constraint/default landing selector\n  --operator NAME_OR_CODE   Existing or future capital replicant (default: Chats-1)\n  --explorer NAME_OR_CODE   Existing or future explorer (default: Chats-2)\n  --source-hub LOCATION     Source manufacturing hub\n  --mission-file PATH       Durable parent mission\n  --mining-setups N         Initial complete setups (5-10, default: 8)\n  --autofactories N         Regional factories (3-6, default: 6)\n  --freighters N            Seed/route freighters (6-12, default: 6)\n  --transport-controllers N Initial AMI transport controllers\n  --hub-maintenance-drones N Capital maintenance reserve (1-4, default: 2)\n  --root-relays N            Relays reserved for the regional root (1-4, default: 1)\n  --expansion-relays N       Expansion relays (0-36, default: 18)\n  --ftl-beacons N            Monitoring beacons (0-18, default: 9)\n  --seed-quantity N         Resource units in each seed freighter (default: 500)\n  --quick-scout-radius LY   Visit-and-scan dense-belt search radius\n  --survey-radius LY        Regional survey radius (default: 30)\n  --min-sites N             Minimum dense mining systems (default: 5)\n  --max-sites N             Maximum dense mining systems (default: 9)\n  --max-concurrency N       Concurrent dispatch limit (default: 8)\n  --wait-timeout-secs N     Per-stage timeout\n  --replace-plan            Replace an incomplete plan\n  --database PATH           Managed SQLite database\n  --verbose                 Log to stderr\n  --log-file PATH           Append detailed logs to a file\n  --json                    Machine-readable plan/status\n\n`stage` prints, loads, assembles, and moves the ark to the source system entry point without requiring the planned replicants. `deliver` creates a plan when needed, manufactures and loads the ark, sends only the ark devices to the landing star entry point (or the star itself when no entry point is known), and stops before regional deployment. `run` resolves the planned replicants and continues the full regional workflow. There is no --execute or resume command."
@@ -232,7 +253,8 @@ fn print_help() {
     );
 }
 
-pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
+/// Runs the legacy bootstrap CLI frontend against the reusable bootstrap services.
+pub async fn run_cli(arguments: Vec<String>) -> AnyResult<()> {
     let config = Config::from_args(arguments)?;
     init_logging(&config)?;
     if config.command == Command::Status {
@@ -485,7 +507,8 @@ fn print_mission(mission: &BootstrapMission, path: &Path, json: bool) -> AnyResu
     Ok(())
 }
 
-pub(crate) fn load_mission(path: &Path) -> AnyResult<BootstrapMission> {
+/// Loads and migrates a durable bootstrap mission.
+pub fn load_mission(path: &Path) -> AnyResult<BootstrapMission> {
     let mut mission: BootstrapMission = serde_json::from_slice(&fs::read(path)?)?;
     if mission.version != PLAN_VERSION {
         return Err(app_error(
@@ -616,6 +639,71 @@ pub(crate) fn unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+fn execution_config(
+    request: &BootstrapExecutionRequest,
+    mission: &BootstrapMission,
+    command: Command,
+) -> Config {
+    Config {
+        command,
+        region: Some(mission.region.clone()),
+        landing_star: Some(mission.landing_star.clone()),
+        source_hub: mission.source_hub.clone(),
+        operator: mission.operator.query().to_owned(),
+        explorer: mission.explorer.query().to_owned(),
+        mission_file: request.mission_file.clone(),
+        database: PathBuf::new(),
+        profile: mission.profile.clone(),
+        seed_quantity: mission.seed_quantity,
+        quick_scout_radius_ly: mission.quick_scout_radius_ly,
+        survey_radius_ly: mission.survey_radius_ly,
+        minimum_sites: mission.minimum_sites,
+        maximum_sites: mission.maximum_sites,
+        max_concurrency: mission.max_concurrency,
+        wait_timeout: request.wait_timeout,
+        replace_plan: false,
+        verbose: false,
+        log_file: None,
+        json: false,
+    }
+}
+
+/// Resumes manufacturing, loading, and source-entry staging for a persisted ark.
+pub async fn stage_bootstrap(
+    client: &Client,
+    request: &BootstrapExecutionRequest,
+) -> AnyResult<BootstrapMission> {
+    let _lock = MissionLock::acquire(&request.mission_file)?;
+    let mut mission = load_mission(&request.mission_file)?;
+    let config = execution_config(request, &mission, Command::Stage);
+    executor::stage(client, &config, &mut mission).await?;
+    Ok(mission)
+}
+
+/// Resumes manufacturing and delivers the ark payload to the persisted landing star.
+pub async fn deliver_bootstrap(
+    client: &Client,
+    request: &BootstrapExecutionRequest,
+) -> AnyResult<BootstrapMission> {
+    let _lock = MissionLock::acquire(&request.mission_file)?;
+    let mut mission = load_mission(&request.mission_file)?;
+    let config = execution_config(request, &mission, Command::Deliver);
+    executor::deliver(client, &config, &mut mission).await?;
+    Ok(mission)
+}
+
+/// Resumes the complete regional bootstrap from its durable checkpoint.
+pub async fn run_bootstrap(
+    client: &Client,
+    request: &BootstrapExecutionRequest,
+) -> AnyResult<BootstrapMission> {
+    let _lock = MissionLock::acquire(&request.mission_file)?;
+    let mut mission = load_mission(&request.mission_file)?;
+    let config = execution_config(request, &mission, Command::Run);
+    executor::execute(client, &config, &mut mission).await?;
+    Ok(mission)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,5 +762,38 @@ mod tests {
         let error = Config::from_args(["plan", "--region", "alpha"].into_iter().map(str::to_owned))
             .expect_err("alpha is not an explicit regional-bootstrap selector");
         assert!(error.to_string().contains("--region must be beta or gamma"));
+    }
+
+    #[test]
+    fn reusable_execution_uses_persisted_mission_scope() {
+        let mission: BootstrapMission = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "mission_id": "mission",
+            "mission_tag": "boot-m:mission",
+            "region_tag": "region:beta",
+            "phase": "planned",
+            "region": "beta",
+            "source_hub": "SOURCE-BELT-1",
+            "source_system": "SOURCE",
+            "source_entry": "SOURCE-STAR",
+            "landing_star": "LANDING",
+            "landing_entry": "LANDING-STAR",
+            "operator": {"requested":"Operator","code":"1","name":"Operator","vessel":"V1"},
+            "explorer": {"requested":"Explorer","code":"2","name":"Explorer","vessel":"V2"},
+            "profile": BootstrapProfile::default(),
+            "seed_quantity": 500,
+            "quick_scout_radius_ly": 7.499,
+            "survey_radius_ly": 30.0,
+            "minimum_sites": 5,
+            "maximum_sites": 9,
+            "max_concurrency": 8,
+            "print": {"requirements":{},"submission_started":false,"queued":false},
+            "children": {"quick_survey":"q.json","initial_mining":"i.json","survey":"s.json","relays":"r.json","mining":"m.json"}
+        })).expect("mission");
+        let request = BootstrapExecutionRequest::new("mission.json", Duration::from_secs(9));
+        let config = execution_config(&request, &mission, Command::Run);
+        assert_eq!(config.region.as_deref(), Some("beta"));
+        assert_eq!(config.landing_star.as_deref(), Some("LANDING"));
+        assert_eq!(config.wait_timeout, Duration::from_secs(9));
     }
 }
