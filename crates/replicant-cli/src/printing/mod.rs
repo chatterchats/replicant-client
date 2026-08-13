@@ -1,3 +1,5 @@
+//! CLI adapter for `replicant-printing` planner, report, and action APIs.
+
 use std::{
     collections::BTreeSet,
     env,

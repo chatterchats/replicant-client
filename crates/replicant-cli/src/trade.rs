@@ -1,13 +1,20 @@
+//! CLI parsing and presentation for the reusable trade-directory report.
+
 use std::{
-    cmp::Ordering,
     env,
     io::{self, IsTerminal, Write},
     path::PathBuf,
 };
 
-use replicant_client::{Client, Replicant, StartupPolicy, SyncDomain};
-use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
-use serde::Deserialize;
+use replicant_client::{Client, Replicant, StartupPolicy};
+use replicant_runtime::{
+    config::ManagedClientConfig,
+    start_managed_client,
+    trade::{
+        ShopTrade, TraderSummary, resolve_trade_viewer, shop_trades, trade_viewers,
+        trader_directory,
+    },
+};
 use serde_json::Value;
 
 const DEFAULT_REPLICANT: &str = "Chats-1";
@@ -105,111 +112,6 @@ fn next_value(
         .ok_or_else(|| app_error(format!("{option} requires a value")))
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-struct TraderSummary {
-    #[serde(default)]
-    controller_code: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    is_local: bool,
-    #[serde(default)]
-    location: Option<String>,
-    #[serde(default)]
-    owner_name: Option<String>,
-    #[serde(default)]
-    owner_replicant_code: Option<String>,
-    #[serde(default)]
-    shop_name: Option<String>,
-    #[serde(default)]
-    star: Option<String>,
-    #[serde(default)]
-    total_stock: Option<i64>,
-    #[serde(default)]
-    trade_count: Option<i64>,
-}
-
-impl TraderSummary {
-    fn display_name(&self) -> &str {
-        self.shop_name.as_deref().unwrap_or("<unnamed shop>")
-    }
-
-    fn owner(&self) -> &str {
-        self.owner_name.as_deref().unwrap_or("<unknown>")
-    }
-
-    fn place(&self) -> &str {
-        self.location
-            .as_deref()
-            .or(self.star.as_deref())
-            .unwrap_or("hidden")
-    }
-
-    fn matches(&self, needle: &str) -> bool {
-        if needle.is_empty() {
-            return true;
-        }
-        let needle = needle.to_ascii_lowercase();
-        [
-            Some(self.controller_code.as_str()),
-            self.shop_name.as_deref(),
-            self.owner_name.as_deref(),
-            self.owner_replicant_code.as_deref(),
-            self.location.as_deref(),
-            self.star.as_deref(),
-            self.description.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|value| value.to_ascii_lowercase().contains(&needle))
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct ShopTrade {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    trade_code: String,
-    #[serde(default)]
-    current_stock: Option<i64>,
-    #[serde(default)]
-    initial_stock: Option<i64>,
-    #[serde(default)]
-    criteria: Option<Value>,
-    #[serde(default)]
-    rewards: Option<Value>,
-    #[serde(default)]
-    created_at: Option<String>,
-}
-
-impl ShopTrade {
-    fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or("<unnamed trade>")
-    }
-
-    fn stock(&self) -> String {
-        match (self.current_stock, self.initial_stock) {
-            (Some(current), Some(initial)) => format!("{current}/{initial}"),
-            (Some(current), None) => current.to_string(),
-            _ => "?".to_owned(),
-        }
-    }
-
-    fn matches(&self, needle: &str) -> bool {
-        if needle.is_empty() {
-            return true;
-        }
-        let needle = needle.to_ascii_lowercase();
-        let give = exchange_summary(self.criteria.as_ref()).to_ascii_lowercase();
-        let get = exchange_summary(self.rewards.as_ref()).to_ascii_lowercase();
-        self.display_name().to_ascii_lowercase().contains(&needle)
-            || self.trade_code.to_ascii_lowercase().contains(&needle)
-            || give.contains(&needle)
-            || get.contains(&needle)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShopLoopResult {
     Back,
@@ -294,16 +196,12 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
 }
 
 async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
-    // The trader directory is replicant-scoped, but it does not require a
-    // galaxy/location/device baseline. Refresh only the small owned-replicant
-    // roster so names such as "Chats-1" resolve without triggering a full sync.
-    client.sync().domain(SyncDomain::Replicants).await?;
     let replicant = select_replicant(client, config.replicant.as_deref(), config.command).await?;
 
     match config.command {
         Command::Interactive => interactive_directory(client, config, &replicant).await,
         Command::List => {
-            let traders = fetch_directory(client, replicant.key.id.as_str()).await?;
+            let traders = trader_directory(client, replicant.key.id.as_str()).await?;
             render_directory_plain(&replicant, &traders);
             Ok(())
         }
@@ -312,11 +210,11 @@ async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {
                 .controller
                 .as_deref()
                 .ok_or_else(|| app_error("trade show requires a controller code"))?;
-            let traders = fetch_directory(client, replicant.key.id.as_str()).await?;
+            let traders = trader_directory(client, replicant.key.id.as_str()).await?;
             let trader = traders
                 .iter()
                 .find(|trader| trader.controller_code.eq_ignore_ascii_case(controller));
-            let trades = fetch_trades(client, controller).await?;
+            let trades = shop_trades(client, controller).await?;
             render_shop_plain(trader, controller, &trades);
             Ok(())
         }
@@ -328,22 +226,13 @@ async fn select_replicant(
     requested: Option<&str>,
     command: Command,
 ) -> crate::AnyResult<Replicant> {
-    let handles = client.replicants().find().owned().collect().await?;
-    let mut replicants = Vec::with_capacity(handles.len());
-    for handle in handles {
-        replicants.push(handle.snapshot().await?);
-    }
-    replicants.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
-    });
+    let mut replicants = trade_viewers(client).await?;
     if replicants.is_empty() {
         return Err(app_error("no owned replicants were found"));
     }
 
     if let Some(requested) = requested {
-        return resolve_replicant(&replicants, requested);
+        return Ok(resolve_trade_viewer(&replicants, requested)?);
     }
 
     let default_index = replicants
@@ -386,83 +275,13 @@ async fn select_replicant(
     Ok(replicants.remove(selected - 1))
 }
 
-fn resolve_replicant(replicants: &[Replicant], requested: &str) -> crate::AnyResult<Replicant> {
-    let mut matches = replicants
-        .iter()
-        .filter(|replicant| {
-            replicant.key.id.as_str().eq_ignore_ascii_case(requested)
-                || replicant
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(app_error(format!("replicant {requested:?} was not found"))),
-        _ => Err(app_error(format!(
-            "replicant {requested:?} matched more than one owned replicant"
-        ))),
-    }
-}
-
-async fn fetch_directory(
-    client: &Client,
-    replicant_code: &str,
-) -> crate::AnyResult<Vec<TraderSummary>> {
-    let value = client.trading().visible_to(replicant_code).await?;
-    let mut traders = value
-        .get("traders")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| serde_json::from_value::<TraderSummary>(value.clone()).ok())
-        .filter(|trader| !trader.controller_code.is_empty())
-        .collect::<Vec<_>>();
-    traders.sort_by(compare_traders);
-    Ok(traders)
-}
-
-fn compare_traders(left: &TraderSummary, right: &TraderSummary) -> Ordering {
-    right
-        .is_local
-        .cmp(&left.is_local)
-        .then_with(|| {
-            left.display_name()
-                .to_ascii_lowercase()
-                .cmp(&right.display_name().to_ascii_lowercase())
-        })
-        .then_with(|| left.controller_code.cmp(&right.controller_code))
-}
-
-async fn fetch_trades(client: &Client, controller: &str) -> crate::AnyResult<Vec<ShopTrade>> {
-    let values = client.trading().for_controller(controller).trades().await?;
-    let mut trades = values
-        .into_iter()
-        .filter_map(|value| serde_json::from_value::<ShopTrade>(value).ok())
-        .collect::<Vec<_>>();
-    trades.sort_by(|left, right| {
-        right
-            .current_stock
-            .unwrap_or_default()
-            .cmp(&left.current_stock.unwrap_or_default())
-            .then_with(|| {
-                left.display_name()
-                    .to_ascii_lowercase()
-                    .cmp(&right.display_name().to_ascii_lowercase())
-            })
-    });
-    Ok(trades)
-}
-
 async fn interactive_directory(
     client: &Client,
     config: &Config,
     replicant: &Replicant,
 ) -> crate::AnyResult<()> {
     let ui = Ui::new(config);
-    let mut traders = fetch_directory(client, replicant.key.id.as_str()).await?;
+    let mut traders = trader_directory(client, replicant.key.id.as_str()).await?;
     let mut filter = String::new();
     let mut notice = None::<String>;
 
@@ -486,7 +305,7 @@ async fn interactive_directory(
                         .to_owned(),
                 );
             }
-            "r" | "refresh" => match fetch_directory(client, replicant.key.id.as_str()).await {
+            "r" | "refresh" => match trader_directory(client, replicant.key.id.as_str()).await {
                 Ok(updated) => {
                     traders = updated;
                     notice = Some("Directory refreshed.".to_owned());
@@ -515,7 +334,7 @@ async fn interactive_shop(
     ui: &Ui,
     trader: &TraderSummary,
 ) -> crate::AnyResult<ShopLoopResult> {
-    let mut trades = match fetch_trades(client, &trader.controller_code).await {
+    let mut trades = match shop_trades(client, &trader.controller_code).await {
         Ok(trades) => trades,
         Err(error) => {
             render_shop_error(ui, trader, &error.to_string());
@@ -544,7 +363,7 @@ async fn interactive_shop(
                     "/text=search trades • /=clear search • r=refresh • b=back • q=quit".to_owned(),
                 );
             }
-            "r" | "refresh" => match fetch_trades(client, &trader.controller_code).await {
+            "r" | "refresh" => match shop_trades(client, &trader.controller_code).await {
                 Ok(updated) => {
                     trades = updated;
                     notice = Some("Trade stock refreshed.".to_owned());

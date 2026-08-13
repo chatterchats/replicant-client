@@ -14,6 +14,12 @@ use std::error::Error;
 /// Error returned by an application report or action.
 pub type ApplicationError = Box<dyn Error + Send + Sync + 'static>;
 
+/// Compatibility error alias for extracted legacy command adapters.
+pub type AnyError = ApplicationError;
+
+/// Compatibility result alias for extracted legacy command adapters.
+pub type AnyResult<T> = Result<T, AnyError>;
+
 /// Result of a read-only application report.
 pub type ReportResult<T> = Result<T, ApplicationError>;
 
@@ -24,6 +30,18 @@ pub mod config;
 
 /// Read-only application queries and reports.
 pub mod reports;
+
+/// Read-only Riker colony shortlist report.
+pub mod rikers;
+
+/// Read-only player trade-directory reports.
+pub mod trade;
+
+/// Finite regional device-ownership reassignment action.
+pub mod ownership;
+
+/// Observatory reports, prospect planning, and bounded command actions.
+pub mod observatory;
 
 /// Survey-route planning and execution.
 pub mod survey;

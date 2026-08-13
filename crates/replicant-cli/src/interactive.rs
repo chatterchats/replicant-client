@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
 };
 
-use replicant_client::raw::{Client as RawClient, SecretString};
+use replicant_runtime::{config::ManagedClientConfig, reports::entity_index, start_managed_client};
 
 use crate::{AnyResult, app_error};
 
@@ -1278,33 +1278,16 @@ impl SmartResolver {
 
 impl SmartIndex {
     async fn load() -> AnyResult<Self> {
-        let token = env::var("RS_API_TOKEN")
-            .map(SecretString::from)
-            .map_err(|_| app_error("RS_API_TOKEN is not set"))?;
-        let client = RawClient::builder().authentication_token(token).build()?;
-        let galaxy = client.galaxy();
-        let locations = client.locations();
-        let (catalogue, location_map) = tokio::join!(galaxy.catalogue(), locations.system_map());
-        let catalogue = catalogue?;
-        let location_map = location_map?;
-
-        let mut systems = BTreeSet::new();
-        let mut locations = BTreeSet::new();
-        for star in catalogue.value.stars {
-            if let Some(designation) = star.designation {
-                systems.insert(designation.trim().to_ascii_uppercase());
-            }
-            if let Some(entry_point) = star.entry_point {
-                locations.insert(entry_point.trim().to_ascii_uppercase());
-            }
-        }
-        for location in location_map.value.locations.into_keys() {
-            locations.insert(location.trim().to_ascii_uppercase());
-        }
-
+        let database =
+            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".to_owned());
+        let client = start_managed_client(ManagedClientConfig::from_env(database)?).await?;
+        let index = entity_index(&client).await;
+        let close = client.close().await;
+        let index = index?;
+        close?;
         Ok(Self {
-            systems: systems.into_iter().collect(),
-            locations: locations.into_iter().collect(),
+            systems: index.systems,
+            locations: index.locations,
         })
     }
 

@@ -15,6 +15,42 @@ use serde_json::Value;
 
 use crate::ReportResult;
 
+/// Reusable system and location values for smart frontend selectors.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EntityIndex {
+    /// Catalogue system designations.
+    pub systems: Vec<String>,
+    /// Known location and entry-point designations.
+    pub locations: Vec<String>,
+}
+
+/// Builds a smart-selector index from managed catalogue and location state.
+pub async fn entity_index(client: &Client) -> ReportResult<EntityIndex> {
+    client.galaxy().refresh_catalogue().await?;
+    let catalogue = client.galaxy().catalogue();
+    let known_locations = client.locations().find().collect().await?;
+
+    let systems = catalogue
+        .iter()
+        .map(|star| star.key.id.as_str().to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let locations = catalogue
+        .iter()
+        .filter_map(|star| star.entry_point.as_ref())
+        .map(|location| location.id.as_str().to_ascii_uppercase())
+        .chain(
+            known_locations
+                .iter()
+                .map(|location| location.id().as_str().to_ascii_uppercase()),
+        )
+        .collect::<BTreeSet<_>>();
+
+    Ok(EntityIndex {
+        systems: systems.into_iter().collect(),
+        locations: locations.into_iter().collect(),
+    })
+}
+
 /// Default number of concurrent system refreshes for a nearby-belt report.
 pub const DEFAULT_BELT_REPORT_CONCURRENCY: usize = 4;
 /// Maximum number of concurrent system refreshes for a nearby-belt report.

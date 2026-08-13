@@ -1,3 +1,5 @@
+//! CLI adapter for `replicant-transport` planning and bounded delivery actions.
+
 use std::{
     env,
     error::Error as StdError,
