@@ -192,7 +192,7 @@ fn whole_seconds(value: Option<f64>) -> Option<i64> {
     })
 }
 
-fn device_travel(travel: &Option<raw::devices::TravelInfo>, realm: &Realm) -> Option<TravelState> {
+fn travel_state(travel: &Option<raw::status::TravelInfo>, realm: &Realm) -> Option<TravelState> {
     travel.as_ref().map(|travel| TravelState {
         arrives_at: travel.arrives_at.clone(),
         departed_at: travel.departed_at.clone(),
@@ -204,22 +204,6 @@ fn device_travel(travel: &Option<raw::devices::TravelInfo>, realm: &Realm) -> Op
         route_eta_seconds: whole_seconds(travel.route_eta_seconds),
         stage: travel.stage.clone(),
         travel_type: travel.r#type.clone(),
-    })
-}
-
-fn replicant_travel(
-    travel: &Option<raw::replicants::TravelInfo>,
-    realm: &Realm,
-) -> Option<TravelState> {
-    travel.as_ref().map(|travel| TravelState {
-        arrives_at: travel.arrives_at.clone(),
-        departed_at: travel.departed_at.clone(),
-        destination: location_key(&travel.destination, realm),
-        eta_seconds: travel.eta_seconds,
-        origin: location_key(&travel.origin, realm),
-        stage: travel.stage.clone(),
-        travel_type: travel.r#type.clone(),
-        ..TravelState::default()
     })
 }
 
@@ -305,7 +289,7 @@ fn device(
         stow_used: raw.stow_used,
         operational_capacity: raw.operational_capacity.and_then(OperationalCapacity::new),
         active_directive: active_device_directive(raw),
-        travel: device_travel(&raw.travel, &realm),
+        travel: travel_state(&raw.travel, &realm),
         access,
     })
 }
@@ -447,7 +431,7 @@ fn replicant(
         status: raw.status.clone().map(ReplicantStatus::from),
         location,
         hosted_device,
-        travel: replicant_travel(&raw.travel, &realm),
+        travel: travel_state(&raw.travel, &realm),
         private,
         access,
     })

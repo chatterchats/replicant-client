@@ -19,6 +19,8 @@ use crate::raw::devices::DeviceListResponse;
 use crate::raw::galaxy::{StarItem, StarListQuery, StarListResponse};
 use crate::raw::{Client, JsonObject, RawResponse, RequestSafety};
 
+pub use crate::raw::status::{MiningInfo, PrintingInfo, TravelInfo};
+
 /// Query parameters for `GET /v1/replicants`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReplicantListQuery {
@@ -57,41 +59,6 @@ pub struct ReplicantListResponse {
     pub replicants: Vec<ReplicantSearchItem>,
 }
 
-/// A replicant's in-progress mining operation.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct MiningInfo {
-    /// Current resource availability at the mining site.
-    pub availability: Option<String>,
-    /// The asteroid belt being mined.
-    pub belt: Option<String>,
-    /// Seconds per mining cycle.
-    pub cycle_time_seconds: Option<f64>,
-    /// Resource density at the site.
-    pub density: Option<String>,
-    /// Resource type being mined.
-    pub resource_type: Option<String>,
-    /// When mining started, RFC3339.
-    pub started_at: Option<String>,
-}
-
-/// A replicant's in-progress print job.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct PrintingInfo {
-    /// When the current print completes, RFC3339.
-    pub completes_at: Option<String>,
-    /// Device type being printed.
-    pub device_type: Option<String>,
-    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
-    /// `f64` is retained for source compatibility and accepts integer JSON.
-    pub eta_seconds: Option<f64>,
-    /// Completion percentage.
-    pub progress_percent: Option<f64>,
-    /// When the current print started, RFC3339.
-    pub started_at: Option<String>,
-}
-
 /// A replicant's in-progress teleport.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -104,41 +71,6 @@ pub struct TeleportInfo {
     pub started_at: Option<String>,
     /// The destination matrix code.
     pub target_matrix_code: Option<String>,
-}
-
-/// A replicant's in-progress travel.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct TravelInfo {
-    /// When this leg arrives, RFC3339.
-    pub arrives_at: Option<String>,
-    /// When travel departed, RFC3339.
-    pub departed_at: Option<String>,
-    /// This leg's destination.
-    pub destination: Option<String>,
-    /// Human-readable destination name.
-    pub destination_name: Option<String>,
-    /// Destination type.
-    pub destination_type: Option<String>,
-    /// Estimated seconds remaining.
-    pub eta_seconds: Option<i64>,
-    /// This leg's origin.
-    pub origin: Option<String>,
-    /// Human-readable origin name.
-    pub origin_name: Option<String>,
-    /// Completion percentage.
-    pub progress_percent: Option<f64>,
-    /// Remaining route legs, open-shaped.
-    #[serde(default)]
-    pub route: Vec<JsonObject>,
-    /// Current travel stage.
-    pub stage: Option<String>,
-    /// Total route distance, in light-years.
-    pub total_distance_ly: Option<f64>,
-    /// Total route time, in seconds.
-    pub total_time_seconds: Option<f64>,
-    /// Travel type.
-    pub r#type: Option<String>,
 }
 
 /// Full status of a single replicant.

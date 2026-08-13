@@ -60,6 +60,7 @@ pub mod replicants;
 pub mod reputation;
 pub mod simulations;
 pub mod species;
+pub mod status;
 pub mod trading;
 pub mod tutorials;
 

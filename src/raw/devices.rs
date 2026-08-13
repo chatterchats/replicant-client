@@ -19,6 +19,8 @@ use crate::error::Error;
 use crate::raw::common::{UpdateField, encode_path_segment, with_query};
 use crate::raw::{Client, JsonObject, RawResponse, RequestSafety};
 
+pub use crate::raw::status::{MiningInfo, PrintingInfo, TravelInfo};
+
 fn deserialize_optional_reference<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -110,53 +112,6 @@ pub struct CargoItem {
     pub resource_type: Option<String>,
 }
 
-/// A device's in-progress mining operation.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct MiningInfo {
-    /// Current resource availability at the mining site.
-    pub availability: Option<String>,
-    /// The asteroid belt being mined. Carries only the current field name;
-    /// the contract defines no legacy alias for this embedded status block
-    /// (unlike the replicant mine-response, see
-    /// [`crate::raw::replicants::MineResponse`]).
-    pub belt: Option<String>,
-    /// Seconds per mining cycle.
-    pub cycle_time_seconds: Option<f64>,
-    /// Resource density at the site.
-    pub density: Option<String>,
-    /// Mining cycles completed but not yet collected.
-    pub pending_cycles: Option<i64>,
-    /// Quantity mined but not yet collected.
-    pub pending_quantity: Option<f64>,
-    /// Total quantity mined so far.
-    pub quantity_mined: Option<i64>,
-    /// Resource type being mined.
-    pub resource_type: Option<String>,
-    /// When mining started, RFC3339.
-    pub started_at: Option<String>,
-}
-
-/// A device's in-progress print job.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct PrintingInfo {
-    /// When the current print completes, RFC3339.
-    pub completes_at: Option<String>,
-    /// Device type being printed.
-    pub device_type: Option<String>,
-    /// Estimated seconds remaining. Replicant Space 2.3.3 emits whole seconds;
-    /// `f64` is retained for source compatibility and accepts integer JSON.
-    pub eta_seconds: Option<f64>,
-    /// Completion percentage.
-    pub progress_percent: Option<f64>,
-    /// When the current print started, RFC3339.
-    pub started_at: Option<String>,
-    /// Tags to apply to the printed device.
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
 /// A device's in-progress prospecting scan.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -206,51 +161,6 @@ pub struct ScanInfo {
     pub started_at: Option<String>,
     /// Scan target designation.
     pub target: Option<String>,
-}
-
-/// A device's in-progress travel.
-#[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct TravelInfo {
-    /// When this leg arrives, RFC3339.
-    pub arrives_at: Option<String>,
-    /// When travel departed, RFC3339.
-    pub departed_at: Option<String>,
-    /// This leg's destination.
-    pub destination: Option<String>,
-    /// Distance of this leg, in AU.
-    pub distance_au: Option<f64>,
-    /// Distance of this leg, in light-years.
-    pub distance_ly: Option<f64>,
-    /// Estimated seconds remaining for this leg. Replicant Space 2.3.3 emits
-    /// whole seconds; `f64` is retained for source compatibility.
-    pub eta_seconds: Option<f64>,
-    /// When the final destination is reached, RFC3339.
-    pub final_arrives_at: Option<String>,
-    /// The overall route's final destination.
-    pub final_destination: Option<String>,
-    /// Human-readable final destination name.
-    pub final_destination_name: Option<String>,
-    /// This leg's origin.
-    pub origin: Option<String>,
-    /// Completion percentage of this leg.
-    pub progress_percent: Option<f64>,
-    /// Remaining route legs, open-shaped.
-    #[serde(default)]
-    pub route: Vec<JsonObject>,
-    /// Estimated seconds remaining for the whole route. Replicant Space 2.3.3
-    /// emits whole seconds; `f64` is retained for source compatibility.
-    pub route_eta_seconds: Option<f64>,
-    /// Completion percentage of the whole route.
-    pub route_progress_percent: Option<f64>,
-    /// Current travel stage.
-    pub stage: Option<String>,
-    /// Total route distance, in light-years.
-    pub total_distance_ly: Option<f64>,
-    /// Total route time, in seconds.
-    pub total_time_seconds: Option<f64>,
-    /// Travel type, e.g. `"direct"`, `"relay"`.
-    pub r#type: Option<String>,
 }
 
 /// Full status of a single device.

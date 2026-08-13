@@ -44,18 +44,68 @@ open_value!(DeviceStatus { Active => "active", Deactivated => "deactivated", Idl
 // the survey/transport/fleet siblings follow the same `ami_<kind>_controller`
 // naming convention documented in `reference/replicant-space/ami/index.md`.
 open_value!(DeviceType {
-    MiningDrone => "mining_drone",
     MiningController => "ami_mining_controller",
     SurveyController => "ami_survey_controller",
+    TradeController => "ami_trade_controller",
     TransportController => "ami_transport_controller",
+    AtmoProcessor => "atmo_processor",
+    Autofactory => "autofactory",
+    CargoFreighter => "cargo_freighter",
+    CargoLifter => "cargo_lifter",
+    CargoVessel => "cargo_vessel",
+    CasimirArray => "casimir_array",
+    CommSatellite => "comm_satellite",
+    ComputeCore => "compute_core",
+    DefenceGrid => "defence_grid",
+    ElectrodynamicTether => "electrodynamic_tether",
+    EmptyReplicantMatrix => "empty_replicant_matrix",
+    ExoticMatterInjector => "exotic_matter_injector",
+    ExoticParticleTrap => "exotic_particle_trap",
+    FiltrationArray => "filtration_array",
+    FleetTender => "fleet_tender",
+    FtlBeacon => "ftl_beacon",
+    FtlRelay => "ftl_relay",
+    FusionBarge => "fusion_barge",
+    GalacticObservatory => "galactic_observatory",
+    GravityLens => "gravity_lens",
+    HabModule => "hab_module",
+    HeavenVessel => "heaven_vessel",
+    HullPlate => "hull_plate",
+    HydroponicBay => "hydroponic_bay",
+    MaintenanceDrone => "maintenance_drone",
+    MassDriver => "mass_driver",
+    MatrixContainer => "matrix_container",
+    MeshRelay => "mesh_relay",
+    MiningDrone => "mining_drone",
+    MobileFleet => "mobile_fleet",
+    NegativeEnergyConduit => "negative_energy_conduit",
+    NutrientSynthesizer => "nutrient_synthesizer",
+    OrbitalDefencePlatform => "orbital_defence_platform",
+    OrbitalFarm => "orbital_farm",
+    PointDefenceArray => "point_defence_array",
+    PowerCellArray => "power_cell_array",
+    Propulsor => "propulsor",
+    RacingVessel => "racing_vessel",
+    RadiationShroud => "radiation_shroud",
+    SeismicMonitor => "seismic_monitor",
+    SensorArray => "sensor_array",
+    ShieldGenerator => "shield_generator",
+    SignalBooster => "signal_booster",
+    SolarCollector => "solar_collector",
+    StructuralFabricator => "structural_fabricator",
+    SurgeCarrier => "surge_carrier",
+    SurgePlate => "surge_plate",
+    SurgePlatform => "surge_platform",
+    SurveyDrone => "survey_drone",
+    SystemHub => "system_hub",
+    ThermalLance => "thermal_lance",
+    TidalCompensator => "tidal_compensator",
+    TransportDrone => "transport_drone",
+    TransportHauler => "transport_hauler",
     FleetController => "ami_fleet_controller",
     ReplicantInterface => "replicant_interface",
-    FtlRelay => "ftl_relay",
     FtlSlingshot => "ftl_slingshot",
     SystemWard => "system_ward",
-    GalacticObservatory => "galactic_observatory",
-    EmptyReplicantMatrix => "empty_replicant_matrix",
-    HeavenVessel => "heaven_vessel"
 });
 // Directive wire values from `reference/replicant-space/ami/*-controller/index.md`.
 open_value!(DeviceDirective {
@@ -110,3 +160,25 @@ impl LifeStage {
 }
 open_value!(TradeStatus { Open => "open", Completed => "completed", Cancelled => "cancelled" });
 open_value!(EventCategory { Account => "account", Device => "device", Replicant => "replicant" });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_blueprint_device_type_is_known() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../blueprints.json")).expect("blueprints JSON");
+        for blueprint in document["blueprints"].as_array().expect("blueprints array") {
+            let wire = blueprint["device_type"]
+                .as_str()
+                .expect("blueprint device_type");
+            let device_type = DeviceType::from(wire);
+            assert!(
+                !matches!(device_type, DeviceType::Unknown(_)),
+                "unknown blueprint device type: {wire}"
+            );
+            assert_eq!(device_type.as_str(), wire);
+        }
+    }
+}
