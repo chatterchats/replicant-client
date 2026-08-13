@@ -16,7 +16,8 @@ use crate::{
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/0002_activity.sql");
 const RESOURCE_CLAIMS_SCHEMA: &str = include_str!("../migrations/0003_resource_claims.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 3;
+const WAIT_INTENT_SCHEMA: &str = include_str!("../migrations/0004_wait_intent.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 4;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +167,13 @@ impl WorkflowRepository {
             transaction.execute_batch(RESOURCE_CLAIMS_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (3)",
+                [],
+            )?;
+        }
+        if found < 4 {
+            transaction.execute_batch(WAIT_INTENT_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (4)",
                 [],
             )?;
         }
@@ -400,11 +408,22 @@ impl WorkflowRepository {
         expected_revision: u64,
         state: WorkflowState<P, R>,
     ) -> Result<WorkflowInstance, RepositoryError> {
+        self.update_with_wait(id, expected_revision, state, None)
+    }
+
+    pub(crate) fn update_with_wait<P: Serialize, R: Serialize>(
+        &self,
+        id: WorkflowId,
+        expected_revision: u64,
+        state: WorkflowState<P, R>,
+        wait_intent: Option<&crate::WaitIntent>,
+    ) -> Result<WorkflowInstance, RepositoryError> {
         let checkpoint_json = serde_json::to_string(&state.checkpoint)?;
         let result_json = state
             .result
             .map(|result| serde_json::to_string(&result))
             .transpose()?;
+        let wait_intent_json = wait_intent.map(serde_json::to_string).transpose()?;
         let expected_revision = i64::try_from(expected_revision)
             .map_err(|_| RepositoryError::RevisionOutOfRange(expected_revision))?;
         let now = now_millis()?;
@@ -427,7 +446,7 @@ impl WorkflowRepository {
             "UPDATE workflow_instances SET
                 status = ?1, current_step = ?2, checkpoint_json = ?3,
                 last_error = ?4, result_json = ?5, updated_at = ?6,
-                revision = revision + 1
+                revision = revision + 1, wait_intent_json = ?9
              WHERE id = ?7 AND revision = ?8",
             params![
                 state.status.as_str(),
@@ -438,6 +457,7 @@ impl WorkflowRepository {
                 now,
                 id.to_string(),
                 expected_revision,
+                wait_intent_json,
             ],
         )?;
         let updated = read_in(&transaction, id)?.ok_or(RepositoryError::NotFound(id))?;
@@ -448,7 +468,7 @@ impl WorkflowRepository {
 
 const COLUMNS: &str = "id, kind, schema_version, config_json, checkpoint_json, status, \
                        current_step, created_at, updated_at, last_error, result_json, \
-                       parent_id, revision";
+                       parent_id, revision, wait_intent_json";
 
 fn read_in(
     connection: &Connection,
@@ -486,6 +506,7 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> Result<WorkflowInstance, rusqlite
         revision: u64::try_from(revision).map_err(|_| {
             to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
         })?,
+        wait_intent_json: row.get(13)?,
     })
 }
 

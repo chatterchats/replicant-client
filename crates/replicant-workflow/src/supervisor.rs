@@ -1,12 +1,20 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use replicant_client::managed::Client;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    ClaimAcquireOutcome, RepositoryError, ResourceClaim, ResourceKey, WorkflowId, WorkflowInstance,
-    WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus,
+    ClaimAcquireOutcome, RepositoryError, ResourceClaim, ResourceKey, WaitIntent, WaitOutcome,
+    WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository, WorkflowState,
+    WorkflowStatus,
 };
 
 /// Boxed future returned by a workflow executor.
@@ -33,13 +41,22 @@ pub enum ControlRequest {
 pub struct WorkflowContext {
     repository: Arc<WorkflowRepository>,
     instance: WorkflowInstance,
+    client: Option<Client>,
+    control: watch::Receiver<ControlRequest>,
 }
 
 impl WorkflowContext {
-    fn new(repository: Arc<WorkflowRepository>, instance: WorkflowInstance) -> Self {
+    fn new(
+        repository: Arc<WorkflowRepository>,
+        instance: WorkflowInstance,
+        client: Option<Client>,
+        control: watch::Receiver<ControlRequest>,
+    ) -> Self {
         Self {
             repository,
             instance,
+            client,
+            control,
         }
     }
 
@@ -123,6 +140,125 @@ impl WorkflowContext {
             self.instance.current_step.clone(),
             self.checkpoint_value()?,
             None,
+        )
+    }
+
+    /// Waits for SSE-backed event or managed-state revision signals, then
+    /// verifies `predicate` against managed durable state.
+    pub async fn wait_until<F>(
+        &mut self,
+        intent: WaitIntent,
+        mut predicate: F,
+    ) -> Result<WaitOutcome, WorkflowWaitError>
+    where
+        F: FnMut(&Client) -> Result<bool, String>,
+    {
+        let client = self
+            .client
+            .clone()
+            .ok_or(WorkflowWaitError::NoManagedClient)?;
+        let mut intent = self.instance.wait_intent()?.unwrap_or(intent);
+        if intent.cursor.is_none() {
+            intent.cursor = client.events().cursor()?;
+        }
+        self.persist_wait(&intent)?;
+        let mut events = client.events().watch().await?;
+        let mut revisions = client.state().watch()?;
+
+        loop {
+            if predicate(&client).map_err(WorkflowWaitError::Predicate)? {
+                self.clear_wait()?;
+                return Ok(WaitOutcome::Satisfied);
+            }
+            if self.recover_history(&client, &mut intent).await?
+                && predicate(&client).map_err(WorkflowWaitError::Predicate)?
+            {
+                self.clear_wait()?;
+                return Ok(WaitOutcome::Satisfied);
+            }
+            let deadline = deadline_delay(intent.deadline_millis)?;
+            tokio::select! {
+                control = self.control.changed() => {
+                    if control.is_err() {
+                        return Err(WorkflowWaitError::ControlClosed);
+                    }
+                    match *self.control.borrow_and_update() {
+                        ControlRequest::Continue => {}
+                        ControlRequest::Pause => return Ok(WaitOutcome::Paused),
+                        ControlRequest::Cancel => return Ok(WaitOutcome::Cancelled),
+                    }
+                }
+                _ = tokio::time::sleep(deadline) => {
+                    self.clear_wait()?;
+                    return Ok(WaitOutcome::Deadline);
+                }
+                revision = revisions.next() => {
+                    revision?;
+                }
+                event = events.next() => {
+                    match event {
+                        Ok(event) => {
+                            intent.cursor = Some(event.id.to_string());
+                            self.persist_wait(&intent)?;
+                        }
+                        Err(replicant_client::Error::Transport { message, .. })
+                            if message.contains("lagged") => {
+                            // A bounded local watcher can lag. Durable history and
+                            // state verification below recover without trusting it.
+                            self.recover_history(&client, &mut intent).await?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recover_history(
+        &mut self,
+        client: &Client,
+        intent: &mut WaitIntent,
+    ) -> Result<bool, WorkflowWaitError> {
+        let mut query = client.events().history();
+        if let Some(cursor) = &intent.cursor {
+            query = query.after(cursor.clone());
+        }
+        if let Some(name) = &intent.event_name {
+            query = query.named(name.clone());
+        }
+        if let Some(device) = &intent.device_code {
+            query = query.for_device(device.clone());
+        }
+        let events = query.collect().await?;
+        if let Some(event) = events.last() {
+            intent.cursor = Some(event.id.to_string());
+            self.persist_wait(intent)?;
+        }
+        Ok(!events.is_empty())
+    }
+
+    fn persist_wait(&mut self, intent: &WaitIntent) -> Result<(), RepositoryError> {
+        self.instance = self.repository.update_with_wait(
+            self.instance.id,
+            self.instance.revision,
+            WorkflowState {
+                status: WorkflowStatus::Waiting,
+                current_step: self.instance.current_step.clone(),
+                checkpoint: self.checkpoint_value()?,
+                last_error: None,
+                result: self.result_value()?,
+            },
+            Some(intent),
+        )?;
+        Ok(())
+    }
+
+    fn clear_wait(&mut self) -> Result<(), RepositoryError> {
+        self.replace(
+            WorkflowStatus::Running,
+            self.instance.current_step.clone(),
+            self.checkpoint_value()?,
+            self.result_value()?,
         )
     }
 
@@ -212,11 +348,36 @@ pub enum SupervisorError {
     Repository(#[from] RepositoryError),
 }
 
+/// Failures while awaiting managed state.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkflowWaitError {
+    /// Workflow persistence failed.
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    /// Managed client state or event observation failed.
+    #[error(transparent)]
+    Managed(#[from] replicant_client::Error),
+    /// The workflow supervisor was created without a managed client.
+    #[error("workflow wait requires a managed client")]
+    NoManagedClient,
+    /// The state predicate could not be evaluated.
+    #[error("managed state predicate failed: {0}")]
+    Predicate(String),
+    /// The supervisor control channel closed unexpectedly.
+    #[error("workflow control channel closed")]
+    ControlClosed,
+    /// The system clock cannot produce a Unix timestamp.
+    #[error("system clock is before the Unix epoch")]
+    Clock,
+}
+
 /// Owns at most one in-process executor for each persisted workflow.
 pub struct WorkflowSupervisor {
     repository: Arc<WorkflowRepository>,
     registry: Arc<WorkflowRegistry>,
     tasks: HashMap<WorkflowId, JoinHandle<()>>,
+    controls: HashMap<WorkflowId, watch::Sender<ControlRequest>>,
+    client: Option<Client>,
     claims_reconciled: bool,
 }
 
@@ -228,8 +389,22 @@ impl WorkflowSupervisor {
             repository,
             registry,
             tasks: HashMap::new(),
+            controls: HashMap::new(),
+            client: None,
             claims_reconciled: false,
         }
+    }
+
+    /// Creates a supervisor integrated with the daemon's one managed client.
+    #[must_use]
+    pub fn with_managed_client(
+        repository: Arc<WorkflowRepository>,
+        registry: Arc<WorkflowRegistry>,
+        client: Client,
+    ) -> Self {
+        let mut supervisor = Self::new(repository, registry);
+        supervisor.client = Some(client);
+        supervisor
     }
 
     /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
@@ -243,7 +418,10 @@ impl WorkflowSupervisor {
             if self.tasks.contains_key(&instance.id) {
                 continue;
             }
-            let instance = if instance.status == WorkflowStatus::Running {
+            let instance = if matches!(
+                instance.status,
+                WorkflowStatus::Running | WorkflowStatus::Waiting
+            ) {
                 self.transition(instance, WorkflowStatus::Reconciling)?
             } else {
                 instance
@@ -262,6 +440,9 @@ impl WorkflowSupervisor {
     pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
         self.transition(instance, WorkflowStatus::Paused)?;
+        if let Some(control) = self.controls.get(&id) {
+            control.send_replace(ControlRequest::Pause);
+        }
         Ok(())
     }
 
@@ -279,6 +460,9 @@ impl WorkflowSupervisor {
     pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
         self.transition(instance, WorkflowStatus::Cancelled)?;
+        if let Some(control) = self.controls.get(&id) {
+            control.send_replace(ControlRequest::Cancel);
+        }
         if !self.tasks.contains_key(&id) {
             self.repository.release_claims(id)?;
         }
@@ -302,7 +486,8 @@ impl WorkflowSupervisor {
         instance: WorkflowInstance,
         status: WorkflowStatus,
     ) -> Result<WorkflowInstance, RepositoryError> {
-        self.repository.update(
+        let wait_intent = instance.wait_intent()?;
+        self.repository.update_with_wait(
             instance.id,
             instance.revision,
             WorkflowState {
@@ -312,6 +497,7 @@ impl WorkflowSupervisor {
                 last_error: instance.last_error.clone(),
                 result: instance.result::<Value>()?,
             },
+            wait_intent.as_ref(),
         )
     }
 
@@ -324,20 +510,34 @@ impl WorkflowSupervisor {
         {
             Ok(Some(executor)) => executor,
             Ok(None) => {
-                let mut context = WorkflowContext::new(self.repository.clone(), instance);
+                let (_, control) = watch::channel(ControlRequest::Continue);
+                let mut context = WorkflowContext::new(
+                    self.repository.clone(),
+                    instance,
+                    self.client.clone(),
+                    control,
+                );
                 context.mark_failed("workflow kind has no executor")?;
                 return Ok(());
             }
             Err(error) => {
-                let mut context = WorkflowContext::new(self.repository.clone(), instance);
+                let (_, control) = watch::channel(ControlRequest::Continue);
+                let mut context = WorkflowContext::new(
+                    self.repository.clone(),
+                    instance,
+                    self.client.clone(),
+                    control,
+                );
                 context.mark_failed(error.to_string())?;
                 return Ok(());
             }
         };
         let id = instance.id;
         let repository = self.repository.clone();
+        let client = self.client.clone();
+        let (control_sender, control) = watch::channel(ControlRequest::Continue);
         let task = tokio::spawn(async move {
-            let mut context = WorkflowContext::new(repository, instance);
+            let mut context = WorkflowContext::new(repository, instance, client, control);
             if let Err(error) = executor.execute(&mut context).await {
                 if let Err(record_error) = context.mark_failed(error) {
                     tracing::error!(workflow_id = %id, error = %record_error, "failed to record workflow executor error");
@@ -347,6 +547,7 @@ impl WorkflowSupervisor {
             }
         });
         self.tasks.insert(id, task);
+        self.controls.insert(id, control_sender);
         Ok(())
     }
 
@@ -358,13 +559,20 @@ impl WorkflowSupervisor {
             .collect();
         for id in finished {
             let task = self.tasks.remove(&id).expect("finished task exists");
+            self.controls.remove(&id);
             if let Err(error) = task.await {
                 let instance = self.read(id)?;
                 if !matches!(
                     instance.status,
                     WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
                 ) {
-                    let mut context = WorkflowContext::new(self.repository.clone(), instance);
+                    let (_, control) = watch::channel(ControlRequest::Continue);
+                    let mut context = WorkflowContext::new(
+                        self.repository.clone(),
+                        instance,
+                        self.client.clone(),
+                        control,
+                    );
                     context.mark_failed(format!("workflow executor task failed: {error}"))?;
                 }
             }
@@ -374,6 +582,19 @@ impl WorkflowSupervisor {
         }
         Ok(())
     }
+}
+
+fn deadline_delay(deadline: Option<i64>) -> Result<Duration, WorkflowWaitError> {
+    let Some(deadline) = deadline else {
+        return Ok(Duration::MAX);
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| WorkflowWaitError::Clock)?
+        .as_millis();
+    Ok(Duration::from_millis(
+        u64::try_from(i128::from(deadline) - i128::try_from(now).unwrap_or(i128::MAX)).unwrap_or(0),
+    ))
 }
 
 impl Drop for WorkflowSupervisor {

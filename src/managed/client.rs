@@ -909,6 +909,12 @@ impl Client {
         super::events::EventsGateway::new(self.clone())
     }
 
+    /// Local managed-state revision observation for application-level waits.
+    #[must_use]
+    pub fn state(&self) -> super::state::StateGateway {
+        super::state::StateGateway::new(self.clone())
+    }
+
     /// Durable operations previously created through this client, most
     /// useful for recovering unresolved operations after a restart.
     #[must_use]

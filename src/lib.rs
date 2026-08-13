@@ -105,6 +105,7 @@ pub mod managed {
         Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
+    pub use state::{StateGateway, StateRevisionWatch};
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind,
         SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
@@ -126,10 +127,11 @@ pub use managed::{
     Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
     ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
     ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
-    SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
-    SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
-    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
-    TravelPreview, TravelVia, TutorialsGateway,
+    StateGateway, StateRevisionWatch, SurveyController, SurveyDirective, SyncCancellation,
+    SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,
+    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
+    TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
+    TutorialsGateway,
 };
 
 #[cfg(feature = "raw")]

@@ -1285,6 +1285,7 @@ dependencies = [
 name = "replicant-workflow"
 version = "0.1.0"
 dependencies = [
+ "replicant-client",
  "rusqlite",
  "serde",
  "serde_json",

@@ -6,9 +6,9 @@ use std::sync::{
 };
 
 use replicant_workflow::{
-    BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WorkflowContext, WorkflowExecutor,
-    WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry, WorkflowRepository,
-    WorkflowStatus, WorkflowSupervisor,
+    BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent, WaitOutcome,
+    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry,
+    WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -287,5 +287,221 @@ async fn records_executor_panics_as_failures() {
             .last_error
             .unwrap()
             .contains("task failed")
+    );
+}
+
+struct WaitingFactory {
+    kind: WorkflowKind,
+    satisfied: Arc<std::sync::atomic::AtomicBool>,
+    deadline_millis: i64,
+}
+
+impl WorkflowFactory for WaitingFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(WaitingWorkflow {
+            satisfied: self.satisfied.clone(),
+            deadline_millis: self.deadline_millis,
+        }))
+    }
+}
+
+struct WaitingWorkflow {
+    satisfied: Arc<std::sync::atomic::AtomicBool>,
+    deadline_millis: i64,
+}
+
+impl WorkflowExecutor for WaitingWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let outcome = context
+                .wait_until(
+                    WaitIntent::state("test state is ready")
+                        .for_event("test.changed")
+                        .until(self.deadline_millis),
+                    |_| Ok(self.satisfied.load(Ordering::SeqCst)),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if matches!(outcome, WaitOutcome::Satisfied | WaitOutcome::Deadline) {
+                context
+                    .mark_succeeded(Some(outcome == WaitOutcome::Satisfied))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn managed_client() -> replicant_client::managed::Client {
+    replicant_client::managed::Client::builder()
+        .authentication_token(replicant_client::raw::SecretString::from("test".to_owned()))
+        .in_memory()
+        .startup_policy(replicant_client::managed::StartupPolicy::RestoreOnly)
+        .start()
+        .await
+        .expect("start managed client")
+}
+
+fn waiting_setup(
+    repository: Arc<WorkflowRepository>,
+    client: replicant_client::managed::Client,
+    satisfied: Arc<std::sync::atomic::AtomicBool>,
+    deadline_millis: i64,
+) -> (WorkflowId, Arc<WorkflowRegistry>, WorkflowSupervisor) {
+    let kind = WorkflowKind::new("test.wait").expect("valid kind");
+    let id = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: (),
+            checkpoint: (),
+            current_step: Some("wait".into()),
+            parent_id: None,
+        })
+        .expect("create workflow")
+        .id;
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(WaitingFactory {
+            kind,
+            satisfied,
+            deadline_millis,
+        }))
+        .expect("register workflow");
+    let registry = Arc::new(registry);
+    let supervisor = WorkflowSupervisor::with_managed_client(repository, registry.clone(), client);
+    (id, registry, supervisor)
+}
+
+fn unix_millis() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_millis(),
+    )
+    .expect("timestamp fits")
+}
+
+#[tokio::test]
+async fn wait_persists_intent_and_wakes_on_pause() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let (id, _, mut supervisor) = waiting_setup(
+        repository.clone(),
+        managed_client().await,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        unix_millis() + 60_000,
+    );
+    supervisor.tick().await.expect("start workflow");
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+    assert_eq!(
+        repository
+            .read(id)
+            .expect("read workflow")
+            .unwrap()
+            .wait_intent()
+            .expect("decode wait")
+            .unwrap()
+            .event_name
+            .as_deref(),
+        Some("test.changed")
+    );
+
+    supervisor.pause(id).expect("pause wait");
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Paused).await;
+    while supervisor.has_executor(id) {
+        tokio::task::yield_now().await;
+        supervisor.tick().await.expect("reap paused wait");
+    }
+}
+
+#[tokio::test]
+async fn wait_wakes_on_cancel() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let (id, _, mut supervisor) = waiting_setup(
+        repository.clone(),
+        managed_client().await,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        unix_millis() + 60_000,
+    );
+    supervisor.tick().await.expect("start workflow");
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+    supervisor.cancel(id).expect("cancel wait");
+    while supervisor.has_executor(id) {
+        tokio::task::yield_now().await;
+        supervisor.tick().await.expect("reap cancelled wait");
+    }
+    assert_eq!(
+        repository.read(id).expect("read workflow").unwrap().status,
+        WorkflowStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn restart_reconciles_wait_and_rechecks_managed_state() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-wait-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
+    let satisfied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client = managed_client().await;
+    let (id, registry, mut supervisor) = waiting_setup(
+        repository.clone(),
+        client.clone(),
+        satisfied.clone(),
+        unix_millis() + 60_000,
+    );
+    supervisor.tick().await.expect("start workflow");
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+    drop(supervisor);
+    drop(repository);
+    tokio::task::yield_now().await;
+
+    satisfied.store(true, Ordering::SeqCst);
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+    let mut supervisor =
+        WorkflowSupervisor::with_managed_client(repository.clone(), registry, client);
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    assert_eq!(
+        repository
+            .read(id)
+            .expect("read workflow")
+            .unwrap()
+            .result::<bool>()
+            .expect("decode result"),
+        Some(true)
+    );
+    drop(supervisor);
+    drop(repository);
+    std::fs::remove_file(path).expect("remove test database");
+}
+
+#[tokio::test]
+async fn wait_wakes_at_persisted_deadline() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let (id, _, mut supervisor) = waiting_setup(
+        repository.clone(),
+        managed_client().await,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        unix_millis(),
+    );
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    assert_eq!(
+        repository
+            .read(id)
+            .expect("read workflow")
+            .unwrap()
+            .result::<bool>()
+            .expect("decode result"),
+        Some(false)
     );
 }

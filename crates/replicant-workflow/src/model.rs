@@ -93,6 +93,69 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+/// Durable description of why a workflow is waiting.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WaitIntent {
+    /// Human-readable, non-secret condition description.
+    pub description: String,
+    /// Optional exact managed event name used as wake-up evidence.
+    pub event_name: Option<String>,
+    /// Optional device code narrowing event evidence.
+    pub device_code: Option<String>,
+    /// Durable managed event cursor from which recovery should continue.
+    pub cursor: Option<String>,
+    /// Optional absolute Unix deadline in milliseconds.
+    pub deadline_millis: Option<i64>,
+}
+
+impl WaitIntent {
+    /// Creates a managed-state predicate wait.
+    #[must_use]
+    pub fn state(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            event_name: None,
+            device_code: None,
+            cursor: None,
+            deadline_millis: None,
+        }
+    }
+
+    /// Adds exact managed event evidence to a state-verified wait.
+    #[must_use]
+    pub fn for_event(mut self, event_name: impl Into<String>) -> Self {
+        self.event_name = Some(event_name.into());
+        self
+    }
+
+    /// Narrows event evidence to one device code.
+    #[must_use]
+    pub fn for_device(mut self, device_code: impl Into<String>) -> Self {
+        self.device_code = Some(device_code.into());
+        self
+    }
+
+    /// Adds an absolute Unix deadline in milliseconds.
+    #[must_use]
+    pub fn until(mut self, deadline_millis: i64) -> Self {
+        self.deadline_millis = Some(deadline_millis);
+        self
+    }
+}
+
+/// Result of a cooperative workflow wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitOutcome {
+    /// Durable managed state verifies the requested predicate.
+    Satisfied,
+    /// The persisted deadline elapsed first.
+    Deadline,
+    /// A cooperative pause was requested.
+    Paused,
+    /// A cooperative cancellation was requested.
+    Cancelled,
+}
+
 impl WorkflowStatus {
     /// Returns whether this workflow can no longer execute.
     #[must_use]
@@ -289,6 +352,7 @@ pub struct WorkflowInstance {
     pub(crate) config_json: String,
     pub(crate) checkpoint_json: String,
     pub(crate) result_json: Option<String>,
+    pub(crate) wait_intent_json: Option<String>,
 }
 
 impl WorkflowInstance {
@@ -305,6 +369,15 @@ impl WorkflowInstance {
     /// Decodes typed result metadata when present.
     pub fn result<R: DeserializeOwned>(&self) -> Result<Option<R>, RepositoryError> {
         self.result_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Decodes the durable wait intent when present.
+    pub fn wait_intent(&self) -> Result<Option<WaitIntent>, RepositoryError> {
+        self.wait_intent_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()

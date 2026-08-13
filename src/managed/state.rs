@@ -18,6 +18,48 @@ use crate::domain::{
 
 use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
 
+/// Local-only managed-state revision gateway.
+#[derive(Clone, Debug)]
+pub struct StateGateway {
+    client: super::Client,
+}
+
+impl StateGateway {
+    pub(crate) fn new(client: super::Client) -> Self {
+        Self { client }
+    }
+
+    /// Returns the current revision of durably committed managed state.
+    pub fn revision(&self) -> crate::Result<u64> {
+        self.client.ensure_open()?;
+        Ok(self.client.managed_state().snapshot().revision())
+    }
+
+    /// Watches coalesced local revisions. This never performs network I/O.
+    pub fn watch(&self) -> crate::Result<StateRevisionWatch> {
+        self.client.ensure_open()?;
+        Ok(StateRevisionWatch {
+            receiver: self.client.managed_state().subscribe(),
+        })
+    }
+}
+
+/// Coalescing local managed-state revision subscription.
+pub struct StateRevisionWatch {
+    receiver: watch::Receiver<Arc<StateSnapshot>>,
+}
+
+impl StateRevisionWatch {
+    /// Waits for the next committed semantic state revision.
+    pub async fn next(&mut self) -> crate::Result<u64> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| crate::Error::Closed)?;
+        Ok(self.receiver.borrow_and_update().revision())
+    }
+}
+
 fn same_projected_observation<T: PartialEq>(
     existing: &Observation<T>,
     incoming: &Observation<T>,
