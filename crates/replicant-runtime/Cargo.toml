@@ -10,8 +10,10 @@ license = "MIT"
 [dependencies]
 futures = "0.3"
 replicant-client = { version = "1.0.0", path = "../.." }
+replicant-mining-planner = { version = "0.1.0", path = "../replicant-mining-planner" }
 replicant-printing = { version = "0.1.0", path = "../replicant-printing", features = ["managed"] }
 replicant-route-planner = { version = "0.1.0", path = "../replicant-route-planner" }
+replicant-transport = { version = "0.1.0", path = "../replicant-transport" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["time"] }

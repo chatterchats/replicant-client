@@ -31,6 +31,9 @@ pub mod survey;
 /// Relay-network planning and restart-safe execution.
 pub mod relay;
 
+/// Mining-network expansion planning and restart-safe execution.
+pub mod mining;
+
 /// Replicant-only asteroid-belt scouting.
 pub mod belt_search;
 

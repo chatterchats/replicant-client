@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::future::join_all;
 use replicant_client::{
     Client, MiningDirective, OperationId, OperationStatus, SurveyDirective, TransportDirective,
     domain::Device, managed::Operation, raw as api_raw,
@@ -15,6 +16,7 @@ use replicant_mining_planner::{
 };
 use replicant_printing::managed::{enqueue_print, factory_queue_slots};
 use replicant_printing::schedule_prints;
+use replicant_transport::{DeliveryOptions, PayloadDevice, deliver_devices_with};
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::info;
@@ -35,10 +37,6 @@ pub(crate) async fn execute(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     if mission.phase.is_terminal() {
-        println!(
-            "Mining mission {} is already {:?}.",
-            mission.mission_id, mission.phase
-        );
         return Ok(());
     }
 
@@ -71,12 +69,6 @@ pub(crate) async fn execute(
         MissionPhase::CompletedWithWarnings
     };
     save_plan(&config.plan_path, mission)?;
-    println!(
-        "Mining mission {} completed: {} sites operational and {} ferry routes active.",
-        mission.mission_id,
-        mission.sites.len(),
-        mission.routes.len()
-    );
     Ok(())
 }
 
@@ -100,7 +92,7 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
         phase = ?phase,
         "mining mission phase"
     );
-    mission.phase = phase;
+    mission.phase = mission.phase.advance_to(phase);
     save_plan(&config.plan_path, mission)
 }
 
@@ -704,7 +696,6 @@ async fn progress_site_pipeline(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     let allocated = allocate_available_site_assets(client, config, mission).await?;
-    finish_arrived_sites(client, config, mission).await?;
     reconcile_carrier_claims(client, mission).await?;
     dispatch_ready_sites(client, config, mission).await?;
     if allocated > 0 {
@@ -806,20 +797,10 @@ fn reusable_pool(
     used: &BTreeSet<String>,
 ) -> BTreeMap<String, Vec<String>> {
     let mut pool = BTreeMap::<String, Vec<String>>::new();
-    for device in devices.iter().filter(|device| {
-        let mission_output = device.tags.iter().any(|tag| tag == mission_tag);
-        device_location(device) == Some(hub)
-            && device
-                .status
-                .as_ref()
-                .is_some_and(|status| status.as_str() == "idle")
-            && device.relationships.controller.is_none()
-            && device.relationships.attached_to.is_none()
-            && device.relationships.stowed_in.is_none()
-            && device.travel.is_none()
-            && (mission_output || !has_reservation_tag(device))
-            && !used.contains(device.key.id.as_str())
-    }) {
+    for device in devices
+        .iter()
+        .filter(|device| is_reusable_device(device, hub, mission_tag, used))
+    {
         if let Some(device_type) = &device.device_type {
             pool.entry(device_type.as_str().to_owned())
                 .or_default()
@@ -831,6 +812,26 @@ fn reusable_pool(
         codes.reverse();
     }
     pool
+}
+
+fn is_reusable_device(
+    device: &Device,
+    hub: &str,
+    mission_tag: &str,
+    used: &BTreeSet<String>,
+) -> bool {
+    let mission_output = device.tags.iter().any(|tag| tag == mission_tag);
+    device_location(device) == Some(hub)
+        && device
+            .status
+            .as_ref()
+            .is_some_and(|status| status.as_str() == "idle")
+        && device.relationships.controller.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.travel.is_none()
+        && (mission_output || !has_reservation_tag(device))
+        && !used.contains(device.key.id.as_str())
 }
 
 fn fill_site_asset(
@@ -933,7 +934,7 @@ async fn deploy_sites(
             return Ok(());
         }
 
-        finish_arrived_sites(client, config, mission).await?;
+        resume_site_configuration(client, config, mission).await?;
         dispatch_ready_sites(client, config, mission).await?;
         if mission
             .sites
@@ -1009,22 +1010,27 @@ async fn dispatch_ready_sites(
         })
         .take(available_slots)
         .collect::<Vec<_>>();
+    let mut deliveries = Vec::new();
     for index in ready {
         let payload = mission.sites[index]
             .assets
             .codes()
             .into_iter()
-            .filter(|code| {
-                find_device(&devices, code).is_some_and(|device| {
-                    device_location(device) == Some(mission.hub_location.as_str())
+            .filter_map(|code| {
+                let device = find_device(&devices, &code)?;
+                (device_location(device) == Some(mission.hub_location.as_str())).then(|| {
+                    PayloadDevice {
+                        code,
+                        device_type: device_type(device).unwrap_or_default().to_owned(),
+                        origin: mission.hub_location.clone(),
+                    }
                 })
             })
             .collect::<Vec<_>>();
         if payload.is_empty() {
-            mission.sites[index].phase = SitePhase::Configuring;
-            configure_site(client, &mission.sites[index]).await?;
-            mission.sites[index].phase = SitePhase::Operational;
+            mission.sites[index].phase = SitePhase::Deploying;
             save_plan(&config.plan_path, mission)?;
+            configure_site(client, config, mission, index).await?;
             continue;
         }
         let Some(carrier) = carriers.pop() else {
@@ -1045,105 +1051,72 @@ async fn dispatch_ready_sites(
             &mission.selected_replicant,
         )
         .await?;
-        attach_devices(client, &carrier, &payload).await?;
-        start_travel(client, &carrier, &mission.sites[index].belt).await?;
+        deliveries.push((index, carrier, payload, mission.sites[index].belt.clone()));
+    }
+    let results = join_all(deliveries.iter().map(|(_, carrier, payload, belt)| {
+        deliver_devices_with(
+            client,
+            belt,
+            payload,
+            std::slice::from_ref(carrier),
+            DeliveryOptions {
+                wait_timeout: config.wait_timeout,
+                poll_interval: POLL_INTERVAL,
+                unfurl_modular_payload: false,
+                return_transports: true,
+            },
+        )
+    }))
+    .await;
+    for ((index, carrier, payload, _), result) in deliveries.into_iter().zip(results) {
+        result?;
+        mission.sites[index].phase = SitePhase::Deploying;
+        save_plan(&config.plan_path, mission)?;
+        configure_site(client, config, mission, index).await?;
         info!(
             system = %mission.sites[index].system,
             carrier = %carrier,
             devices = payload.len(),
             destination = %mission.sites[index].belt,
-            "dispatched mining site concurrently"
+            "delivered and configured mining site"
         );
     }
     Ok(())
 }
 
-async fn finish_arrived_sites(
+async fn resume_site_configuration(
     client: &Client,
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
-    let candidates = mission
+    let pending = mission
         .sites
         .iter()
         .enumerate()
         .filter_map(|(index, site)| {
-            matches!(site.phase, SitePhase::Outbound | SitePhase::Configuring).then_some(index)
+            matches!(
+                site.phase,
+                SitePhase::Deploying
+                    | SitePhase::Adopting
+                    | SitePhase::Verifying
+                    | SitePhase::Configuring
+            )
+            .then_some(index)
         })
         .collect::<Vec<_>>();
-    for index in candidates {
-        let arrived = if let Some(carrier) = &mission.sites[index].carrier {
-            let snapshot = client.devices().get(carrier).await?.snapshot().await?;
-            if mission.sites[index].phase == SitePhase::Outbound
-                && snapshot.travel.is_none()
-                && device_location(&snapshot) == Some(mission.hub_location.as_str())
-            {
-                add_tags(
-                    client,
-                    carrier,
-                    &[mission.mission_tag.clone(), role_tag("carrier")],
-                )
-                .await?;
-                ensure_asset_ownership(
-                    client,
-                    std::slice::from_ref(carrier),
-                    &mission.selected_replicant,
-                )
-                .await?;
-                let attached = snapshot
-                    .relationships
-                    .attached_devices
-                    .iter()
-                    .map(|device| device.id.as_str().to_owned())
-                    .collect::<BTreeSet<_>>();
-                let devices = refresh_device_snapshots(client).await?;
-                let payload = mission.sites[index]
-                    .assets
-                    .codes()
-                    .into_iter()
-                    .filter(|code| {
-                        find_device(&devices, code).is_some_and(|device| {
-                            device_location(device) == Some(mission.hub_location.as_str())
-                                && !attached.contains(code)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                attach_devices(client, carrier, &payload).await?;
-                start_travel(client, carrier, &mission.sites[index].belt).await?;
-                false
-            } else {
-                snapshot.travel.is_none()
-                    && device_location(&snapshot) == Some(mission.sites[index].belt.as_str())
-            }
-        } else {
-            true
-        };
-        if !arrived {
-            continue;
-        }
-        mission.sites[index].phase = SitePhase::Configuring;
-        save_plan(&config.plan_path, mission)?;
-        if let Some(carrier) = mission.sites[index].carrier.clone() {
-            let snapshot = client.devices().get(&carrier).await?.snapshot().await?;
-            let attached = snapshot
-                .relationships
-                .attached_devices
-                .iter()
-                .map(|device| device.id.as_str().to_owned())
-                .collect::<Vec<_>>();
-            detach_devices(client, &carrier, &attached).await?;
-        }
-        configure_site(client, &mission.sites[index]).await?;
-        mission.sites[index].phase = SitePhase::Operational;
-        save_plan(&config.plan_path, mission)?;
-        if let Some(carrier) = mission.sites[index].carrier.clone() {
-            start_travel(client, &carrier, &mission.hub_location).await?;
-        }
+    for index in pending {
+        configure_site(client, config, mission, index).await?;
     }
     Ok(())
 }
 
-async fn configure_site(client: &Client, site: &super::SiteMission) -> AnyResult<()> {
+async fn configure_site(
+    client: &Client,
+    config: &Config,
+    mission: &mut MiningMission,
+    index: usize,
+) -> AnyResult<()> {
+    let site = &mission.sites[index];
     for code in site.assets.codes() {
         let snapshot = client.devices().get(&code).await?.snapshot().await?;
         if device_location(&snapshot) != Some(site.belt.as_str()) {
@@ -1154,11 +1127,23 @@ async fn configure_site(client: &Client, site: &super::SiteMission) -> AnyResult
         }
     }
     tag_site_assets(client, site).await?;
+    mission.sites[index].phase = SitePhase::Adopting;
+    save_plan(&config.plan_path, mission)?;
+    let site = &mission.sites[index];
     let mining_controller =
         site.assets.mining_controller.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no mining controller")
         })?;
     ensure_adoption(client, mining_controller, &site.assets.mining_drones).await?;
+    let survey_controller =
+        site.assets.survey_controller.as_deref().ok_or_else(|| {
+            app_error(io::ErrorKind::InvalidData, "site has no survey controller")
+        })?;
+    ensure_adoption(client, survey_controller, &site.assets.survey_drones).await?;
+    mission.sites[index].phase = SitePhase::Verifying;
+    save_plan(&config.plan_path, mission)?;
+    let site = &mission.sites[index];
+    let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
     let mining = client
         .devices()
         .get(mining_controller)
@@ -1180,11 +1165,7 @@ async fn configure_site(client: &Client, site: &super::SiteMission) -> AnyResult
         ensure_operation_accepted(&mining.launch().await?).await?;
     }
 
-    let survey_controller =
-        site.assets.survey_controller.as_deref().ok_or_else(|| {
-            app_error(io::ErrorKind::InvalidData, "site has no survey controller")
-        })?;
-    ensure_adoption(client, survey_controller, &site.assets.survey_drones).await?;
+    let survey_controller = site.assets.survey_controller.as_deref().unwrap_or_default();
     let survey = client
         .devices()
         .get(survey_controller)
@@ -1241,6 +1222,8 @@ async fn configure_site(client: &Client, site: &super::SiteMission) -> AnyResult
         sleep(POLL_INTERVAL).await;
     }
     info!(system = %site.system, belt = %site.belt, "mining site operational");
+    mission.sites[index].phase = SitePhase::Operational;
+    save_plan(&config.plan_path, mission)?;
     Ok(())
 }
 
@@ -1555,76 +1538,6 @@ async fn remove_tags(client: &Client, code: &str, removable: &[String]) -> AnyRe
     .await
 }
 
-async fn attach_devices(client: &Client, carrier: &str, devices: &[String]) -> AnyResult<()> {
-    if devices.is_empty() {
-        return Ok(());
-    }
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
-        .attach(targets(devices))
-        .await?;
-    ensure_operation_accepted(&operation).await?;
-    let deadline = Instant::now() + VERIFY_TIMEOUT;
-    loop {
-        let snapshot = client.devices().get(carrier).await?.snapshot().await?;
-        let attached = snapshot
-            .relationships
-            .attached_devices
-            .iter()
-            .map(|device| device.id.as_str())
-            .collect::<BTreeSet<_>>();
-        if devices
-            .iter()
-            .all(|device| attached.contains(device.as_str()))
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                format!("carrier {carrier} did not report all attached devices"),
-            ));
-        }
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
-async fn detach_devices(client: &Client, carrier: &str, devices: &[String]) -> AnyResult<()> {
-    if devices.is_empty() {
-        return Ok(());
-    }
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
-        .command(api_raw::devices::DeviceCommand::Detach(targets(devices)))
-        .await?;
-    ensure_operation_accepted(&operation).await?;
-    let deadline = Instant::now() + VERIFY_TIMEOUT;
-    loop {
-        let mut detached = true;
-        for code in devices {
-            let snapshot = client.devices().get(code).await?.snapshot().await?;
-            if snapshot.relationships.attached_to.is_some() {
-                detached = false;
-                break;
-            }
-        }
-        if detached {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(app_error(
-                io::ErrorKind::TimedOut,
-                format!("carrier {carrier} did not finish detaching its payload"),
-            ));
-        }
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
 fn targets(devices: &[String]) -> api_raw::devices::TargetsCommand {
     api_raw::devices::TargetsCommand {
         device: None,
@@ -1705,6 +1618,30 @@ fn role_for_type(device_type_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use replicant_client::domain::{
+        AccessScope, DeviceId, DeviceKey, DeviceRelationships, DeviceStatus, LocationKey,
+    };
+
+    fn device(code: &str) -> Device {
+        Device {
+            key: DeviceKey::live(DeviceId::from(code)),
+            device_type: Some(replicant_client::domain::DeviceType::from(MINING_DRONE)),
+            status: Some(DeviceStatus::from("idle")),
+            location: Some(LocationKey::live("HUB-BELT-1".into())),
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: DeviceRelationships::default(),
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            active_directive: None,
+            travel: None,
+            access: AccessScope::Owned,
+        }
+    }
 
     fn print_batch(factory: &str, tag: &str) -> ExecutionPrintBatch {
         ExecutionPrintBatch {
@@ -1845,5 +1782,44 @@ mod tests {
         assert!(!pool_can_complete_site(&pool, &assets));
         pool.insert(MAINTENANCE_DRONE.into(), vec!["md".into()]);
         assert!(pool_can_complete_site(&pool, &assets));
+    }
+
+    #[test]
+    fn reusable_device_rejects_attached_reserved_and_used_assets() {
+        let used = BTreeSet::new();
+        let plain = device("plain");
+        assert!(is_reusable_device(&plain, "HUB-BELT-1", "mission", &used));
+
+        let mut attached = device("attached");
+        attached.relationships.attached_to = Some(DeviceKey::live(DeviceId::from("carrier")));
+        assert!(!is_reusable_device(
+            &attached,
+            "HUB-BELT-1",
+            "mission",
+            &used
+        ));
+
+        let mut reserved = device("reserved");
+        reserved.tags.push("mine-m:other".into());
+        assert!(!is_reusable_device(
+            &reserved,
+            "HUB-BELT-1",
+            "mission",
+            &used
+        ));
+        reserved.tags.push("mission".into());
+        assert!(is_reusable_device(
+            &reserved,
+            "HUB-BELT-1",
+            "mission",
+            &used
+        ));
+
+        assert!(!is_reusable_device(
+            &plain,
+            "HUB-BELT-1",
+            "mission",
+            &["plain".to_owned()].into_iter().collect()
+        ));
     }
 }
