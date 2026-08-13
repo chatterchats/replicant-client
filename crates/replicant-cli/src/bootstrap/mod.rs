@@ -15,7 +15,8 @@ use model::{BootstrapMission, ChildMissions, MissionPhase, PLAN_VERSION, PrintSt
 use replicant_bootstrap_planner::{
     BootstrapProfile, ark_device_requirements, mission_tag, validate_profile,
 };
-use replicant_client::{Client, SecretString, StartupPolicy, SyncDomain};
+use replicant_client::{Client, SyncDomain};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
@@ -246,15 +247,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
             ),
         ));
     }
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     let result = match config.command {
         Command::Plan => create_plan(&client, &config).await,
         Command::Stage => {

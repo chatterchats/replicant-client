@@ -14,9 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use replicant_client::{
-    Client, Device, OperationStatus, Replicant, SecretString, Star, StartupPolicy, SyncDomain,
-};
+use replicant_client::{Client, Device, OperationStatus, Replicant, Star, SyncDomain};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::Serialize;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -194,18 +193,7 @@ Examples:\n  replicant-cli ownership reassign \\\n    --region solregion --regio
 }
 
 async fn start_client(database: &Path) -> crate::AnyResult<Client> {
-    let token = env::var("RS_API_TOKEN").map_err(|_| {
-        io::Error::new(
-            ErrorKind::NotFound,
-            "RS_API_TOKEN is required; export it before running this command",
-        )
-    })?;
-    Ok(Client::builder()
-        .authentication_token(SecretString::from(token))
-        .sqlite(database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?)
+    Ok(start_managed_client(ManagedClientConfig::from_env(database)?).await?)
 }
 
 async fn run(client: &Client, config: &Config) -> crate::AnyResult<()> {

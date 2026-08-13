@@ -85,8 +85,9 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
-    SecretString, StartupPolicy, SurveyDirective, SyncDomain, domain::GalacticPosition, raw,
+    SurveyDirective, SyncDomain, domain::GalacticPosition, raw,
 };
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
@@ -993,20 +994,12 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         "starting survey-route automation"
     );
 
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
     let _mission_lock = if config.command == Command::Run {
         Some(MissionLock::acquire(&config.plan_path)?)
     } else {
         None
     };
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
 
     let result = run(&client, &config).await;
     let close_result = client.close().await;

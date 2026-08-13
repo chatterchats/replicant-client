@@ -9,7 +9,7 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Replicant, SecretString, StartupPolicy,
+    Client, Replicant,
     domain::{Device, DeviceType, Location},
 };
 use replicant_mining_planner::{
@@ -19,6 +19,7 @@ use replicant_mining_planner::{
     site_tag,
 };
 use replicant_printing::managed::discover_factories;
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::info;
@@ -494,15 +495,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         ));
     }
 
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     let result = match config.command {
         Command::Plan => create_plan(&client, &config).await,
         Command::Run => {

@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use replicant_client::{Client, SecretString, StartupPolicy};
 use replicant_printing::{
     PrintRequest,
     managed::{
@@ -17,6 +16,7 @@ use replicant_printing::{
         printing_status_in_system, queue_prints_with_components,
     },
 };
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 const DEFAULT_HUB: &str = "SCEPTURUM-BELT-1";
@@ -292,15 +292,7 @@ from live inventory and Autofactory queues."
 pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
     init_logging(&config)?;
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     client.ready().await?;
 
     match config.command {

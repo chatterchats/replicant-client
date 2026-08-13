@@ -5,7 +5,8 @@ use std::{
     path::PathBuf,
 };
 
-use replicant_client::{Client, Replicant, SecretString, StartupPolicy, SyncDomain};
+use replicant_client::{Client, Replicant, StartupPolicy, SyncDomain};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -279,15 +280,11 @@ impl std::fmt::Display for Styled<'_> {
 
 pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error("RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::RestoreOnly)
-        .start()
-        .await?;
+    let client = start_managed_client(
+        ManagedClientConfig::from_env(&config.database)?
+            .with_startup_policy(StartupPolicy::RestoreOnly),
+    )
+    .await?;
 
     let result = run(&client, &config).await;
     let close_result = client.close().await;

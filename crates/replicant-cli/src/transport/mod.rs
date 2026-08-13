@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use replicant_client::{Client, SecretString, StartupPolicy};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use replicant_transport::{
     CarrierPreference, DeliveryOptions, DeliveryRequest, DeviceRequest, ResourceMap,
     execute_delivery, plan_delivery,
@@ -227,15 +227,7 @@ impl Config {
 pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
     init_logging(&config)?;
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     client.ready().await?;
 
     let plan_result = plan_delivery(&client, &config.request).await;

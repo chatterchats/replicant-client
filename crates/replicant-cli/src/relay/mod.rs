@@ -42,8 +42,7 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, SecretString,
-    StartupPolicy, raw,
+    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, raw,
 };
 use replicant_printing::{
     Blueprint as PrintingBlueprint, FactoryWorkload, QuantityMap,
@@ -59,6 +58,7 @@ use replicant_route_planner::{
     NetworkNode, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
     Star as PlannerStar, plan_relay_network_with_ranges,
 };
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::{Instant, sleep, timeout};
@@ -530,20 +530,12 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
             ),
         ));
     }
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
     let _mission_lock = if config.command == Command::Run {
         Some(MissionLock::acquire(&config.plan_path)?)
     } else {
         None
     };
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
 
     let result = run(&client, &config).await;
     let close_result = client.close().await;

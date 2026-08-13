@@ -9,7 +9,8 @@ use std::{
     io::{self, ErrorKind},
 };
 
-use replicant_client::{Client, Knowledge, LifeStage, Location, Realm, SecretString};
+use replicant_client::{Client, Knowledge, LifeStage, Location, Realm};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 
 const PREFERRED_DISTANCE_INNER_LY: f64 = 15.0;
 const PREFERRED_DISTANCE_OUTER_LY: f64 = 35.0;
@@ -118,20 +119,9 @@ mutations."
 
 pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
-    let token = env::var("RS_API_TOKEN").map_err(|_| {
-        io::Error::new(
-            ErrorKind::NotFound,
-            "RS_API_TOKEN is required; export it before running this command",
-        )
-    })?;
-
     eprintln!("database: {}", config.database);
 
-    let client = Client::builder()
-        .authentication_token(SecretString::from(token))
-        .sqlite(&config.database)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
 
     // This is the only remote step. Every query and score below reads the
     // committed local snapshot produced by full synchronization.

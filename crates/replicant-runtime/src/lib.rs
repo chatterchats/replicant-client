@@ -21,6 +21,19 @@ pub mod actions {}
 /// Application-level events and user-facing notifications.
 pub mod notifications {}
 
+/// Starts the managed Replicant Space client using application startup policy.
+pub async fn start_managed_client(
+    config: config::ManagedClientConfig,
+) -> replicant_client::Result<Client> {
+    let (authentication_token, database, startup_policy) = config.into_parts();
+    Client::builder()
+        .authentication_token(authentication_token)
+        .sqlite(database)
+        .startup_policy(startup_policy)
+        .start()
+        .await
+}
+
 /// Shared state owned by the application layer.
 ///
 /// [`Client`] is already a cheaply cloneable shared handle, so cloning this

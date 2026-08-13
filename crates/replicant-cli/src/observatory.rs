@@ -13,9 +13,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use replicant_client::{
-    Client, DeviceType, OperationOutcome, OperationStatus, SecretString, Star, StartupPolicy, raw,
-};
+use replicant_client::{Client, DeviceType, OperationOutcome, OperationStatus, Star, raw};
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde_json::Value;
 
 const DEFAULT_DATABASE: &str = "replicant-client.sqlite";
@@ -525,18 +524,7 @@ fn parse_vec3(value: &str) -> crate::AnyResult<Vec3> {
 }
 
 async fn start_client(database: &Path) -> crate::AnyResult<Client> {
-    let token = env::var("RS_API_TOKEN").map_err(|_| {
-        io::Error::new(
-            ErrorKind::NotFound,
-            "RS_API_TOKEN is required; export it before running this command",
-        )
-    })?;
-    Ok(Client::builder()
-        .authentication_token(SecretString::from(token))
-        .sqlite(database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?)
+    Ok(start_managed_client(ManagedClientConfig::from_env(database)?).await?)
 }
 
 async fn run_status(config: StatusConfig) -> crate::AnyResult<()> {

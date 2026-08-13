@@ -16,9 +16,10 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Operation, OperationStatus, Replicant, SecretString, Star, StartupPolicy, SyncDomain,
+    Client, Operation, OperationStatus, Replicant, Star, SyncDomain,
     domain::{GalacticPosition, Location},
 };
+use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde_json::Value;
 use tokio::time::{Instant, timeout};
 use tracing::{info, warn};
@@ -246,15 +247,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let config = Config::from_args_and_env(arguments)?;
     init_logging(&config)?;
 
-    let token = env::var("RS_API_TOKEN")
-        .map(SecretString::from)
-        .map_err(|_| app_error("RS_API_TOKEN is not set"))?;
-    let client = Client::builder()
-        .authentication_token(token)
-        .sqlite(&config.database)
-        .startup_policy(StartupPolicy::Essential)
-        .start()
-        .await?;
+    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
 
     let result = run(&client, &config).await;
     let close_result = client.close().await;

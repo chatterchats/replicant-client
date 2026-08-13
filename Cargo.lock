@@ -1179,6 +1179,7 @@ dependencies = [
  "replicant-mining-planner",
  "replicant-printing",
  "replicant-route-planner",
+ "replicant-runtime",
  "replicant-transport",
  "serde",
  "serde_json",
