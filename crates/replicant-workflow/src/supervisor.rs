@@ -5,8 +5,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::{
-    RepositoryError, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository,
-    WorkflowState, WorkflowStatus,
+    ClaimAcquireOutcome, RepositoryError, ResourceClaim, ResourceKey, WorkflowId, WorkflowInstance,
+    WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus,
 };
 
 /// Boxed future returned by a workflow executor.
@@ -93,6 +93,29 @@ impl WorkflowContext {
             .map(|_| ())
     }
 
+    /// Atomically acquires an exclusive gameplay resource for this workflow.
+    pub fn acquire_claim(
+        &self,
+        resource: ResourceKey,
+    ) -> Result<ClaimAcquireOutcome, RepositoryError> {
+        self.repository.acquire_claim(self.instance.id, resource)
+    }
+
+    /// Releases one claim only if this workflow owns it.
+    pub fn release_claim(&self, resource: &ResourceKey) -> Result<bool, RepositoryError> {
+        self.repository.release_claim(self.instance.id, resource)
+    }
+
+    /// Lists this workflow's persisted resource claims.
+    pub fn claims(&self) -> Result<Vec<ResourceClaim>, RepositoryError> {
+        self.repository.claims(self.instance.id)
+    }
+
+    /// Explicitly releases all claims at a workflow-defined safe boundary.
+    pub fn release_all_claims(&self) -> Result<usize, RepositoryError> {
+        self.repository.release_claims(self.instance.id)
+    }
+
     /// Marks this invocation as durably waiting.
     pub fn mark_waiting(&mut self) -> Result<(), RepositoryError> {
         self.replace(
@@ -103,7 +126,7 @@ impl WorkflowContext {
         )
     }
 
-    /// Marks this invocation as successfully completed.
+    /// Marks this invocation as successfully completed and releases its claims.
     pub fn mark_succeeded<R: Serialize>(
         &mut self,
         result: Option<R>,
@@ -113,10 +136,12 @@ impl WorkflowContext {
             self.instance.current_step.clone(),
             self.checkpoint_value()?,
             result.map(serde_json::to_value).transpose()?,
-        )
+        )?;
+        self.release_all_claims()?;
+        Ok(())
     }
 
-    /// Marks this invocation as failed while retaining its checkpoint.
+    /// Marks this invocation as failed, retaining its checkpoint and releasing its claims.
     pub fn mark_failed(&mut self, error: impl Into<String>) -> Result<(), RepositoryError> {
         let error = error.into();
         let checkpoint = self.checkpoint_value()?;
@@ -132,6 +157,7 @@ impl WorkflowContext {
                 result,
             },
         )?;
+        self.release_all_claims()?;
         Ok(())
     }
 
@@ -191,6 +217,7 @@ pub struct WorkflowSupervisor {
     repository: Arc<WorkflowRepository>,
     registry: Arc<WorkflowRegistry>,
     tasks: HashMap<WorkflowId, JoinHandle<()>>,
+    claims_reconciled: bool,
 }
 
 impl WorkflowSupervisor {
@@ -201,11 +228,16 @@ impl WorkflowSupervisor {
             repository,
             registry,
             tasks: HashMap::new(),
+            claims_reconciled: false,
         }
     }
 
-    /// Reaps completed tasks, reconciles interrupted work, and starts runnable instances.
+    /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
     pub async fn tick(&mut self) -> Result<(), SupervisorError> {
+        if !self.claims_reconciled {
+            self.repository.reconcile_claims()?;
+            self.claims_reconciled = true;
+        }
         self.reap_finished().await?;
         for instance in self.repository.list()? {
             if self.tasks.contains_key(&instance.id) {
@@ -226,7 +258,7 @@ impl WorkflowSupervisor {
         Ok(())
     }
 
-    /// Durably requests a cooperative pause.
+    /// Durably requests a cooperative pause while retaining resource claims.
     pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
         self.transition(instance, WorkflowStatus::Paused)?;
@@ -241,9 +273,15 @@ impl WorkflowSupervisor {
     }
 
     /// Durably requests cooperative cancellation.
+    ///
+    /// Claims remain held until a running executor reaches its safe boundary;
+    /// a workflow without an executor releases them immediately.
     pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
         self.transition(instance, WorkflowStatus::Cancelled)?;
+        if !self.tasks.contains_key(&id) {
+            self.repository.release_claims(id)?;
+        }
         Ok(())
     }
 
@@ -329,6 +367,9 @@ impl WorkflowSupervisor {
                     let mut context = WorkflowContext::new(self.repository.clone(), instance);
                     context.mark_failed(format!("workflow executor task failed: {error}"))?;
                 }
+            }
+            if self.read(id)?.status == WorkflowStatus::Cancelled {
+                self.repository.release_claims(id)?;
             }
         }
         Ok(())

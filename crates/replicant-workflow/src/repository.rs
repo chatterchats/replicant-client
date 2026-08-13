@@ -9,13 +9,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::{
-    NewWorkflow, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
-    WorkflowStatus,
+    ClaimAcquireOutcome, NewWorkflow, ResourceClaim, ResourceKey, WorkflowActivity, WorkflowId,
+    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/0002_activity.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 2;
+const RESOURCE_CLAIMS_SCHEMA: &str = include_str!("../migrations/0003_resource_claims.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 3;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +30,9 @@ pub enum RepositoryError {
     /// A stable workflow kind was malformed.
     #[error("invalid workflow kind {0:?}")]
     InvalidKind(String),
+    /// A resource namespace or identity was malformed.
+    #[error("invalid resource key {0:?}")]
+    InvalidResourceKey(ResourceKey),
     /// A malformed lifecycle status was found in SQLite.
     #[error("invalid persisted workflow status {0:?}")]
     InvalidStoredStatus(String),
@@ -52,6 +56,20 @@ pub enum RepositoryError {
     /// No workflow has the requested ID.
     #[error("workflow {0} was not found")]
     NotFound(WorkflowId),
+    /// A terminal workflow cannot acquire new resources.
+    #[error("terminal workflow {workflow_id} cannot acquire resources")]
+    TerminalClaimOwner {
+        /// Workflow attempting the acquisition.
+        workflow_id: WorkflowId,
+    },
+    /// Another workflow exclusively owns the resource.
+    #[error("resource {resource:?} is claimed by workflow {owner}")]
+    ClaimConflict {
+        /// Requested resource.
+        resource: ResourceKey,
+        /// Current owning workflow.
+        owner: WorkflowId,
+    },
     /// The requested lifecycle transition is not valid.
     #[error("invalid workflow transition from {from:?} to {to:?}")]
     InvalidTransition {
@@ -141,6 +159,13 @@ impl WorkflowRepository {
             transaction.execute_batch(ACTIVITY_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (2)",
+                [],
+            )?;
+        }
+        if found < 3 {
+            transaction.execute_batch(RESOURCE_CLAIMS_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (3)",
                 [],
             )?;
         }
@@ -238,6 +263,134 @@ impl WorkflowRepository {
             })
         })?;
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Atomically acquires an exclusive resource claim.
+    ///
+    /// Reacquiring a claim owned by `workflow_id` is idempotent and refreshes
+    /// its update timestamp. A claim owned by any other workflow conflicts
+    /// until it is explicitly released or startup reconciliation removes it.
+    pub fn acquire_claim(
+        &self,
+        workflow_id: WorkflowId,
+        resource: ResourceKey,
+    ) -> Result<ClaimAcquireOutcome, RepositoryError> {
+        let (namespace, key) = resource.persisted_parts()?;
+        let now = now_millis()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner =
+            read_in(&transaction, workflow_id)?.ok_or(RepositoryError::NotFound(workflow_id))?;
+        if owner.status.is_terminal() {
+            return Err(RepositoryError::TerminalClaimOwner { workflow_id });
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT workflow_id, acquired_at FROM workflow_resource_claims
+                 WHERE resource_namespace = ?1 AND resource_key = ?2",
+                params![namespace, key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_owner, acquired_at)) = existing {
+            let existing_owner = parse_id(existing_owner)?;
+            if existing_owner != workflow_id {
+                return Err(RepositoryError::ClaimConflict {
+                    resource,
+                    owner: existing_owner,
+                });
+            }
+            transaction.execute(
+                "UPDATE workflow_resource_claims SET updated_at = ?1
+                 WHERE resource_namespace = ?2 AND resource_key = ?3",
+                params![now, namespace, key],
+            )?;
+            transaction.commit()?;
+            return Ok(ClaimAcquireOutcome::AlreadyOwned(ResourceClaim {
+                resource,
+                workflow_id,
+                acquired_at,
+                updated_at: now,
+            }));
+        }
+        transaction.execute(
+            "INSERT INTO workflow_resource_claims (
+                resource_namespace, resource_key, workflow_id, acquired_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![namespace, key, workflow_id.to_string(), now],
+        )?;
+        transaction.commit()?;
+        Ok(ClaimAcquireOutcome::Acquired(ResourceClaim {
+            resource,
+            workflow_id,
+            acquired_at: now,
+            updated_at: now,
+        }))
+    }
+
+    /// Atomically releases a resource only when `workflow_id` owns it.
+    pub fn release_claim(
+        &self,
+        workflow_id: WorkflowId,
+        resource: &ResourceKey,
+    ) -> Result<bool, RepositoryError> {
+        let (namespace, key) = resource.persisted_parts()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let released = transaction.execute(
+            "DELETE FROM workflow_resource_claims
+             WHERE resource_namespace = ?1 AND resource_key = ?2 AND workflow_id = ?3",
+            params![namespace, key, workflow_id.to_string()],
+        )? != 0;
+        transaction.commit()?;
+        Ok(released)
+    }
+
+    /// Atomically releases every claim owned by one workflow.
+    pub fn release_claims(&self, workflow_id: WorkflowId) -> Result<usize, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let released = transaction.execute(
+            "DELETE FROM workflow_resource_claims WHERE workflow_id = ?1",
+            [workflow_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(released)
+    }
+
+    /// Lists claims owned by one workflow.
+    pub fn claims(&self, workflow_id: WorkflowId) -> Result<Vec<ResourceClaim>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT resource_namespace, resource_key, acquired_at, updated_at
+             FROM workflow_resource_claims WHERE workflow_id = ?1
+             ORDER BY resource_namespace, resource_key",
+        )?;
+        let rows = statement.query_map([workflow_id.to_string()], |row| {
+            Ok(ResourceClaim {
+                resource: resource_key(row.get(0)?, row.get(1)?),
+                workflow_id,
+                acquired_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Removes claims whose owner is missing or terminal after a restart.
+    pub fn reconcile_claims(&self) -> Result<usize, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let released = transaction.execute(
+            "DELETE FROM workflow_resource_claims
+             WHERE workflow_id NOT IN (
+                 SELECT id FROM workflow_instances
+                 WHERE status NOT IN ('succeeded', 'failed', 'cancelled')
+             )",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(released)
     }
 
     /// Replaces mutable workflow state if `expected_revision` is current.
@@ -339,6 +492,21 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> Result<WorkflowInstance, rusqlite
 fn parse_id(value: String) -> Result<WorkflowId, rusqlite::Error> {
     WorkflowId::from_str(&value)
         .map_err(|_| to_sql_conversion_error(RepositoryError::InvalidStoredId(value)))
+}
+
+fn resource_key(namespace: String, key: String) -> ResourceKey {
+    match namespace.as_str() {
+        "replicant" => ResourceKey::Replicant(key),
+        "device" => ResourceKey::Device(key),
+        "autofactory" => ResourceKey::Autofactory(key),
+        namespace => ResourceKey::Namespaced {
+            namespace: namespace
+                .strip_prefix("custom:")
+                .unwrap_or(namespace)
+                .to_owned(),
+            key,
+        },
+    }
 }
 
 fn to_sql_conversion_error(error: RepositoryError) -> rusqlite::Error {

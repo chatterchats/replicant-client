@@ -94,6 +94,12 @@ pub enum WorkflowStatus {
 }
 
 impl WorkflowStatus {
+    /// Returns whether this workflow can no longer execute.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
     /// Returns whether a state replacement may use `next`.
     #[must_use]
     pub fn can_transition_to(self, next: Self) -> bool {
@@ -129,6 +135,67 @@ impl WorkflowStatus {
             Self::Cancelled => "cancelled",
         }
     }
+}
+
+/// Exclusive gameplay resource identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "identity")]
+pub enum ResourceKey {
+    /// Replicant code or name.
+    Replicant(String),
+    /// Device or vessel code.
+    Device(String),
+    /// Autofactory code.
+    Autofactory(String),
+    /// Application-defined namespace and stable identity.
+    Namespaced { namespace: String, key: String },
+}
+
+impl ResourceKey {
+    pub(crate) fn persisted_parts(&self) -> Result<(String, &str), RepositoryError> {
+        let (namespace, key) = match self {
+            Self::Replicant(key) => ("replicant".to_owned(), key.as_str()),
+            Self::Device(key) => ("device".to_owned(), key.as_str()),
+            Self::Autofactory(key) => ("autofactory".to_owned(), key.as_str()),
+            Self::Namespaced { namespace, key } => {
+                if namespace.is_empty()
+                    || namespace.len() > 128
+                    || !namespace.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+                {
+                    return Err(RepositoryError::InvalidResourceKey(self.clone()));
+                }
+                (format!("custom:{namespace}"), key.as_str())
+            }
+        };
+        if key.is_empty() || key.len() > 256 {
+            return Err(RepositoryError::InvalidResourceKey(self.clone()));
+        }
+        Ok((namespace, key))
+    }
+}
+
+/// One persisted exclusive resource claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceClaim {
+    /// Claimed gameplay resource.
+    pub resource: ResourceKey,
+    /// Workflow that owns the claim.
+    pub workflow_id: WorkflowId,
+    /// First acquisition time in Unix milliseconds.
+    pub acquired_at: i64,
+    /// Most recent idempotent acquisition time in Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// Result of atomically acquiring a claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimAcquireOutcome {
+    /// The resource was unclaimed and is now owned by the workflow.
+    Acquired(ResourceClaim),
+    /// The workflow already owned the claim; its update timestamp was refreshed.
+    AlreadyOwned(ResourceClaim),
 }
 
 impl FromStr for WorkflowStatus {

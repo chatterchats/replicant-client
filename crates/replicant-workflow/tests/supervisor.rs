@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use replicant_workflow::{
-    BoxWorkflowFuture, ControlRequest, NewWorkflow, WorkflowContext, WorkflowExecutor,
+    BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WorkflowContext, WorkflowExecutor,
     WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry, WorkflowRepository,
     WorkflowStatus, WorkflowSupervisor,
 };
@@ -178,6 +178,9 @@ async fn finish_remaining(harness: &Harness, completed: usize) {
 async fn completes_and_checkpoints_each_step() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
     let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    repository
+        .acquire_claim(id, ResourceKey::Replicant("ADA".into()))
+        .expect("claim resource");
     supervisor.tick().await.expect("start workflow");
     finish_remaining(&harness, 0).await;
     wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
@@ -190,12 +193,16 @@ async fn completes_and_checkpoints_each_step() {
         .expect("decode checkpoint");
     assert_eq!(checkpoint.completed, 3);
     assert_eq!(repository.activity(id).expect("read activity").len(), 3);
+    assert!(repository.claims(id).expect("read claims").is_empty());
 }
 
 #[tokio::test]
 async fn pauses_and_resumes_cooperatively() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
     let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    repository
+        .acquire_claim(id, ResourceKey::Device("VESSEL-1".into()))
+        .expect("claim resource");
     supervisor.tick().await.expect("start workflow");
     reach_step(&harness).await;
     supervisor.pause(id).expect("request pause");
@@ -205,6 +212,7 @@ async fn pauses_and_resumes_cooperatively() {
         tokio::task::yield_now().await;
         supervisor.tick().await.expect("reap paused executor");
     }
+    assert_eq!(repository.claims(id).expect("read claims").len(), 1);
 
     supervisor.resume(id).expect("resume workflow");
     supervisor.tick().await.expect("restart workflow");
@@ -217,11 +225,19 @@ async fn pauses_and_resumes_cooperatively() {
 async fn cancels_cooperatively() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
     let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    repository
+        .acquire_claim(id, ResourceKey::Autofactory("FACTORY-1".into()))
+        .expect("claim resource");
     supervisor.tick().await.expect("start workflow");
     reach_step(&harness).await;
     supervisor.cancel(id).expect("request cancellation");
+    assert_eq!(repository.claims(id).expect("read claims").len(), 1);
     harness.proceed.add_permits(1);
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Cancelled).await;
+    while supervisor.has_executor(id) {
+        tokio::task::yield_now().await;
+        supervisor.tick().await.expect("reap cancelled executor");
+    }
+    assert!(repository.claims(id).expect("read claims").is_empty());
     assert_eq!(repository.activity(id).expect("read activity").len(), 1);
 }
 

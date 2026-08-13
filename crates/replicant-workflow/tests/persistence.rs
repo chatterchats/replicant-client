@@ -1,10 +1,14 @@
 //! SQLite persistence and registry acceptance tests.
 
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+};
 
 use replicant_workflow::{
-    NewWorkflow, RegistryError, RepositoryError, WorkflowFactory, WorkflowKind, WorkflowRegistry,
-    WorkflowRepository, WorkflowState, WorkflowStatus,
+    ClaimAcquireOutcome, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowFactory,
+    WorkflowKind, WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus,
+    WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +167,177 @@ fn persists_across_reopen() {
     fs::remove_file(path).expect("remove test database");
 }
 
+#[test]
+fn claims_are_typed_idempotent_and_exclusive() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let owner = create(&repository, None);
+    let contender = create(&repository, None);
+    let resource = ResourceKey::Device("VESSEL-1".into());
+
+    let first = repository
+        .acquire_claim(owner.id, resource.clone())
+        .expect("acquire claim");
+    let acquired_at = match first {
+        ClaimAcquireOutcome::Acquired(claim) => claim.acquired_at,
+        ClaimAcquireOutcome::AlreadyOwned(_) => panic!("new claim was already owned"),
+    };
+    assert!(matches!(
+        repository
+            .acquire_claim(owner.id, resource.clone())
+            .expect("reacquire claim"),
+        ClaimAcquireOutcome::AlreadyOwned(claim) if claim.acquired_at == acquired_at
+    ));
+    assert!(matches!(
+        repository.acquire_claim(contender.id, resource.clone()),
+        Err(RepositoryError::ClaimConflict { owner: id, .. }) if id == owner.id
+    ));
+    assert!(
+        !repository
+            .release_claim(contender.id, &resource)
+            .expect("non-owner release")
+    );
+    assert!(
+        repository
+            .release_claim(owner.id, &resource)
+            .expect("owner release")
+    );
+
+    for resource in [
+        ResourceKey::Replicant("ADA".into()),
+        ResourceKey::Autofactory("FACTORY-1".into()),
+        ResourceKey::Namespaced {
+            namespace: "survey.site".into(),
+            key: "SOL:A1".into(),
+        },
+    ] {
+        repository
+            .acquire_claim(owner.id, resource)
+            .expect("acquire typed claim");
+    }
+    assert_eq!(repository.claims(owner.id).expect("list claims").len(), 3);
+}
+
+#[test]
+fn concurrent_workflows_cannot_claim_the_same_resource() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-claims-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let first_repository = WorkflowRepository::open(&path).expect("open first repository");
+    let first = create(&first_repository, None).id;
+    let second_repository = WorkflowRepository::open(&path).expect("open second repository");
+    let second = create(&second_repository, None).id;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let run = |repository: WorkflowRepository, workflow_id, barrier: Arc<Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            repository.acquire_claim(workflow_id, ResourceKey::Replicant("ADA".into()))
+        })
+    };
+    let first_thread = run(first_repository, first, barrier.clone());
+    let second_thread = run(second_repository, second, barrier.clone());
+    barrier.wait();
+    let results = [
+        first_thread.join().expect("first claimant thread"),
+        second_thread.join().expect("second claimant thread"),
+    ];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(RepositoryError::ClaimConflict { .. })))
+            .count(),
+        1
+    );
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[tokio::test]
+async fn startup_reconciles_terminal_and_missing_claim_owners() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-claim-reconcile-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let repository = WorkflowRepository::open(&path).expect("open repository");
+    let terminal = create(&repository, None);
+    let paused = create(&repository, None);
+    repository
+        .acquire_claim(terminal.id, ResourceKey::Device("DONE".into()))
+        .expect("claim terminal resource");
+    repository
+        .acquire_claim(paused.id, ResourceKey::Device("PAUSED".into()))
+        .expect("claim paused resource");
+    let terminal = repository
+        .update(
+            terminal.id,
+            terminal.revision,
+            WorkflowState::<_, ()> {
+                status: WorkflowStatus::Running,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 0 },
+                last_error: None,
+                result: None,
+            },
+        )
+        .expect("start owner");
+    repository
+        .update(
+            terminal.id,
+            terminal.revision,
+            WorkflowState::<_, ()> {
+                status: WorkflowStatus::Succeeded,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 0 },
+                last_error: None,
+                result: None,
+            },
+        )
+        .expect("complete owner");
+    repository
+        .update(
+            paused.id,
+            paused.revision,
+            WorkflowState::<_, ()> {
+                status: WorkflowStatus::Paused,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 0 },
+                last_error: None,
+                result: None,
+            },
+        )
+        .expect("pause owner");
+    drop(repository);
+    let raw = rusqlite::Connection::open(&path).expect("open raw sqlite");
+    raw.pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable foreign keys for orphan fixture");
+    raw.execute(
+        "INSERT INTO workflow_resource_claims
+             (resource_namespace, resource_key, workflow_id, acquired_at, updated_at)
+             VALUES ('device', 'MISSING', '00000000-0000-0000-0000-000000000000', 1, 1)",
+        [],
+    )
+    .expect("insert missing owner claim");
+
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+    let mut supervisor =
+        WorkflowSupervisor::new(repository.clone(), Arc::new(WorkflowRegistry::new()));
+    supervisor.tick().await.expect("startup reconciliation");
+    assert!(
+        repository
+            .claims(terminal.id)
+            .expect("terminal claims")
+            .is_empty()
+    );
+    assert_eq!(
+        repository.claims(paused.id).expect("paused claims").len(),
+        1
+    );
+    drop(supervisor);
+    drop(repository);
+    fs::remove_file(path).expect("remove test database");
+}
+
 struct Factory {
     kind: WorkflowKind,
 }
@@ -239,7 +414,7 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         WorkflowRepository::open(&path),
         Err(RepositoryError::UnsupportedDatabaseSchema {
             found: 99,
-            supported: 2
+            supported: 3
         })
     ));
     fs::remove_file(path).expect("remove test database");

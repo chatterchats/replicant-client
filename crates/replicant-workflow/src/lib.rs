@@ -6,8 +6,8 @@ mod repository;
 mod supervisor;
 
 pub use model::{
-    NewWorkflow, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
-    WorkflowStatus,
+    ClaimAcquireOutcome, NewWorkflow, ResourceClaim, ResourceKey, WorkflowActivity, WorkflowId,
+    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowRegistry};
 pub use repository::{RepositoryError, WorkflowRepository};
