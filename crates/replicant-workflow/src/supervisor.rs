@@ -76,6 +76,12 @@ impl WorkflowContext {
         self.instance.checkpoint()
     }
 
+    /// Returns the daemon-owned managed client for gameplay reconciliation.
+    #[must_use]
+    pub fn managed_client(&self) -> Option<&Client> {
+        self.client.as_ref()
+    }
+
     /// Atomically advances to a named logical step and persists its checkpoint.
     pub fn advance_to<P: Serialize>(
         &mut self,

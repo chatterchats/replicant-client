@@ -88,7 +88,12 @@ use replicant_client::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+tokio::task_local! {
+    static WORKFLOW_CHECKPOINTS: mpsc::UnboundedSender<Box<SurveyExecutionState>>;
+}
 
 /// Error type returned by the reusable survey workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -304,7 +309,7 @@ fn validate_drone_codes(drones: Option<&[String]>) -> AnyResult<()> {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum RunPhase {
+pub(crate) enum RunPhase {
     PreparingFleet,
     Ready,
     Traveling,
@@ -335,8 +340,9 @@ impl RouteStop {
     }
 }
 
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct RoutePlan {
+pub struct SurveyExecutionState {
     version: u32,
     created_unix_seconds: u64,
     replicant: String,
@@ -381,7 +387,9 @@ const fn default_maintenance_check_seconds() -> u64 {
     DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs()
 }
 
-impl RoutePlan {
+type RoutePlan = SurveyExecutionState;
+
+impl SurveyExecutionState {
     fn migrate(&mut self) -> AnyResult<bool> {
         match self.version {
             PLAN_VERSION => Ok(false),
@@ -480,6 +488,20 @@ impl RoutePlan {
         }
 
         changed
+    }
+
+    pub(crate) fn step_name(&self) -> String {
+        format!("{:?}", self.phase).to_ascii_lowercase()
+    }
+
+    pub(crate) fn resources(&self) -> (&str, &str, Vec<&str>) {
+        let devices = self
+            .controller
+            .iter()
+            .chain(self.drones.iter())
+            .map(String::as_str)
+            .collect();
+        (&self.replicant, &self.vessel, devices)
     }
 }
 
@@ -4515,6 +4537,7 @@ fn save_plan(path: &Path, plan: &RoutePlan) -> AnyResult<()> {
         writer.get_ref().sync_all()?;
     }
     fs::rename(&temporary, path)?;
+    let _ = WORKFLOW_CHECKPOINTS.try_with(|sender| sender.send(Box::new(plan.clone())));
     debug!(
         target: "replicant_client::explore",
         event = "route.plan_saved",
@@ -4527,7 +4550,8 @@ fn save_plan(path: &Path, plan: &RoutePlan) -> AnyResult<()> {
 }
 
 /// Inputs for invoking the durable survey-route workflow from another automation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SurveyMode {
     /// Create or replace a route plan without executing it.
     Plan,
@@ -4537,7 +4561,7 @@ pub enum SurveyMode {
 
 /// Reusable survey-route configuration.
 #[allow(missing_docs)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SurveyOptions {
     pub mode: SurveyMode,
     pub replicant: String,
@@ -4656,6 +4680,36 @@ pub async fn execute_survey_route(
         .transpose()?;
     run(client, &config).await?;
     survey_status(&options.mission_file)
+}
+
+/// Executes a survey route while reporting every durable phase checkpoint.
+pub async fn execute_survey_workflow<F>(
+    client: &Client,
+    options: &SurveyOptions,
+    mut checkpoint: F,
+) -> AnyResult<SurveyPlanSummary>
+where
+    F: FnMut(SurveyExecutionState) -> AnyResult<()>,
+{
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let execution = WORKFLOW_CHECKPOINTS.scope(sender, execute_survey_route(client, options));
+    tokio::pin!(execution);
+    loop {
+        tokio::select! {
+            result = &mut execution => {
+                while let Ok(state) = receiver.try_recv() {
+                    checkpoint(*state)?;
+                }
+                return result;
+            }
+            Some(state) = receiver.recv() => checkpoint(*state)?,
+        }
+    }
+}
+
+/// Restores the workflow-authoritative checkpoint into the legacy mission file.
+pub fn restore_survey_checkpoint(path: &Path, checkpoint: &SurveyExecutionState) -> AnyResult<()> {
+    save_plan(path, checkpoint)
 }
 
 /// Inputs for invoking the durable survey-route workflow from another automation.

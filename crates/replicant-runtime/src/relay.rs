@@ -61,9 +61,14 @@ use replicant_route_planner::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
+
+tokio::task_local! {
+    static WORKFLOW_CHECKPOINTS: mpsc::UnboundedSender<Box<RelayExecutionState>>;
+}
 
 const PLAN_VERSION: u32 = 2;
 const DEFAULT_MAX_HOP_LY: f64 = 7.499;
@@ -508,6 +513,37 @@ impl RelayExecutionState {
                 .map(|stop| stop.system.clone()),
             pending_relays,
         }
+    }
+
+    pub(crate) fn step_name(&self) -> &'static str {
+        match self.status().phase {
+            RelayExecutionPhase::AwaitingRelays => "awaiting_relays",
+            RelayExecutionPhase::Deploying => "deploying",
+            RelayExecutionPhase::ReturningToHub => "returning_to_hub",
+            RelayExecutionPhase::Succeeded => "complete",
+        }
+    }
+
+    pub(crate) fn resources(&self) -> (&str, Vec<&str>, Vec<&str>) {
+        let devices = std::iter::once(self.vessel_code.as_str())
+            .chain(self.hub_stock_relays.iter().map(String::as_str))
+            .chain(
+                self.stops
+                    .iter()
+                    .filter_map(|stop| stop.relay_code.as_deref()),
+            )
+            .chain(
+                self.supply
+                    .iter()
+                    .flat_map(|supply| supply.carriers.iter().map(|carrier| carrier.code.as_str())),
+            )
+            .collect();
+        let factories = self
+            .print_jobs
+            .iter()
+            .map(|job| job.factory_code.as_str())
+            .collect();
+        (&self.replicant_code, devices, factories)
     }
 }
 
@@ -4541,6 +4577,7 @@ fn save_plan(path: &Path, plan: &MissionPlan) -> AnyResult<()> {
         writer.get_ref().sync_all()?;
     }
     fs::rename(temporary, path)?;
+    let _ = WORKFLOW_CHECKPOINTS.try_with(|sender| sender.send(Box::new(plan.clone())));
     Ok(())
 }
 
@@ -4812,7 +4849,7 @@ fn designation_in_system(location: &str, system: &str) -> bool {
 }
 
 /// Inputs for invoking the durable relay-expansion workflow from another automation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RelayExpansionRequest {
     /// Replicant name or code that carries and deploys the relays.
     pub replicant: String,
@@ -4887,6 +4924,36 @@ pub async fn execute_expansion(
         stops: plan.stops.len(),
         state: plan,
     })
+}
+
+/// Executes relay expansion while reporting every durable phase checkpoint.
+pub async fn execute_relay_workflow<F>(
+    client: &Client,
+    request: &RelayExpansionRequest,
+    mut checkpoint: F,
+) -> AnyResult<RelayExpansionReport>
+where
+    F: FnMut(RelayExecutionState) -> AnyResult<()>,
+{
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let execution = WORKFLOW_CHECKPOINTS.scope(sender, execute_expansion(client, request));
+    tokio::pin!(execution);
+    loop {
+        tokio::select! {
+            result = &mut execution => {
+                while let Ok(state) = receiver.try_recv() {
+                    checkpoint(*state)?;
+                }
+                return result;
+            }
+            Some(state) = receiver.recv() => checkpoint(*state)?,
+        }
+    }
+}
+
+/// Restores the workflow-authoritative checkpoint into the legacy mission file.
+pub fn restore_relay_checkpoint(path: &Path, checkpoint: &RelayExecutionState) -> AnyResult<()> {
+    save_plan(path, checkpoint)
 }
 
 #[cfg(test)]

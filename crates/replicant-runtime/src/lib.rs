@@ -49,6 +49,9 @@ pub mod survey;
 /// Relay-network planning and restart-safe execution.
 pub mod relay;
 
+/// Durable survey and relay workflow registrations.
+pub mod workflows;
+
 /// Mining-network expansion planning and restart-safe execution.
 pub mod mining;
 

@@ -16,9 +16,10 @@ replicant-mining-planner = { version = "0.1.0", path = "../replicant-mining-plan
 replicant-printing = { version = "0.1.0", path = "../replicant-printing", features = ["managed"] }
 replicant-route-planner = { version = "0.1.0", path = "../replicant-route-planner" }
 replicant-transport = { version = "0.1.0", path = "../replicant-transport" }
+replicant-workflow = { version = "0.1.0", path = "../replicant-workflow" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

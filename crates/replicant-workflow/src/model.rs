@@ -211,7 +211,12 @@ pub enum ResourceKey {
     /// Autofactory code.
     Autofactory(String),
     /// Application-defined namespace and stable identity.
-    Namespaced { namespace: String, key: String },
+    Namespaced {
+        /// Stable application-defined namespace.
+        namespace: String,
+        /// Stable resource identity within the namespace.
+        key: String,
+    },
 }
 
 impl ResourceKey {
