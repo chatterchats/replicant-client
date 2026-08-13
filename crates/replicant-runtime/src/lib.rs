@@ -25,6 +25,12 @@ pub mod config;
 /// Read-only application queries and reports.
 pub mod reports;
 
+/// Survey-route planning and execution.
+pub mod survey;
+
+/// Replicant-only asteroid-belt scouting.
+pub mod belt_search;
+
 /// Finite application mutations and bounded operations.
 pub mod actions;
 

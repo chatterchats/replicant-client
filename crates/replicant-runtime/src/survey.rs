@@ -1,4 +1,4 @@
-//! Durable survey-route planning and automation.
+//! Reusable survey-route planning and execution.
 //!
 //! This CLI:
 //!
@@ -74,7 +74,6 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    env,
     error::Error as StdError,
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
@@ -87,11 +86,9 @@ use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
     SurveyDirective, SyncDomain, domain::GalacticPosition, raw,
 };
-use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, prelude::*};
+use tracing::{debug, info, warn};
 
 /// Error type returned by the reusable survey workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -246,26 +243,15 @@ const DEFAULT_MAINTENANCE_RESUME_PCT: f64 = 95.0;
 const DEFAULT_MAINTENANCE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const DEVICE_FUNCTIONAL_FLOOR_PCT: f64 = 21.0;
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-const DEFAULT_FILTER: &str = concat!(
-    "replicant_client=info,",
-    "replicant_client::explore=debug,",
-    "replicant_client::raw::http=info,",
-    "replicant_client::raw::rate_limit=info,",
-    "replicant_client::events=info,",
-    "replicant_client::ops=info"
-);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Plan,
     Run,
-    Status,
 }
 
 #[derive(Debug)]
 struct Config {
     command: Command,
-    database: PathBuf,
     replicant: String,
     vessel: String,
     center: String,
@@ -273,7 +259,6 @@ struct Config {
     system_limit: usize,
     star_detail_concurrency: usize,
     plan_path: PathBuf,
-    log_path: Option<PathBuf>,
     controller_override: Option<String>,
     drone_overrides: Option<Vec<String>>,
     replace_plan: bool,
@@ -285,224 +270,9 @@ struct Config {
     maintenance_threshold_pct: f64,
     maintenance_resume_pct: f64,
     maintenance_check_interval: Duration,
-    verbose: bool,
 }
 
 impl Config {
-    fn from_args_and_env(arguments: impl IntoIterator<Item = String>) -> AnyResult<Self> {
-        let mut arguments = arguments.into_iter();
-        let command = match arguments.next().as_deref() {
-            Some("plan") => Command::Plan,
-            Some("run") => Command::Run,
-            Some("status") => Command::Status,
-            Some("-h" | "--help") | None => {
-                print_help();
-                std::process::exit(0);
-            }
-            Some(other) => {
-                return Err(app_error(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown command: {other}"),
-                ));
-            }
-        };
-        let mut database = env::var_os("REPLICANT_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
-        let mut replicant = env_string("RS_EXPLORE_REPLICANT", "B6BA399E");
-        let mut vessel = env_string("RS_EXPLORE_VESSEL", "FD5EA802");
-        let mut center = env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase();
-        let mut radius_ly = env_f64("RS_EXPLORE_RADIUS_LY", 30.0)?;
-        let mut system_limit = env_usize("RS_EXPLORE_SYSTEM_LIMIT", 80)?.max(1);
-        let mut star_detail_concurrency =
-            env_usize("RS_EXPLORE_STAR_DETAIL_CONCURRENCY", 8)?.clamp(1, 16);
-        let mut plan_path = env::var_os("RS_EXPLORE_PLAN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("explore-survey-route.json"));
-        let mut log_path = env::var_os("RS_EXPLORE_LOG_FILE")
-            .or_else(|| env::var_os("RS_EXPLORE_LOG"))
-            .map(PathBuf::from);
-        let mut controller_override = env::var("RS_EXPLORE_CONTROLLER").ok();
-        let mut drone_overrides = env::var("RS_EXPLORE_DRONES")
-            .ok()
-            .map(|value| parse_drone_codes(&value));
-        let mut replace_plan = env_bool("RS_EXPLORE_REPLACE_PLAN", false)?
-            || env_bool("RS_EXPLORE_REBUILD_PLAN", false)?;
-        let mut include_explored = env_bool("RS_EXPLORE_INCLUDE_EXPLORED", false)?;
-        let mut travel_timeout =
-            Duration::from_secs(env_u64("RS_EXPLORE_TRAVEL_TIMEOUT_SECS", 6 * 60 * 60)?);
-        let mut survey_timeout =
-            Duration::from_secs(env_u64("RS_EXPLORE_SURVEY_TIMEOUT_SECS", 6 * 60 * 60)?);
-        let mut maintenance_home = env::var("RS_EXPLORE_MAINTENANCE_HOME")
-            .ok()
-            .map(|value| value.to_ascii_uppercase());
-        let mut maintenance_interval = env_usize(
-            "RS_EXPLORE_MAINTENANCE_INTERVAL_SYSTEMS",
-            DEFAULT_MAINTENANCE_INTERVAL,
-        )?;
-        let mut maintenance_threshold_pct = env_f64(
-            "RS_EXPLORE_MAINTENANCE_THRESHOLD_PCT",
-            DEFAULT_MAINTENANCE_THRESHOLD_PCT,
-        )?;
-        let mut maintenance_resume_pct = env_f64(
-            "RS_EXPLORE_MAINTENANCE_RESUME_PCT",
-            DEFAULT_MAINTENANCE_RESUME_PCT,
-        )?;
-        let mut maintenance_check_interval = Duration::from_secs(env_u64(
-            "RS_EXPLORE_MAINTENANCE_CHECK_SECS",
-            DEFAULT_MAINTENANCE_CHECK_INTERVAL.as_secs(),
-        )?);
-        let mut verbose = env_bool("RS_EXPLORE_VERBOSE", false)?;
-
-        while let Some(argument) = arguments.next() {
-            match argument.as_str() {
-                "--database" => {
-                    database = PathBuf::from(required_argument(&mut arguments, "--database")?)
-                }
-                "--replicant" => replicant = required_argument(&mut arguments, "--replicant")?,
-                "--vessel" => vessel = required_argument(&mut arguments, "--vessel")?,
-                "--center" => {
-                    center = required_argument(&mut arguments, "--center")?.to_ascii_uppercase()
-                }
-                "--radius" => {
-                    radius_ly =
-                        positive_f64(&required_argument(&mut arguments, "--radius")?, "--radius")?;
-                }
-                "--system-limit" => {
-                    system_limit = positive_usize(
-                        &required_argument(&mut arguments, "--system-limit")?,
-                        "--system-limit",
-                    )?;
-                }
-                "--star-detail-concurrency" => {
-                    star_detail_concurrency = positive_usize(
-                        &required_argument(&mut arguments, "--star-detail-concurrency")?,
-                        "--star-detail-concurrency",
-                    )?
-                    .clamp(1, 16);
-                }
-                "--mission-file" | "--plan-file" => {
-                    plan_path = PathBuf::from(required_argument(&mut arguments, &argument)?)
-                }
-                "--controller" => {
-                    controller_override = Some(required_argument(&mut arguments, "--controller")?)
-                }
-                "--drones" => {
-                    drone_overrides = Some(parse_drone_codes(&required_argument(
-                        &mut arguments,
-                        "--drones",
-                    )?));
-                }
-                "--replace-plan" | "--rebuild-plan" => replace_plan = true,
-                "--include-explored" => include_explored = true,
-                "--travel-timeout-secs" => {
-                    travel_timeout = Duration::from_secs(u64::try_from(positive_usize(
-                        &required_argument(&mut arguments, "--travel-timeout-secs")?,
-                        "--travel-timeout-secs",
-                    )?)?);
-                }
-                "--survey-timeout-secs" => {
-                    survey_timeout = Duration::from_secs(u64::try_from(positive_usize(
-                        &required_argument(&mut arguments, "--survey-timeout-secs")?,
-                        "--survey-timeout-secs",
-                    )?)?);
-                }
-                "--maintenance-home" => {
-                    maintenance_home = Some(
-                        required_argument(&mut arguments, "--maintenance-home")?
-                            .to_ascii_uppercase(),
-                    );
-                }
-                "--maintenance-interval-systems" => {
-                    maintenance_interval = positive_usize(
-                        &required_argument(&mut arguments, "--maintenance-interval-systems")?,
-                        "--maintenance-interval-systems",
-                    )?;
-                }
-                "--maintenance-threshold-pct" => {
-                    maintenance_threshold_pct = percentage(
-                        &required_argument(&mut arguments, "--maintenance-threshold-pct")?,
-                        "--maintenance-threshold-pct",
-                    )?;
-                }
-                "--maintenance-resume-pct" => {
-                    maintenance_resume_pct = percentage(
-                        &required_argument(&mut arguments, "--maintenance-resume-pct")?,
-                        "--maintenance-resume-pct",
-                    )?;
-                }
-                "--maintenance-check-secs" => {
-                    maintenance_check_interval =
-                        Duration::from_secs(u64::try_from(positive_usize(
-                            &required_argument(&mut arguments, "--maintenance-check-secs")?,
-                            "--maintenance-check-secs",
-                        )?)?);
-                }
-                "--verbose" => verbose = true,
-                "--log-file" => {
-                    log_path = Some(PathBuf::from(required_argument(
-                        &mut arguments,
-                        "--log-file",
-                    )?));
-                }
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(app_error(
-                        io::ErrorKind::InvalidInput,
-                        format!("unexpected argument: {other}"),
-                    ));
-                }
-            }
-        }
-        validate_drone_codes(drone_overrides.as_deref())?;
-        if maintenance_threshold_pct > 100.0 || maintenance_resume_pct > 100.0 {
-            return Err(app_error(
-                io::ErrorKind::InvalidInput,
-                "maintenance capacity percentages must not exceed 100",
-            ));
-        }
-        if maintenance_resume_pct < maintenance_threshold_pct {
-            return Err(app_error(
-                io::ErrorKind::InvalidInput,
-                "--maintenance-resume-pct must be greater than or equal to --maintenance-threshold-pct",
-            ));
-        }
-        if command != Command::Plan && replace_plan {
-            return Err(app_error(
-                io::ErrorKind::InvalidInput,
-                "--replace-plan belongs on the plan command",
-            ));
-        }
-        let maintenance_home = maintenance_home.unwrap_or_else(|| center.clone());
-        Ok(Self {
-            command,
-            database,
-            replicant,
-            vessel,
-            center,
-            radius_ly,
-            system_limit,
-            star_detail_concurrency,
-            plan_path,
-            log_path,
-            controller_override,
-            drone_overrides,
-            replace_plan,
-            include_explored,
-            travel_timeout,
-            survey_timeout,
-            maintenance_home,
-            maintenance_interval,
-            maintenance_threshold_pct,
-            maintenance_resume_pct,
-            maintenance_check_interval,
-            verbose,
-        })
-    }
-
     fn adopt_plan_identity(&mut self, plan: &RoutePlan) {
         self.replicant.clone_from(&plan.replicant);
         self.vessel.clone_from(&plan.vessel);
@@ -519,27 +289,6 @@ impl Config {
     }
 }
 
-fn required_argument(
-    arguments: &mut impl Iterator<Item = String>,
-    option: &str,
-) -> AnyResult<String> {
-    arguments.next().ok_or_else(|| {
-        app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} requires a value"),
-        )
-    })
-}
-
-fn parse_drone_codes(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
 fn validate_drone_codes(drones: Option<&[String]>) -> AnyResult<()> {
     let Some(drones) = drones else {
         return Ok(());
@@ -549,163 +298,6 @@ fn validate_drone_codes(drones: Option<&[String]>) -> AnyResult<()> {
             io::ErrorKind::InvalidInput,
             format!("--drones must contain exactly {DRONE_COUNT} distinct comma-separated codes"),
         ));
-    }
-    Ok(())
-}
-
-fn positive_usize(value: &str, option: &str) -> AnyResult<usize> {
-    let value = value.parse::<usize>().map_err(|_| {
-        app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be an integer"),
-        )
-    })?;
-    if value == 0 {
-        return Err(app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be greater than zero"),
-        ));
-    }
-    Ok(value)
-}
-
-fn percentage(value: &str, option: &str) -> AnyResult<f64> {
-    let value = value.parse::<f64>().map_err(|_| {
-        app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be numeric"),
-        )
-    })?;
-    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
-        return Err(app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be between 0 and 100"),
-        ));
-    }
-    Ok(value)
-}
-
-fn positive_f64(value: &str, option: &str) -> AnyResult<f64> {
-    let value = value.parse::<f64>().map_err(|_| {
-        app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be numeric"),
-        )
-    })?;
-    if !value.is_finite() || value <= 0.0 {
-        return Err(app_error(
-            io::ErrorKind::InvalidInput,
-            format!("{option} must be finite and greater than zero"),
-        ));
-    }
-    Ok(value)
-}
-
-fn print_help() {
-    println!(
-        "Replicant survey route\n\n\
-Usage:\n  replicant-cli survey --plan [OPTIONS]\n  replicant-cli survey --run [OPTIONS]\n  replicant-cli survey --status [OPTIONS]\n\n\
-Options:\n  --replicant CODE           Surveying replicant\n  --vessel CODE              Vessel carrying the survey fleet\n  --center SYSTEM            Route centre (default: SCEPTURUM)\n  --radius LY                Search radius (default: 30)\n  --system-limit N           Maximum route systems (default: 80)\n  --star-detail-concurrency N  Concurrent star-detail reads (1-16)\n  --controller CODE          Survey-controller override\n  --drones A,B,C             Three survey-drone overrides\n  --include-explored         Include systems already explored\n  --mission-file PATH        Persisted mission JSON\n  --replace-plan             Replace the existing mission during plan\n  --database PATH            Managed SQLite database\n  --travel-timeout-secs N    Per-travel wait timeout\n  --survey-timeout-secs N    Per-survey wait timeout\n  --maintenance-home LOC     Home system/location for survey-fleet repair\n  --maintenance-interval-systems N  Proactive RTB interval (default: 40)\n  --maintenance-threshold-pct N  RTB at or below this capacity (default: 25)\n  --maintenance-resume-pct N  Repair target before resuming (default: 95)\n  --maintenance-check-secs N  Capacity check interval while surveying\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
-Plan performs reads and writes the mission only. Run always reconciles and\n\
-continues that mission; there is no separate resume command or --execute flag."
-    );
-}
-
-fn env_string(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_owned())
-}
-
-fn env_bool(name: &str, default: bool) -> AnyResult<bool> {
-    match env::var(name) {
-        Ok(value) => match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(app_error(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be 1/0, true/false, yes/no, or on/off"),
-            )),
-        },
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn env_usize(name: &str, default: usize) -> AnyResult<usize> {
-    match env::var(name) {
-        Ok(value) => Ok(value.parse()?),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn env_u64(name: &str, default: u64) -> AnyResult<u64> {
-    match env::var(name) {
-        Ok(value) => Ok(value.parse()?),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn env_f64(name: &str, default: f64) -> AnyResult<f64> {
-    match env::var(name) {
-        Ok(value) => {
-            let parsed: f64 = value.parse()?;
-            if !parsed.is_finite() || parsed <= 0.0 {
-                return Err(app_error(
-                    io::ErrorKind::InvalidInput,
-                    format!("{name} must be a positive finite number"),
-                ));
-            }
-            Ok(parsed)
-        }
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn install_tracing(config: &Config) -> AnyResult<()> {
-    if !config.verbose && config.log_path.is_none() {
-        return Ok(());
-    }
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
-    match (&config.log_path, config.verbose) {
-        (None, true) => tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
-            .try_init()
-            .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?,
-        (Some(path), verbose) => {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent)?;
-            }
-            let file = OpenOptions::new().create(true).append(true).open(path)?;
-            let registry = tracing_subscriber::registry().with(filter);
-            if verbose {
-                registry
-                    .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_ansi(false)
-                            .with_writer(std::sync::Mutex::new(file)),
-                    )
-                    .try_init()
-                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
-            } else {
-                registry
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_ansi(false)
-                            .with_writer(std::sync::Mutex::new(file)),
-                    )
-                    .try_init()
-                    .map_err(|error| app_error(io::ErrorKind::Other, error.to_string()))?;
-            }
-        }
-        (None, false) => {}
     }
     Ok(())
 }
@@ -957,73 +549,6 @@ struct CandidateStar {
     distance_from_center_ly: f64,
 }
 
-/// Runs the standalone survey-route command-line interface.
-pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
-    let mut config = Config::from_args_and_env(arguments)?;
-    if config.command == Command::Status {
-        return show_status(&config);
-    }
-    if config.command == Command::Run && !config.plan_path.exists() {
-        return Err(app_error(
-            io::ErrorKind::NotFound,
-            format!(
-                "no survey mission exists at {}; create one with `replicant-cli survey --plan`",
-                config.plan_path.display()
-            ),
-        ));
-    }
-    if config.plan_path.exists() && !config.replace_plan {
-        let mut saved: RoutePlan = serde_json::from_slice(&fs::read(&config.plan_path)?)?;
-        saved.migrate()?;
-        config.adopt_plan_identity(&saved);
-    }
-    install_tracing(&config)?;
-
-    info!(
-        target: "replicant_client::explore",
-        event = "explore.started",
-        replicant = %config.replicant,
-        vessel = %config.vessel,
-        center = %config.center,
-        radius_ly = config.radius_ly,
-        system_limit = config.system_limit,
-        star_detail_concurrency = config.star_detail_concurrency,
-        plan = %config.plan_path.display(),
-        log = config.log_path.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
-        command = ?config.command,
-        "starting survey-route automation"
-    );
-
-    let _mission_lock = if config.command == Command::Run {
-        Some(MissionLock::acquire(&config.plan_path)?)
-    } else {
-        None
-    };
-    let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
-
-    let result = run(&client, &config).await;
-    let close_result = client.close().await;
-
-    if let Err(error) = &result {
-        error!(
-            target: "replicant_client::explore",
-            event = "explore.failed",
-            error = %error,
-            "survey-route automation failed; run it again to reconcile and continue the saved mission"
-        );
-    }
-    close_result?;
-    result
-}
-
-fn show_status(config: &Config) -> AnyResult<()> {
-    let mut plan: RoutePlan = serde_json::from_slice(&fs::read(&config.plan_path)?)?;
-    plan.migrate()?;
-    plan.normalize_progress();
-    print_plan(&plan);
-    Ok(())
-}
-
 async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     client.ready().await?;
     let replicants = client.sync().domain(SyncDomain::Replicants).await?;
@@ -1038,7 +563,6 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     let mut plan = load_or_create_plan(client, config).await?;
     if plan.next_index >= plan.route.len() || plan.phase == RunPhase::Complete {
         log_route(&plan);
-        print_plan(&plan);
         info!(
             target: "replicant_client::explore",
             event = "route.already_completed",
@@ -1050,8 +574,6 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
 
     reconcile_current_system_scan_on_startup(client, config, &mut plan).await?;
     log_route(&plan);
-    print_plan(&plan);
-
     if config.command == Command::Plan {
         return Ok(());
     }
@@ -1725,40 +1247,6 @@ fn log_route(plan: &RoutePlan) {
             finalized = plan.stop_is_finalized(index),
             "planned route stop"
         );
-    }
-}
-
-fn print_plan(plan: &RoutePlan) {
-    let total_distance = plan
-        .route
-        .iter()
-        .map(|stop| stop.leg_distance_ly)
-        .sum::<f64>();
-    let completed = plan.next_index.min(plan.route.len());
-    println!("Survey route mission");
-    println!("  Replicant: {}", plan.replicant);
-    println!("  Vessel: {}", plan.vessel);
-    println!("  Centre: {}", plan.center);
-    println!("  Radius: {:.2} ly", plan.radius_ly);
-    println!("  Progress: {completed}/{} stops", plan.route.len());
-    println!("  Phase: {:?}", plan.phase);
-    println!("  Route distance: {total_distance:.2} ly");
-    println!(
-        "  Maintenance: {} every {} stops at <= {:.1}% (resume >= {:.1}%, check {}s)",
-        plan.maintenance_home,
-        plan.maintenance_interval,
-        plan.maintenance_threshold_pct,
-        plan.maintenance_resume_pct,
-        plan.maintenance_check_seconds
-    );
-    if let Some(next) = plan.route.get(plan.next_index) {
-        println!("  Next system: {}", next.star);
-    }
-    if let Some(controller) = &plan.controller {
-        println!("  Survey controller: {controller}");
-    }
-    if !plan.drones.is_empty() {
-        println!("  Survey drones: {}", plan.drones.join(", "));
     }
 }
 
@@ -5039,6 +4527,138 @@ fn save_plan(path: &Path, plan: &RoutePlan) -> AnyResult<()> {
 }
 
 /// Inputs for invoking the durable survey-route workflow from another automation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurveyMode {
+    /// Create or replace a route plan without executing it.
+    Plan,
+    /// Reconcile and execute a persisted route plan.
+    Run,
+}
+
+/// Reusable survey-route configuration.
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct SurveyOptions {
+    pub mode: SurveyMode,
+    pub replicant: String,
+    pub vessel: String,
+    pub center: String,
+    pub radius_ly: f64,
+    pub system_limit: usize,
+    pub star_detail_concurrency: usize,
+    pub mission_file: PathBuf,
+    pub controller: Option<String>,
+    pub drones: Option<Vec<String>>,
+    pub replace_plan: bool,
+    pub include_explored: bool,
+    pub travel_timeout: Duration,
+    pub survey_timeout: Duration,
+    pub maintenance_home: String,
+    pub maintenance_interval: usize,
+    pub maintenance_threshold_pct: f64,
+    pub maintenance_resume_pct: f64,
+    pub maintenance_check_interval: Duration,
+}
+
+/// Frontend-renderable survey mission state.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Serialize)]
+pub struct SurveyPlanSummary {
+    pub replicant: String,
+    pub vessel: String,
+    pub center: String,
+    pub radius_ly: f64,
+    pub completed_stops: usize,
+    pub total_stops: usize,
+    pub phase: String,
+    pub route_distance_ly: f64,
+    pub maintenance_home: String,
+    pub maintenance_interval: usize,
+    pub maintenance_threshold_pct: f64,
+    pub maintenance_resume_pct: f64,
+    pub maintenance_check_seconds: u64,
+    pub next_system: Option<String>,
+    pub controller: Option<String>,
+    pub drones: Vec<String>,
+    pub systems: Vec<String>,
+}
+
+fn summarize_plan(plan: &RoutePlan) -> SurveyPlanSummary {
+    SurveyPlanSummary {
+        replicant: plan.replicant.clone(),
+        vessel: plan.vessel.clone(),
+        center: plan.center.clone(),
+        radius_ly: plan.radius_ly,
+        completed_stops: plan.next_index.min(plan.route.len()),
+        total_stops: plan.route.len(),
+        phase: format!("{:?}", plan.phase),
+        route_distance_ly: plan.route.iter().map(|stop| stop.leg_distance_ly).sum(),
+        maintenance_home: plan.maintenance_home.clone(),
+        maintenance_interval: plan.maintenance_interval,
+        maintenance_threshold_pct: plan.maintenance_threshold_pct,
+        maintenance_resume_pct: plan.maintenance_resume_pct,
+        maintenance_check_seconds: plan.maintenance_check_seconds,
+        next_system: plan
+            .route
+            .get(plan.next_index)
+            .map(|stop| stop.star.clone()),
+        controller: plan.controller.clone(),
+        drones: plan.drones.clone(),
+        systems: plan.route.iter().map(|stop| stop.star.clone()).collect(),
+    }
+}
+
+/// Loads persisted survey mission state without starting a client.
+pub fn survey_status(path: &Path) -> AnyResult<SurveyPlanSummary> {
+    let mut plan: RoutePlan = serde_json::from_slice(&fs::read(path)?)?;
+    plan.migrate()?;
+    plan.normalize_progress();
+    Ok(summarize_plan(&plan))
+}
+
+/// Plans or executes a survey route with an existing managed client.
+pub async fn execute_survey_route(
+    client: &Client,
+    options: &SurveyOptions,
+) -> AnyResult<SurveyPlanSummary> {
+    validate_drone_codes(options.drones.as_deref())?;
+    let mut config = Config {
+        command: match options.mode {
+            SurveyMode::Plan => Command::Plan,
+            SurveyMode::Run => Command::Run,
+        },
+        replicant: options.replicant.clone(),
+        vessel: options.vessel.clone(),
+        center: options.center.to_ascii_uppercase(),
+        radius_ly: options.radius_ly,
+        system_limit: options.system_limit.max(1),
+        star_detail_concurrency: options.star_detail_concurrency.clamp(1, 16),
+        plan_path: options.mission_file.clone(),
+        controller_override: options.controller.clone(),
+        drone_overrides: options.drones.clone(),
+        replace_plan: options.replace_plan,
+        include_explored: options.include_explored,
+        travel_timeout: options.travel_timeout,
+        survey_timeout: options.survey_timeout,
+        maintenance_home: options.maintenance_home.to_ascii_uppercase(),
+        maintenance_interval: options.maintenance_interval.max(1),
+        maintenance_threshold_pct: options.maintenance_threshold_pct,
+        maintenance_resume_pct: options.maintenance_resume_pct,
+        maintenance_check_interval: options.maintenance_check_interval,
+    };
+    if options.mission_file.exists() && !options.replace_plan {
+        let mut saved: RoutePlan = serde_json::from_slice(&fs::read(&options.mission_file)?)?;
+        saved.migrate()?;
+        config.adopt_plan_identity(&saved);
+    }
+    let _lock = (options.mode == SurveyMode::Run)
+        .then(|| MissionLock::acquire(&options.mission_file))
+        .transpose()?;
+    run(client, &config).await?;
+    survey_status(&options.mission_file)
+}
+
+/// Inputs for invoking the durable survey-route workflow from another automation.
 #[derive(Clone, Debug)]
 pub struct SurveyRequest {
     /// Replicant code responsible for the survey.
@@ -5076,42 +4696,33 @@ pub struct SurveyReport {
 
 /// Creates or resumes a survey route using an already-running managed client.
 pub async fn execute_survey(client: &Client, request: &SurveyRequest) -> AnyResult<SurveyReport> {
-    validate_drone_codes(request.drones.as_deref())?;
-    let mut config = Config {
-        command: Command::Run,
-        database: PathBuf::new(),
-        replicant: request.replicant.clone(),
-        vessel: request.vessel.clone(),
-        center: request.center.to_ascii_uppercase(),
-        radius_ly: request.radius_ly,
-        system_limit: request.system_limit.max(1),
-        star_detail_concurrency: request.star_detail_concurrency.clamp(1, 16),
-        plan_path: request.mission_file.clone(),
-        log_path: None,
-        controller_override: request.controller.clone(),
-        drone_overrides: request.drones.clone(),
-        replace_plan: false,
-        include_explored: request.include_explored,
-        travel_timeout: request.travel_timeout,
-        survey_timeout: request.survey_timeout,
-        maintenance_home: request.center.to_ascii_uppercase(),
-        maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
-        maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
-        maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
-        maintenance_check_interval: DEFAULT_MAINTENANCE_CHECK_INTERVAL,
-        verbose: false,
-    };
-    if request.mission_file.exists() {
-        let mut saved: RoutePlan = serde_json::from_slice(&fs::read(&request.mission_file)?)?;
-        saved.migrate()?;
-        config.adopt_plan_identity(&saved);
-    }
-    let _lock = MissionLock::acquire(&request.mission_file)?;
-    run(client, &config).await?;
-    let mut plan: RoutePlan = serde_json::from_slice(&fs::read(&request.mission_file)?)?;
-    plan.migrate()?;
+    let summary = execute_survey_route(
+        client,
+        &SurveyOptions {
+            mode: SurveyMode::Run,
+            replicant: request.replicant.clone(),
+            vessel: request.vessel.clone(),
+            center: request.center.to_ascii_uppercase(),
+            radius_ly: request.radius_ly,
+            system_limit: request.system_limit.max(1),
+            star_detail_concurrency: request.star_detail_concurrency.clamp(1, 16),
+            mission_file: request.mission_file.clone(),
+            controller: request.controller.clone(),
+            drones: request.drones.clone(),
+            replace_plan: false,
+            include_explored: request.include_explored,
+            travel_timeout: request.travel_timeout,
+            survey_timeout: request.survey_timeout,
+            maintenance_home: request.center.to_ascii_uppercase(),
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            maintenance_threshold_pct: DEFAULT_MAINTENANCE_THRESHOLD_PCT,
+            maintenance_resume_pct: DEFAULT_MAINTENANCE_RESUME_PCT,
+            maintenance_check_interval: DEFAULT_MAINTENANCE_CHECK_INTERVAL,
+        },
+    )
+    .await?;
     Ok(SurveyReport {
-        systems: plan.route.into_iter().map(|stop| stop.star).collect(),
+        systems: summary.systems,
     })
 }
 
