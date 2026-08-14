@@ -35,3 +35,9 @@ mining-expansion*
 !cargo.lock
 *.log
 *.txt
+apps/web/node_modules/
+apps/web/dist/
+apps/web/*.tsbuildinfo
+!apps/web/package.json
+!apps/web/package-lock.json
+!apps/web/tsconfig.json

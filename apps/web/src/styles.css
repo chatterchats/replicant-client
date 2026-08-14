@@ -1,0 +1,231 @@
+:root {
+  color: #eff8f6;
+  background: #12201e;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+button,
+input {
+  font: inherit;
+}
+button {
+  color: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 260px 1fr;
+}
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  padding: 20px 16px;
+  border-right: 1px solid rgba(159, 188, 193, 0.16);
+  background: #12201e;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+.brand span:last-child {
+  display: grid;
+  gap: 2px;
+}
+.brand small,
+.status-bar small {
+  color: #9fb6b2;
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background: #41d4c8;
+  color: #062824;
+  font-weight: 800;
+}
+nav {
+  flex: 1;
+  overflow-y: auto;
+}
+nav section {
+  margin-bottom: 18px;
+}
+nav h2,
+.eyebrow {
+  margin: 0 10px 6px;
+  color: #78908c;
+  font-size: 0.67rem;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+nav button,
+.settings,
+.palette-results button {
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  padding: 8px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+nav button:hover,
+.settings:hover,
+nav button.active,
+.settings.active,
+.palette-results button:hover {
+  background: rgba(65, 212, 200, 0.12);
+  color: #83eee5;
+}
+.settings {
+  border-top: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 0;
+  padding-top: 16px;
+}
+main {
+  min-width: 0;
+  background:
+    radial-gradient(
+      circle at top right,
+      rgba(65, 212, 200, 0.08),
+      transparent 32%
+    ),
+    #12201e;
+}
+.status-bar {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 24px;
+  border-bottom: 1px solid rgba(159, 188, 193, 0.16);
+  color: #9fb6b2;
+}
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #78908c;
+}
+.status-dot.healthy {
+  background: #57d48b;
+  box-shadow: 0 0 12px rgba(87, 212, 139, 0.45);
+}
+.status-dot.degraded {
+  background: #f3b14f;
+}
+.status-dot.unhealthy,
+.status-dot.offline {
+  background: #ef6b7a;
+}
+.palette-trigger {
+  margin-left: auto;
+  border: 1px solid rgba(159, 188, 193, 0.2);
+  border-radius: 6px;
+  background: rgba(26, 48, 44, 0.75);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+kbd {
+  color: #9fb6b2;
+  font-size: 0.75rem;
+}
+.page {
+  max-width: 820px;
+  padding: 64px 48px;
+}
+.page .eyebrow {
+  margin-left: 0;
+  color: #41d4c8;
+}
+h1 {
+  margin: 8px 0 12px;
+  font-size: clamp(2rem, 5vw, 3.6rem);
+}
+.lede {
+  max-width: 620px;
+  color: #9fb6b2;
+  font-size: 1.08rem;
+  line-height: 1.65;
+}
+.connection-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-top: 36px;
+  padding: 20px;
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  background: #1a302c;
+}
+.connection-card .status-dot {
+  margin-top: 5px;
+  flex: 0 0 auto;
+}
+.connection-card p {
+  margin: 5px 0 0;
+  color: #9fb6b2;
+}
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding-top: 15vh;
+  background: rgba(3, 12, 11, 0.7);
+  backdrop-filter: blur(4px);
+}
+.palette {
+  width: min(520px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid rgba(159, 188, 193, 0.26);
+  border-radius: 10px;
+  background: #1a302c;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.5);
+}
+.palette input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid rgba(159, 188, 193, 0.16);
+  outline: 0;
+  background: transparent;
+  color: #eff8f6;
+  padding: 18px;
+}
+.palette-results {
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 8px;
+}
+.palette-results p {
+  padding: 10px;
+  color: #9fb6b2;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    display: none;
+  }
+  .page {
+    padding: 44px 24px;
+  }
+}

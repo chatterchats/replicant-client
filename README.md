@@ -215,6 +215,16 @@ let retrieval = client.devices().retrieve("LOCKER-CODE").await?;
 
 ## Development
 
+Run the local daemon and web development server in separate terminals:
+
+```sh
+RS_API_TOKEN=... cargo run -p replicant-server --bin replicantd
+npm --prefix apps/web install
+npm --prefix apps/web run dev
+```
+
+Frontend-only checks are available through `make web-check`.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings

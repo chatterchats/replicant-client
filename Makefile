@@ -1,8 +1,10 @@
 SHELL := /bin/sh
 CARGO ?= cargo
 PYTHON ?= python3
+NPM ?= npm
+WEB_DIR := apps/web
 
-.PHONY: help fmt fmt-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci zip
+.PHONY: help fmt fmt-check web-fmt web-fmt-check web-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci zip
 
 help:
 	@printf '%s\n' \
@@ -10,8 +12,9 @@ help:
 	  '' \
 	  'Usage: make <target>' \
 	  '' \
-	  'fmt                    		Format all Rust sources' \
-	  'fmt-check              		Verify formatting without modifying files' \
+	  'fmt                    		Format Rust and frontend sources' \
+	  'fmt-check              		Verify Rust and frontend formatting' \
+	  'web-check              		Run frontend format, lint, test, and build checks' \
 	  'lint                   		Run Clippy with warnings denied' \
 	  'test                   		Run tests with all features enabled' \
 	  'doc                    		Build docs with warnings denied' \
@@ -33,9 +36,20 @@ build-workspace:
 
 fmt:
 	$(CARGO) fmt --all
+	$(MAKE) web-fmt
 
 fmt-check:
 	$(CARGO) fmt --all -- --check
+	$(MAKE) web-fmt-check
+
+web-fmt:
+	$(NPM) --prefix $(WEB_DIR) run format
+
+web-fmt-check:
+	$(NPM) --prefix $(WEB_DIR) run format:check
+
+web-check:
+	$(NPM) --prefix $(WEB_DIR) run check
 
 lint:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
@@ -58,7 +72,7 @@ policy-checks: contract-policy-check
 	$(PYTHON) scripts/schema_policy_check.py
 	$(PYTHON) scripts/authority_matrix_check.py
 
-ci: fmt-check lint test check-all doc policy-checks
+ci: fmt-check lint test check-all doc policy-checks web-check
 
 zip:
 	$(PYTHON) scripts/repo_zip.py $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
