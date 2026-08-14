@@ -9,6 +9,7 @@ import {
   useNotifications,
   useWorkflows,
 } from "./daemon";
+import { AutomationsPage } from "./AutomationsPage";
 import type { EntityKind, WorkflowStatus } from "./protocol";
 import {
   initialShellState,
@@ -258,60 +259,65 @@ export function App() {
 
         <div className="workspace">
           <div className="content-column">
-            <article className="page">
-              <p className="eyebrow">{group}</p>
-              <h1>{shell.page}</h1>
-              <p className="lede">
-                Live application state is synchronized through the local daemon.
-              </p>
-              <section className="connection-card">
-                <span className={`status-dot ${status}`} aria-hidden="true" />
-                <div>
-                  <strong>Daemon connection</strong>
-                  <p>
-                    {health?.detail ??
-                      (connection === "offline"
-                        ? "Start replicantd to connect."
-                        : syncing
-                          ? "Synchronizing daemon state…"
-                          : "Daemon state is current.")}
-                  </p>
-                  {revision === null ? null : (
-                    <small>Revision {revision}</small>
-                  )}
-                </div>
-              </section>
-
-              {entityList.length || workflows.length ? (
-                <section className="entity-list" aria-label="Live entities">
-                  <h2>Live entities</h2>
+            {shell.page === "Automations" ? (
+              <AutomationsPage entities={entities} workflows={workflows} />
+            ) : (
+              <article className="page">
+                <p className="eyebrow">{group}</p>
+                <h1>{shell.page}</h1>
+                <p className="lede">
+                  Live application state is synchronized through the local
+                  daemon.
+                </p>
+                <section className="connection-card">
+                  <span className={`status-dot ${status}`} aria-hidden="true" />
                   <div>
-                    {entityList.map((entity) => (
-                      <button
-                        key={`${entity.kind}:${entity.id}`}
-                        onClick={() => {
-                          select(entity);
-                        }}
-                      >
-                        <small>{entity.kind}</small>
-                        {entity.id}
-                      </button>
-                    ))}
-                    {workflows.map((workflow) => (
-                      <button
-                        key={workflow.id}
-                        onClick={() => {
-                          select({ kind: "workflow", id: workflow.id });
-                        }}
-                      >
-                        <small>workflow · {workflow.status}</small>
-                        {workflow.kind}
-                      </button>
-                    ))}
+                    <strong>Daemon connection</strong>
+                    <p>
+                      {health?.detail ??
+                        (connection === "offline"
+                          ? "Start replicantd to connect."
+                          : syncing
+                            ? "Synchronizing daemon state…"
+                            : "Daemon state is current.")}
+                    </p>
+                    {revision === null ? null : (
+                      <small>Revision {revision}</small>
+                    )}
                   </div>
                 </section>
-              ) : null}
-            </article>
+
+                {entityList.length || workflows.length ? (
+                  <section className="entity-list" aria-label="Live entities">
+                    <h2>Live entities</h2>
+                    <div>
+                      {entityList.map((entity) => (
+                        <button
+                          key={`${entity.kind}:${entity.id}`}
+                          onClick={() => {
+                            select(entity);
+                          }}
+                        >
+                          <small>{entity.kind}</small>
+                          {entity.id}
+                        </button>
+                      ))}
+                      {workflows.map((workflow) => (
+                        <button
+                          key={workflow.id}
+                          onClick={() => {
+                            select({ kind: "workflow", id: workflow.id });
+                          }}
+                        >
+                          <small>workflow · {workflow.status}</small>
+                          {workflow.kind}
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
+              </article>
+            )}
           </div>
 
           {shell.inspectorOpen && shell.selectedEntity ? (

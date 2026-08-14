@@ -57,6 +57,58 @@ export interface WorkflowSummary {
   updated_at_ms: number;
 }
 
+export type ParameterKind =
+  | { type: "string" | "integer" | "number" | "boolean" | "enum" }
+  | {
+      type:
+        "system" | "location" | "replicant" | "device" | "device_type" | "tag";
+    }
+  | { type: "entity"; entity_kind: EntityKind };
+
+export interface ParameterDescriptor {
+  name: string;
+  label: string;
+  description: string;
+  kind: ParameterKind;
+  required: boolean;
+  default: unknown;
+  options: { value: string; label: string }[];
+  validation: {
+    minimum: number | null;
+    maximum: number | null;
+    min_length: number | null;
+    max_length: number | null;
+  };
+}
+
+export interface WorkflowDescriptor {
+  kind: string;
+  display_name: string;
+  description: string;
+  category: string;
+  risk: "none" | "low" | "elevated";
+  parameters: ParameterDescriptor[];
+  supported_triggers: (
+    "manual" | "schedule" | "game_event" | "state_condition" | "parent_workflow"
+  )[];
+}
+
+export interface DescriptorCatalog {
+  workflows: WorkflowDescriptor[];
+}
+
+export interface WorkflowDetail {
+  summary: WorkflowSummary;
+  schema_version: number;
+  parameters: Record<string, unknown>;
+  wait_reason: string | null;
+  parent_id: string | null;
+  claims: EntityRef[];
+  created_at_ms: number;
+  finished_at_ms: number | null;
+  error: string | null;
+}
+
 export interface RuntimeSnapshot {
   metadata: SnapshotMetadata;
   sync: RuntimeSyncStatus;
@@ -147,6 +199,13 @@ function number(value: unknown, name: string): number {
   return value;
 }
 
+function optionalFiniteNumber(value: unknown, name: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value))
+    throw new Error(`Invalid ${name}`);
+  return value;
+}
+
 const healthStatuses = ["healthy", "degraded", "unhealthy"] as const;
 const syncPhases = [
   "starting",
@@ -228,6 +287,128 @@ function workflow(value: unknown): WorkflowSummary {
     current_step: nullableString(item.current_step, "workflow step"),
     revision: number(item.revision, "workflow revision"),
     updated_at_ms: number(item.updated_at_ms, "workflow update time"),
+  };
+}
+
+function parameter(value: unknown): ParameterDescriptor {
+  const item = record(value, "parameter descriptor");
+  const rawKind = record(item.kind, "parameter kind");
+  const kindType = oneOf(
+    rawKind.type,
+    [
+      "string",
+      "integer",
+      "number",
+      "boolean",
+      "enum",
+      "system",
+      "location",
+      "replicant",
+      "device",
+      "device_type",
+      "tag",
+      "entity",
+    ] as const,
+    "parameter kind",
+  );
+  const kind: ParameterKind =
+    kindType === "entity"
+      ? {
+          type: kindType,
+          entity_kind: oneOf(
+            rawKind.entity_kind,
+            entityKinds,
+            "parameter entity kind",
+          ),
+        }
+      : { type: kindType };
+  if (
+    typeof item.name !== "string" ||
+    typeof item.label !== "string" ||
+    typeof item.description !== "string" ||
+    typeof item.required !== "boolean" ||
+    !Array.isArray(item.options)
+  )
+    throw new Error("Invalid parameter descriptor");
+  const validation = record(item.validation, "parameter validation");
+  return {
+    name: item.name,
+    label: item.label,
+    description: item.description,
+    kind,
+    required: item.required,
+    default: item.default,
+    options: item.options.map((option) => {
+      const value = record(option, "parameter option");
+      if (typeof value.value !== "string" || typeof value.label !== "string")
+        throw new Error("Invalid parameter option");
+      return { value: value.value, label: value.label };
+    }),
+    validation: {
+      minimum: optionalFiniteNumber(validation.minimum, "parameter minimum"),
+      maximum: optionalFiniteNumber(validation.maximum, "parameter maximum"),
+      min_length:
+        validation.min_length === null
+          ? null
+          : number(validation.min_length, "parameter minimum length"),
+      max_length:
+        validation.max_length === null
+          ? null
+          : number(validation.max_length, "parameter maximum length"),
+    },
+  };
+}
+
+function descriptor(value: unknown): WorkflowDescriptor {
+  const item = record(value, "workflow descriptor");
+  if (
+    typeof item.kind !== "string" ||
+    typeof item.display_name !== "string" ||
+    typeof item.description !== "string" ||
+    typeof item.category !== "string" ||
+    !Array.isArray(item.parameters) ||
+    !Array.isArray(item.supported_triggers)
+  )
+    throw new Error("Invalid workflow descriptor");
+  return {
+    kind: item.kind,
+    display_name: item.display_name,
+    description: item.description,
+    category: item.category,
+    risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
+    parameters: item.parameters.map(parameter),
+    supported_triggers: item.supported_triggers.map((trigger) =>
+      oneOf(
+        trigger,
+        [
+          "manual",
+          "schedule",
+          "game_event",
+          "state_condition",
+          "parent_workflow",
+        ] as const,
+        "workflow trigger",
+      ),
+    ),
+  };
+}
+
+function workflowDetail(value: unknown): WorkflowDetail {
+  const item = record(value, "workflow detail");
+  if (!Array.isArray(item.claims)) throw new Error("Invalid workflow claims");
+  return {
+    summary: workflow(item.summary),
+    schema_version: number(item.schema_version, "workflow schema version"),
+    parameters: record(item.parameters, "workflow parameters"),
+    wait_reason: nullableString(item.wait_reason, "workflow wait reason"),
+    parent_id: nullableString(item.parent_id, "workflow parent"),
+    claims: item.claims.map(entity),
+    created_at_ms: number(item.created_at_ms, "workflow creation time"),
+    finished_at_ms:
+      item.finished_at_ms === null
+        ? null
+        : number(item.finished_at_ms, "workflow finish time"),
+    error: nullableString(item.error, "workflow error"),
   };
 }
 
@@ -318,6 +499,42 @@ export function parseSnapshotResponse(
       sync: sync(item.sync),
       workflows: item.workflows.map(workflow),
     };
+  });
+}
+
+export function parseDescriptorsResponse(
+  value: unknown,
+): Versioned<DescriptorCatalog> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "descriptor catalog");
+    if (!Array.isArray(item.workflows))
+      throw new Error("Invalid workflow descriptors");
+    return { workflows: item.workflows.map(descriptor) };
+  });
+}
+
+export function parseWorkflowResponse(
+  value: unknown,
+): Versioned<WorkflowSummary> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "workflow response");
+    return workflow(item.workflow);
+  });
+}
+
+export function parseWorkflowDetailResponse(
+  value: unknown,
+): Versioned<WorkflowDetail> {
+  return envelope(value, workflowDetail);
+}
+
+export function parseWorkflowActivityResponse(
+  value: unknown,
+): Versioned<WorkflowActivity[]> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "workflow activity response");
+    if (!Array.isArray(item.activity)) throw new Error("Invalid activity list");
+    return item.activity.map(activity);
   });
 }
 
