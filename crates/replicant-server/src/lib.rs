@@ -1197,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_routes_create_list_pause_and_report_stable_errors() {
-        let (app, client, _) = test_app().await;
+        let (app, client, state) = test_app().await;
         let body = serde_json::json!({
             "kind": "relay.expansion",
             "parameters": {
@@ -1222,6 +1222,11 @@ mod tests {
         let id = created["payload"]["workflow"]["id"]
             .as_str()
             .expect("workflow id");
+        assert_eq!(
+            state.repository.list().expect("persisted workflows").len(),
+            1,
+            "the daemon retains workflow ownership after the start request ends"
+        );
 
         let response = app
             .clone()

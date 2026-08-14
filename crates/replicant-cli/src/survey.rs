@@ -1,5 +1,6 @@
-use std::{env, fs, io, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, env, fs, io, path::PathBuf, time::Duration};
 
+use replicant_protocol::{OperationKind, StartWorkflowRequest};
 pub use replicant_runtime::survey::{SurveyRequest, execute_survey};
 use replicant_runtime::{
     config::ManagedClientConfig,
@@ -26,13 +27,26 @@ struct Config {
     options: SurveyOptions,
     log_path: Option<PathBuf>,
     verbose: bool,
+    direct: bool,
 }
 
 pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
+    let standalone_option = arguments
+        .iter()
+        .find(|argument| matches!(argument.as_str(), "--database" | "--verbose" | "--log-file"))
+        .cloned();
     let config = parse(arguments)?;
     if matches!(config.command, Command::Status) {
         print_plan(&survey_status(&config.options.mission_file)?);
         return Ok(());
+    }
+    if !config.direct {
+        if let Some(option) = standalone_option {
+            return Err(crate::app_error(format!(
+                "{option} configures standalone execution; use --direct or configure replicantd"
+            )));
+        }
+        return crate::workflow::submit(workflow_request(&config.options)?).await;
     }
     if matches!(config.command, Command::Run) && !config.options.mission_file.exists() {
         return Err(app_error(
@@ -118,8 +132,10 @@ fn parse(arguments: Vec<String>) -> crate::AnyResult<Config> {
     let mut maintenance_check_interval =
         Duration::from_secs(env_u64("RS_EXPLORE_MAINTENANCE_CHECK_SECS", 900)?);
     let mut verbose = env_bool("RS_EXPLORE_VERBOSE", false)?;
+    let mut direct = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--direct" => direct = true,
             "--database" => database = required_path(&mut arguments, "--database")?,
             "--replicant" => replicant = required(&mut arguments, "--replicant")?,
             "--vessel" => vessel = required(&mut arguments, "--vessel")?,
@@ -257,6 +273,65 @@ fn parse(arguments: Vec<String>) -> crate::AnyResult<Config> {
         },
         log_path,
         verbose,
+        direct,
+    })
+}
+
+fn workflow_request(options: &SurveyOptions) -> crate::AnyResult<StartWorkflowRequest> {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("mode".into(), serde_json::to_value(options.mode)?);
+    parameters.insert("replicant".into(), options.replicant.clone().into());
+    parameters.insert("vessel".into(), options.vessel.clone().into());
+    parameters.insert("center".into(), options.center.clone().into());
+    parameters.insert("radius_ly".into(), options.radius_ly.into());
+    parameters.insert("system_limit".into(), options.system_limit.into());
+    parameters.insert(
+        "star_detail_concurrency".into(),
+        options.star_detail_concurrency.into(),
+    );
+    parameters.insert(
+        "mission_file".into(),
+        options.mission_file.to_string_lossy().into_owned().into(),
+    );
+    if let Some(controller) = &options.controller {
+        parameters.insert("controller".into(), controller.clone().into());
+    }
+    if let Some(drones) = &options.drones {
+        parameters.insert("drones_csv".into(), drones.join(",").into());
+    }
+    parameters.insert("replace_plan".into(), options.replace_plan.into());
+    parameters.insert("include_explored".into(), options.include_explored.into());
+    parameters.insert(
+        "travel_timeout_seconds".into(),
+        options.travel_timeout.as_secs().into(),
+    );
+    parameters.insert(
+        "survey_timeout_seconds".into(),
+        options.survey_timeout.as_secs().into(),
+    );
+    parameters.insert(
+        "maintenance_home".into(),
+        options.maintenance_home.clone().into(),
+    );
+    parameters.insert(
+        "maintenance_interval".into(),
+        options.maintenance_interval.into(),
+    );
+    parameters.insert(
+        "maintenance_threshold_pct".into(),
+        options.maintenance_threshold_pct.into(),
+    );
+    parameters.insert(
+        "maintenance_resume_pct".into(),
+        options.maintenance_resume_pct.into(),
+    );
+    parameters.insert(
+        "maintenance_check_seconds".into(),
+        options.maintenance_check_interval.as_secs().into(),
+    );
+    Ok(StartWorkflowRequest {
+        kind: OperationKind("survey.route".to_owned()),
+        parameters,
     })
 }
 
@@ -452,6 +527,27 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> crate::AnyError
 }
 fn print_help() {
     println!(
-        "Replicant survey route\n\nUsage:\n  replicant-cli survey --plan [OPTIONS]\n  replicant-cli survey --run [OPTIONS]\n  replicant-cli survey --status [OPTIONS]"
+        "Replicant survey route\n\nUsage:\n  replicant-cli survey --plan [OPTIONS]\n  replicant-cli survey --run [OPTIONS]\n  replicant-cli survey --status [OPTIONS]\n\nPlan and run submit durable replicantd workflows by default. Use --direct for\ndiagnostic standalone execution with a local managed client."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_request_contains_typed_survey_options() {
+        let config = parse(vec![
+            "run".into(),
+            "--replicant".into(),
+            "TEST-1".into(),
+            "--system-limit".into(),
+            "12".into(),
+        ])
+        .expect("config");
+        let request = workflow_request(&config.options).expect("request");
+        assert_eq!(request.kind.0, "survey.route");
+        assert_eq!(request.parameters["replicant"], "TEST-1");
+        assert_eq!(request.parameters["system_limit"], 12);
+    }
 }

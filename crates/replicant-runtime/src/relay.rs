@@ -343,7 +343,7 @@ fn print_help() {
     println!(
         "FTL relay expansion\n\n\
 Usage:\n  replicant-cli relay plan [OPTIONS] SYSTEM ...\n  replicant-cli relay run [OPTIONS]\n  replicant-cli relay status [OPTIONS]\n\n\
-Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               New FTL relay range (default: 7.499); existing relay-capable devices use advertised ranges\n  --reuse-account-relays     Reuse disconnected account relay islands too\n  --ignore-printer CODE      Exclude an Autofactory from relay print assignment; repeatable and comma-separated\n  --supply-strategy MODE     auto, staged, minimal, or hub (default: auto)\n  --wait-timeout-secs N      Per-phase timeout\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
+Options:\n  --replace-plan             Replace the saved plan\n  --replicant NAME_OR_CODE   Transport replicant (default: Chats-1)\n  --hub LOCATION             Manufacturing hub (default: SCEPTURUM-BELT-1)\n  --plan PATH                Saved mission plan\n  --database PATH            Managed SQLite database\n  --max-hop LY               New FTL relay range (default: 7.499); existing relay-capable devices use advertised ranges\n  --reuse-account-relays     Reuse disconnected account relay islands too\n  --ignore-printer CODE      Exclude an Autofactory from relay print assignment; repeatable and comma-separated\n  --supply-strategy MODE     auto, staged, minimal, or hub (default: auto)\n  --wait-timeout-secs N      Per-phase timeout\n  --direct                   Run locally instead of submitting run to replicantd\n  --verbose                  Show tracing logs in the terminal\n  --log-file PATH            Append tracing logs to a file\n  -h, --help                 Show this help\n\n\
 Targets are system designations, not planet locations. Plan is read-only. Run\n\
 always reconciles and continues the persisted mission; there is no separate\n\
 resume command or --execute confirmation."
@@ -4863,6 +4863,25 @@ pub struct RelayExpansionRequest {
     pub max_hop_ly: f64,
     /// Maximum wait for printing, travel, or activation evidence.
     pub wait_timeout: Duration,
+}
+
+/// Parses the existing relay CLI contract into a daemon workflow request.
+pub fn relay_workflow_request(arguments: Vec<String>) -> AnyResult<RelayExpansionRequest> {
+    let config = Config::from_args_and_env(arguments)?;
+    if config.command != Command::Run {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "only relay run is a durable daemon workflow",
+        ));
+    }
+    Ok(RelayExpansionRequest {
+        replicant: config.replicant,
+        hub: config.hub,
+        targets: config.targets,
+        mission_file: config.plan_path,
+        max_hop_ly: config.max_hop_ly,
+        wait_timeout: config.wait_timeout,
+    })
 }
 
 /// Summary returned after a reusable relay expansion completes.

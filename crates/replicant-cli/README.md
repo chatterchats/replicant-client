@@ -26,6 +26,8 @@ cargo build -p replicant-cli
 | Command | Operations | Purpose |
 | --- | --- | --- |
 | `interactive` | — | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup. |
+| `daemon` | — | Show local `replicantd` health. |
+| `workflow` | `list`, `inspect`, `start`, `pause`, `resume`, `cancel` | Control durable workflows owned by `replicantd`. |
 | `print` | `queue`, `status`, `clear` | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
 | `transport` | `--plan` or execute | Deliver resources and devices between locations. |
 | `survey` | `plan`, `run`, `status` | Plan and execute durable survey routes. |
@@ -39,6 +41,30 @@ cargo build -p replicant-cli
 
 Stateful commands accept an operation word or its flag form. For example,
 `survey plan` and `survey --plan` are equivalent.
+
+Survey `plan`/`run` and Relay `run` submit a durable workflow to
+`replicantd` and return immediately; exiting the CLI does not stop it. Use
+`--direct` only for deliberate standalone diagnostics or compatibility.
+`REPLICANTD_URL` defaults to `http://127.0.0.1:8080`.
+
+```sh
+cargo run -p replicant-server --bin replicantd
+cargo run -p replicant-cli -- daemon
+cargo run -p replicant-cli -- workflow list
+cargo run -p replicant-cli -- workflow inspect WORKFLOW_ID
+cargo run -p replicant-cli -- workflow pause WORKFLOW_ID
+cargo run -p replicant-cli -- workflow resume WORKFLOW_ID
+cargo run -p replicant-cli -- workflow cancel WORKFLOW_ID
+```
+
+Generic workflow submission accepts typed `NAME=VALUE` parameters. JSON
+scalars, arrays, and objects retain their types; other values are strings:
+
+```sh
+cargo run -p replicant-cli -- workflow start relay.expansion \
+  replicant=Chats-1 hub=SCEPTURUM-BELT-1 targets_csv=THYFFAWFF \
+  mission_file=ftl-relay-expansion.json
+```
 
 ### Interactive command builder
 
@@ -140,10 +166,9 @@ each command documents its current flags and defaults.
 
 ## State and recovery
 
-Managed state defaults to `replicant-client.sqlite`. Long-running workflows
-also write mission JSON. SQLite records normalized observations and durable
-operation outcomes; mission files record workflow phases. Keep both when
-backing up or moving active work.
+`replicantd` owns the normal long-running managed client and durable workflow
+supervisor. Managed state defaults to `replicant-client.sqlite`; the runtime
+database and mission files must also be retained when backing up active work.
 
 Planning commands do not perform gameplay mutations. `deliver` reconciles a saved
 bootstrap mission through arrival at its landing entry and stops before regional
