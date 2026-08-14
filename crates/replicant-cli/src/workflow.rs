@@ -61,6 +61,28 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     Ok(())
 }
 
+fn find_descriptor(catalogue: &DescriptorCatalog, kind: &str) -> Option<Value> {
+    catalogue
+        .reports
+        .iter()
+        .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+        .and_then(|item| serde_json::to_value(item).ok())
+        .or_else(|| {
+            catalogue
+                .actions
+                .iter()
+                .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+                .and_then(|item| serde_json::to_value(item).ok())
+        })
+        .or_else(|| {
+            catalogue
+                .workflows
+                .iter()
+                .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+                .and_then(|item| serde_json::to_value(item).ok())
+        })
+}
+
 fn render_catalogue(catalogue: &DescriptorCatalog) -> String {
     let mut output = String::new();
     for (class, entries) in [
@@ -131,6 +153,14 @@ pub(crate) async fn run_operation_cli(arguments: Vec<String>) -> crate::AnyResul
                 "{}",
                 render_catalogue(&DaemonClient::from_env().descriptors().await?)
             );
+        }
+        Some("describe" | "help") => {
+            let kind = required(&mut arguments, "operation describe KIND")?;
+            reject_extra(arguments)?;
+            let catalogue = DaemonClient::from_env().descriptors().await?;
+            let descriptor = find_descriptor(&catalogue, &kind)
+                .ok_or_else(|| crate::app_error(format!("unknown operation kind {kind:?}")))?;
+            println!("{}", serde_json::to_string_pretty(&descriptor)?);
         }
         Some(class @ ("report" | "action")) => {
             let kind = required(
@@ -302,6 +332,7 @@ fn print_operation_help() {
     println!(
         "Daemon operation catalogue\n\n\
 Usage:\n  replicant-cli operation catalogue\n  replicant-cli operation report KIND [NAME=VALUE ...]\n  replicant-cli operation action KIND [NAME=VALUE ...]\n\n\
+  replicant-cli operation help KIND\n\n\
 Kinds may use catalogue aliases. Values accept JSON scalars, arrays, and objects; unquoted values are strings.\n\
 Set REPLICANTD_URL to override http://127.0.0.1:8080."
     );
@@ -364,5 +395,15 @@ mod tests {
         ] {
             assert!(rendered.contains(expected));
         }
+    }
+
+    #[test]
+    fn descriptor_help_resolves_catalogue_aliases() {
+        let catalogue =
+            replicant_runtime::catalogue::OperationCatalogue::new().expect("operation catalogue");
+        let descriptor =
+            find_descriptor(catalogue.descriptors(), "nearby_belt_report").expect("legacy alias");
+        assert_eq!(descriptor["kind"], "nearby_belts");
+        assert_eq!(descriptor["operation_class"], "report");
     }
 }

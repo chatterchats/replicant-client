@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use replicant_protocol::{OperationKind, StartWorkflowRequest};
 
-pub(crate) use replicant_runtime::relay::{RelayExpansionRequest, execute_expansion};
+use replicant_runtime::relay::RelayExpansionRequest;
 
 /// Runs the relay command through the reusable runtime service.
 pub(crate) async fn run_cli(mut arguments: Vec<String>) -> crate::AnyResult<()> {

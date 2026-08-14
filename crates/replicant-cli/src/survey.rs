@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, env, fs, io, path::PathBuf, time::Duration};
 
 use replicant_protocol::{OperationKind, StartWorkflowRequest};
-pub use replicant_runtime::survey::{SurveyRequest, execute_survey};
 use replicant_runtime::{
     config::ManagedClientConfig,
     start_managed_client,

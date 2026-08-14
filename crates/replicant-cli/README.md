@@ -1,8 +1,9 @@
 # replicant-cli
 
-`replicant-cli` is the workspace's single user-facing command for Replicant
-Space automation. It combines the local client, planners, printing, and
-transport packages into restart-safe workflows.
+`replicant-cli` is a frontend for the reusable Replicant application crates.
+It parses commands, renders results, and dispatches durable work to
+`replicantd`; gameplay algorithms remain in runtime, planner, report, and
+action libraries.
 
 The binary is not published. Run it from the repository root.
 
@@ -27,7 +28,7 @@ cargo build -p replicant-cli
 | --- | --- | --- |
 | `interactive` | — | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup. |
 | `daemon` | — | Show local `replicantd` health. |
-| `operation` | `catalogue`, `report`, `action` | Discover and run registered capabilities through `replicantd`. |
+| `operation` | `catalogue`, `help`, `report`, `action` | Discover and run registered capabilities through `replicantd`. |
 | `workflow` | `list`, `inspect`, `start`, `pause`, `resume`, `cancel` | Control durable workflows owned by `replicantd`. |
 | `print` | `queue`, `status`, `clear` | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
 | `transport` | `--plan` or execute | Deliver resources and devices between locations. |
@@ -72,6 +73,7 @@ familiar legacy example names as aliases:
 
 ```sh
 cargo run -p replicant-cli -- operation catalogue
+cargo run -p replicant-cli -- operation help nearby_belts
 cargo run -p replicant-cli -- operation report nearby_belt_report \
   origin=SCEPTURUM radius_ly=25
 cargo run -p replicant-cli -- operation action clear_tags \
@@ -79,6 +81,12 @@ cargo run -p replicant-cli -- operation action clear_tags \
 ```
 
 Use `dry_run=true` before reviewing a mutating action.
+
+Specialized commands preserve their established syntax. Survey planning/runs
+and Relay runs use `replicantd` by default; `--direct` selects deliberate local
+diagnostic execution. Other compatibility commands still call their owning
+reusable service directly where no daemon descriptor exists; they do not own
+the underlying gameplay implementation.
 
 ### Interactive command builder
 

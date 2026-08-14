@@ -9,12 +9,13 @@ use std::{
 use replicant_mining_planner::QuantityMap;
 use replicant_runtime::{
     config::ManagedClientConfig,
-    mining::{MiningMission, RoutePhase, SitePhase, load_expansion, plan_expansion},
+    mining::{
+        MiningExpansionRequest, MiningMission, RoutePhase, SitePhase, execute_expansion,
+        load_expansion, plan_expansion,
+    },
     start_managed_client,
 };
 use tracing_subscriber::{EnvFilter, prelude::*};
-
-pub(crate) use replicant_runtime::mining::{MiningExpansionRequest, execute_expansion};
 
 const DEFAULT_REPLICANT: &str = "Chats-1";
 const DEFAULT_HUB: &str = "SCEPTURUM-BELT-1";
