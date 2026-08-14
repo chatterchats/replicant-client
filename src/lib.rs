@@ -105,7 +105,7 @@ pub mod managed {
         Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
-    pub use state::{StateGateway, StateRevisionWatch};
+    pub use state::{GalaxyRevisionWatch, StateGateway, StateRevisionWatch};
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind,
         SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
@@ -120,12 +120,13 @@ pub use managed::{
     ClientBuilder, ClientDegradation, ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery,
     DeviceQueryChange, DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway,
     DirectoryGateway, DynamicCommand, EventCatchUpReport, EventHistoryQuery, EventStreamOptions,
-    EventWatch, EventsGateway, FleetController, GalaxyGateway, InventoryGateway,
-    LocationDiagnostic, LocationEventsGateway, LocationHydration, LocationHydrationFailure,
-    LocationHydrationReport, LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
-    LocationQueryDiagnostics, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
-    Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
-    ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
+    EventWatch, EventsGateway, FleetController, GalaxyGateway, GalaxyRevisionWatch,
+    InventoryGateway, LocationDiagnostic, LocationEventsGateway, LocationHydration,
+    LocationHydrationFailure, LocationHydrationReport, LocationPredicateDiagnostic,
+    LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, LocationsGateway,
+    MessagesGateway, MiningController, MiningDirective, Operation, OperationOutcome,
+    OperationStatus, OperationWatch, OperationsGateway, Readiness, ReadinessComponent,
+    ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
     ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
     StateGateway, StateRevisionWatch, SurveyController, SurveyDirective, SyncCancellation,
     SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,

@@ -24,7 +24,7 @@ use axum::{
     routing::{get, post},
 };
 use replicant_client::{
-    ClientStatus,
+    ClientDegradation, ClientStatus,
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
@@ -207,7 +207,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Runs periodic persisted-workflow reconciliation until shutdown.
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
-    let mut revisions = state.client().state().watch().ok();
+    let mut revisions = state.client().state().watch_galaxy().ok();
     let mut operations = state.client().operations().watch().ok();
     let mut workflows = state
         .repository
@@ -322,6 +322,7 @@ async fn live_connection(mut socket: WebSocket, state: Arc<AppState>) {
     let Ok(initial) = state.resnapshot_message() else {
         return;
     };
+    let initial_revision = initial.revision;
     if send_live(&mut socket, initial).await.is_err() {
         return;
     }
@@ -332,6 +333,7 @@ async fn live_connection(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         tokio::select! {
             update = updates.recv() => match update {
+                Ok(update) if update.revision <= initial_revision => {}
                 Ok(update) => if send_live(&mut socket, update).await.is_err() { break; },
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if let Ok(message) = state.resnapshot_message() {
@@ -761,6 +763,12 @@ fn status_detail(status: &ClientStatus) -> Option<&'static str> {
         ClientStatus::Starting | ClientStatus::Restoring => Some("managed state is restoring"),
         ClientStatus::CatchingUp | ClientStatus::Synchronizing | ClientStatus::Connecting => {
             Some("managed synchronization is in progress")
+        }
+        ClientStatus::Degraded(ClientDegradation::StartupIncomplete) => {
+            Some("managed startup synchronization is incomplete")
+        }
+        ClientStatus::Degraded(ClientDegradation::EventContinuity) => {
+            Some("managed event continuity is degraded")
         }
         ClientStatus::Degraded(_) => Some("managed synchronization is degraded"),
         ClientStatus::Offline => Some("managed client is offline"),
@@ -1539,5 +1547,19 @@ mod tests {
     #[test]
     fn default_bind_is_loopback() {
         assert!(is_loopback(DEFAULT_BIND.parse().expect("default bind")));
+    }
+
+    #[test]
+    fn degraded_health_identifies_the_managed_failure() {
+        assert_eq!(
+            status_detail(&ClientStatus::Degraded(
+                ClientDegradation::StartupIncomplete
+            )),
+            Some("managed startup synchronization is incomplete")
+        );
+        assert_eq!(
+            status_detail(&ClientStatus::Degraded(ClientDegradation::EventContinuity)),
+            Some("managed event continuity is degraded")
+        );
     }
 }

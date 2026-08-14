@@ -35,12 +35,52 @@ impl StateGateway {
         Ok(self.client.managed_state().snapshot().revision())
     }
 
+    /// Returns the revision of projections used by the galaxy scene.
+    pub fn galaxy_revision(&self) -> crate::Result<u64> {
+        self.client.ensure_open()?;
+        Ok(self.client.managed_state().snapshot().galaxy_revision())
+    }
+
     /// Watches coalesced local revisions. This never performs network I/O.
     pub fn watch(&self) -> crate::Result<StateRevisionWatch> {
         self.client.ensure_open()?;
         Ok(StateRevisionWatch {
             receiver: self.client.managed_state().subscribe(),
         })
+    }
+
+    /// Watches only revisions that can change the rendered galaxy scene.
+    pub fn watch_galaxy(&self) -> crate::Result<GalaxyRevisionWatch> {
+        self.client.ensure_open()?;
+        let receiver = self.client.managed_state().subscribe();
+        let last_seen = receiver.borrow().galaxy_revision();
+        Ok(GalaxyRevisionWatch {
+            receiver,
+            last_seen,
+        })
+    }
+}
+
+/// Coalescing subscription for managed projections used by the galaxy scene.
+pub struct GalaxyRevisionWatch {
+    receiver: watch::Receiver<Arc<StateSnapshot>>,
+    last_seen: u64,
+}
+
+impl GalaxyRevisionWatch {
+    /// Waits for the next committed galaxy-scene revision.
+    pub async fn next(&mut self) -> crate::Result<u64> {
+        loop {
+            self.receiver
+                .changed()
+                .await
+                .map_err(|_| crate::Error::Closed)?;
+            let revision = self.receiver.borrow_and_update().galaxy_revision();
+            if revision != self.last_seen {
+                self.last_seen = revision;
+                return Ok(revision);
+            }
+        }
     }
 }
 
@@ -75,6 +115,7 @@ fn same_projected_observation<T: PartialEq>(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StateSnapshot {
     revision: u64,
+    galaxy_revision: u64,
     devices: BTreeMap<DeviceKey, Observation<Device>>,
     account: Option<Observation<Account>>,
     replicants: BTreeMap<ReplicantKey, Observation<Replicant>>,
@@ -93,6 +134,10 @@ struct GalaxySnapshot {
 impl StateSnapshot {
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn galaxy_revision(&self) -> u64 {
+        self.galaxy_revision
     }
 
     pub(crate) fn devices(&self) -> &BTreeMap<DeviceKey, Observation<Device>> {
@@ -141,6 +186,7 @@ impl StateEngine {
         })?;
         let snapshot = Arc::new(StateSnapshot {
             revision: 0,
+            galaxy_revision: 0,
             devices,
             account,
             replicants,
@@ -262,6 +308,12 @@ impl StateEngine {
                 }
             })
             .collect::<Vec<_>>();
+        let galaxy_changed = stars.len() != existing.len()
+            || stars.iter().any(|star| {
+                existing
+                    .get(&star.value.key)
+                    .is_none_or(|current| current.value != star.value)
+            });
         self.store
             .lock()
             .as_mut()
@@ -278,6 +330,7 @@ impl StateEngine {
         *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
+        snapshot.galaxy_revision += u64::from(galaxy_changed);
         self.publish(snapshot);
         Ok(())
     }
@@ -322,6 +375,15 @@ impl StateEngine {
                 }
             })
             .collect::<Vec<_>>();
+        let galaxy_changed = knowledge.iter().any(|observation| {
+            let key = (
+                observation.value.replicant.clone(),
+                observation.value.star.clone(),
+            );
+            existing
+                .get(&key)
+                .is_none_or(|current| current.value != observation.value)
+        });
 
         self.store
             .lock()
@@ -345,6 +407,7 @@ impl StateEngine {
 
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
+        snapshot.galaxy_revision += u64::from(galaxy_changed);
         self.publish(snapshot);
         Ok(())
     }
@@ -362,6 +425,7 @@ impl StateEngine {
         let previous = self.snapshot();
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision,
             devices: previous.devices.clone(),
             account: Some(account),
             replicants: previous.replicants.clone(),
@@ -382,11 +446,16 @@ impl StateEngine {
             .ok_or(StoreError::Closed)?
             .persist_replicant(&replicant)?;
         let previous = self.snapshot();
+        let galaxy_changed = previous
+            .replicants
+            .get(&replicant.value.key)
+            .is_none_or(|current| !same_projected_observation(current, &replicant));
         let mut replicants = previous.replicants.clone();
         replicants.insert(replicant.value.key.clone(), replicant);
         let simulations = previous.simulations.clone();
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + u64::from(galaxy_changed),
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants,
@@ -421,6 +490,7 @@ impl StateEngine {
         simulations.insert(simulation.value.id, simulation);
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -452,6 +522,7 @@ impl StateEngine {
         simulations.insert(simulation.value.id, simulation);
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + u64::from(!devices.is_empty()),
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -481,6 +552,7 @@ impl StateEngine {
         }
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + 1,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -506,6 +578,7 @@ impl StateEngine {
         inventories.insert(inventory.value.owner.clone(), inventory);
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -536,6 +609,7 @@ impl StateEngine {
         locations.insert(location.value.key.clone(), location);
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -652,6 +726,7 @@ impl StateEngine {
         }
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision,
             devices: previous.devices.clone(),
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -686,6 +761,7 @@ impl StateEngine {
         }
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + 1,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -968,6 +1044,7 @@ impl StateEngine {
             // spin; the newer observation time still protects merge ordering.
             let next = Arc::new(StateSnapshot {
                 revision: previous.revision,
+                galaxy_revision: previous.galaxy_revision,
                 devices: next_devices,
                 account: previous.account.clone(),
                 replicants: previous.replicants.clone(),
@@ -984,6 +1061,7 @@ impl StateEngine {
 
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + 1,
             devices: next_devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -1012,9 +1090,13 @@ impl StateEngine {
                     || observation.metadata.access != crate::domain::AccessScope::Owned
             })
             .map(|(key, observation)| (key.clone(), observation.clone()))
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        if devices == previous.devices {
+            return Ok(previous);
+        }
         Ok(self.publish(StateSnapshot {
             revision: previous.revision + 1,
+            galaxy_revision: previous.galaxy_revision + 1,
             devices,
             account: previous.account.clone(),
             replicants: previous.replicants.clone(),
@@ -1168,6 +1250,31 @@ mod tests {
         assert!(!receiver.has_changed().expect("watch is open"));
     }
 
+    #[tokio::test]
+    async fn galaxy_watch_ignores_unrelated_revisions() {
+        let engine = StateEngine::open_memory().expect("open engine");
+        let receiver = engine.subscribe();
+        let last_seen = receiver.borrow().galaxy_revision();
+        let mut watch = GalaxyRevisionWatch {
+            last_seen,
+            receiver,
+        };
+
+        let mut unrelated = (*engine.snapshot()).clone();
+        unrelated.revision += 1;
+        engine.publish(unrelated);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), watch.next())
+                .await
+                .is_err()
+        );
+
+        engine
+            .persist_devices(&[device("D1")])
+            .expect("persist scene device");
+        assert_eq!(watch.next().await.expect("galaxy revision"), 1);
+    }
+
     #[test]
     fn identical_device_refresh_does_not_publish_another_revision() {
         let engine = StateEngine::open_memory().expect("open engine");
@@ -1289,6 +1396,7 @@ mod tests {
         engine
             .replace_catalogue(vec![catalogue_star("SOL", None, None)], None)
             .expect("persist partial catalogue");
+        assert_eq!(engine.snapshot().galaxy_revision(), 1);
         let catalogue = engine.catalogue();
         assert_eq!(catalogue[0].value.has_hub, Some(true));
         assert_eq!(catalogue[0].value.region.as_deref(), Some("solzone"));
@@ -1299,6 +1407,7 @@ mod tests {
         engine
             .persist_star_knowledge(star_knowledge("R1", "SOL", None, None))
             .expect("persist partial star knowledge");
+        assert_eq!(engine.snapshot().galaxy_revision(), 2);
         let knowledge = engine.star_knowledge(&ReplicantKey::live("R1".into()));
         assert_eq!(knowledge[0].value.has_hub, Some(false));
         assert_eq!(knowledge[0].value.region.as_deref(), Some("alpha"));

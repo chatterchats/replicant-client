@@ -271,7 +271,31 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    if (state.needsResnapshot) socketRef.current?.close();
+    if (!state.needsResnapshot) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const resnapshot = async () => {
+      try {
+        const [health, snapshot] = await Promise.all([
+          daemonApi.health(controller.signal),
+          daemonApi.snapshot(controller.signal),
+        ]);
+        if (!controller.signal.aborted)
+          dispatch({ type: "snapshot", snapshot, health });
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          dispatch({ type: "continuity_lost", error: String(error) });
+          timer = setTimeout(() => void resnapshot(), 500);
+        }
+      }
+    };
+
+    void resnapshot();
+    return () => {
+      controller.abort();
+      if (timer !== undefined) clearTimeout(timer);
+    };
   }, [state.needsResnapshot]);
 
   return <DaemonContext value={state}>{children}</DaemonContext>;

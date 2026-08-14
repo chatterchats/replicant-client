@@ -97,6 +97,34 @@ describe("daemonReducer", () => {
     expect(state.revision).toBe(13);
   });
 
+  it("resnapshots without disconnecting when the socket starts ahead", () => {
+    let state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+    });
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(11, {
+        type: "snapshot",
+        data: { revision: 11, generated_at_ms: 2 },
+      }),
+    });
+    expect(state.needsResnapshot).toBe(true);
+    expect(state.connection).toBe("connecting");
+
+    state = daemonReducer(state, {
+      type: "snapshot",
+      snapshot: {
+        ...snapshot,
+        metadata: { ...snapshot.metadata, revision: 11 },
+      },
+      health,
+    });
+    expect(state.needsResnapshot).toBe(false);
+    expect(state.revision).toBe(11);
+  });
+
   it("tracks reconnect state with capped backoff", () => {
     const offline = daemonReducer(initialDaemonState, {
       type: "disconnected",

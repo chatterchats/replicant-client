@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
 import { useGalaxyRevision } from "./daemon";
@@ -70,23 +70,39 @@ export function GalaxyPage({
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState(loadSettings);
+  const latestRevision = useRef(galaxyRevision);
+  const loading = useRef(false);
+  const mounted = useRef(true);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void daemonApi
-      .galaxyScene(controller.signal)
-      .then((next) => {
-        setScene((current) =>
-          current?.revision === next.revision ? current : next,
-        );
-        setError(undefined);
-      })
-      .catch((reason: unknown) => {
-        setError(String(reason));
-      });
+    mounted.current = true;
     return () => {
-      controller.abort();
+      mounted.current = false;
     };
+  }, []);
+
+  useEffect(() => {
+    latestRevision.current = galaxyRevision;
+    if (loading.current) return;
+    loading.current = true;
+    void (async () => {
+      try {
+        let requestedRevision: number;
+        do {
+          requestedRevision = latestRevision.current;
+          const next = await daemonApi.galaxyScene();
+          if (!mounted.current) return;
+          setScene((current) =>
+            current?.revision === next.revision ? current : next,
+          );
+          setError(undefined);
+        } while (latestRevision.current !== requestedRevision);
+      } catch (reason: unknown) {
+        if (mounted.current) setError(String(reason));
+      } finally {
+        loading.current = false;
+      }
+    })();
   }, [galaxyRevision]);
 
   useEffect(() => {
