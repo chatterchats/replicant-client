@@ -27,6 +27,8 @@ describe("GalaxyMapWasm", () => {
           layers={defaultGalaxyLayers}
           centerSystem=""
           onSelectStar={() => undefined}
+          onContextStar={() => undefined}
+          onSelectWorkflow={() => undefined}
         />,
       ),
     ).toContain('aria-label="Interactive galaxy map"');

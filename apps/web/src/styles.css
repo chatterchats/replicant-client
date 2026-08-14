@@ -286,7 +286,47 @@ h1 {
   text-transform: capitalize;
 }
 .galaxy-canvas-shell {
+  position: relative;
   min-height: 360px;
+}
+.galaxy-workflow-overlays {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: grid;
+  gap: 6px;
+  max-height: calc(100% - 24px);
+  overflow: auto;
+}
+.galaxy-workflow-overlays button,
+.galaxy-context-menu button {
+  display: grid;
+  gap: 2px;
+  min-width: 170px;
+  border: 1px solid rgba(65, 212, 200, 0.35);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: rgba(11, 25, 23, 0.94);
+  color: #eff8f6;
+  text-align: left;
+  cursor: pointer;
+}
+.galaxy-workflow-overlays small,
+.galaxy-context-menu small {
+  color: #78908c;
+  text-transform: uppercase;
+}
+.galaxy-context-menu {
+  position: fixed;
+  z-index: 30;
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 6px;
+  border: 1px solid rgba(159, 188, 193, 0.24);
+  border-radius: 8px;
+  background: #071210;
+  list-style: none;
 }
 .galaxy-map canvas {
   width: 100%;

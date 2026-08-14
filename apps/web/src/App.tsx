@@ -10,7 +10,11 @@ import {
   useWorkflows,
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
-import { CommandPalette, type CommandContext } from "./CommandPalette";
+import {
+  CommandPalette,
+  type CommandContext,
+  type DescriptorCommand,
+} from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
 import { daemonApi } from "./api";
 import type {
@@ -106,6 +110,9 @@ export function App() {
     workflows: [],
   });
   const [selectedGalaxyStar, setSelectedGalaxyStar] = useState<GalaxyStar>();
+  const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
+  const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
+    useState<string>();
   const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
@@ -301,6 +308,7 @@ export function App() {
           <button
             className="palette-trigger"
             onClick={() => {
+              setGalaxyCommand(undefined);
               dispatch({ type: "set_palette", open: true });
             }}
           >
@@ -311,12 +319,25 @@ export function App() {
         <div className="workspace">
           <div className="content-column">
             {shell.page === "Automations" ? (
-              <AutomationsPage entities={entities} workflows={workflows} />
+              <AutomationsPage
+                entities={entities}
+                workflows={workflows}
+                selectedWorkflowId={selectedAutomationWorkflow}
+              />
             ) : shell.page === "Galaxy" ? (
               <GalaxyPage
+                descriptors={descriptors}
                 onSelectStar={(star) => {
                   setSelectedGalaxyStar(star);
                   select({ kind: "system", id: star.id });
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
                 }}
               />
             ) : (
@@ -446,10 +467,13 @@ export function App() {
           entities={entities}
           navigation={navigationCommands}
           onClose={() => {
+            setGalaxyCommand(undefined);
             dispatch({ type: "set_palette", open: false });
           }}
           onNavigate={navigate}
-          onWorkflowStarted={() => {
+          initialCommand={galaxyCommand}
+          onWorkflowStarted={(workflow) => {
+            setSelectedAutomationWorkflow(workflow.id);
             navigate("Automations");
           }}
         />

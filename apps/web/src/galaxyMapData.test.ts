@@ -37,7 +37,7 @@ const scene: GalaxySceneSnapshot = {
   relay_edges: [{ from: "SOL", to: "ALPHA" }],
   active_travel: [],
   signals: [],
-  highlights: [],
+  highlights: [{ workflow_id: "workflow-1", from: "SOL", to: "ALPHA" }],
   overlays: [
     {
       kind: "life",
@@ -46,7 +46,13 @@ const scene: GalaxySceneSnapshot = {
       count: 1,
     },
   ],
-  workflow_targets: [],
+  workflow_targets: [
+    {
+      workflow_id: "workflow-1",
+      workflow_kind: "relay.expansion",
+      system: "ALPHA",
+    },
+  ],
 };
 
 describe("galaxy map mapping", () => {
@@ -66,6 +72,14 @@ describe("galaxy map mapping", () => {
       },
     ]);
     expect(geometry.life).toEqual([{ x: 0, y: 0, z: 0 }]);
+    expect(geometry.highlights).toEqual([
+      {
+        from: { x: 0, y: 0, z: 0 },
+        to: { x: 7, y: 0, z: 0 },
+        exploration_route: true,
+        workflow_id: "workflow-1",
+      },
+    ]);
   });
 
   it("honors renderer layer toggles", () => {

@@ -38,6 +38,19 @@ export function descriptorCommands(
   ];
 }
 
+export function applicableDescriptorCommands(
+  catalog: DescriptorCatalog,
+  entityKind: ContextKind,
+): DescriptorCommand[] {
+  return descriptorCommands(catalog).filter(({ descriptor }) =>
+    descriptor.parameters.some((parameter) =>
+      parameter.kind.type === "entity"
+        ? parameter.kind.entity_kind === entityKind
+        : parameter.kind.type === entityKind,
+    ),
+  );
+}
+
 export function searchDescriptors(
   catalog: DescriptorCatalog,
   query: string,
@@ -95,6 +108,7 @@ export function CommandPalette({
   onClose,
   onNavigate,
   onWorkflowStarted,
+  initialCommand,
 }: {
   catalog: DescriptorCatalog;
   context: CommandContext;
@@ -103,10 +117,17 @@ export function CommandPalette({
   onClose: () => void;
   onNavigate: (page: string) => void;
   onWorkflowStarted: (workflow: WorkflowSummary) => void;
+  initialCommand?: DescriptorCommand;
 }) {
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<DescriptorCommand | null>(null);
-  const [values, setValues] = useState<Record<string, unknown>>({});
+  const [selected, setSelected] = useState<DescriptorCommand | null>(
+    initialCommand ?? null,
+  );
+  const [values, setValues] = useState<Record<string, unknown>>(() =>
+    initialCommand
+      ? resolveContextDefaults(initialCommand.descriptor, context)
+      : {},
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [confirming, setConfirming] = useState(false);
   const [confirmation, setConfirmation] = useState("");

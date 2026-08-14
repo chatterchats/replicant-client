@@ -453,9 +453,11 @@ function WorkflowInspector({
 export function AutomationsPage({
   workflows,
   entities,
+  selectedWorkflowId,
 }: {
   workflows: WorkflowSummary[];
   entities: Record<string, unknown>;
+  selectedWorkflowId?: string;
 }) {
   const [tab, setTab] = useState<Tab>("Active");
   const [descriptors, setDescriptors] = useState<WorkflowDescriptor[]>([]);
@@ -477,6 +479,12 @@ export function AutomationsPage({
   const workflowVersion = currentWorkflows
     .map(({ id, revision }) => `${id}:${String(revision)}`)
     .join();
+
+  useEffect(() => {
+    if (!selectedWorkflowId) return;
+    setTab("Active");
+    setSelectedId(selectedWorkflowId);
+  }, [selectedWorkflowId]);
 
   useEffect(() => {
     const controller = new AbortController();

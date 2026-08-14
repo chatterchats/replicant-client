@@ -9,7 +9,15 @@ import {
   type GalaxyLayers,
 } from "./galaxyMapData";
 import { GalaxyMapWasm } from "./GalaxyMapWasm";
-import type { GalaxySceneSnapshot, GalaxyStar } from "./protocol";
+import {
+  applicableDescriptorCommands,
+  type DescriptorCommand,
+} from "./CommandPalette";
+import type {
+  DescriptorCatalog,
+  GalaxySceneSnapshot,
+  GalaxyStar,
+} from "./protocol";
 
 const SETTINGS_KEY = "replicant.galaxy.settings";
 const explorations = ["all", "undiscovered", "partial", "explored"] as const;
@@ -63,13 +71,24 @@ function loadSettings(): GalaxySettings {
 
 export function GalaxyPage({
   onSelectStar,
+  descriptors,
+  onRunCommand,
+  onSelectWorkflow,
 }: {
   onSelectStar: (star: GalaxyStar) => void;
+  descriptors: DescriptorCatalog;
+  onRunCommand: (command: DescriptorCommand) => void;
+  onSelectWorkflow: (workflowId: string) => void;
 }) {
   const galaxyRevision = useGalaxyRevision();
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState(loadSettings);
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    star: GalaxyStar;
+  }>();
   const latestRevision = useRef(galaxyRevision);
   const loading = useRef(false);
   const mounted = useRef(true);
@@ -112,6 +131,17 @@ export function GalaxyPage({
       // Storage is optional; React state still preserves this session.
     }
   }, [settings]);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => {
+      setMenu(undefined);
+    };
+    window.addEventListener("click", close);
+    return () => {
+      window.removeEventListener("click", close);
+    };
+  }, [menu]);
 
   const visibleStars = useMemo(
     () => filterGalaxyStars(scene?.stars ?? [], settings.filters),
@@ -217,7 +247,50 @@ export function GalaxyPage({
             const star = scene.stars.find((item) => item.id === system);
             if (star) onSelectStar(star);
           }}
+          onContextStar={(system, x, y) => {
+            const star = scene.stars.find((item) => item.id === system);
+            if (!star) return;
+            setSettings((current) => ({ ...current, anchor: system }));
+            onSelectStar(star);
+            setMenu({ x, y, star });
+          }}
+          onSelectWorkflow={onSelectWorkflow}
         />
+      ) : null}
+      {menu ? (
+        <menu
+          className="galaxy-context-menu"
+          aria-label={`${menu.star.id} operations`}
+          style={{ left: menu.x, top: menu.y }}
+          onClick={(event) => {
+            event.stopPropagation();
+          }}
+        >
+          <li>
+            <button
+              onClick={() => {
+                setMenu(undefined);
+              }}
+            >
+              Inspect
+            </button>
+          </li>
+          {applicableDescriptorCommands(descriptors, "system").map(
+            (command) => (
+              <li key={`${command.operationClass}:${command.descriptor.kind}`}>
+                <button
+                  onClick={() => {
+                    setMenu(undefined);
+                    onRunCommand(command);
+                  }}
+                >
+                  <small>{command.operationClass}</small>
+                  {command.descriptor.display_name}
+                </button>
+              </li>
+            ),
+          )}
+        </menu>
       ) : null}
     </article>
   );

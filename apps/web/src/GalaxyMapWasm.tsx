@@ -103,12 +103,16 @@ export function GalaxyMapWasm({
   layers,
   centerSystem,
   onSelectStar,
+  onContextStar,
+  onSelectWorkflow,
 }: {
   scene: GalaxySceneSnapshot;
   visibleStars: GalaxyStar[];
   layers: GalaxyLayers;
   centerSystem: string;
   onSelectStar: (system: string) => void;
+  onContextStar: (system: string, x: number, y: number) => void;
+  onSelectWorkflow: (workflowId: string) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | undefined>(undefined);
@@ -229,7 +233,10 @@ export function GalaxyMapWasm({
           const point = canvasPoint(event);
           const picked = renderer.pointer_up(point.x, point.y);
           persistCamera(renderer);
-          if (picked) onSelectStar(picked);
+          if (!picked) return;
+          if (event.button === 2)
+            onContextStar(picked, event.clientX, event.clientY);
+          else onSelectStar(picked);
         }}
         onWheel={(event) => {
           event.preventDefault();
@@ -239,6 +246,31 @@ export function GalaxyMapWasm({
           persistCamera(renderer);
         }}
       />
+      {layers.highlights && scene.workflow_targets.length ? (
+        <aside
+          className="galaxy-workflow-overlays"
+          aria-label="Active workflow overlays"
+        >
+          {[
+            ...new Map(
+              scene.workflow_targets.map((target) => [
+                target.workflow_id,
+                target,
+              ]),
+            ).values(),
+          ].map((target) => (
+            <button
+              key={target.workflow_id}
+              onClick={() => {
+                onSelectWorkflow(target.workflow_id);
+              }}
+            >
+              <small>{target.workflow_kind}</small>
+              <strong>{target.system}</strong>
+            </button>
+          ))}
+        </aside>
+      ) : null}
     </div>
   );
 }

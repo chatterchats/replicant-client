@@ -1107,7 +1107,7 @@ fn descriptor_catalog() -> DescriptorCatalog {
                     required(
                         "targets_csv",
                         "Target systems (comma-separated)",
-                        ParameterKind::String,
+                        ParameterKind::System,
                     ),
                     required("mission_file", "Mission file", ParameterKind::String),
                     defaulted(

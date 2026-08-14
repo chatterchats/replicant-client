@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveContextDefaults, searchDescriptors } from "./CommandPalette";
+import {
+  applicableDescriptorCommands,
+  resolveContextDefaults,
+  searchDescriptors,
+} from "./CommandPalette";
 import type { DescriptorCatalog, WorkflowDescriptor } from "./protocol";
 
 const descriptor: WorkflowDescriptor = {
@@ -57,6 +61,15 @@ describe("descriptor command discovery", () => {
       expect(searchDescriptors(catalog, query)).toHaveLength(1);
     },
   );
+
+  it("only applies descriptors with matching semantic entity parameters", () => {
+    expect(
+      applicableDescriptorCommands(catalog, "system").map(
+        ({ descriptor: item }) => item.kind,
+      ),
+    ).toEqual(["survey.route"]);
+    expect(applicableDescriptorCommands(catalog, "device")).toEqual([]);
+  });
 });
 
 it("resolves selected entity context ahead of static defaults", () => {

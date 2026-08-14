@@ -100,7 +100,14 @@ export function mapGalaxyScene(
           .filter((item) => item !== null)
       : [],
     highlights: layers.highlights
-      ? links(scene.highlights, { exploration_route: true })
+      ? scene.highlights
+          .map((item) =>
+            edge(item.from, item.to, stars, {
+              exploration_route: true,
+              workflow_id: item.workflow_id,
+            }),
+          )
+          .filter((item) => item !== null)
       : [],
     life: layers.life ? centers("life") : [],
     devices: layers.devices ? centers("device") : [],
