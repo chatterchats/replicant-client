@@ -10,7 +10,9 @@ import {
   useWorkflows,
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
-import type { EntityKind, WorkflowStatus } from "./protocol";
+import { CommandPalette, type CommandContext } from "./CommandPalette";
+import { daemonApi } from "./api";
+import type { DescriptorCatalog, EntityKind, WorkflowStatus } from "./protocol";
 import {
   initialShellState,
   shellReducer,
@@ -28,7 +30,10 @@ const navigation = [
   ],
 ] as const;
 
-const commands = [...navigation.flatMap(([, items]) => items), "Settings"];
+const navigationCommands = [
+  ...navigation.flatMap(([, items]) => items),
+  "Settings",
+];
 const activeWorkflowStatuses: WorkflowStatus[] = [
   "queued",
   "running",
@@ -89,7 +94,11 @@ function Inspector({
 
 export function App() {
   const [shell, dispatch] = useReducer(shellReducer, initialShellState);
-  const [query, setQuery] = useState("");
+  const [descriptors, setDescriptors] = useState<DescriptorCatalog>({
+    reports: [],
+    actions: [],
+    workflows: [],
+  });
   const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
@@ -97,6 +106,17 @@ export function App() {
   const workflows = useWorkflows();
   const activity = useActivity();
   const notifications = useNotifications();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void daemonApi
+      .descriptors(controller.signal)
+      .then(setDescriptors)
+      .catch(() => undefined);
+    return () => {
+      controller.abort();
+    };
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -116,13 +136,6 @@ export function App() {
     };
   }, [shell.activityOpen, shell.inspectorOpen, shell.paletteOpen]);
 
-  const matches = useMemo(
-    () =>
-      commands.filter((command) =>
-        command.toLowerCase().includes(query.trim().toLowerCase()),
-      ),
-    [query],
-  );
   const entityList = useMemo(
     () =>
       Object.keys(entities).map((key) => {
@@ -140,10 +153,13 @@ export function App() {
   const currentReplicantValue = currentReplicant
     ? entities[`replicant:${currentReplicant.id}`]
     : undefined;
-  const location = textField(
+  const currentLocation = textField(
     currentReplicantValue,
     "location",
     "location_code",
+  );
+  const currentSystem = textField(
+    currentReplicantValue,
     "system",
     "system_code",
   );
@@ -160,6 +176,32 @@ export function App() {
       ? daemon.workflows[shell.selectedEntity.id]
       : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
     : undefined;
+  const commandContext: CommandContext = {
+    system:
+      (shell.selectedEntity?.kind === "system"
+        ? shell.selectedEntity.id
+        : null) ??
+      textField(selectedValue, "system", "system_code") ??
+      currentSystem ??
+      undefined,
+    location:
+      (shell.selectedEntity?.kind === "location"
+        ? shell.selectedEntity.id
+        : null) ??
+      textField(selectedValue, "location", "location_code") ??
+      currentLocation ??
+      undefined,
+    device:
+      shell.selectedEntity?.kind === "device"
+        ? shell.selectedEntity.id
+        : undefined,
+    replicant:
+      (shell.selectedEntity?.kind === "replicant"
+        ? shell.selectedEntity.id
+        : null) ??
+      textField(selectedValue, "replicant", "replicant_id", "owner") ??
+      currentReplicant?.id,
+  };
   const group =
     navigation.find(([, items]) =>
       (items as readonly string[]).includes(shell.page),
@@ -167,7 +209,6 @@ export function App() {
 
   const navigate = (destination: string) => {
     dispatch({ type: "navigate", page: destination });
-    setQuery("");
   };
   const select = (entity: SelectedEntity) => {
     dispatch({ type: "select", entity });
@@ -225,7 +266,7 @@ export function App() {
           </button>
           <span className="status-item">
             <small>Location / system</small>
-            <strong>{location ?? "Unknown"}</strong>
+            <strong>{currentLocation ?? currentSystem ?? "Unknown"}</strong>
           </span>
           <span className="status-item sync-status">
             <small>Daemon / managed sync</small>
@@ -382,46 +423,19 @@ export function App() {
       </main>
 
       {shell.paletteOpen ? (
-        <div
-          className="palette-backdrop"
-          role="presentation"
-          onMouseDown={() => {
+        <CommandPalette
+          catalog={descriptors}
+          context={commandContext}
+          entities={entities}
+          navigation={navigationCommands}
+          onClose={() => {
             dispatch({ type: "set_palette", open: false });
           }}
-        >
-          <section
-            className="palette"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Command palette"
-            onMouseDown={(event) => {
-              event.stopPropagation();
-            }}
-          >
-            <input
-              autoFocus
-              aria-label="Search commands"
-              placeholder="Go to…"
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-              }}
-            />
-            <div className="palette-results">
-              {matches.map((command) => (
-                <button
-                  key={command}
-                  onClick={() => {
-                    navigate(command);
-                  }}
-                >
-                  {command}
-                </button>
-              ))}
-              {matches.length === 0 ? <p>No commands found.</p> : null}
-            </div>
-          </section>
-        </div>
+          onNavigate={navigate}
+          onWorkflowStarted={() => {
+            navigate("Automations");
+          }}
+        />
       ) : null}
     </div>
   );

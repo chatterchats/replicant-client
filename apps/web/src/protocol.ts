@@ -81,21 +81,38 @@ export interface ParameterDescriptor {
   };
 }
 
-export interface WorkflowDescriptor {
+interface Descriptor {
   kind: string;
   display_name: string;
+  aliases: string[];
   description: string;
   category: string;
-  risk: "none" | "low" | "elevated";
   parameters: ParameterDescriptor[];
+}
+
+export interface ReportDescriptor extends Descriptor {
+  risk: "none";
+}
+
+export interface ActionDescriptor extends Descriptor {
+  risk: "none" | "low" | "elevated";
+}
+
+export interface WorkflowDescriptor extends Descriptor {
+  risk: "none" | "low" | "elevated";
   supported_triggers: (
     "manual" | "schedule" | "game_event" | "state_condition" | "parent_workflow"
   )[];
 }
 
 export interface DescriptorCatalog {
+  reports: ReportDescriptor[];
+  actions: ActionDescriptor[];
   workflows: WorkflowDescriptor[];
 }
+
+export type OperationDescriptor =
+  ReportDescriptor | ActionDescriptor | WorkflowDescriptor;
 
 export interface WorkflowDetail {
   summary: WorkflowSummary;
@@ -359,24 +376,35 @@ function parameter(value: unknown): ParameterDescriptor {
   };
 }
 
-function descriptor(value: unknown): WorkflowDescriptor {
-  const item = record(value, "workflow descriptor");
+function descriptor(value: unknown, label: string) {
+  const item = record(value, label);
   if (
     typeof item.kind !== "string" ||
     typeof item.display_name !== "string" ||
+    !Array.isArray(item.aliases) ||
+    !item.aliases.every((alias) => typeof alias === "string") ||
     typeof item.description !== "string" ||
     typeof item.category !== "string" ||
-    !Array.isArray(item.parameters) ||
-    !Array.isArray(item.supported_triggers)
+    !Array.isArray(item.parameters)
   )
-    throw new Error("Invalid workflow descriptor");
+    throw new Error(`Invalid ${label}`);
   return {
     kind: item.kind,
     display_name: item.display_name,
+    aliases: item.aliases,
     description: item.description,
     category: item.category,
-    risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
     parameters: item.parameters.map(parameter),
+  };
+}
+
+function workflowDescriptor(value: unknown): WorkflowDescriptor {
+  const item = record(value, "workflow descriptor");
+  if (!Array.isArray(item.supported_triggers))
+    throw new Error("Invalid workflow descriptor");
+  return {
+    ...descriptor(value, "workflow descriptor"),
+    risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
     supported_triggers: item.supported_triggers.map((trigger) =>
       oneOf(
         trigger,
@@ -507,10 +535,35 @@ export function parseDescriptorsResponse(
 ): Versioned<DescriptorCatalog> {
   return envelope(value, (payload) => {
     const item = record(payload, "descriptor catalog");
-    if (!Array.isArray(item.workflows))
-      throw new Error("Invalid workflow descriptors");
-    return { workflows: item.workflows.map(descriptor) };
+    if (
+      !Array.isArray(item.reports) ||
+      !Array.isArray(item.actions) ||
+      !Array.isArray(item.workflows)
+    )
+      throw new Error("Invalid descriptors");
+    return {
+      reports: item.reports.map((value) => ({
+        ...descriptor(value, "report descriptor"),
+        risk: "none" as const,
+      })),
+      actions: item.actions.map((value) => {
+        const parsed = descriptor(value, "action descriptor");
+        const item = record(value, "action descriptor");
+        return {
+          ...parsed,
+          risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
+        };
+      }),
+      workflows: item.workflows.map(workflowDescriptor),
+    };
   });
+}
+
+export function parseOperationResponse(value: unknown): Versioned<unknown> {
+  return envelope(
+    value,
+    (payload) => record(payload, "operation response").result,
+  );
 }
 
 export function parseWorkflowResponse(

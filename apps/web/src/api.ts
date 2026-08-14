@@ -1,6 +1,7 @@
 import {
   parseDescriptorsResponse,
   parseHealthResponse,
+  parseOperationResponse,
   parseSnapshotResponse,
   parseWorkflowActivityResponse,
   parseWorkflowDetailResponse,
@@ -57,6 +58,18 @@ export const daemonApi = {
   async startWorkflow(kind: string, parameters: Record<string, unknown>) {
     return parseWorkflowResponse(
       await post("/api/workflows", { kind, parameters }),
+    ).payload;
+  },
+  async runOperation(
+    operationClass: "report" | "action",
+    kind: string,
+    parameters: Record<string, unknown>,
+  ) {
+    return parseOperationResponse(
+      await post(
+        `/api/${operationClass === "report" ? "reports" : "actions"}/${encodeURIComponent(kind)}`,
+        { parameters },
+      ),
     ).payload;
   },
   async controlWorkflow(id: string, action: "pause" | "resume" | "cancel") {

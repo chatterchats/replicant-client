@@ -11,12 +11,13 @@ use replicant_client::{
     Client, Realm,
     domain::{GalacticPosition, Location},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ReportResult;
 
 /// Reusable system and location values for smart frontend selectors.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EntityIndex {
     /// Catalogue system designations.
     pub systems: Vec<String>,
@@ -57,7 +58,7 @@ pub const DEFAULT_BELT_REPORT_CONCURRENCY: usize = 4;
 pub const MAX_BELT_REPORT_CONCURRENCY: usize = 16;
 
 /// Inputs for [`nearby_belt_report`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NearbyBeltReportRequest {
     /// Catalogue system at the center of the search.
     pub origin: String,
@@ -80,7 +81,7 @@ impl NearbyBeltReportRequest {
 }
 
 /// One asteroid belt in a nearby explored system.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NearbyBelt {
     /// System containing the belt.
     pub system: String,
@@ -110,7 +111,7 @@ impl NearbyBelt {
 }
 
 /// A system that could not be refreshed while building a report.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SystemRefreshFailure {
     /// System designation.
     pub system: String,
@@ -119,7 +120,7 @@ pub struct SystemRefreshFailure {
 }
 
 /// Typed result of a nearby-belt report.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NearbyBeltReport {
     /// Requested origin system.
     pub origin: String,

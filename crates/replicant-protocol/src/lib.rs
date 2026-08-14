@@ -248,6 +248,20 @@ pub struct StartWorkflowRequest {
     pub parameters: BTreeMap<String, Value>,
 }
 
+/// Request to execute a finite report or action.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunOperationRequest {
+    /// Typed parameter values keyed by descriptor name.
+    pub parameters: BTreeMap<String, Value>,
+}
+
+/// Frontend-renderable result from a finite report or action.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunOperationResponse {
+    /// Typed operation result.
+    pub result: Value,
+}
+
 /// Response after creating a workflow instance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartWorkflowResponse {
@@ -418,6 +432,9 @@ pub struct ReportDescriptor {
     pub kind: OperationKind,
     /// Human-readable name.
     pub display_name: String,
+    /// Alternative discoverable names, including former CLI/example names.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Human-readable description.
     pub description: String,
     /// Navigation category.
@@ -433,6 +450,9 @@ pub struct ActionDescriptor {
     pub kind: OperationKind,
     /// Human-readable name.
     pub display_name: String,
+    /// Alternative discoverable names, including former CLI/example names.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Human-readable description.
     pub description: String,
     /// Navigation category.
@@ -450,6 +470,9 @@ pub struct WorkflowDescriptor {
     pub kind: OperationKind,
     /// Human-readable name.
     pub display_name: String,
+    /// Alternative discoverable names, including former CLI names.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Human-readable description.
     pub description: String,
     /// Navigation category.
@@ -659,6 +682,7 @@ mod tests {
         round_trip(&Versioned::current(WorkflowDescriptor {
             kind: OperationKind("survey.route".to_owned()),
             display_name: "Survey route".to_owned(),
+            aliases: vec!["survey".to_owned()],
             description: "Survey a sequence of systems".to_owned(),
             category: "survey".to_owned(),
             risk: MutationRisk::Low,

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { daemonApi } from "./api";
 import type {
   EntityKind,
+  OperationDescriptor,
   ParameterDescriptor,
   WorkflowActivity,
   WorkflowDescriptor,
@@ -70,7 +71,7 @@ function optionsFor(
 }
 
 export function validateParameters(
-  descriptor: WorkflowDescriptor,
+  descriptor: OperationDescriptor,
   values: Values,
 ) {
   const errors: Record<string, string> = {};

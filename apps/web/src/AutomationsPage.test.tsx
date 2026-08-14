@@ -76,6 +76,7 @@ describe("descriptor workflow form", () => {
     const descriptor: WorkflowDescriptor = {
       kind: "test.workflow",
       display_name: "Test",
+      aliases: [],
       description: "Test",
       category: "test",
       risk: "low",

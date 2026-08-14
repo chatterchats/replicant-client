@@ -28,10 +28,11 @@ use replicant_client::{
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
-    ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef,
-    ErrorResponse, HealthStatus, LiveDelta, LiveMessage, MutationRisk, OperationKind,
-    OperationStatus, OperationUpdate, ParameterDescriptor, ParameterKind, ParameterOption,
-    ParameterValidation, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
+    ActionDescriptor, ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId,
+    EntityKind, EntityRef, ErrorResponse, HealthStatus, LiveDelta, LiveMessage, MutationRisk,
+    OperationKind, OperationStatus, OperationUpdate, ParameterDescriptor, ParameterKind,
+    ParameterOption, ParameterValidation, ReportDescriptor, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
     StartWorkflowRequest, StartWorkflowResponse, SyncPhase, TriggerKind, Versioned,
     WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDescriptor,
     WorkflowDetail, WorkflowId as ProtocolWorkflowId, WorkflowListResponse,
@@ -39,8 +40,10 @@ use replicant_protocol::{
 };
 use replicant_runtime::{
     ApplicationContext,
+    actions::{ClearTagsAction, ContributeDevicesAction, clear_tags, contribute_devices},
     config::RuntimeConfig,
     relay::RelayExpansionRequest,
+    reports::{NearbyBeltReportRequest, nearby_belt_report},
     survey::{SurveyMode, SurveyOptions},
     workflows::{
         RelayWorkflowConfig, SurveyWorkflowConfig, WorkflowActivityEvent, new_relay_workflow,
@@ -188,6 +191,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/snapshot", get(snapshot))
         .route("/ws", get(websocket))
         .route("/api/descriptors", get(descriptors))
+        .route("/api/reports/{kind}", post(run_report))
+        .route("/api/actions/{kind}", post(run_action))
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
@@ -401,6 +406,62 @@ async fn snapshot(
 
 async fn descriptors(State(state): State<Arc<AppState>>) -> Json<Versioned<DescriptorCatalog>> {
     Json(Versioned::current(state.descriptors.clone()))
+}
+
+async fn run_report(
+    State(state): State<Arc<AppState>>,
+    Path(kind): Path<String>,
+    payload: Result<Json<RunOperationRequest>, JsonRejection>,
+) -> Result<Json<Versioned<RunOperationResponse>>, ApiError> {
+    let request = payload
+        .map_err(|_| ApiError::invalid("invalid report parameters"))?
+        .0;
+    let result = match kind.as_str() {
+        "nearby_belts" => {
+            let request = operation_parameters(request)?;
+            let result = nearby_belt_report(state.client(), &request)
+                .await
+                .map_err(|_| ApiError::internal())?;
+            serde_json::to_value(result).map_err(|_| ApiError::internal())?
+        }
+        _ => return Err(ApiError::operation_not_found()),
+    };
+    Ok(Json(Versioned::current(RunOperationResponse { result })))
+}
+
+async fn run_action(
+    State(state): State<Arc<AppState>>,
+    Path(kind): Path<String>,
+    payload: Result<Json<RunOperationRequest>, JsonRejection>,
+) -> Result<Json<Versioned<RunOperationResponse>>, ApiError> {
+    let request = payload
+        .map_err(|_| ApiError::invalid("invalid action parameters"))?
+        .0;
+    let result = match kind.as_str() {
+        "clear_tags" => {
+            let request: ClearTagsAction = operation_parameters(request)?;
+            let result = clear_tags(state.client(), &request)
+                .await
+                .map_err(|_| ApiError::internal())?;
+            serde_json::to_value(result).map_err(|_| ApiError::internal())?
+        }
+        "contribute_devices" => {
+            let request: ContributeDevicesAction = operation_parameters(request)?;
+            let result = contribute_devices(state.client(), &request)
+                .await
+                .map_err(|_| ApiError::internal())?;
+            serde_json::to_value(result).map_err(|_| ApiError::internal())?
+        }
+        _ => return Err(ApiError::operation_not_found()),
+    };
+    Ok(Json(Versioned::current(RunOperationResponse { result })))
+}
+
+fn operation_parameters<T: serde::de::DeserializeOwned>(
+    request: RunOperationRequest,
+) -> Result<T, ApiError> {
+    serde_json::from_value(Value::Object(request.parameters.into_iter().collect()))
+        .map_err(|_| ApiError::invalid("invalid operation parameters"))
 }
 
 #[derive(Default, Deserialize)]
@@ -873,12 +934,63 @@ fn default_max_hop() -> f64 {
 
 fn descriptor_catalog() -> DescriptorCatalog {
     DescriptorCatalog {
-        reports: Vec::new(),
-        actions: Vec::new(),
+        reports: vec![ReportDescriptor {
+            kind: OperationKind("nearby_belts".to_owned()),
+            display_name: "Nearby belt report".to_owned(),
+            aliases: vec!["nearby_belt_report".to_owned(), "belts".to_owned()],
+            description: "Find asteroid belts in explored systems near an origin star.".to_owned(),
+            category: "reports".to_owned(),
+            parameters: vec![
+                required("origin", "Origin system", ParameterKind::System),
+                defaulted(
+                    "radius_ly",
+                    "Radius (light years)",
+                    ParameterKind::Number,
+                    10.0,
+                ),
+                defaulted(
+                    "concurrency",
+                    "Refresh concurrency",
+                    ParameterKind::Integer,
+                    4,
+                ),
+            ],
+        }],
+        actions: vec![
+            ActionDescriptor {
+                kind: OperationKind("clear_tags".to_owned()),
+                display_name: "Clear device tags".to_owned(),
+                aliases: vec!["clear_tags".to_owned()],
+                description: "Remove matching tags from owned devices.".to_owned(),
+                category: "devices".to_owned(),
+                risk: MutationRisk::Elevated,
+                parameters: vec![
+                    required("tag_prefix", "Tag prefix", ParameterKind::Tag),
+                    defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
+                ],
+            },
+            ActionDescriptor {
+                kind: OperationKind("contribute_devices".to_owned()),
+                display_name: "Contribute devices".to_owned(),
+                aliases: vec!["contribute_twaffy_injectors".to_owned()],
+                description: "Contribute selected owned devices at a destination.".to_owned(),
+                category: "devices".to_owned(),
+                risk: MutationRisk::Elevated,
+                parameters: vec![
+                    required("destination", "Destination", ParameterKind::Location),
+                    required("device_type", "Device type", ParameterKind::DeviceType),
+                    required("owner", "Owner", ParameterKind::Replicant),
+                    optional("tag", "Tag", ParameterKind::Tag),
+                    optional("count", "Maximum devices", ParameterKind::Integer),
+                    defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
+                ],
+            },
+        ],
         workflows: vec![
             WorkflowDescriptor {
                 kind: OperationKind("survey.route".to_owned()),
                 display_name: "Survey route".to_owned(),
+                aliases: vec!["survey".to_owned()],
                 description: "Plan or execute a restart-safe system survey route.".to_owned(),
                 category: "survey".to_owned(),
                 risk: MutationRisk::Elevated,
@@ -961,6 +1073,7 @@ fn descriptor_catalog() -> DescriptorCatalog {
             WorkflowDescriptor {
                 kind: OperationKind("relay.expansion".to_owned()),
                 display_name: "Relay expansion".to_owned(),
+                aliases: vec!["relay".to_owned()],
                 description: "Build and deploy a restart-safe relay expansion.".to_owned(),
                 category: "relay".to_owned(),
                 risk: MutationRisk::Elevated,
@@ -1056,6 +1169,14 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "workflow_not_found",
             message: "workflow not found",
+        }
+    }
+
+    fn operation_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "operation_not_found",
+            message: "operation not found",
         }
     }
 
