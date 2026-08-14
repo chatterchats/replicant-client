@@ -87,18 +87,23 @@ interface Descriptor {
   aliases: string[];
   description: string;
   category: string;
+  operation_class: "report" | "action" | "workflow";
+  applicable_to: EntityKind[];
   parameters: ParameterDescriptor[];
 }
 
 export interface ReportDescriptor extends Descriptor {
+  operation_class: "report";
   risk: "none";
 }
 
 export interface ActionDescriptor extends Descriptor {
+  operation_class: "action";
   risk: "none" | "low" | "elevated";
 }
 
 export interface WorkflowDescriptor extends Descriptor {
+  operation_class: "workflow";
   risk: "none" | "low" | "elevated";
   supported_triggers: (
     "manual" | "schedule" | "game_event" | "state_condition" | "parent_workflow"
@@ -491,6 +496,7 @@ function descriptor(value: unknown, label: string) {
     !item.aliases.every((alias) => typeof alias === "string") ||
     typeof item.description !== "string" ||
     typeof item.category !== "string" ||
+    !Array.isArray(item.applicable_to) ||
     !Array.isArray(item.parameters)
   )
     throw new Error(`Invalid ${label}`);
@@ -500,6 +506,14 @@ function descriptor(value: unknown, label: string) {
     aliases: item.aliases,
     description: item.description,
     category: item.category,
+    operation_class: oneOf(
+      item.operation_class,
+      ["report", "action", "workflow"] as const,
+      "operation class",
+    ),
+    applicable_to: item.applicable_to.map((kind) =>
+      oneOf(kind, entityKinds, "applicable entity kind"),
+    ),
     parameters: item.parameters.map(parameter),
   };
 }
@@ -510,6 +524,11 @@ function workflowDescriptor(value: unknown): WorkflowDescriptor {
     throw new Error("Invalid workflow descriptor");
   return {
     ...descriptor(value, "workflow descriptor"),
+    operation_class: oneOf(
+      item.operation_class,
+      ["workflow"] as const,
+      "workflow operation class",
+    ),
     risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
     supported_triggers: item.supported_triggers.map((trigger) =>
       oneOf(
@@ -851,15 +870,29 @@ export function parseDescriptorsResponse(
     )
       throw new Error("Invalid descriptors");
     return {
-      reports: item.reports.map((value) => ({
-        ...descriptor(value, "report descriptor"),
-        risk: "none" as const,
-      })),
+      reports: item.reports.map((value) => {
+        const parsed = descriptor(value, "report descriptor");
+        const item = record(value, "report descriptor");
+        return {
+          ...parsed,
+          operation_class: oneOf(
+            item.operation_class,
+            ["report"] as const,
+            "report operation class",
+          ),
+          risk: oneOf(item.risk, ["none"] as const, "report risk"),
+        };
+      }),
       actions: item.actions.map((value) => {
         const parsed = descriptor(value, "action descriptor");
         const item = record(value, "action descriptor");
         return {
           ...parsed,
+          operation_class: oneOf(
+            item.operation_class,
+            ["action"] as const,
+            "action operation class",
+          ),
           risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
         };
       }),

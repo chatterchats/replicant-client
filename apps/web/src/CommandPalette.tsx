@@ -22,20 +22,12 @@ export interface DescriptorCommand {
 export function descriptorCommands(
   catalog: DescriptorCatalog,
 ): DescriptorCommand[] {
-  return [
-    ...catalog.reports.map((descriptor) => ({
+  return [...catalog.reports, ...catalog.actions, ...catalog.workflows].map(
+    (descriptor) => ({
       descriptor,
-      operationClass: "report" as const,
-    })),
-    ...catalog.actions.map((descriptor) => ({
-      descriptor,
-      operationClass: "action" as const,
-    })),
-    ...catalog.workflows.map((descriptor) => ({
-      descriptor,
-      operationClass: "workflow" as const,
-    })),
-  ];
+      operationClass: descriptor.operation_class,
+    }),
+  );
 }
 
 export function applicableDescriptorCommands(
@@ -43,11 +35,7 @@ export function applicableDescriptorCommands(
   entityKind: ContextKind,
 ): DescriptorCommand[] {
   return descriptorCommands(catalog).filter(({ descriptor }) =>
-    descriptor.parameters.some((parameter) =>
-      parameter.kind.type === "entity"
-        ? parameter.kind.entity_kind === entityKind
-        : parameter.kind.type === entityKind,
-    ),
+    descriptor.applicable_to.includes(entityKind),
   );
 }
 

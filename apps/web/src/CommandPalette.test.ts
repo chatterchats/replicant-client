@@ -13,6 +13,8 @@ const descriptor: WorkflowDescriptor = {
   aliases: ["scan systems"],
   description: "Survey nearby systems",
   category: "missions",
+  operation_class: "workflow",
+  applicable_to: ["system", "replicant"],
   risk: "elevated",
   supported_triggers: ["manual"],
   parameters: [

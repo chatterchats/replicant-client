@@ -71,6 +71,12 @@ impl WorkflowRegistry {
         }
     }
 
+    /// Returns whether a factory is registered for `kind`.
+    #[must_use]
+    pub fn contains(&self, kind: &WorkflowKind) -> bool {
+        self.factories.contains_key(kind)
+    }
+
     /// Resolves a factory that can load the instance's persisted schema.
     pub fn resolve(
         &self,

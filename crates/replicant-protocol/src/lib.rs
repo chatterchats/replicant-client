@@ -666,6 +666,18 @@ pub enum MutationRisk {
     Elevated,
 }
 
+/// Lifecycle class for a user-invokable operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationClass {
+    /// Read-only, finite query.
+    Report,
+    /// Finite mutation.
+    Action,
+    /// Durable persisted state machine.
+    Workflow,
+}
+
 /// Supported automation trigger. Upstream game events are delivered through SSE.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -696,6 +708,13 @@ pub struct ReportDescriptor {
     pub description: String,
     /// Navigation category.
     pub category: String,
+    /// Operation lifecycle class.
+    pub operation_class: OperationClass,
+    /// Mutation risk; reports are always [`MutationRisk::None`].
+    pub risk: MutationRisk,
+    /// Entity contexts from which this report is useful.
+    #[serde(default)]
+    pub applicable_to: Vec<EntityKind>,
     /// Accepted parameters.
     pub parameters: Vec<ParameterDescriptor>,
 }
@@ -714,8 +733,13 @@ pub struct ActionDescriptor {
     pub description: String,
     /// Navigation category.
     pub category: String,
+    /// Operation lifecycle class.
+    pub operation_class: OperationClass,
     /// Mutation risk.
     pub risk: MutationRisk,
+    /// Entity contexts from which this action is useful.
+    #[serde(default)]
+    pub applicable_to: Vec<EntityKind>,
     /// Accepted parameters.
     pub parameters: Vec<ParameterDescriptor>,
 }
@@ -734,8 +758,13 @@ pub struct WorkflowDescriptor {
     pub description: String,
     /// Navigation category.
     pub category: String,
+    /// Operation lifecycle class.
+    pub operation_class: OperationClass,
     /// Mutation risk.
     pub risk: MutationRisk,
+    /// Entity contexts from which this workflow is useful.
+    #[serde(default)]
+    pub applicable_to: Vec<EntityKind>,
     /// Accepted parameters.
     pub parameters: Vec<ParameterDescriptor>,
     /// Trigger kinds supported by this workflow.
@@ -942,7 +971,9 @@ mod tests {
             aliases: vec!["survey".to_owned()],
             description: "Survey a sequence of systems".to_owned(),
             category: "survey".to_owned(),
+            operation_class: OperationClass::Workflow,
             risk: MutationRisk::Low,
+            applicable_to: vec![EntityKind::System],
             parameters: vec![ParameterDescriptor {
                 name: "system".to_owned(),
                 label: "System".to_owned(),

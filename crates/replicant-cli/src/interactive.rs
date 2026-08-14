@@ -19,6 +19,7 @@ const TOP_LEVEL_COMMANDS: &[(&str, &str)] = &[
     ("observatory", "Galactic Observatory operations"),
     ("event", "Civilisation-event planning and execution"),
     ("bootstrap", "Regional bootstrap / landing delivery"),
+    ("workflow", "Daemon-backed operation catalogue"),
     ("rikers", "Riker colony-candidate report"),
 ];
 
@@ -310,6 +311,7 @@ fn operations_for(command: &str) -> &'static [&'static str] {
         "observatory" => &["status", "prospect", "triangulate"],
         "event" => &["interactive", "list", "plan", "run", "status"],
         "bootstrap" => &["plan", "stage", "deliver", "run", "status"],
+        "workflow" => &["catalogue"],
         _ => &[],
     }
 }

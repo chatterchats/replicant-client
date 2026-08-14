@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use replicant_protocol::{
-    DaemonHealth, HealthStatus, OperationKind, StartWorkflowRequest, WorkflowDetail,
-    WorkflowStatus, WorkflowSummary,
+    DaemonHealth, DescriptorCatalog, HealthStatus, OperationKind, StartWorkflowRequest,
+    WorkflowDetail, WorkflowStatus, WorkflowSummary,
 };
 use serde_json::Value;
 
@@ -15,6 +15,13 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
             reject_extra(arguments)?;
             let response = DaemonClient::from_env().workflows().await?;
             print!("{}", render_list(&response.workflows));
+        }
+        Some("catalogue" | "catalog") => {
+            reject_extra(arguments)?;
+            print!(
+                "{}",
+                render_catalogue(&DaemonClient::from_env().descriptors().await?)
+            );
         }
         Some("inspect") => {
             let id = required(&mut arguments, "workflow inspect ID")?;
@@ -52,6 +59,43 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         }
     }
     Ok(())
+}
+
+fn render_catalogue(catalogue: &DescriptorCatalog) -> String {
+    let mut output = String::new();
+    for (class, entries) in [
+        (
+            "Reports",
+            catalogue
+                .reports
+                .iter()
+                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "Actions",
+            catalogue
+                .actions
+                .iter()
+                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .collect(),
+        ),
+        (
+            "Workflows",
+            catalogue
+                .workflows
+                .iter()
+                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .collect(),
+        ),
+    ] {
+        output.push_str(class);
+        output.push('\n');
+        for (kind, name, description) in entries {
+            output.push_str(&format!("  {kind:<20} {name} — {description}\n"));
+        }
+    }
+    output
 }
 
 pub(crate) async fn daemon_status(arguments: Vec<String>) -> crate::AnyResult<()> {
@@ -185,7 +229,7 @@ fn render_detail(workflow: &WorkflowDetail) -> String {
 fn print_help() {
     println!(
         "Daemon workflow control\n\n\
-Usage:\n  replicant-cli workflow list\n  replicant-cli workflow inspect ID\n  replicant-cli workflow start KIND [--param] NAME=VALUE ...\n  replicant-cli workflow pause ID\n  replicant-cli workflow resume ID\n  replicant-cli workflow cancel ID\n\n\
+Usage:\n  replicant-cli workflow catalogue\n  replicant-cli workflow list\n  replicant-cli workflow inspect ID\n  replicant-cli workflow start KIND [--param] NAME=VALUE ...\n  replicant-cli workflow pause ID\n  replicant-cli workflow resume ID\n  replicant-cli workflow cancel ID\n\n\
 Values accept JSON scalars, arrays, and objects; unquoted values are strings.\n\
 Set REPLICANTD_URL to override http://127.0.0.1:8080."
     );
@@ -229,5 +273,22 @@ mod tests {
         assert!(rendered.contains("workflow-1"));
         assert!(rendered.contains("waiting"));
         assert!(rendered.contains("surveying"));
+    }
+
+    #[test]
+    fn renders_every_catalogue_lifecycle_class() {
+        let catalogue =
+            replicant_runtime::catalogue::OperationCatalogue::new().expect("operation catalogue");
+        let rendered = render_catalogue(catalogue.descriptors());
+        for expected in [
+            "Reports",
+            "nearby_belts",
+            "Actions",
+            "clear_tags",
+            "Workflows",
+            "survey.route",
+        ] {
+            assert!(rendered.contains(expected));
+        }
     }
 }

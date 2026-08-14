@@ -62,6 +62,8 @@ describe("system marker mapping", () => {
           aliases: [],
           description: "Survey a system",
           category: "mission",
+          operation_class: "workflow",
+          applicable_to: ["system"],
           parameters: [
             {
               name: "system",

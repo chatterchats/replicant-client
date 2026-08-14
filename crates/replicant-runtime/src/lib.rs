@@ -63,6 +63,7 @@ pub mod event;
 
 /// Regional bootstrap planning and restart-safe execution.
 pub mod bootstrap;
+pub mod catalogue;
 
 /// Replicant-only asteroid-belt scouting.
 pub mod belt_search;

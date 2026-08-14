@@ -79,6 +79,8 @@ describe("descriptor workflow form", () => {
       aliases: [],
       description: "Test",
       category: "test",
+      operation_class: "workflow",
+      applicable_to: [],
       risk: "low",
       supported_triggers: ["manual"],
       parameters: [parameter("replicant", { type: "replicant" })],

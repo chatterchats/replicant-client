@@ -28,36 +28,29 @@ use replicant_client::{
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
-    ActionDescriptor, ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId,
-    EntityKind, EntityRef, ErrorResponse, GalaxySceneSnapshot, HealthStatus, LiveDelta,
-    LiveMessage, MutationRisk, OperationKind, OperationStatus, OperationUpdate,
-    ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
-    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
-    TriggerKind, Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse,
-    WorkflowDescriptor, WorkflowDetail, WorkflowId as ProtocolWorkflowId, WorkflowListResponse,
-    WorkflowStatus as ProtocolStatus, WorkflowSummary,
+    ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef,
+    ErrorResponse, GalaxySceneSnapshot, HealthStatus, LiveDelta, LiveMessage, OperationClass,
+    OperationKind, OperationStatus, OperationUpdate, RunOperationRequest, RunOperationResponse,
+    RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest,
+    StartWorkflowResponse, SyncPhase, SystemSceneSnapshot, Versioned, WorkflowActivity,
+    WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
+    WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
-    actions::{ClearTagsAction, ContributeDevicesAction, clear_tags, contribute_devices},
+    catalogue::{CatalogueError, OperationCatalogue},
     config::RuntimeConfig,
     galaxy_scene::galaxy_scene as build_galaxy_scene,
-    relay::RelayExpansionRequest,
-    reports::nearby_belt_report,
-    survey::{SurveyMode, SurveyOptions},
     system_scene::system_scene as build_system_scene,
-    workflows::{
-        RelayWorkflowConfig, SurveyWorkflowConfig, WorkflowActivityEvent, new_relay_workflow,
-        new_survey_workflow, register,
-    },
+    workflows::WorkflowActivityEvent,
 };
 use replicant_workflow::{
-    RegistryError, RepositoryError, ResourceKey, SupervisorError, WorkflowId, WorkflowInstance,
+    RepositoryError, ResourceKey, SupervisorError, WorkflowId, WorkflowInstance,
     WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, watch};
 
 const LIVE_BUFFER: usize = 32;
@@ -116,7 +109,7 @@ pub struct AppState {
     context: ApplicationContext,
     repository: Arc<WorkflowRepository>,
     supervisor: Mutex<WorkflowSupervisor>,
-    descriptors: DescriptorCatalog,
+    catalogue: OperationCatalogue,
     live: broadcast::Sender<LiveMessage>,
     revision: AtomicU64,
     publish_lock: StdMutex<()>,
@@ -128,18 +121,19 @@ impl AppState {
         client: Client,
         runtime_config: RuntimeConfig,
         repository: Arc<WorkflowRepository>,
-    ) -> Result<Arc<Self>, RegistryError> {
-        let mut registry = replicant_workflow::WorkflowRegistry::new();
-        register(&mut registry)?;
-        let registry = Arc::new(registry);
-        let supervisor =
-            WorkflowSupervisor::with_managed_client(repository.clone(), registry, client.clone());
+    ) -> Result<Arc<Self>, CatalogueError> {
+        let catalogue = OperationCatalogue::new()?;
+        let supervisor = WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            catalogue.workflow_registry(),
+            client.clone(),
+        );
         let revision = client.state().revision().unwrap_or_default();
         Ok(Arc::new(Self {
             context: ApplicationContext::new(client, runtime_config),
             repository,
             supervisor: Mutex::new(supervisor),
-            descriptors: descriptor_catalog(),
+            catalogue,
             live: broadcast::channel(LIVE_BUFFER).0,
             revision: AtomicU64::new(revision),
             publish_lock: StdMutex::new(()),
@@ -440,7 +434,7 @@ async fn system_scene(
 }
 
 async fn descriptors(State(state): State<Arc<AppState>>) -> Json<Versioned<DescriptorCatalog>> {
-    Json(Versioned::current(state.descriptors.clone()))
+    Json(Versioned::current(state.catalogue.descriptors().clone()))
 }
 
 async fn run_report(
@@ -451,16 +445,11 @@ async fn run_report(
     let request = payload
         .map_err(|_| ApiError::invalid("invalid report parameters"))?
         .0;
-    let result = match kind.as_str() {
-        "nearby_belts" => {
-            let request = operation_parameters(request)?;
-            let result = nearby_belt_report(state.client(), &request)
-                .await
-                .map_err(|_| ApiError::internal())?;
-            serde_json::to_value(result).map_err(|_| ApiError::internal())?
-        }
-        _ => return Err(ApiError::operation_not_found()),
-    };
+    let result = state
+        .catalogue
+        .run_report(state.client(), &kind, request.parameters)
+        .await
+        .map_err(ApiError::catalogue)?;
     Ok(Json(Versioned::current(RunOperationResponse { result })))
 }
 
@@ -472,31 +461,12 @@ async fn run_action(
     let request = payload
         .map_err(|_| ApiError::invalid("invalid action parameters"))?
         .0;
-    let result = match kind.as_str() {
-        "clear_tags" => {
-            let request: ClearTagsAction = operation_parameters(request)?;
-            let result = clear_tags(state.client(), &request)
-                .await
-                .map_err(|_| ApiError::internal())?;
-            serde_json::to_value(result).map_err(|_| ApiError::internal())?
-        }
-        "contribute_devices" => {
-            let request: ContributeDevicesAction = operation_parameters(request)?;
-            let result = contribute_devices(state.client(), &request)
-                .await
-                .map_err(|_| ApiError::internal())?;
-            serde_json::to_value(result).map_err(|_| ApiError::internal())?
-        }
-        _ => return Err(ApiError::operation_not_found()),
-    };
+    let result = state
+        .catalogue
+        .run_action(state.client(), &kind, request.parameters)
+        .await
+        .map_err(ApiError::catalogue)?;
     Ok(Json(Versioned::current(RunOperationResponse { result })))
-}
-
-fn operation_parameters<T: serde::de::DeserializeOwned>(
-    request: RunOperationRequest,
-) -> Result<T, ApiError> {
-    serde_json::from_value(Value::Object(request.parameters.into_iter().collect()))
-        .map_err(|_| ApiError::invalid("invalid operation parameters"))
 }
 
 #[derive(Default, Deserialize)]
@@ -539,26 +509,10 @@ async fn start_workflow(
     payload: Result<Json<StartWorkflowRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Versioned<StartWorkflowResponse>>), ApiError> {
     let Json(request) = payload.map_err(|_| ApiError::invalid("invalid JSON request"))?;
-    let instance = match request.kind.0.as_str() {
-        "survey.route" => {
-            let parameters: SurveyStart = decode_parameters(request.parameters)?;
-            state
-                .repository
-                .create(new_survey_workflow(SurveyWorkflowConfig {
-                    options: parameters.into_options(),
-                }))
-        }
-        "relay.expansion" => {
-            let parameters: RelayStart = decode_parameters(request.parameters)?;
-            state
-                .repository
-                .create(new_relay_workflow(RelayWorkflowConfig {
-                    request: parameters.into_request(),
-                }))
-        }
-        _ => return Err(ApiError::invalid("unknown workflow kind")),
-    }
-    .map_err(ApiError::repository)?;
+    let instance = state
+        .catalogue
+        .create_workflow(&state.repository, &request.kind.0, request.parameters)
+        .map_err(ApiError::catalogue)?;
     Ok((
         StatusCode::CREATED,
         Json(Versioned::current(StartWorkflowResponse {
@@ -838,358 +792,6 @@ fn present_activity(message: &str) -> (ActivityLevel, Option<String>, String) {
     }
 }
 
-#[derive(Deserialize)]
-struct SurveyStart {
-    #[serde(default = "default_survey_mode")]
-    mode: SurveyMode,
-    replicant: String,
-    vessel: String,
-    center: String,
-    #[serde(default = "default_radius")]
-    radius_ly: f64,
-    #[serde(default = "default_system_limit")]
-    system_limit: usize,
-    #[serde(default = "default_concurrency")]
-    star_detail_concurrency: usize,
-    mission_file: PathBuf,
-    #[serde(default)]
-    controller: Option<String>,
-    #[serde(default)]
-    drones_csv: Option<String>,
-    #[serde(default)]
-    replace_plan: bool,
-    #[serde(default)]
-    include_explored: bool,
-    #[serde(default = "default_timeout")]
-    travel_timeout_seconds: u64,
-    #[serde(default = "default_timeout")]
-    survey_timeout_seconds: u64,
-    maintenance_home: String,
-    #[serde(default = "default_maintenance_interval")]
-    maintenance_interval: usize,
-    #[serde(default = "default_maintenance_threshold")]
-    maintenance_threshold_pct: f64,
-    #[serde(default = "default_maintenance_resume")]
-    maintenance_resume_pct: f64,
-    #[serde(default = "default_maintenance_check")]
-    maintenance_check_seconds: u64,
-}
-
-impl SurveyStart {
-    fn into_options(self) -> SurveyOptions {
-        SurveyOptions {
-            mode: self.mode,
-            replicant: self.replicant,
-            vessel: self.vessel,
-            center: self.center,
-            radius_ly: self.radius_ly,
-            system_limit: self.system_limit,
-            star_detail_concurrency: self.star_detail_concurrency,
-            mission_file: self.mission_file,
-            controller: self.controller,
-            drones: self.drones_csv.map(csv),
-            replace_plan: self.replace_plan,
-            include_explored: self.include_explored,
-            travel_timeout: Duration::from_secs(self.travel_timeout_seconds),
-            survey_timeout: Duration::from_secs(self.survey_timeout_seconds),
-            maintenance_home: self.maintenance_home,
-            maintenance_interval: self.maintenance_interval,
-            maintenance_threshold_pct: self.maintenance_threshold_pct,
-            maintenance_resume_pct: self.maintenance_resume_pct,
-            maintenance_check_interval: Duration::from_secs(self.maintenance_check_seconds),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct RelayStart {
-    replicant: String,
-    hub: String,
-    targets_csv: String,
-    mission_file: PathBuf,
-    #[serde(default = "default_max_hop")]
-    max_hop_ly: f64,
-    #[serde(default = "default_timeout")]
-    wait_timeout_seconds: u64,
-}
-
-impl RelayStart {
-    fn into_request(self) -> RelayExpansionRequest {
-        RelayExpansionRequest {
-            replicant: self.replicant,
-            hub: self.hub,
-            targets: csv(self.targets_csv),
-            mission_file: self.mission_file,
-            max_hop_ly: self.max_hop_ly,
-            wait_timeout: Duration::from_secs(self.wait_timeout_seconds),
-        }
-    }
-}
-
-fn csv(value: String) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn decode_parameters<T: for<'de> Deserialize<'de>>(
-    parameters: BTreeMap<String, Value>,
-) -> Result<T, ApiError> {
-    serde_json::from_value(Value::Object(parameters.into_iter().collect::<Map<_, _>>()))
-        .map_err(|_| ApiError::invalid("invalid workflow parameters"))
-}
-
-fn default_survey_mode() -> SurveyMode {
-    SurveyMode::Run
-}
-fn default_radius() -> f64 {
-    10.0
-}
-fn default_system_limit() -> usize {
-    80
-}
-fn default_concurrency() -> usize {
-    8
-}
-fn default_timeout() -> u64 {
-    21_600
-}
-fn default_maintenance_interval() -> usize {
-    40
-}
-fn default_maintenance_threshold() -> f64 {
-    25.0
-}
-fn default_maintenance_resume() -> f64 {
-    95.0
-}
-fn default_maintenance_check() -> u64 {
-    900
-}
-fn default_max_hop() -> f64 {
-    7.499
-}
-
-fn descriptor_catalog() -> DescriptorCatalog {
-    DescriptorCatalog {
-        reports: vec![ReportDescriptor {
-            kind: OperationKind("nearby_belts".to_owned()),
-            display_name: "Nearby belt report".to_owned(),
-            aliases: vec!["nearby_belt_report".to_owned(), "belts".to_owned()],
-            description: "Find asteroid belts in explored systems near an origin star.".to_owned(),
-            category: "reports".to_owned(),
-            parameters: vec![
-                required("origin", "Origin system", ParameterKind::System),
-                defaulted(
-                    "radius_ly",
-                    "Radius (light years)",
-                    ParameterKind::Number,
-                    10.0,
-                ),
-                defaulted(
-                    "concurrency",
-                    "Refresh concurrency",
-                    ParameterKind::Integer,
-                    4,
-                ),
-            ],
-        }],
-        actions: vec![
-            ActionDescriptor {
-                kind: OperationKind("clear_tags".to_owned()),
-                display_name: "Clear device tags".to_owned(),
-                aliases: vec!["clear_tags".to_owned()],
-                description: "Remove matching tags from owned devices.".to_owned(),
-                category: "devices".to_owned(),
-                risk: MutationRisk::Elevated,
-                parameters: vec![
-                    required("tag_prefix", "Tag prefix", ParameterKind::Tag),
-                    defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
-                ],
-            },
-            ActionDescriptor {
-                kind: OperationKind("contribute_devices".to_owned()),
-                display_name: "Contribute devices".to_owned(),
-                aliases: vec!["contribute_twaffy_injectors".to_owned()],
-                description: "Contribute selected owned devices at a destination.".to_owned(),
-                category: "devices".to_owned(),
-                risk: MutationRisk::Elevated,
-                parameters: vec![
-                    required("destination", "Destination", ParameterKind::Location),
-                    required("device_type", "Device type", ParameterKind::DeviceType),
-                    required("owner", "Owner", ParameterKind::Replicant),
-                    optional("tag", "Tag", ParameterKind::Tag),
-                    optional("count", "Maximum devices", ParameterKind::Integer),
-                    defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
-                ],
-            },
-        ],
-        workflows: vec![
-            WorkflowDescriptor {
-                kind: OperationKind("survey.route".to_owned()),
-                display_name: "Survey route".to_owned(),
-                aliases: vec!["survey".to_owned()],
-                description: "Plan or execute a restart-safe system survey route.".to_owned(),
-                category: "survey".to_owned(),
-                risk: MutationRisk::Elevated,
-                parameters: vec![
-                    enum_parameter("mode", "Mode", &["plan", "run"], "run"),
-                    required("replicant", "Replicant", ParameterKind::Replicant),
-                    required("vessel", "Vessel", ParameterKind::Device),
-                    required("center", "Centre system", ParameterKind::System),
-                    defaulted("radius_ly", "Radius (ly)", ParameterKind::Number, 10.0),
-                    defaulted("system_limit", "System limit", ParameterKind::Integer, 80),
-                    defaulted(
-                        "star_detail_concurrency",
-                        "Catalogue concurrency",
-                        ParameterKind::Integer,
-                        8,
-                    ),
-                    required("mission_file", "Mission file", ParameterKind::String),
-                    optional("controller", "Survey controller", ParameterKind::Device),
-                    optional(
-                        "drones_csv",
-                        "Survey drones (comma-separated)",
-                        ParameterKind::String,
-                    ),
-                    defaulted(
-                        "replace_plan",
-                        "Replace plan",
-                        ParameterKind::Boolean,
-                        false,
-                    ),
-                    defaulted(
-                        "include_explored",
-                        "Include explored",
-                        ParameterKind::Boolean,
-                        false,
-                    ),
-                    defaulted(
-                        "travel_timeout_seconds",
-                        "Travel timeout (seconds)",
-                        ParameterKind::Integer,
-                        21_600,
-                    ),
-                    defaulted(
-                        "survey_timeout_seconds",
-                        "Survey timeout (seconds)",
-                        ParameterKind::Integer,
-                        21_600,
-                    ),
-                    required(
-                        "maintenance_home",
-                        "Maintenance home",
-                        ParameterKind::System,
-                    ),
-                    defaulted(
-                        "maintenance_interval",
-                        "Maintenance interval",
-                        ParameterKind::Integer,
-                        40,
-                    ),
-                    defaulted(
-                        "maintenance_threshold_pct",
-                        "Maintenance threshold (%)",
-                        ParameterKind::Number,
-                        25.0,
-                    ),
-                    defaulted(
-                        "maintenance_resume_pct",
-                        "Maintenance resume (%)",
-                        ParameterKind::Number,
-                        95.0,
-                    ),
-                    defaulted(
-                        "maintenance_check_seconds",
-                        "Maintenance check (seconds)",
-                        ParameterKind::Integer,
-                        900,
-                    ),
-                ],
-                supported_triggers: vec![TriggerKind::Manual],
-            },
-            WorkflowDescriptor {
-                kind: OperationKind("relay.expansion".to_owned()),
-                display_name: "Relay expansion".to_owned(),
-                aliases: vec!["relay".to_owned()],
-                description: "Build and deploy a restart-safe relay expansion.".to_owned(),
-                category: "relay".to_owned(),
-                risk: MutationRisk::Elevated,
-                parameters: vec![
-                    required("replicant", "Replicant", ParameterKind::Replicant),
-                    required("hub", "Manufacturing hub", ParameterKind::Location),
-                    required(
-                        "targets_csv",
-                        "Target systems (comma-separated)",
-                        ParameterKind::System,
-                    ),
-                    required("mission_file", "Mission file", ParameterKind::String),
-                    defaulted(
-                        "max_hop_ly",
-                        "Maximum hop (ly)",
-                        ParameterKind::Number,
-                        7.499,
-                    ),
-                    defaulted(
-                        "wait_timeout_seconds",
-                        "Wait timeout (seconds)",
-                        ParameterKind::Integer,
-                        21_600,
-                    ),
-                ],
-                supported_triggers: vec![TriggerKind::Manual],
-            },
-        ],
-    }
-}
-
-fn parameter(name: &str, label: &str, kind: ParameterKind, required: bool) -> ParameterDescriptor {
-    ParameterDescriptor {
-        name: name.to_owned(),
-        label: label.to_owned(),
-        description: label.to_owned(),
-        kind,
-        required,
-        default: None,
-        options: Vec::new(),
-        validation: ParameterValidation::default(),
-    }
-}
-
-fn required(name: &str, label: &str, kind: ParameterKind) -> ParameterDescriptor {
-    parameter(name, label, kind, true)
-}
-
-fn optional(name: &str, label: &str, kind: ParameterKind) -> ParameterDescriptor {
-    parameter(name, label, kind, false)
-}
-
-fn defaulted(
-    name: &str,
-    label: &str,
-    kind: ParameterKind,
-    value: impl Into<Value>,
-) -> ParameterDescriptor {
-    let mut parameter = parameter(name, label, kind, false);
-    parameter.default = Some(value.into());
-    parameter
-}
-
-fn enum_parameter(name: &str, label: &str, values: &[&str], default: &str) -> ParameterDescriptor {
-    let mut parameter = defaulted(name, label, ParameterKind::Enum, default);
-    parameter.options = values
-        .iter()
-        .map(|value| ParameterOption {
-            value: (*value).to_owned(),
-            label: (*value).to_owned(),
-        })
-        .collect();
-    parameter
-}
-
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -1249,6 +851,22 @@ impl ApiError {
             },
             error => {
                 tracing::error!(error = %error, "runtime repository request failed");
+                Self::internal()
+            }
+        }
+    }
+
+    fn catalogue(error: CatalogueError) -> Self {
+        match error {
+            CatalogueError::UnknownKind {
+                class: OperationClass::Workflow,
+                ..
+            } => Self::invalid("unknown workflow kind"),
+            CatalogueError::UnknownKind { .. } => Self::operation_not_found(),
+            CatalogueError::Invalid(_) => Self::invalid("invalid operation parameters"),
+            CatalogueError::Repository(error) => Self::repository(error),
+            error => {
+                tracing::error!(error = %error, "runtime catalogue request failed");
                 Self::internal()
             }
         }
