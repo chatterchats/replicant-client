@@ -2,9 +2,12 @@ SHELL := /bin/sh
 CARGO ?= cargo
 PYTHON ?= python3
 NPM ?= npm
+WASM_PACK ?= wasm-pack
 WEB_DIR := apps/web
+GALAXY_RENDERER_DIR := crates/galaxy-renderer
+GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check web-fmt web-fmt-check web-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci zip
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci zip
 
 help:
 	@printf '%s\n' \
@@ -41,6 +44,9 @@ fmt:
 fmt-check:
 	$(CARGO) fmt --all -- --check
 	$(MAKE) web-fmt-check
+
+galaxy-wasm:
+	$(WASM_PACK) build $(GALAXY_RENDERER_DIR) --target web --out-dir $(GALAXY_WASM_OUT) --release --locked
 
 web-fmt:
 	$(NPM) --prefix $(WEB_DIR) run format

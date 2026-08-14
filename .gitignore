@@ -33,10 +33,12 @@ logs/
 mining-expansion*
 *.lock
 !cargo.lock
+!crates/galaxy-renderer/Cargo.lock
 *.log
 *.txt
 apps/web/node_modules/
 apps/web/dist/
+apps/web/src/wasm/galaxy_renderer/
 apps/web/*.tsbuildinfo
 !apps/web/package.json
 !apps/web/package-lock.json

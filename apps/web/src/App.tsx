@@ -11,6 +11,7 @@ import {
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
 import { CommandPalette, type CommandContext } from "./CommandPalette";
+import { GalaxyMapWasm } from "./GalaxyMapWasm";
 import { daemonApi } from "./api";
 import type { DescriptorCatalog, EntityKind, WorkflowStatus } from "./protocol";
 import {
@@ -302,6 +303,8 @@ export function App() {
           <div className="content-column">
             {shell.page === "Automations" ? (
               <AutomationsPage entities={entities} workflows={workflows} />
+            ) : shell.page === "Galaxy" ? (
+              <GalaxyMapWasm />
             ) : (
               <article className="page">
                 <p className="eyebrow">{group}</p>
