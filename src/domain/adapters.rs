@@ -525,6 +525,18 @@ pub fn location_detail(
     if let Some(mining_bonus_pct) = raw.mining_bonus_pct {
         unknown.insert("mining_bonus_pct".into(), Value::from(mining_bonus_pct));
     }
+    if let Some(events) = &raw.active_location_events {
+        unknown.insert(
+            "active_location_events".into(),
+            Value::Array(events.iter().cloned().map(Value::Object).collect()),
+        );
+    }
+    if let Some(sites) = &raw.resource_sites {
+        unknown.insert(
+            "resource_sites".into(),
+            Value::Array(sites.iter().cloned().map(Value::Object).collect()),
+        );
+    }
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),
@@ -1128,7 +1140,9 @@ mod location_tests {
                 "outer_radius_au": 0.9,
                 "resources": {"carbon": "rich"}
             },
-            "mining_bonus_pct": 12.5
+            "mining_bonus_pct": 12.5,
+            "active_location_events": [{"event_code": "E1"}],
+            "resource_sites": [{"site_code": "R1"}]
         }))
         .expect("belt location should decode");
 
@@ -1141,6 +1155,14 @@ mod location_tests {
         assert_eq!(
             observation.value.unknown["mining_bonus_pct"],
             Value::from(12.5)
+        );
+        assert_eq!(
+            observation.value.unknown["active_location_events"][0]["event_code"],
+            "E1"
+        );
+        assert_eq!(
+            observation.value.unknown["resource_sites"][0]["site_code"],
+            "R1"
         );
     }
 

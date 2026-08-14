@@ -5,6 +5,7 @@ import {
   parseGalaxySceneResponse,
   parseLiveMessage,
   parseSnapshotResponse,
+  parseSystemSceneResponse,
 } from "./protocol";
 
 describe("parseHealthResponse", () => {
@@ -96,5 +97,32 @@ describe("parseHealthResponse", () => {
     }).payload;
     expect(scene.stars[0]?.id).toBe("SOL");
     expect(scene.stars[0]?.position.z).toBe(2);
+  });
+
+  it("parses an application-owned system scene", () => {
+    const scene = parseSystemSceneResponse({
+      protocol_version: 1,
+      payload: {
+        system: "SOL",
+        revision: 7,
+        generated_at_ms: 8,
+        markers: [
+          {
+            id: "SOL-1",
+            label: "SOL-1",
+            kind: "planet",
+            entity: { kind: "location", id: "SOL-1" },
+            location: "SOL-1",
+            parent: null,
+            position: { x: 1, y: 2 },
+            count: 1,
+          },
+        ],
+        active_travel: [],
+        workflow_markers: [],
+      },
+    }).payload;
+    expect(scene.system).toBe("SOL");
+    expect(scene.markers[0]?.entity.kind).toBe("location");
   });
 });

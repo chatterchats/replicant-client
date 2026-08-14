@@ -340,6 +340,158 @@ h1 {
 .galaxy-map-error {
   color: #ef6b7a;
 }
+.system-page {
+  padding: 30px 36px 70px;
+}
+.system-page-header,
+.system-map-toolbar,
+.system-map-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.system-page-header {
+  justify-content: space-between;
+}
+.system-page-header h1 {
+  margin: 6px 0;
+}
+.system-map-toolbar {
+  margin: 18px 0 10px;
+}
+.system-map-toolbar button,
+.system-page-header button {
+  border: 1px solid rgba(159, 188, 193, 0.24);
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #0b1917;
+  color: #eff8f6;
+  cursor: pointer;
+}
+.system-map-counts {
+  margin-left: auto;
+  color: #78908c;
+  font-size: 0.78rem;
+}
+.system-map-stage {
+  position: relative;
+  height: min(680px, 68vh);
+  overflow: hidden;
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  background: radial-gradient(circle at center, #102421, #06110f 72%);
+  cursor: grab;
+  touch-action: none;
+}
+.system-map-content {
+  position: relative;
+  width: 1000px;
+  height: 1000px;
+}
+.system-map-webgl {
+  position: absolute;
+  inset: 0;
+  width: 1000px;
+  height: 1000px;
+  pointer-events: none;
+}
+.system-marker {
+  position: absolute;
+  display: grid;
+  justify-items: center;
+  min-width: 72px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #dcebe8;
+  translate: -50% -50%;
+  cursor: pointer;
+}
+.system-marker > span {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #84b9b1;
+  border-radius: 50%;
+  background: #183d37;
+  box-shadow: 0 0 10px rgba(65, 212, 200, 0.45);
+}
+.system-marker.star > span {
+  width: 26px;
+  height: 26px;
+  border-color: #ffe39a;
+  background: #dcae45;
+}
+.system-marker.planet > span {
+  width: 20px;
+  height: 20px;
+}
+.system-marker.moon > span,
+.system-marker.lagrange > span {
+  width: 8px;
+  height: 8px;
+}
+.system-marker.belt > span {
+  border-style: dashed;
+  background: transparent;
+}
+.system-marker.factory > span,
+.system-marker.relay > span {
+  border-radius: 2px;
+  border-color: #be8cff;
+}
+.system-marker.event > span {
+  border-color: #ef6b7a;
+  background: #672c36;
+}
+.system-marker.resource_site > span {
+  border-color: #70d89b;
+  background: #24563a;
+}
+.system-marker small {
+  margin-top: 4px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: rgba(5, 14, 13, 0.82);
+  white-space: nowrap;
+}
+.system-marker b {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  font-size: 0.65rem;
+}
+.system-activity-marker {
+  position: absolute;
+  z-index: 2;
+  width: 25px;
+  height: 25px;
+  border: 1px solid #41d4c8;
+  border-radius: 50%;
+  background: #102e2a;
+  color: #8af0e7;
+  translate: -50% -50%;
+  cursor: pointer;
+}
+.system-activity-marker.workflow {
+  border-color: #be8cff;
+  color: #d7b8ff;
+}
+.system-map-legend {
+  flex-wrap: wrap;
+  padding-top: 10px;
+  color: #78908c;
+  font-size: 0.72rem;
+  text-transform: capitalize;
+}
+.system-map-legend span::before {
+  content: "·";
+  margin-right: 8px;
+  color: #41d4c8;
+}
+.system-map-fallback,
+.error-state {
+  color: #ef6b7a;
+}
 .entity-list {
   margin-top: 36px;
 }

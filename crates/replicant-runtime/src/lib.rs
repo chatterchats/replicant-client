@@ -28,6 +28,9 @@ pub type ActionResult<T> = Result<T, ApplicationError>;
 
 pub mod config;
 
+/// Renderer-ready system scenes derived from managed state.
+pub mod system_scene;
+
 /// Read-only application queries and reports.
 pub mod reports;
 

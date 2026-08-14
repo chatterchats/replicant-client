@@ -16,11 +16,13 @@ import {
   type DescriptorCommand,
 } from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
+import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
   EntityKind,
   GalaxyStar,
+  SystemMarker,
   WorkflowStatus,
 } from "./protocol";
 import {
@@ -110,6 +112,9 @@ export function App() {
     workflows: [],
   });
   const [selectedGalaxyStar, setSelectedGalaxyStar] = useState<GalaxyStar>();
+  const [selectedSystem, setSelectedSystem] = useState<string>();
+  const [selectedSystemMarker, setSelectedSystemMarker] =
+    useState<SystemMarker>();
   const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
   const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
     useState<string>();
@@ -191,7 +196,10 @@ export function App() {
       : shell.selectedEntity.kind === "system" &&
           selectedGalaxyStar?.id === shell.selectedEntity.id
         ? selectedGalaxyStar
-        : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
+        : selectedSystemMarker?.entity.kind === shell.selectedEntity.kind &&
+            selectedSystemMarker.entity.id === shell.selectedEntity.id
+          ? selectedSystemMarker
+          : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
     : undefined;
   const commandContext: CommandContext = {
     system:
@@ -199,6 +207,7 @@ export function App() {
         ? shell.selectedEntity.id
         : null) ??
       textField(selectedValue, "system", "system_code") ??
+      selectedSystem ??
       currentSystem ??
       undefined,
     location:
@@ -329,6 +338,7 @@ export function App() {
                 descriptors={descriptors}
                 onSelectStar={(star) => {
                   setSelectedGalaxyStar(star);
+                  setSelectedSystem(star.id);
                   select({ kind: "system", id: star.id });
                 }}
                 onRunCommand={(command) => {
@@ -339,6 +349,29 @@ export function App() {
                   setSelectedAutomationWorkflow(workflowId);
                   navigate("Automations");
                 }}
+                onOpenSystem={(star) => {
+                  setSelectedGalaxyStar(star);
+                  setSelectedSystem(star.id);
+                  select({ kind: "system", id: star.id });
+                  navigate("System");
+                }}
+              />
+            ) : shell.page === "System" ? (
+              <SystemPage
+                system={selectedSystem ?? currentSystem ?? undefined}
+                descriptors={descriptors}
+                onSelectMarker={(marker) => {
+                  setSelectedSystemMarker(marker);
+                  select(marker.entity);
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+                onOpenGalaxy={() => {
+                  navigate("Galaxy");
+                }}
+                onSelectEntity={select}
               />
             ) : (
               <article className="page">

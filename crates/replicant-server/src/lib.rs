@@ -33,8 +33,8 @@ use replicant_protocol::{
     LiveMessage, MutationRisk, OperationKind, OperationStatus, OperationUpdate,
     ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
     RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, TriggerKind,
-    Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    TriggerKind, Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse,
     WorkflowDescriptor, WorkflowDetail, WorkflowId as ProtocolWorkflowId, WorkflowListResponse,
     WorkflowStatus as ProtocolStatus, WorkflowSummary,
 };
@@ -44,8 +44,9 @@ use replicant_runtime::{
     config::RuntimeConfig,
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     relay::RelayExpansionRequest,
-    reports::{NearbyBeltReportRequest, nearby_belt_report},
+    reports::nearby_belt_report,
     survey::{SurveyMode, SurveyOptions},
+    system_scene::system_scene as build_system_scene,
     workflows::{
         RelayWorkflowConfig, SurveyWorkflowConfig, WorkflowActivityEvent, new_relay_workflow,
         new_survey_workflow, register,
@@ -191,6 +192,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
         .route("/api/galaxy-scene", get(galaxy_scene))
+        .route("/api/system-scene/{system}", get(system_scene))
         .route("/ws", get(websocket))
         .route("/api/descriptors", get(descriptors))
         .route("/api/reports/{kind}", post(run_report))
@@ -417,6 +419,21 @@ async fn galaxy_scene(
         .await
         .map_err(|error| {
             tracing::error!(error = %error, "galaxy scene projection failed");
+            ApiError::unavailable()
+        })?;
+    Ok(Json(Versioned::current(scene)))
+}
+
+async fn system_scene(
+    State(state): State<Arc<AppState>>,
+    Path(system): Path<String>,
+) -> Result<Json<Versioned<SystemSceneSnapshot>>, ApiError> {
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let revision = state.revision.load(Ordering::Relaxed);
+    let scene = build_system_scene(state.client(), &workflows, &system, revision, now_millis()?)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, system, "system scene projection failed");
             ApiError::unavailable()
         })?;
     Ok(Json(Versioned::current(scene)))
@@ -1327,6 +1344,7 @@ mod tests {
             "/api/health",
             "/api/snapshot",
             "/api/galaxy-scene",
+            "/api/system-scene/SOL",
             "/api/descriptors",
         ] {
             let response = app

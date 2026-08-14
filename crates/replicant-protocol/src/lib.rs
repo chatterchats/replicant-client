@@ -296,6 +296,109 @@ pub struct GalaxySceneSnapshot {
     pub workflow_targets: Vec<GalaxyWorkflowTarget>,
 }
 
+/// Two-dimensional renderer coordinates within one star system.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SystemPoint {
+    /// Horizontal scene coordinate.
+    pub x: f64,
+    /// Vertical scene coordinate.
+    pub y: f64,
+}
+
+/// Semantic marker category used by the system map and entity actions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemMarkerKind {
+    /// Central star.
+    Star,
+    /// Planetary body.
+    Planet,
+    /// Moon.
+    Moon,
+    /// Asteroid or other belt.
+    Belt,
+    /// Lagrange point.
+    Lagrange,
+    /// Other known location.
+    Location,
+    /// Traveling or stationary vessel.
+    Vessel,
+    /// General device.
+    Device,
+    /// Autofactory or factory-like device.
+    Factory,
+    /// Relay or system-hub device.
+    Relay,
+    /// Known location event.
+    Event,
+    /// Known resource extraction site.
+    ResourceSite,
+}
+
+/// One renderer-ready object in a system scene.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemMarker {
+    /// Stable marker identity.
+    pub id: String,
+    /// Human-readable marker label.
+    pub label: String,
+    /// Marker category.
+    pub kind: SystemMarkerKind,
+    /// Entity selected and inspected when the marker is activated.
+    pub entity: EntityRef,
+    /// Hosting location designation.
+    pub location: String,
+    /// Parent location for orbit rendering, when known.
+    pub parent: Option<String>,
+    /// Stable application-generated scene position.
+    pub position: SystemPoint,
+    /// Number of represented objects when the marker is an aggregate.
+    pub count: u32,
+}
+
+/// Active travel between known locations in one system.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemTravel {
+    /// Traveling replicant or device.
+    pub entity: EntityRef,
+    /// Origin location designation.
+    pub from: String,
+    /// Destination location designation.
+    pub to: String,
+    /// ISO-8601 departure time, when known.
+    pub started_at: Option<String>,
+    /// ISO-8601 arrival time, when known.
+    pub arrives_at: Option<String>,
+}
+
+/// Active workflow projected into a system.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemWorkflowMarker {
+    /// Workflow instance.
+    pub workflow_id: WorkflowId,
+    /// Registered workflow kind.
+    pub workflow_kind: OperationKind,
+    /// Location used to place the workflow marker.
+    pub location: String,
+}
+
+/// Complete application-owned scene for one star system.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemSceneSnapshot {
+    /// Canonical system designation.
+    pub system: String,
+    /// Key used to avoid reapplying unchanged scene geometry.
+    pub revision: u64,
+    /// Unix milliseconds when this scene was built.
+    pub generated_at_ms: i64,
+    /// Bodies, locations, devices, events, and resource sites.
+    pub markers: Vec<SystemMarker>,
+    /// Active in-system travel.
+    pub active_travel: Vec<SystemTravel>,
+    /// Active workflow locations.
+    pub workflow_markers: Vec<SystemWorkflowMarker>,
+}
+
 /// Current daemon/runtime state returned to frontends as one consistent view.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {

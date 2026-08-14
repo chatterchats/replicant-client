@@ -74,11 +74,13 @@ export function GalaxyPage({
   descriptors,
   onRunCommand,
   onSelectWorkflow,
+  onOpenSystem,
 }: {
   onSelectStar: (star: GalaxyStar) => void;
   descriptors: DescriptorCatalog;
   onRunCommand: (command: DescriptorCommand) => void;
   onSelectWorkflow: (workflowId: string) => void;
+  onOpenSystem: (star: GalaxyStar) => void;
 }) {
   const galaxyRevision = useGalaxyRevision();
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
@@ -273,6 +275,16 @@ export function GalaxyPage({
               }}
             >
               Inspect
+            </button>
+          </li>
+          <li>
+            <button
+              onClick={() => {
+                setMenu(undefined);
+                onOpenSystem(menu.star);
+              }}
+            >
+              Open system
             </button>
           </li>
           {applicableDescriptorCommands(descriptors, "system").map(

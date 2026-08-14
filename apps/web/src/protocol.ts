@@ -177,6 +177,55 @@ export interface GalaxySceneSnapshot {
   }[];
 }
 
+export type SystemMarkerKind =
+  | "star"
+  | "planet"
+  | "moon"
+  | "belt"
+  | "lagrange"
+  | "location"
+  | "vessel"
+  | "device"
+  | "factory"
+  | "relay"
+  | "event"
+  | "resource_site";
+
+export interface SystemPoint {
+  x: number;
+  y: number;
+}
+
+export interface SystemMarker {
+  id: string;
+  label: string;
+  kind: SystemMarkerKind;
+  entity: EntityRef;
+  location: string;
+  parent: string | null;
+  position: SystemPoint;
+  count: number;
+}
+
+export interface SystemSceneSnapshot {
+  system: string;
+  revision: number;
+  generated_at_ms: number;
+  markers: SystemMarker[];
+  active_travel: {
+    entity: EntityRef;
+    from: string;
+    to: string;
+    started_at: string | null;
+    arrives_at: string | null;
+  }[];
+  workflow_markers: {
+    workflow_id: string;
+    workflow_kind: string;
+    location: string;
+  }[];
+}
+
 export interface EntityRef {
   kind: EntityKind;
   id: string;
@@ -701,6 +750,87 @@ export function parseGalaxySceneResponse(
           };
         },
       ),
+    };
+  });
+}
+
+export function parseSystemSceneResponse(
+  value: unknown,
+): Versioned<SystemSceneSnapshot> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "system scene");
+    if (typeof item.system !== "string")
+      throw new Error("Invalid system scene");
+    return {
+      system: item.system,
+      revision: number(item.revision, "system scene revision"),
+      generated_at_ms: number(item.generated_at_ms, "system scene time"),
+      markers: array(item.markers, "system markers").map((value) => {
+        const marker = record(value, "system marker");
+        if (
+          typeof marker.id !== "string" ||
+          typeof marker.label !== "string" ||
+          typeof marker.location !== "string"
+        )
+          throw new Error("Invalid system marker");
+        const position = record(marker.position, "system marker position");
+        return {
+          id: marker.id,
+          label: marker.label,
+          kind: oneOf(
+            marker.kind,
+            [
+              "star",
+              "planet",
+              "moon",
+              "belt",
+              "lagrange",
+              "location",
+              "vessel",
+              "device",
+              "factory",
+              "relay",
+              "event",
+              "resource_site",
+            ] as const,
+            "system marker kind",
+          ),
+          entity: entity(marker.entity),
+          location: marker.location,
+          parent: nullableString(marker.parent, "system marker parent"),
+          position: {
+            x: number(position.x, "system marker x"),
+            y: number(position.y, "system marker y"),
+          },
+          count: number(marker.count, "system marker count"),
+        };
+      }),
+      active_travel: array(item.active_travel, "system travel").map((value) => {
+        const travel = record(value, "system travel");
+        return {
+          entity: entity(travel.entity),
+          ...stringPair(value, "system travel"),
+          started_at: nullableString(travel.started_at, "travel start"),
+          arrives_at: nullableString(travel.arrives_at, "travel arrival"),
+        };
+      }),
+      workflow_markers: array(
+        item.workflow_markers,
+        "system workflow markers",
+      ).map((value) => {
+        const marker = record(value, "system workflow marker");
+        if (
+          typeof marker.workflow_id !== "string" ||
+          typeof marker.workflow_kind !== "string" ||
+          typeof marker.location !== "string"
+        )
+          throw new Error("Invalid system workflow marker");
+        return {
+          workflow_id: marker.workflow_id,
+          workflow_kind: marker.workflow_kind,
+          location: marker.location,
+        };
+      }),
     };
   });
 }

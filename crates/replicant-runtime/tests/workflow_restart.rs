@@ -1,3 +1,5 @@
+//! Restart coverage for persisted runtime workflow checkpoints.
+
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use replicant_runtime::workflows::{

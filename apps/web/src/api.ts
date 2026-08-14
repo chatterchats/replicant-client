@@ -1,6 +1,7 @@
 import {
   parseDescriptorsResponse,
   parseGalaxySceneResponse,
+  parseSystemSceneResponse,
   parseHealthResponse,
   parseOperationResponse,
   parseSnapshotResponse,
@@ -45,6 +46,11 @@ export const daemonApi = {
   async galaxyScene(signal?: AbortSignal) {
     return parseGalaxySceneResponse(await get("/api/galaxy-scene", signal))
       .payload;
+  },
+  async systemScene(system: string, signal?: AbortSignal) {
+    return parseSystemSceneResponse(
+      await get(`/api/system-scene/${encodeURIComponent(system)}`, signal),
+    ).payload;
   },
   async descriptors(signal?: AbortSignal) {
     return parseDescriptorsResponse(await get("/api/descriptors", signal))
