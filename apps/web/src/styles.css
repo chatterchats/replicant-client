@@ -240,7 +240,8 @@ h1 {
   overflow: auto;
 }
 .galaxy-map {
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(360px, 1fr);
   padding: 36px 42px;
@@ -287,7 +288,8 @@ h1 {
 }
 .galaxy-canvas-shell {
   position: relative;
-  min-height: 360px;
+  min-height: 0;
+  overflow: hidden;
 }
 .galaxy-workflow-overlays {
   position: absolute;
@@ -329,9 +331,10 @@ h1 {
   list-style: none;
 }
 .galaxy-map canvas {
+  display: block;
   width: 100%;
   height: 100%;
-  min-height: 360px;
+  min-height: 0;
   border: 1px solid rgba(159, 188, 193, 0.16);
   border-radius: 8px;
   background: #071210;
