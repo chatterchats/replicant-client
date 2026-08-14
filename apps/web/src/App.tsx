@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { type DaemonHealth, parseHealthResponse } from "./protocol";
+import { useDaemonConnection, useDaemonHealth } from "./daemon";
 
 const navigation = [
   ["Operations", ["Overview", "Galaxy", "System"]],
@@ -19,28 +19,8 @@ export function App() {
   const [selected, setSelected] = useState("Overview");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [health, setHealth] = useState<DaemonHealth>();
-  const [connectionError, setConnectionError] = useState(false);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetch("/api/health", { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok)
-          throw new Error(`Daemon returned ${String(response.status)}`);
-        return parseHealthResponse(await response.json());
-      })
-      .then((response) => {
-        setHealth(response.payload);
-      })
-      .catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === "AbortError"))
-          setConnectionError(true);
-      });
-    return () => {
-      controller.abort();
-    };
-  }, []);
+  const health = useDaemonHealth();
+  const { connection, syncing, revision } = useDaemonConnection();
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -70,8 +50,8 @@ export function App() {
     setQuery("");
   };
 
-  const connection =
-    health?.status ?? (connectionError ? "offline" : "connecting");
+  const status =
+    connection === "connected" ? (health?.status ?? "healthy") : connection;
 
   return (
     <div className="app-shell">
@@ -113,9 +93,10 @@ export function App() {
 
       <main>
         <header className="status-bar">
-          <span className={`status-dot ${connection}`} aria-hidden="true" />
-          <span>replicantd: {connection}</span>
+          <span className={`status-dot ${status}`} aria-hidden="true" />
+          <span>replicantd: {status}</span>
           {health ? <small>v{health.daemon_version}</small> : null}
+          {revision === null ? null : <small>revision {revision}</small>}
           <button
             className="palette-trigger"
             onClick={() => {
@@ -133,14 +114,16 @@ export function App() {
             come from the local daemon protocol.
           </p>
           <section className="connection-card">
-            <span className={`status-dot ${connection}`} aria-hidden="true" />
+            <span className={`status-dot ${status}`} aria-hidden="true" />
             <div>
               <strong>Daemon connection</strong>
               <p>
                 {health?.detail ??
-                  (connectionError
+                  (connection === "offline"
                     ? "Start replicantd to connect."
-                    : "Connecting to /api/health…")}
+                    : syncing
+                      ? "Synchronizing daemon state…"
+                      : "Daemon state is current.")}
               </p>
             </div>
           </section>
