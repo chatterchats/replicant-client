@@ -1,8 +1,9 @@
 use std::{env, io};
 
 use replicant_protocol::{
-    DaemonHealth, DescriptorCatalog, ErrorResponse, StartWorkflowRequest, StartWorkflowResponse,
-    Versioned, WorkflowControlResponse, WorkflowDetail, WorkflowListResponse,
+    DaemonHealth, DescriptorCatalog, ErrorResponse, RunOperationRequest, RunOperationResponse,
+    StartWorkflowRequest, StartWorkflowResponse, Versioned, WorkflowControlResponse,
+    WorkflowDetail, WorkflowListResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -46,6 +47,16 @@ impl DaemonClient {
         request: &StartWorkflowRequest,
     ) -> crate::AnyResult<StartWorkflowResponse> {
         self.post("/api/workflows", Some(request)).await
+    }
+
+    pub(crate) async fn run_operation(
+        &self,
+        class: &str,
+        kind: &str,
+        request: &RunOperationRequest,
+    ) -> crate::AnyResult<RunOperationResponse> {
+        self.post(&format!("/api/{class}s/{kind}"), Some(request))
+            .await
     }
 
     pub(crate) async fn control(

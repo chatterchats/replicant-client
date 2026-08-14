@@ -168,15 +168,19 @@ cargo run -p replicant-cli -- print status --system SCEPTURUM
 
 ## Examples
 
-The root [`examples/`](examples) directory contains runnable tools and
-compile-checked API sketches. See [`examples/README.md`](examples/README.md)
-for prerequisites, safety notes, and a command for every example.
+Application reports and mutations are registered in the daemon catalogue. This
+is the preferred path because the daemon owns the single managed client:
 
 ```sh
-cargo run --example raw_read
-cargo run --example nearby_belt_report -- SCEPTURUM 25
-cargo check --example fluent_queries
+cargo run -p replicant-cli -- operation catalogue
+cargo run -p replicant-cli -- operation report nearby_belt_report origin=SCEPTURUM radius_ly=25
+cargo run -p replicant-cli -- operation action clear_tags tag_prefix=evt- dry_run=true
 ```
+
+Familiar example names are catalogue aliases. The root [`examples/`](examples)
+directory remains for SDK education and thin preset demonstrations; see
+[`examples/README.md`](examples/README.md) for the complete inventory and safety
+notes.
 
 ## Persistence and security
 

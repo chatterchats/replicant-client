@@ -7,8 +7,26 @@ the repository root; nothing needs to be installed or fetched from crates.io.
 cargo check --examples --all-features
 ```
 
-Some examples are live tools. Read the safety note for an example before
-running it against an account.
+Application operations should normally be discovered and run through
+`replicant-cli operation catalogue`. The examples retained here either teach
+the SDK directly or demonstrate a registered reusable API/preset.
+
+## Inventory
+
+| Example | Decision |
+| --- | --- |
+| `raw_read`, `raw_events` | Keep as raw SDK educational examples. |
+| `fluent_queries`, `game_concepts`, `managed_sync` | Keep as managed SDK educational examples. |
+| `bobnet_messages` | Keep as an SDK example of managed message history and SSE-backed watching. |
+| `initialize_colony_database` | Retire as the preferred application initializer; keep as an SDK hydration example. Normal applications use `replicantd` startup/synchronization. |
+| `nearby_belt_report` | Registered Report alias for `nearby_belts`; keep as a thin reusable-report demonstration. |
+| `clear_tags` | Registered Action `clear_tags`; keep as a thin action demonstration. |
+| `contribute_twaffy_injectors` | Named TWAFFY preset alias for generic Action `contribute_devices`; keep as a thin action demonstration. |
+| `tag_twaffy_ring_injectors` | Named TWAFFY preset alias for generic Action `tag_devices`; keep as a thin action demonstration. |
+
+The TWAFFY destination, owner, device type, and tag are defaults only in the
+explicitly named preset examples. The generic catalogue actions require those
+values from the caller.
 
 ## Authentication and storage
 
@@ -89,6 +107,33 @@ RS_API_TOKEN='your-token' \
 `REPLICANT_DB` selects the database. `RS_BELT_REPORT_CONCURRENCY` defaults to
 4 and is capped at 16.
 
+Preferred application invocation:
+
+```sh
+cargo run -p replicant-cli -- operation report nearby_belt_report \
+  origin=SCEPTURUM radius_ly=25
+```
+
+### `clear_tags`
+
+Thin demonstration of the registered `clear_tags` action. Prefer the catalogue
+path and preview it before mutation:
+
+```sh
+cargo run -p replicant-cli -- operation action clear_tags \
+  tag_prefix=evt- dry_run=true
+```
+
+### `contribute_twaffy_injectors`
+
+Thin named-preset demonstration of generic `contribute_devices`. The catalogue
+path requires the preset values explicitly and accepts the old script name:
+
+```sh
+cargo run -p replicant-cli -- operation action contribute_twaffy_injectors \
+  destination=TWAFFY-OBJ-1 device_type=exotic_matter_injector owner=Chats-4 dry_run=true
+```
+
 ### `tag_twaffy_ring_injectors`
 
 Adds `twaffy-ring-001` to every owned `exotic_matter_injector` that lacks it,
@@ -105,6 +150,13 @@ cargo run --example tag_twaffy_ring_injectors
 The operation journal prevents blind retries after ambiguous transport
 failures. Review the fixed device type and tag constants in the source before
 running it.
+
+Preferred catalogue invocation, with the preset values made explicit:
+
+```sh
+cargo run -p replicant-cli -- operation action tag_twaffy_ring_injectors \
+  device_type=exotic_matter_injector tag=twaffy-ring-001 dry_run=true
+```
 
 ## Compile-checked API sketches
 

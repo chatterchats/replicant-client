@@ -14,9 +14,8 @@
 
 use std::{env, error::Error, io, path::PathBuf};
 
-use replicant_client::{
-    Client, DeviceType, Operation, OperationStatus, SecretString, StartupPolicy, raw,
-};
+use replicant_client::{Client, SecretString, StartupPolicy};
+use replicant_runtime::actions::{TagDevicesAction, tag_devices};
 
 type AnyError = Box<dyn Error + Send + Sync + 'static>;
 type AnyResult<T> = Result<T, AnyError>;
@@ -41,66 +40,16 @@ async fn main() -> AnyResult<()> {
         .await?;
     client.ready().await?;
 
-    let result = tag_injectors(&client).await;
+    let result = tag_devices(&client, &TagDevicesAction::new(DEVICE_TYPE, TAG)).await;
     let close_result = client.close().await;
-    result?;
-    close_result?;
-    Ok(())
-}
-
-async fn tag_injectors(client: &Client) -> AnyResult<()> {
-    let handles = client
-        .devices()
-        .refresh_many()
-        .of_type(DeviceType::from(DEVICE_TYPE))
-        .collect()
-        .await?;
-
-    let total = handles.len();
-    let mut tagged = 0usize;
-    let mut already_tagged = 0usize;
-
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
-        if snapshot.tags.iter().any(|tag| tag == TAG) {
-            already_tagged += 1;
-            println!("skip {}: already tagged {TAG}", handle.id().as_str());
-            continue;
-        }
-
-        let operation = handle
-            .configure(raw::devices::DeviceConfiguration {
-                add_tags: Some(vec![TAG.to_owned()]),
-                ..Default::default()
-            })
-            .await?;
-        ensure_operation_accepted(&operation).await?;
-        tagged += 1;
-        println!("tagged {} with {TAG}", handle.id().as_str());
+    let result = result?;
+    for event in result.report.events {
+        println!("{:?} {}: {}", event.kind, event.subject, event.detail);
     }
-
     println!(
-        "Done: {total} {DEVICE_TYPE} device(s), {tagged} newly tagged, {already_tagged} already tagged."
+        "Done: {} {DEVICE_TYPE} device(s), {} newly tagged, {} already tagged.",
+        result.scanned_devices, result.changed_devices, result.already_tagged_devices
     );
-    Ok(())
-}
-
-async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
-    // The managed mutation has already made its one durable submission attempt.
-    // Check that immediate classification without serially waiting for SSE
-    // confirmation after every independent tag update.
-    let outcome = operation.outcome().await?;
-    if matches!(
-        outcome.status,
-        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
-    ) {
-        return Err(io::Error::other(format!(
-            "operation {} ended as {:?}: {:?}",
-            operation.id().as_str(),
-            outcome.status,
-            outcome.response
-        ))
-        .into());
-    }
+    close_result?;
     Ok(())
 }

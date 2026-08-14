@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use replicant_protocol::{
-    DaemonHealth, DescriptorCatalog, HealthStatus, OperationKind, StartWorkflowRequest,
-    WorkflowDetail, WorkflowStatus, WorkflowSummary,
+    DaemonHealth, DescriptorCatalog, HealthStatus, OperationKind, RunOperationRequest,
+    StartWorkflowRequest, WorkflowDetail, WorkflowStatus, WorkflowSummary,
 };
 use serde_json::Value;
 
@@ -69,7 +69,14 @@ fn render_catalogue(catalogue: &DescriptorCatalog) -> String {
             catalogue
                 .reports
                 .iter()
-                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .map(|item| {
+                    (
+                        &item.kind.0,
+                        &item.aliases,
+                        &item.display_name,
+                        &item.description,
+                    )
+                })
                 .collect::<Vec<_>>(),
         ),
         (
@@ -77,7 +84,14 @@ fn render_catalogue(catalogue: &DescriptorCatalog) -> String {
             catalogue
                 .actions
                 .iter()
-                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .map(|item| {
+                    (
+                        &item.kind.0,
+                        &item.aliases,
+                        &item.display_name,
+                        &item.description,
+                    )
+                })
                 .collect(),
         ),
         (
@@ -85,17 +99,60 @@ fn render_catalogue(catalogue: &DescriptorCatalog) -> String {
             catalogue
                 .workflows
                 .iter()
-                .map(|item| (&item.kind.0, &item.display_name, &item.description))
+                .map(|item| {
+                    (
+                        &item.kind.0,
+                        &item.aliases,
+                        &item.display_name,
+                        &item.description,
+                    )
+                })
                 .collect(),
         ),
     ] {
         output.push_str(class);
         output.push('\n');
-        for (kind, name, description) in entries {
+        for (kind, aliases, name, description) in entries {
             output.push_str(&format!("  {kind:<20} {name} — {description}\n"));
+            if !aliases.is_empty() {
+                output.push_str(&format!("    aliases: {}\n", aliases.join(", ")));
+            }
         }
     }
     output
+}
+
+pub(crate) async fn run_operation_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
+    let mut arguments = arguments.into_iter();
+    match arguments.next().as_deref() {
+        Some("catalogue" | "catalog") => {
+            reject_extra(arguments)?;
+            print!(
+                "{}",
+                render_catalogue(&DaemonClient::from_env().descriptors().await?)
+            );
+        }
+        Some(class @ ("report" | "action")) => {
+            let kind = required(
+                &mut arguments,
+                "operation report|action KIND [NAME=VALUE ...]",
+            )?;
+            let request = RunOperationRequest {
+                parameters: parse_parameters(arguments)?,
+            };
+            let response = DaemonClient::from_env()
+                .run_operation(class, &kind, &request)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&response.result)?);
+        }
+        Some("-h" | "--help") | None => print_operation_help(),
+        Some(other) => {
+            return Err(crate::app_error(format!(
+                "unknown operation command {other:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn daemon_status(arguments: Vec<String>) -> crate::AnyResult<()> {
@@ -117,6 +174,15 @@ pub(crate) fn start_request(
     mut arguments: impl Iterator<Item = String>,
 ) -> crate::AnyResult<StartWorkflowRequest> {
     let kind = required(&mut arguments, "workflow start KIND [NAME=VALUE ...]")?;
+    Ok(StartWorkflowRequest {
+        kind: OperationKind(kind),
+        parameters: parse_parameters(arguments)?,
+    })
+}
+
+fn parse_parameters(
+    mut arguments: impl Iterator<Item = String>,
+) -> crate::AnyResult<BTreeMap<String, Value>> {
     let mut parameters = BTreeMap::new();
     while let Some(argument) = arguments.next() {
         let assignment = if argument == "--param" {
@@ -131,10 +197,7 @@ pub(crate) fn start_request(
         let value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()));
         parameters.insert(name.to_owned(), value);
     }
-    Ok(StartWorkflowRequest {
-        kind: OperationKind(kind),
-        parameters,
-    })
+    Ok(parameters)
 }
 
 pub(crate) async fn submit(request: StartWorkflowRequest) -> crate::AnyResult<()> {
@@ -235,6 +298,15 @@ Set REPLICANTD_URL to override http://127.0.0.1:8080."
     );
 }
 
+fn print_operation_help() {
+    println!(
+        "Daemon operation catalogue\n\n\
+Usage:\n  replicant-cli operation catalogue\n  replicant-cli operation report KIND [NAME=VALUE ...]\n  replicant-cli operation action KIND [NAME=VALUE ...]\n\n\
+Kinds may use catalogue aliases. Values accept JSON scalars, arrays, and objects; unquoted values are strings.\n\
+Set REPLICANTD_URL to override http://127.0.0.1:8080."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +357,8 @@ mod tests {
             "nearby_belts",
             "Actions",
             "clear_tags",
+            "contribute_twaffy_injectors",
+            "tag_twaffy_ring_injectors",
             "Workflows",
             "survey.route",
         ] {

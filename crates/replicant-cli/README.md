@@ -27,6 +27,7 @@ cargo build -p replicant-cli
 | --- | --- | --- |
 | `interactive` | — | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup. |
 | `daemon` | — | Show local `replicantd` health. |
+| `operation` | `catalogue`, `report`, `action` | Discover and run registered capabilities through `replicantd`. |
 | `workflow` | `list`, `inspect`, `start`, `pause`, `resume`, `cancel` | Control durable workflows owned by `replicantd`. |
 | `print` | `queue`, `status`, `clear` | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
 | `transport` | `--plan` or execute | Deliver resources and devices between locations. |
@@ -65,6 +66,19 @@ cargo run -p replicant-cli -- workflow start relay.expansion \
   replicant=Chats-1 hub=SCEPTURUM-BELT-1 targets_csv=THYFFAWFF \
   mission_file=ftl-relay-expansion.json
 ```
+
+Registered reports and finite actions use the same typed catalogue and accept
+familiar legacy example names as aliases:
+
+```sh
+cargo run -p replicant-cli -- operation catalogue
+cargo run -p replicant-cli -- operation report nearby_belt_report \
+  origin=SCEPTURUM radius_ly=25
+cargo run -p replicant-cli -- operation action clear_tags \
+  tag_prefix=evt- dry_run=true
+```
+
+Use `dry_run=true` before reviewing a mutating action.
 
 ### Interactive command builder
 

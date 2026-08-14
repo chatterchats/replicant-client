@@ -15,7 +15,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    actions::{ClearTagsAction, ContributeDevicesAction, clear_tags, contribute_devices},
+    actions::{
+        ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
+        tag_devices,
+    },
     relay::RelayExpansionRequest,
     reports::nearby_belt_report,
     survey::{SurveyMode, SurveyOptions},
@@ -118,6 +121,9 @@ impl OperationCatalogue {
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<Value, CatalogueError> {
+        let kind = self
+            .resolve_kind(OperationClass::Report, kind)
+            .ok_or_else(|| unknown(OperationClass::Report, kind))?;
         let parameters = self.validate(OperationClass::Report, kind, parameters, false)?;
         match kind {
             "nearby_belts" => serialize(
@@ -136,6 +142,9 @@ impl OperationCatalogue {
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<Value, CatalogueError> {
+        let kind = self
+            .resolve_kind(OperationClass::Action, kind)
+            .ok_or_else(|| unknown(OperationClass::Action, kind))?;
         let parameters = self.validate(OperationClass::Action, kind, parameters, false)?;
         match kind {
             "clear_tags" => serialize(
@@ -145,6 +154,11 @@ impl OperationCatalogue {
             ),
             "contribute_devices" => serialize(
                 contribute_devices(client, &decode::<ContributeDevicesAction>(parameters)?)
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+            ),
+            "tag_devices" => serialize(
+                tag_devices(client, &decode::<TagDevicesAction>(parameters)?)
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
@@ -159,6 +173,9 @@ impl OperationCatalogue {
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<WorkflowInstance, CatalogueError> {
+        let kind = self
+            .resolve_kind(OperationClass::Workflow, kind)
+            .ok_or_else(|| unknown(OperationClass::Workflow, kind))?;
         let parameters = self.validate(OperationClass::Workflow, kind, parameters, false)?;
         let instance = match kind {
             "survey.route" => {
@@ -176,6 +193,29 @@ impl OperationCatalogue {
             _ => return Err(unknown(OperationClass::Workflow, kind)),
         };
         Ok(instance)
+    }
+
+    fn resolve_kind<'a>(&'a self, class: OperationClass, kind: &str) -> Option<&'a str> {
+        match class {
+            OperationClass::Report => self
+                .descriptors
+                .reports
+                .iter()
+                .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+                .map(|item| item.kind.0.as_str()),
+            OperationClass::Action => self
+                .descriptors
+                .actions
+                .iter()
+                .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+                .map(|item| item.kind.0.as_str()),
+            OperationClass::Workflow => self
+                .descriptors
+                .workflows
+                .iter()
+                .find(|item| item.kind.0 == kind || item.aliases.iter().any(|alias| alias == kind))
+                .map(|item| item.kind.0.as_str()),
+        }
     }
 
     fn applicable_to(&self, class: OperationClass, kind: &str) -> Option<&[EntityKind]> {
@@ -430,6 +470,21 @@ fn descriptors() -> DescriptorCatalog {
                         Some(1.0),
                         None,
                     ),
+                    defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
+                ],
+            },
+            ActionDescriptor {
+                kind: operation_kind("tag_devices"),
+                display_name: "Tag devices".to_owned(),
+                aliases: strings(&["tag_twaffy_ring_injectors"]),
+                description: "Add one tag to every owned device of a type.".to_owned(),
+                category: "devices".to_owned(),
+                operation_class: OperationClass::Action,
+                risk: MutationRisk::Elevated,
+                applicable_to: vec![EntityKind::Device],
+                parameters: vec![
+                    required("device_type", "Device type", ParameterKind::DeviceType),
+                    required("tag", "Tag", ParameterKind::Tag),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
             },
@@ -876,6 +931,27 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_script_names_resolve_to_registered_capabilities() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        for (class, alias, canonical) in [
+            (OperationClass::Action, "clear_tags", "clear_tags"),
+            (
+                OperationClass::Action,
+                "contribute_twaffy_injectors",
+                "contribute_devices",
+            ),
+            (
+                OperationClass::Action,
+                "tag_twaffy_ring_injectors",
+                "tag_devices",
+            ),
+            (OperationClass::Report, "nearby_belt_report", "nearby_belts"),
+        ] {
+            assert_eq!(catalogue.resolve_kind(class, alias), Some(canonical));
+        }
     }
 
     #[test]

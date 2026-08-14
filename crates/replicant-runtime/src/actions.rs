@@ -126,6 +126,111 @@ impl ClearTagsActionResult {
     }
 }
 
+/// Inputs for adding one tag to every owned device of a type.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TagDevicesAction {
+    /// Device type selected for tagging.
+    pub device_type: String,
+    /// Tag added to matching devices that do not already carry it.
+    pub tag: String,
+    /// When true, report matching devices without submitting mutations.
+    pub dry_run: bool,
+}
+
+impl TagDevicesAction {
+    /// Creates a mutating tag-devices action.
+    #[must_use]
+    pub fn new(device_type: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            device_type: device_type.into(),
+            tag: tag.into(),
+            dry_run: false,
+        }
+    }
+}
+
+/// Typed result of a tag-devices action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TagDevicesActionResult {
+    /// Total owned devices of the requested type scanned.
+    pub scanned_devices: usize,
+    /// Devices that received or would receive the tag.
+    pub changed_devices: usize,
+    /// Devices that already carried the tag.
+    pub already_tagged_devices: usize,
+    /// Standard action events for non-stdout frontends.
+    pub report: ActionReport,
+}
+
+/// Adds one tag to every owned device of a type through managed operations.
+pub async fn tag_devices(
+    client: &Client,
+    action: &TagDevicesAction,
+) -> ActionResult<TagDevicesActionResult> {
+    if action.device_type.is_empty() || action.tag.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "device_type and tag must not be empty",
+        )
+        .into());
+    }
+
+    let handles = client
+        .devices()
+        .refresh_many()
+        .of_type(DeviceType::from(action.device_type.as_str()))
+        .collect()
+        .await?;
+    let scanned_devices = handles.len();
+    let mut changed_devices = 0;
+    let mut already_tagged_devices = 0;
+    let mut report = ActionReport::default();
+
+    for handle in handles {
+        let snapshot = handle.snapshot().await?;
+        if snapshot.tags.iter().any(|tag| tag == &action.tag) {
+            already_tagged_devices += 1;
+            report.events.push(ActionEvent::new(
+                ActionEventKind::Skipped,
+                handle.id().as_str(),
+                format!("already tagged {}", action.tag),
+            ));
+            continue;
+        }
+
+        let event = if action.dry_run {
+            ActionEvent::new(
+                ActionEventKind::Planned,
+                handle.id().as_str(),
+                format!("add tag {}", action.tag),
+            )
+        } else {
+            let operation = handle
+                .configure(raw::devices::DeviceConfiguration {
+                    add_tags: Some(vec![action.tag.clone()]),
+                    ..Default::default()
+                })
+                .await?;
+            ensure_operation_accepted(&operation).await?;
+            ActionEvent::new(
+                ActionEventKind::Succeeded,
+                handle.id().as_str(),
+                format!("added tag {}", action.tag),
+            )
+            .operation(&operation)
+        };
+        changed_devices += 1;
+        report.events.push(event);
+    }
+
+    Ok(TagDevicesActionResult {
+        scanned_devices,
+        changed_devices,
+        already_tagged_devices,
+        report,
+    })
+}
+
 /// Removes matching tags from every owned device through managed operations.
 pub async fn clear_tags(
     client: &Client,
