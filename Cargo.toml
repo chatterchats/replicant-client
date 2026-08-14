@@ -9,6 +9,7 @@ members = [
   "crates/replicant-transport",
   "crates/replicant-runtime",
   "crates/replicant-protocol",
+  "crates/replicant-server",
   "crates/replicant-workflow",
   "crates/replicant-cli",
 ]

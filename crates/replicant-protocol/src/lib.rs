@@ -145,6 +145,17 @@ pub struct SnapshotMetadata {
     pub generated_at_ms: i64,
 }
 
+/// Current daemon/runtime state returned to frontends as one consistent view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Current managed-client synchronization state.
+    pub sync: RuntimeSyncStatus,
+    /// Current persisted workflows.
+    pub workflows: Vec<WorkflowSummary>,
+}
+
 /// Persisted workflow lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -287,6 +298,13 @@ pub struct WorkflowActivity {
     pub step: Option<String>,
     /// Human-readable, non-secret message.
     pub message: String,
+}
+
+/// Durable workflow activity response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowActivityResponse {
+    /// Activity records in durable emission order.
+    pub activity: Vec<WorkflowActivity>,
 }
 
 /// Semantic parameter kind used to select an appropriate frontend control.
