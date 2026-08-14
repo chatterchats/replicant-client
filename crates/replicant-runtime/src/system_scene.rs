@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use replicant_client::{Client, Device, Location, Replicant, TravelState};
+use replicant_client::{Client, Device, Knowledge, Location, Replicant, TravelState};
 use replicant_protocol::{
     EntityId, EntityKind, EntityRef, OperationKind, SystemMarker, SystemMarkerKind, SystemPoint,
     SystemSceneSnapshot, SystemTravel, SystemWorkflowMarker, WorkflowId,
@@ -68,6 +68,7 @@ fn build_scene(
     generated_at_ms: i64,
 ) -> SystemSceneSnapshot {
     locations.sort_by(|left, right| left.id().cmp(right.id()));
+    locations.retain(|location| location.id().as_str() != system);
     let mut known = locations
         .iter()
         .map(|location| location.id().to_string())
@@ -94,13 +95,22 @@ fn build_scene(
         },
     )]);
 
-    for (index, location) in locations.iter().enumerate() {
+    let mut top_level_index = 0;
+    for location in &locations {
         let id = location.id().to_string();
-        let parent = location.parent.as_ref().map(|value| value.id.to_string());
-        let position = location_position(&id, parent.as_deref(), index, &positions);
-        positions.insert(id.clone(), position);
         let kind = location_kind(location);
-        markers.push(marker(
+        let parent = location
+            .parent
+            .as_ref()
+            .map(|value| value.id.to_string())
+            .or_else(|| inferred_parent(&id, kind));
+        let orbit = top_level_index;
+        if parent.is_none() {
+            top_level_index += 1;
+        }
+        let position = location_position(&id, parent.as_deref(), orbit, &positions);
+        positions.insert(id.clone(), position);
+        let mut body = marker(
             &id,
             &id,
             kind,
@@ -109,7 +119,12 @@ fn build_scene(
             parent,
             position,
             1,
-        ));
+        );
+        body.in_habitable_zone = match location.in_habitable_zone() {
+            Knowledge::Present(value) => Some(*value),
+            _ => None,
+        };
+        markers.push(body);
         append_known_content(&mut markers, location, position);
     }
 
@@ -205,6 +220,17 @@ fn location_kind(location: &Location) -> SystemMarkerKind {
     }
 }
 
+fn inferred_parent(id: &str, kind: SystemMarkerKind) -> Option<String> {
+    match kind {
+        SystemMarkerKind::Moon => id.rsplit_once('-').map(|(parent, _)| parent.to_owned()),
+        SystemMarkerKind::Lagrange => id
+            .strip_suffix("-L4")
+            .or_else(|| id.strip_suffix("-L5"))
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 fn device_kind(device: &Device) -> SystemMarkerKind {
     let kind = device
         .device_type
@@ -281,6 +307,7 @@ fn marker(
         },
         location: location.to_owned(),
         parent,
+        in_habitable_zone: None,
         position,
         count,
     }
@@ -301,7 +328,7 @@ fn location_position(
     let radius = if parent.is_some() {
         34.0
     } else {
-        95.0 + index as f64 * 48.0
+        68.0 + index as f64 * 32.0
     };
     let angle = hash(id) as f64 / u32::MAX as f64 * std::f64::consts::TAU;
     SystemPoint {
@@ -442,6 +469,7 @@ mod tests {
     #[test]
     fn scene_maps_bodies_and_device_categories_to_typed_markers() {
         let mut planet = location("SOL-1", LocationType::Planet, None);
+        planet.environment.in_habitable_zone = Knowledge::Present(true);
         planet.unknown.insert(
             "active_location_events".to_owned(),
             serde_json::json!([{"event_code": "E1"}]),
@@ -455,6 +483,7 @@ mod tests {
             vec![
                 planet,
                 location("SOL-1-A", LocationType::Moon, Some("SOL-1")),
+                location("SOL-1-L4", LocationType::from("lagrange"), None),
                 location("SOL-BELT", LocationType::Belt, None),
             ],
             vec![
@@ -473,6 +502,7 @@ mod tests {
             SystemMarkerKind::Star,
             SystemMarkerKind::Planet,
             SystemMarkerKind::Moon,
+            SystemMarkerKind::Lagrange,
             SystemMarkerKind::Belt,
             SystemMarkerKind::Factory,
             SystemMarkerKind::Relay,
@@ -488,5 +518,24 @@ mod tests {
             .unwrap();
         assert_eq!(moon.parent.as_deref(), Some("SOL-1"));
         assert_eq!(moon.entity.kind, EntityKind::Location);
+        assert_eq!(
+            scene
+                .markers
+                .iter()
+                .find(|marker| marker.id == "SOL-1-L4")
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some("SOL-1")
+        );
+        assert_eq!(
+            scene
+                .markers
+                .iter()
+                .find(|marker| marker.id == "SOL-1")
+                .unwrap()
+                .in_habitable_zone,
+            Some(true)
+        );
     }
 }

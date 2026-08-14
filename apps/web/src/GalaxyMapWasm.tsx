@@ -4,6 +4,17 @@ import { mapGalaxyScene, type GalaxyLayers } from "./galaxyMapData";
 import type { GalaxySceneSnapshot, GalaxyStar } from "./protocol";
 
 const CAMERA_KEY = "replicant.galaxy.camera";
+type RendererModule =
+  typeof import("./wasm/galaxy_renderer/galaxy_renderer.js");
+let rendererModule: Promise<RendererModule> | undefined;
+
+function loadRenderer() {
+  return (rendererModule ??=
+    import("./wasm/galaxy_renderer/galaxy_renderer.js").then(async (module) => {
+      await module.default();
+      return module;
+    }));
+}
 
 interface Camera {
   theta: number;
@@ -127,11 +138,10 @@ export function GalaxyMapWasm({
     const controller = new AbortController();
     let frame = 0;
     let observer: ResizeObserver | undefined;
-    void import("./wasm/galaxy_renderer/galaxy_renderer.js")
-      .then(async ({ default: init, GalaxyRenderer }) => {
+    void loadRenderer()
+      .then(({ GalaxyRenderer }) => {
         const canvas = canvasRef.current;
         if (!canvas) return;
-        await init();
         if (controller.signal.aborted) return;
         const renderer = new GalaxyRenderer(canvas) as Renderer;
         rendererRef.current = renderer;

@@ -36,8 +36,11 @@ export function SystemPage({
   const revision = useGalaxyRevision();
   const [scene, setScene] = useState<SystemSceneSnapshot>();
   const [error, setError] = useState<string>();
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(0.55);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [showHabitableZone, setShowHabitableZone] = useState(true);
+  const [showAssets, setShowAssets] = useState(true);
+  const [showLabels, setShowLabels] = useState(false);
   const [menu, setMenu] = useState<{
     marker: SystemMarker;
     x: number;
@@ -112,7 +115,7 @@ export function SystemPage({
           <div className="system-map-toolbar" aria-label="System map controls">
             <button
               onClick={() => {
-                setZoom((value) => Math.max(0.45, value - 0.2));
+                setZoom((value) => Math.max(0.3, value - 0.2));
               }}
             >
               −
@@ -127,12 +130,45 @@ export function SystemPage({
             </button>
             <button
               onClick={() => {
-                setZoom(1);
+                setZoom(0.55);
                 setPan({ x: 0, y: 0 });
               }}
             >
               Reset
             </button>
+            <details className="galaxy-layers system-map-layers">
+              <summary>Layers</summary>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={showHabitableZone}
+                  onChange={(event) => {
+                    setShowHabitableZone(event.target.checked);
+                  }}
+                />
+                Habitable planets
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={showAssets}
+                  onChange={(event) => {
+                    setShowAssets(event.target.checked);
+                  }}
+                />
+                Assets
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={showLabels}
+                  onChange={(event) => {
+                    setShowLabels(event.target.checked);
+                  }}
+                />
+                Labels
+              </label>
+            </details>
             <span className="system-map-counts">
               {scene.markers.length} markers · {scene.active_travel.length}{" "}
               traveling · {scene.workflow_markers.length} workflows
@@ -158,7 +194,7 @@ export function SystemPage({
               setZoom((value) =>
                 Math.min(
                   2.5,
-                  Math.max(0.45, value * (event.deltaY > 0 ? 0.9 : 1.1)),
+                  Math.max(0.3, value * (event.deltaY > 0 ? 0.9 : 1.1)),
                 ),
               );
             }}
@@ -170,6 +206,9 @@ export function SystemPage({
               scene={scene}
               zoom={zoom}
               pan={pan}
+              showHabitableZone={showHabitableZone}
+              showAssets={showAssets}
+              showLabels={showLabels}
               onSelect={onSelectMarker}
               onContext={(marker, x, y) => {
                 onSelectMarker(marker);

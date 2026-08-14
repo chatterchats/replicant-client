@@ -292,10 +292,10 @@ impl GalaxyRendererInner {
     }
 
     pub fn pointer_down(&mut self, x: f32, y: f32, button: i32, shift: bool) -> bool {
-        if button != 0 && button != 1 {
+        if !(0..=2).contains(&button) {
             return false;
         }
-        let mode = if button == 1 || shift {
+        let mode = if button != 0 || shift {
             DragMode::Pan
         } else {
             DragMode::Rotate

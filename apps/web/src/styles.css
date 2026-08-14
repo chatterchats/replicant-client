@@ -387,9 +387,12 @@ h1 {
   touch-action: none;
 }
 .system-map-content {
-  position: relative;
+  position: absolute;
+  top: 50%;
+  left: 50%;
   width: 1000px;
   height: 1000px;
+  translate: -50% -50%;
 }
 .system-map-webgl {
   position: absolute;
@@ -427,6 +430,12 @@ h1 {
 .system-marker.planet > span {
   width: 20px;
   height: 20px;
+}
+.system-marker.planet.habitable > span {
+  border-color: #70d89b;
+  box-shadow:
+    0 0 0 10px rgba(112, 216, 155, 0.16),
+    0 0 18px rgba(112, 216, 155, 0.7);
 }
 .system-marker.moon > span,
 .system-marker.lagrange > span {

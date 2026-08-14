@@ -114,7 +114,8 @@ describe("parseHealthResponse", () => {
             entity: { kind: "location", id: "SOL-1" },
             location: "SOL-1",
             parent: null,
-            position: { x: 1, y: 2 },
+            in_habitable_zone: true,
+            position: { x: 1.25, y: 2.5 },
             count: 1,
           },
         ],
@@ -124,5 +125,7 @@ describe("parseHealthResponse", () => {
     }).payload;
     expect(scene.system).toBe("SOL");
     expect(scene.markers[0]?.entity.kind).toBe("location");
+    expect(scene.markers[0]?.in_habitable_zone).toBe(true);
+    expect(scene.markers[0]?.position.x).toBe(1.25);
   });
 });

@@ -72,6 +72,9 @@ export function SystemMapGl({
   scene,
   zoom,
   pan,
+  showHabitableZone,
+  showAssets,
+  showLabels,
   onSelect,
   onContext,
   onSelectEntity,
@@ -79,6 +82,9 @@ export function SystemMapGl({
   scene: SystemSceneSnapshot;
   zoom: number;
   pan: { x: number; y: number };
+  showHabitableZone: boolean;
+  showAssets: boolean;
+  showLabels: boolean;
   onSelect: (marker: SystemMarker) => void;
   onContext: (marker: SystemMarker, x: number, y: number) => void;
   onSelectEntity: (entity: EntityRef) => void;
@@ -144,30 +150,36 @@ export function SystemMapGl({
   return (
     <div className="system-map-content">
       <canvas ref={canvas} className="system-map-webgl" aria-hidden="true" />
-      {scene.markers.map((marker) => (
-        <button
-          className={`system-marker ${marker.kind}`}
-          key={marker.id}
-          style={{
-            left: `${String((marker.position.x - 500) * zoom + 500 + pan.x)}px`,
-            top: `${String((marker.position.y - 500) * zoom + 500 + pan.y)}px`,
-          }}
-          title={`${marker.label} · ${marker.kind}`}
-          onClick={(event) => {
-            event.stopPropagation();
-            onSelect(marker);
-          }}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            onContext(marker, event.clientX, event.clientY);
-          }}
-        >
-          <span aria-hidden="true" />
-          <small>{marker.label}</small>
-          {marker.count > 1 ? <b>{marker.count}</b> : null}
-        </button>
-      ))}
+      {scene.markers
+        .filter(
+          (marker) =>
+            showAssets ||
+            !["vessel", "device", "factory", "relay"].includes(marker.kind),
+        )
+        .map((marker) => (
+          <button
+            className={`system-marker ${marker.kind}${showHabitableZone && marker.in_habitable_zone ? " habitable" : ""}`}
+            key={marker.id}
+            style={{
+              left: `${String((marker.position.x - 500) * zoom + 500 + pan.x)}px`,
+              top: `${String((marker.position.y - 500) * zoom + 500 + pan.y)}px`,
+            }}
+            title={`${marker.label} · ${marker.kind}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onSelect(marker);
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onContext(marker, event.clientX, event.clientY);
+            }}
+          >
+            <span aria-hidden="true" />
+            {showLabels ? <small>{marker.label}</small> : null}
+            {marker.count > 1 ? <b>{marker.count}</b> : null}
+          </button>
+        ))}
       {scene.active_travel.map((travel) => {
         const from = positions.get(travel.from);
         const to = positions.get(travel.to);

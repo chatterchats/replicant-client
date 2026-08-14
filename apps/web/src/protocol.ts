@@ -203,6 +203,7 @@ export interface SystemMarker {
   entity: EntityRef;
   location: string;
   parent: string | null;
+  in_habitable_zone: boolean | null;
   position: SystemPoint;
   count: number;
 }
@@ -770,7 +771,9 @@ export function parseSystemSceneResponse(
         if (
           typeof marker.id !== "string" ||
           typeof marker.label !== "string" ||
-          typeof marker.location !== "string"
+          typeof marker.location !== "string" ||
+          (marker.in_habitable_zone !== null &&
+            typeof marker.in_habitable_zone !== "boolean")
         )
           throw new Error("Invalid system marker");
         const position = record(marker.position, "system marker position");
@@ -798,9 +801,10 @@ export function parseSystemSceneResponse(
           entity: entity(marker.entity),
           location: marker.location,
           parent: nullableString(marker.parent, "system marker parent"),
+          in_habitable_zone: marker.in_habitable_zone,
           position: {
-            x: number(position.x, "system marker x"),
-            y: number(position.y, "system marker y"),
+            x: finiteNumber(position.x, "system marker x"),
+            y: finiteNumber(position.y, "system marker y"),
           },
           count: number(marker.count, "system marker count"),
         };

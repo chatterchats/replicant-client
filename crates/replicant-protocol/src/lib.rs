@@ -350,6 +350,9 @@ pub struct SystemMarker {
     pub location: String,
     /// Parent location for orbit rendering, when known.
     pub parent: Option<String>,
+    /// Whether this orbital body is known to be in the star's habitable zone.
+    #[serde(default)]
+    pub in_habitable_zone: Option<bool>,
     /// Stable application-generated scene position.
     pub position: SystemPoint,
     /// Number of represented objects when the marker is an aggregate.

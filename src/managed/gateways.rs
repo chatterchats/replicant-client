@@ -618,7 +618,11 @@ fn evaluate_location(
             |actual| range.contains(&actual),
         ),
         LocationPredicate::System(system) => {
-            let matched = location.system.as_deref() == Some(system);
+            let designation = location.key.id.as_str();
+            let matched = location.system.as_deref().map_or_else(
+                || designation == system || designation.starts_with(&format!("{system}-")),
+                |actual| actual == system,
+            );
             result(
                 "in_system",
                 if matched {
@@ -2971,7 +2975,7 @@ mod tests {
                 scanned: None,
                 system_scanned: Some(true),
                 system_tags: Vec::new(),
-                system: Some("SOL".into()),
+                system: None,
                 parent: None,
                 survey_progress: Default::default(),
                 environment: domain::LocationEnvironment {
@@ -3011,6 +3015,7 @@ mod tests {
             .breathable_atmosphere()
             .has_magnetic_field()
             .in_habitable_zone()
+            .in_system("SOL")
             .life_stage_below(LifeStage::Intelligent)
             .gravity_g_between(0.8..=1.3)
             .surface_temp_c_between(10.0..=25.0);
