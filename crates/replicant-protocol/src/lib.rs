@@ -145,6 +145,157 @@ pub struct SnapshotMetadata {
     pub generated_at_ms: i64,
 }
 
+/// Three-dimensional galactic coordinates in light-years.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyPoint {
+    /// Galactic X coordinate.
+    pub x: f64,
+    /// Galactic Y coordinate.
+    pub y: f64,
+    /// Galactic Z coordinate.
+    pub z: f64,
+}
+
+/// Application-level exploration state for a known star.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalaxyExploration {
+    /// The system has not been explored by an owned replicant.
+    Undiscovered,
+    /// The system is known but not confirmed explored.
+    Partial,
+    /// An owned replicant has confirmed exploration.
+    Explored,
+}
+
+/// One renderer-ready star without upstream API structure leakage.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyStar {
+    /// Canonical system designation.
+    pub id: String,
+    /// Display name, when distinct from the designation.
+    pub name: Option<String>,
+    /// Known spectral classification.
+    pub spectral_type: Option<String>,
+    /// Absolute galactic coordinates.
+    pub position: GalaxyPoint,
+    /// Best application-owned exploration state.
+    pub exploration: GalaxyExploration,
+    /// Whether an owned replicant is currently in this system.
+    pub current: bool,
+    /// Whether the system contains a known hub.
+    pub has_hub: bool,
+    /// Whether life has been discovered in the system.
+    pub has_life: bool,
+    /// Whether an active owned relay is present.
+    pub has_relay: bool,
+}
+
+/// A connection between two known systems.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyEdge {
+    /// Origin system designation.
+    pub from: String,
+    /// Destination system designation.
+    pub to: String,
+}
+
+/// Active travel projected onto known systems.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyTravel {
+    /// Traveling replicant or device.
+    pub entity: EntityRef,
+    /// Origin system designation.
+    pub from: String,
+    /// Destination system designation.
+    pub to: String,
+    /// ISO-8601 departure time, when known.
+    pub started_at: Option<String>,
+    /// ISO-8601 arrival time, when known.
+    pub arrives_at: Option<String>,
+}
+
+/// A player-discovered signal at absolute galactic coordinates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GalaxySignal {
+    /// Stable signal identifier.
+    pub id: String,
+    /// Human-readable label, when known.
+    pub label: Option<String>,
+    /// Absolute galactic coordinates.
+    pub position: GalaxyPoint,
+}
+
+/// Visual overlay supported by the galaxy renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalaxyOverlayKind {
+    /// Discovered life.
+    Life,
+    /// Owned device presence.
+    Device,
+    /// Relay-network influence.
+    Influence,
+}
+
+/// One system-centered renderer overlay.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyOverlay {
+    /// Overlay category.
+    pub kind: GalaxyOverlayKind,
+    /// System designation.
+    pub system: String,
+    /// System coordinates.
+    pub position: GalaxyPoint,
+    /// Number of represented entities.
+    pub count: u32,
+}
+
+/// Highlight connecting a workflow's anchor and target system.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyHighlight {
+    /// Owning workflow.
+    pub workflow_id: WorkflowId,
+    /// Anchor system.
+    pub from: String,
+    /// Target system.
+    pub to: String,
+}
+
+/// A system targeted by a currently active workflow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GalaxyWorkflowTarget {
+    /// Owning workflow.
+    pub workflow_id: WorkflowId,
+    /// Registered workflow kind.
+    pub workflow_kind: OperationKind,
+    /// Target system designation.
+    pub system: String,
+}
+
+/// Complete application-owned galaxy scene returned independently of the general snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GalaxySceneSnapshot {
+    /// Key used to avoid reapplying unchanged scene geometry.
+    pub revision: u64,
+    /// Unix milliseconds when this scene was built.
+    pub generated_at_ms: i64,
+    /// Known stars with coordinates.
+    pub stars: Vec<GalaxyStar>,
+    /// Connections between active relay systems.
+    pub relay_edges: Vec<GalaxyEdge>,
+    /// Current device and replicant travel.
+    pub active_travel: Vec<GalaxyTravel>,
+    /// Player-discovered off-system signals.
+    pub signals: Vec<GalaxySignal>,
+    /// Workflow route highlights.
+    pub highlights: Vec<GalaxyHighlight>,
+    /// Device, life, and influence overlays.
+    pub overlays: Vec<GalaxyOverlay>,
+    /// Current workflow targets.
+    pub workflow_targets: Vec<GalaxyWorkflowTarget>,
+}
+
 /// Current daemon/runtime state returned to frontends as one consistent view.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {

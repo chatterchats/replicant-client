@@ -132,6 +132,51 @@ export interface RuntimeSnapshot {
   workflows: WorkflowSummary[];
 }
 
+export interface GalaxyPoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface GalaxyStar {
+  id: string;
+  name: string | null;
+  spectral_type: string | null;
+  position: GalaxyPoint;
+  exploration: "undiscovered" | "partial" | "explored";
+  current: boolean;
+  has_hub: boolean;
+  has_life: boolean;
+  has_relay: boolean;
+}
+
+export interface GalaxySceneSnapshot {
+  revision: number;
+  generated_at_ms: number;
+  stars: GalaxyStar[];
+  relay_edges: { from: string; to: string }[];
+  active_travel: {
+    entity: EntityRef;
+    from: string;
+    to: string;
+    started_at: string | null;
+    arrives_at: string | null;
+  }[];
+  signals: { id: string; label: string | null; position: GalaxyPoint }[];
+  highlights: { workflow_id: string; from: string; to: string }[];
+  overlays: {
+    kind: "life" | "device" | "influence";
+    system: string;
+    position: GalaxyPoint;
+    count: number;
+  }[];
+  workflow_targets: {
+    workflow_id: string;
+    workflow_kind: string;
+    system: string;
+  }[];
+}
+
 export interface EntityRef {
   kind: EntityKind;
   id: string;
@@ -220,6 +265,17 @@ function optionalFiniteNumber(value: unknown, name: string): number | null {
   if (value === null) return null;
   if (typeof value !== "number" || !Number.isFinite(value))
     throw new Error(`Invalid ${name}`);
+  return value;
+}
+
+function finiteNumber(value: unknown, name: string): number {
+  const parsed = optionalFiniteNumber(value, name);
+  if (parsed === null) throw new Error(`Invalid ${name}`);
+  return parsed;
+}
+
+function array(value: unknown, name: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`Invalid ${name}`);
   return value;
 }
 
@@ -446,6 +502,22 @@ function entity(value: unknown): EntityRef {
   return { kind: oneOf(item.kind, entityKinds, "entity kind"), id: item.id };
 }
 
+function point(value: unknown): GalaxyPoint {
+  const item = record(value, "galaxy point");
+  return {
+    x: finiteNumber(item.x, "galaxy x"),
+    y: finiteNumber(item.y, "galaxy y"),
+    z: finiteNumber(item.z, "galaxy z"),
+  };
+}
+
+function stringPair(value: unknown, name: string) {
+  const item = record(value, name);
+  if (typeof item.from !== "string" || typeof item.to !== "string")
+    throw new Error(`Invalid ${name}`);
+  return { from: item.from, to: item.to };
+}
+
 function activity(value: unknown): WorkflowActivity {
   const item = record(value, "workflow activity");
   if (typeof item.workflow_id !== "string" || typeof item.message !== "string")
@@ -526,6 +598,109 @@ export function parseSnapshotResponse(
       metadata: metadata(item.metadata),
       sync: sync(item.sync),
       workflows: item.workflows.map(workflow),
+    };
+  });
+}
+
+export function parseGalaxySceneResponse(
+  value: unknown,
+): Versioned<GalaxySceneSnapshot> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "galaxy scene");
+    return {
+      revision: number(item.revision, "galaxy scene revision"),
+      generated_at_ms: number(item.generated_at_ms, "galaxy scene time"),
+      stars: array(item.stars, "galaxy scene stars").map((value) => {
+        const star = record(value, "galaxy star");
+        if (
+          typeof star.id !== "string" ||
+          typeof star.current !== "boolean" ||
+          typeof star.has_hub !== "boolean" ||
+          typeof star.has_life !== "boolean" ||
+          typeof star.has_relay !== "boolean"
+        )
+          throw new Error("Invalid galaxy star");
+        return {
+          id: star.id,
+          name: nullableString(star.name, "galaxy star name"),
+          spectral_type: nullableString(
+            star.spectral_type,
+            "galaxy spectral type",
+          ),
+          position: point(star.position),
+          exploration: oneOf(
+            star.exploration,
+            ["undiscovered", "partial", "explored"] as const,
+            "galaxy exploration",
+          ),
+          current: star.current,
+          has_hub: star.has_hub,
+          has_life: star.has_life,
+          has_relay: star.has_relay,
+        };
+      }),
+      relay_edges: array(item.relay_edges, "galaxy relay edges").map((value) =>
+        stringPair(value, "relay edge"),
+      ),
+      active_travel: array(item.active_travel, "galaxy travel").map((value) => {
+        const travel = record(value, "active travel");
+        return {
+          entity: entity(travel.entity),
+          ...stringPair(value, "active travel"),
+          started_at: nullableString(travel.started_at, "travel start"),
+          arrives_at: nullableString(travel.arrives_at, "travel arrival"),
+        };
+      }),
+      signals: array(item.signals, "galaxy signals").map((value) => {
+        const signal = record(value, "galaxy signal");
+        if (typeof signal.id !== "string")
+          throw new Error("Invalid galaxy signal");
+        return {
+          id: signal.id,
+          label: nullableString(signal.label, "signal label"),
+          position: point(signal.position),
+        };
+      }),
+      highlights: array(item.highlights, "galaxy highlights").map((value) => {
+        const highlight = record(value, "galaxy highlight");
+        if (typeof highlight.workflow_id !== "string")
+          throw new Error("Invalid galaxy highlight");
+        return {
+          workflow_id: highlight.workflow_id,
+          ...stringPair(value, "galaxy highlight"),
+        };
+      }),
+      overlays: array(item.overlays, "galaxy overlays").map((value) => {
+        const overlay = record(value, "galaxy overlay");
+        if (typeof overlay.system !== "string")
+          throw new Error("Invalid galaxy overlay");
+        return {
+          kind: oneOf(
+            overlay.kind,
+            ["life", "device", "influence"] as const,
+            "galaxy overlay kind",
+          ),
+          system: overlay.system,
+          position: point(overlay.position),
+          count: number(overlay.count, "galaxy overlay count"),
+        };
+      }),
+      workflow_targets: array(item.workflow_targets, "workflow targets").map(
+        (value) => {
+          const target = record(value, "workflow target");
+          if (
+            typeof target.workflow_id !== "string" ||
+            typeof target.workflow_kind !== "string" ||
+            typeof target.system !== "string"
+          )
+            throw new Error("Invalid workflow target");
+          return {
+            workflow_id: target.workflow_id,
+            workflow_kind: target.workflow_kind,
+            system: target.system,
+          };
+        },
+      ),
     };
   });
 }

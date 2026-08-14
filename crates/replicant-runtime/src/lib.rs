@@ -70,6 +70,9 @@ pub mod actions;
 /// Application-level events and user-facing notifications.
 pub mod notifications {}
 
+/// Application-owned galaxy scene projection.
+pub mod galaxy_scene;
+
 /// Starts the managed Replicant Space client using application startup policy.
 pub async fn start_managed_client(
     config: config::ManagedClientConfig,

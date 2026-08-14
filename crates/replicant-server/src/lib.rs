@@ -29,19 +29,20 @@ use replicant_client::{
 };
 use replicant_protocol::{
     ActionDescriptor, ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId,
-    EntityKind, EntityRef, ErrorResponse, HealthStatus, LiveDelta, LiveMessage, MutationRisk,
-    OperationKind, OperationStatus, OperationUpdate, ParameterDescriptor, ParameterKind,
-    ParameterOption, ParameterValidation, ReportDescriptor, RunOperationRequest,
-    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
-    StartWorkflowRequest, StartWorkflowResponse, SyncPhase, TriggerKind, Versioned,
-    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDescriptor,
-    WorkflowDetail, WorkflowId as ProtocolWorkflowId, WorkflowListResponse,
+    EntityKind, EntityRef, ErrorResponse, GalaxySceneSnapshot, HealthStatus, LiveDelta,
+    LiveMessage, MutationRisk, OperationKind, OperationStatus, OperationUpdate,
+    ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
+    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, TriggerKind,
+    Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse,
+    WorkflowDescriptor, WorkflowDetail, WorkflowId as ProtocolWorkflowId, WorkflowListResponse,
     WorkflowStatus as ProtocolStatus, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
     actions::{ClearTagsAction, ContributeDevicesAction, clear_tags, contribute_devices},
     config::RuntimeConfig,
+    galaxy_scene::galaxy_scene as build_galaxy_scene,
     relay::RelayExpansionRequest,
     reports::{NearbyBeltReportRequest, nearby_belt_report},
     survey::{SurveyMode, SurveyOptions},
@@ -189,6 +190,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/ws", get(websocket))
         .route("/api/descriptors", get(descriptors))
         .route("/api/reports/{kind}", post(run_report))
@@ -402,6 +404,20 @@ async fn snapshot(
         },
         workflows,
     })))
+}
+
+async fn galaxy_scene(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<GalaxySceneSnapshot>>, ApiError> {
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let revision = state.revision.load(Ordering::Relaxed);
+    let scene = build_galaxy_scene(state.client(), &workflows, revision, now_millis()?)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "galaxy scene projection failed");
+            ApiError::unavailable()
+        })?;
+    Ok(Json(Versioned::current(scene)))
 }
 
 async fn descriptors(State(state): State<Arc<AppState>>) -> Json<Versioned<DescriptorCatalog>> {
@@ -1299,7 +1315,12 @@ mod tests {
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
         let (app, client, _) = test_app().await;
-        for path in ["/api/health", "/api/snapshot", "/api/descriptors"] {
+        for path in [
+            "/api/health",
+            "/api/snapshot",
+            "/api/galaxy-scene",
+            "/api/descriptors",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::get(path).body(Body::empty()).expect("request"))

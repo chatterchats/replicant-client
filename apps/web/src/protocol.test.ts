@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseHealthResponse,
+  parseGalaxySceneResponse,
   parseLiveMessage,
   parseSnapshotResponse,
 } from "./protocol";
@@ -64,5 +65,36 @@ describe("parseHealthResponse", () => {
         delta: { type: "raw_upstream_event", data: {} },
       }),
     ).toThrow("Unsupported live delta");
+  });
+
+  it("parses an application-owned galaxy scene", () => {
+    const scene = parseGalaxySceneResponse({
+      protocol_version: 1,
+      payload: {
+        revision: 7,
+        generated_at_ms: 8,
+        stars: [
+          {
+            id: "SOL",
+            name: null,
+            spectral_type: "G",
+            position: { x: 0, y: 1, z: 2 },
+            exploration: "explored",
+            current: true,
+            has_hub: true,
+            has_life: true,
+            has_relay: false,
+          },
+        ],
+        relay_edges: [],
+        active_travel: [],
+        signals: [],
+        highlights: [],
+        overlays: [],
+        workflow_targets: [],
+      },
+    }).payload;
+    expect(scene.stars[0]?.id).toBe("SOL");
+    expect(scene.stars[0]?.position.z).toBe(2);
   });
 });

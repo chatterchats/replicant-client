@@ -11,9 +11,14 @@ import {
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
 import { CommandPalette, type CommandContext } from "./CommandPalette";
-import { GalaxyMapWasm } from "./GalaxyMapWasm";
+import { GalaxyPage } from "./GalaxyPage";
 import { daemonApi } from "./api";
-import type { DescriptorCatalog, EntityKind, WorkflowStatus } from "./protocol";
+import type {
+  DescriptorCatalog,
+  EntityKind,
+  GalaxyStar,
+  WorkflowStatus,
+} from "./protocol";
 import {
   initialShellState,
   shellReducer,
@@ -100,6 +105,7 @@ export function App() {
     actions: [],
     workflows: [],
   });
+  const [selectedGalaxyStar, setSelectedGalaxyStar] = useState<GalaxyStar>();
   const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
@@ -175,7 +181,10 @@ export function App() {
   const selectedValue = shell.selectedEntity
     ? shell.selectedEntity.kind === "workflow"
       ? daemon.workflows[shell.selectedEntity.id]
-      : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
+      : shell.selectedEntity.kind === "system" &&
+          selectedGalaxyStar?.id === shell.selectedEntity.id
+        ? selectedGalaxyStar
+        : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
     : undefined;
   const commandContext: CommandContext = {
     system:
@@ -304,7 +313,12 @@ export function App() {
             {shell.page === "Automations" ? (
               <AutomationsPage entities={entities} workflows={workflows} />
             ) : shell.page === "Galaxy" ? (
-              <GalaxyMapWasm />
+              <GalaxyPage
+                onSelectStar={(star) => {
+                  setSelectedGalaxyStar(star);
+                  select({ kind: "system", id: star.id });
+                }}
+              />
             ) : (
               <article className="page">
                 <p className="eyebrow">{group}</p>

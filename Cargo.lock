@@ -1446,6 +1446,7 @@ dependencies = [
  "replicant-event-planner",
  "replicant-mining-planner",
  "replicant-printing",
+ "replicant-protocol",
  "replicant-route-planner",
  "replicant-transport",
  "replicant-workflow",

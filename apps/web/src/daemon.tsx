@@ -28,6 +28,7 @@ export type ConnectionState =
 export interface DaemonState {
   connection: ConnectionState;
   revision: number | null;
+  galaxyRevision: number;
   syncing: boolean;
   health: DaemonHealth | null;
   sync: RuntimeSyncStatus | null;
@@ -52,6 +53,7 @@ export type DaemonAction =
 export const initialDaemonState: DaemonState = {
   connection: "connecting",
   revision: null,
+  galaxyRevision: 0,
   syncing: true,
   health: null,
   sync: null,
@@ -94,6 +96,7 @@ export function daemonReducer(
       return {
         ...state,
         revision: action.snapshot.metadata.revision,
+        galaxyRevision: action.snapshot.metadata.revision,
         syncing: action.snapshot.sync.phase !== "ready",
         health: action.health,
         sync: action.snapshot.sync,
@@ -145,6 +148,10 @@ export function daemonReducer(
         case "domain_invalidated":
           return {
             ...next,
+            galaxyRevision:
+              message.delta.data.slice === "universe"
+                ? message.revision
+                : state.galaxyRevision,
             invalidated: state.invalidated.includes(message.delta.data.slice)
               ? state.invalidated
               : [...state.invalidated, message.delta.data.slice],
@@ -153,6 +160,7 @@ export function daemonReducer(
         case "workflow_updated":
           return {
             ...next,
+            galaxyRevision: message.revision,
             workflows: {
               ...state.workflows,
               [message.delta.data.id]: message.delta.data,
@@ -285,3 +293,4 @@ export const useEntities = () => useDaemonState().entities;
 export const useWorkflows = () => Object.values(useDaemonState().workflows);
 export const useActivity = () => useDaemonState().activity;
 export const useNotifications = () => useDaemonState().notifications;
+export const useGalaxyRevision = () => useDaemonState().galaxyRevision;

@@ -57,6 +57,7 @@ describe("daemonReducer", () => {
     expect(state.revision).toBe(12);
     expect(state.entities["device:D-1"]).toEqual({ name: "Miner" });
     expect(state.notifications).toHaveLength(1);
+    expect(state.galaxyRevision).toBe(10);
   });
 
   it("resnapshots after a revision gap and ignores uncertain deltas", () => {
