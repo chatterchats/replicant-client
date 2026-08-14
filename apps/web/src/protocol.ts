@@ -119,6 +119,27 @@ export interface DescriptorCatalog {
 export type OperationDescriptor =
   ReportDescriptor | ActionDescriptor | WorkflowDescriptor;
 
+export type FiniteExecutionStatus = "succeeded" | "skipped" | "failed";
+
+export interface ResultSummary {
+  succeeded: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface FiniteExecution {
+  id: string;
+  operation_class: "report" | "action";
+  kind: string;
+  status: FiniteExecutionStatus;
+  summary: ResultSummary;
+  started_at_ms: number;
+  finished_at_ms: number;
+  result: unknown;
+  error: string | null;
+  links: EntityRef[];
+}
+
 export interface WorkflowDetail {
   summary: WorkflowSummary;
   schema_version: number;
@@ -571,6 +592,41 @@ function entity(value: unknown): EntityRef {
   return { kind: oneOf(item.kind, entityKinds, "entity kind"), id: item.id };
 }
 
+function finiteExecution(value: unknown): FiniteExecution {
+  const item = record(value, "finite execution");
+  const summary = record(item.summary, "result summary");
+  if (
+    typeof item.id !== "string" ||
+    typeof item.kind !== "string" ||
+    !Array.isArray(item.links)
+  )
+    throw new Error("Invalid finite execution");
+  return {
+    id: item.id,
+    operation_class: oneOf(
+      item.operation_class,
+      ["report", "action"] as const,
+      "finite execution class",
+    ),
+    kind: item.kind,
+    status: oneOf(
+      item.status,
+      ["succeeded", "skipped", "failed"] as const,
+      "finite execution status",
+    ),
+    summary: {
+      succeeded: number(summary.succeeded, "successful result count"),
+      skipped: number(summary.skipped, "skipped result count"),
+      failed: number(summary.failed, "failed result count"),
+    },
+    started_at_ms: number(item.started_at_ms, "execution start time"),
+    finished_at_ms: number(item.finished_at_ms, "execution finish time"),
+    result: item.result,
+    error: nullableString(item.error, "execution error"),
+    links: item.links.map(entity),
+  };
+}
+
 function point(value: unknown): GalaxyPoint {
   const item = record(value, "galaxy point");
   return {
@@ -901,11 +957,23 @@ export function parseDescriptorsResponse(
   });
 }
 
-export function parseOperationResponse(value: unknown): Versioned<unknown> {
-  return envelope(
-    value,
-    (payload) => record(payload, "operation response").result,
+export function parseOperationResponse(
+  value: unknown,
+): Versioned<FiniteExecution> {
+  return envelope(value, (payload) =>
+    finiteExecution(record(payload, "operation response").execution),
   );
+}
+
+export function parseFiniteExecutionHistoryResponse(
+  value: unknown,
+): Versioned<FiniteExecution[]> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "finite execution history response");
+    if (!Array.isArray(item.executions))
+      throw new Error("Invalid finite execution history");
+    return item.executions.map(finiteExecution);
+  });
 }
 
 export function parseWorkflowResponse(

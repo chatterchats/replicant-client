@@ -5,6 +5,7 @@ import { ParameterField, validateParameters } from "./AutomationsPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
+  FiniteExecution,
   OperationDescriptor,
   WorkflowSummary,
 } from "./protocol";
@@ -96,6 +97,7 @@ export function CommandPalette({
   onClose,
   onNavigate,
   onWorkflowStarted,
+  onOperationFinished,
   initialCommand,
 }: {
   catalog: DescriptorCatalog;
@@ -105,6 +107,7 @@ export function CommandPalette({
   onClose: () => void;
   onNavigate: (page: string) => void;
   onWorkflowStarted: (workflow: WorkflowSummary) => void;
+  onOperationFinished: (execution: FiniteExecution) => void;
   initialCommand?: DescriptorCommand;
 }) {
   const [query, setQuery] = useState("");
@@ -119,7 +122,6 @@ export function CommandPalette({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [confirming, setConfirming] = useState(false);
   const [confirmation, setConfirmation] = useState("");
-  const [result, setResult] = useState<unknown>();
   const [serverError, setServerError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [active, setActive] = useState(0);
@@ -152,14 +154,13 @@ export function CommandPalette({
           await daemonApi.startWorkflow(selected.descriptor.kind, parameters),
         );
       } else {
-        setResult(
+        onOperationFinished(
           await daemonApi.runOperation(
             selected.operationClass,
             selected.descriptor.kind,
             parameters,
           ),
         );
-        setConfirming(false);
       }
     } catch (error) {
       setServerError(String(error));
@@ -179,16 +180,7 @@ export function CommandPalette({
           event.stopPropagation();
         }}
       >
-        {result !== undefined && selected ? (
-          <div className="palette-result">
-            <small>{selected.operationClass} result</small>
-            <h2>{selected.descriptor.display_name}</h2>
-            <pre>{JSON.stringify(result, null, 2)}</pre>
-            <button className="primary" onClick={onClose}>
-              Done
-            </button>
-          </div>
-        ) : confirming && selected ? (
+        {confirming && selected ? (
           <div className="palette-confirmation">
             <span className={`risk ${selected.descriptor.risk}`}>
               {selected.descriptor.risk} risk

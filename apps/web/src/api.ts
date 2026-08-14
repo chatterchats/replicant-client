@@ -1,5 +1,6 @@
 import {
   parseDescriptorsResponse,
+  parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
   parseSystemSceneResponse,
   parseHealthResponse,
@@ -64,6 +65,11 @@ export const daemonApi = {
   async workflowActivity(id: string, signal?: AbortSignal) {
     return parseWorkflowActivityResponse(
       await get(`/api/workflows/${encodeURIComponent(id)}/activity`, signal),
+    ).payload;
+  },
+  async history(signal?: AbortSignal) {
+    return parseFiniteExecutionHistoryResponse(
+      await get("/api/history", signal),
     ).payload;
   },
   async startWorkflow(kind: string, parameters: Record<string, unknown>) {

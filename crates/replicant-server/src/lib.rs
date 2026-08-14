@@ -29,11 +29,12 @@ use replicant_client::{
 };
 use replicant_protocol::{
     ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef,
-    ErrorResponse, GalaxySceneSnapshot, HealthStatus, LiveDelta, LiveMessage, OperationClass,
-    OperationKind, OperationStatus, OperationUpdate, RunOperationRequest, RunOperationResponse,
-    RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest,
-    StartWorkflowResponse, SyncPhase, SystemSceneSnapshot, Versioned, WorkflowActivity,
-    WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    ErrorResponse, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
+    LiveDelta, LiveMessage, OperationClass, OperationKind, OperationStatus, OperationUpdate,
+    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
     WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
     WorkflowSummary,
 };
@@ -46,8 +47,10 @@ use replicant_runtime::{
     workflows::WorkflowActivityEvent,
 };
 use replicant_workflow::{
-    RepositoryError, ResourceKey, SupervisorError, WorkflowId, WorkflowInstance,
-    WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
+    FiniteExecution as StoredFiniteExecution, FiniteExecutionClass,
+    FiniteExecutionStatus as StoredFiniteExecutionStatus, RepositoryError, ResourceKey,
+    SupervisorError, WorkflowId, WorkflowInstance, WorkflowRepository, WorkflowStatus,
+    WorkflowSupervisor,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -191,6 +194,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/descriptors", get(descriptors))
         .route("/api/reports/{kind}", post(run_report))
         .route("/api/actions/{kind}", post(run_action))
+        .route("/api/history", get(finite_execution_history))
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
@@ -445,12 +449,18 @@ async fn run_report(
     let request = payload
         .map_err(|_| ApiError::invalid("invalid report parameters"))?
         .0;
+    let started_at = now_millis()?;
     let result = state
         .catalogue
         .run_report(state.client(), &kind, request.parameters)
-        .await
-        .map_err(ApiError::catalogue)?;
-    Ok(Json(Versioned::current(RunOperationResponse { result })))
+        .await;
+    operation_response(
+        &state,
+        FiniteExecutionClass::Report,
+        &kind,
+        started_at,
+        result,
+    )
 }
 
 async fn run_action(
@@ -461,12 +471,253 @@ async fn run_action(
     let request = payload
         .map_err(|_| ApiError::invalid("invalid action parameters"))?
         .0;
+    let started_at = now_millis()?;
     let result = state
         .catalogue
         .run_action(state.client(), &kind, request.parameters)
-        .await
-        .map_err(ApiError::catalogue)?;
-    Ok(Json(Versioned::current(RunOperationResponse { result })))
+        .await;
+    operation_response(
+        &state,
+        FiniteExecutionClass::Action,
+        &kind,
+        started_at,
+        result,
+    )
+}
+
+fn operation_response(
+    state: &AppState,
+    operation_class: FiniteExecutionClass,
+    kind: &str,
+    started_at: i64,
+    result: Result<Value, CatalogueError>,
+) -> Result<Json<Versioned<RunOperationResponse>>, ApiError> {
+    match result {
+        Ok(result) => {
+            let result = sanitize_result(result);
+            let (summary, status) = summarize_result(&result);
+            let execution = persist_execution(
+                state,
+                operation_class,
+                kind,
+                status,
+                started_at,
+                Some(&result),
+                None,
+                summary,
+            );
+            Ok(Json(Versioned::current(RunOperationResponse {
+                result,
+                execution,
+            })))
+        }
+        Err(error) => {
+            let _ = persist_execution(
+                state,
+                operation_class,
+                kind,
+                StoredFiniteExecutionStatus::Failed,
+                started_at,
+                None,
+                Some("execution failed"),
+                ResultSummary {
+                    failed: 1,
+                    ..ResultSummary::default()
+                },
+            );
+            Err(ApiError::catalogue(error))
+        }
+    }
+}
+
+async fn finite_execution_history(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<FiniteExecutionHistoryResponse>>, ApiError> {
+    let executions = state
+        .repository
+        .finite_execution_history()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .map(|execution| {
+            let summary = execution
+                .result
+                .as_ref()
+                .map_or_else(ResultSummary::default, |result| summarize_result(result).0);
+            present_execution(execution, summary)
+        })
+        .collect();
+    Ok(Json(Versioned::current(FiniteExecutionHistoryResponse {
+        executions,
+    })))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_execution(
+    state: &AppState,
+    operation_class: FiniteExecutionClass,
+    kind: &str,
+    status: StoredFiniteExecutionStatus,
+    started_at: i64,
+    result: Option<&Value>,
+    error: Option<&str>,
+    summary: ResultSummary,
+) -> ProtocolFiniteExecution {
+    match state.repository.record_finite_execution(
+        operation_class,
+        kind,
+        status,
+        started_at,
+        result,
+        error,
+    ) {
+        Ok(execution) => present_execution(execution, summary),
+        Err(repository_error) => {
+            tracing::error!(error = %repository_error, kind, "finite execution history was not persisted");
+            present_execution(
+                StoredFiniteExecution {
+                    id: format!("unpersisted-{started_at}"),
+                    operation_class,
+                    kind: kind.to_owned(),
+                    status,
+                    started_at,
+                    finished_at: now_millis().unwrap_or(started_at),
+                    result: result.cloned(),
+                    error: error.map(str::to_owned),
+                },
+                summary,
+            )
+        }
+    }
+}
+
+fn present_execution(
+    execution: StoredFiniteExecution,
+    summary: ResultSummary,
+) -> ProtocolFiniteExecution {
+    let links = execution
+        .result
+        .as_ref()
+        .map_or_else(Vec::new, result_links);
+    ProtocolFiniteExecution {
+        id: execution.id,
+        operation_class: match execution.operation_class {
+            FiniteExecutionClass::Report => OperationClass::Report,
+            FiniteExecutionClass::Action => OperationClass::Action,
+        },
+        kind: OperationKind(execution.kind),
+        status: match execution.status {
+            StoredFiniteExecutionStatus::Succeeded => ProtocolFiniteExecutionStatus::Succeeded,
+            StoredFiniteExecutionStatus::Skipped => ProtocolFiniteExecutionStatus::Skipped,
+            StoredFiniteExecutionStatus::Failed => ProtocolFiniteExecutionStatus::Failed,
+        },
+        summary,
+        started_at_ms: execution.started_at,
+        finished_at_ms: execution.finished_at,
+        result: execution.result,
+        error: execution.error,
+        links,
+    }
+}
+
+fn summarize_result(result: &Value) -> (ResultSummary, StoredFiniteExecutionStatus) {
+    fn visit(value: &Value, summary: &mut ResultSummary) {
+        match value {
+            Value::Array(values) => values.iter().for_each(|value| visit(value, summary)),
+            Value::Object(object) => {
+                if let Some(Value::String(kind)) = object.get("kind") {
+                    match kind.as_str() {
+                        "planned" | "succeeded" => summary.succeeded += 1,
+                        "skipped" => summary.skipped += 1,
+                        "failed" => summary.failed += 1,
+                        _ => {}
+                    }
+                }
+                object.values().for_each(|value| visit(value, summary));
+            }
+            _ => {}
+        }
+    }
+    let mut summary = ResultSummary::default();
+    visit(result, &mut summary);
+    if summary == ResultSummary::default() {
+        summary.succeeded = 1;
+    }
+    let status = if summary.failed > 0 {
+        StoredFiniteExecutionStatus::Failed
+    } else if summary.succeeded == 0 && summary.skipped > 0 {
+        StoredFiniteExecutionStatus::Skipped
+    } else {
+        StoredFiniteExecutionStatus::Succeeded
+    };
+    (summary, status)
+}
+
+fn sanitize_result(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(sanitize_result).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let lowered = key.to_ascii_lowercase();
+                    let sensitive = [
+                        "token",
+                        "secret",
+                        "password",
+                        "credential",
+                        "authorization",
+                        "api_key",
+                    ]
+                    .iter()
+                    .any(|needle| lowered.contains(needle));
+                    (
+                        key,
+                        if sensitive {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            sanitize_result(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn result_links(result: &Value) -> Vec<EntityRef> {
+    fn visit(value: &Value, links: &mut Vec<EntityRef>) {
+        match value {
+            Value::Array(values) => values.iter().for_each(|value| visit(value, links)),
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let kind = match key.as_str() {
+                        "operation_id" => Some(EntityKind::Operation),
+                        "workflow_id" => Some(EntityKind::Workflow),
+                        "system" => Some(EntityKind::System),
+                        "location" => Some(EntityKind::Location),
+                        "replicant" => Some(EntityKind::Replicant),
+                        "device" => Some(EntityKind::Device),
+                        _ => None,
+                    };
+                    if let (Some(kind), Value::String(id)) = (kind, value) {
+                        let link = EntityRef {
+                            kind,
+                            id: EntityId(id.clone()),
+                        };
+                        if !links.contains(&link) {
+                            links.push(link);
+                        }
+                    }
+                    visit(value, links);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut links = Vec::new();
+    visit(result, &mut links);
+    links
 }
 
 #[derive(Default, Deserialize)]
@@ -754,6 +1005,31 @@ fn now_millis() -> Result<i64, ApiError> {
         .map_err(|_| ApiError::internal())?
         .as_millis();
     i64::try_from(millis).map_err(|_| ApiError::internal())
+}
+
+#[cfg(test)]
+mod finite_result_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn sanitizes_and_summarizes_action_results() {
+        let result = sanitize_result(json!({
+            "api_token": "do-not-export",
+            "report": {"events": [
+                {"kind": "succeeded", "device": "D-1", "operation_id": "O-1"},
+                {"kind": "skipped", "device": "D-2"}
+            ]}
+        }));
+        let (summary, status) = summarize_result(&result);
+
+        assert_eq!(result["api_token"], "[redacted]");
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(status, StoredFiniteExecutionStatus::Succeeded);
+        assert_eq!(result_links(&result).len(), 3);
+    }
 }
 
 fn present_activity(message: &str) -> (ActivityLevel, Option<String>, String) {

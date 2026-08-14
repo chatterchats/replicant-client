@@ -977,12 +977,106 @@ h1 {
   overflow: auto;
 }
 
+.history-page {
+  padding: 24px;
+}
+.history-page > header,
+.result-inspector > header,
+.history-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.history-page select {
+  margin-left: 8px;
+}
+.history-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.7fr) minmax(0, 1.3fr);
+  gap: 16px;
+}
+.history-list,
+.result-inspector {
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  background: rgba(8, 20, 25, 0.7);
+}
+.history-list button {
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  border-bottom: 1px solid rgba(159, 188, 193, 0.1);
+  text-align: left;
+}
+.history-list button span {
+  display: grid;
+  gap: 4px;
+}
+.result-inspector {
+  min-width: 0;
+  padding: 16px;
+}
+.result-status {
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+.result-status.succeeded {
+  color: #78e6a3;
+  background: rgba(61, 180, 105, 0.12);
+}
+.result-status.skipped {
+  color: #e5cf7b;
+  background: rgba(190, 159, 55, 0.12);
+}
+.result-status.failed {
+  color: #ff8f8f;
+  background: rgba(211, 65, 65, 0.12);
+}
+.result-summary,
+.result-tools,
+.result-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.result-summary span {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(159, 188, 193, 0.08);
+}
+.result-table-scroll {
+  overflow-x: auto;
+}
+.result-inspector table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.result-inspector th,
+.result-inspector td {
+  padding: 7px;
+  border-bottom: 1px solid rgba(159, 188, 193, 0.1);
+  text-align: left;
+  vertical-align: top;
+}
+.result-inspector th {
+  color: #9fb6b2;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
 @media (max-width: 720px) {
   .app-shell {
     grid-template-columns: 1fr;
   }
   .sidebar {
     display: none;
+  }
+  .history-layout {
+    grid-template-columns: 1fr;
   }
   main {
     height: 100vh;

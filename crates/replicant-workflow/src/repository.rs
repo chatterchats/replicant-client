@@ -7,17 +7,22 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
+use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
-    ClaimAcquireOutcome, NewWorkflow, ResourceClaim, ResourceKey, WorkflowActivity, WorkflowId,
-    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
+    ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass, FiniteExecutionStatus, NewWorkflow,
+    ResourceClaim, ResourceKey, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind,
+    WorkflowState, WorkflowStatus,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/0002_activity.sql");
 const RESOURCE_CLAIMS_SCHEMA: &str = include_str!("../migrations/0003_resource_claims.sql");
 const WAIT_INTENT_SCHEMA: &str = include_str!("../migrations/0004_wait_intent.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 4;
+const FINITE_EXECUTION_SCHEMA: &str =
+    include_str!("../migrations/0005_finite_execution_history.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 5;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +182,13 @@ impl WorkflowRepository {
                 [],
             )?;
         }
+        if found < 5 {
+            transaction.execute_batch(FINITE_EXECUTION_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (5)",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -229,6 +241,93 @@ impl WorkflowRepository {
             "SELECT {COLUMNS} FROM workflow_instances ORDER BY created_at, id"
         ))?;
         let rows = statement.query_map([], row_to_instance)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Persists a completed, sanitized report or action execution.
+    pub fn record_finite_execution(
+        &self,
+        operation_class: FiniteExecutionClass,
+        kind: &str,
+        status: FiniteExecutionStatus,
+        started_at: i64,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<FiniteExecution, RepositoryError> {
+        let execution = FiniteExecution {
+            id: Uuid::new_v4().to_string(),
+            operation_class,
+            kind: kind.to_owned(),
+            status,
+            started_at,
+            finished_at: now_millis()?,
+            result: result.cloned(),
+            error: error.map(str::to_owned),
+        };
+        let result_json = execution
+            .result
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO finite_executions (
+                id, operation_class, kind, status, started_at, finished_at, result_json, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                execution.id,
+                execution.operation_class.as_str(),
+                execution.kind,
+                execution.status.as_str(),
+                execution.started_at,
+                execution.finished_at,
+                result_json,
+                execution.error,
+            ],
+        )?;
+        Ok(execution)
+    }
+
+    /// Lists finite executions newest first.
+    pub fn finite_execution_history(&self) -> Result<Vec<FiniteExecution>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, operation_class, kind, status, started_at, finished_at, result_json, error
+             FROM finite_executions ORDER BY finished_at DESC, id DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let operation_class = match row.get::<_, String>(1)?.as_str() {
+                "report" => FiniteExecutionClass::Report,
+                "action" => FiniteExecutionClass::Action,
+                value => return Err(invalid_stored_execution(value)),
+            };
+            let status = match row.get::<_, String>(3)?.as_str() {
+                "succeeded" => FiniteExecutionStatus::Succeeded,
+                "skipped" => FiniteExecutionStatus::Skipped,
+                "failed" => FiniteExecutionStatus::Failed,
+                value => return Err(invalid_stored_execution(value)),
+            };
+            let result_json = row.get::<_, Option<String>>(6)?;
+            Ok(FiniteExecution {
+                id: row.get(0)?,
+                operation_class,
+                kind: row.get(2)?,
+                status,
+                started_at: row.get(4)?,
+                finished_at: row.get(5)?,
+                result: result_json
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                error: row.get(7)?,
+            })
+        })?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
@@ -562,6 +661,14 @@ fn resource_key(namespace: String, key: String) -> ResourceKey {
 
 fn to_sql_conversion_error(error: RepositoryError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn invalid_stored_execution(value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        format!("invalid persisted finite execution value {value:?}").into(),
+    )
 }
 
 fn now_millis() -> Result<i64, RepositoryError> {

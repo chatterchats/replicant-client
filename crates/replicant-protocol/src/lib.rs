@@ -517,6 +517,63 @@ pub struct RunOperationRequest {
 pub struct RunOperationResponse {
     /// Typed operation result.
     pub result: Value,
+    /// Persisted application-level execution record.
+    pub execution: FiniteExecution,
+}
+
+/// Terminal status of a finite report or action execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiniteExecutionStatus {
+    /// Execution completed useful work.
+    Succeeded,
+    /// Execution completed but found no work to perform.
+    Skipped,
+    /// Execution failed.
+    Failed,
+}
+
+/// Success/skipped/failure counts derived from structured result events.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResultSummary {
+    /// Successful or planned result items.
+    pub succeeded: usize,
+    /// Items intentionally skipped.
+    pub skipped: usize,
+    /// Failed result items.
+    pub failed: usize,
+}
+
+/// Persisted application-level result of a finite report or action.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FiniteExecution {
+    /// Stable execution identifier.
+    pub id: String,
+    /// Report or action class.
+    pub operation_class: OperationClass,
+    /// Registered operation kind.
+    pub kind: OperationKind,
+    /// Terminal status.
+    pub status: FiniteExecutionStatus,
+    /// Structured outcome counts.
+    pub summary: ResultSummary,
+    /// Start time in Unix milliseconds.
+    pub started_at_ms: i64,
+    /// Finish time in Unix milliseconds.
+    pub finished_at_ms: i64,
+    /// Sanitized structured result, when successful.
+    pub result: Option<Value>,
+    /// Sanitized error summary, when failed.
+    pub error: Option<String>,
+    /// Affected entities, workflows, and managed operations discovered in the result.
+    pub links: Vec<EntityRef>,
+}
+
+/// Finite application execution history response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FiniteExecutionHistoryResponse {
+    /// Executions newest first.
+    pub executions: Vec<FiniteExecution>,
 }
 
 /// Response after creating a workflow instance.

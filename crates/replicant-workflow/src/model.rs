@@ -5,6 +5,66 @@ use uuid::Uuid;
 
 use crate::RepositoryError;
 
+/// Application-level class for one persisted finite execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FiniteExecutionClass {
+    /// Read-only report.
+    Report,
+    /// Bounded mutating action.
+    Action,
+}
+
+impl FiniteExecutionClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Action => "action",
+        }
+    }
+}
+
+/// Terminal application-level status for one finite execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FiniteExecutionStatus {
+    /// Execution completed useful work.
+    Succeeded,
+    /// Execution completed but found no work to perform.
+    Skipped,
+    /// Execution failed.
+    Failed,
+}
+
+impl FiniteExecutionStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Durable, frontend-safe result of a finite report or action.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FiniteExecution {
+    /// Stable execution identifier.
+    pub id: String,
+    /// Report or action.
+    pub operation_class: FiniteExecutionClass,
+    /// Registered descriptor kind.
+    pub kind: String,
+    /// Terminal execution status.
+    pub status: FiniteExecutionStatus,
+    /// Start time in Unix milliseconds.
+    pub started_at: i64,
+    /// Finish time in Unix milliseconds.
+    pub finished_at: i64,
+    /// Sanitized structured result, when successful.
+    pub result: Option<serde_json::Value>,
+    /// Sanitized error summary, when failed.
+    pub error: Option<String>,
+}
+
 /// Stable identifier for a persisted workflow instance.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

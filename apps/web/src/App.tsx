@@ -16,11 +16,13 @@ import {
   type DescriptorCommand,
 } from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
+import { HistoryPage } from "./HistoryPage";
 import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
   EntityKind,
+  FiniteExecution,
   GalaxyStar,
   SystemMarker,
   WorkflowStatus,
@@ -112,6 +114,7 @@ export function App() {
     workflows: [],
   });
   const [selectedGalaxyStar, setSelectedGalaxyStar] = useState<GalaxyStar>();
+  const [selectedExecution, setSelectedExecution] = useState<FiniteExecution>();
   const [selectedSystem, setSelectedSystem] = useState<string>();
   const [selectedSystemMarker, setSelectedSystemMarker] =
     useState<SystemMarker>();
@@ -333,6 +336,16 @@ export function App() {
                 workflows={workflows}
                 selectedWorkflowId={selectedAutomationWorkflow}
               />
+            ) : shell.page === "History" ? (
+              <HistoryPage
+                workflows={workflows}
+                selectedExecution={selectedExecution}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onSelectEntity={select}
+              />
             ) : shell.page === "Galaxy" ? (
               <GalaxyPage
                 descriptors={descriptors}
@@ -508,6 +521,10 @@ export function App() {
           onWorkflowStarted={(workflow) => {
             setSelectedAutomationWorkflow(workflow.id);
             navigate("Automations");
+          }}
+          onOperationFinished={(execution) => {
+            setSelectedExecution(execution);
+            navigate("History");
           }}
         />
       ) : null}
