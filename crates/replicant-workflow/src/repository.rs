@@ -273,6 +273,36 @@ impl WorkflowRepository {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    /// Lists durable activity after a global sequence cursor.
+    pub fn activity_since(&self, after_id: i64) -> Result<Vec<WorkflowActivity>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, workflow_id, created_at, message FROM workflow_activity WHERE id > ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([after_id], |row| {
+            let stored_id = row.get::<_, String>(1)?;
+            let workflow_id: WorkflowId = stored_id
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidParameterName(stored_id))?;
+            Ok(WorkflowActivity {
+                id: row.get(0)?,
+                workflow_id,
+                created_at: row.get(2)?,
+                message: row.get(3)?,
+            })
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Returns the latest global activity sequence without loading history.
+    pub fn latest_activity_id(&self) -> Result<i64, RepositoryError> {
+        Ok(self.connection()?.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM workflow_activity",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Atomically acquires an exclusive resource claim.
     ///
     /// Reacquiring a claim owned by `workflow_id` is idempotent and refreshes

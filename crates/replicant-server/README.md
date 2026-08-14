@@ -21,10 +21,11 @@ Configuration is environment-based:
 
 The default binding is loopback-only. Binding to a non-loopback address is an explicit advanced deployment choice and should only be done behind an authenticated same-origin proxy or on an isolated container network.
 
-HTTP routes are rooted at `/api`:
+The daemon exposes these local routes:
 
 - `GET /api/health`
 - `GET /api/snapshot`
+- `GET /ws` (WebSocket upgrade)
 - `GET /api/descriptors`
 - `GET, POST /api/workflows`
 - `GET /api/workflows/{id}`
@@ -34,3 +35,5 @@ HTTP routes are rooted at `/api`:
 - `POST /api/workflows/{id}/cancel`
 
 Responses use the versioned types from `replicant-protocol`. Upstream game events remain managed-client SSE traffic; this server does not expose webhook endpoints.
+
+Each WebSocket connection starts with a `snapshot` message naming the current application revision; the frontend then fetches `/api/snapshot` and applies subsequent typed messages in revision order. Reconnecting always starts from a fresh snapshot. The server sends WebSocket ping frames every 15 seconds and closes connections that do not pong within 45 seconds. Live updates use a bounded buffer; a lagging client receives a fresh `snapshot` message and is disconnected so it can reconnect without applying an uncertain delta sequence.

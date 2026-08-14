@@ -658,6 +658,24 @@ pub struct OperationWatch {
     id: OperationId,
 }
 
+/// Local stream of status changes for every durable managed operation.
+pub struct OperationsWatch {
+    receiver: tokio::sync::broadcast::Receiver<(OperationId, OperationStatus)>,
+}
+
+impl OperationsWatch {
+    /// Waits for the next managed operation status change.
+    pub async fn next(&mut self) -> Result<(OperationId, OperationStatus)> {
+        self.receiver.recv().await.map_err(|error| match error {
+            tokio::sync::broadcast::error::RecvError::Closed => Error::Closed,
+            tokio::sync::broadcast::error::RecvError::Lagged(skipped) => Error::Transport {
+                message: format!("managed operation watcher lagged by {skipped} updates"),
+                source: None,
+            },
+        })
+    }
+}
+
 impl OperationWatch {
     /// Returns the latest status published for this operation since the last
     /// call, if any is available now.
@@ -781,6 +799,14 @@ impl OperationsGateway {
             client: self.client.clone(),
             id,
         }
+    }
+
+    /// Watches local status changes for all durable managed operations.
+    pub fn watch(&self) -> Result<OperationsWatch> {
+        self.client.ensure_open()?;
+        Ok(OperationsWatch {
+            receiver: self.client.managed_operations().subscribe(),
+        })
     }
 
     /// Every durable operation not yet in a terminal state, most useful for

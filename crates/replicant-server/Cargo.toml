@@ -12,7 +12,7 @@ name = "replicantd"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 replicant-client = { version = "1.0.0", path = "../.." }
 replicant-protocol = { version = "0.1.0", path = "../replicant-protocol" }
 replicant-runtime = { version = "0.1.0", path = "../replicant-runtime" }
@@ -25,7 +25,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+futures-util = "0.3"
 http-body-util = "0.1"
+tokio-tungstenite = "0.28"
 tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]

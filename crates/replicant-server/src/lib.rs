@@ -5,21 +5,32 @@ use std::{
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State, rejection::JsonRejection},
+    extract::{
+        Path, Query, State, WebSocketUpgrade,
+        rejection::JsonRejection,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use replicant_client::{ClientStatus, managed::Client};
+use replicant_client::{
+    ClientStatus,
+    managed::{Client, OperationStatus as ManagedOperationStatus},
+};
 use replicant_protocol::{
-    ActivityLevel, DaemonHealth, DescriptorCatalog, EntityId, EntityKind, EntityRef, ErrorResponse,
-    HealthStatus, MutationRisk, OperationKind, ParameterDescriptor, ParameterKind, ParameterOption,
+    ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef,
+    ErrorResponse, HealthStatus, LiveDelta, LiveMessage, MutationRisk, OperationKind,
+    OperationStatus, OperationUpdate, ParameterDescriptor, ParameterKind, ParameterOption,
     ParameterValidation, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
     StartWorkflowRequest, StartWorkflowResponse, SyncPhase, TriggerKind, Versioned,
     WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDescriptor,
@@ -42,7 +53,11 @@ use replicant_workflow::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
+
+const LIVE_BUFFER: usize = 32;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Default loopback address used by the daemon.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -97,6 +112,9 @@ pub struct AppState {
     repository: Arc<WorkflowRepository>,
     supervisor: Mutex<WorkflowSupervisor>,
     descriptors: DescriptorCatalog,
+    live: broadcast::Sender<LiveMessage>,
+    revision: AtomicU64,
+    publish_lock: StdMutex<()>,
 }
 
 impl AppState {
@@ -111,11 +129,15 @@ impl AppState {
         let registry = Arc::new(registry);
         let supervisor =
             WorkflowSupervisor::with_managed_client(repository.clone(), registry, client.clone());
+        let revision = client.state().revision().unwrap_or_default();
         Ok(Arc::new(Self {
             context: ApplicationContext::new(client, runtime_config),
             repository,
             supervisor: Mutex::new(supervisor),
             descriptors: descriptor_catalog(),
+            live: broadcast::channel(LIVE_BUFFER).0,
+            revision: AtomicU64::new(revision),
+            publish_lock: StdMutex::new(()),
         }))
     }
 
@@ -124,6 +146,39 @@ impl AppState {
     pub fn client(&self) -> &Client {
         self.context.client()
     }
+
+    /// Publishes a frontend-safe runtime notification.
+    pub fn notify(&self, notification: replicant_protocol::Notification) {
+        self.publish(LiveDelta::Notification(notification));
+    }
+
+    fn publish(&self, delta: LiveDelta) {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.live.send(LiveMessage::current(revision, delta));
+    }
+
+    fn snapshot_metadata(&self) -> Result<SnapshotMetadata, ApiError> {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(SnapshotMetadata {
+            revision: self.revision.load(Ordering::Relaxed),
+            generated_at_ms: now_millis()?,
+        })
+    }
+
+    fn resnapshot_message(&self) -> Result<LiveMessage, ApiError> {
+        let metadata = self.snapshot_metadata()?;
+        Ok(LiveMessage::current(
+            metadata.revision,
+            LiveDelta::Snapshot(metadata),
+        ))
+    }
 }
 
 /// Builds the local HTTP router.
@@ -131,6 +186,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
+        .route("/ws", get(websocket))
         .route("/api/descriptors", get(descriptors))
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
@@ -144,11 +200,46 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Runs periodic persisted-workflow reconciliation until shutdown.
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut revisions = state.client().state().watch().ok();
+    let mut operations = state.client().operations().watch().ok();
+    let mut workflows = state
+        .repository
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|workflow| (workflow.id.to_string(), workflow.revision))
+        .collect::<BTreeMap<_, _>>();
+    let mut activity_cursor = state.repository.latest_activity_id().unwrap_or_default();
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 if let Err(error) = state.supervisor.lock().await.tick().await {
                     tracing::error!(error = %error, "workflow supervisor tick failed");
+                }
+                publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
+            }
+            revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
+                match revision {
+                    Ok(_) => state.publish(LiveDelta::DomainInvalidated { slice: DomainSlice::Universe }),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "managed state watcher stopped");
+                        revisions = None;
+                    }
+                }
+            }
+            operation = async { operations.as_mut().expect("guarded").next().await }, if operations.is_some() => {
+                match operation {
+                    Ok((id, status)) => state.publish(LiveDelta::OperationUpdated(OperationUpdate {
+                        id: EntityId(id.to_string()),
+                        workflow_id: None,
+                        status: operation_status(status),
+                        message: None,
+                        updated_at_ms: now_millis().unwrap_or_default(),
+                    })),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "managed operation watcher stopped");
+                        operations = None;
+                    }
                 }
             }
             changed = shutdown.changed() => {
@@ -158,6 +249,117 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
             }
         }
     }
+}
+
+fn publish_workflow_updates(
+    state: &AppState,
+    revisions: &mut BTreeMap<String, u64>,
+    activity_cursor: &mut i64,
+) {
+    if let Ok(current) = state.repository.list() {
+        for workflow in current {
+            let delta = match revisions.insert(workflow.id.to_string(), workflow.revision) {
+                None => Some(LiveDelta::WorkflowCreated(summary(&workflow))),
+                Some(revision) if revision != workflow.revision => {
+                    Some(LiveDelta::WorkflowUpdated(summary(&workflow)))
+                }
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                state.publish(delta);
+            }
+        }
+    }
+    if let Ok(activity) = state.repository.activity_since(*activity_cursor) {
+        for record in activity {
+            *activity_cursor = record.id;
+            if let Ok(id) = u64::try_from(record.id) {
+                let (level, step, message) = present_activity(&record.message);
+                state.publish(LiveDelta::WorkflowActivity(WorkflowActivity {
+                    id,
+                    workflow_id: ProtocolWorkflowId(record.workflow_id.to_string()),
+                    occurred_at_ms: record.created_at,
+                    level,
+                    step,
+                    message,
+                }));
+            }
+        }
+    }
+}
+
+fn operation_status(status: ManagedOperationStatus) -> OperationStatus {
+    match status {
+        ManagedOperationStatus::Prepared => OperationStatus::Pending,
+        ManagedOperationStatus::Submitted
+        | ManagedOperationStatus::Accepted
+        | ManagedOperationStatus::InProgress
+        | ManagedOperationStatus::AwaitingEvidence => OperationStatus::Running,
+        ManagedOperationStatus::Completed => OperationStatus::Succeeded,
+        ManagedOperationStatus::ReconciliationRequired | ManagedOperationStatus::Ambiguous => {
+            OperationStatus::Ambiguous
+        }
+        ManagedOperationStatus::Cancelled
+        | ManagedOperationStatus::Rejected
+        | ManagedOperationStatus::Failed => OperationStatus::Failed,
+        _ => OperationStatus::Ambiguous,
+    }
+}
+
+async fn websocket(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+    ws.on_upgrade(move |socket| live_connection(socket, state))
+}
+
+async fn live_connection(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut updates = state.live.subscribe();
+    let Ok(initial) = state.resnapshot_message() else {
+        return;
+    };
+    if send_live(&mut socket, initial).await.is_err() {
+        return;
+    }
+
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.tick().await;
+    let mut last_pong = Instant::now();
+    loop {
+        tokio::select! {
+            update = updates.recv() => match update {
+                Ok(update) => if send_live(&mut socket, update).await.is_err() { break; },
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if let Ok(message) = state.resnapshot_message() {
+                        let _ = send_live(&mut socket, message).await;
+                    }
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            _ = heartbeat.tick() => {
+                if last_pong.elapsed() > HEARTBEAT_TIMEOUT
+                    || socket.send(Message::Ping(Default::default())).await.is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_live(socket: &mut WebSocket, message: LiveMessage) -> Result<(), ()> {
+    let text = serde_json::to_string(&message).map_err(|_| ())?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Versioned<DaemonHealth>> {
@@ -186,10 +388,7 @@ async fn snapshot(
         .collect();
     let status = state.client().status();
     Ok(Json(Versioned::current(RuntimeSnapshot {
-        metadata: SnapshotMetadata {
-            revision,
-            generated_at_ms: now_millis()?,
-        },
+        metadata: state.snapshot_metadata()?,
         sync: RuntimeSyncStatus {
             phase: sync_phase(&status),
             revision,
@@ -922,13 +1121,17 @@ mod tests {
         body::Body,
         http::{Request, header},
     };
+    use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use replicant_client::StartupPolicy;
+    use replicant_protocol::{Notification, NotificationLevel};
+    use replicant_workflow::{NewWorkflow, WorkflowKind};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     use super::*;
 
-    async fn test_app() -> (Router, Client) {
+    async fn test_app() -> (Router, Client, Arc<AppState>) {
         let client = Client::builder()
             .in_memory()
             .startup_policy(StartupPolicy::RestoreOnly)
@@ -938,7 +1141,28 @@ mod tests {
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
         let state = AppState::new(client.clone(), RuntimeConfig::new("test"), repository)
             .expect("app state");
-        (router(state), client)
+        (router(state.clone()), client, state)
+    }
+
+    async fn next_live(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> LiveMessage {
+        loop {
+            match socket
+                .next()
+                .await
+                .expect("websocket message")
+                .expect("websocket frame")
+            {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    return serde_json::from_str(&text).expect("live message");
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
+                frame => panic!("unexpected websocket frame: {frame:?}"),
+            }
+        }
     }
 
     async fn json(response: Response) -> Value {
@@ -953,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
-        let (app, client) = test_app().await;
+        let (app, client, _) = test_app().await;
         for path in ["/api/health", "/api/snapshot", "/api/descriptors"] {
             let response = app
                 .clone()
@@ -973,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_routes_create_list_pause_and_report_stable_errors() {
-        let (app, client) = test_app().await;
+        let (app, client, _) = test_app().await;
         let body = serde_json::json!({
             "kind": "relay.expansion",
             "parameters": {
@@ -1070,6 +1294,98 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json(response).await["payload"]["code"], "invalid_request");
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn websocket_connects_delivers_updates_and_resnapshots_on_reconnect() {
+        let (app, client, state) = test_app().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        let url = format!("ws://{address}/ws");
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect websocket");
+        let initial = next_live(&mut socket).await;
+        assert!(matches!(initial.delta, LiveDelta::Snapshot(_)));
+
+        state.notify(Notification {
+            id: EntityId("test-notification".into()),
+            level: NotificationLevel::Info,
+            title: "Test".into(),
+            message: "runtime changed".into(),
+            created_at_ms: 1,
+        });
+        let update = next_live(&mut socket).await;
+        assert!(matches!(update.delta, LiveDelta::Notification(_)));
+        assert!(update.revision > initial.revision);
+        drop(socket);
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("reconnect websocket");
+        let resnapshot = next_live(&mut socket).await;
+        assert!(matches!(resnapshot.delta, LiveDelta::Snapshot(_)));
+        assert_eq!(resnapshot.revision, update.revision);
+
+        server.abort();
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn slow_client_is_told_to_resnapshot() {
+        let (_, client, state) = test_app().await;
+        let mut updates = state.live.subscribe();
+        for _ in 0..=LIVE_BUFFER {
+            state.publish(LiveDelta::DomainInvalidated {
+                slice: DomainSlice::Universe,
+            });
+        }
+        assert!(matches!(
+            updates.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        let message = match state.resnapshot_message() {
+            Ok(message) => message,
+            Err(_) => panic!("resnapshot failed"),
+        };
+        assert!(matches!(message.delta, LiveDelta::Snapshot(_)));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn workflow_lifecycle_and_activity_are_published() {
+        let (_, client, state) = test_app().await;
+        let mut updates = state.live.subscribe();
+        let workflow = state
+            .repository
+            .create(NewWorkflow {
+                kind: WorkflowKind::new("test.workflow").expect("kind"),
+                schema_version: 1,
+                config: (),
+                checkpoint: (),
+                current_step: Some("start".into()),
+                parent_id: None,
+            })
+            .expect("create workflow");
+        state
+            .repository
+            .append_activity(workflow.id, "started")
+            .expect("append activity");
+        publish_workflow_updates(&state, &mut BTreeMap::new(), &mut 0);
+
+        assert!(matches!(
+            updates.recv().await.expect("workflow update").delta,
+            LiveDelta::WorkflowCreated(_)
+        ));
+        assert!(matches!(
+            updates.recv().await.expect("activity update").delta,
+            LiveDelta::WorkflowActivity(_)
+        ));
         client.close().await.expect("close client");
     }
 
