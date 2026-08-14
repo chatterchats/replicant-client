@@ -1,6 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
 
-import { useDaemonConnection, useDaemonHealth } from "./daemon";
+import {
+  useActivity,
+  useDaemonConnection,
+  useDaemonHealth,
+  useDaemonState,
+  useEntities,
+  useNotifications,
+  useWorkflows,
+} from "./daemon";
+import type { EntityKind, WorkflowStatus } from "./protocol";
+import {
+  initialShellState,
+  shellReducer,
+  type SelectedEntity,
+} from "./shellState";
 
 const navigation = [
   ["Operations", ["Overview", "Galaxy", "System"]],
@@ -14,27 +28,92 @@ const navigation = [
 ] as const;
 
 const commands = [...navigation.flatMap(([, items]) => items), "Settings"];
+const activeWorkflowStatuses: WorkflowStatus[] = [
+  "queued",
+  "running",
+  "waiting",
+  "paused",
+  "reconciling",
+];
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function textField(value: unknown, ...fields: string[]): string | null {
+  const record = asRecord(value);
+  for (const field of fields) {
+    if (typeof record?.[field] === "string") return record[field];
+  }
+  return null;
+}
+
+function Inspector({
+  entity,
+  value,
+  onClose,
+  onClear,
+}: {
+  entity: SelectedEntity;
+  value: unknown;
+  onClose: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <aside className="inspector" aria-label="Selected entity inspector">
+      <header className="drawer-header">
+        <div>
+          <small>{entity.kind}</small>
+          <strong>{entity.id}</strong>
+        </div>
+        <button aria-label="Close inspector" onClick={onClose}>
+          ×
+        </button>
+      </header>
+      <div className="inspector-body">
+        {value === undefined ? (
+          <p>This entity is not present in the current daemon projection.</p>
+        ) : (
+          <pre>{JSON.stringify(value, null, 2)}</pre>
+        )}
+      </div>
+      <button className="clear-selection" onClick={onClear}>
+        Clear selection
+      </button>
+    </aside>
+  );
+}
 
 export function App() {
-  const [selected, setSelected] = useState("Overview");
-  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shell, dispatch] = useReducer(shellReducer, initialShellState);
   const [query, setQuery] = useState("");
+  const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
+  const entities = useEntities();
+  const workflows = useWorkflows();
+  const activity = useActivity();
+  const notifications = useNotifications();
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPaletteOpen((open) => !open);
+        dispatch({ type: "set_palette", open: !shell.paletteOpen });
       }
-      if (event.key === "Escape") setPaletteOpen(false);
+      if (event.key === "Escape") {
+        if (shell.paletteOpen) dispatch({ type: "set_palette", open: false });
+        else if (shell.inspectorOpen) dispatch({ type: "toggle_inspector" });
+        else if (shell.activityOpen) dispatch({ type: "toggle_activity" });
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, []);
+  }, [shell.activityOpen, shell.inspectorOpen, shell.paletteOpen]);
 
   const matches = useMemo(
     () =>
@@ -43,15 +122,55 @@ export function App() {
       ),
     [query],
   );
-
-  const navigate = (destination: string) => {
-    setSelected(destination);
-    setPaletteOpen(false);
-    setQuery("");
-  };
-
+  const entityList = useMemo(
+    () =>
+      Object.keys(entities).map((key) => {
+        const separator = key.indexOf(":");
+        return {
+          kind: key.slice(0, separator) as EntityKind,
+          id: key.slice(separator + 1),
+        };
+      }),
+    [entities],
+  );
+  const currentReplicant = entityList.find(
+    (entity) => entity.kind === "replicant",
+  );
+  const currentReplicantValue = currentReplicant
+    ? entities[`replicant:${currentReplicant.id}`]
+    : undefined;
+  const location = textField(
+    currentReplicantValue,
+    "location",
+    "location_code",
+    "system",
+    "system_code",
+  );
+  const activeWorkflows = workflows.filter((workflow) =>
+    activeWorkflowStatuses.includes(workflow.status),
+  );
+  const warnings = notifications.filter(
+    (notification) => notification.level !== "info",
+  );
   const status =
     connection === "connected" ? (health?.status ?? "healthy") : connection;
+  const selectedValue = shell.selectedEntity
+    ? shell.selectedEntity.kind === "workflow"
+      ? daemon.workflows[shell.selectedEntity.id]
+      : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
+    : undefined;
+  const group =
+    navigation.find(([, items]) =>
+      (items as readonly string[]).includes(shell.page),
+    )?.[0] ?? "Settings";
+
+  const navigate = (destination: string) => {
+    dispatch({ type: "navigate", page: destination });
+    setQuery("");
+  };
+  const select = (entity: SelectedEntity) => {
+    dispatch({ type: "select", entity });
+  };
 
   return (
     <div className="app-shell">
@@ -64,12 +183,12 @@ export function App() {
           </span>
         </header>
         <nav aria-label="Primary navigation">
-          {navigation.map(([group, items]) => (
-            <section key={group}>
-              <h2>{group}</h2>
+          {navigation.map(([navGroup, items]) => (
+            <section key={navGroup}>
+              <h2>{navGroup}</h2>
               {items.map((item) => (
                 <button
-                  className={selected === item ? "active" : ""}
+                  className={shell.page === item ? "active" : ""}
                   key={item}
                   onClick={() => {
                     navigate(item);
@@ -82,7 +201,7 @@ export function App() {
           ))}
         </nav>
         <button
-          className={selected === "Settings" ? "active settings" : "settings"}
+          className={shell.page === "Settings" ? "active settings" : "settings"}
           onClick={() => {
             navigate("Settings");
           }}
@@ -93,49 +212,175 @@ export function App() {
 
       <main>
         <header className="status-bar">
-          <span className={`status-dot ${status}`} aria-hidden="true" />
-          <span>replicantd: {status}</span>
-          {health ? <small>v{health.daemon_version}</small> : null}
-          {revision === null ? null : <small>revision {revision}</small>}
+          <button
+            className="status-item identity"
+            disabled={!currentReplicant}
+            onClick={() => {
+              if (currentReplicant) select(currentReplicant);
+            }}
+          >
+            <small>Replicant</small>
+            <strong>{currentReplicant?.id ?? "Not selected"}</strong>
+          </button>
+          <span className="status-item">
+            <small>Location / system</small>
+            <strong>{location ?? "Unknown"}</strong>
+          </span>
+          <span className="status-item sync-status">
+            <small>Daemon / managed sync</small>
+            <strong>
+              <span className={`status-dot ${status}`} aria-hidden="true" />
+              {status} · {daemon.sync?.phase ?? (syncing ? "syncing" : "ready")}
+            </strong>
+          </span>
+          <button
+            className="status-item"
+            onClick={() => {
+              navigate("Automations");
+            }}
+          >
+            <small>Active workflows</small>
+            <strong>{activeWorkflows.length}</strong>
+          </button>
+          <span className={`status-item ${warnings.length ? "warning" : ""}`}>
+            <small>Warnings</small>
+            <strong>{warnings.length}</strong>
+          </span>
           <button
             className="palette-trigger"
             onClick={() => {
-              setPaletteOpen(true);
+              dispatch({ type: "set_palette", open: true });
             }}
           >
             Commands <kbd>⌘K</kbd>
           </button>
         </header>
-        <article className="page">
-          <p className="eyebrow">Operations</p>
-          <h1>{selected}</h1>
-          <p className="lede">
-            The web application shell is ready. Live state and commands will
-            come from the local daemon protocol.
-          </p>
-          <section className="connection-card">
-            <span className={`status-dot ${status}`} aria-hidden="true" />
-            <div>
-              <strong>Daemon connection</strong>
-              <p>
-                {health?.detail ??
-                  (connection === "offline"
-                    ? "Start replicantd to connect."
-                    : syncing
-                      ? "Synchronizing daemon state…"
-                      : "Daemon state is current.")}
+
+        <div className="workspace">
+          <div className="content-column">
+            <article className="page">
+              <p className="eyebrow">{group}</p>
+              <h1>{shell.page}</h1>
+              <p className="lede">
+                Live application state is synchronized through the local daemon.
               </p>
+              <section className="connection-card">
+                <span className={`status-dot ${status}`} aria-hidden="true" />
+                <div>
+                  <strong>Daemon connection</strong>
+                  <p>
+                    {health?.detail ??
+                      (connection === "offline"
+                        ? "Start replicantd to connect."
+                        : syncing
+                          ? "Synchronizing daemon state…"
+                          : "Daemon state is current.")}
+                  </p>
+                  {revision === null ? null : (
+                    <small>Revision {revision}</small>
+                  )}
+                </div>
+              </section>
+
+              {entityList.length || workflows.length ? (
+                <section className="entity-list" aria-label="Live entities">
+                  <h2>Live entities</h2>
+                  <div>
+                    {entityList.map((entity) => (
+                      <button
+                        key={`${entity.kind}:${entity.id}`}
+                        onClick={() => {
+                          select(entity);
+                        }}
+                      >
+                        <small>{entity.kind}</small>
+                        {entity.id}
+                      </button>
+                    ))}
+                    {workflows.map((workflow) => (
+                      <button
+                        key={workflow.id}
+                        onClick={() => {
+                          select({ kind: "workflow", id: workflow.id });
+                        }}
+                      >
+                        <small>workflow · {workflow.status}</small>
+                        {workflow.kind}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+            </article>
+          </div>
+
+          {shell.inspectorOpen && shell.selectedEntity ? (
+            <Inspector
+              entity={shell.selectedEntity}
+              value={selectedValue}
+              onClose={() => {
+                dispatch({ type: "toggle_inspector" });
+              }}
+              onClear={() => {
+                dispatch({ type: "clear_selection" });
+              }}
+            />
+          ) : null}
+        </div>
+
+        <section
+          className={`activity-drawer ${shell.activityOpen ? "open" : ""}`}
+          aria-label="Workflow activity"
+        >
+          <button
+            className="activity-toggle"
+            aria-expanded={shell.activityOpen}
+            onClick={() => {
+              dispatch({ type: "toggle_activity" });
+            }}
+          >
+            <span>Activity</span>
+            <span>{activity.length} updates</span>
+            <span aria-hidden="true">{shell.activityOpen ? "⌄" : "⌃"}</span>
+          </button>
+          {shell.activityOpen ? (
+            <div className="activity-list">
+              {activity.length ? (
+                activity
+                  .slice()
+                  .reverse()
+                  .map((item) => (
+                    <button
+                      className={`activity-item ${item.level}`}
+                      key={item.id}
+                      onClick={() => {
+                        select({ kind: "workflow", id: item.workflow_id });
+                      }}
+                    >
+                      <time
+                        dateTime={new Date(item.occurred_at_ms).toISOString()}
+                      >
+                        {new Date(item.occurred_at_ms).toLocaleTimeString()}
+                      </time>
+                      <strong>{item.workflow_id}</strong>
+                      <span>{item.step ?? item.level}</span>
+                      <p>{item.message}</p>
+                    </button>
+                  ))
+              ) : (
+                <p className="empty-state">No workflow activity yet.</p>
+              )}
             </div>
-          </section>
-        </article>
+          ) : null}
+        </section>
       </main>
 
-      {paletteOpen ? (
+      {shell.paletteOpen ? (
         <div
           className="palette-backdrop"
           role="presentation"
           onMouseDown={() => {
-            setPaletteOpen(false);
+            dispatch({ type: "set_palette", open: false });
           }}
         >
           <section
