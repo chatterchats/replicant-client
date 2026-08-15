@@ -212,46 +212,67 @@ export function filterAndSortDevices(
   descending = false,
 ): DeviceSummary[] {
   const search = filters.search.trim().toLowerCase();
-  return devices
-    .filter((device) => {
-      const matchesSearch = [
-        device.entity.id,
-        device.device_type,
-        device.status,
-        device.owner,
-        device.owner_name,
-        device.system,
-        device.location,
-        ...device.tags,
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(search);
-      return (
-        matchesSearch &&
-        (!filters.status ||
-          normalizedDeviceStatus(device.status) === filters.status) &&
-        (!filters.type || device.device_type === filters.type) &&
-        (!filters.system || device.system === filters.system) &&
-        (!filters.owner || device.owner === filters.owner)
-      );
-    })
-    .sort((left, right) => {
-      const a = deviceValue(left, sort);
-      const b = deviceValue(right, sort);
-      let order =
-        typeof a === "number" && typeof b === "number"
-          ? a - b
-          : String(a).localeCompare(String(b), undefined, { numeric: true });
-      if (order === 0 && sort === "type")
-        order = (left.system ?? "").localeCompare(right.system ?? "");
-      if (order === 0)
-        order = left.entity.id.localeCompare(right.entity.id, undefined, {
-          numeric: true,
-        });
-      return descending ? -order : order;
-    });
+  const filtered = devices.filter((device) => {
+    const matchesSearch = [
+      device.entity.id,
+      device.device_type,
+      device.status,
+      device.owner,
+      device.owner_name,
+      device.system,
+      device.location,
+      ...device.tags,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(search);
+    return (
+      matchesSearch &&
+      (!filters.status ||
+        normalizedDeviceStatus(device.status) === filters.status) &&
+      (!filters.type || device.device_type === filters.type) &&
+      (!filters.system || device.system === filters.system) &&
+      (!filters.owner || device.owner === filters.owner)
+    );
+  });
+  const codes = new Set(filtered.map((device) => device.entity.id));
+  const parents = new Set<string>();
+  for (const device of filtered) {
+    for (const parent of [
+      device.stowed_in,
+      device.attached_to,
+      device.controller,
+    ])
+      if (parent && codes.has(parent)) parents.add(parent);
+    if (
+      [
+        ...device.stowed_devices,
+        ...device.attached_devices,
+        ...device.controlled_devices,
+      ].some((child) => codes.has(child))
+    )
+      parents.add(device.entity.id);
+  }
+  return filtered.sort((left, right) => {
+    const parentOrder =
+      Number(parents.has(right.entity.id)) -
+      Number(parents.has(left.entity.id));
+    if (parentOrder !== 0) return parentOrder;
+    const a = deviceValue(left, sort);
+    const b = deviceValue(right, sort);
+    let order =
+      typeof a === "number" && typeof b === "number"
+        ? a - b
+        : String(a).localeCompare(String(b), undefined, { numeric: true });
+    if (order === 0 && sort === "type")
+      order = (left.system ?? "").localeCompare(right.system ?? "");
+    if (order === 0)
+      order = left.entity.id.localeCompare(right.entity.id, undefined, {
+        numeric: true,
+      });
+    return descending ? -order : order;
+  });
 }
 
 function deviceParent(

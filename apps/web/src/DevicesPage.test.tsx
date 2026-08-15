@@ -113,13 +113,19 @@ describe("device fleet browser", () => {
     const laterSystem = device("MINER-B", {
       device_type: "mining_drone",
       system: "VEGA",
+      controlled_devices: ["MINER-C"],
+    });
+    const controlledMiner = device("MINER-C", {
+      device_type: "mining_drone",
+      system: "VEGA",
+      controller: "MINER-B",
     });
     const earlierSystem = device("MINER-A", {
       device_type: "mining_drone",
       system: "ALPHA",
     });
     const ordered = filterAndSortDevices(
-      [laterSystem, relay, drone, vessel, earlierSystem],
+      [earlierSystem, relay, drone, controlledMiner, vessel, laterSystem],
       filters,
       "type",
     );
@@ -142,8 +148,9 @@ describe("device fleet browser", () => {
       ["DRONE", 1, "controlled"],
     ]);
     expect(groups.at(1)?.rows.map((row) => row.device.entity.id)).toEqual([
-      "MINER-A",
       "MINER-B",
+      "MINER-C",
+      "MINER-A",
     ]);
     const vesselRows = groups.at(0)?.rows ?? [];
     expect(
