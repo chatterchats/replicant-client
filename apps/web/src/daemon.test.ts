@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { daemonReducer, initialDaemonState, retryDelay } from "./daemon";
+import {
+  daemonReducer,
+  initialDaemonState,
+  retryDelay,
+  socketUrl,
+} from "./daemon";
 import type { DaemonHealth, LiveMessage, RuntimeSnapshot } from "./protocol";
 
 const health: DaemonHealth = {
@@ -143,5 +148,11 @@ describe("daemonReducer", () => {
     expect(reconnecting.connection).toBe("reconnecting");
     expect(retryDelay(0)).toBe(500);
     expect(retryDelay(100)).toBe(10_000);
+  });
+
+  it("connects a packaged desktop UI to the loopback daemon", () => {
+    expect(
+      socketUrl({ href: "tauri://localhost/" }, "http://127.0.0.1:8080"),
+    ).toBe("ws://127.0.0.1:8080/ws");
   });
 });

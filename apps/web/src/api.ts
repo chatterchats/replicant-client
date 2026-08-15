@@ -15,8 +15,17 @@ import {
 } from "./protocol";
 import type { AutomationControlAction, TriggerRequest } from "./protocol";
 
+export function daemonUrl(path: string, origin?: string): string {
+  const configuredOrigin = (
+    import.meta as unknown as {
+      env: { VITE_REPLICANT_DAEMON_ORIGIN?: string };
+    }
+  ).env.VITE_REPLICANT_DAEMON_ORIGIN;
+  return `${(origin ?? configuredOrigin)?.replace(/\/+$/, "") ?? ""}${path}`;
+}
+
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
-  const response = await fetch(path, { signal });
+  const response = await fetch(daemonUrl(path), { signal });
   if (!response.ok)
     throw new Error(`replicantd returned ${String(response.status)}`);
   return response.json() as Promise<unknown>;
@@ -31,7 +40,7 @@ async function send(
   path: string,
   body?: unknown,
 ): Promise<unknown> {
-  const response = await fetch(path, {
+  const response = await fetch(daemonUrl(path), {
     method,
     headers:
       body === undefined ? undefined : { "Content-Type": "application/json" },

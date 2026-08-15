@@ -12,6 +12,7 @@ members = [
   "crates/replicant-server",
   "crates/replicant-workflow",
   "crates/replicant-cli",
+  "apps/desktop/src-tauri",
 ]
 resolver = "3"
 

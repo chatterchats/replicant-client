@@ -44,3 +44,10 @@ apps/web/*.tsbuildinfo
 !apps/web/package.json
 !apps/web/package-lock.json
 !apps/web/tsconfig.json
+!apps/desktop/package.json
+!apps/desktop/package-lock.json
+!apps/desktop/src-tauri/tauri.conf.json
+!apps/desktop/src-tauri/capabilities/*.json
+apps/desktop/node_modules/
+apps/desktop/src-tauri/binaries/replicantd-*
+apps/desktop/src-tauri/icons/

@@ -62,6 +62,7 @@ use replicant_workflow::{
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, watch};
+use tower_http::cors::CorsLayer;
 
 const LIVE_BUFFER: usize = 32;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -215,6 +216,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/workflows/{id}/pause", post(pause_workflow))
         .route("/api/workflows/{id}/resume", post(resume_workflow))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow))
+        .layer(
+            CorsLayer::new()
+                .allow_origin([
+                    "tauri://localhost".parse().expect("valid Tauri origin"),
+                    "http://tauri.localhost"
+                        .parse()
+                        .expect("valid Tauri origin"),
+                ])
+                .allow_private_network(true)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::DELETE,
+                ])
+                .allow_headers([axum::http::header::CONTENT_TYPE]),
+        )
         .with_state(state)
 }
 
@@ -2096,6 +2114,35 @@ mod tests {
             );
             assert!(!value.to_string().contains("token"));
         }
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn desktop_origin_can_reach_the_loopback_api() {
+        let (app, client, _) = test_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/health")
+                    .header(header::ORIGIN, "tauri://localhost")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header("access-control-request-private-network", "true")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"tauri://localhost".parse().expect("header value"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network"),
+            Some(&"true".parse().expect("header value"))
+        );
         client.close().await.expect("close client");
     }
 

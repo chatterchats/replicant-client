@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Render the Replicant UI without exposing shell access to JavaScript.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -5,10 +5,11 @@ NPM ?= npm
 WASM_PACK ?= wasm-pack
 DOCKER_COMPOSE ?= docker compose
 WEB_DIR := apps/web
+DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip
 
 help:
 	@printf '%s\n' \
@@ -19,6 +20,10 @@ help:
 	  'fmt                    		Format Rust and frontend sources' \
 	  'fmt-check              		Verify Rust and frontend formatting' \
 	  'web-check              		Run frontend format, lint, test, and build checks' \
+	  'desktop-check          		Compile and smoke-test desktop packaging' \
+	  'desktop-sidecar        		Build the release replicantd sidecar' \
+	  'desktop-dev            		Run the desktop development shell' \
+	  'desktop-build          		Build native desktop release packages' \
 	  'lint                   		Run Clippy with warnings denied' \
 	  'test                   		Run tests with all features enabled' \
 	  'doc                    		Build docs with warnings denied' \
@@ -47,10 +52,12 @@ build-workspace:
 fmt:
 	$(CARGO) fmt --all
 	$(MAKE) web-fmt
+	$(MAKE) desktop-fmt
 
 fmt-check:
 	$(CARGO) fmt --all -- --check
 	$(MAKE) web-fmt-check
+	$(MAKE) desktop-fmt-check
 
 galaxy-wasm:
 	$(WASM_PACK) build $(GALAXY_RENDERER_DIR) --target web --out-dir $(GALAXY_WASM_OUT) --release --locked
@@ -63,6 +70,32 @@ web-fmt-check:
 
 web-check:
 	$(NPM) --prefix $(WEB_DIR) run check
+
+desktop-fmt:
+	$(NPM) --prefix $(WEB_DIR) exec -- prettier --write \
+	  "apps/desktop/package.json" "apps/desktop/README.md" "apps/desktop/scripts/*.mjs" \
+	  "apps/desktop/src-tauri/tauri.conf.json" "apps/desktop/src-tauri/capabilities/*.json"
+
+desktop-fmt-check:
+	$(NPM) --prefix $(WEB_DIR) exec -- prettier --check \
+	  "apps/desktop/package.json" "apps/desktop/README.md" "apps/desktop/scripts/*.mjs" \
+	  "apps/desktop/src-tauri/tauri.conf.json" "apps/desktop/src-tauri/capabilities/*.json"
+
+desktop-prepare:
+	node $(DESKTOP_DIR)/scripts/prepare-sidecar.mjs
+
+desktop-check: desktop-prepare
+	$(CARGO) check -p replicant-desktop --all-targets
+	$(NPM) --prefix $(DESKTOP_DIR) run check
+
+desktop-sidecar:
+	node $(DESKTOP_DIR)/scripts/prepare-sidecar.mjs --release
+
+desktop-dev:
+	$(NPM) --prefix $(DESKTOP_DIR) run dev
+
+desktop-build:
+	$(NPM) --prefix $(DESKTOP_DIR) run build
 
 lint:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
@@ -85,7 +118,7 @@ policy-checks: contract-policy-check
 	$(PYTHON) scripts/schema_policy_check.py
 	$(PYTHON) scripts/authority_matrix_check.py
 
-ci: fmt-check lint test check-all doc policy-checks web-check
+ci: desktop-prepare fmt-check lint test check-all doc policy-checks web-check desktop-check
 
 docker-build:
 	$(DOCKER_COMPOSE) build

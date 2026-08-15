@@ -240,6 +240,10 @@ python3 scripts/contract_policy_check.py
 
 `make ci` runs the complete repository gate.
 
+The optional Tauri shell packages the same web application and a loopback-only
+`replicantd` sidecar without changing the daemon, CLI, web development, or
+Docker deployment paths. See [`apps/desktop/README.md`](apps/desktop/README.md).
+
 ## Container deployment
 
 The production Docker and Docker Compose deployment is documented in

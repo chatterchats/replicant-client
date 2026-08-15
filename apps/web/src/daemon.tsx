@@ -8,7 +8,7 @@ import {
   useRef,
 } from "react";
 
-import { daemonApi } from "./api";
+import { daemonApi, daemonUrl } from "./api";
 import {
   type AutomationStatus,
   type DaemonHealth,
@@ -221,9 +221,13 @@ export function retryDelay(attempt: number): number {
 
 const DaemonContext = createContext<DaemonState | null>(null);
 
-function socketUrl() {
-  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}/ws`;
+export function socketUrl(
+  location: Pick<Location, "href"> = window.location,
+  daemonOrigin?: string,
+) {
+  const url = new URL(daemonUrl("/ws", daemonOrigin), location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.href;
 }
 
 export function DaemonProvider({ children }: { children: ReactNode }) {
