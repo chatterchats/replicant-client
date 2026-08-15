@@ -187,6 +187,77 @@ pub struct EntityIndexSnapshot {
     pub entities: Vec<EntitySummary>,
 }
 
+/// Workflow ownership of an exclusively claimed device.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceClaim {
+    /// Workflow holding the claim.
+    pub workflow_id: WorkflowId,
+    /// Registered workflow kind.
+    pub workflow_kind: OperationKind,
+    /// Current workflow lifecycle state.
+    pub workflow_status: WorkflowStatus,
+}
+
+/// Frontend-safe operational view of one managed device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceSummary {
+    /// Stable device address.
+    pub entity: EntityRef,
+    /// Forward-compatible device type wire value.
+    pub device_type: Option<String>,
+    /// Forward-compatible device status wire value.
+    pub status: Option<String>,
+    /// Managed-state ownership scope.
+    pub ownership: String,
+    /// Assigned replicant code, when present.
+    pub owner: Option<String>,
+    /// Containing system, when known.
+    pub system: Option<String>,
+    /// Current location, when known.
+    pub location: Option<String>,
+    /// User-defined device tags.
+    pub tags: Vec<String>,
+    /// Parent attachment relationship.
+    pub attached_to: Option<String>,
+    /// Parent stow relationship.
+    pub stowed_in: Option<String>,
+    /// AMI controller relationship.
+    pub controller: Option<String>,
+    /// Configured linked device relationship.
+    pub linked_device: Option<String>,
+    /// Directly attached child devices.
+    pub attached_devices: Vec<String>,
+    /// Devices adopted by this controller.
+    pub controlled_devices: Vec<String>,
+    /// Devices carried in this device.
+    pub stowed_devices: Vec<String>,
+    /// Maximum attached-device count, when reported.
+    pub attach_capacity: Option<i64>,
+    /// Cargo/stow capacity, when reported.
+    pub cargo_capacity: Option<i64>,
+    /// Used cargo/stow capacity, when reported.
+    pub cargo_used: Option<i64>,
+    /// Normalized operational capacity in percentage points.
+    pub operational_capacity_percent: Option<f64>,
+    /// Active AMI directive wire value, when present.
+    pub active_directive: Option<String>,
+    /// Active AMI directive status, when present.
+    pub directive_status: Option<String>,
+    /// Final travel destination, when traveling.
+    pub travel_destination: Option<String>,
+    /// Exclusive runtime claim, when held.
+    pub claim: Option<DeviceClaim>,
+}
+
+/// Typed device fleet projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DevicesSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Stable device rows sorted by code.
+    pub devices: Vec<DeviceSummary>,
+}
+
 /// Three-dimensional galactic coordinates in light-years.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GalaxyPoint {
@@ -1371,6 +1442,40 @@ mod tests {
                 location: Some("EARTH".to_owned()),
                 entity_type: None,
                 status: Some("idle".to_owned()),
+            }],
+        }));
+        round_trip(&Versioned::current(DevicesSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1_765_000_000_000,
+            },
+            devices: vec![DeviceSummary {
+                entity: EntityRef {
+                    kind: EntityKind::Device,
+                    id: EntityId("D-1".to_owned()),
+                },
+                device_type: Some("future_device".to_owned()),
+                status: None,
+                ownership: "owned".to_owned(),
+                owner: None,
+                system: None,
+                location: None,
+                tags: Vec::new(),
+                attached_to: None,
+                stowed_in: None,
+                controller: None,
+                linked_device: None,
+                attached_devices: Vec::new(),
+                controlled_devices: Vec::new(),
+                stowed_devices: Vec::new(),
+                attach_capacity: None,
+                cargo_capacity: None,
+                cargo_used: None,
+                operational_capacity_percent: None,
+                active_directive: None,
+                directive_status: None,
+                travel_destination: None,
+                claim: None,
             }],
         }));
         round_trip(&Versioned::current(OverviewSnapshot {

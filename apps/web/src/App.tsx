@@ -18,11 +18,13 @@ import {
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
 import { OverviewPage } from "./OverviewPage";
+import { DevicesPage } from "./DevicesPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
+  DeviceSummary,
   EntitySummary,
   FiniteExecution,
   GalaxyStar,
@@ -77,6 +79,14 @@ function isEntitySummary(value: unknown): value is EntitySummary {
   return typeof record?.label === "string" && asRecord(record.entity) !== null;
 }
 
+function isDeviceSummary(value: unknown): value is DeviceSummary {
+  const record = asRecord(value);
+  return (
+    asRecord(record?.entity)?.kind === "device" &&
+    typeof record?.ownership === "string"
+  );
+}
+
 function Inspector({
   entity,
   value,
@@ -88,6 +98,7 @@ function Inspector({
   onClose: () => void;
   onClear: () => void;
 }) {
+  const device = isDeviceSummary(value) ? value : undefined;
   const summary = isEntitySummary(value) ? value : undefined;
   return (
     <aside className="inspector" aria-label="Selected entity inspector">
@@ -101,7 +112,112 @@ function Inspector({
         </button>
       </header>
       <div className="inspector-body">
-        {summary ? (
+        {device ? (
+          <dl>
+            <dt>Type</dt>
+            <dd>{device.device_type ?? "Unknown"}</dd>
+            <dt>Status</dt>
+            <dd>{device.status ?? "Unknown"}</dd>
+            <dt>Ownership</dt>
+            <dd>{device.owner ?? device.ownership}</dd>
+            {device.system && (
+              <>
+                <dt>System</dt>
+                <dd>{device.system}</dd>
+              </>
+            )}
+            {device.location && (
+              <>
+                <dt>Location</dt>
+                <dd>{device.location}</dd>
+              </>
+            )}
+            {device.tags.length > 0 && (
+              <>
+                <dt>Tags</dt>
+                <dd>{device.tags.join(", ")}</dd>
+              </>
+            )}
+            {(device.attached_to || device.stowed_in || device.controller) && (
+              <>
+                <dt>Relationship</dt>
+                <dd>
+                  {device.attached_to
+                    ? `Attached to ${device.attached_to}`
+                    : device.stowed_in
+                      ? `Stowed in ${device.stowed_in}`
+                      : `Controlled by ${device.controller ?? "—"}`}
+                </dd>
+              </>
+            )}
+            {device.controlled_devices.length > 0 && (
+              <>
+                <dt>Controlled devices</dt>
+                <dd>{device.controlled_devices.join(", ")}</dd>
+              </>
+            )}
+            {device.attached_devices.length > 0 && (
+              <>
+                <dt>Attached devices</dt>
+                <dd>{device.attached_devices.join(", ")}</dd>
+              </>
+            )}
+            {device.stowed_devices.length > 0 && (
+              <>
+                <dt>Stowed devices</dt>
+                <dd>{device.stowed_devices.join(", ")}</dd>
+              </>
+            )}
+            {device.operational_capacity_percent !== null && (
+              <>
+                <dt>Operational</dt>
+                <dd>{device.operational_capacity_percent.toFixed(0)}%</dd>
+              </>
+            )}
+            {device.cargo_capacity !== null && (
+              <>
+                <dt>Cargo</dt>
+                <dd>
+                  {device.cargo_used ?? 0} / {device.cargo_capacity}
+                </dd>
+              </>
+            )}
+            {device.attach_capacity !== null && (
+              <>
+                <dt>Attach capacity</dt>
+                <dd>{device.attach_capacity}</dd>
+              </>
+            )}
+            {device.active_directive && (
+              <>
+                <dt>Directive</dt>
+                <dd>
+                  {device.active_directive}
+                  {device.directive_status
+                    ? ` · ${device.directive_status}`
+                    : ""}
+                </dd>
+              </>
+            )}
+            {device.travel_destination && (
+              <>
+                <dt>Traveling to</dt>
+                <dd>{device.travel_destination}</dd>
+              </>
+            )}
+            {device.claim && (
+              <>
+                <dt>Workflow claim</dt>
+                <dd>
+                  {device.claim.workflow_kind}
+                  <small>
+                    {device.claim.workflow_id} · {device.claim.workflow_status}
+                  </small>
+                </dd>
+              </>
+            )}
+          </dl>
+        ) : summary ? (
           <dl>
             {summary.secondary_label && (
               <>
@@ -153,6 +269,7 @@ export function App() {
   const [selectedSystem, setSelectedSystem] = useState<string>();
   const [selectedSystemMarker, setSelectedSystemMarker] =
     useState<SystemMarker>();
+  const [selectedDevice, setSelectedDevice] = useState<DeviceSummary>();
   const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
   const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
     useState<string>();
@@ -218,13 +335,18 @@ export function App() {
   const selectedValue = shell.selectedEntity
     ? shell.selectedEntity.kind === "workflow"
       ? daemon.workflows[shell.selectedEntity.id]
-      : shell.selectedEntity.kind === "system" &&
-          selectedGalaxyStar?.id === shell.selectedEntity.id
-        ? selectedGalaxyStar
-        : selectedSystemMarker?.entity.kind === shell.selectedEntity.kind &&
-            selectedSystemMarker.entity.id === shell.selectedEntity.id
-          ? selectedSystemMarker
-          : entities[`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`]
+      : shell.selectedEntity.kind === "device" &&
+          selectedDevice?.entity.id === shell.selectedEntity.id
+        ? selectedDevice
+        : shell.selectedEntity.kind === "system" &&
+            selectedGalaxyStar?.id === shell.selectedEntity.id
+          ? selectedGalaxyStar
+          : selectedSystemMarker?.entity.kind === shell.selectedEntity.kind &&
+              selectedSystemMarker.entity.id === shell.selectedEntity.id
+            ? selectedSystemMarker
+            : entities[
+                `${shell.selectedEntity.kind}:${shell.selectedEntity.id}`
+              ]
     : undefined;
   const commandContext: CommandContext = {
     system:
@@ -262,6 +384,7 @@ export function App() {
     dispatch({ type: "navigate", page: destination });
   };
   const select = (entity: SelectedEntity) => {
+    if (entity.kind !== "device") setSelectedDevice(undefined);
     dispatch({ type: "select", entity });
   };
   const controlAutomation = (
@@ -434,6 +557,29 @@ export function App() {
                   setSelectedSystem(system);
                   select({ kind: "system", id: system });
                   navigate("System");
+                }}
+              />
+            ) : shell.page === "Devices" ? (
+              <DevicesPage
+                descriptors={descriptors}
+                onSelectDevice={(device) => {
+                  setSelectedDevice(device);
+                  select(device.entity);
+                }}
+                onSelectEntity={select}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  select({ kind: "workflow", id: workflowId });
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
                 }}
               />
             ) : shell.page === "Automations" ? (

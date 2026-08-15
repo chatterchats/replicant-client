@@ -1288,6 +1288,149 @@ h1 {
 .overview-state.error {
   color: #ef8a96;
 }
+
+.page-heading,
+.device-filters,
+.device-table td > small,
+.claim-link small {
+  display: flex;
+}
+
+.page-heading {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.device-filters {
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 24px 0 14px;
+}
+
+.device-filters label {
+  display: grid;
+  gap: 5px;
+  min-width: 120px;
+}
+
+.device-filters label > span,
+.table-summary {
+  color: #9fb6b2;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.device-filters input,
+.device-filters select {
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 5px;
+  background: #1a302c;
+  color: #eff8f6;
+  min-height: 34px;
+  padding: 6px 9px;
+}
+
+.device-search {
+  flex: 1 1 280px;
+}
+
+.device-table-wrap {
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  overflow: auto;
+}
+
+.device-table {
+  border-collapse: collapse;
+  min-width: 1050px;
+  width: 100%;
+}
+
+.device-table th {
+  background: #1a302c;
+  position: sticky;
+  text-align: left;
+  top: 0;
+  z-index: 1;
+}
+
+.device-table th,
+.device-table td {
+  border-bottom: 1px solid rgba(159, 188, 193, 0.16);
+  padding: 9px 11px;
+  vertical-align: top;
+}
+
+.device-table td > small,
+.claim-link small {
+  color: #9fb6b2;
+  margin-top: 3px;
+}
+
+.table-sort,
+.entity-link,
+.subtle-link,
+.claim-link,
+.row-actions button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.table-sort,
+.entity-link,
+.subtle-link,
+.claim-link {
+  cursor: pointer;
+}
+
+.entity-link,
+.claim-link {
+  color: #41d4c8;
+}
+
+.subtle-link {
+  color: #9fb6b2;
+  display: block;
+  font-size: 0.78rem;
+}
+
+.row-actions {
+  position: relative;
+}
+
+.row-actions summary {
+  cursor: pointer;
+}
+
+.row-actions div {
+  background: #1a302c;
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px #0008;
+  display: grid;
+  gap: 8px;
+  min-width: 190px;
+  padding: 10px;
+  position: absolute;
+  right: 0;
+  z-index: 3;
+}
+
+.row-actions button:hover,
+.entity-link:hover,
+.claim-link:hover {
+  text-decoration: underline;
+}
+
+.inline-warning {
+  color: #f3b14f;
+}
 .attention-list .warning strong {
   color: #f3b14f;
 }

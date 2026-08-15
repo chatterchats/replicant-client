@@ -109,6 +109,43 @@ export interface OverviewSnapshot {
   recent_activity: WorkflowActivity[];
 }
 
+export interface DeviceClaim {
+  workflow_id: string;
+  workflow_kind: string;
+  workflow_status: WorkflowStatus;
+}
+
+export interface DeviceSummary {
+  entity: EntityRef;
+  device_type: string | null;
+  status: string | null;
+  ownership: string;
+  owner: string | null;
+  system: string | null;
+  location: string | null;
+  tags: string[];
+  attached_to: string | null;
+  stowed_in: string | null;
+  controller: string | null;
+  linked_device: string | null;
+  attached_devices: string[];
+  controlled_devices: string[];
+  stowed_devices: string[];
+  attach_capacity: number | null;
+  cargo_capacity: number | null;
+  cargo_used: number | null;
+  operational_capacity_percent: number | null;
+  active_directive: string | null;
+  directive_status: string | null;
+  travel_destination: string | null;
+  claim: DeviceClaim | null;
+}
+
+export interface DevicesSnapshot {
+  metadata: SnapshotMetadata;
+  devices: DeviceSummary[];
+}
+
 export interface WorkflowSummary {
   id: string;
   kind: string;
@@ -487,6 +524,13 @@ function finiteNumber(value: unknown, name: string): number {
 function array(value: unknown, name: string): unknown[] {
   if (!Array.isArray(value)) throw new Error(`Invalid ${name}`);
   return value;
+}
+
+function stringArray(value: unknown, name: string): string[] {
+  const values = array(value, name);
+  if (!values.every((item) => typeof item === "string"))
+    throw new Error(`Invalid ${name}`);
+  return values;
 }
 
 const healthStatuses = ["healthy", "degraded", "unhealthy"] as const;
@@ -1037,6 +1081,94 @@ export function parseOverviewResponse(
       recent_activity: array(item.recent_activity, "recent activity").map(
         activity,
       ),
+    };
+  });
+}
+
+export function parseDevicesResponse(
+  value: unknown,
+): Versioned<DevicesSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "devices snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      devices: array(snapshot.devices, "devices").map((value) => {
+        const device = record(value, "device");
+        if (typeof device.ownership !== "string")
+          throw new Error("Invalid device ownership");
+        const claim =
+          device.claim === null
+            ? null
+            : (() => {
+                const item = record(device.claim, "device claim");
+                if (
+                  typeof item.workflow_id !== "string" ||
+                  typeof item.workflow_kind !== "string"
+                )
+                  throw new Error("Invalid device claim");
+                return {
+                  workflow_id: item.workflow_id,
+                  workflow_kind: item.workflow_kind,
+                  workflow_status: oneOf(
+                    item.workflow_status,
+                    workflowStatuses,
+                    "workflow status",
+                  ),
+                };
+              })();
+        return {
+          entity: entity(device.entity),
+          device_type: nullableString(device.device_type, "device type"),
+          status: nullableString(device.status, "device status"),
+          ownership: device.ownership,
+          owner: nullableString(device.owner, "device owner"),
+          system: nullableString(device.system, "device system"),
+          location: nullableString(device.location, "device location"),
+          tags: stringArray(device.tags, "device tags"),
+          attached_to: nullableString(device.attached_to, "attached device"),
+          stowed_in: nullableString(device.stowed_in, "stowed device"),
+          controller: nullableString(device.controller, "device controller"),
+          linked_device: nullableString(device.linked_device, "linked device"),
+          attached_devices: stringArray(
+            device.attached_devices,
+            "attached devices",
+          ),
+          controlled_devices: stringArray(
+            device.controlled_devices,
+            "controlled devices",
+          ),
+          stowed_devices: stringArray(device.stowed_devices, "stowed devices"),
+          attach_capacity:
+            device.attach_capacity === null
+              ? null
+              : number(device.attach_capacity, "attach capacity"),
+          cargo_capacity:
+            device.cargo_capacity === null
+              ? null
+              : number(device.cargo_capacity, "cargo capacity"),
+          cargo_used:
+            device.cargo_used === null
+              ? null
+              : number(device.cargo_used, "cargo used"),
+          operational_capacity_percent: optionalFiniteNumber(
+            device.operational_capacity_percent,
+            "operational capacity",
+          ),
+          active_directive: nullableString(
+            device.active_directive,
+            "active directive",
+          ),
+          directive_status: nullableString(
+            device.directive_status,
+            "directive status",
+          ),
+          travel_destination: nullableString(
+            device.travel_destination,
+            "travel destination",
+          ),
+          claim,
+        };
+      }),
     };
   });
 }

@@ -25,24 +25,25 @@ use axum::{
 };
 use replicant_client::{
     ClientDegradation, ClientStatus,
+    domain::Device,
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
     ActivityLevel, AutomationControlAction, AutomationControlRequest, AutomationControlResponse,
     AutomationStatus, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
-    DescriptorCatalog, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind, EntityRef,
-    EntitySummary, ErrorResponse, FiniteExecution as ProtocolFiniteExecution,
-    FiniteExecutionHistoryResponse, FiniteExecutionStatus as ProtocolFiniteExecutionStatus,
-    GalaxySceneSnapshot, HealthStatus, LiveDelta, LiveMessage, Notification, NotificationLevel,
-    OperationClass, OperationKind, OperationStatus, OperationUpdate, OverviewReplicant,
-    OverviewSnapshot, OverviewTravel, RequirementSummary, ResultSummary, RunOperationRequest,
-    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
-    StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
-    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
-    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
-    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
-    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
-    WorkflowStatusCount, WorkflowSummary,
+    DescriptorCatalog, DeviceClaim, DeviceSummary, DevicesSnapshot, DomainSlice, EntityId,
+    EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
+    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
+    LiveDelta, LiveMessage, Notification, NotificationLevel, OperationClass, OperationKind,
+    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
+    RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot,
+    RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase,
+    SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
+    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
+    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
+    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
+    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowStatusCount, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
@@ -198,6 +199,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
+        .route("/api/devices", get(devices))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -608,6 +610,9 @@ fn publish_workflow_updates(
                 state.publish(LiveDelta::DomainInvalidated {
                     slice: DomainSlice::Overview,
                 });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Devices,
+                });
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
                 }
@@ -920,6 +925,142 @@ fn build_overview_snapshot(
         attention_workflows,
         notifications,
         recent_activity,
+    }
+}
+
+async fn devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<DevicesSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let location_systems = state
+        .client()
+        .locations()
+        .find()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .into_iter()
+        .map(|location| (location.id().to_string(), location.system))
+        .collect::<BTreeMap<_, _>>();
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let mut claims = BTreeMap::new();
+    for workflow in &workflows {
+        for claim in state
+            .repository
+            .claims(workflow.id)
+            .map_err(ApiError::repository)?
+        {
+            if let ResourceKey::Device(code) = claim.resource {
+                let workflow = summary(workflow);
+                claims.insert(
+                    code,
+                    DeviceClaim {
+                        workflow_id: workflow.id,
+                        workflow_kind: workflow.kind,
+                        workflow_status: workflow.status,
+                    },
+                );
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for handle in state
+        .client()
+        .devices()
+        .find()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+    {
+        let device = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        rows.push(device_summary(
+            device,
+            &location_systems,
+            claims.remove(handle.id().as_str()),
+        ));
+    }
+    rows.sort_by(|left, right| left.entity.cmp(&right.entity));
+    Ok(Json(Versioned::current(DevicesSnapshot {
+        metadata,
+        devices: rows,
+    })))
+}
+
+fn device_summary(
+    device: Device,
+    location_systems: &BTreeMap<String, Option<String>>,
+    claim: Option<DeviceClaim>,
+) -> DeviceSummary {
+    let location = device.location.map(|value| value.id.to_string());
+    DeviceSummary {
+        entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
+        device_type: wire_value(device.device_type.as_ref()),
+        status: wire_value(device.status.as_ref()),
+        ownership: wire_value(Some(&device.access)).unwrap_or_else(|| "unknown".to_owned()),
+        owner: device
+            .relationships
+            .assigned_replicant
+            .map(|value| value.id.to_string()),
+        system: location
+            .as_ref()
+            .and_then(|value| location_systems.get(value).cloned().flatten()),
+        location,
+        tags: device.tags,
+        attached_to: device
+            .relationships
+            .attached_to
+            .map(|value| value.id.to_string()),
+        stowed_in: device
+            .relationships
+            .stowed_in
+            .map(|value| value.id.to_string()),
+        controller: device
+            .relationships
+            .controller
+            .map(|value| value.id.to_string()),
+        linked_device: device
+            .relationships
+            .linked_device
+            .map(|value| value.id.to_string()),
+        attached_devices: device
+            .relationships
+            .attached_devices
+            .into_iter()
+            .map(|value| value.id.to_string())
+            .collect(),
+        controlled_devices: device
+            .relationships
+            .controlled_devices
+            .into_iter()
+            .map(|value| value.id.to_string())
+            .collect(),
+        stowed_devices: device
+            .relationships
+            .stowed_devices
+            .into_iter()
+            .map(|value| value.id.to_string())
+            .collect(),
+        attach_capacity: device.attach_capacity,
+        cargo_capacity: device.stow_capacity,
+        cargo_used: device.stow_used,
+        operational_capacity_percent: device
+            .operational_capacity
+            .map(replicant_client::domain::OperationalCapacity::percent),
+        active_directive: device
+            .active_directive
+            .as_ref()
+            .and_then(|value| wire_value(value.directive.as_ref())),
+        directive_status: device.active_directive.and_then(|value| value.status),
+        travel_destination: device.travel.and_then(|value| {
+            value
+                .final_destination
+                .or(value.destination)
+                .map(|destination| destination.id.to_string())
+        }),
+        claim,
     }
 }
 
@@ -2473,6 +2614,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_projection_normalizes_unknown_and_optional_fields() {
+        use replicant_client::domain::{
+            AccessScope, DeviceKey, DeviceRelationships, DeviceType, LocationKey,
+            OperationalCapacity, ReplicantKey,
+        };
+
+        let device = Device {
+            key: DeviceKey::live("D-1".into()),
+            device_type: Some(DeviceType::from("future_device")),
+            status: None,
+            location: Some(LocationKey::live("EARTH".into())),
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: vec!["hauler".to_owned()],
+            relationships: DeviceRelationships {
+                assigned_replicant: Some(ReplicantKey::live("R-1".into())),
+                ..DeviceRelationships::default()
+            },
+            attach_capacity: None,
+            stow_capacity: Some(100),
+            stow_used: Some(25),
+            operational_capacity: OperationalCapacity::new(0.75),
+            active_directive: None,
+            travel: None,
+            access: AccessScope::Owned,
+        };
+        let row = device_summary(
+            device,
+            &BTreeMap::from([("EARTH".to_owned(), Some("SOL".to_owned()))]),
+            Some(DeviceClaim {
+                workflow_id: ProtocolWorkflowId("wf-1".to_owned()),
+                workflow_kind: OperationKind("transport.route".to_owned()),
+                workflow_status: ProtocolStatus::Running,
+            }),
+        );
+
+        assert_eq!(row.device_type.as_deref(), Some("future_device"));
+        assert_eq!(row.status, None);
+        assert_eq!(row.owner.as_deref(), Some("R-1"));
+        assert_eq!(row.system.as_deref(), Some("SOL"));
+        assert_eq!(row.operational_capacity_percent, Some(75.0));
+        assert_eq!(row.claim.expect("claim").workflow_id.0, "wf-1");
+    }
+
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
         let (app, client, _) = test_app().await;
@@ -2480,6 +2667,7 @@ mod tests {
             "/api/health",
             "/api/snapshot",
             "/api/overview",
+            "/api/devices",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
@@ -2499,6 +2687,10 @@ mod tests {
             if path == "/api/entities" {
                 assert!(value["payload"]["metadata"]["revision"].is_number());
                 assert!(value["payload"]["entities"].is_array());
+            }
+            if path == "/api/devices" {
+                assert!(value["payload"]["metadata"]["revision"].is_number());
+                assert!(value["payload"]["devices"].is_array());
             }
             assert!(!value.to_string().contains("token"));
         }
@@ -3000,6 +3192,7 @@ mod tests {
             DomainSlice::Entities,
             DomainSlice::Workflows,
             DomainSlice::Overview,
+            DomainSlice::Devices,
         ] {
             assert!(matches!(
                 updates.recv().await.expect("domain invalidation").delta,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseHealthResponse,
+  parseDevicesResponse,
   parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
@@ -10,6 +11,49 @@ import {
   parseSystemSceneResponse,
   parseTriggerListResponse,
 } from "./protocol";
+
+describe("parseDevicesResponse", () => {
+  it("preserves forward-compatible device types and missing fields", () => {
+    const parsed = parseDevicesResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 3, generated_at_ms: 10 },
+        devices: [
+          {
+            entity: { kind: "device", id: "D-1" },
+            device_type: "future_device",
+            status: null,
+            ownership: "owned",
+            owner: null,
+            system: null,
+            location: null,
+            tags: [],
+            attached_to: null,
+            stowed_in: null,
+            controller: null,
+            linked_device: null,
+            attached_devices: [],
+            controlled_devices: [],
+            stowed_devices: [],
+            attach_capacity: null,
+            cargo_capacity: null,
+            cargo_used: null,
+            operational_capacity_percent: null,
+            active_directive: null,
+            directive_status: null,
+            travel_destination: null,
+            claim: null,
+          },
+        ],
+      },
+    });
+    expect(parsed.payload.devices[0]).toMatchObject({
+      device_type: "future_device",
+      status: null,
+      claim: null,
+    });
+  });
+});
 
 describe("parseHealthResponse", () => {
   it("accepts the versioned daemon health shape", () => {
