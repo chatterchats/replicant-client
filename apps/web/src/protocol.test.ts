@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseAutofactoryResponse,
+  parseCargoResponse,
   parseHealthResponse,
   parseDevicesResponse,
   parseInventoryResponse,
@@ -12,6 +14,32 @@ import {
   parseSystemSceneResponse,
   parseTriggerListResponse,
 } from "./protocol";
+
+const rawDevice = {
+  entity: { kind: "device", id: "D-1" },
+  device_type: "future_device",
+  status: "active",
+  ownership: "owned",
+  owner: null,
+  system: "SOL",
+  location: "SOL-1",
+  tags: [],
+  attached_to: null,
+  stowed_in: null,
+  controller: null,
+  linked_device: null,
+  attached_devices: [],
+  controlled_devices: [],
+  stowed_devices: [],
+  attach_capacity: 2,
+  cargo_capacity: 10,
+  cargo_used: 3,
+  operational_capacity_percent: 100,
+  active_directive: null,
+  directive_status: null,
+  travel_destination: null,
+  claim: null,
+};
 
 describe("parseDevicesResponse", () => {
   it("preserves forward-compatible device types and missing fields", () => {
@@ -53,6 +81,66 @@ describe("parseDevicesResponse", () => {
       status: null,
       owner_name: null,
       claim: null,
+    });
+  });
+});
+
+describe("asset projection parsers", () => {
+  it("parses Autofactory queues and utilization", () => {
+    const parsed = parseAutofactoryResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 10 },
+        utilization: {
+          total: 1,
+          busy: 1,
+          available: 0,
+          unavailable: 0,
+          queued_units: 2,
+          utilization_percent: 100,
+        },
+        factories: [
+          {
+            device: rawDevice,
+            availability: "busy",
+            queue_capacity: 4,
+            queued_units: 2,
+            current_job: {
+              device_type: "relay",
+              quantity: 1,
+              eta_seconds: 60,
+              tags: [],
+            },
+            queued_jobs: [],
+          },
+        ],
+      },
+    });
+    expect(parsed.payload.factories[0]?.current_job?.device_type).toBe("relay");
+    expect(parsed.payload.utilization.utilization_percent).toBe(100);
+  });
+
+  it("parses capability-based cargo rows", () => {
+    const parsed = parseCargoResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 5, generated_at_ms: 10 },
+        cargo_used: 3,
+        cargo_capacity: 10,
+        attachment_used: 1,
+        attachment_capacity: 2,
+        carriers: [
+          {
+            device: rawDevice,
+            attachment_used: 1,
+            resources: [{ resource: "silicates", quantity: 3 }],
+          },
+        ],
+      },
+    });
+    expect(parsed.payload.carriers[0]?.resources[0]).toEqual({
+      resource: "silicates",
+      quantity: 3,
     });
   });
 });

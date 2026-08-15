@@ -261,6 +261,113 @@ pub struct DevicesSnapshot {
     pub devices: Vec<DeviceSummary>,
 }
 
+/// One active or queued Autofactory print job.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FactoryJobSummary {
+    /// Canonical device type, or `unknown` when omitted upstream.
+    pub device_type: String,
+    /// Number of units represented by the job.
+    pub quantity: i64,
+    /// Reported seconds remaining, when available.
+    pub eta_seconds: Option<f64>,
+    /// Tags applied to the completed device.
+    pub tags: Vec<String>,
+}
+
+/// Whether an Autofactory can accept work or is currently occupied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutofactoryAvailability {
+    /// Ready to accept work.
+    Available,
+    /// Printing or holding queued work.
+    Busy,
+    /// Compacted or transitioning and unable to print.
+    Unavailable,
+}
+
+/// Operational manufacturing row for one Autofactory.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutofactorySummary {
+    /// Shared managed-device projection.
+    pub device: DeviceSummary,
+    /// Current availability derived from live factory state.
+    pub availability: AutofactoryAvailability,
+    /// Maximum queued units reported by the factory.
+    pub queue_capacity: Option<i64>,
+    /// Units currently occupying the queue.
+    pub queued_units: i64,
+    /// Active print job, when present.
+    pub current_job: Option<FactoryJobSummary>,
+    /// Jobs waiting behind the active print.
+    pub queued_jobs: Vec<FactoryJobSummary>,
+}
+
+/// Aggregate manufacturing utilization.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutofactoryUtilization {
+    /// Total managed Autofactories.
+    pub total: usize,
+    /// Factories with active or queued work.
+    pub busy: usize,
+    /// Factories ready to accept work.
+    pub available: usize,
+    /// Factories unable to print in their current state.
+    pub unavailable: usize,
+    /// Total queued print units.
+    pub queued_units: i64,
+    /// Busy factories as a percentage of printable factories.
+    pub utilization_percent: f64,
+}
+
+/// Typed Autofactory dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutofactorySnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Aggregate manufacturing state.
+    pub utilization: AutofactoryUtilization,
+    /// Stable rows sorted by factory code.
+    pub factories: Vec<AutofactorySummary>,
+}
+
+/// Resource quantity currently carried by a device.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CargoResourceSummary {
+    /// Canonical resource type.
+    pub resource: String,
+    /// Positive carried quantity.
+    pub quantity: i64,
+}
+
+/// Operational cargo row for one capability-bearing carrier.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CargoCarrierSummary {
+    /// Shared managed-device projection.
+    pub device: DeviceSummary,
+    /// Resources currently in cargo.
+    pub resources: Vec<CargoResourceSummary>,
+    /// Number of occupied attachment slots.
+    pub attachment_used: i64,
+}
+
+/// Typed cargo and transport dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CargoSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Total reported cargo use across carriers.
+    pub cargo_used: i64,
+    /// Total reported cargo capacity across carriers.
+    pub cargo_capacity: i64,
+    /// Total occupied attachment slots.
+    pub attachment_used: i64,
+    /// Total reported attachment capacity.
+    pub attachment_capacity: i64,
+    /// Stable carrier rows sorted by device code.
+    pub carriers: Vec<CargoCarrierSummary>,
+}
+
 /// Managed inventory ownership scope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1469,6 +1576,38 @@ mod tests {
         }
     }
 
+    fn device() -> DeviceSummary {
+        DeviceSummary {
+            entity: EntityRef {
+                kind: EntityKind::Device,
+                id: EntityId("D-1".to_owned()),
+            },
+            device_type: Some("future_device".to_owned()),
+            status: None,
+            ownership: "owned".to_owned(),
+            owner: None,
+            owner_name: None,
+            system: None,
+            location: None,
+            tags: Vec::new(),
+            attached_to: None,
+            stowed_in: None,
+            controller: None,
+            linked_device: None,
+            attached_devices: Vec::new(),
+            controlled_devices: Vec::new(),
+            stowed_devices: Vec::new(),
+            attach_capacity: None,
+            cargo_capacity: None,
+            cargo_used: None,
+            operational_capacity_percent: None,
+            active_directive: None,
+            directive_status: None,
+            travel_destination: None,
+            claim: None,
+        }
+    }
+
     #[test]
     fn request_response_and_descriptor_round_trip() {
         round_trip(&Versioned::current(StartWorkflowRequest {
@@ -1529,34 +1668,51 @@ mod tests {
                 revision: 42,
                 generated_at_ms: 1_765_000_000_000,
             },
-            devices: vec![DeviceSummary {
-                entity: EntityRef {
-                    kind: EntityKind::Device,
-                    id: EntityId("D-1".to_owned()),
-                },
-                device_type: Some("future_device".to_owned()),
-                status: None,
-                ownership: "owned".to_owned(),
-                owner: None,
-                owner_name: None,
-                system: None,
-                location: None,
-                tags: Vec::new(),
-                attached_to: None,
-                stowed_in: None,
-                controller: None,
-                linked_device: None,
-                attached_devices: Vec::new(),
-                controlled_devices: Vec::new(),
-                stowed_devices: Vec::new(),
-                attach_capacity: None,
-                cargo_capacity: None,
-                cargo_used: None,
-                operational_capacity_percent: None,
-                active_directive: None,
-                directive_status: None,
-                travel_destination: None,
-                claim: None,
+            devices: vec![device()],
+        }));
+        round_trip(&Versioned::current(AutofactorySnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            utilization: AutofactoryUtilization {
+                total: 1,
+                busy: 1,
+                available: 0,
+                unavailable: 0,
+                queued_units: 2,
+                utilization_percent: 100.0,
+            },
+            factories: vec![AutofactorySummary {
+                device: device(),
+                availability: AutofactoryAvailability::Busy,
+                queue_capacity: Some(4),
+                queued_units: 2,
+                current_job: Some(FactoryJobSummary {
+                    device_type: "relay".to_owned(),
+                    quantity: 1,
+                    eta_seconds: Some(60.0),
+                    tags: Vec::new(),
+                }),
+                queued_jobs: Vec::new(),
+            }],
+        }));
+        round_trip(&Versioned::current(CargoSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            cargo_used: 3,
+            cargo_capacity: 10,
+            attachment_used: 1,
+            attachment_capacity: 2,
+            carriers: vec![CargoCarrierSummary {
+                device: device(),
+                resources: vec![CargoResourceSummary {
+                    resource: "silicates".to_owned(),
+                    quantity: 3,
+                }],
+                attachment_used: 1,
             }],
         }));
         round_trip(&Versioned::current(InventorySnapshot {

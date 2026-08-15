@@ -147,6 +147,57 @@ export interface DevicesSnapshot {
   devices: DeviceSummary[];
 }
 
+export interface FactoryJobSummary {
+  device_type: string;
+  quantity: number;
+  eta_seconds: number | null;
+  tags: string[];
+}
+
+export type AutofactoryAvailability = "available" | "busy" | "unavailable";
+
+export interface AutofactorySummary {
+  device: DeviceSummary;
+  availability: AutofactoryAvailability;
+  queue_capacity: number | null;
+  queued_units: number;
+  current_job: FactoryJobSummary | null;
+  queued_jobs: FactoryJobSummary[];
+}
+
+export interface AutofactorySnapshot {
+  metadata: SnapshotMetadata;
+  utilization: {
+    total: number;
+    busy: number;
+    available: number;
+    unavailable: number;
+    queued_units: number;
+    utilization_percent: number;
+  };
+  factories: AutofactorySummary[];
+}
+
+export interface CargoResourceSummary {
+  resource: string;
+  quantity: number;
+}
+
+export interface CargoCarrierSummary {
+  device: DeviceSummary;
+  resources: CargoResourceSummary[];
+  attachment_used: number;
+}
+
+export interface CargoSnapshot {
+  metadata: SnapshotMetadata;
+  cargo_used: number;
+  cargo_capacity: number;
+  attachment_used: number;
+  attachment_capacity: number;
+  carriers: CargoCarrierSummary[];
+}
+
 export type InventoryOwnerKind = "account" | "replicant" | "location";
 
 export interface InventoryQuantity {
@@ -1131,85 +1182,176 @@ export function parseDevicesResponse(
     const snapshot = record(payload, "devices snapshot");
     return {
       metadata: metadata(snapshot.metadata),
-      devices: array(snapshot.devices, "devices").map((value) => {
-        const device = record(value, "device");
-        if (typeof device.ownership !== "string")
-          throw new Error("Invalid device ownership");
-        const claim =
-          device.claim === null
-            ? null
-            : (() => {
-                const item = record(device.claim, "device claim");
-                if (
-                  typeof item.workflow_id !== "string" ||
-                  typeof item.workflow_kind !== "string"
-                )
-                  throw new Error("Invalid device claim");
-                return {
-                  workflow_id: item.workflow_id,
-                  workflow_kind: item.workflow_kind,
-                  workflow_status: oneOf(
-                    item.workflow_status,
-                    workflowStatuses,
-                    "workflow status",
-                  ),
-                };
-              })();
+      devices: array(snapshot.devices, "devices").map(parseDeviceSummary),
+    };
+  });
+}
+
+function parseDeviceSummary(value: unknown): DeviceSummary {
+  const device = record(value, "device");
+  if (typeof device.ownership !== "string")
+    throw new Error("Invalid device ownership");
+  const claim =
+    device.claim === null
+      ? null
+      : (() => {
+          const item = record(device.claim, "device claim");
+          if (
+            typeof item.workflow_id !== "string" ||
+            typeof item.workflow_kind !== "string"
+          )
+            throw new Error("Invalid device claim");
+          return {
+            workflow_id: item.workflow_id,
+            workflow_kind: item.workflow_kind,
+            workflow_status: oneOf(
+              item.workflow_status,
+              workflowStatuses,
+              "workflow status",
+            ),
+          };
+        })();
+  return {
+    entity: entity(device.entity),
+    device_type: nullableString(device.device_type, "device type"),
+    status: nullableString(device.status, "device status"),
+    ownership: device.ownership,
+    owner: nullableString(device.owner, "device owner"),
+    owner_name:
+      device.owner_name === undefined
+        ? null
+        : nullableString(device.owner_name, "device owner name"),
+    system: nullableString(device.system, "device system"),
+    location: nullableString(device.location, "device location"),
+    tags: stringArray(device.tags, "device tags"),
+    attached_to: nullableString(device.attached_to, "attached device"),
+    stowed_in: nullableString(device.stowed_in, "stowed device"),
+    controller: nullableString(device.controller, "device controller"),
+    linked_device: nullableString(device.linked_device, "linked device"),
+    attached_devices: stringArray(device.attached_devices, "attached devices"),
+    controlled_devices: stringArray(
+      device.controlled_devices,
+      "controlled devices",
+    ),
+    stowed_devices: stringArray(device.stowed_devices, "stowed devices"),
+    attach_capacity:
+      device.attach_capacity === null
+        ? null
+        : number(device.attach_capacity, "attach capacity"),
+    cargo_capacity:
+      device.cargo_capacity === null
+        ? null
+        : number(device.cargo_capacity, "cargo capacity"),
+    cargo_used:
+      device.cargo_used === null
+        ? null
+        : number(device.cargo_used, "cargo used"),
+    operational_capacity_percent: optionalFiniteNumber(
+      device.operational_capacity_percent,
+      "operational capacity",
+    ),
+    active_directive: nullableString(
+      device.active_directive,
+      "active directive",
+    ),
+    directive_status: nullableString(
+      device.directive_status,
+      "directive status",
+    ),
+    travel_destination: nullableString(
+      device.travel_destination,
+      "travel destination",
+    ),
+    claim,
+  };
+}
+
+function parseFactoryJob(value: unknown): FactoryJobSummary {
+  const job = record(value, "factory job");
+  if (typeof job.device_type !== "string")
+    throw new Error("Invalid factory job type");
+  return {
+    device_type: job.device_type,
+    quantity: number(job.quantity, "factory job quantity"),
+    eta_seconds: optionalFiniteNumber(job.eta_seconds, "factory job ETA"),
+    tags: stringArray(job.tags, "factory job tags"),
+  };
+}
+
+export function parseAutofactoryResponse(
+  value: unknown,
+): Versioned<AutofactorySnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "autofactory snapshot");
+    const utilization = record(snapshot.utilization, "autofactory utilization");
+    return {
+      metadata: metadata(snapshot.metadata),
+      utilization: {
+        total: number(utilization.total, "factory total"),
+        busy: number(utilization.busy, "busy factories"),
+        available: number(utilization.available, "available factories"),
+        unavailable: number(utilization.unavailable, "unavailable factories"),
+        queued_units: number(utilization.queued_units, "queued units"),
+        utilization_percent: number(
+          utilization.utilization_percent,
+          "factory utilization",
+        ),
+      },
+      factories: array(snapshot.factories, "factories").map((value) => {
+        const factory = record(value, "autofactory");
         return {
-          entity: entity(device.entity),
-          device_type: nullableString(device.device_type, "device type"),
-          status: nullableString(device.status, "device status"),
-          ownership: device.ownership,
-          owner: nullableString(device.owner, "device owner"),
-          owner_name:
-            device.owner_name === undefined
+          device: parseDeviceSummary(factory.device),
+          availability: oneOf(
+            factory.availability,
+            ["available", "busy", "unavailable"] as const,
+            "factory availability",
+          ),
+          queue_capacity:
+            factory.queue_capacity === null
               ? null
-              : nullableString(device.owner_name, "device owner name"),
-          system: nullableString(device.system, "device system"),
-          location: nullableString(device.location, "device location"),
-          tags: stringArray(device.tags, "device tags"),
-          attached_to: nullableString(device.attached_to, "attached device"),
-          stowed_in: nullableString(device.stowed_in, "stowed device"),
-          controller: nullableString(device.controller, "device controller"),
-          linked_device: nullableString(device.linked_device, "linked device"),
-          attached_devices: stringArray(
-            device.attached_devices,
-            "attached devices",
-          ),
-          controlled_devices: stringArray(
-            device.controlled_devices,
-            "controlled devices",
-          ),
-          stowed_devices: stringArray(device.stowed_devices, "stowed devices"),
-          attach_capacity:
-            device.attach_capacity === null
+              : number(factory.queue_capacity, "queue capacity"),
+          queued_units: number(factory.queued_units, "queued units"),
+          current_job:
+            factory.current_job === null
               ? null
-              : number(device.attach_capacity, "attach capacity"),
-          cargo_capacity:
-            device.cargo_capacity === null
-              ? null
-              : number(device.cargo_capacity, "cargo capacity"),
-          cargo_used:
-            device.cargo_used === null
-              ? null
-              : number(device.cargo_used, "cargo used"),
-          operational_capacity_percent: optionalFiniteNumber(
-            device.operational_capacity_percent,
-            "operational capacity",
+              : parseFactoryJob(factory.current_job),
+          queued_jobs: array(factory.queued_jobs, "queued jobs").map(
+            parseFactoryJob,
           ),
-          active_directive: nullableString(
-            device.active_directive,
-            "active directive",
+        };
+      }),
+    };
+  });
+}
+
+export function parseCargoResponse(value: unknown): Versioned<CargoSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "cargo snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      cargo_used: number(snapshot.cargo_used, "cargo used"),
+      cargo_capacity: number(snapshot.cargo_capacity, "cargo capacity"),
+      attachment_used: number(snapshot.attachment_used, "attachment used"),
+      attachment_capacity: number(
+        snapshot.attachment_capacity,
+        "attachment capacity",
+      ),
+      carriers: array(snapshot.carriers, "cargo carriers").map((value) => {
+        const carrier = record(value, "cargo carrier");
+        return {
+          device: parseDeviceSummary(carrier.device),
+          attachment_used: number(carrier.attachment_used, "attachment used"),
+          resources: array(carrier.resources, "cargo resources").map(
+            (value) => {
+              const resource = record(value, "cargo resource");
+              if (typeof resource.resource !== "string")
+                throw new Error("Invalid cargo resource");
+              return {
+                resource: resource.resource,
+                quantity: number(resource.quantity, "cargo resource quantity"),
+              };
+            },
           ),
-          directive_status: nullableString(
-            device.directive_status,
-            "directive status",
-          ),
-          travel_destination: nullableString(
-            device.travel_destination,
-            "travel destination",
-          ),
-          claim,
         };
       }),
     };

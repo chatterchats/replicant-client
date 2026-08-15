@@ -1693,6 +1693,82 @@ h1 {
   margin-top: 6px;
 }
 
+.asset-dashboard h2 {
+  font-size: 0.9rem;
+  margin: 18px 0 10px;
+}
+
+.asset-operations {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.asset-operations h2 {
+  margin: 0 8px 0 0;
+}
+
+.asset-operations p {
+  color: #78908c;
+  margin: 0;
+}
+
+.asset-jobs {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.asset-jobs ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.asset-jobs li {
+  border-bottom: 1px solid rgba(159, 188, 193, 0.12);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr 1fr auto;
+  padding: 8px 0;
+}
+
+.status-chip {
+  border: 1px solid rgba(159, 188, 193, 0.22);
+  border-radius: 999px;
+  display: inline-block;
+  margin-right: 6px;
+  padding: 2px 7px;
+}
+
+.status-chip.available {
+  color: #83eee5;
+}
+.status-chip.busy {
+  color: #f3b14f;
+}
+.status-chip.unavailable {
+  color: #78908c;
+}
+
+.capacity-meter {
+  display: grid;
+  gap: 3px;
+  min-width: 100px;
+}
+
+.capacity-meter meter {
+  accent-color: #41d4c8;
+  width: 100%;
+}
+
+.cargo-table .workflow-link,
+.cargo-table td > small {
+  display: block;
+  margin-top: 4px;
+}
+
 @media (max-width: 720px) {
   .triggers-layout {
     grid-template-columns: 1fr;
@@ -1712,7 +1788,8 @@ h1 {
   }
   .overview-grid,
   .overview-metrics,
-  .inventory-summary {
+  .inventory-summary,
+  .asset-jobs {
     grid-template-columns: 1fr 1fr;
   }
   .overview-page,

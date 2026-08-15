@@ -29,10 +29,12 @@ use replicant_client::{
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
-    ActivityLevel, AutomationControlAction, AutomationControlRequest, AutomationControlResponse,
-    AutomationStatus, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
+    ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
+    AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
+    AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
+    CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
     DescriptorCatalog, DeviceClaim, DeviceSummary, DevicesSnapshot, DomainSlice, EntityId,
-    EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
+    EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse, FactoryJobSummary,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
@@ -64,7 +66,7 @@ use replicant_workflow::{
     WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::{Mutex, broadcast, watch};
 use tower_http::cors::CorsLayer;
 
@@ -203,6 +205,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
         .route("/api/inventory", get(inventory))
+        .route("/api/autofactories", get(autofactories))
+        .route("/api/cargo", get(cargo))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -616,6 +620,12 @@ fn publish_workflow_updates(
                 state.publish(LiveDelta::DomainInvalidated {
                     slice: DomainSlice::Devices,
                 });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Autofactories,
+                });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Cargo,
+                });
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
                 }
@@ -935,6 +945,14 @@ async fn devices(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<DevicesSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
+    let devices = device_rows(&state).await?;
+    Ok(Json(Versioned::current(DevicesSnapshot {
+        metadata,
+        devices,
+    })))
+}
+
+async fn device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
     let location_systems = state
         .client()
         .locations()
@@ -1005,10 +1023,197 @@ async fn devices(
         ));
     }
     rows.sort_by(|left, right| left.entity.cmp(&right.entity));
-    Ok(Json(Versioned::current(DevicesSnapshot {
+    Ok(rows)
+}
+
+async fn autofactories(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<AutofactorySnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let mut factories = Vec::new();
+    for device in device_rows(&state)
+        .await?
+        .into_iter()
+        .filter(|device| device.device_type.as_deref() == Some("autofactory"))
+    {
+        let detail = state
+            .client()
+            .raw()
+            .devices()
+            .get(&device.entity.id.0)
+            .await
+            .map_err(|_| ApiError::unavailable())?
+            .value;
+        let current_job = detail.printing.map(|printing| FactoryJobSummary {
+            device_type: printing.device_type.unwrap_or_else(|| "unknown".to_owned()),
+            quantity: 1,
+            eta_seconds: printing.eta_seconds,
+            tags: printing.tags,
+        });
+        let queued_jobs = detail
+            .print_queue
+            .iter()
+            .map(factory_job_from_queue)
+            .collect::<Vec<_>>();
+        let queued_units = queued_jobs.iter().map(|job| job.quantity).sum();
+        let unavailable = device.status.as_deref().is_some_and(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "compacted" | "compacting" | "unfurling"
+            )
+        });
+        let availability = if unavailable {
+            AutofactoryAvailability::Unavailable
+        } else if current_job.is_some() || !queued_jobs.is_empty() {
+            AutofactoryAvailability::Busy
+        } else {
+            AutofactoryAvailability::Available
+        };
+        factories.push(AutofactorySummary {
+            device,
+            availability,
+            queue_capacity: detail.queue_size,
+            queued_units,
+            current_job,
+            queued_jobs,
+        });
+    }
+    Ok(Json(Versioned::current(autofactory_snapshot(
+        metadata, factories,
+    ))))
+}
+
+fn autofactory_snapshot(
+    metadata: SnapshotMetadata,
+    factories: Vec<AutofactorySummary>,
+) -> AutofactorySnapshot {
+    let busy = factories
+        .iter()
+        .filter(|factory| factory.availability == AutofactoryAvailability::Busy)
+        .count();
+    let available = factories
+        .iter()
+        .filter(|factory| factory.availability == AutofactoryAvailability::Available)
+        .count();
+    let unavailable = factories.len().saturating_sub(busy + available);
+    let printable = busy + available;
+    AutofactorySnapshot {
         metadata,
-        devices: rows,
-    })))
+        utilization: AutofactoryUtilization {
+            total: factories.len(),
+            busy,
+            available,
+            unavailable,
+            queued_units: factories.iter().map(|factory| factory.queued_units).sum(),
+            utilization_percent: if printable == 0 {
+                0.0
+            } else {
+                busy as f64 * 100.0 / printable as f64
+            },
+        },
+        factories,
+    }
+}
+
+fn factory_job_from_queue(value: &Map<String, Value>) -> FactoryJobSummary {
+    FactoryJobSummary {
+        device_type: string_field(value, &["device_type", "type"])
+            .unwrap_or("unknown")
+            .to_owned(),
+        quantity: integer_field(value, &["quantity", "count"])
+            .unwrap_or(1)
+            .max(1),
+        eta_seconds: number_field(value, &["eta_seconds", "remaining_seconds"]),
+        tags: value
+            .get("tags")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+fn string_field<'a>(value: &'a Map<String, Value>, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str))
+}
+
+fn integer_field(value: &Map<String, Value>, names: &[&str]) -> Option<i64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_i64))
+}
+
+fn number_field(value: &Map<String, Value>, names: &[&str]) -> Option<f64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_f64))
+}
+
+async fn cargo(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<CargoSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let mut carriers = Vec::new();
+    for device in device_rows(&state).await?.into_iter().filter(|device| {
+        device.cargo_capacity.unwrap_or_default() > 0
+            || device.attach_capacity.unwrap_or_default() > 0
+            || !device.attached_devices.is_empty()
+            || !device.stowed_devices.is_empty()
+    }) {
+        let detail = state
+            .client()
+            .raw()
+            .devices()
+            .get(&device.entity.id.0)
+            .await
+            .map_err(|_| ApiError::unavailable())?
+            .value;
+        let mut resources = detail
+            .cargo
+            .into_iter()
+            .filter_map(|item| {
+                let quantity = item.quantity.unwrap_or_default();
+                if quantity <= 0 {
+                    return None;
+                }
+                Some(CargoResourceSummary {
+                    resource: item.resource_type?,
+                    quantity,
+                })
+            })
+            .collect::<Vec<_>>();
+        resources.sort_by(|left, right| left.resource.cmp(&right.resource));
+        carriers.push(CargoCarrierSummary {
+            attachment_used: i64::try_from(device.attached_devices.len()).unwrap_or(i64::MAX),
+            device,
+            resources,
+        });
+    }
+    Ok(Json(Versioned::current(cargo_snapshot(metadata, carriers))))
+}
+
+fn cargo_snapshot(metadata: SnapshotMetadata, carriers: Vec<CargoCarrierSummary>) -> CargoSnapshot {
+    CargoSnapshot {
+        metadata,
+        cargo_used: carriers
+            .iter()
+            .filter_map(|carrier| carrier.device.cargo_used)
+            .sum(),
+        cargo_capacity: carriers
+            .iter()
+            .filter_map(|carrier| carrier.device.cargo_capacity)
+            .sum(),
+        attachment_used: carriers.iter().map(|carrier| carrier.attachment_used).sum(),
+        attachment_capacity: carriers
+            .iter()
+            .filter_map(|carrier| carrier.device.attach_capacity)
+            .sum(),
+        carriers,
+    }
 }
 
 async fn inventory(
@@ -2715,6 +2920,35 @@ mod tests {
         serde_json::from_slice(&body).expect("JSON response")
     }
 
+    fn projected_device(code: &str) -> DeviceSummary {
+        DeviceSummary {
+            entity: summary_ref(EntityKind::Device, code.to_owned()),
+            device_type: None,
+            status: None,
+            ownership: "owned".to_owned(),
+            owner: None,
+            owner_name: None,
+            system: None,
+            location: None,
+            tags: Vec::new(),
+            attached_to: None,
+            stowed_in: None,
+            controller: None,
+            linked_device: None,
+            attached_devices: Vec::new(),
+            controlled_devices: Vec::new(),
+            stowed_devices: Vec::new(),
+            attach_capacity: None,
+            cargo_capacity: None,
+            cargo_used: None,
+            operational_capacity_percent: None,
+            active_directive: None,
+            directive_status: None,
+            travel_destination: None,
+            claim: None,
+        }
+    }
+
     #[test]
     fn overview_projection_groups_active_and_attention_work() {
         let workflow = |id: &str, status| WorkflowSummary {
@@ -2887,6 +3121,68 @@ mod tests {
         assert_eq!(snapshot.resources[1].distribution.len(), 2);
     }
 
+    #[test]
+    fn asset_projections_aggregate_factory_and_carrier_capacity() {
+        let metadata = SnapshotMetadata {
+            revision: 9,
+            generated_at_ms: 10,
+        };
+        let factory = |code: &str, availability, queued_units| AutofactorySummary {
+            device: projected_device(code),
+            availability,
+            queue_capacity: Some(4),
+            queued_units,
+            current_job: None,
+            queued_jobs: Vec::new(),
+        };
+        let manufacturing = autofactory_snapshot(
+            metadata.clone(),
+            vec![
+                factory("F-1", AutofactoryAvailability::Busy, 2),
+                factory("F-2", AutofactoryAvailability::Available, 0),
+                factory("F-3", AutofactoryAvailability::Unavailable, 0),
+            ],
+        );
+        assert_eq!(manufacturing.utilization.queued_units, 2);
+        assert_eq!(manufacturing.utilization.utilization_percent, 50.0);
+
+        let mut device = projected_device("C-1");
+        device.cargo_used = Some(3);
+        device.cargo_capacity = Some(10);
+        device.attach_capacity = Some(4);
+        let cargo = cargo_snapshot(
+            metadata,
+            vec![CargoCarrierSummary {
+                device,
+                resources: vec![CargoResourceSummary {
+                    resource: "silicates".to_owned(),
+                    quantity: 3,
+                }],
+                attachment_used: 2,
+            }],
+        );
+        assert_eq!((cargo.cargo_used, cargo.cargo_capacity), (3, 10));
+        assert_eq!((cargo.attachment_used, cargo.attachment_capacity), (2, 4));
+    }
+
+    #[test]
+    fn queued_factory_jobs_accept_current_upstream_field_names() {
+        let job = factory_job_from_queue(
+            &[
+                ("device_type".to_owned(), Value::String("relay".to_owned())),
+                ("quantity".to_owned(), Value::from(2)),
+                ("eta_seconds".to_owned(), Value::from(30.0)),
+                ("tags".to_owned(), serde_json::json!(["network"])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(job.device_type, "relay");
+        assert_eq!(job.quantity, 2);
+        assert_eq!(job.eta_seconds, Some(30.0));
+        assert_eq!(job.tags, ["network"]);
+    }
+
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
         let (app, client, _) = test_app().await;
@@ -2896,6 +3192,8 @@ mod tests {
             "/api/overview",
             "/api/devices",
             "/api/inventory",
+            "/api/autofactories",
+            "/api/cargo",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
@@ -3426,6 +3724,8 @@ mod tests {
             DomainSlice::Workflows,
             DomainSlice::Overview,
             DomainSlice::Devices,
+            DomainSlice::Autofactories,
+            DomainSlice::Cargo,
         ] {
             assert!(matches!(
                 updates.recv().await.expect("domain invalidation").delta,

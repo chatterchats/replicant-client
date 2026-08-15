@@ -10,6 +10,8 @@ import {
   useWorkflows,
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
+import { AutofactoryPage } from "./AutofactoryPage";
+import { CargoPage } from "./CargoPage";
 import {
   CommandPalette,
   type CommandContext,
@@ -574,6 +576,50 @@ export function App() {
                   setSelectedSystem(system);
                   select({ kind: "system", id: system });
                   navigate("System");
+                }}
+              />
+            ) : shell.page === "Autofactory" ? (
+              <AutofactoryPage
+                descriptors={descriptors}
+                onSelectDevice={(device) => {
+                  setSelectedDevice(device);
+                  select(device.entity);
+                }}
+                onSelectEntity={select}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Cargo" ? (
+              <CargoPage
+                descriptors={descriptors}
+                onSelectDevice={(device) => {
+                  setSelectedDevice(device);
+                  select(device.entity);
+                }}
+                onSelectEntity={select}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
                 }}
               />
             ) : shell.page === "Automations" ? (

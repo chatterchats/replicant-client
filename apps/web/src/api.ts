@@ -1,5 +1,7 @@
 import {
+  parseAutofactoryResponse,
   parseAutomationControlResponse,
+  parseCargoResponse,
   parseDescriptorsResponse,
   parseDevicesResponse,
   parseInventoryResponse,
@@ -91,6 +93,13 @@ export const daemonApi = {
   },
   async inventory(signal?: AbortSignal) {
     return parseInventoryResponse(await get("/api/inventory", signal)).payload;
+  },
+  async autofactories(signal?: AbortSignal) {
+    return parseAutofactoryResponse(await get("/api/autofactories", signal))
+      .payload;
+  },
+  async cargo(signal?: AbortSignal) {
+    return parseCargoResponse(await get("/api/cargo", signal)).payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;
