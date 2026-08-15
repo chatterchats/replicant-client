@@ -55,36 +55,17 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
   mining: [
     "ami_mining_controller",
     "mining_drone",
-    "exotic_matter_injector",
-    "exotic_particle_trap",
-    "mass_driver",
-    "thermal_lance",
   ],
   survey: [
     "ami_survey_controller",
     "survey_drone",
-    "sensor_array",
-    "seismic_monitor",
   ],
   ftl_comms: [
     "ftl_beacon",
     "ftl_relay",
-    "ftl_slingshot",
-    "system_hub",
-    "comm_satellite",
-    "mesh_relay",
-    "signal_booster",
-    "galactic_observatory",
-    "electrodynamic_tether",
   ],
   maintenance: [
     "maintenance_drone",
-    "fleet_tender",
-    "system_ward",
-    "defence_grid",
-    "orbital_defence_platform",
-    "point_defence_array",
-    "shield_generator",
   ],
   transport: [
     "ami_transport_controller",
@@ -92,7 +73,6 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
     "transport_drone",
     "transport_hauler",
     "cargo_freighter",
-    "cargo_lifter",
   ],
   carrier: [
     "surge_carrier",
@@ -103,15 +83,6 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
   ],
   manufacturing: [
     "autofactory",
-    "structural_fabricator",
-    "atmo_processor",
-    "filtration_array",
-    "hydroponic_bay",
-    "nutrient_synthesizer",
-    "orbital_farm",
-    "solar_collector",
-    "power_cell_array",
-    "compute_core",
   ],
 };
 
