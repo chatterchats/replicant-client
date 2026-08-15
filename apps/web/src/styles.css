@@ -802,6 +802,36 @@ h1 {
   background: #1a302c;
   padding: 20px;
 }
+.triggers-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(320px, 1fr);
+  gap: 16px;
+}
+.trigger-list {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+.trigger-list article {
+  display: grid;
+  gap: 12px;
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  background: #1a302c;
+  padding: 14px;
+}
+.trigger-list article > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.trigger-list article > header div {
+  display: grid;
+  gap: 4px;
+}
+.trigger-list small {
+  color: #78908c;
+}
 .workflow-form header h2,
 .placeholder-card h2 {
   margin: 8px 0;
@@ -1069,6 +1099,9 @@ h1 {
 }
 
 @media (max-width: 720px) {
+  .triggers-layout {
+    grid-template-columns: 1fr;
+  }
   .app-shell {
     grid-template-columns: 1fr;
   }

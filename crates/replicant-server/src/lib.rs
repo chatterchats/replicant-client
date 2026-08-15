@@ -21,20 +21,23 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use replicant_client::{
     ClientDegradation, ClientStatus,
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
-    ActivityLevel, DaemonHealth, DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef,
-    ErrorResponse, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    ActivityLevel, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
+    DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef, ErrorResponse,
+    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     LiveDelta, LiveMessage, OperationClass, OperationKind, OperationStatus, OperationUpdate,
     ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
     SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
-    Versioned, WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
+    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
+    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
     WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
     WorkflowSummary,
 };
@@ -47,9 +50,10 @@ use replicant_runtime::{
     workflows::WorkflowActivityEvent,
 };
 use replicant_workflow::{
-    FiniteExecution as StoredFiniteExecution, FiniteExecutionClass,
-    FiniteExecutionStatus as StoredFiniteExecutionStatus, RepositoryError, ResourceKey,
-    SupervisorError, WorkflowId, WorkflowInstance, WorkflowRepository, WorkflowStatus,
+    AutomationTrigger, FiniteExecution as StoredFiniteExecution, FiniteExecutionClass,
+    FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger, RepositoryError, ResourceKey,
+    SupervisorError, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
+    WorkflowId, WorkflowInstance, WorkflowKind, WorkflowRepository, WorkflowStatus,
     WorkflowSupervisor,
 };
 use serde::Deserialize;
@@ -195,6 +199,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/reports/{kind}", post(run_report))
         .route("/api/actions/{kind}", post(run_action))
         .route("/api/history", get(finite_execution_history))
+        .route("/api/triggers", get(list_triggers).post(create_trigger))
+        .route(
+            "/api/triggers/{id}",
+            put(update_trigger).delete(delete_trigger),
+        )
+        .route("/api/triggers/{id}/fire", post(fire_trigger))
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
@@ -252,6 +262,253 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
+                }
+            }
+        }
+    }
+}
+
+/// Evaluates durable automation definitions from local managed events and projections.
+pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut events = state.client().events().watch().await.ok();
+    let mut revisions = state.client().state().watch().ok();
+    evaluate_schedules_and_parents(&state).await;
+    evaluate_event_triggers(&state).await;
+    evaluate_state_triggers(&state).await;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                evaluate_schedules_and_parents(&state).await;
+                evaluate_event_triggers(&state).await;
+            }
+            event = async { events.as_mut().expect("guarded").next().await }, if events.is_some() => {
+                if let Err(error) = event {
+                    tracing::warn!(error = %error, "trigger event watcher lagged; recovering from durable history");
+                    events = state.client().events().watch().await.ok();
+                }
+                evaluate_event_triggers(&state).await;
+            }
+            revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
+                if let Err(error) = revision {
+                    tracing::warn!(error = %error, "trigger state watcher stopped");
+                    revisions = state.client().state().watch().ok();
+                }
+                evaluate_state_triggers(&state).await;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn evaluate_schedules_and_parents(state: &Arc<AppState>) {
+    let now = now_millis().unwrap_or_default();
+    let Ok(triggers) = state.repository.list_triggers() else {
+        return;
+    };
+    let workflows = state.repository.list().unwrap_or_default();
+    for trigger in triggers.into_iter().filter(|trigger| trigger.enabled) {
+        match &trigger.condition {
+            TriggerCondition::Schedule { interval_millis } => {
+                if *interval_millis <= 0 {
+                    let _ = state
+                        .repository
+                        .set_trigger_error(trigger.id, Some("schedule interval must be positive"));
+                    continue;
+                }
+                let Some(due) = trigger.next_run_at.filter(|due| *due <= now) else {
+                    continue;
+                };
+                let mut next = due.saturating_add(*interval_millis);
+                while next <= now {
+                    next = next.saturating_add(*interval_millis);
+                }
+                claim_and_launch(state, trigger, format!("schedule:{due}"), Some(next), None).await;
+            }
+            TriggerCondition::ParentWorkflow {
+                parent_kind,
+                status,
+            } => {
+                for parent in workflows.iter().filter(|workflow| {
+                    workflow.status == *status
+                        && parent_kind
+                            .as_ref()
+                            .is_none_or(|kind| workflow.kind == *kind)
+                }) {
+                    claim_and_launch(
+                        state,
+                        trigger.clone(),
+                        format!("parent:{}", parent.id),
+                        None,
+                        Some(parent.id),
+                    )
+                    .await;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn evaluate_state_triggers(state: &Arc<AppState>) {
+    let Ok(revision) = state.client().state().revision() else {
+        return;
+    };
+    let Ok(triggers) = state.repository.list_triggers() else {
+        return;
+    };
+    for trigger in triggers.into_iter().filter(|trigger| trigger.enabled) {
+        if let TriggerCondition::StateCondition { minimum_revision } = trigger.condition
+            && revision >= minimum_revision
+        {
+            claim_and_launch(
+                state,
+                trigger,
+                format!("state:{minimum_revision}"),
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+async fn evaluate_event_triggers(state: &Arc<AppState>) {
+    let Ok(triggers) = state.repository.list_triggers() else {
+        return;
+    };
+    let current_cursor = state.client().events().cursor().ok().flatten();
+    for trigger in triggers.into_iter().filter(|trigger| trigger.enabled) {
+        let TriggerCondition::GameEvent {
+            event_name,
+            device_code,
+        } = &trigger.condition
+        else {
+            continue;
+        };
+        let mut query = state.client().events().history().named(event_name);
+        if let Some(cursor) = &trigger.event_cursor {
+            query = query.after(cursor);
+        }
+        if let Some(device_code) = device_code {
+            query = query.for_device(device_code);
+        }
+        let Ok(events) = query.collect().await else {
+            let _ = state
+                .repository
+                .set_trigger_error(trigger.id, Some("managed event history unavailable"));
+            continue;
+        };
+        for event in events {
+            if state.client().state().revision().is_err() {
+                let _ = state
+                    .repository
+                    .set_trigger_error(trigger.id, Some("managed projections unavailable"));
+                break;
+            }
+            claim_and_launch(
+                state,
+                trigger.clone(),
+                format!("event:{}", event.id),
+                None,
+                None,
+            )
+            .await;
+            let _ = state
+                .repository
+                .set_trigger_cursor(trigger.id, event.id.as_str());
+        }
+        if let Some(cursor) = &current_cursor {
+            let _ = state.repository.set_trigger_cursor(trigger.id, cursor);
+        }
+    }
+}
+
+async fn claim_and_launch(
+    state: &Arc<AppState>,
+    trigger: AutomationTrigger,
+    dedupe_key: String,
+    next_run_at: Option<i64>,
+    parent_id: Option<WorkflowId>,
+) {
+    let now = now_millis().unwrap_or_default();
+    match state
+        .repository
+        .claim_trigger_firing(trigger.id, &dedupe_key, now, next_run_at)
+    {
+        Ok(true) => {
+            if let Err(error) = launch_trigger(state, &trigger, parent_id).await {
+                let _ = state.repository.set_trigger_error(trigger.id, Some(&error));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(trigger_id = %trigger.id, error = %error, "trigger claim failed")
+        }
+    }
+}
+
+async fn launch_trigger(
+    state: &AppState,
+    trigger: &AutomationTrigger,
+    parent_id: Option<WorkflowId>,
+) -> Result<(), String> {
+    match trigger.target.operation_class {
+        TriggerTargetClass::Workflow => state
+            .catalogue
+            .create_workflow_with_parent(
+                &state.repository,
+                &trigger.target.kind,
+                trigger.target.parameters.clone(),
+                parent_id,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string()),
+        TriggerTargetClass::Action => {
+            let started_at = now_millis().map_err(|error| error.message)?;
+            match state
+                .catalogue
+                .run_action(
+                    state.client(),
+                    &trigger.target.kind,
+                    trigger.target.parameters.clone(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    let result = sanitize_result(result);
+                    let (summary, status) = summarize_result(&result);
+                    persist_execution(
+                        state,
+                        FiniteExecutionClass::Action,
+                        &trigger.target.kind,
+                        status,
+                        started_at,
+                        Some(&result),
+                        None,
+                        summary,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    persist_execution(
+                        state,
+                        FiniteExecutionClass::Action,
+                        &trigger.target.kind,
+                        StoredFiniteExecutionStatus::Failed,
+                        started_at,
+                        None,
+                        Some("triggered action failed"),
+                        ResultSummary {
+                            failed: 1,
+                            ..ResultSummary::default()
+                        },
+                    );
+                    Err(error.to_string())
                 }
             }
         }
@@ -549,6 +806,325 @@ async fn finite_execution_history(
     Ok(Json(Versioned::current(FiniteExecutionHistoryResponse {
         executions,
     })))
+}
+
+async fn list_triggers(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<TriggerListResponse>>, ApiError> {
+    let triggers = state
+        .repository
+        .list_triggers()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .map(present_trigger)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(Versioned::current(TriggerListResponse { triggers })))
+}
+
+async fn create_trigger(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<CreateTriggerRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Versioned<ProtocolTrigger>>), ApiError> {
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid trigger definition"))?;
+    validate_trigger_request(&state, &request.name, &request.condition, &request.target)?;
+    let condition = stored_condition(&request.condition)?;
+    let now = now_millis()?;
+    let next_run_at = match condition {
+        TriggerCondition::Schedule { interval_millis } => Some(now.saturating_add(interval_millis)),
+        _ => None,
+    };
+    let event_cursor = matches!(condition, TriggerCondition::GameEvent { .. })
+        .then(|| state.client().events().cursor().ok().flatten())
+        .flatten();
+    let trigger = state
+        .repository
+        .create_trigger(NewTrigger {
+            name: request.name.trim().to_owned(),
+            condition,
+            target: stored_target(request.target)?,
+            enabled: request.enabled,
+            next_run_at,
+            event_cursor,
+        })
+        .map_err(ApiError::repository)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned::current(present_trigger(trigger)?)),
+    ))
+}
+
+async fn update_trigger(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<UpdateTriggerRequest>, JsonRejection>,
+) -> Result<Json<Versioned<ProtocolTrigger>>, ApiError> {
+    let id = parse_trigger_id(&id)?;
+    let current = state
+        .repository
+        .read_trigger(id)
+        .map_err(ApiError::repository)?
+        .ok_or_else(ApiError::not_found)?;
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid trigger definition"))?;
+    validate_trigger_request(&state, &request.name, &request.condition, &request.target)?;
+    let condition = stored_condition(&request.condition)?;
+    let now = now_millis()?;
+    let next_run_at = match condition {
+        TriggerCondition::Schedule { interval_millis } => Some(now.saturating_add(interval_millis)),
+        _ => None,
+    };
+    let event_cursor = if matches!(condition, TriggerCondition::GameEvent { .. }) {
+        current
+            .event_cursor
+            .or_else(|| state.client().events().cursor().ok().flatten())
+    } else {
+        None
+    };
+    let trigger = state
+        .repository
+        .update_trigger(
+            id,
+            request.expected_revision,
+            TriggerState {
+                name: request.name.trim().to_owned(),
+                condition,
+                target: stored_target(request.target)?,
+                enabled: request.enabled,
+                next_run_at,
+                event_cursor,
+            },
+        )
+        .map_err(ApiError::repository)?;
+    Ok(Json(Versioned::current(present_trigger(trigger)?)))
+}
+
+async fn delete_trigger(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state
+        .repository
+        .delete_trigger(parse_trigger_id(&id)?)
+        .map_err(ApiError::repository)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+async fn fire_trigger(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Versioned<ProtocolTrigger>>, ApiError> {
+    let id = parse_trigger_id(&id)?;
+    let trigger = state
+        .repository
+        .read_trigger(id)
+        .map_err(ApiError::repository)?
+        .ok_or_else(ApiError::not_found)?;
+    if !matches!(trigger.condition, TriggerCondition::Manual) {
+        return Err(ApiError::invalid(
+            "only manual triggers can be fired directly",
+        ));
+    }
+    if !trigger.enabled {
+        return Err(ApiError::invalid("trigger is disabled"));
+    }
+    let claimed = state
+        .repository
+        .claim_trigger_firing(
+            id,
+            &format!("manual:{}", TriggerId::new()),
+            now_millis()?,
+            None,
+        )
+        .map_err(ApiError::repository)?;
+    if claimed && let Err(error) = launch_trigger(&state, &trigger, None).await {
+        state
+            .repository
+            .set_trigger_error(id, Some(&error))
+            .map_err(ApiError::repository)?;
+        return Err(ApiError::invalid("trigger launch failed"));
+    }
+    let trigger = state
+        .repository
+        .read_trigger(id)
+        .map_err(ApiError::repository)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(Versioned::current(present_trigger(trigger)?)))
+}
+
+fn validate_trigger_request(
+    state: &AppState,
+    name: &str,
+    condition: &ProtocolTriggerCondition,
+    target: &ProtocolTriggerTarget,
+) -> Result<(), ApiError> {
+    if name.trim().is_empty() || name.len() > 128 {
+        return Err(ApiError::invalid(
+            "trigger name must contain 1 to 128 characters",
+        ));
+    }
+    let trigger_kind = match condition {
+        ProtocolTriggerCondition::Manual => replicant_protocol::TriggerKind::Manual,
+        ProtocolTriggerCondition::Schedule { interval_seconds } if *interval_seconds > 0 => {
+            replicant_protocol::TriggerKind::Schedule
+        }
+        ProtocolTriggerCondition::Schedule { .. } => {
+            return Err(ApiError::invalid(
+                "schedule interval must be at least one second",
+            ));
+        }
+        ProtocolTriggerCondition::GameEvent { event_name, .. } if !event_name.trim().is_empty() => {
+            replicant_protocol::TriggerKind::GameEvent
+        }
+        ProtocolTriggerCondition::GameEvent { .. } => {
+            return Err(ApiError::invalid("game event name cannot be empty"));
+        }
+        ProtocolTriggerCondition::StateCondition { .. } => {
+            replicant_protocol::TriggerKind::StateCondition
+        }
+        ProtocolTriggerCondition::ParentWorkflow { status, .. }
+            if matches!(
+                status,
+                ProtocolStatus::Succeeded | ProtocolStatus::Failed | ProtocolStatus::Cancelled
+            ) =>
+        {
+            replicant_protocol::TriggerKind::ParentWorkflow
+        }
+        ProtocolTriggerCondition::ParentWorkflow { .. } => {
+            return Err(ApiError::invalid("parent workflow status must be terminal"));
+        }
+    };
+    if !matches!(
+        target.operation_class,
+        OperationClass::Action | OperationClass::Workflow
+    ) {
+        return Err(ApiError::invalid(
+            "triggers can launch only actions or workflows",
+        ));
+    }
+    state
+        .catalogue
+        .validate_invocation(
+            target.operation_class,
+            &target.kind.0,
+            target.parameters.clone(),
+        )
+        .map_err(ApiError::catalogue)?;
+    if target.operation_class == OperationClass::Workflow
+        && !state
+            .catalogue
+            .descriptors()
+            .workflows
+            .iter()
+            .any(|descriptor| {
+                descriptor.kind == target.kind
+                    && descriptor.supported_triggers.contains(&trigger_kind)
+            })
+    {
+        return Err(ApiError::invalid(
+            "workflow does not support this trigger kind",
+        ));
+    }
+    Ok(())
+}
+
+fn stored_condition(condition: &ProtocolTriggerCondition) -> Result<TriggerCondition, ApiError> {
+    Ok(match condition {
+        ProtocolTriggerCondition::Manual => TriggerCondition::Manual,
+        ProtocolTriggerCondition::Schedule { interval_seconds } => TriggerCondition::Schedule {
+            interval_millis: i64::try_from(*interval_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000))
+                .ok_or_else(|| ApiError::invalid("schedule interval is too large"))?,
+        },
+        ProtocolTriggerCondition::GameEvent {
+            event_name,
+            device_code,
+        } => TriggerCondition::GameEvent {
+            event_name: event_name.clone(),
+            device_code: device_code.clone(),
+        },
+        ProtocolTriggerCondition::StateCondition { minimum_revision } => {
+            TriggerCondition::StateCondition {
+                minimum_revision: *minimum_revision,
+            }
+        }
+        ProtocolTriggerCondition::ParentWorkflow {
+            parent_kind,
+            status,
+        } => TriggerCondition::ParentWorkflow {
+            parent_kind: parent_kind
+                .as_ref()
+                .map(|kind| WorkflowKind::new(kind.0.clone()))
+                .transpose()
+                .map_err(ApiError::repository)?,
+            status: stored_status(*status),
+        },
+    })
+}
+
+fn stored_target(target: ProtocolTriggerTarget) -> Result<TriggerTarget, ApiError> {
+    let operation_class = match target.operation_class {
+        OperationClass::Action => TriggerTargetClass::Action,
+        OperationClass::Workflow => TriggerTargetClass::Workflow,
+        OperationClass::Report => {
+            return Err(ApiError::invalid("reports cannot be trigger targets"));
+        }
+    };
+    Ok(TriggerTarget {
+        operation_class,
+        kind: target.kind.0,
+        parameters: target.parameters,
+    })
+}
+
+fn present_trigger(trigger: AutomationTrigger) -> Result<ProtocolTrigger, ApiError> {
+    let condition = match trigger.condition {
+        TriggerCondition::Manual => ProtocolTriggerCondition::Manual,
+        TriggerCondition::Schedule { interval_millis } => ProtocolTriggerCondition::Schedule {
+            interval_seconds: u64::try_from(interval_millis / 1_000)
+                .map_err(|_| ApiError::invalid("invalid stored schedule interval"))?,
+        },
+        TriggerCondition::GameEvent {
+            event_name,
+            device_code,
+        } => ProtocolTriggerCondition::GameEvent {
+            event_name,
+            device_code,
+        },
+        TriggerCondition::StateCondition { minimum_revision } => {
+            ProtocolTriggerCondition::StateCondition { minimum_revision }
+        }
+        TriggerCondition::ParentWorkflow {
+            parent_kind,
+            status,
+        } => ProtocolTriggerCondition::ParentWorkflow {
+            parent_kind: parent_kind.map(|kind| OperationKind(kind.to_string())),
+            status: protocol_status(status),
+        },
+    };
+    Ok(ProtocolTrigger {
+        id: ProtocolTriggerId(trigger.id.to_string()),
+        name: trigger.name,
+        condition,
+        target: ProtocolTriggerTarget {
+            operation_class: match trigger.target.operation_class {
+                TriggerTargetClass::Action => OperationClass::Action,
+                TriggerTargetClass::Workflow => OperationClass::Workflow,
+            },
+            kind: OperationKind(trigger.target.kind),
+            parameters: trigger.target.parameters,
+        },
+        enabled: trigger.enabled,
+        created_at_ms: trigger.created_at,
+        updated_at_ms: trigger.updated_at,
+        last_fired_at_ms: trigger.last_fired_at,
+        next_run_at_ms: trigger.next_run_at,
+        last_error: trigger.last_error,
+        revision: trigger.revision,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -872,6 +1448,11 @@ fn parse_id(id: &str) -> Result<WorkflowId, ApiError> {
         .map_err(|_| ApiError::invalid("invalid workflow id"))
 }
 
+fn parse_trigger_id(id: &str) -> Result<TriggerId, ApiError> {
+    id.parse()
+        .map_err(|_| ApiError::invalid("invalid trigger id"))
+}
+
 fn summary(instance: &WorkflowInstance) -> WorkflowSummary {
     WorkflowSummary {
         id: ProtocolWorkflowId(instance.id.to_string()),
@@ -955,6 +1536,19 @@ fn protocol_status(status: WorkflowStatus) -> ProtocolStatus {
         WorkflowStatus::Succeeded => ProtocolStatus::Succeeded,
         WorkflowStatus::Failed => ProtocolStatus::Failed,
         WorkflowStatus::Cancelled => ProtocolStatus::Cancelled,
+    }
+}
+
+fn stored_status(status: ProtocolStatus) -> WorkflowStatus {
+    match status {
+        ProtocolStatus::Queued => WorkflowStatus::Queued,
+        ProtocolStatus::Running => WorkflowStatus::Running,
+        ProtocolStatus::Waiting => WorkflowStatus::Waiting,
+        ProtocolStatus::Paused => WorkflowStatus::Paused,
+        ProtocolStatus::Reconciling => WorkflowStatus::Reconciling,
+        ProtocolStatus::Succeeded => WorkflowStatus::Succeeded,
+        ProtocolStatus::Failed => WorkflowStatus::Failed,
+        ProtocolStatus::Cancelled => WorkflowStatus::Cancelled,
     }
 }
 
@@ -1361,6 +1955,108 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json(response).await["payload"]["code"], "invalid_request");
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn trigger_routes_crud_and_manual_fire_are_durable() {
+        let (app, client, state) = test_app().await;
+        let target = serde_json::json!({
+            "operation_class": "workflow",
+            "kind": "relay.expansion",
+            "parameters": {
+                "replicant": "TEST-1",
+                "hub": "SOL-HUB",
+                "targets_csv": "ALPHA,BETA",
+                "mission_file": "relay-test.json"
+            }
+        });
+        let create = serde_json::json!({
+            "name": "manual relay",
+            "condition": { "kind": "manual" },
+            "target": target,
+            "enabled": false
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/triggers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = json(response).await;
+        let id = created["payload"]["id"].as_str().expect("trigger id");
+
+        let update = serde_json::json!({
+            "expected_revision": 0,
+            "name": "manual relay",
+            "condition": { "kind": "manual" },
+            "target": target,
+            "enabled": true
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/triggers/{id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["payload"]["enabled"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/triggers/{id}/fire"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json(response).await["payload"]["last_fired_at_ms"].is_number());
+        assert_eq!(state.repository.list().expect("workflows").len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/triggers")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            json(response).await["payload"]["triggers"]
+                .as_array()
+                .expect("triggers")
+                .len(),
+            1
+        );
+
+        let response = app
+            .oneshot(
+                Request::delete(format!("/api/triggers/{id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .repository
+                .list_triggers()
+                .expect("triggers")
+                .is_empty()
+        );
         client.close().await.expect("close client");
     }
 

@@ -1,9 +1,157 @@
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use crate::RepositoryError;
+
+/// Stable identifier for a persisted automation trigger.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TriggerId(Uuid);
+
+impl TriggerId {
+    /// Creates a unique trigger identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TriggerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for TriggerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for TriggerId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+/// Registered operation class launched by a trigger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerTargetClass {
+    /// Finite mutating action.
+    Action,
+    /// Durable workflow.
+    Workflow,
+}
+
+/// Registered action or workflow invocation persisted with a trigger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TriggerTarget {
+    /// Operation lifecycle class.
+    pub operation_class: TriggerTargetClass,
+    /// Stable registered operation kind.
+    pub kind: String,
+    /// Typed descriptor parameters at the JSON boundary.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, serde_json::Value>,
+}
+
+/// Durable condition that can launch a registered action or workflow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TriggerCondition {
+    /// Explicit local-client invocation.
+    Manual,
+    /// Repeating fixed interval schedule.
+    Schedule {
+        /// Interval between firings in milliseconds.
+        interval_millis: i64,
+    },
+    /// Exact managed game event delivered through the SSE-backed journal.
+    GameEvent {
+        /// Open dotted managed event name.
+        event_name: String,
+        /// Optional device-code filter.
+        device_code: Option<String>,
+    },
+    /// Fires once when the durable managed projection reaches a revision.
+    StateCondition {
+        /// Minimum managed projection revision.
+        minimum_revision: u64,
+    },
+    /// Fires once for each matching terminal parent workflow.
+    ParentWorkflow {
+        /// Optional exact registered parent workflow kind.
+        parent_kind: Option<WorkflowKind>,
+        /// Required terminal parent status.
+        status: WorkflowStatus,
+    },
+}
+
+/// Input used to create a persisted automation trigger.
+pub struct NewTrigger {
+    /// Human-readable trigger name.
+    pub name: String,
+    /// Durable launch condition.
+    pub condition: TriggerCondition,
+    /// Registered action or workflow invocation.
+    pub target: TriggerTarget,
+    /// Whether automatic or manual firing is permitted.
+    pub enabled: bool,
+    /// First due time for a schedule, in Unix milliseconds.
+    pub next_run_at: Option<i64>,
+    /// Initial managed event cursor for event triggers.
+    pub event_cursor: Option<String>,
+}
+
+/// Complete editable trigger definition.
+pub struct TriggerState {
+    /// Human-readable trigger name.
+    pub name: String,
+    /// Durable launch condition.
+    pub condition: TriggerCondition,
+    /// Registered action or workflow invocation.
+    pub target: TriggerTarget,
+    /// Whether firing is permitted.
+    pub enabled: bool,
+    /// Next due schedule time, in Unix milliseconds.
+    pub next_run_at: Option<i64>,
+    /// Durable managed event cursor.
+    pub event_cursor: Option<String>,
+}
+
+/// Persisted automation trigger and its visible status.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationTrigger {
+    /// Stable trigger identifier.
+    pub id: TriggerId,
+    /// Human-readable trigger name.
+    pub name: String,
+    /// Durable launch condition.
+    pub condition: TriggerCondition,
+    /// Registered action or workflow invocation.
+    pub target: TriggerTarget,
+    /// Whether firing is permitted.
+    pub enabled: bool,
+    /// Creation time in Unix milliseconds.
+    pub created_at: i64,
+    /// Last update time in Unix milliseconds.
+    pub updated_at: i64,
+    /// Most recent claimed firing time.
+    pub last_fired_at: Option<i64>,
+    /// Next due schedule time.
+    pub next_run_at: Option<i64>,
+    /// Most recent launch or evaluation error.
+    pub last_error: Option<String>,
+    /// Last managed event cursor consumed by this trigger.
+    pub event_cursor: Option<String>,
+    /// Optimistic concurrency revision.
+    pub revision: u64,
+}
 
 /// Application-level class for one persisted finite execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -6,6 +6,7 @@ import {
   parseLiveMessage,
   parseSnapshotResponse,
   parseSystemSceneResponse,
+  parseTriggerListResponse,
 } from "./protocol";
 
 describe("parseHealthResponse", () => {
@@ -127,5 +128,34 @@ describe("parseHealthResponse", () => {
     expect(scene.markers[0]?.entity.kind).toBe("location");
     expect(scene.markers[0]?.in_habitable_zone).toBe(true);
     expect(scene.markers[0]?.position.x).toBe(1.25);
+  });
+
+  it("parses durable trigger status", () => {
+    const triggers = parseTriggerListResponse({
+      protocol_version: 1,
+      payload: {
+        triggers: [
+          {
+            id: "trigger-1",
+            name: "hourly survey",
+            condition: { kind: "schedule", interval_seconds: 3600 },
+            target: {
+              operation_class: "workflow",
+              kind: "survey.route",
+              parameters: {},
+            },
+            enabled: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_fired_at_ms: null,
+            next_run_at_ms: 3,
+            last_error: null,
+            revision: 0,
+          },
+        ],
+      },
+    }).payload;
+    expect(triggers[0]?.condition.kind).toBe("schedule");
+    expect(triggers[0]?.next_run_at_ms).toBe(3);
   });
 });

@@ -3,7 +3,7 @@
 use std::{error::Error, sync::Arc};
 
 use replicant_runtime::{config::ManagedClientConfig, config::RuntimeConfig, start_managed_client};
-use replicant_server::{AppState, DaemonConfig, router, run_supervisor};
+use replicant_server::{AppState, DaemonConfig, router, run_supervisor, run_trigger_engine};
 use replicant_workflow::WorkflowRepository;
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::EnvFilter;
@@ -28,12 +28,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let supervisor = tokio::spawn(run_supervisor(state.clone(), shutdown_rx.clone()));
+    let triggers = tokio::spawn(run_trigger_engine(state.clone(), shutdown_rx.clone()));
     let signal = tokio::spawn(shutdown_signal(shutdown_tx.clone()));
     let server_result = axum::serve(listener, router(state))
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
         .await;
     let _ = shutdown_tx.send(true);
     supervisor.await?;
+    triggers.await?;
     signal.abort();
     client.close().await?;
     server_result?;

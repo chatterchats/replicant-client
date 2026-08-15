@@ -107,6 +107,19 @@ impl OperationCatalogue {
         self.workflow_registry.clone()
     }
 
+    /// Validates a registered invocation without executing it.
+    pub fn validate_invocation(
+        &self,
+        class: OperationClass,
+        kind: &str,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<(), CatalogueError> {
+        let kind = self
+            .resolve_kind(class, kind)
+            .ok_or_else(|| unknown(class, kind))?;
+        self.validate(class, kind, parameters, false).map(drop)
+    }
+
     /// Returns whether an operation applies to an entity context.
     #[must_use]
     pub fn is_applicable(&self, class: OperationClass, kind: &str, entity: &EntityKind) -> bool {
@@ -173,26 +186,40 @@ impl OperationCatalogue {
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<WorkflowInstance, CatalogueError> {
+        self.create_workflow_with_parent(repository, kind, parameters, None)
+    }
+
+    /// Validates and persists a workflow linked to a parent orchestration.
+    pub fn create_workflow_with_parent(
+        &self,
+        repository: &WorkflowRepository,
+        kind: &str,
+        parameters: BTreeMap<String, Value>,
+        parent_id: Option<replicant_workflow::WorkflowId>,
+    ) -> Result<WorkflowInstance, CatalogueError> {
         let kind = self
             .resolve_kind(OperationClass::Workflow, kind)
             .ok_or_else(|| unknown(OperationClass::Workflow, kind))?;
         let parameters = self.validate(OperationClass::Workflow, kind, parameters, false)?;
-        let instance = match kind {
+        match kind {
             "survey.route" => {
                 let parameters: SurveyStart = decode(parameters)?;
-                repository.create(new_survey_workflow(SurveyWorkflowConfig {
+                let mut workflow = new_survey_workflow(SurveyWorkflowConfig {
                     options: parameters.into_options(),
-                }))?
+                });
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
             }
             "relay.expansion" => {
                 let parameters: RelayStart = decode(parameters)?;
-                repository.create(new_relay_workflow(RelayWorkflowConfig {
+                let mut workflow = new_relay_workflow(RelayWorkflowConfig {
                     request: parameters.into_request(),
-                }))?
+                });
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
             }
-            _ => return Err(unknown(OperationClass::Workflow, kind)),
-        };
-        Ok(instance)
+            _ => Err(unknown(OperationClass::Workflow, kind)),
+        }
     }
 
     fn resolve_kind<'a>(&'a self, class: OperationClass, kind: &str) -> Option<&'a str> {
@@ -618,7 +645,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                     None,
                 ),
             ],
-            supported_triggers: vec![TriggerKind::Manual],
+            supported_triggers: all_trigger_kinds(),
         },
         WorkflowDescriptor {
             kind: operation_kind(relay_workflow_kind().as_str()),
@@ -663,8 +690,18 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                     None,
                 ),
             ],
-            supported_triggers: vec![TriggerKind::Manual],
+            supported_triggers: all_trigger_kinds(),
         },
+    ]
+}
+
+fn all_trigger_kinds() -> Vec<TriggerKind> {
+    vec![
+        TriggerKind::Manual,
+        TriggerKind::Schedule,
+        TriggerKind::GameEvent,
+        TriggerKind::StateCondition,
+        TriggerKind::ParentWorkflow,
     ]
 }
 

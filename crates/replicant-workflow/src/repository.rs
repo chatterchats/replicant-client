@@ -11,9 +11,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass, FiniteExecutionStatus, NewWorkflow,
-    ResourceClaim, ResourceKey, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind,
-    WorkflowState, WorkflowStatus,
+    AutomationTrigger, ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass,
+    FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim, ResourceKey, TriggerId,
+    TriggerState, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
+    WorkflowStatus,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
@@ -22,7 +23,8 @@ const RESOURCE_CLAIMS_SCHEMA: &str = include_str!("../migrations/0003_resource_c
 const WAIT_INTENT_SCHEMA: &str = include_str!("../migrations/0004_wait_intent.sql");
 const FINITE_EXECUTION_SCHEMA: &str =
     include_str!("../migrations/0005_finite_execution_history.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 5;
+const AUTOMATION_TRIGGER_SCHEMA: &str = include_str!("../migrations/0006_automation_triggers.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 6;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +47,9 @@ pub enum RepositoryError {
     /// A malformed workflow ID was found in SQLite.
     #[error("invalid persisted workflow ID {0:?}")]
     InvalidStoredId(String),
+    /// A malformed trigger ID was found in SQLite.
+    #[error("invalid persisted trigger ID {0:?}")]
+    InvalidStoredTriggerId(String),
     /// A malformed negative revision was found in SQLite.
     #[error("invalid persisted workflow revision {0}")]
     InvalidStoredRevision(i64),
@@ -89,6 +94,17 @@ pub enum RepositoryError {
     ConcurrentUpdate {
         /// Workflow ID.
         id: WorkflowId,
+        /// Revision supplied by the caller.
+        expected: u64,
+    },
+    /// No trigger has the requested ID.
+    #[error("trigger {0} was not found")]
+    TriggerNotFound(TriggerId),
+    /// Another writer updated this trigger row first.
+    #[error("trigger {id} revision changed; expected {expected}")]
+    ConcurrentTriggerUpdate {
+        /// Trigger ID.
+        id: TriggerId,
         /// Revision supplied by the caller.
         expected: u64,
     },
@@ -189,7 +205,186 @@ impl WorkflowRepository {
                 [],
             )?;
         }
+        if found < 6 {
+            transaction.execute_batch(AUTOMATION_TRIGGER_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (6)",
+                [],
+            )?;
+        }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Creates a persisted trigger definition.
+    pub fn create_trigger(
+        &self,
+        trigger: NewTrigger,
+    ) -> Result<AutomationTrigger, RepositoryError> {
+        let id = TriggerId::new();
+        let now = now_millis()?;
+        let condition = serde_json::to_string(&trigger.condition)?;
+        let target = serde_json::to_string(&trigger.target)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO automation_triggers (
+                id, name, condition_json, target_json, enabled, created_at, updated_at,
+                next_run_at, event_cursor
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+            params![
+                id.to_string(),
+                trigger.name,
+                condition,
+                target,
+                trigger.enabled,
+                now,
+                trigger.next_run_at,
+                trigger.event_cursor,
+            ],
+        )?;
+        let trigger =
+            read_trigger_in(&transaction, id)?.ok_or(RepositoryError::TriggerNotFound(id))?;
+        transaction.commit()?;
+        Ok(trigger)
+    }
+
+    /// Reads one persisted trigger.
+    pub fn read_trigger(
+        &self,
+        id: TriggerId,
+    ) -> Result<Option<AutomationTrigger>, RepositoryError> {
+        let connection = self.connection()?;
+        read_trigger_in(&connection, id)
+    }
+
+    /// Lists trigger definitions in creation order.
+    pub fn list_triggers(&self) -> Result<Vec<AutomationTrigger>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM automation_triggers ORDER BY created_at, id"
+        ))?;
+        let rows = statement.query_map([], row_to_trigger)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Replaces an editable trigger definition with optimistic concurrency.
+    pub fn update_trigger(
+        &self,
+        id: TriggerId,
+        expected_revision: u64,
+        state: TriggerState,
+    ) -> Result<AutomationTrigger, RepositoryError> {
+        let expected = i64::try_from(expected_revision)
+            .map_err(|_| RepositoryError::RevisionOutOfRange(expected_revision))?;
+        let now = now_millis()?;
+        let condition = serde_json::to_string(&state.condition)?;
+        let target = serde_json::to_string(&state.target)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_trigger_in(&transaction, id)?.is_none() {
+            return Err(RepositoryError::TriggerNotFound(id));
+        }
+        let changed = transaction.execute(
+            "UPDATE automation_triggers SET name = ?1, condition_json = ?2, target_json = ?3,
+                enabled = ?4, next_run_at = ?5, event_cursor = ?6, updated_at = ?7,
+                last_error = NULL, revision = revision + 1
+             WHERE id = ?8 AND revision = ?9",
+            params![
+                state.name,
+                condition,
+                target,
+                state.enabled,
+                state.next_run_at,
+                state.event_cursor,
+                now,
+                id.to_string(),
+                expected,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::ConcurrentTriggerUpdate {
+                id,
+                expected: expected_revision,
+            });
+        }
+        let trigger =
+            read_trigger_in(&transaction, id)?.ok_or(RepositoryError::TriggerNotFound(id))?;
+        transaction.commit()?;
+        Ok(trigger)
+    }
+
+    /// Deletes a trigger and its dedupe receipts.
+    pub fn delete_trigger(&self, id: TriggerId) -> Result<bool, RepositoryError> {
+        Ok(self.connection()?.execute(
+            "DELETE FROM automation_triggers WHERE id = ?1",
+            [id.to_string()],
+        )? != 0)
+    }
+
+    /// Atomically claims one logical firing. Duplicate keys never launch twice.
+    pub fn claim_trigger_firing(
+        &self,
+        id: TriggerId,
+        dedupe_key: &str,
+        fired_at: i64,
+        next_run_at: Option<i64>,
+    ) -> Result<bool, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enabled = transaction
+            .query_row(
+                "SELECT enabled FROM automation_triggers WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .ok_or(RepositoryError::TriggerNotFound(id))?;
+        if !enabled {
+            return Ok(false);
+        }
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO automation_trigger_firings (trigger_id, dedupe_key, claimed_at)
+             VALUES (?1, ?2, ?3)",
+            params![id.to_string(), dedupe_key, fired_at],
+        )? != 0;
+        if inserted {
+            transaction.execute(
+                "UPDATE automation_triggers SET last_fired_at = ?1, next_run_at = ?2,
+                    last_error = NULL, updated_at = ?1, revision = revision + 1 WHERE id = ?3",
+                params![fired_at, next_run_at, id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Advances one event trigger's durable managed-event cursor.
+    pub fn set_trigger_cursor(&self, id: TriggerId, cursor: &str) -> Result<(), RepositoryError> {
+        let changed = self.connection()?.execute(
+            "UPDATE automation_triggers SET event_cursor = ?1 WHERE id = ?2",
+            params![cursor, id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TriggerNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// Records a visible trigger evaluation or launch error.
+    pub fn set_trigger_error(
+        &self,
+        id: TriggerId,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let changed = self.connection()?.execute(
+            "UPDATE automation_triggers SET last_error = ?1, updated_at = ?2,
+                revision = revision + 1 WHERE id = ?3",
+            params![error, now_millis()?, id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::TriggerNotFound(id));
+        }
         Ok(())
     }
 
@@ -598,6 +793,59 @@ impl WorkflowRepository {
 const COLUMNS: &str = "id, kind, schema_version, config_json, checkpoint_json, status, \
                        current_step, created_at, updated_at, last_error, result_json, \
                        parent_id, revision, wait_intent_json";
+
+const TRIGGER_COLUMNS: &str = "id, name, condition_json, target_json, enabled, created_at, \
+                               updated_at, last_fired_at, next_run_at, last_error, \
+                               event_cursor, revision";
+
+fn read_trigger_in(
+    connection: &Connection,
+    id: TriggerId,
+) -> Result<Option<AutomationTrigger>, RepositoryError> {
+    connection
+        .query_row(
+            &format!("SELECT {TRIGGER_COLUMNS} FROM automation_triggers WHERE id = ?1"),
+            [id.to_string()],
+            row_to_trigger,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn row_to_trigger(row: &rusqlite::Row<'_>) -> Result<AutomationTrigger, rusqlite::Error> {
+    let stored_id = row.get::<_, String>(0)?;
+    let revision = row.get::<_, i64>(11)?;
+    Ok(AutomationTrigger {
+        id: TriggerId::from_str(&stored_id).map_err(|_| {
+            to_sql_conversion_error(RepositoryError::InvalidStoredTriggerId(stored_id))
+        })?,
+        name: row.get(1)?,
+        condition: serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        target: serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        enabled: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        last_fired_at: row.get(7)?,
+        next_run_at: row.get(8)?,
+        last_error: row.get(9)?,
+        event_cursor: row.get(10)?,
+        revision: u64::try_from(revision).map_err(|_| {
+            to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
+        })?,
+    })
+}
 
 fn read_in(
     connection: &Connection,

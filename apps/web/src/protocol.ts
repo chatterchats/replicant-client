@@ -57,6 +57,44 @@ export interface WorkflowSummary {
   updated_at_ms: number;
 }
 
+export type TriggerCondition =
+  | { kind: "manual" }
+  | { kind: "schedule"; interval_seconds: number }
+  | { kind: "game_event"; event_name: string; device_code: string | null }
+  | { kind: "state_condition"; minimum_revision: number }
+  | {
+      kind: "parent_workflow";
+      parent_kind: string | null;
+      status: WorkflowStatus;
+    };
+
+export interface TriggerTarget {
+  operation_class: "action" | "workflow";
+  kind: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface AutomationTrigger {
+  id: string;
+  name: string;
+  condition: TriggerCondition;
+  target: TriggerTarget;
+  enabled: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_fired_at_ms: number | null;
+  next_run_at_ms: number | null;
+  last_error: string | null;
+  revision: number;
+}
+
+export interface TriggerRequest {
+  name: string;
+  condition: TriggerCondition;
+  target: TriggerTarget;
+  enabled: boolean;
+}
+
 export type ParameterKind =
   | { type: "string" | "integer" | "number" | "boolean" | "enum" }
   | {
@@ -436,6 +474,104 @@ function workflow(value: unknown): WorkflowSummary {
     current_step: nullableString(item.current_step, "workflow step"),
     revision: number(item.revision, "workflow revision"),
     updated_at_ms: number(item.updated_at_ms, "workflow update time"),
+  };
+}
+
+function trigger(value: unknown): AutomationTrigger {
+  const item = record(value, "automation trigger");
+  const rawCondition = record(item.condition, "trigger condition");
+  const kind = oneOf(
+    rawCondition.kind,
+    [
+      "manual",
+      "schedule",
+      "game_event",
+      "state_condition",
+      "parent_workflow",
+    ] as const,
+    "trigger kind",
+  );
+  let condition: TriggerCondition;
+  switch (kind) {
+    case "manual":
+      condition = { kind };
+      break;
+    case "schedule":
+      condition = {
+        kind,
+        interval_seconds: number(
+          rawCondition.interval_seconds,
+          "schedule interval",
+        ),
+      };
+      break;
+    case "game_event":
+      if (typeof rawCondition.event_name !== "string")
+        throw new Error("Invalid game event name");
+      condition = {
+        kind,
+        event_name: rawCondition.event_name,
+        device_code: nullableString(
+          rawCondition.device_code,
+          "event device code",
+        ),
+      };
+      break;
+    case "state_condition":
+      condition = {
+        kind,
+        minimum_revision: number(
+          rawCondition.minimum_revision,
+          "minimum state revision",
+        ),
+      };
+      break;
+    case "parent_workflow":
+      condition = {
+        kind,
+        parent_kind: nullableString(rawCondition.parent_kind, "parent kind"),
+        status: oneOf(
+          rawCondition.status,
+          workflowStatuses,
+          "parent workflow status",
+        ),
+      };
+      break;
+  }
+  const rawTarget = record(item.target, "trigger target");
+  if (
+    typeof item.id !== "string" ||
+    typeof item.name !== "string" ||
+    typeof item.enabled !== "boolean" ||
+    typeof rawTarget.kind !== "string"
+  )
+    throw new Error("Invalid trigger");
+  return {
+    id: item.id,
+    name: item.name,
+    condition,
+    target: {
+      operation_class: oneOf(
+        rawTarget.operation_class,
+        ["action", "workflow"] as const,
+        "trigger target class",
+      ),
+      kind: rawTarget.kind,
+      parameters: record(rawTarget.parameters, "trigger parameters"),
+    },
+    enabled: item.enabled,
+    created_at_ms: number(item.created_at_ms, "trigger creation time"),
+    updated_at_ms: number(item.updated_at_ms, "trigger update time"),
+    last_fired_at_ms:
+      item.last_fired_at_ms === null
+        ? null
+        : number(item.last_fired_at_ms, "last trigger time"),
+    next_run_at_ms:
+      item.next_run_at_ms === null
+        ? null
+        : number(item.next_run_at_ms, "next trigger time"),
+    last_error: nullableString(item.last_error, "trigger error"),
+    revision: number(item.revision, "trigger revision"),
   };
 }
 
@@ -974,6 +1110,22 @@ export function parseFiniteExecutionHistoryResponse(
       throw new Error("Invalid finite execution history");
     return item.executions.map(finiteExecution);
   });
+}
+
+export function parseTriggerListResponse(
+  value: unknown,
+): Versioned<AutomationTrigger[]> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "trigger list response");
+    if (!Array.isArray(item.triggers)) throw new Error("Invalid trigger list");
+    return item.triggers.map(trigger);
+  });
+}
+
+export function parseTriggerResponse(
+  value: unknown,
+): Versioned<AutomationTrigger> {
+  return envelope(value, trigger);
 }
 
 export function parseWorkflowResponse(

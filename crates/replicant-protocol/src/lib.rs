@@ -35,6 +35,11 @@ impl<T> Versioned<T> {
 #[serde(transparent)]
 pub struct WorkflowId(pub String);
 
+/// Stable identifier for a persisted automation trigger.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TriggerId(pub String);
+
 /// Stable identifier for a registered report, action, or workflow kind.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -749,6 +754,112 @@ pub enum TriggerKind {
     StateCondition,
     /// Started by another workflow.
     ParentWorkflow,
+}
+
+/// Durable automation condition. Game events come from the managed SSE journal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TriggerCondition {
+    /// Explicit local-client invocation.
+    Manual,
+    /// Repeating fixed interval.
+    Schedule {
+        /// Interval between firings in whole seconds.
+        interval_seconds: u64,
+    },
+    /// Exact normalized managed game event.
+    GameEvent {
+        /// Open dotted event name.
+        event_name: String,
+        /// Optional device-code filter.
+        device_code: Option<String>,
+    },
+    /// Fires once when managed projections reach a revision.
+    StateCondition {
+        /// Minimum managed projection revision.
+        minimum_revision: u64,
+    },
+    /// Fires for matching terminal parent workflows.
+    ParentWorkflow {
+        /// Optional exact registered parent workflow kind.
+        parent_kind: Option<OperationKind>,
+        /// Required terminal parent status.
+        status: WorkflowStatus,
+    },
+}
+
+/// Registered action or workflow launched by a trigger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TriggerTarget {
+    /// Action or workflow. Reports cannot mutate automatically.
+    pub operation_class: OperationClass,
+    /// Stable registered operation kind.
+    pub kind: OperationKind,
+    /// Descriptor parameters.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, Value>,
+}
+
+/// Persisted trigger definition and visible evaluation status.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationTrigger {
+    /// Stable trigger identifier.
+    pub id: TriggerId,
+    /// Human-readable name.
+    pub name: String,
+    /// Durable condition.
+    pub condition: TriggerCondition,
+    /// Registered launch target.
+    pub target: TriggerTarget,
+    /// Explicit firing permission.
+    pub enabled: bool,
+    /// Creation time in Unix milliseconds.
+    pub created_at_ms: i64,
+    /// Last update time in Unix milliseconds.
+    pub updated_at_ms: i64,
+    /// Most recent claimed firing time.
+    pub last_fired_at_ms: Option<i64>,
+    /// Next schedule time.
+    pub next_run_at_ms: Option<i64>,
+    /// Most recent sanitized evaluation or launch error.
+    pub last_error: Option<String>,
+    /// Optimistic concurrency revision.
+    pub revision: u64,
+}
+
+/// Request to create a disabled or explicitly enabled trigger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreateTriggerRequest {
+    /// Human-readable name.
+    pub name: String,
+    /// Durable condition.
+    pub condition: TriggerCondition,
+    /// Registered launch target.
+    pub target: TriggerTarget,
+    /// Explicit firing permission.
+    pub enabled: bool,
+}
+
+/// Full trigger replacement request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UpdateTriggerRequest {
+    /// Revision returned by the most recent read.
+    pub expected_revision: u64,
+    /// Human-readable name.
+    pub name: String,
+    /// Durable condition.
+    pub condition: TriggerCondition,
+    /// Registered launch target.
+    pub target: TriggerTarget,
+    /// Explicit firing permission.
+    pub enabled: bool,
+}
+
+/// Trigger collection returned to local frontends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TriggerListResponse {
+    /// Persisted definitions in creation order.
+    pub triggers: Vec<AutomationTrigger>,
 }
 
 /// Descriptor for a read-only report.

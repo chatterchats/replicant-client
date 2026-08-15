@@ -3,9 +3,12 @@ import { useEffect, useMemo, useState } from "react";
 
 import { daemonApi } from "./api";
 import type {
+  AutomationTrigger,
   EntityKind,
   OperationDescriptor,
   ParameterDescriptor,
+  TriggerCondition,
+  TriggerRequest,
   WorkflowActivity,
   WorkflowDescriptor,
   WorkflowDetail,
@@ -289,6 +292,382 @@ function WorkflowForm({
   );
 }
 
+function TriggersView({
+  descriptors,
+  entities,
+}: {
+  descriptors: OperationDescriptor[];
+  entities: Record<string, unknown>;
+}) {
+  const targets = descriptors.filter(
+    (descriptor) => descriptor.operation_class !== "report",
+  );
+  const [triggers, setTriggers] = useState<AutomationTrigger[]>([]);
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<TriggerCondition["kind"]>("schedule");
+  const [targetKey, setTargetKey] = useState("");
+  const [values, setValues] = useState<Values>({});
+  const [interval, setInterval] = useState(3600);
+  const [eventName, setEventName] = useState("");
+  const [deviceCode, setDeviceCode] = useState("");
+  const [minimumRevision, setMinimumRevision] = useState(0);
+  const [parentKind, setParentKind] = useState("");
+  const [parentStatus, setParentStatus] = useState<WorkflowStatus>("succeeded");
+  const [enabled, setEnabled] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selected = targets.find(
+    (descriptor) =>
+      `${descriptor.operation_class}:${descriptor.kind}` === targetKey,
+  );
+
+  const reload = () =>
+    daemonApi
+      .triggers()
+      .then((items) => {
+        setTriggers(items);
+      })
+      .catch((reason: unknown) => {
+        setError(String(reason));
+      });
+
+  useEffect(() => {
+    void reload();
+    const timer = window.setInterval(() => {
+      void reload();
+    }, 5000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const requestFor = (trigger: AutomationTrigger): TriggerRequest => ({
+    name: trigger.name,
+    condition: trigger.condition,
+    target: trigger.target,
+    enabled: trigger.enabled,
+  });
+
+  const condition = (): TriggerCondition => {
+    switch (kind) {
+      case "manual":
+        return { kind };
+      case "schedule":
+        return { kind, interval_seconds: interval };
+      case "game_event":
+        return {
+          kind,
+          event_name: eventName,
+          device_code: deviceCode || null,
+        };
+      case "state_condition":
+        return { kind, minimum_revision: minimumRevision };
+      case "parent_workflow":
+        return {
+          kind,
+          parent_kind: parentKind || null,
+          status: parentStatus,
+        };
+    }
+  };
+
+  return (
+    <div className="triggers-layout">
+      <form
+        className="workflow-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!selected) {
+            setError("Select an action or workflow.");
+            return;
+          }
+          const validation = validateParameters(selected, values);
+          if (Object.keys(validation).length) {
+            setError(Object.values(validation)[0] ?? "Invalid parameters.");
+            return;
+          }
+          setError(null);
+          void daemonApi
+            .createTrigger({
+              name,
+              condition: condition(),
+              target: {
+                operation_class: selected.operation_class,
+                kind: selected.kind,
+                parameters: Object.fromEntries(
+                  Object.entries(values).filter(([, value]) => value !== ""),
+                ),
+              },
+              enabled,
+            })
+            .then((trigger) => {
+              setTriggers((items) => [...items, trigger]);
+              setName("");
+              setEnabled(false);
+            })
+            .catch((reason: unknown) => {
+              setError(String(reason));
+            });
+        }}
+      >
+        <header>
+          <h2>New trigger</h2>
+          <p>Automatic mutation stays off until you explicitly enable it.</p>
+        </header>
+        <div className="form-grid">
+          <label>
+            Name
+            <input
+              required
+              maxLength={128}
+              value={name}
+              onChange={(event) => {
+                setName(event.target.value);
+              }}
+            />
+          </label>
+          <label>
+            Trigger
+            <select
+              value={kind}
+              onChange={(event) => {
+                setKind(event.target.value as TriggerCondition["kind"]);
+              }}
+            >
+              <option value="manual">Manual</option>
+              <option value="schedule">Schedule</option>
+              <option value="game_event">Game event (SSE)</option>
+              <option value="state_condition">State revision</option>
+              <option value="parent_workflow">Parent workflow</option>
+            </select>
+          </label>
+          <label>
+            Target
+            <select
+              required
+              value={targetKey}
+              onChange={(event) => {
+                const next = targets.find(
+                  (descriptor) =>
+                    `${descriptor.operation_class}:${descriptor.kind}` ===
+                    event.target.value,
+                );
+                setTargetKey(event.target.value);
+                setValues(
+                  Object.fromEntries(
+                    (next?.parameters ?? []).map((item) => [
+                      item.name,
+                      item.default ?? "",
+                    ]),
+                  ),
+                );
+              }}
+            >
+              <option value="">Select target</option>
+              {targets
+                .filter(
+                  (descriptor) =>
+                    descriptor.operation_class === "action" ||
+                    descriptor.supported_triggers.includes(kind),
+                )
+                .map((descriptor) => (
+                  <option
+                    key={`${descriptor.operation_class}:${descriptor.kind}`}
+                    value={`${descriptor.operation_class}:${descriptor.kind}`}
+                  >
+                    {descriptor.display_name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          {kind === "schedule" ? (
+            <label>
+              Interval seconds
+              <input
+                min={1}
+                type="number"
+                value={interval}
+                onChange={(event) => {
+                  setInterval(event.target.valueAsNumber);
+                }}
+              />
+            </label>
+          ) : null}
+          {kind === "game_event" ? (
+            <>
+              <label>
+                Event name
+                <input
+                  required
+                  placeholder="mining.completed"
+                  value={eventName}
+                  onChange={(event) => {
+                    setEventName(event.target.value);
+                  }}
+                />
+              </label>
+              <label>
+                Device code (optional)
+                <input
+                  value={deviceCode}
+                  onChange={(event) => {
+                    setDeviceCode(event.target.value);
+                  }}
+                />
+              </label>
+            </>
+          ) : null}
+          {kind === "state_condition" ? (
+            <label>
+              Minimum managed revision
+              <input
+                min={0}
+                type="number"
+                value={minimumRevision}
+                onChange={(event) => {
+                  setMinimumRevision(event.target.valueAsNumber);
+                }}
+              />
+            </label>
+          ) : null}
+          {kind === "parent_workflow" ? (
+            <>
+              <label>
+                Parent kind (optional)
+                <select
+                  value={parentKind}
+                  onChange={(event) => {
+                    setParentKind(event.target.value);
+                  }}
+                >
+                  <option value="">Any workflow</option>
+                  {descriptors
+                    .filter(
+                      (descriptor) => descriptor.operation_class === "workflow",
+                    )
+                    .map((descriptor) => (
+                      <option key={descriptor.kind} value={descriptor.kind}>
+                        {descriptor.display_name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <label>
+                Parent status
+                <select
+                  value={parentStatus}
+                  onChange={(event) => {
+                    setParentStatus(event.target.value as WorkflowStatus);
+                  }}
+                >
+                  <option value="succeeded">Succeeded</option>
+                  <option value="failed">Failed</option>
+                  <option value="cancelled">Cancelled</option>
+                </select>
+              </label>
+            </>
+          ) : null}
+          <label className="boolean-field">
+            <input
+              checked={enabled}
+              type="checkbox"
+              onChange={(event) => {
+                setEnabled(event.target.checked);
+              }}
+            />
+            <span>Enabled</span>
+          </label>
+        </div>
+        {selected?.parameters.map((parameter) => (
+          <ParameterField
+            key={parameter.name}
+            parameter={parameter}
+            value={values[parameter.name]}
+            entities={entities}
+            onChange={(value) => {
+              setValues((current) => ({
+                ...current,
+                [parameter.name]: value,
+              }));
+            }}
+          />
+        ))}
+        {error ? <p className="form-error">{error}</p> : null}
+        <button className="primary" type="submit">
+          Save trigger
+        </button>
+      </form>
+      <section className="trigger-list" aria-label="Persisted triggers">
+        {triggers.length ? (
+          triggers.map((trigger) => (
+            <article key={trigger.id}>
+              <header>
+                <div>
+                  <strong>{trigger.name}</strong>
+                  <small>
+                    {trigger.condition.kind.replaceAll("_", " ")} →{" "}
+                    {trigger.target.kind}
+                  </small>
+                </div>
+                <span
+                  className={`status ${trigger.enabled ? "running" : "paused"}`}
+                >
+                  {trigger.enabled ? "enabled" : "disabled"}
+                </span>
+              </header>
+              <small>
+                Last fired:{" "}
+                {trigger.last_fired_at_ms
+                  ? new Date(trigger.last_fired_at_ms).toLocaleString()
+                  : "never"}
+                {trigger.next_run_at_ms
+                  ? ` · Next: ${new Date(trigger.next_run_at_ms).toLocaleString()}`
+                  : ""}
+              </small>
+              {trigger.last_error ? (
+                <p className="form-error">{trigger.last_error}</p>
+              ) : null}
+              <div className="workflow-actions">
+                <button
+                  onClick={() => {
+                    void daemonApi
+                      .updateTrigger(trigger.id, trigger.revision, {
+                        ...requestFor(trigger),
+                        enabled: !trigger.enabled,
+                      })
+                      .then(reload);
+                  }}
+                >
+                  {trigger.enabled ? "Disable" : "Enable"}
+                </button>
+                {trigger.condition.kind === "manual" ? (
+                  <button
+                    disabled={!trigger.enabled}
+                    onClick={() =>
+                      void daemonApi.fireTrigger(trigger.id).then(reload)
+                    }
+                  >
+                    Run
+                  </button>
+                ) : null}
+                <button
+                  className="danger"
+                  onClick={() =>
+                    void daemonApi.deleteTrigger(trigger.id).then(reload)
+                  }
+                >
+                  Delete
+                </button>
+              </div>
+            </article>
+          ))
+        ) : (
+          <p className="empty-state">No persisted triggers.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function targetSummary(
   detail: WorkflowDetail | undefined,
   descriptor: WorkflowDescriptor | undefined,
@@ -461,6 +840,9 @@ export function AutomationsPage({
 }) {
   const [tab, setTab] = useState<Tab>("Active");
   const [descriptors, setDescriptors] = useState<WorkflowDescriptor[]>([]);
+  const [triggerDescriptors, setTriggerDescriptors] = useState<
+    OperationDescriptor[]
+  >([]);
   const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [created, setCreated] = useState<WorkflowSummary[]>([]);
@@ -492,6 +874,7 @@ export function AutomationsPage({
       .descriptors(controller.signal)
       .then((catalog) => {
         setDescriptors(catalog.workflows);
+        setTriggerDescriptors([...catalog.actions, ...catalog.workflows]);
       })
       .catch((reason: unknown) => {
         setError(String(reason));
@@ -636,21 +1019,7 @@ export function AutomationsPage({
           )}
         </div>
       ) : tab === "Schedules" ? (
-        <section className="placeholder-card">
-          <h2>Schedules</h2>
-          <p>
-            Schedule-capable workflow descriptors will appear here when
-            persisted triggers arrive.
-          </p>
-          <small>
-            {
-              descriptors.filter((item) =>
-                item.supported_triggers.includes("schedule"),
-              ).length
-            }{" "}
-            templates currently support schedules.
-          </small>
-        </section>
+        <TriggersView descriptors={triggerDescriptors} entities={entities} />
       ) : (
         <section className="workflow-list" aria-label={`${tab} workflows`}>
           {visible.length ? (

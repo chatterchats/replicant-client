@@ -6,10 +6,13 @@ import {
   parseHealthResponse,
   parseOperationResponse,
   parseSnapshotResponse,
+  parseTriggerListResponse,
+  parseTriggerResponse,
   parseWorkflowActivityResponse,
   parseWorkflowDetailResponse,
   parseWorkflowResponse,
 } from "./protocol";
+import type { TriggerRequest } from "./protocol";
 
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const response = await fetch(path, { signal });
@@ -19,12 +22,21 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
 }
 
 async function post(path: string, body?: unknown): Promise<unknown> {
+  return send("POST", path, body);
+}
+
+async function send(
+  method: "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
   const response = await fetch(path, {
-    method: "POST",
+    method,
     headers:
       body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (response.status === 204) return null;
   const value = (await response.json()) as unknown;
   if (!response.ok) {
     const payload = (value as { payload?: { message?: unknown } }).payload;
@@ -70,6 +82,28 @@ export const daemonApi = {
   async history(signal?: AbortSignal) {
     return parseFiniteExecutionHistoryResponse(
       await get("/api/history", signal),
+    ).payload;
+  },
+  async triggers(signal?: AbortSignal) {
+    return parseTriggerListResponse(await get("/api/triggers", signal)).payload;
+  },
+  async createTrigger(request: TriggerRequest) {
+    return parseTriggerResponse(await post("/api/triggers", request)).payload;
+  },
+  async updateTrigger(id: string, revision: number, request: TriggerRequest) {
+    return parseTriggerResponse(
+      await send("PUT", `/api/triggers/${encodeURIComponent(id)}`, {
+        expected_revision: revision,
+        ...request,
+      }),
+    ).payload;
+  },
+  async deleteTrigger(id: string) {
+    await send("DELETE", `/api/triggers/${encodeURIComponent(id)}`);
+  },
+  async fireTrigger(id: string) {
+    return parseTriggerResponse(
+      await post(`/api/triggers/${encodeURIComponent(id)}/fire`),
     ).payload;
   },
   async startWorkflow(kind: string, parameters: Record<string, unknown>) {
