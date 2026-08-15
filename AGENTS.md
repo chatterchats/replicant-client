@@ -48,6 +48,8 @@ Always inspect the actual repository before editing. The repository may have evo
 ## Supplied Reference UI / Renderer
 
 The user has explicit permission from the author to use the supplied `replicant.react` source and `galaxy-renderer`.
+`replicant.react` is available at `/run/media/chats/22d0a494-68e2-4df8-9e89-ab37d31eb5b8/replicant.react/`
+`galaxy-renderer` is available at `$REPO/crates/galaxy-renderer`
 
 Reference React source contains useful patterns/components such as:
 
