@@ -38,6 +38,20 @@ describe("parseHealthResponse", () => {
             detail: null,
           },
           workflows: [],
+          requirements: [
+            {
+              id: "relay-sol",
+              name: "SOL relay coverage",
+              target: "relay infrastructure",
+              scope: "system SOL",
+              desired: 2,
+              actual: 1,
+              in_progress: 1,
+              missing: 0,
+              workflow_id: "workflow-1",
+              status: "running",
+            },
+          ],
         },
       }).payload.metadata.revision,
     ).toBe(4);

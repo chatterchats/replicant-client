@@ -23,8 +23,9 @@ use crate::{
     reports::nearby_belt_report,
     survey::{SurveyMode, SurveyOptions},
     workflows::{
-        RelayWorkflowConfig, SurveyWorkflowConfig, new_relay_workflow, new_survey_workflow,
-        register, relay_workflow_kind, survey_workflow_kind,
+        RelayWorkflowConfig, RequirementWorkflowConfig, SurveyWorkflowConfig, new_relay_workflow,
+        new_requirement_workflow, new_survey_workflow, register, relay_workflow_kind,
+        requirement_workflow_kind, survey_workflow_kind,
     },
 };
 
@@ -215,6 +216,15 @@ impl OperationCatalogue {
                 let mut workflow = new_relay_workflow(RelayWorkflowConfig {
                     request: parameters.into_request(),
                 });
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "requirement.fulfillment" => {
+                let parameters: RequirementStart = decode(parameters)?;
+                let requirement = serde_json::from_str(&parameters.requirement_json)
+                    .map_err(|error| CatalogueError::Invalid(error.to_string()))?;
+                let mut workflow =
+                    new_requirement_workflow(RequirementWorkflowConfig { requirement });
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
@@ -692,6 +702,22 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             ],
             supported_triggers: all_trigger_kinds(),
         },
+        WorkflowDescriptor {
+            kind: operation_kind(requirement_workflow_kind().as_str()),
+            display_name: "Fulfill requirement".to_owned(),
+            aliases: strings(&["requirement"]),
+            description: "Evaluate desired state and expose its lower-level child work.".to_owned(),
+            category: "automation".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location],
+            parameters: vec![required(
+                "requirement_json",
+                "Typed requirement JSON",
+                ParameterKind::String,
+            )],
+            supported_triggers: all_trigger_kinds(),
+        },
     ]
 }
 
@@ -859,6 +885,11 @@ struct RelayStart {
     max_hop_ly: f64,
     #[serde(default = "default_timeout")]
     wait_timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct RequirementStart {
+    requirement_json: String,
 }
 
 impl RelayStart {

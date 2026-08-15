@@ -33,21 +33,22 @@ use replicant_protocol::{
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     LiveDelta, LiveMessage, OperationClass, OperationKind, OperationStatus, OperationUpdate,
-    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
-    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
-    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
-    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
-    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
-    WorkflowSummary,
+    RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot,
+    RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase,
+    SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
+    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
+    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
+    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
+    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
     catalogue::{CatalogueError, OperationCatalogue},
     config::RuntimeConfig,
     galaxy_scene::galaxy_scene as build_galaxy_scene,
+    requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     system_scene::system_scene as build_system_scene,
-    workflows::WorkflowActivityEvent,
+    workflows::{RequirementWorkflowCheckpoint, RequirementWorkflowConfig, WorkflowActivityEvent},
 };
 use replicant_workflow::{
     AutomationTrigger, FiniteExecution as StoredFiniteExecution, FiniteExecutionClass,
@@ -645,13 +646,13 @@ async fn snapshot(
         .state()
         .revision()
         .map_err(|_| ApiError::unavailable())?;
-    let workflows = state
-        .repository
-        .list()
-        .map_err(ApiError::repository)?
+    let instances = state.repository.list().map_err(ApiError::repository)?;
+    let requirements = instances
         .iter()
-        .map(summary)
+        .filter(|instance| instance.kind.as_str() == "requirement.fulfillment")
+        .filter_map(requirement_summary)
         .collect();
+    let workflows = instances.iter().map(summary).collect();
     let status = state.client().status();
     Ok(Json(Versioned::current(RuntimeSnapshot {
         metadata: state.snapshot_metadata()?,
@@ -662,6 +663,7 @@ async fn snapshot(
             detail: status_detail(&status).map(str::to_owned),
         },
         workflows,
+        requirements,
     })))
 }
 
@@ -1461,6 +1463,57 @@ fn summary(instance: &WorkflowInstance) -> WorkflowSummary {
         current_step: instance.current_step.clone(),
         revision: instance.revision,
         updated_at_ms: instance.updated_at,
+    }
+}
+
+fn requirement_summary(instance: &WorkflowInstance) -> Option<RequirementSummary> {
+    let config = instance.config::<RequirementWorkflowConfig>().ok()?;
+    let checkpoint = instance
+        .checkpoint::<RequirementWorkflowCheckpoint>()
+        .ok()?;
+    let plan =
+        checkpoint
+            .plan
+            .unwrap_or_else(|| replicant_runtime::requirements::FulfillmentPlan {
+                requirement_id: config.requirement.id.clone(),
+                desired: config.requirement.desired,
+                actual: 0,
+                in_progress: 0,
+                missing: config.requirement.desired,
+                step: None,
+            });
+    Some(RequirementSummary {
+        id: config.requirement.id,
+        name: config.requirement.name,
+        target: requirement_target(&config.requirement.target),
+        scope: requirement_scope(&config.requirement.scope),
+        desired: plan.desired,
+        actual: plan.actual,
+        in_progress: plan.in_progress,
+        missing: plan.missing,
+        workflow_id: ProtocolWorkflowId(instance.id.to_string()),
+        status: protocol_status(instance.status),
+    })
+}
+
+fn requirement_scope(scope: &RequirementScope) -> String {
+    match scope {
+        RequirementScope::System(value) => format!("system {value}"),
+        RequirementScope::Location(value) => format!("location {value}"),
+    }
+}
+
+fn requirement_target(target: &RequirementTarget) -> String {
+    match target {
+        RequirementTarget::Device { device_type, .. } => device_type.clone(),
+        RequirementTarget::Infrastructure { infrastructure } => match infrastructure {
+            InfrastructureKind::Relay => "relay infrastructure".to_owned(),
+            InfrastructureKind::Mining => "mining infrastructure".to_owned(),
+        },
+        RequirementTarget::Availability { asset } => match asset {
+            AvailabilityKind::Device(value) => format!("available {value}"),
+            AvailabilityKind::Resource(value) => format!("available {value}"),
+        },
     }
 }
 

@@ -1097,6 +1097,42 @@ h1 {
   font-size: 0.75rem;
   text-transform: uppercase;
 }
+.requirements-grid {
+  display: grid;
+  gap: 12px;
+}
+.requirement-card {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 2fr;
+  gap: 20px;
+  padding: 18px;
+  border: 1px solid rgba(159, 188, 193, 0.14);
+  border-radius: 8px;
+  background: rgba(159, 188, 193, 0.04);
+  color: inherit;
+  text-align: left;
+}
+.requirement-card span,
+.requirement-card dl div {
+  display: grid;
+  gap: 4px;
+}
+.requirement-card dl {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin: 0;
+}
+.requirement-card dt,
+.requirement-card small {
+  color: #9fb6b2;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+.requirement-card dd {
+  margin: 0;
+  font-size: 1.35rem;
+}
 
 @media (max-width: 720px) {
   .triggers-layout {
@@ -1110,6 +1146,10 @@ h1 {
   }
   .history-layout {
     grid-template-columns: 1fr;
+  }
+  .requirement-card,
+  .requirement-card dl {
+    grid-template-columns: 1fr 1fr;
   }
   main {
     height: 100vh;

@@ -55,6 +55,9 @@ pub mod relay;
 /// Durable survey and relay workflow registrations.
 pub mod workflows;
 
+/// Declarative desired-state evaluation and fulfillment planning.
+pub mod requirements;
+
 /// Mining-network expansion planning and restart-safe execution.
 pub mod mining;
 

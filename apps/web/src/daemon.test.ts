@@ -17,6 +17,7 @@ const snapshot: RuntimeSnapshot = {
     detail: null,
   },
   workflows: [],
+  requirements: [],
 };
 
 function live(revision: number, delta: LiveMessage["delta"]): LiveMessage {

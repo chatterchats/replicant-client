@@ -416,6 +416,34 @@ pub struct RuntimeSnapshot {
     pub sync: RuntimeSyncStatus,
     /// Current persisted workflows.
     pub workflows: Vec<WorkflowSummary>,
+    /// Desired-state requirements with current fulfillment progress.
+    #[serde(default)]
+    pub requirements: Vec<RequirementSummary>,
+}
+
+/// Frontend-safe desired-state requirement evaluation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequirementSummary {
+    /// Stable requirement identity.
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Human-readable target summary.
+    pub target: String,
+    /// Human-readable system or location scope.
+    pub scope: String,
+    /// Desired count or quantity.
+    pub desired: u64,
+    /// Quantity currently present in managed state.
+    pub actual: u64,
+    /// Quantity covered by active child work.
+    pub in_progress: u64,
+    /// Remaining gap.
+    pub missing: u64,
+    /// Owning fulfillment workflow.
+    pub workflow_id: WorkflowId,
+    /// Parent workflow lifecycle state.
+    pub status: WorkflowStatus,
 }
 
 /// Persisted workflow lifecycle state.

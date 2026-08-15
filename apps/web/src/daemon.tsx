@@ -15,6 +15,7 @@ import {
   type LiveMessage,
   type Notification,
   type OperationUpdate,
+  type RequirementSummary,
   parseLiveMessage,
   type RuntimeSnapshot,
   type RuntimeSyncStatus,
@@ -34,6 +35,7 @@ export interface DaemonState {
   sync: RuntimeSyncStatus | null;
   entities: Record<string, unknown>;
   workflows: Record<string, WorkflowSummary>;
+  requirements: RequirementSummary[];
   activity: WorkflowActivity[];
   notifications: Notification[];
   operations: Record<string, OperationUpdate>;
@@ -59,6 +61,7 @@ export const initialDaemonState: DaemonState = {
   sync: null,
   entities: {},
   workflows: {},
+  requirements: [],
   activity: [],
   notifications: [],
   operations: {},
@@ -104,6 +107,7 @@ export function daemonReducer(
         workflows: Object.fromEntries(
           action.snapshot.workflows.map((workflow) => [workflow.id, workflow]),
         ),
+        requirements: action.snapshot.requirements,
         activity: [],
         notifications: [],
         operations: {},
@@ -161,6 +165,8 @@ export function daemonReducer(
           return {
             ...next,
             galaxyRevision: message.revision,
+            needsResnapshot:
+              message.delta.data.kind === "requirement.fulfillment",
             workflows: {
               ...state.workflows,
               [message.delta.data.id]: message.delta.data,

@@ -82,6 +82,12 @@ impl WorkflowContext {
         self.client.as_ref()
     }
 
+    /// Returns the durable repository for composing child workflows.
+    #[must_use]
+    pub fn repository(&self) -> &WorkflowRepository {
+        &self.repository
+    }
+
     /// Atomically advances to a named logical step and persists its checkpoint.
     pub fn advance_to<P: Serialize>(
         &mut self,

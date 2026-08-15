@@ -17,6 +17,7 @@ import {
 } from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
+import { RequirementsPage } from "./RequirementsPage";
 import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
 import type {
@@ -335,6 +336,14 @@ export function App() {
                 entities={entities}
                 workflows={workflows}
                 selectedWorkflowId={selectedAutomationWorkflow}
+              />
+            ) : shell.page === "Requirements" ? (
+              <RequirementsPage
+                requirements={daemon.requirements}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
               />
             ) : shell.page === "History" ? (
               <HistoryPage

@@ -41,6 +41,19 @@ impl StateGateway {
         Ok(self.client.managed_state().snapshot().galaxy_revision())
     }
 
+    /// Returns current durable inventory projections without network I/O.
+    pub fn inventories(&self) -> crate::Result<Vec<Inventory>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_state()
+            .snapshot()
+            .inventories
+            .values()
+            .map(|observation| observation.value.clone())
+            .collect())
+    }
+
     /// Watches coalesced local revisions. This never performs network I/O.
     pub fn watch(&self) -> crate::Result<StateRevisionWatch> {
         self.client.ensure_open()?;

@@ -1,17 +1,28 @@
 //! Durable workflow adapters for the survey and relay runtime services.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use replicant_workflow::{
     BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError, ResourceKey,
-    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowKind, WorkflowRegistry,
+    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
+    catalogue::OperationCatalogue,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
         restore_relay_checkpoint,
+    },
+    requirements::{
+        ActiveFulfillment, FulfillmentOperation, FulfillmentOperationClass, FulfillmentPlan,
+        Requirement, evaluate_requirement, managed_facts,
     },
     survey::{
         SurveyExecutionState, SurveyOptions, execute_survey_workflow, restore_survey_checkpoint,
@@ -30,10 +41,21 @@ pub fn relay_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("relay.expansion").expect("static workflow kind is valid")
 }
 
+/// Stable desired-state orchestration workflow kind.
+pub fn requirement_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("requirement.fulfillment").expect("static workflow kind is valid")
+}
+
+fn requirement_action_kind() -> WorkflowKind {
+    WorkflowKind::new("requirement.action").expect("static workflow kind is valid")
+}
+
 /// Registers both application workflow kinds.
 pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(SurveyWorkflowFactory::new()))?;
-    registry.register(Arc::new(RelayWorkflowFactory::new()))
+    registry.register(Arc::new(RelayWorkflowFactory::new()))?;
+    registry.register(Arc::new(RequirementWorkflowFactory::new()))?;
+    registry.register(Arc::new(RequirementActionFactory::new()))
 }
 
 /// Persisted survey workflow configuration.
@@ -66,6 +88,29 @@ pub struct RelayWorkflowCheckpoint {
     pub state: Option<RelayExecutionState>,
     /// Completed phase names, retained for restart reconciliation activity.
     pub completed_steps: BTreeSet<String>,
+}
+
+/// Persisted desired-state workflow configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RequirementWorkflowConfig {
+    /// Desired state and registered lower-level fulfillment operation.
+    pub requirement: Requirement,
+}
+
+/// Restart-safe desired-state orchestration checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RequirementWorkflowCheckpoint {
+    /// Most recent non-mutating evaluation.
+    pub plan: Option<FulfillmentPlan>,
+    /// Child workflows already created by this orchestration.
+    pub children: Vec<WorkflowId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RequirementActionConfig {
+    requirement_id: String,
+    quantity: u64,
+    operation: FulfillmentOperation,
 }
 
 /// Structured activity payload stored as JSON for future protocol/UI use.
@@ -385,6 +430,249 @@ impl WorkflowExecutor for RelayWorkflow {
     }
 }
 
+struct RequirementWorkflowFactory(WorkflowKind);
+
+impl RequirementWorkflowFactory {
+    fn new() -> Self {
+        Self(requirement_workflow_kind())
+    }
+}
+
+impl WorkflowFactory for RequirementWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.0
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        SCHEMA_VERSION
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(RequirementWorkflow))
+    }
+}
+
+struct RequirementWorkflow;
+
+impl WorkflowExecutor for RequirementWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let config: RequirementWorkflowConfig =
+                context.config().map_err(|error| error.to_string())?;
+            let mut checkpoint: RequirementWorkflowCheckpoint =
+                context.checkpoint().map_err(|error| error.to_string())?;
+            let client = context
+                .managed_client()
+                .cloned()
+                .ok_or_else(|| "requirement workflow requires a managed client".to_owned())?;
+            claim(
+                context,
+                ResourceKey::Namespaced {
+                    namespace: "requirement".to_owned(),
+                    key: config.requirement.id.clone(),
+                },
+            )?;
+
+            loop {
+                let children = checkpoint
+                    .children
+                    .iter()
+                    .map(|id| context.repository().read(*id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                let active = children
+                    .iter()
+                    .filter_map(|child| child.as_ref())
+                    .map(|child| ActiveFulfillment {
+                        requirement_id: config.requirement.id.clone(),
+                        quantity: child
+                            .config::<RequirementActionConfig>()
+                            .map(|config| config.quantity)
+                            .unwrap_or_else(|_| {
+                                checkpoint
+                                    .plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.step.as_ref())
+                                    .map_or(0, |step| step.quantity)
+                            }),
+                        status: child.status,
+                    })
+                    .collect::<Vec<_>>();
+                let facts = managed_facts(&client)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let plan = evaluate_requirement(&config.requirement, &facts, &active);
+                checkpoint.plan = Some(plan.clone());
+                context
+                    .advance_to(
+                        if plan.missing == 0 && plan.in_progress == 0 {
+                            "satisfied"
+                        } else if plan.in_progress != 0 {
+                            "awaiting_children"
+                        } else {
+                            "planning"
+                        },
+                        &checkpoint,
+                    )
+                    .map_err(|error| error.to_string())?;
+
+                if plan.missing == 0 && plan.in_progress == 0 {
+                    emit(context, &WorkflowActivityEvent::Completion)?;
+                    return context
+                        .mark_succeeded(Some(plan))
+                        .map_err(|error| error.to_string());
+                }
+                if plan.in_progress == 0 {
+                    let step = plan.step.expect("missing requirement has a step");
+                    let key = fulfillment_key(&config.requirement.id, &step.operation);
+                    if let Some(existing) = equivalent_active(context, &key)? {
+                        checkpoint.children.push(existing);
+                    } else {
+                        let child = match step.operation.operation_class {
+                            FulfillmentOperationClass::Action => context
+                                .repository()
+                                .create(NewWorkflow {
+                                    kind: requirement_action_kind(),
+                                    schema_version: SCHEMA_VERSION,
+                                    config: RequirementActionConfig {
+                                        requirement_id: config.requirement.id.clone(),
+                                        quantity: step.quantity,
+                                        operation: step.operation.clone(),
+                                    },
+                                    checkpoint: Value::Null,
+                                    current_step: Some("queued".to_owned()),
+                                    parent_id: Some(context.id()),
+                                })
+                                .map_err(|error| error.to_string())?,
+                            FulfillmentOperationClass::Workflow => OperationCatalogue::new()
+                                .map_err(|error| error.to_string())?
+                                .create_workflow_with_parent(
+                                    context.repository(),
+                                    &step.operation.kind,
+                                    step.operation.parameters.clone(),
+                                    Some(context.id()),
+                                )
+                                .map_err(|error| error.to_string())?,
+                        };
+                        context
+                            .repository()
+                            .acquire_claim(
+                                child.id,
+                                ResourceKey::Namespaced {
+                                    namespace: "fulfillment".to_owned(),
+                                    key,
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        for resource in &step.operation.claims {
+                            context
+                                .repository()
+                                .acquire_claim(child.id, resource.clone())
+                                .map_err(|error| error.to_string())?;
+                        }
+                        checkpoint.children.push(child.id);
+                    }
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(|error| error.to_string())?;
+                }
+
+                match context
+                    .control_request()
+                    .map_err(|error| error.to_string())?
+                {
+                    replicant_workflow::ControlRequest::Continue => {}
+                    replicant_workflow::ControlRequest::Pause
+                    | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+}
+
+struct RequirementActionFactory(WorkflowKind);
+
+impl RequirementActionFactory {
+    fn new() -> Self {
+        Self(requirement_action_kind())
+    }
+}
+
+impl WorkflowFactory for RequirementActionFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.0
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        SCHEMA_VERSION
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(RequirementActionWorkflow))
+    }
+}
+
+struct RequirementActionWorkflow;
+
+impl WorkflowExecutor for RequirementActionWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let config: RequirementActionConfig =
+                context.config().map_err(|error| error.to_string())?;
+            let client = context
+                .managed_client()
+                .cloned()
+                .ok_or_else(|| "fulfillment action requires a managed client".to_owned())?;
+            context
+                .advance_to("executing", &Value::Null)
+                .map_err(|error| error.to_string())?;
+            let result = OperationCatalogue::new()
+                .map_err(|error| error.to_string())?
+                .run_action(&client, &config.operation.kind, config.operation.parameters)
+                .await
+                .map_err(|error| error.to_string())?;
+            context
+                .mark_succeeded(Some(result))
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+fn fulfillment_key(requirement_id: &str, operation: &FulfillmentOperation) -> String {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    requirement_id.hash(&mut hash);
+    operation.kind.hash(&mut hash);
+    serde_json::to_string(&operation.parameters)
+        .expect("fulfillment parameters serialize")
+        .hash(&mut hash);
+    format!("{requirement_id}:{:016x}", hash.finish())
+}
+
+fn equivalent_active(context: &WorkflowContext, key: &str) -> Result<Option<WorkflowId>, String> {
+    let resource = ResourceKey::Namespaced {
+        namespace: "fulfillment".to_owned(),
+        key: key.to_owned(),
+    };
+    for workflow in context
+        .repository()
+        .list()
+        .map_err(|error| error.to_string())?
+    {
+        if !workflow.status.is_terminal()
+            && context
+                .repository()
+                .claims(workflow.id)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|claim| claim.resource == resource)
+        {
+            return Ok(Some(workflow.id));
+        }
+    }
+    Ok(None)
+}
+
 /// Creates a queued durable survey workflow payload.
 pub fn new_survey_workflow(
     config: SurveyWorkflowConfig,
@@ -413,6 +701,20 @@ pub fn new_relay_workflow(
     }
 }
 
+/// Creates a queued durable desired-state fulfillment workflow.
+pub fn new_requirement_workflow(
+    config: RequirementWorkflowConfig,
+) -> NewWorkflow<RequirementWorkflowConfig, RequirementWorkflowCheckpoint> {
+    NewWorkflow {
+        kind: requirement_workflow_kind(),
+        schema_version: SCHEMA_VERSION,
+        config,
+        checkpoint: RequirementWorkflowCheckpoint::default(),
+        current_step: Some("queued".to_owned()),
+        parent_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +723,10 @@ mod tests {
     fn stable_kinds_and_structured_activity_round_trip() {
         assert_eq!(survey_workflow_kind().as_str(), "survey.route");
         assert_eq!(relay_workflow_kind().as_str(), "relay.expansion");
+        assert_eq!(
+            requirement_workflow_kind().as_str(),
+            "requirement.fulfillment"
+        );
         let event = WorkflowActivityEvent::WaitReason {
             step: "surveying".to_owned(),
             reason: "managed state".to_owned(),

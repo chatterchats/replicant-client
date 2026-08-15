@@ -194,6 +194,20 @@ export interface RuntimeSnapshot {
   metadata: SnapshotMetadata;
   sync: RuntimeSyncStatus;
   workflows: WorkflowSummary[];
+  requirements: RequirementSummary[];
+}
+
+export interface RequirementSummary {
+  id: string;
+  name: string;
+  target: string;
+  scope: string;
+  desired: number;
+  actual: number;
+  in_progress: number;
+  missing: number;
+  workflow_id: string;
+  status: WorkflowStatus;
 }
 
 export interface GalaxyPoint {
@@ -855,10 +869,52 @@ export function parseSnapshotResponse(
     const item = record(payload, "runtime snapshot");
     if (!Array.isArray(item.workflows))
       throw new Error("Invalid snapshot workflows");
+    const requirements = item.requirements ?? [];
+    if (!Array.isArray(requirements))
+      throw new Error("Invalid snapshot requirements");
     return {
       metadata: metadata(item.metadata),
       sync: sync(item.sync),
       workflows: item.workflows.map(workflow),
+      requirements: requirements.map((value) => {
+        const requirement = record(value, "requirement");
+        if (
+          typeof requirement.id !== "string" ||
+          typeof requirement.name !== "string" ||
+          typeof requirement.target !== "string" ||
+          typeof requirement.scope !== "string" ||
+          typeof requirement.workflow_id !== "string"
+        )
+          throw new Error("Invalid requirement");
+        return {
+          id: requirement.id,
+          name: requirement.name,
+          target: requirement.target,
+          scope: requirement.scope,
+          desired: number(requirement.desired, "requirement desired"),
+          actual: number(requirement.actual, "requirement actual"),
+          in_progress: number(
+            requirement.in_progress,
+            "requirement in progress",
+          ),
+          missing: number(requirement.missing, "requirement missing"),
+          workflow_id: requirement.workflow_id,
+          status: oneOf(
+            requirement.status,
+            [
+              "queued",
+              "running",
+              "waiting",
+              "paused",
+              "reconciling",
+              "succeeded",
+              "failed",
+              "cancelled",
+            ] as const,
+            "requirement status",
+          ),
+        };
+      }),
     };
   });
 }
