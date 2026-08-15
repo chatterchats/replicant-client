@@ -40,6 +40,9 @@ pub mod rikers;
 /// Read-only player trade-directory reports.
 pub mod trade;
 
+/// Read-only messages, account standing, and leaderboard reports.
+pub mod intelligence;
+
 /// Finite regional device-ownership reassignment action.
 pub mod ownership;
 

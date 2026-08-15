@@ -1771,6 +1771,46 @@ h1 {
   width: 100%;
 }
 
+.intelligence-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(240px, 0.7fr) minmax(320px, 1.3fr);
+}
+
+.intelligence-grid .asset-operations,
+.message-list {
+  align-items: stretch;
+  display: grid;
+  gap: 8px;
+}
+
+.intelligence-grid .asset-operations button,
+.message-list article,
+.intelligence-card-grid article {
+  background: rgba(13, 28, 31, 0.72);
+  border: 1px solid rgba(159, 188, 193, 0.14);
+  border-radius: 8px;
+  padding: 12px;
+  text-align: left;
+}
+
+.intelligence-grid .asset-operations button > *,
+.message-list header > * {
+  display: block;
+  margin: 2px 0;
+}
+
+.message-list article p {
+  margin-bottom: 0;
+  white-space: pre-wrap;
+}
+
+.intelligence-card-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 .cargo-table .workflow-link,
 .cargo-table td > small {
   display: block;
@@ -1797,7 +1837,8 @@ h1 {
   .overview-grid,
   .overview-metrics,
   .inventory-summary,
-  .asset-jobs {
+  .asset-jobs,
+  .intelligence-grid {
     grid-template-columns: 1fr 1fr;
   }
   .overview-page,

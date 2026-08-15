@@ -27,13 +27,21 @@ use replicant_client::{
     ClientDegradation, ClientStatus,
     domain::{Device, Inventory, InventoryOwner},
     managed::{Client, OperationStatus as ManagedOperationStatus},
-    raw::events::LocationEvent,
+    raw::{
+        accounts::{AccountAchievementListResponse, AccountMeResponse},
+        bobnet::{DeviceChannelsResponse, DeviceMessagesResponse},
+        events::LocationEvent,
+        leaderboards::{LeaderboardIndexResponse, LeaderboardResponse},
+        messages::MessageListResponse,
+        reputation::AccountReputationResponse,
+    },
 };
 use replicant_event_planner::remaining_requirements;
 use replicant_protocol::{
-    ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
-    AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
-    AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
+    AccountReplicantSummary, AchievementSummary, ActivityLevel, AutofactoryAvailability,
+    AutofactorySnapshot, AutofactorySummary, AutofactoryUtilization, AutomationControlAction,
+    AutomationControlRequest, AutomationControlResponse, AutomationStatus,
+    AutomationTrigger as ProtocolTrigger, BobnetChannelSummary, BobnetMessageSummary,
     BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary,
     CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim,
     DeviceSummary, DevicesSnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind,
@@ -41,15 +49,17 @@ use replicant_protocol::{
     EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
     FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
-    InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
-    InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, MiningInstallationStatus,
-    MiningInstallationSummary, MiningSnapshot, Notification, NotificationLevel, OperationClass,
-    OperationKind, OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot,
-    OverviewTravel, RelayExpansionSummary, RelaySnapshot, RequirementSummary, ResultSummary,
-    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary,
-    SurveySnapshot, SyncPhase, SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary,
-    TradeSnapshot, TradeSummary, TriggerCondition as ProtocolTriggerCondition,
+    InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
+    InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
+    LeaderboardEntrySummary, LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot,
+    MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
+    NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
+    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
+    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
+    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StandingSnapshot, StartWorkflowRequest, StartWorkflowResponse,
+    SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot, TradeControllerSummary,
+    TradeItemSummary, TradeSnapshot, TradeSummary, TriggerCondition as ProtocolTriggerCondition,
     TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
     UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
     WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
@@ -62,6 +72,9 @@ use replicant_runtime::{
     config::RuntimeConfig,
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
+    intelligence::{
+        account_profile, inbox, leaderboard, leaderboard_index, relay_history, standing,
+    },
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
@@ -227,6 +240,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/missions/bootstrap", get(bootstrap_missions))
         .route("/api/events", get(events))
         .route("/api/trade", get(trade))
+        .route("/api/reports", get(reports))
+        .route("/api/messages", get(messages))
+        .route("/api/network", get(network))
+        .route("/api/standing", get(standing_snapshot))
+        .route("/api/leaderboards", get(leaderboards))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -1698,6 +1716,373 @@ fn trade_items(value: Option<&Value>) -> Vec<TradeItemSummary> {
             .then_with(|| left.item.cmp(&right.item))
     });
     normalized
+}
+
+async fn reports(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<ReportsSnapshot>>, ApiError> {
+    let executions = state
+        .repository
+        .finite_execution_history()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .filter(|execution| execution.operation_class == FiniteExecutionClass::Report)
+        .map(|execution| {
+            let summary = execution
+                .result
+                .as_ref()
+                .map_or_else(ResultSummary::default, |result| summarize_result(result).0);
+            present_execution(execution, summary)
+        })
+        .collect();
+    Ok(Json(Versioned::current(ReportsSnapshot {
+        metadata: state.snapshot_metadata()?,
+        reports: state.catalogue.descriptors().reports.clone(),
+        executions,
+    })))
+}
+
+#[derive(Deserialize)]
+struct MessagesQuery {
+    relay: Option<String>,
+}
+
+async fn messages(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MessagesQuery>,
+) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let relays = relay_device_rows(&state).await?;
+    if let Some(relay) = query.relay.as_deref()
+        && !relays.iter().any(|device| device.entity.id.0 == relay)
+    {
+        return Err(ApiError::invalid("unknown relay device"));
+    }
+    let inbox = inbox(state.client(), 100)
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let relay_data = if let Some(relay) = query.relay.as_deref() {
+        Some(
+            relay_history(state.client(), relay, 100)
+                .await
+                .map_err(|_| ApiError::unavailable())?,
+        )
+    } else {
+        None
+    };
+    Ok(Json(Versioned::current(messages_snapshot(
+        metadata,
+        relays,
+        query.relay,
+        inbox,
+        relay_data,
+    ))))
+}
+
+fn messages_snapshot(
+    metadata: SnapshotMetadata,
+    relays: Vec<DeviceSummary>,
+    selected_relay: Option<String>,
+    inbox: MessageListResponse,
+    relay_data: Option<(DeviceChannelsResponse, DeviceMessagesResponse)>,
+) -> MessagesSnapshot {
+    let (channels, relay_messages, next_cursor) = relay_data.map_or_else(
+        || (Vec::new(), Vec::new(), None),
+        |(channels, messages)| {
+            (
+                channels
+                    .channels
+                    .into_iter()
+                    .filter_map(|channel| {
+                        channel.name.map(|name| BobnetChannelSummary {
+                            name,
+                            last_active: channel.last_active,
+                        })
+                    })
+                    .collect(),
+                messages
+                    .messages
+                    .into_iter()
+                    .map(|message| BobnetMessageSummary {
+                        id: message.id,
+                        channel: message.channel,
+                        body: message.message,
+                        is_npc_or_system: message.replicant_code.is_none(),
+                        sender: message.replicant_code,
+                        sender_name: message.replicant_name,
+                        current_system: message.current_star,
+                        created_at: message.time,
+                    })
+                    .collect(),
+                messages.next_cursor,
+            )
+        },
+    );
+    MessagesSnapshot {
+        metadata,
+        relays: relays.into_iter().map(|device| device.entity).collect(),
+        selected_relay,
+        channels,
+        relay_messages,
+        unread_count: inbox.unread_message_count,
+        inbox: inbox
+            .messages
+            .into_iter()
+            .map(|message| InboxMessageSummary {
+                id: message.id,
+                title: message.title,
+                body: message.body,
+                category: message.category,
+                message_type: message.message_type,
+                is_read: message.is_read,
+                created_at: message.created_at,
+            })
+            .collect(),
+        next_cursor,
+    }
+}
+
+async fn network(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<NetworkSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let account = account_profile(state.client())
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let mut relays = Vec::new();
+    for device in relay_device_rows(&state).await? {
+        match state.client().bobnet().channels(&device.entity.id.0).await {
+            Ok(channels) => relays.push(NetworkRelaySummary {
+                device,
+                channels: channel_summaries(channels),
+                error: None,
+            }),
+            Err(_) => relays.push(NetworkRelaySummary {
+                device,
+                channels: Vec::new(),
+                error: Some("Channel status unavailable".to_owned()),
+            }),
+        }
+    }
+    Ok(Json(Versioned::current(network_snapshot(
+        metadata, account, relays,
+    ))))
+}
+
+fn channel_summaries(channels: DeviceChannelsResponse) -> Vec<BobnetChannelSummary> {
+    channels
+        .channels
+        .into_iter()
+        .filter_map(|channel| {
+            channel.name.map(|name| BobnetChannelSummary {
+                name,
+                last_active: channel.last_active,
+            })
+        })
+        .collect()
+}
+
+fn network_snapshot(
+    metadata: SnapshotMetadata,
+    account: AccountMeResponse,
+    relays: Vec<NetworkRelaySummary>,
+) -> NetworkSnapshot {
+    NetworkSnapshot {
+        metadata,
+        account_name: account.name,
+        account_status: account.status,
+        subscribed_channels: account.bobnet_channels,
+        replicants: account
+            .replicants
+            .into_iter()
+            .filter_map(|replicant| {
+                replicant
+                    .replicant_code
+                    .map(|code| AccountReplicantSummary {
+                        entity: summary_ref(EntityKind::Replicant, code),
+                        name: replicant.name,
+                        system: replicant.current_star,
+                        location: replicant.current_location,
+                        hosted_device: replicant
+                            .hosted_device_code
+                            .map(|code| summary_ref(EntityKind::Device, code)),
+                    })
+            })
+            .collect(),
+        relays,
+    }
+}
+
+async fn relay_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
+    Ok(device_rows(state)
+        .await?
+        .into_iter()
+        .filter(|device| {
+            device
+                .device_type
+                .as_deref()
+                .is_some_and(|kind| kind.to_ascii_lowercase().contains("relay"))
+        })
+        .collect())
+}
+
+async fn standing_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<StandingSnapshot>>, ApiError> {
+    let (account, achievements, reputation) = standing(state.client())
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(build_standing_snapshot(
+        state.snapshot_metadata()?,
+        account,
+        achievements,
+        reputation,
+    ))))
+}
+
+fn build_standing_snapshot(
+    metadata: SnapshotMetadata,
+    account: AccountMeResponse,
+    achievements: AccountAchievementListResponse,
+    reputation: AccountReputationResponse,
+) -> StandingSnapshot {
+    StandingSnapshot {
+        metadata,
+        experience_points_total: account.experience_points_total,
+        civilisation_points: None,
+        achievements: achievements
+            .achievements
+            .into_iter()
+            .filter_map(|achievement| {
+                achievement.achievement_key.map(|key| AchievementSummary {
+                    key,
+                    title: achievement.title,
+                    description: achievement.description,
+                    category: achievement.category,
+                    xp_reward: achievement.xp_reward,
+                    achieved_at: achievement.achieved_at,
+                })
+            })
+            .collect(),
+        reputation: reputation
+            .reputation
+            .into_iter()
+            .filter_map(|standing| {
+                standing.species_key.map(|species| ReputationSummary {
+                    species,
+                    name: standing.name,
+                    value: standing.total_reputation,
+                    description: standing.description,
+                    trait_name: standing.r#trait,
+                })
+            })
+            .collect(),
+    }
+}
+
+#[derive(Deserialize)]
+struct LeaderboardsQuery {
+    board: Option<String>,
+}
+
+async fn leaderboards(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LeaderboardsQuery>,
+) -> Result<Json<Versioned<LeaderboardsSnapshot>>, ApiError> {
+    let index = leaderboard_index(state.client())
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let selected = query.board.or_else(|| {
+        index
+            .boards
+            .iter()
+            .filter_map(|board| board.key.as_deref())
+            .find(|key| *key == "xp")
+            .or_else(|| {
+                index
+                    .boards
+                    .iter()
+                    .filter_map(|board| board.key.as_deref())
+                    .find(|key| is_standard_leaderboard(key))
+            })
+            .map(str::to_owned)
+    });
+    if selected.as_deref().is_some_and(|key| {
+        !is_standard_leaderboard(key)
+            || !index
+                .boards
+                .iter()
+                .any(|board| board.key.as_deref() == Some(key))
+    }) {
+        return Err(ApiError::invalid("unknown leaderboard"));
+    }
+    let entries = if let Some(board) = selected.as_deref() {
+        leaderboard(state.client(), board)
+            .await
+            .map_err(|_| ApiError::unavailable())?
+    } else {
+        LeaderboardResponse::default()
+    };
+    Ok(Json(Versioned::current(leaderboards_snapshot(
+        state.snapshot_metadata()?,
+        index,
+        selected,
+        entries,
+    ))))
+}
+
+fn is_standard_leaderboard(key: &str) -> bool {
+    matches!(
+        key,
+        "colony_moon"
+            | "colony_planet"
+            | "distance"
+            | "fleet"
+            | "megastructure"
+            | "reputation"
+            | "trades"
+            | "xp"
+    )
+}
+
+fn leaderboards_snapshot(
+    metadata: SnapshotMetadata,
+    index: LeaderboardIndexResponse,
+    selected_board: Option<String>,
+    leaderboard: LeaderboardResponse,
+) -> LeaderboardsSnapshot {
+    LeaderboardsSnapshot {
+        metadata,
+        boards: index
+            .boards
+            .into_iter()
+            .filter_map(|board| {
+                board.key.and_then(|key| {
+                    is_standard_leaderboard(&key).then(|| LeaderboardBoardSummary {
+                        key,
+                        name: board.name,
+                        description: board.description,
+                        board_type: board.r#type,
+                    })
+                })
+            })
+            .collect(),
+        selected_board,
+        entries: leaderboard
+            .entries
+            .into_iter()
+            .map(|entry| LeaderboardEntrySummary {
+                rank: entry.rank,
+                replicant: entry
+                    .replicant_code
+                    .map(|code| summary_ref(EntityKind::Replicant, code)),
+                name: entry.name,
+                designation: entry.designation,
+                value: entry.value,
+                contribution_count: entry.contribution_count,
+            })
+            .collect(),
+    }
 }
 
 fn bootstrap_mission_summaries(
@@ -3493,11 +3878,18 @@ mod tests {
     };
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
-    use replicant_client::StartupPolicy;
+    use replicant_client::{
+        StartupPolicy,
+        raw::{SecretString, Url},
+    };
     use replicant_protocol::{Notification, NotificationLevel};
     use replicant_workflow::{NewWorkflow, WorkflowKind, WorkflowState};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
 
@@ -3512,6 +3904,21 @@ mod tests {
         let state = AppState::new(client.clone(), RuntimeConfig::new("test"), repository)
             .expect("app state");
         (router(state.clone()), client, state)
+    }
+
+    async fn test_app_at(base_url: &str) -> (Router, Client) {
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(base_url).expect("mock URL"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client");
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
+        let state = AppState::new(client.clone(), RuntimeConfig::new("test"), repository)
+            .expect("app state");
+        (router(state), client)
     }
 
     async fn next_live(
@@ -3657,6 +4064,132 @@ mod tests {
         let response = serde_json::from_value::<Versioned<TradeSnapshot>>(json(response).await)
             .expect("typed trade response");
         assert!(response.payload.controllers.is_empty());
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn intelligence_projections_normalize_actual_sdk_fields() {
+        let metadata = SnapshotMetadata {
+            revision: 1,
+            generated_at_ms: 2,
+        };
+        let inbox = serde_json::from_value(serde_json::json!({
+            "messages": [{"id": 1, "title": "Notice", "is_read": false}],
+            "unread_message_count": 1
+        }))
+        .expect("message fixture");
+        let relay_channels = serde_json::from_value(serde_json::json!({
+            "channels": [{"name": "general", "last_active": null}]
+        }))
+        .expect("channel fixture");
+        let relay_messages = serde_json::from_value(serde_json::json!({
+            "messages": [{"id": 2, "message": "hello", "replicant_code": null}]
+        }))
+        .expect("relay message fixture");
+        let messages = messages_snapshot(
+            metadata.clone(),
+            vec![projected_device("RELAY-1")],
+            Some("RELAY-1".to_owned()),
+            inbox,
+            Some((relay_channels, relay_messages)),
+        );
+        assert_eq!(messages.unread_count, Some(1));
+        assert!(messages.relay_messages[0].is_npc_or_system);
+
+        let account: AccountMeResponse = serde_json::from_value(serde_json::json!({
+            "name": "Operator",
+            "bobnet_channels": ["general"],
+            "replicants": [{"replicant_code": "R-1", "current_star": "SOL"}],
+            "experience_points_total": 42
+        }))
+        .expect("account fixture");
+        let network = network_snapshot(metadata.clone(), account.clone(), Vec::new());
+        assert_eq!(network.replicants[0].entity.id.0, "R-1");
+        let achievements = serde_json::from_value(serde_json::json!({
+            "achievements": [{"achievement_key": "first-flight", "xp_reward": 5}]
+        }))
+        .expect("achievement fixture");
+        let reputation = serde_json::from_value(serde_json::json!({
+            "reputation": [{"species_key": "huwanu", "total_reputation": 3.5}]
+        }))
+        .expect("reputation fixture");
+        let standing = build_standing_snapshot(metadata.clone(), account, achievements, reputation);
+        assert_eq!(standing.experience_points_total, Some(42));
+        assert_eq!(standing.civilisation_points, None);
+        assert_eq!(standing.achievements[0].key, "first-flight");
+
+        let index = serde_json::from_value(serde_json::json!({
+            "boards": [{"key": "xp", "name": "XP"}]
+        }))
+        .expect("leaderboard index fixture");
+        let board = serde_json::from_value(serde_json::json!({
+            "board": "xp",
+            "entries": [{"rank": 1, "replicant_code": "R-1", "value": 100}]
+        }))
+        .expect("leaderboard fixture");
+        let leaderboards = leaderboards_snapshot(metadata, index, Some("xp".to_owned()), board);
+        assert_eq!(
+            leaderboards.entries[0]
+                .replicant
+                .as_ref()
+                .map(|item| item.id.0.as_str()),
+            Some("R-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_routes_are_typed_and_daemon_mediated() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            ("/v1/messages", serde_json::json!({"messages": []})),
+            (
+                "/v1/accounts/me",
+                serde_json::json!({"name": "Operator", "replicants": []}),
+            ),
+            (
+                "/v1/accounts/achievements",
+                serde_json::json!({"achievements": []}),
+            ),
+            (
+                "/v1/accounts/reputation",
+                serde_json::json!({"reputation": []}),
+            ),
+            (
+                "/v1/leaderboards",
+                serde_json::json!({"boards": [{"key": "xp"}]}),
+            ),
+            (
+                "/v1/leaderboards/xp",
+                serde_json::json!({"board": "xp", "entries": []}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let (app, client) = test_app_at(&server.uri()).await;
+        for route in [
+            "/api/reports",
+            "/api/messages",
+            "/api/network",
+            "/api/standing",
+            "/api/leaderboards",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(json(response).await["protocol_version"], 1);
+        }
         client.close().await.expect("close client");
     }
 

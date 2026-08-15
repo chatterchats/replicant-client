@@ -595,6 +595,220 @@ pub struct TradeSnapshot {
     pub controllers: Vec<TradeControllerSummary>,
 }
 
+/// Typed report catalogue and recent execution projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReportsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Registered read-only report descriptors.
+    pub reports: Vec<ReportDescriptor>,
+    /// Recent report executions, newest first.
+    pub executions: Vec<FiniteExecution>,
+}
+
+/// One account-inbox message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InboxMessageSummary {
+    /// Upstream message identifier when supplied.
+    pub id: Option<i64>,
+    /// Display title.
+    pub title: Option<String>,
+    /// Message body.
+    pub body: Option<String>,
+    /// Message category.
+    pub category: Option<String>,
+    /// Message type.
+    pub message_type: Option<String>,
+    /// Whether the account has read the message.
+    pub is_read: Option<bool>,
+    /// Server timestamp when supplied.
+    pub created_at: Option<String>,
+}
+
+/// One channel observed by a relay device.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BobnetChannelSummary {
+    /// Channel name.
+    pub name: String,
+    /// Last activity timestamp when supplied.
+    pub last_active: Option<String>,
+}
+
+/// One message observed in a relay history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BobnetMessageSummary {
+    /// Upstream message identifier when supplied.
+    pub id: Option<i64>,
+    /// Channel the message was sent on.
+    pub channel: Option<String>,
+    /// Message body.
+    pub body: Option<String>,
+    /// Sending replicant code; absent for NPC/system messages.
+    pub sender: Option<String>,
+    /// Sending replicant display name when supplied.
+    pub sender_name: Option<String>,
+    /// Whether the message lacks a player replicant sender.
+    pub is_npc_or_system: bool,
+    /// Sender's current system when supplied.
+    pub current_system: Option<String>,
+    /// Server timestamp when supplied.
+    pub created_at: Option<String>,
+}
+
+/// Typed account inbox and optional relay-history projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessagesSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Known relay-capable device addresses.
+    pub relays: Vec<EntityRef>,
+    /// Relay selected for history, when requested.
+    pub selected_relay: Option<String>,
+    /// Channels visible to the selected relay.
+    pub channels: Vec<BobnetChannelSummary>,
+    /// History visible to the selected relay.
+    pub relay_messages: Vec<BobnetMessageSummary>,
+    /// Account-wide notification inbox.
+    pub inbox: Vec<InboxMessageSummary>,
+    /// Account-wide unread count when supplied.
+    pub unread_count: Option<i64>,
+    /// Opaque next relay-history cursor when supplied.
+    pub next_cursor: Option<i64>,
+}
+
+/// One relay-capable managed device and its observed channel availability.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetworkRelaySummary {
+    /// Managed device projection.
+    pub device: DeviceSummary,
+    /// Channels currently observable through the relay.
+    pub channels: Vec<BobnetChannelSummary>,
+    /// Safe-read failure for this relay, when other network data remains useful.
+    pub error: Option<String>,
+}
+
+/// One replicant related to the authenticated account.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountReplicantSummary {
+    /// Replicant address.
+    pub entity: EntityRef,
+    /// Display name when supplied.
+    pub name: Option<String>,
+    /// Current system when supplied.
+    pub system: Option<String>,
+    /// Current location when supplied.
+    pub location: Option<String>,
+    /// Hosted device when supplied.
+    pub hosted_device: Option<EntityRef>,
+}
+
+/// Typed account and BobNet network-status projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetworkSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Authenticated account display name when supplied.
+    pub account_name: Option<String>,
+    /// Account status when supplied.
+    pub account_status: Option<String>,
+    /// Account's subscribed BobNet channels.
+    pub subscribed_channels: Vec<String>,
+    /// Replicants belonging to the account.
+    pub replicants: Vec<AccountReplicantSummary>,
+    /// Known managed relay devices.
+    pub relays: Vec<NetworkRelaySummary>,
+}
+
+/// One earned account achievement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AchievementSummary {
+    /// Stable achievement key.
+    pub key: String,
+    /// Display title when supplied.
+    pub title: Option<String>,
+    /// Display description when supplied.
+    pub description: Option<String>,
+    /// Achievement category when supplied.
+    pub category: Option<String>,
+    /// XP reward when supplied.
+    pub xp_reward: Option<i64>,
+    /// Earned timestamp when supplied.
+    pub achieved_at: Option<String>,
+}
+
+/// One account-level species reputation entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReputationSummary {
+    /// Stable species key.
+    pub species: String,
+    /// Species display name when supplied.
+    pub name: Option<String>,
+    /// Aggregated account reputation when supplied.
+    pub value: Option<f64>,
+    /// Standing description when supplied.
+    pub description: Option<String>,
+    /// Dominant species trait when supplied.
+    pub trait_name: Option<String>,
+}
+
+/// Typed account progression and standing projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StandingSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Account-wide XP total when supplied.
+    pub experience_points_total: Option<i64>,
+    /// Civilisation points are currently not exposed by the account API.
+    pub civilisation_points: Option<i64>,
+    /// Earned achievements.
+    pub achievements: Vec<AchievementSummary>,
+    /// Aggregated species reputation.
+    pub reputation: Vec<ReputationSummary>,
+}
+
+/// One published leaderboard descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LeaderboardBoardSummary {
+    /// Stable board key.
+    pub key: String,
+    /// Display name when supplied.
+    pub name: Option<String>,
+    /// Description when supplied.
+    pub description: Option<String>,
+    /// Board type when supplied.
+    pub board_type: Option<String>,
+}
+
+/// One normalized ranked leaderboard entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeaderboardEntrySummary {
+    /// Rank when supplied.
+    pub rank: Option<i64>,
+    /// Replicant link when supplied.
+    pub replicant: Option<EntityRef>,
+    /// Display name when supplied.
+    pub name: Option<String>,
+    /// Colony designation when supplied.
+    pub designation: Option<String>,
+    /// Ranked value when supplied.
+    pub value: Option<f64>,
+    /// Contribution count when supplied.
+    pub contribution_count: Option<i64>,
+}
+
+/// Typed refresh-on-demand leaderboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeaderboardsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Published standard leaderboards.
+    pub boards: Vec<LeaderboardBoardSummary>,
+    /// Selected board key.
+    pub selected_board: Option<String>,
+    /// Ranked rows for the selected board.
+    pub entries: Vec<LeaderboardEntrySummary>,
+}
+
 /// One active or queued Autofactory print job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FactoryJobSummary {
@@ -2163,6 +2377,46 @@ mod tests {
                 }],
                 workflow: None,
             }],
+        }));
+        let intelligence_metadata = SnapshotMetadata {
+            revision: 42,
+            generated_at_ms: 1,
+        };
+        round_trip(&Versioned::current(ReportsSnapshot {
+            metadata: intelligence_metadata.clone(),
+            reports: Vec::new(),
+            executions: Vec::new(),
+        }));
+        round_trip(&Versioned::current(MessagesSnapshot {
+            metadata: intelligence_metadata.clone(),
+            relays: Vec::new(),
+            selected_relay: None,
+            channels: Vec::new(),
+            relay_messages: Vec::new(),
+            inbox: Vec::new(),
+            unread_count: None,
+            next_cursor: None,
+        }));
+        round_trip(&Versioned::current(NetworkSnapshot {
+            metadata: intelligence_metadata.clone(),
+            account_name: None,
+            account_status: None,
+            subscribed_channels: Vec::new(),
+            replicants: Vec::new(),
+            relays: Vec::new(),
+        }));
+        round_trip(&Versioned::current(StandingSnapshot {
+            metadata: intelligence_metadata.clone(),
+            experience_points_total: Some(10),
+            civilisation_points: None,
+            achievements: Vec::new(),
+            reputation: Vec::new(),
+        }));
+        round_trip(&Versioned::current(LeaderboardsSnapshot {
+            metadata: intelligence_metadata,
+            boards: Vec::new(),
+            selected_board: None,
+            entries: Vec::new(),
         }));
         round_trip(&Versioned::current(AutofactorySnapshot {
             metadata: SnapshotMetadata {

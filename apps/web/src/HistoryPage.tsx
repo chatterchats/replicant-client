@@ -10,7 +10,7 @@ import {
 
 type HistoryFilter = "all" | "workflow" | "action" | "report";
 
-function ResultView({
+export function ResultView({
   execution,
   onSelectEntity,
 }: {

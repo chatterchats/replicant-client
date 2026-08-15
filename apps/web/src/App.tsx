@@ -21,12 +21,17 @@ import {
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
 import { InventoryPage } from "./InventoryPage";
+import { LeaderboardsPage } from "./LeaderboardsPage";
+import { MessagesPage } from "./MessagesPage";
 import { MiningPage } from "./MiningPage";
+import { NetworkPage } from "./NetworkPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
 import { EventsPage } from "./EventsPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { RelayPage } from "./RelayPage";
+import { ReportsPage } from "./ReportsPage";
+import { StandingPage } from "./StandingPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
 import { TradePage } from "./TradePage";
@@ -759,6 +764,16 @@ export function App() {
                 }}
                 onSelectEntity={select}
               />
+            ) : shell.page === "Reports" ? (
+              <ReportsPage entities={entities} onSelectEntity={select} />
+            ) : shell.page === "Messages" ? (
+              <MessagesPage onSelectEntity={select} />
+            ) : shell.page === "Network" ? (
+              <NetworkPage onSelectEntity={select} />
+            ) : shell.page === "Standing" ? (
+              <StandingPage />
+            ) : shell.page === "Leaderboards" ? (
+              <LeaderboardsPage onSelectEntity={select} />
             ) : shell.page === "Galaxy" ? (
               <GalaxyPage
                 descriptors={descriptors}

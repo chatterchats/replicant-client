@@ -6,7 +6,10 @@ import {
   parseDescriptorsResponse,
   parseDevicesResponse,
   parseInventoryResponse,
+  parseLeaderboardsResponse,
+  parseMessagesResponse,
   parseMiningResponse,
+  parseNetworkResponse,
   parseRelayResponse,
   parseEntityIndexResponse,
   parseEventsResponse,
@@ -16,7 +19,9 @@ import {
   parseHealthResponse,
   parseOperationResponse,
   parseOverviewResponse,
+  parseReportsResponse,
   parseSnapshotResponse,
+  parseStandingResponse,
   parseSurveyResponse,
   parseTradeResponse,
   parseTriggerListResponse,
@@ -127,6 +132,26 @@ export const daemonApi = {
   },
   async trade(signal?: AbortSignal) {
     return parseTradeResponse(await get("/api/trade", signal)).payload;
+  },
+  async reports(signal?: AbortSignal) {
+    return parseReportsResponse(await get("/api/reports", signal)).payload;
+  },
+  async messages(relay?: string, signal?: AbortSignal) {
+    const query = relay ? `?relay=${encodeURIComponent(relay)}` : "";
+    return parseMessagesResponse(await get(`/api/messages${query}`, signal))
+      .payload;
+  },
+  async network(signal?: AbortSignal) {
+    return parseNetworkResponse(await get("/api/network", signal)).payload;
+  },
+  async standing(signal?: AbortSignal) {
+    return parseStandingResponse(await get("/api/standing", signal)).payload;
+  },
+  async leaderboards(board?: string, signal?: AbortSignal) {
+    const query = board ? `?board=${encodeURIComponent(board)}` : "";
+    return parseLeaderboardsResponse(
+      await get(`/api/leaderboards${query}`, signal),
+    ).payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;

@@ -7,14 +7,19 @@ import {
   parseHealthResponse,
   parseDevicesResponse,
   parseInventoryResponse,
+  parseLeaderboardsResponse,
   parseMiningResponse,
+  parseMessagesResponse,
+  parseNetworkResponse,
   parseRelayResponse,
   parseEntityIndexResponse,
   parseEventsResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
   parseOverviewResponse,
+  parseReportsResponse,
   parseSnapshotResponse,
+  parseStandingResponse,
   parseSurveyResponse,
   parseSystemSceneResponse,
   parseTradeResponse,
@@ -635,5 +640,63 @@ describe("parseHealthResponse", () => {
     }).payload.controllers[0];
     expect(trade?.shop_name).toBeNull();
     expect(trade?.trades[0]?.current_stock).toBeNull();
+  });
+
+  it("parses typed intelligence snapshots", () => {
+    const metadata = { revision: 1, generated_at_ms: 2 };
+    const envelope = (payload: object) => ({ protocol_version: 1, payload });
+    expect(
+      parseReportsResponse(envelope({ metadata, reports: [], executions: [] }))
+        .payload.reports,
+    ).toEqual([]);
+    expect(
+      parseMessagesResponse(
+        envelope({
+          metadata,
+          relays: [],
+          selected_relay: null,
+          channels: [],
+          relay_messages: [],
+          inbox: [],
+          unread_count: null,
+          next_cursor: null,
+        }),
+      ).payload.unread_count,
+    ).toBeNull();
+    expect(
+      parseNetworkResponse(
+        envelope({
+          metadata,
+          account_name: null,
+          account_status: null,
+          subscribed_channels: [],
+          replicants: [],
+          relays: [],
+        }),
+      ).payload.relays,
+    ).toEqual([]);
+    expect(
+      parseStandingResponse(
+        envelope({
+          metadata,
+          experience_points_total: 12,
+          civilisation_points: null,
+          achievements: [],
+          reputation: [],
+        }),
+      ).payload.experience_points_total,
+    ).toBe(12);
+    expect(
+      parseLeaderboardsResponse(
+        envelope({
+          metadata,
+          boards: [
+            { key: "xp", name: null, description: null, board_type: null },
+          ],
+          selected_board: "xp",
+          entries: [],
+        }),
+      ).payload.selected_board,
+    ).toBe("xp");
   });
 });

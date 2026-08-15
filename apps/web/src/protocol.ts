@@ -315,6 +315,120 @@ export interface TradeSnapshot {
   controllers: TradeControllerSummary[];
 }
 
+export interface ReportsSnapshot {
+  metadata: SnapshotMetadata;
+  reports: ReportDescriptor[];
+  executions: FiniteExecution[];
+}
+
+export interface InboxMessageSummary {
+  id: number | null;
+  title: string | null;
+  body: string | null;
+  category: string | null;
+  message_type: string | null;
+  is_read: boolean | null;
+  created_at: string | null;
+}
+
+export interface BobnetChannelSummary {
+  name: string;
+  last_active: string | null;
+}
+
+export interface BobnetMessageSummary {
+  id: number | null;
+  channel: string | null;
+  body: string | null;
+  sender: string | null;
+  sender_name: string | null;
+  is_npc_or_system: boolean;
+  current_system: string | null;
+  created_at: string | null;
+}
+
+export interface MessagesSnapshot {
+  metadata: SnapshotMetadata;
+  relays: EntityRef[];
+  selected_relay: string | null;
+  channels: BobnetChannelSummary[];
+  relay_messages: BobnetMessageSummary[];
+  inbox: InboxMessageSummary[];
+  unread_count: number | null;
+  next_cursor: number | null;
+}
+
+export interface NetworkRelaySummary {
+  device: DeviceSummary;
+  channels: BobnetChannelSummary[];
+  error: string | null;
+}
+
+export interface AccountReplicantSummary {
+  entity: EntityRef;
+  name: string | null;
+  system: string | null;
+  location: string | null;
+  hosted_device: EntityRef | null;
+}
+
+export interface NetworkSnapshot {
+  metadata: SnapshotMetadata;
+  account_name: string | null;
+  account_status: string | null;
+  subscribed_channels: string[];
+  replicants: AccountReplicantSummary[];
+  relays: NetworkRelaySummary[];
+}
+
+export interface AchievementSummary {
+  key: string;
+  title: string | null;
+  description: string | null;
+  category: string | null;
+  xp_reward: number | null;
+  achieved_at: string | null;
+}
+
+export interface ReputationSummary {
+  species: string;
+  name: string | null;
+  value: number | null;
+  description: string | null;
+  trait_name: string | null;
+}
+
+export interface StandingSnapshot {
+  metadata: SnapshotMetadata;
+  experience_points_total: number | null;
+  civilisation_points: number | null;
+  achievements: AchievementSummary[];
+  reputation: ReputationSummary[];
+}
+
+export interface LeaderboardBoardSummary {
+  key: string;
+  name: string | null;
+  description: string | null;
+  board_type: string | null;
+}
+
+export interface LeaderboardEntrySummary {
+  rank: number | null;
+  replicant: EntityRef | null;
+  name: string | null;
+  designation: string | null;
+  value: number | null;
+  contribution_count: number | null;
+}
+
+export interface LeaderboardsSnapshot {
+  metadata: SnapshotMetadata;
+  boards: LeaderboardBoardSummary[];
+  selected_board: string | null;
+  entries: LeaderboardEntrySummary[];
+}
+
 export interface FactoryJobSummary {
   device_type: string;
   quantity: number;
@@ -1096,6 +1210,19 @@ function descriptor(value: unknown, label: string) {
   };
 }
 
+function reportDescriptor(value: unknown): ReportDescriptor {
+  const item = record(value, "report descriptor");
+  return {
+    ...descriptor(value, "report descriptor"),
+    operation_class: oneOf(
+      item.operation_class,
+      ["report"] as const,
+      "report operation class",
+    ),
+    risk: oneOf(item.risk, ["none"] as const, "report risk"),
+  };
+}
+
 function workflowDescriptor(value: unknown): WorkflowDescriptor {
   const item = record(value, "workflow descriptor");
   if (!Array.isArray(item.supported_triggers))
@@ -1800,6 +1927,231 @@ export function parseTradeResponse(value: unknown): Versioned<TradeSnapshot> {
   });
 }
 
+function bobnetChannel(value: unknown): BobnetChannelSummary {
+  const channel = record(value, "BobNet channel");
+  if (typeof channel.name !== "string")
+    throw new Error("Invalid BobNet channel");
+  return {
+    name: channel.name,
+    last_active: nullableString(channel.last_active, "channel activity"),
+  };
+}
+
+export function parseReportsResponse(
+  value: unknown,
+): Versioned<ReportsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "reports snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      reports: array(snapshot.reports, "reports").map(reportDescriptor),
+      executions: array(snapshot.executions, "report executions").map(
+        finiteExecution,
+      ),
+    };
+  });
+}
+
+export function parseMessagesResponse(
+  value: unknown,
+): Versioned<MessagesSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "messages snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      relays: array(snapshot.relays, "message relays").map(entity),
+      selected_relay: nullableString(snapshot.selected_relay, "selected relay"),
+      channels: array(snapshot.channels, "message channels").map(bobnetChannel),
+      relay_messages: array(snapshot.relay_messages, "relay messages").map(
+        (value) => {
+          const message = record(value, "relay message");
+          if (typeof message.is_npc_or_system !== "boolean")
+            throw new Error("Invalid relay message");
+          return {
+            id: optionalFiniteNumber(message.id, "relay message ID"),
+            channel: nullableString(message.channel, "message channel"),
+            body: nullableString(message.body, "message body"),
+            sender: nullableString(message.sender, "message sender"),
+            sender_name: nullableString(
+              message.sender_name,
+              "message sender name",
+            ),
+            is_npc_or_system: message.is_npc_or_system,
+            current_system: nullableString(
+              message.current_system,
+              "sender system",
+            ),
+            created_at: nullableString(message.created_at, "message time"),
+          };
+        },
+      ),
+      inbox: array(snapshot.inbox, "inbox messages").map((value) => {
+        const message = record(value, "inbox message");
+        if (message.is_read !== null && typeof message.is_read !== "boolean")
+          throw new Error("Invalid inbox message");
+        return {
+          id: optionalFiniteNumber(message.id, "inbox message ID"),
+          title: nullableString(message.title, "message title"),
+          body: nullableString(message.body, "message body"),
+          category: nullableString(message.category, "message category"),
+          message_type: nullableString(message.message_type, "message type"),
+          is_read: message.is_read,
+          created_at: nullableString(message.created_at, "message time"),
+        };
+      }),
+      unread_count: optionalFiniteNumber(snapshot.unread_count, "unread count"),
+      next_cursor: optionalFiniteNumber(snapshot.next_cursor, "message cursor"),
+    };
+  });
+}
+
+export function parseNetworkResponse(
+  value: unknown,
+): Versioned<NetworkSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "network snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      account_name: nullableString(snapshot.account_name, "account name"),
+      account_status: nullableString(snapshot.account_status, "account status"),
+      subscribed_channels: stringArray(
+        snapshot.subscribed_channels,
+        "subscribed channels",
+      ),
+      replicants: array(snapshot.replicants, "account replicants").map(
+        (value) => {
+          const replicant = record(value, "account replicant");
+          return {
+            entity: entity(replicant.entity),
+            name: nullableString(replicant.name, "replicant name"),
+            system: nullableString(replicant.system, "replicant system"),
+            location: nullableString(replicant.location, "replicant location"),
+            hosted_device:
+              replicant.hosted_device === null
+                ? null
+                : entity(replicant.hosted_device),
+          };
+        },
+      ),
+      relays: array(snapshot.relays, "network relays").map((value) => {
+        const relay = record(value, "network relay");
+        return {
+          device: parseDeviceSummary(relay.device),
+          channels: array(relay.channels, "relay channels").map(bobnetChannel),
+          error: nullableString(relay.error, "relay error"),
+        };
+      }),
+    };
+  });
+}
+
+export function parseStandingResponse(
+  value: unknown,
+): Versioned<StandingSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "standing snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      experience_points_total: optionalFiniteNumber(
+        snapshot.experience_points_total,
+        "experience points",
+      ),
+      civilisation_points: optionalFiniteNumber(
+        snapshot.civilisation_points,
+        "civilisation points",
+      ),
+      achievements: array(snapshot.achievements, "achievements").map(
+        (value) => {
+          const achievement = record(value, "achievement");
+          if (typeof achievement.key !== "string")
+            throw new Error("Invalid achievement");
+          return {
+            key: achievement.key,
+            title: nullableString(achievement.title, "achievement title"),
+            description: nullableString(
+              achievement.description,
+              "achievement description",
+            ),
+            category: nullableString(
+              achievement.category,
+              "achievement category",
+            ),
+            xp_reward: optionalFiniteNumber(
+              achievement.xp_reward,
+              "achievement XP",
+            ),
+            achieved_at: nullableString(
+              achievement.achieved_at,
+              "achievement time",
+            ),
+          };
+        },
+      ),
+      reputation: array(snapshot.reputation, "reputation").map((value) => {
+        const reputation = record(value, "reputation");
+        if (typeof reputation.species !== "string")
+          throw new Error("Invalid reputation");
+        return {
+          species: reputation.species,
+          name: nullableString(reputation.name, "species name"),
+          value: optionalFiniteNumber(reputation.value, "reputation value"),
+          description: nullableString(
+            reputation.description,
+            "reputation description",
+          ),
+          trait_name: nullableString(reputation.trait_name, "species trait"),
+        };
+      }),
+    };
+  });
+}
+
+export function parseLeaderboardsResponse(
+  value: unknown,
+): Versioned<LeaderboardsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "leaderboards snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      selected_board: nullableString(
+        snapshot.selected_board,
+        "selected leaderboard",
+      ),
+      boards: array(snapshot.boards, "leaderboards").map((value) => {
+        const board = record(value, "leaderboard");
+        if (typeof board.key !== "string")
+          throw new Error("Invalid leaderboard");
+        return {
+          key: board.key,
+          name: nullableString(board.name, "leaderboard name"),
+          description: nullableString(
+            board.description,
+            "leaderboard description",
+          ),
+          board_type: nullableString(board.board_type, "leaderboard type"),
+        };
+      }),
+      entries: array(snapshot.entries, "leaderboard entries").map((value) => {
+        const entry = record(value, "leaderboard entry");
+        return {
+          rank: optionalFiniteNumber(entry.rank, "leaderboard rank"),
+          replicant: entry.replicant === null ? null : entity(entry.replicant),
+          name: nullableString(entry.name, "leaderboard name"),
+          designation: nullableString(
+            entry.designation,
+            "leaderboard designation",
+          ),
+          value: optionalFiniteNumber(entry.value, "leaderboard value"),
+          contribution_count: optionalFiniteNumber(
+            entry.contribution_count,
+            "leaderboard contributions",
+          ),
+        };
+      }),
+    };
+  });
+}
+
 function parseFactoryJob(value: unknown): FactoryJobSummary {
   const job = record(value, "factory job");
   if (typeof job.device_type !== "string")
@@ -2234,19 +2586,7 @@ export function parseDescriptorsResponse(
     )
       throw new Error("Invalid descriptors");
     return {
-      reports: item.reports.map((value) => {
-        const parsed = descriptor(value, "report descriptor");
-        const item = record(value, "report descriptor");
-        return {
-          ...parsed,
-          operation_class: oneOf(
-            item.operation_class,
-            ["report"] as const,
-            "report operation class",
-          ),
-          risk: oneOf(item.risk, ["none"] as const, "report risk"),
-        };
-      }),
+      reports: item.reports.map(reportDescriptor),
       actions: item.actions.map((value) => {
         const parsed = descriptor(value, "action descriptor");
         const item = record(value, "action descriptor");
