@@ -32,7 +32,7 @@ help:
 	  'docker-up             		Start the production Compose stack' \
 	  'docker-down           		Stop the stack without deleting durable data' \
 	  'docker-smoke          		Start and probe a configured full stack' \
-	  'docker-persistence-smoke	Prove the data volume survives container recreation' \
+	  'docker-persistence-smoke	Prove the data directory survives container recreation' \
 	  'zip                    		Create a clean working-tree ZIP for handoff'
 
 clean:

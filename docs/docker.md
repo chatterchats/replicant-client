@@ -12,6 +12,9 @@ Install Docker Engine with the Compose plugin. Clone the repository, then:
 ```sh
 cp .env.example .env
 # Edit .env and replace the RS_API_TOKEN placeholder.
+mkdir -p "$HOME/.local/share/replicant"
+# If your user/group IDs are not 1000, set REPLICANT_UID and REPLICANT_GID
+# in .env to the output of: id -u; id -g
 docker compose build
 docker compose up -d
 docker compose ps
@@ -56,7 +59,8 @@ are never copied into either image or sent to the browser.
 
 ## Durable state and persistence check
 
-The named volume `replicant-data` is mounted at `/var/lib/replicant` and holds:
+The host directory `${HOME}/.local/share/replicant` is mounted at
+`/var/lib/replicant` and holds:
 
 - `replicant-client.sqlite` plus SQLite WAL files: managed projections, event
   history, and managed operations;
@@ -65,52 +69,64 @@ The named volume `replicant-data` is mounted at `/var/lib/replicant` and holds:
 - future intentionally persistent profile configuration or file logs placed
   below the same data root.
 
-Override the volume name with `REPLICANT_DATA_VOLUME`. Prove the volume is
-reused by two newly created containers without a live account:
+Override the host path with `REPLICANT_DATA_DIR`. It must exist and be writable
+by `REPLICANT_UID:REPLICANT_GID`; these default to `1000:1000`. Prove the
+directory is reused by two newly created containers without a live account:
 
 ```sh
 make docker-persistence-smoke
 ```
 
 The first one-shot container writes `/var/lib/replicant/.persistence-smoke`;
-the second is a fresh container and verifies the marker. Do not use
-`docker compose down -v`: that command destroys the databases.
+the second is a fresh container and verifies the marker. Because this is a bind
+mount, `docker compose down` does not remove the host data directory.
 
 The current profile and application configuration are environment-based. The
 ignored host `.env` file therefore survives container recreation separately
-from the named volume. There are no other durable application paths today.
+from the data directory. There are no other durable application paths today.
+
+Deployments created before the host-directory default used the Docker volume
+`replicant-data`. Migrate it while the daemon is stopped:
+
+```sh
+docker compose down
+mkdir -p "$HOME/.local/share/replicant"
+docker run --rm \
+  -v replicant-data:/from:ro \
+  -v "$HOME/.local/share/replicant:/to" \
+  alpine:3.22 \
+  sh -c "cp -a /from/. /to/ && chown -R $(id -u):$(id -g) /to"
+docker compose up -d
+```
+
+Keep the old volume until the migrated workflows and managed state have been
+verified.
 
 ## Backup and restore
 
-Stop the daemon for a consistent backup, then archive the whole data volume:
+Stop the daemon for a consistent backup, then archive the host data directory:
 
 ```sh
 docker compose stop replicantd
 mkdir -p backups
-docker run --rm \
-  -v replicant-data:/data:ro \
-  -v "$PWD/backups:/backup" \
-  alpine:3.22 \
-  tar -C /data -czf /backup/replicant-data.tgz .
+tar -C "${REPLICANT_DATA_DIR:-$HOME/.local/share/replicant}" \
+  -czf backups/replicant-data.tgz .
 docker compose start replicantd
 ```
 
-Keep both SQLite databases in the same dated backup. Restore into a new volume
-so the failed data remains recoverable:
+Keep both SQLite databases in the same dated backup. Restore into a new
+directory so the failed data remains recoverable:
 
 ```sh
 docker compose down
-docker volume create replicant-data-restored
-docker run --rm \
-  -v replicant-data-restored:/data \
-  -v "$PWD/backups:/backup:ro" \
-  alpine:3.22 \
-  tar -C /data -xzf /backup/replicant-data.tgz
-REPLICANT_DATA_VOLUME=replicant-data-restored docker compose up -d
+mkdir -p "$HOME/.local/share/replicant-restored"
+tar -C "$HOME/.local/share/replicant-restored" \
+  -xzf backups/replicant-data.tgz
+REPLICANT_DATA_DIR="$HOME/.local/share/replicant-restored" docker compose up -d
 ```
 
-After verifying the restored stack, put the selected volume name in `.env`.
-Never delete the old volume until the restored workflows and managed state
+After verifying the restored stack, put the selected directory in `.env`.
+Never delete the old directory until the restored workflows and managed state
 have reconciled successfully.
 
 ## Upgrade and rollback
@@ -130,8 +146,8 @@ docker compose logs -f replicantd
 SIGTERM from Compose follows the daemon's native graceful shutdown path and
 allows 30 seconds for checkpointing. If an image upgrade fails, stop the stack,
 return to the previously working source/image, and start it against the same
-volume. If a migration prevents rollback, preserve the failed volume and start
-the old image against a restored pre-upgrade volume instead.
+directory. If a migration prevents rollback, preserve the failed directory and
+start the old image against a restored pre-upgrade directory instead.
 
 ## Daemon-only and explicit remote access
 

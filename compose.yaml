@@ -11,10 +11,15 @@ services:
       REPLICANT_PROFILE: ${REPLICANT_PROFILE:-default}
       RS_API_TOKEN: ${RS_API_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-info}
+    user: "${REPLICANT_UID:-1000}:${REPLICANT_GID:-1000}"
     expose:
       - "8080"
     volumes:
-      - replicant-data:/var/lib/replicant
+      - type: bind
+        source: ${REPLICANT_DATA_DIR:-${HOME}/.local/share/replicant}
+        target: /var/lib/replicant
+        bind:
+          create_host_path: false
     networks:
       - app
     restart: unless-stopped
@@ -53,7 +58,3 @@ services:
 networks:
   app:
     driver: bridge
-
-volumes:
-  replicant-data:
-    name: ${REPLICANT_DATA_VOLUME:-replicant-data}
