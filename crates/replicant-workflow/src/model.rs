@@ -398,7 +398,7 @@ impl WorkflowStatus {
         self == next
             || matches!(
                 (self, next),
-                (Queued, Running | Paused | Cancelled)
+                (Queued, Running | Paused | Failed | Cancelled)
                     | (
                         Running,
                         Waiting | Paused | Reconciling | Succeeded | Failed | Cancelled

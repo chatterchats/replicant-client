@@ -65,6 +65,12 @@ pub enum RepositoryError {
         /// Highest version supported by this crate.
         supported: i64,
     },
+    /// The recorded database migration sequence has a gap or invalid version.
+    #[error("invalid runtime database migration history: {0:?}")]
+    InvalidMigrationHistory(Vec<i64>),
+    /// SQLite detected database corruption.
+    #[error("runtime database integrity check failed: {0}")]
+    DatabaseIntegrity(String),
     /// No workflow has the requested ID.
     #[error("workflow {0} was not found")]
     NotFound(WorkflowId),
@@ -140,6 +146,11 @@ impl WorkflowRepository {
     fn from_connection(connection: Connection) -> Result<Self, RepositoryError> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let integrity: String =
+            connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(RepositoryError::DatabaseIntegrity(integrity));
+        }
         let repository = Self {
             connection: Mutex::new(connection),
         };
@@ -170,6 +181,16 @@ impl WorkflowRepository {
                 found,
                 supported: CURRENT_DATABASE_SCHEMA,
             });
+        }
+        let versions = {
+            let mut statement = transaction
+                .prepare("SELECT version FROM runtime_schema_migrations ORDER BY version")?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<i64>, _>>()?
+        };
+        if versions != (1..=found).collect::<Vec<_>>() {
+            return Err(RepositoryError::InvalidMigrationHistory(versions));
         }
         if found < 1 {
             transaction.execute_batch(INITIAL_SCHEMA)?;
@@ -852,6 +873,49 @@ impl WorkflowRepository {
             ],
         )?;
         let updated = read_in(&transaction, id)?.ok_or(RepositoryError::NotFound(id))?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Atomically replaces an old workflow payload with its explicitly migrated form.
+    pub(crate) fn migrate_workflow(
+        &self,
+        instance: &WorkflowInstance,
+        target_version: u32,
+        migration: crate::WorkflowMigration,
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        if target_version <= instance.schema_version {
+            return Err(RepositoryError::InvalidWorkflowSchemaVersion);
+        }
+        let revision = i64::try_from(instance.revision)
+            .map_err(|_| RepositoryError::RevisionOutOfRange(instance.revision))?;
+        let config = serde_json::to_string(&migration.config)?;
+        let checkpoint = serde_json::to_string(&migration.checkpoint)?;
+        let now = now_millis()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE workflow_instances SET schema_version = ?1, config_json = ?2,
+                checkpoint_json = ?3, updated_at = ?4, revision = revision + 1
+             WHERE id = ?5 AND revision = ?6 AND schema_version = ?7",
+            params![
+                target_version,
+                config,
+                checkpoint,
+                now,
+                instance.id.to_string(),
+                revision,
+                instance.schema_version,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::ConcurrentUpdate {
+                id: instance.id,
+                expected: instance.revision,
+            });
+        }
+        let updated =
+            read_in(&transaction, instance.id)?.ok_or(RepositoryError::NotFound(instance.id))?;
         transaction.commit()?;
         Ok(updated)
     }

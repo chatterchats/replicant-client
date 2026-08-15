@@ -421,15 +421,50 @@ impl WorkflowSupervisor {
 
     /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
     pub async fn tick(&mut self) -> Result<(), SupervisorError> {
-        if !self.claims_reconciled {
-            self.repository.reconcile_claims()?;
+        let instances = if !self.claims_reconciled {
+            let released_claims = self.repository.reconcile_claims()?;
+            let instances = self.repository.list()?;
+            let resumable = instances
+                .iter()
+                .filter(|workflow| {
+                    matches!(
+                        workflow.status,
+                        WorkflowStatus::Queued
+                            | WorkflowStatus::Running
+                            | WorkflowStatus::Waiting
+                            | WorkflowStatus::Reconciling
+                    )
+                })
+                .count();
+            let paused = instances
+                .iter()
+                .filter(|workflow| workflow.status == WorkflowStatus::Paused)
+                .count();
+            let terminal = instances
+                .iter()
+                .filter(|workflow| workflow.status.is_terminal())
+                .count();
+            tracing::info!(
+                workflows = instances.len(),
+                resumable,
+                paused,
+                terminal,
+                released_claims,
+                "workflow startup reconciliation complete"
+            );
             self.claims_reconciled = true;
-        }
+            Some(instances)
+        } else {
+            None
+        };
         self.reap_finished().await?;
         if self.repository.automation_policy()?.workflows_paused {
             return Ok(());
         }
-        for instance in self.repository.list()? {
+        for instance in match instances {
+            Some(instances) => instances,
+            None => self.repository.list()?,
+        } {
             if self.tasks.contains_key(&instance.id) {
                 continue;
             }
@@ -556,6 +591,26 @@ impl WorkflowSupervisor {
     }
 
     fn start(&mut self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+        let instance = match self.registry.migration(&instance) {
+            Ok(Some((target_version, migration))) => {
+                let migrated =
+                    self.repository
+                        .migrate_workflow(&instance, target_version, migration)?;
+                tracing::info!(
+                    workflow_id = %migrated.id,
+                    kind = %migrated.kind,
+                    from_version = instance.schema_version,
+                    to_version = target_version,
+                    "workflow checkpoint migrated"
+                );
+                migrated
+            }
+            Ok(None) => instance,
+            Err(error) => {
+                self.fail_without_executor(instance, error.to_string())?;
+                return Ok(());
+            }
+        };
         let instance = self.transition(instance, WorkflowStatus::Running)?;
         let mut executor = match self
             .registry
@@ -602,6 +657,28 @@ impl WorkflowSupervisor {
         });
         self.tasks.insert(id, task);
         self.controls.insert(id, control_sender);
+        Ok(())
+    }
+
+    fn fail_without_executor(
+        &self,
+        instance: WorkflowInstance,
+        error: String,
+    ) -> Result<(), SupervisorError> {
+        tracing::error!(
+            workflow_id = %instance.id,
+            kind = %instance.kind,
+            schema_version = instance.schema_version,
+            "workflow startup reconciliation failed"
+        );
+        let (_, control) = watch::channel(ControlRequest::Continue);
+        WorkflowContext::new(
+            self.repository.clone(),
+            instance,
+            self.client.clone(),
+            control,
+        )
+        .mark_failed(error)?;
         Ok(())
     }
 

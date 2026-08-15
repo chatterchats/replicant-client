@@ -1153,7 +1153,7 @@ fn present_trigger(trigger: AutomationTrigger) -> Result<ProtocolTrigger, ApiErr
                 TriggerTargetClass::Workflow => OperationClass::Workflow,
             },
             kind: OperationKind(trigger.target.kind),
-            parameters: trigger.target.parameters,
+            parameters: sanitize_parameters(trigger.target.parameters),
         },
         enabled: trigger.enabled,
         created_at_ms: trigger.created_at,
@@ -1297,6 +1297,15 @@ fn sanitize_result(value: Value) -> Value {
         ),
         value => value,
     }
+}
+
+fn sanitize_parameters(parameters: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let Value::Object(parameters) =
+        sanitize_result(Value::Object(parameters.into_iter().collect()))
+    else {
+        unreachable!("an object remains an object after sanitization")
+    };
+    parameters.into_iter().collect()
 }
 
 fn result_links(result: &Value) -> Vec<EntityRef> {
@@ -1653,7 +1662,7 @@ fn detail(
 }
 
 fn config_parameters(value: Value) -> Result<BTreeMap<String, Value>, ApiError> {
-    let Value::Object(mut object) = value else {
+    let Value::Object(mut object) = sanitize_result(value) else {
         return Err(ApiError::internal());
     };
     if object.len() == 1
@@ -1732,11 +1741,11 @@ fn operational_notifications(
         .iter()
         .filter_map(workflow_notification)
         .chain(triggers.iter().filter_map(|trigger| {
-            trigger.last_error.as_ref().map(|error| Notification {
+            trigger.last_error.as_ref().map(|_| Notification {
                 id: EntityId(format!("trigger:{}:failed", trigger.id)),
                 level: NotificationLevel::Error,
                 title: "Automatic trigger failed".to_owned(),
-                message: format!("{}: {error}", trigger.name),
+                message: "An automatic trigger failed; inspect local daemon logs".to_owned(),
                 created_at_ms: trigger.updated_at,
             })
         }))
@@ -1769,7 +1778,11 @@ fn workflow_notification(workflow: &WorkflowInstance) -> Option<Notification> {
             "Workflow needs attention"
         }
         .to_owned(),
-        message: format!("{}: {error}", workflow.kind),
+        message: if blocked {
+            "A workflow is blocked by a resource claim".to_owned()
+        } else {
+            "A workflow failed; inspect local daemon logs".to_owned()
+        },
         created_at_ms: workflow.updated_at,
     })
 }
@@ -2010,7 +2023,7 @@ mod tests {
     use http_body_util::BodyExt;
     use replicant_client::StartupPolicy;
     use replicant_protocol::{Notification, NotificationLevel};
-    use replicant_workflow::{NewWorkflow, WorkflowKind};
+    use replicant_workflow::{NewWorkflow, WorkflowKind, WorkflowState};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -2083,6 +2096,49 @@ mod tests {
             );
             assert!(!value.to_string().contains("token"));
         }
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn workflow_failure_payloads_and_notifications_redact_secrets() {
+        let (_, client, state) = test_app().await;
+        let workflow = state
+            .repository
+            .create(NewWorkflow {
+                kind: WorkflowKind::new("test.secret-safety").unwrap(),
+                schema_version: 1,
+                config: serde_json::json!({ "api_token": "do-not-export", "system": "SOL" }),
+                checkpoint: serde_json::json!({ "secret": "also-private" }),
+                current_step: None,
+                parent_id: None,
+            })
+            .unwrap();
+        let failed = state
+            .repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: None,
+                    checkpoint: serde_json::json!({ "secret": "also-private" }),
+                    last_error: Some("authentication failed for do-not-export".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .unwrap();
+
+        let exported = serde_json::to_string(
+            &detail(&state.repository, &failed).unwrap_or_else(|_| panic!("workflow detail")),
+        )
+        .unwrap();
+        let notifications =
+            serde_json::to_string(&operational_notifications(&[failed], &[], &client.status()))
+                .unwrap();
+        assert!(!exported.contains("do-not-export"));
+        assert!(!exported.contains("also-private"));
+        assert!(!notifications.contains("do-not-export"));
+        assert!(exported.contains("[redacted]"));
         client.close().await.expect("close client");
     }
 
@@ -2445,21 +2501,22 @@ mod tests {
     #[tokio::test]
     async fn slow_client_is_told_to_resnapshot() {
         let (_, client, state) = test_app().await;
-        let mut updates = state.live.subscribe();
-        for _ in 0..=LIVE_BUFFER {
-            state.publish(LiveDelta::DomainInvalidated {
-                slice: DomainSlice::Universe,
-            });
+        for _ in 0..3 {
+            let mut updates = state.live.subscribe();
+            for _ in 0..=LIVE_BUFFER {
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Universe,
+                });
+            }
+            assert!(matches!(
+                updates.recv().await,
+                Err(broadcast::error::RecvError::Lagged(_))
+            ));
+            let message = state
+                .resnapshot_message()
+                .unwrap_or_else(|_| panic!("resnapshot"));
+            assert!(matches!(message.delta, LiveDelta::Snapshot(_)));
         }
-        assert!(matches!(
-            updates.recv().await,
-            Err(broadcast::error::RecvError::Lagged(_))
-        ));
-        let message = match state.resnapshot_message() {
-            Ok(message) => message,
-            Err(_) => panic!("resnapshot failed"),
-        };
-        assert!(matches!(message.delta, LiveDelta::Snapshot(_)));
         client.close().await.expect("close client");
     }
 

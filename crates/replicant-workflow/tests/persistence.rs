@@ -7,8 +7,8 @@ use std::{
 
 use replicant_workflow::{
     ClaimAcquireOutcome, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowFactory,
-    WorkflowKind, WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus,
-    WorkflowSupervisor,
+    WorkflowKind, WorkflowMigration, WorkflowRegistry, WorkflowRepository, WorkflowState,
+    WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -350,6 +350,26 @@ impl WorkflowFactory for Factory {
     fn current_schema_version(&self) -> u32 {
         2
     }
+
+    fn supports_schema_version(&self, version: u32) -> bool {
+        matches!(version, 1 | 2)
+    }
+
+    fn migrate(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<Option<WorkflowMigration>, String> {
+        let config = instance
+            .config::<serde_json::Value>()
+            .map_err(|error| error.to_string())?;
+        let checkpoint = instance
+            .checkpoint::<serde_json::Value>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(WorkflowMigration::new(
+            serde_json::json!({ "system": config["system_code"] }),
+            serde_json::json!({ "visits": checkpoint["seen"] }),
+        )))
+    }
 }
 
 #[test]
@@ -434,4 +454,166 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         invalid,
         Err(RepositoryError::InvalidWorkflowSchemaVersion)
     ));
+}
+
+#[tokio::test]
+async fn explicitly_migrates_old_checkpoint_before_executor_resolution() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let workflow = repository
+        .create(NewWorkflow {
+            kind: kind(),
+            schema_version: 1,
+            config: serde_json::json!({ "system_code": "SOL" }),
+            checkpoint: serde_json::json!({ "seen": 4 }),
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create old workflow");
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(Factory { kind: kind() }))
+        .expect("register factory");
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+
+    supervisor.tick().await.expect("migrate workflow");
+
+    let migrated = repository
+        .read(workflow.id)
+        .expect("read workflow")
+        .expect("workflow exists");
+    assert_eq!(migrated.schema_version, 2);
+    assert_eq!(migrated.config::<Config>().unwrap().system, "SOL");
+    assert_eq!(migrated.checkpoint::<Checkpoint>().unwrap().visits, 4);
+    assert_eq!(migrated.status, WorkflowStatus::Failed);
+    assert_eq!(
+        migrated.revision, 3,
+        "migration and failure are separate durable writes"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_checkpoint_fails_without_running_or_losing_claims_history() {
+    struct UnsupportedFactory(WorkflowKind);
+    impl WorkflowFactory for UnsupportedFactory {
+        fn kind(&self) -> &WorkflowKind {
+            &self.0
+        }
+
+        fn current_schema_version(&self) -> u32 {
+            2
+        }
+    }
+
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let workflow = repository
+        .create(NewWorkflow {
+            kind: kind(),
+            schema_version: 1,
+            config: serde_json::json!({ "incompatible": true }),
+            checkpoint: serde_json::json!(["not", "reinterpreted"]),
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create incompatible workflow");
+    repository
+        .acquire_claim(workflow.id, ResourceKey::Device("SAFE".into()))
+        .expect("claim resource");
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(UnsupportedFactory(kind())))
+        .expect("register factory");
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+
+    supervisor
+        .tick()
+        .await
+        .expect("reject incompatible workflow");
+
+    let failed = repository.read(workflow.id).unwrap().unwrap();
+    assert_eq!(failed.status, WorkflowStatus::Failed);
+    assert!(
+        failed
+            .last_error
+            .unwrap()
+            .contains("does not support schema version 1")
+    );
+    assert!(repository.claims(workflow.id).unwrap().is_empty());
+    assert_eq!(
+        repository.list().unwrap().len(),
+        1,
+        "terminal history is retained"
+    );
+}
+
+#[test]
+fn migrates_an_existing_runtime_database_without_losing_workflows() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-database-migration-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let id = uuid::Uuid::new_v4();
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open old database");
+        connection
+            .execute_batch(concat!(
+                include_str!("../migrations/0001_initial.sql"),
+                include_str!("../migrations/0002_activity.sql"),
+                include_str!("../migrations/0003_resource_claims.sql"),
+                "CREATE TABLE runtime_schema_migrations (version INTEGER PRIMARY KEY NOT NULL);",
+                "INSERT INTO runtime_schema_migrations VALUES (1), (2), (3);"
+            ))
+            .expect("install old schema");
+        connection
+            .execute(
+                "INSERT INTO workflow_instances
+                 (id, kind, schema_version, config_json, checkpoint_json, status,
+                  created_at, updated_at)
+                 VALUES (?1, 'survey.route', 2, '{\"system\":\"SOL\"}',
+                         '{\"visits\":7}', 'paused', 1, 1)",
+                [id.to_string()],
+            )
+            .expect("insert old workflow");
+    }
+
+    let repository = WorkflowRepository::open(&path).expect("migrate database");
+    let workflows = repository.list().expect("read migrated workflows");
+    assert_eq!(workflows.len(), 1);
+    assert_eq!(workflows[0].checkpoint::<Checkpoint>().unwrap().visits, 7);
+    assert_eq!(repository.automation_policy().unwrap(), Default::default());
+    drop(repository);
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
+fn rejects_gapped_database_migration_history() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-gapped-migration-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open database");
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+                 INSERT INTO runtime_schema_migrations VALUES (1), (3);",
+            )
+            .expect("create invalid history");
+    }
+    assert!(matches!(
+        WorkflowRepository::open(&path),
+        Err(RepositoryError::InvalidMigrationHistory(versions)) if versions == vec![1, 3]
+    ));
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
+fn rejects_corrupt_runtime_database_without_recreating_it() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-corrupt-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&path, b"not a sqlite database").expect("write corrupt fixture");
+    assert!(WorkflowRepository::open(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"not a sqlite database");
+    fs::remove_file(path).expect("remove test database");
 }

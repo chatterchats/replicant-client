@@ -285,18 +285,33 @@ async fn reopens_and_resumes_without_repeating_completed_steps() {
         "replicant-workflow-supervisor-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
-    let repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
+    let mut repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
     let (id, harness, registry, mut supervisor) = setup(repository.clone(), false);
-    supervisor.tick().await.expect("start workflow");
-    reach_step(&harness).await;
-    drop(supervisor);
-    drop(repository);
-    tokio::task::yield_now().await;
+    repository
+        .acquire_claim(id, ResourceKey::Device("RESTART-VESSEL".into()))
+        .expect("claim resource");
 
-    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry);
-    supervisor.tick().await.expect("reconcile workflow");
-    finish_remaining(&harness, 1).await;
+    for expected_completed in 1..=3 {
+        supervisor.tick().await.expect("start workflow");
+        reach_step(&harness).await;
+        assert_eq!(
+            repository
+                .read(id)
+                .unwrap()
+                .unwrap()
+                .checkpoint::<Checkpoint>()
+                .unwrap()
+                .completed,
+            expected_completed
+        );
+        assert_eq!(repository.claims(id).unwrap().len(), 1);
+        drop(supervisor);
+        drop(repository);
+        tokio::task::yield_now().await;
+        repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+        supervisor = WorkflowSupervisor::new(repository.clone(), registry.clone());
+    }
+
     wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
 
     let activity = repository.activity(id).expect("read activity");
@@ -304,6 +319,138 @@ async fn reopens_and_resumes_without_repeating_completed_steps() {
     assert_eq!(activity[0].message, "completed step 1");
     assert_eq!(activity[1].message, "completed step 2");
     assert_eq!(activity[2].message, "completed step 3");
+    assert!(repository.claims(id).expect("terminal claims").is_empty());
+    drop(supervisor);
+    drop(repository);
+
+    for _ in 0..3 {
+        let repository = WorkflowRepository::open(&path).expect("reopen terminal history");
+        assert_eq!(repository.list().unwrap().len(), 1);
+        assert_eq!(repository.activity(id).unwrap().len(), 3);
+    }
+    std::fs::remove_file(path).expect("remove test database");
+}
+
+struct MutationHarness {
+    submitted: AtomicUsize,
+    evidence: std::sync::atomic::AtomicBool,
+    submitted_before_checkpoint: Semaphore,
+    checkpoint_allowed: Semaphore,
+}
+
+impl Default for MutationHarness {
+    fn default() -> Self {
+        Self {
+            submitted: AtomicUsize::new(0),
+            evidence: std::sync::atomic::AtomicBool::new(false),
+            submitted_before_checkpoint: Semaphore::new(0),
+            checkpoint_allowed: Semaphore::new(0),
+        }
+    }
+}
+
+struct MutationFactory {
+    kind: WorkflowKind,
+    harness: Arc<MutationHarness>,
+}
+
+impl WorkflowFactory for MutationFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(MutationWorkflow(self.harness.clone())))
+    }
+}
+
+struct MutationWorkflow(Arc<MutationHarness>);
+
+impl WorkflowExecutor for MutationWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            if !self.0.evidence.swap(true, Ordering::SeqCst) {
+                self.0.submitted.fetch_add(1, Ordering::SeqCst);
+                self.0.submitted_before_checkpoint.add_permits(1);
+                self.0
+                    .checkpoint_allowed
+                    .acquire()
+                    .await
+                    .expect("test harness remains open")
+                    .forget();
+            }
+            context
+                .persist_checkpoint(&serde_json::json!({ "evidence_reconciled": true }))
+                .map_err(|error| error.to_string())?;
+            context
+                .mark_succeeded(Some(true))
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[tokio::test]
+async fn restart_after_mutation_submission_reconciles_evidence_without_resubmitting() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-mutation-gap-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
+    let kind = WorkflowKind::new("test.mutation-gap").unwrap();
+    let workflow = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: (),
+            checkpoint: serde_json::json!({ "evidence_reconciled": false }),
+            current_step: Some("submit".into()),
+            parent_id: None,
+        })
+        .unwrap();
+    let harness = Arc::new(MutationHarness::default());
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(MutationFactory {
+            kind,
+            harness: harness.clone(),
+        }))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry.clone());
+    supervisor.tick().await.unwrap();
+    harness
+        .submitted_before_checkpoint
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    drop(supervisor);
+    drop(repository);
+    tokio::task::yield_now().await;
+
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry);
+    wait_for_status(
+        &mut supervisor,
+        &repository,
+        workflow.id,
+        WorkflowStatus::Succeeded,
+    )
+    .await;
+    assert_eq!(harness.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repository
+            .read(workflow.id)
+            .unwrap()
+            .unwrap()
+            .checkpoint::<serde_json::Value>()
+            .unwrap()["evidence_reconciled"],
+        true
+    );
     drop(supervisor);
     drop(repository);
     std::fs::remove_file(path).expect("remove test database");
@@ -489,7 +636,7 @@ async fn restart_reconciles_wait_and_rechecks_managed_state() {
         "replicant-workflow-wait-{}.sqlite",
         uuid::Uuid::new_v4()
     ));
-    let repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
+    let mut repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
     let satisfied = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let client = managed_client().await;
     let (id, registry, mut supervisor) = waiting_setup(
@@ -498,16 +645,21 @@ async fn restart_reconciles_wait_and_rechecks_managed_state() {
         satisfied.clone(),
         unix_millis() + 60_000,
     );
-    supervisor.tick().await.expect("start workflow");
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
-    drop(supervisor);
-    drop(repository);
-    tokio::task::yield_now().await;
+    for _ in 0..3 {
+        supervisor.tick().await.expect("start workflow");
+        wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+        drop(supervisor);
+        drop(repository);
+        tokio::task::yield_now().await;
+        repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+        supervisor = WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            registry.clone(),
+            client.clone(),
+        );
+    }
 
     satisfied.store(true, Ordering::SeqCst);
-    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
-    let mut supervisor =
-        WorkflowSupervisor::with_managed_client(repository.clone(), registry, client);
     wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(
         repository
