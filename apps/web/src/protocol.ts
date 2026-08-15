@@ -187,6 +187,49 @@ export interface MiningSnapshot {
   workflows: WorkflowSummary[];
 }
 
+export interface RelayExpansionSummary {
+  workflow: WorkflowSummary;
+  replicant: string;
+  hub: string;
+  targets: string[];
+  phase: string;
+  completed_stops: number;
+  total_stops: number | null;
+  next_system: string | null;
+  pending_relays: number | null;
+}
+
+export interface RelaySnapshot {
+  metadata: SnapshotMetadata;
+  relays: DeviceSummary[];
+  staged_relays: DeviceSummary[];
+  connected_systems: number;
+  relay_edges: { from: string; to: string }[];
+  expansions: RelayExpansionSummary[];
+}
+
+export interface BootstrapMissionSummary {
+  mission_id: string;
+  execution_id: string;
+  region: string;
+  source_hub: string;
+  target_system: string;
+  target_location: string;
+  phase: string;
+  reserved_devices: number;
+  loaded_devices: number;
+  capital_system: string | null;
+  selected_sites: number;
+  warnings: string[];
+  completed: boolean;
+  updated_at_ms: number;
+}
+
+export interface BootstrapSnapshot {
+  metadata: SnapshotMetadata;
+  missions: BootstrapMissionSummary[];
+}
+
 export interface FactoryJobSummary {
   device_type: string;
   quantity: number;
@@ -1387,6 +1430,113 @@ export function parseMiningResponse(value: unknown): Versioned<MiningSnapshot> {
         },
       ),
       workflows: array(snapshot.workflows, "mining workflows").map(workflow),
+    };
+  });
+}
+
+export function parseRelayResponse(value: unknown): Versioned<RelaySnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "relay snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      relays: array(snapshot.relays, "relays").map(parseDeviceSummary),
+      staged_relays: array(snapshot.staged_relays, "staged relays").map(
+        parseDeviceSummary,
+      ),
+      connected_systems: number(
+        snapshot.connected_systems,
+        "connected relay systems",
+      ),
+      relay_edges: array(snapshot.relay_edges, "relay edges").map((value) => {
+        const edge = record(value, "relay edge");
+        if (typeof edge.from !== "string" || typeof edge.to !== "string")
+          throw new Error("Invalid relay edge");
+        return { from: edge.from, to: edge.to };
+      }),
+      expansions: array(snapshot.expansions, "relay expansions").map(
+        (value) => {
+          const expansion = record(value, "relay expansion");
+          if (
+            typeof expansion.replicant !== "string" ||
+            typeof expansion.hub !== "string" ||
+            typeof expansion.phase !== "string"
+          )
+            throw new Error("Invalid relay expansion");
+          return {
+            workflow: workflow(expansion.workflow),
+            replicant: expansion.replicant,
+            hub: expansion.hub,
+            targets: stringArray(expansion.targets, "relay targets"),
+            phase: expansion.phase,
+            completed_stops: number(
+              expansion.completed_stops,
+              "completed relay stops",
+            ),
+            total_stops: optionalFiniteNumber(
+              expansion.total_stops,
+              "relay stops",
+            ),
+            next_system: nullableString(
+              expansion.next_system,
+              "next relay system",
+            ),
+            pending_relays: optionalFiniteNumber(
+              expansion.pending_relays,
+              "pending relays",
+            ),
+          };
+        },
+      ),
+    };
+  });
+}
+
+export function parseBootstrapResponse(
+  value: unknown,
+): Versioned<BootstrapSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "bootstrap snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      missions: array(snapshot.missions, "bootstrap missions").map((value) => {
+        const mission = record(value, "bootstrap mission");
+        if (
+          typeof mission.mission_id !== "string" ||
+          typeof mission.execution_id !== "string" ||
+          typeof mission.region !== "string" ||
+          typeof mission.source_hub !== "string" ||
+          typeof mission.target_system !== "string" ||
+          typeof mission.target_location !== "string" ||
+          typeof mission.phase !== "string" ||
+          typeof mission.completed !== "boolean"
+        )
+          throw new Error("Invalid bootstrap mission");
+        return {
+          mission_id: mission.mission_id,
+          execution_id: mission.execution_id,
+          region: mission.region,
+          source_hub: mission.source_hub,
+          target_system: mission.target_system,
+          target_location: mission.target_location,
+          phase: mission.phase,
+          reserved_devices: number(
+            mission.reserved_devices,
+            "reserved bootstrap devices",
+          ),
+          loaded_devices: number(
+            mission.loaded_devices,
+            "loaded bootstrap devices",
+          ),
+          capital_system: nullableString(
+            mission.capital_system,
+            "bootstrap capital",
+          ),
+          selected_sites: number(mission.selected_sites, "bootstrap sites"),
+          warnings: stringArray(mission.warnings, "bootstrap warnings"),
+          completed: mission.completed,
+          updated_at_ms: number(mission.updated_at_ms, "bootstrap update time"),
+        };
+      }),
     };
   });
 }

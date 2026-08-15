@@ -19,6 +19,7 @@ use crate::{
         ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
         tag_devices,
     },
+    bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
     relay::RelayExpansionRequest,
     reports::nearby_belt_report,
     survey::{SurveyMode, SurveyOptions},
@@ -173,6 +174,21 @@ impl OperationCatalogue {
             ),
             "tag_devices" => serialize(
                 tag_devices(client, &decode::<TagDevicesAction>(parameters)?)
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+            ),
+            "bootstrap.stage" => serialize(
+                stage_bootstrap(client, &decode::<BootstrapStart>(parameters)?.request())
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+            ),
+            "bootstrap.deliver" => serialize(
+                deliver_bootstrap(client, &decode::<BootstrapStart>(parameters)?.request())
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+            ),
+            "bootstrap.run" => serialize(
+                run_bootstrap(client, &decode::<BootstrapStart>(parameters)?.request())
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
@@ -525,6 +541,21 @@ fn descriptors() -> DescriptorCatalog {
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
             },
+            bootstrap_action(
+                "bootstrap.stage",
+                "Stage bootstrap ark",
+                "Resume manufacturing, loading, and source staging from a bootstrap mission file.",
+            ),
+            bootstrap_action(
+                "bootstrap.deliver",
+                "Deliver bootstrap ark",
+                "Deliver a staged bootstrap ark to its planned landing star.",
+            ),
+            bootstrap_action(
+                "bootstrap.run",
+                "Run regional bootstrap",
+                "Resume the complete regional bootstrap from its durable mission file.",
+            ),
         ],
         workflows: workflow_descriptors(),
     }
@@ -812,6 +843,32 @@ fn enum_parameter(name: &str, label: &str, values: &[&str], default: &str) -> Pa
     parameter
 }
 
+fn bootstrap_action(kind: &str, display_name: &str, description: &str) -> ActionDescriptor {
+    ActionDescriptor {
+        kind: operation_kind(kind),
+        display_name: display_name.to_owned(),
+        aliases: Vec::new(),
+        description: description.to_owned(),
+        category: "bootstrap".to_owned(),
+        operation_class: OperationClass::Action,
+        risk: MutationRisk::Elevated,
+        applicable_to: vec![EntityKind::System, EntityKind::Location],
+        parameters: vec![
+            required("mission_file", "Mission file", ParameterKind::String),
+            bounded(
+                defaulted(
+                    "wait_timeout_seconds",
+                    "Wait timeout (seconds)",
+                    ParameterKind::Integer,
+                    21_600,
+                ),
+                Some(1.0),
+                None,
+            ),
+        ],
+    }
+}
+
 #[derive(Deserialize)]
 struct SurveyStart {
     #[serde(default = "default_survey_mode")]
@@ -885,6 +942,22 @@ struct RelayStart {
     max_hop_ly: f64,
     #[serde(default = "default_timeout")]
     wait_timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct BootstrapStart {
+    mission_file: PathBuf,
+    #[serde(default = "default_timeout")]
+    wait_timeout_seconds: u64,
+}
+
+impl BootstrapStart {
+    fn request(self) -> BootstrapExecutionRequest {
+        BootstrapExecutionRequest::new(
+            self.mission_file,
+            Duration::from_secs(self.wait_timeout_seconds),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -1036,5 +1109,29 @@ mod tests {
             &EntityKind::Device
         ));
         assert!(catalogue.is_applicable(OperationClass::Action, "clear_tags", &EntityKind::Device));
+        assert!(catalogue.is_applicable(
+            OperationClass::Action,
+            "bootstrap.run",
+            &EntityKind::System
+        ));
+    }
+
+    #[test]
+    fn bootstrap_actions_validate_persisted_mission_inputs() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        for kind in ["bootstrap.stage", "bootstrap.deliver", "bootstrap.run"] {
+            let parameters = catalogue
+                .validate(
+                    OperationClass::Action,
+                    kind,
+                    BTreeMap::from([(
+                        "mission_file".to_owned(),
+                        Value::String("regional-bootstrap.json".to_owned()),
+                    )]),
+                    false,
+                )
+                .expect("valid bootstrap action");
+            assert_eq!(parameters["wait_timeout_seconds"], 21_600);
+        }
     }
 }

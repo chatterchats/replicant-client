@@ -11,6 +11,7 @@ import {
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
 import { AutofactoryPage } from "./AutofactoryPage";
+import { BootstrapPage } from "./BootstrapPage";
 import { CargoPage } from "./CargoPage";
 import {
   CommandPalette,
@@ -24,6 +25,7 @@ import { MiningPage } from "./MiningPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
 import { RequirementsPage } from "./RequirementsPage";
+import { RelayPage } from "./RelayPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
 import { daemonApi } from "./api";
@@ -654,6 +656,40 @@ export function App() {
                 onSelectWorkflow={(workflowId) => {
                   setSelectedAutomationWorkflow(workflowId);
                   navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Relay" ? (
+              <RelayPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onOpenGalaxy={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("Galaxy");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Bootstrap" ? (
+              <BootstrapPage
+                descriptors={descriptors}
+                onOpenGalaxy={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("Galaxy");
+                }}
+                onOpenHistory={() => {
+                  navigate("History");
                 }}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);

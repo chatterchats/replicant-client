@@ -32,26 +32,28 @@ use replicant_protocol::{
     ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
     AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
     AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
-    CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
-    DescriptorCatalog, DeviceClaim, DeviceSummary, DevicesSnapshot, DomainSlice, EntityId,
-    EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse, FactoryJobSummary,
+    BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary,
+    CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim,
+    DeviceSummary, DevicesSnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind,
+    EntityRef, EntitySummary, ErrorResponse, FactoryJobSummary,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
     InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, MiningInstallationStatus,
     MiningInstallationSummary, MiningSnapshot, Notification, NotificationLevel, OperationClass,
     OperationKind, OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot,
-    OverviewTravel, RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse,
-    RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest,
-    StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
-    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
-    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
-    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
-    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
-    WorkflowStatusCount, WorkflowSummary,
+    OverviewTravel, RelayExpansionSummary, RelaySnapshot, RequirementSummary, ResultSummary,
+    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary,
+    SurveySnapshot, SyncPhase, SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
+    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
+    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
+    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
+    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowStatusCount, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
+    bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
     config::RuntimeConfig,
     galaxy_scene::galaxy_scene as build_galaxy_scene,
@@ -59,8 +61,9 @@ use replicant_runtime::{
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
     workflows::{
-        RequirementWorkflowCheckpoint, RequirementWorkflowConfig, SurveyWorkflowCheckpoint,
-        SurveyWorkflowConfig, WorkflowActivityEvent,
+        RelayWorkflowCheckpoint, RelayWorkflowConfig, RequirementWorkflowCheckpoint,
+        RequirementWorkflowConfig, SurveyWorkflowCheckpoint, SurveyWorkflowConfig,
+        WorkflowActivityEvent,
     },
 };
 use replicant_workflow::{
@@ -214,6 +217,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/cargo", get(cargo))
         .route("/api/missions/survey", get(survey_missions))
         .route("/api/missions/mining", get(mining_missions))
+        .route("/api/missions/relay", get(relay_missions))
+        .route("/api/missions/bootstrap", get(bootstrap_missions))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -632,6 +637,9 @@ fn publish_workflow_updates(
                 });
                 state.publish(LiveDelta::DomainInvalidated {
                     slice: DomainSlice::Cargo,
+                });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Missions,
                 });
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
@@ -1327,6 +1335,185 @@ async fn mining_missions(
     })))
 }
 
+async fn relay_missions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<RelaySnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let scene = build_galaxy_scene(
+        state.client(),
+        &workflows,
+        metadata.revision,
+        metadata.generated_at_ms,
+    )
+    .await
+    .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(relay_snapshot(
+        metadata,
+        device_rows(&state).await?,
+        scene,
+        &workflows,
+    )?)))
+}
+
+fn relay_snapshot(
+    metadata: SnapshotMetadata,
+    devices: Vec<DeviceSummary>,
+    scene: GalaxySceneSnapshot,
+    workflows: &[WorkflowInstance],
+) -> Result<RelaySnapshot, ApiError> {
+    const RELAY_TYPES: [&str; 3] = ["ftl_relay", "system_hub", "deep_space_relay_station"];
+    let connected = scene
+        .stars
+        .iter()
+        .filter(|star| star.has_relay)
+        .map(|star| star.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let relay_capable = |device: &&DeviceSummary| {
+        device
+            .device_type
+            .as_deref()
+            .is_some_and(|kind| RELAY_TYPES.contains(&kind))
+    };
+    let deployed = |device: &&DeviceSummary| {
+        relay_capable(device)
+            && device.ownership == "owned"
+            && device.attached_to.is_none()
+            && device.stowed_in.is_none()
+            && device
+                .system
+                .as_deref()
+                .is_some_and(|system| connected.contains(system))
+            && device
+                .status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "active" | "relaying"))
+    };
+    let relays = devices.iter().filter(deployed).cloned().collect::<Vec<_>>();
+    let deployed_codes = relays
+        .iter()
+        .map(|device| device.entity.id.0.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let staged_relays = devices
+        .iter()
+        .filter(relay_capable)
+        .filter(|device| !deployed_codes.contains(device.entity.id.0.as_str()))
+        .filter(|device| {
+            device.tags.iter().any(|tag| tag.starts_with("relay-m:"))
+                || device
+                    .claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.workflow_kind.0 == "relay.expansion")
+        })
+        .cloned()
+        .collect();
+    let mut expansions = Vec::new();
+    for workflow in workflows.iter().filter(|workflow| {
+        workflow.kind.as_str() == "relay.expansion" && active_workflow(workflow.status)
+    }) {
+        let config = workflow
+            .config::<RelayWorkflowConfig>()
+            .map_err(ApiError::repository)?;
+        let checkpoint = workflow
+            .checkpoint::<RelayWorkflowCheckpoint>()
+            .map_err(ApiError::repository)?;
+        let status = checkpoint.state.as_ref().map(|state| state.status());
+        expansions.push(RelayExpansionSummary {
+            workflow: summary(workflow),
+            replicant: config.request.replicant,
+            hub: config.request.hub,
+            targets: config.request.targets.clone(),
+            phase: status
+                .as_ref()
+                .and_then(|status| wire_value(Some(&status.phase)))
+                .or_else(|| workflow.current_step.clone())
+                .unwrap_or_else(|| "queued".to_owned()),
+            completed_stops: status.as_ref().map_or(0, |status| status.completed_stops),
+            total_stops: status.as_ref().map(|status| status.total_stops),
+            next_system: status
+                .as_ref()
+                .and_then(|status| status.next_system.clone())
+                .or_else(|| config.request.targets.first().cloned()),
+            pending_relays: status.map(|status| status.pending_relays),
+        });
+    }
+    expansions.sort_by(|left, right| left.workflow.id.cmp(&right.workflow.id));
+    Ok(RelaySnapshot {
+        metadata,
+        relays,
+        staged_relays,
+        connected_systems: connected.len(),
+        relay_edges: scene.relay_edges,
+        expansions,
+    })
+}
+
+async fn bootstrap_missions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<BootstrapSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let missions = bootstrap_mission_summaries(
+        state
+            .repository
+            .finite_execution_history()
+            .map_err(ApiError::repository)?,
+    );
+    Ok(Json(Versioned::current(BootstrapSnapshot {
+        metadata,
+        missions,
+    })))
+}
+
+fn bootstrap_mission_summaries(
+    executions: Vec<StoredFiniteExecution>,
+) -> Vec<BootstrapMissionSummary> {
+    let mut latest = BTreeMap::new();
+    for execution in executions {
+        if !execution.kind.starts_with("bootstrap.") {
+            continue;
+        }
+        let Some(result) = execution.result else {
+            continue;
+        };
+        let Ok(mission) = serde_json::from_value::<BootstrapMission>(result) else {
+            continue;
+        };
+        latest.entry(mission.mission_id.clone()).or_insert_with(|| {
+            bootstrap_mission_summary(mission, execution.id, execution.finished_at)
+        });
+    }
+    let mut missions = latest.into_values().collect::<Vec<_>>();
+    missions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    missions
+}
+
+fn bootstrap_mission_summary(
+    mission: BootstrapMission,
+    execution_id: String,
+    updated_at_ms: i64,
+) -> BootstrapMissionSummary {
+    BootstrapMissionSummary {
+        mission_id: mission.mission_id,
+        execution_id,
+        region: mission.region,
+        source_hub: mission.source_hub,
+        target_system: mission.landing_star,
+        target_location: mission.landing_entry,
+        phase: wire_value(Some(&mission.phase)).unwrap_or_else(|| "unknown".to_owned()),
+        reserved_devices: mission.assets.values().map(Vec::len).sum(),
+        loaded_devices: mission
+            .carrier_loads
+            .iter()
+            .map(|load| load.devices.len())
+            .sum(),
+        capital_system: mission.capital_system,
+        selected_sites: mission.selected_belts.len(),
+        warnings: mission.warnings,
+        completed: mission.phase.is_terminal(),
+        updated_at_ms,
+    }
+}
+
 fn mining_installations(devices: Vec<DeviceSummary>) -> Vec<MiningInstallationSummary> {
     const TYPES: [&str; 5] = [
         "ami_mining_controller",
@@ -1844,6 +2031,11 @@ fn operation_response(
                 None,
                 summary,
             );
+            if kind.starts_with("bootstrap.") {
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Missions,
+                });
+            }
             Ok(Json(Versioned::current(RunOperationResponse {
                 result,
                 execution,
@@ -3388,6 +3580,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_projection_reuses_coverage_and_registered_workflow_state() {
+        use replicant_runtime::{
+            relay::RelayExpansionRequest,
+            workflows::{RelayWorkflowConfig, new_relay_workflow},
+        };
+
+        let (_, client, state) = test_app().await;
+        let workflow = state
+            .repository
+            .create(new_relay_workflow(RelayWorkflowConfig {
+                request: RelayExpansionRequest {
+                    replicant: "R-1".to_owned(),
+                    hub: "SOL-1".to_owned(),
+                    targets: vec!["VEGA".to_owned()],
+                    mission_file: PathBuf::from("relay.json"),
+                    max_hop_ly: 7.499,
+                    wait_timeout: Duration::from_secs(1),
+                },
+            }))
+            .expect("relay workflow");
+        let mut deployed = projected_device("RELAY-1");
+        deployed.device_type = Some("ftl_relay".to_owned());
+        deployed.status = Some("active".to_owned());
+        deployed.system = Some("SOL".to_owned());
+        let mut staged = projected_device("RELAY-2");
+        staged.device_type = Some("ftl_relay".to_owned());
+        staged.tags = vec!["relay-m:test".to_owned()];
+        let snapshot = relay_snapshot(
+            SnapshotMetadata {
+                revision: 4,
+                generated_at_ms: 10,
+            },
+            vec![deployed, staged],
+            GalaxySceneSnapshot {
+                revision: 4,
+                generated_at_ms: 10,
+                stars: vec![replicant_protocol::GalaxyStar {
+                    id: "SOL".to_owned(),
+                    name: None,
+                    spectral_type: None,
+                    position: replicant_protocol::GalaxyPoint {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    exploration: replicant_protocol::GalaxyExploration::Explored,
+                    current: false,
+                    has_hub: false,
+                    has_life: false,
+                    has_relay: true,
+                }],
+                relay_edges: Vec::new(),
+                active_travel: Vec::new(),
+                signals: Vec::new(),
+                highlights: Vec::new(),
+                overlays: Vec::new(),
+                workflow_targets: Vec::new(),
+            },
+            &[workflow],
+        )
+        .unwrap_or_else(|_| panic!("relay snapshot"));
+
+        assert_eq!(snapshot.connected_systems, 1);
+        assert_eq!(snapshot.relays[0].entity.id.0, "RELAY-1");
+        assert_eq!(snapshot.staged_relays[0].entity.id.0, "RELAY-2");
+        assert_eq!(snapshot.expansions[0].next_system.as_deref(), Some("VEGA"));
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn bootstrap_projection_distinguishes_active_and_completed_missions() {
+        fn mission(phase: &str) -> BootstrapMission {
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "mission_id": format!("BOOT-{phase}"),
+                "mission_tag": "boot-m:test",
+                "region_tag": "region:beta",
+                "phase": phase,
+                "region": "beta",
+                "source_hub": "SOL-1",
+                "source_system": "SOL",
+                "source_entry": "SOL-ENTRY",
+                "landing_star": "VEGA",
+                "landing_entry": "VEGA-ENTRY",
+                "operator": { "name": null },
+                "explorer": { "name": null },
+                "profile": {
+                    "mining_setups": 5,
+                    "autofactories": 3,
+                    "cargo_freighters": 6,
+                    "transport_controllers": 1,
+                    "hub_maintenance_drones": 1,
+                    "exploration_survey_drones": 2,
+                    "root_relays": 1,
+                    "expansion_relays": 0,
+                    "ftl_beacons": 0,
+                    "dedicated_surge_carriers": 0
+                },
+                "seed_quantity": 500,
+                "quick_scout_radius_ly": 7.499,
+                "survey_radius_ly": 30.0,
+                "minimum_sites": 5,
+                "maximum_sites": 9,
+                "max_concurrency": 8,
+                "print": { "requirements": {}, "submission_started": false, "queued": false },
+                "assets": { "ftl_relay": ["RELAY-1"] },
+                "carrier_target": 1,
+                "seed_freighters": [],
+                "carrier_loads": [{ "carrier": "C-1", "capacity": 10, "devices": ["RELAY-1"] }],
+                "capital_system": null,
+                "capital_belt": null,
+                "capital_entry": null,
+                "children": {
+                    "quick_survey": "quick.json",
+                    "initial_mining": "initial.json",
+                    "survey": "survey.json",
+                    "relays": "relays.json",
+                    "mining": "mining.json"
+                }
+            }))
+            .expect("bootstrap mission")
+        }
+
+        let active =
+            bootstrap_mission_summary(mission("staged_at_source"), "EXEC-1".to_owned(), 10);
+        let completed = bootstrap_mission_summary(mission("completed"), "EXEC-2".to_owned(), 20);
+        assert!(!active.completed);
+        assert_eq!((active.reserved_devices, active.loaded_devices), (1, 1));
+        assert!(completed.completed);
+    }
+
+    #[tokio::test]
     async fn survey_projection_reads_registered_workflow_state() {
         use replicant_runtime::{
             survey::{SurveyMode, SurveyOptions},
@@ -3470,6 +3794,8 @@ mod tests {
             "/api/cargo",
             "/api/missions/survey",
             "/api/missions/mining",
+            "/api/missions/relay",
+            "/api/missions/bootstrap",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
@@ -4002,6 +4328,7 @@ mod tests {
             DomainSlice::Devices,
             DomainSlice::Autofactories,
             DomainSlice::Cargo,
+            DomainSlice::Missions,
         ] {
             assert!(matches!(
                 updates.recv().await.expect("domain invalidation").delta,
@@ -4016,6 +4343,27 @@ mod tests {
             updates.recv().await.expect("overview invalidation").delta,
             LiveDelta::DomainInvalidated {
                 slice: DomainSlice::Overview
+            }
+        ));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_action_completion_invalidates_missions() {
+        let (_, client, state) = test_app().await;
+        let mut updates = state.live.subscribe();
+        operation_response(
+            &state,
+            FiniteExecutionClass::Action,
+            "bootstrap.run",
+            1,
+            Ok(Value::Null),
+        )
+        .unwrap_or_else(|_| panic!("operation response"));
+        assert!(matches!(
+            updates.recv().await.expect("mission invalidation").delta,
+            LiveDelta::DomainInvalidated {
+                slice: DomainSlice::Missions
             }
         ));
         client.close().await.expect("close client");

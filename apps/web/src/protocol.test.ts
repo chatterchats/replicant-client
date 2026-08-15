@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseAutofactoryResponse,
+  parseBootstrapResponse,
   parseCargoResponse,
   parseHealthResponse,
   parseDevicesResponse,
   parseInventoryResponse,
   parseMiningResponse,
+  parseRelayResponse,
   parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
@@ -145,6 +147,64 @@ describe("mission projection parsers", () => {
     expect(mining.payload.installations[0]?.missing).toEqual([
       "mining controller",
     ]);
+  });
+
+  it("parses Relay coverage and Bootstrap mission progress", () => {
+    const relay = parseRelayResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 10 },
+        relays: [{ ...rawDevice, device_type: "ftl_relay" }],
+        staged_relays: [],
+        connected_systems: 2,
+        relay_edges: [{ from: "SOL", to: "VEGA" }],
+        expansions: [
+          {
+            workflow: { ...workflow, kind: "relay.expansion" },
+            replicant: "R-1",
+            hub: "SOL-1",
+            targets: ["VEGA"],
+            phase: "deploying",
+            completed_stops: 1,
+            total_stops: 2,
+            next_system: "VEGA",
+            pending_relays: 0,
+          },
+        ],
+      },
+    });
+    expect(relay.payload.relay_edges[0]).toEqual({ from: "SOL", to: "VEGA" });
+    expect(relay.payload.expansions[0]?.next_system).toBe("VEGA");
+
+    const bootstrap = parseBootstrapResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 5, generated_at_ms: 10 },
+        missions: [
+          {
+            mission_id: "BOOT-1",
+            execution_id: "EXEC-1",
+            region: "beta",
+            source_hub: "SOL-1",
+            target_system: "VEGA",
+            target_location: "VEGA-ENTRY",
+            phase: "completed",
+            reserved_devices: 10,
+            loaded_devices: 10,
+            capital_system: "VEGA",
+            selected_sites: 5,
+            warnings: [],
+            completed: true,
+            updated_at_ms: 10,
+          },
+        ],
+      },
+    });
+    expect(bootstrap.payload.missions[0]).toMatchObject({
+      mission_id: "BOOT-1",
+      completed: true,
+      selected_sites: 5,
+    });
   });
 });
 

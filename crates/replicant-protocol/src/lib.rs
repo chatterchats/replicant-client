@@ -343,6 +343,88 @@ pub struct MiningSnapshot {
     pub workflows: Vec<WorkflowSummary>,
 }
 
+/// One durable relay expansion and its current route progress.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelayExpansionSummary {
+    /// Persisted workflow lifecycle.
+    pub workflow: WorkflowSummary,
+    /// Assigned replicant.
+    pub replicant: String,
+    /// Manufacturing hub.
+    pub hub: String,
+    /// Requested target systems.
+    pub targets: Vec<String>,
+    /// Current relay executor phase.
+    pub phase: String,
+    /// Completed deployment stops.
+    pub completed_stops: usize,
+    /// Total planned stops, when a checkpoint exists.
+    pub total_stops: Option<usize>,
+    /// Next incomplete system.
+    pub next_system: Option<String>,
+    /// Relays still awaiting manufacture or discovery.
+    pub pending_relays: Option<usize>,
+}
+
+/// Typed Relay mission dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelaySnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Owned, deployed relay-capable devices.
+    pub relays: Vec<DeviceSummary>,
+    /// Relay devices staged or claimed for expansion.
+    pub staged_relays: Vec<DeviceSummary>,
+    /// Systems covered by an active relay.
+    pub connected_systems: usize,
+    /// Active relay-network edges owned by the galaxy projection.
+    pub relay_edges: Vec<GalaxyEdge>,
+    /// Active durable relay expansions.
+    pub expansions: Vec<RelayExpansionSummary>,
+}
+
+/// One recent regional bootstrap mission projected from finite action history.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BootstrapMissionSummary {
+    /// Durable bootstrap mission identifier.
+    pub mission_id: String,
+    /// Latest finite action execution identifier.
+    pub execution_id: String,
+    /// Target region.
+    pub region: String,
+    /// Source manufacturing hub.
+    pub source_hub: String,
+    /// Planned landing system.
+    pub target_system: String,
+    /// Planned landing location or entry point.
+    pub target_location: String,
+    /// Current persisted mission phase.
+    pub phase: String,
+    /// Devices reserved by the mission.
+    pub reserved_devices: usize,
+    /// Devices assigned to carrier loads.
+    pub loaded_devices: usize,
+    /// Established regional capital, when known.
+    pub capital_system: Option<String>,
+    /// Selected mining systems or belts.
+    pub selected_sites: usize,
+    /// Persisted mission warnings.
+    pub warnings: Vec<String>,
+    /// Whether the persisted phase is terminal.
+    pub completed: bool,
+    /// Latest action completion time.
+    pub updated_at_ms: i64,
+}
+
+/// Typed Bootstrap mission dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BootstrapSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Active and recent missions observed through registered bootstrap actions.
+    pub missions: Vec<BootstrapMissionSummary>,
+}
+
 /// One active or queued Autofactory print job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FactoryJobSummary {
@@ -1789,6 +1871,52 @@ mod tests {
                 status: MiningInstallationStatus::Partial,
             }],
             workflows: Vec::new(),
+        }));
+        round_trip(&Versioned::current(RelaySnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            relays: vec![device()],
+            staged_relays: Vec::new(),
+            connected_systems: 2,
+            relay_edges: vec![GalaxyEdge {
+                from: "SOL".to_owned(),
+                to: "VEGA".to_owned(),
+            }],
+            expansions: vec![RelayExpansionSummary {
+                workflow: workflow(),
+                replicant: "R-1".to_owned(),
+                hub: "SOL-1".to_owned(),
+                targets: vec!["VEGA".to_owned()],
+                phase: "deploying".to_owned(),
+                completed_stops: 1,
+                total_stops: Some(2),
+                next_system: Some("VEGA".to_owned()),
+                pending_relays: Some(0),
+            }],
+        }));
+        round_trip(&Versioned::current(BootstrapSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            missions: vec![BootstrapMissionSummary {
+                mission_id: "BOOT-1".to_owned(),
+                execution_id: "EXEC-1".to_owned(),
+                region: "beta".to_owned(),
+                source_hub: "SOL-1".to_owned(),
+                target_system: "VEGA".to_owned(),
+                target_location: "VEGA-ENTRY".to_owned(),
+                phase: "staged_at_source".to_owned(),
+                reserved_devices: 10,
+                loaded_devices: 8,
+                capital_system: None,
+                selected_sites: 0,
+                warnings: Vec::new(),
+                completed: false,
+                updated_at_ms: 10,
+            }],
         }));
         round_trip(&Versioned::current(AutofactorySnapshot {
             metadata: SnapshotMetadata {

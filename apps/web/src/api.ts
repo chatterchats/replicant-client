@@ -1,11 +1,13 @@
 import {
   parseAutofactoryResponse,
   parseAutomationControlResponse,
+  parseBootstrapResponse,
   parseCargoResponse,
   parseDescriptorsResponse,
   parseDevicesResponse,
   parseInventoryResponse,
   parseMiningResponse,
+  parseRelayResponse,
   parseEntityIndexResponse,
   parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
@@ -109,6 +111,13 @@ export const daemonApi = {
   },
   async mining(signal?: AbortSignal) {
     return parseMiningResponse(await get("/api/missions/mining", signal))
+      .payload;
+  },
+  async relay(signal?: AbortSignal) {
+    return parseRelayResponse(await get("/api/missions/relay", signal)).payload;
+  },
+  async bootstrap(signal?: AbortSignal) {
+    return parseBootstrapResponse(await get("/api/missions/bootstrap", signal))
       .payload;
   },
   async entities(signal?: AbortSignal) {
