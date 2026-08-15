@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useState } from "react";
 
 import {
   useActivity,
+  useAutomationControl,
   useDaemonConnection,
   useDaemonHealth,
   useDaemonState,
@@ -31,6 +32,7 @@ import { EventsPage } from "./EventsPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { RelayPage } from "./RelayPage";
 import { ReportsPage } from "./ReportsPage";
+import { SettingsPage } from "./SettingsPage";
 import { StandingPage } from "./StandingPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
@@ -40,10 +42,12 @@ import type {
   DescriptorCatalog,
   DeviceSummary,
   EntitySummary,
+  EventSummary,
   FiniteExecution,
   GalaxyStar,
   SystemMarker,
   WorkflowStatus,
+  WorkflowSummary,
 } from "./protocol";
 import {
   initialShellState,
@@ -101,19 +105,55 @@ function isDeviceSummary(value: unknown): value is DeviceSummary {
   );
 }
 
+function isWorkflowSummary(value: unknown): value is WorkflowSummary {
+  const record = asRecord(value);
+  return (
+    typeof record?.id === "string" &&
+    typeof record.kind === "string" &&
+    typeof record.status === "string" &&
+    typeof record.revision === "number"
+  );
+}
+
+function isEventSummary(value: unknown): value is EventSummary {
+  const record = asRecord(value);
+  return (
+    typeof record?.designation === "string" &&
+    typeof record.title === "string" &&
+    typeof record.system === "string" &&
+    typeof record.location === "string"
+  );
+}
+
 function Inspector({
   entity,
   value,
   onClose,
   onClear,
+  onOpenGalaxy,
+  onOpenSystem,
+  onOpenWorkflow,
 }: {
   entity: SelectedEntity;
   value: unknown;
   onClose: () => void;
   onClear: () => void;
+  onOpenGalaxy: (system: string) => void;
+  onOpenSystem: (system: string) => void;
+  onOpenWorkflow: (workflowId: string) => void;
 }) {
   const device = isDeviceSummary(value) ? value : undefined;
-  const summary = isEntitySummary(value) ? value : undefined;
+  const workflow = !device && isWorkflowSummary(value) ? value : undefined;
+  const event =
+    !device && !workflow && isEventSummary(value) ? value : undefined;
+  const summary =
+    !device && !workflow && !event && isEntitySummary(value)
+      ? value
+      : undefined;
+  const targetSystem =
+    entity.kind === "system"
+      ? entity.id
+      : (event?.system ?? device?.system ?? summary?.system ?? null);
   return (
     <aside className="inspector" aria-label="Selected entity inspector">
       <header className="drawer-header">
@@ -220,6 +260,82 @@ function Inspector({
               </>
             )}
           </dl>
+        ) : workflow ? (
+          <dl>
+            <dt>Kind</dt>
+            <dd>{workflow.kind}</dd>
+            <dt>Status</dt>
+            <dd>
+              <span className="status-chip">{workflow.status}</span>
+            </dd>
+            {workflow.current_step && (
+              <>
+                <dt>Step</dt>
+                <dd>{workflow.current_step}</dd>
+              </>
+            )}
+            <dt>Revision</dt>
+            <dd>{workflow.revision}</dd>
+            <dt>Updated</dt>
+            <dd>{new Date(workflow.updated_at_ms).toLocaleString()}</dd>
+          </dl>
+        ) : event ? (
+          <dl>
+            <dt>Title</dt>
+            <dd>{event.title}</dd>
+            <dt>Status</dt>
+            <dd>
+              <span className="status-chip">{event.status ?? "unknown"}</span>
+            </dd>
+            <dt>Type</dt>
+            <dd>
+              {[event.event_type, event.category, event.tier]
+                .filter((value) => value !== null)
+                .join(" · ") || "Unclassified"}
+            </dd>
+            <dt>System</dt>
+            <dd>{event.system}</dd>
+            <dt>Location</dt>
+            <dd>{event.location}</dd>
+            {event.description && (
+              <>
+                <dt>Description</dt>
+                <dd>{event.description}</dd>
+              </>
+            )}
+            {event.criteria.length > 0 && (
+              <>
+                <dt>Progress</dt>
+                <dd>
+                  {event.criteria.map((criterion) => (
+                    <div key={criterion.name}>
+                      {criterion.name} ·{" "}
+                      {criterion.complete ? "complete" : "active"}
+                    </div>
+                  ))}
+                </dd>
+              </>
+            )}
+            {(event.rewards.resources.length > 0 ||
+              event.rewards.devices.length > 0 ||
+              event.rewards.xp !== null) && (
+              <>
+                <dt>Rewards</dt>
+                <dd>
+                  {[...event.rewards.resources, ...event.rewards.devices].map(
+                    (reward) => (
+                      <div key={reward.item}>
+                        {reward.quantity} {reward.item}
+                      </div>
+                    ),
+                  )}
+                  {event.rewards.xp !== null && (
+                    <div>{event.rewards.xp} XP</div>
+                  )}
+                </dd>
+              </>
+            )}
+          </dl>
         ) : summary ? (
           <dl>
             {summary.secondary_label && (
@@ -253,6 +369,37 @@ function Inspector({
           <pre>{JSON.stringify(value, null, 2)}</pre>
         )}
       </div>
+      {targetSystem || entity.kind === "workflow" ? (
+        <div className="inspector-actions">
+          {targetSystem && (
+            <>
+              <button
+                onClick={() => {
+                  onOpenGalaxy(targetSystem);
+                }}
+              >
+                Show on Galaxy
+              </button>
+              <button
+                onClick={() => {
+                  onOpenSystem(targetSystem);
+                }}
+              >
+                Show on System
+              </button>
+            </>
+          )}
+          {entity.kind === "workflow" && (
+            <button
+              onClick={() => {
+                onOpenWorkflow(entity.id);
+              }}
+            >
+              Open in Automation
+            </button>
+          )}
+        </div>
+      ) : null}
       <button className="clear-selection" onClick={onClear}>
         Clear selection
       </button>
@@ -273,11 +420,15 @@ export function App() {
   const [selectedSystemMarker, setSelectedSystemMarker] =
     useState<SystemMarker>();
   const [selectedDevice, setSelectedDevice] = useState<DeviceSummary>();
+  const [selectedEvent, setSelectedEvent] = useState<EventSummary>();
   const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
   const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
     useState<string>();
-  const [automationBusy, setAutomationBusy] = useState(false);
-  const [automationError, setAutomationError] = useState<string>();
+  const {
+    busy: automationBusy,
+    error: automationError,
+    control: controlAutomation,
+  } = useAutomationControl();
   const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
@@ -341,15 +492,18 @@ export function App() {
       : shell.selectedEntity.kind === "device" &&
           selectedDevice?.entity.id === shell.selectedEntity.id
         ? selectedDevice
-        : shell.selectedEntity.kind === "system" &&
-            selectedGalaxyStar?.id === shell.selectedEntity.id
-          ? selectedGalaxyStar
-          : selectedSystemMarker?.entity.kind === shell.selectedEntity.kind &&
-              selectedSystemMarker.entity.id === shell.selectedEntity.id
-            ? selectedSystemMarker
-            : entities[
-                `${shell.selectedEntity.kind}:${shell.selectedEntity.id}`
-              ]
+        : shell.selectedEntity.kind === "event" &&
+            selectedEvent?.designation === shell.selectedEntity.id
+          ? selectedEvent
+          : shell.selectedEntity.kind === "system" &&
+              selectedGalaxyStar?.id === shell.selectedEntity.id
+            ? selectedGalaxyStar
+            : selectedSystemMarker?.entity.kind === shell.selectedEntity.kind &&
+                selectedSystemMarker.entity.id === shell.selectedEntity.id
+              ? selectedSystemMarker
+              : entities[
+                  `${shell.selectedEntity.kind}:${shell.selectedEntity.id}`
+                ]
     : undefined;
   const commandContext: CommandContext = {
     system:
@@ -388,30 +542,22 @@ export function App() {
   };
   const select = (entity: SelectedEntity) => {
     if (entity.kind !== "device") setSelectedDevice(undefined);
+    if (entity.kind !== "event") setSelectedEvent(undefined);
     dispatch({ type: "select", entity });
   };
-  const controlAutomation = (
-    action:
-      | "enable_triggers"
-      | "disable_triggers"
-      | "pause_all"
-      | "resume_all"
-      | "cancel",
-  ) => {
-    const confirmed =
-      action !== "cancel" ||
-      window.confirm("Cancel every eligible workflow? This cannot be undone.");
-    if (!confirmed) return;
-    setAutomationBusy(true);
-    setAutomationError(undefined);
-    void daemonApi
-      .controlAutomation(action, [], action === "cancel")
-      .catch((error: unknown) => {
-        setAutomationError(String(error));
-      })
-      .finally(() => {
-        setAutomationBusy(false);
-      });
+  const openSystem = (system: string) => {
+    setSelectedSystem(system);
+    select({ kind: "system", id: system });
+    navigate("System");
+  };
+  const openGalaxy = (system: string) => {
+    setSelectedSystem(system);
+    select({ kind: "system", id: system });
+    navigate("Galaxy");
+  };
+  const openWorkflow = (workflowId: string) => {
+    setSelectedAutomationWorkflow(workflowId);
+    navigate("Automations");
   };
 
   return (
@@ -552,15 +698,8 @@ export function App() {
               <OverviewPage
                 onNavigate={navigate}
                 onSelectEntity={select}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
+                onSelectWorkflow={openWorkflow}
+                onOpenSystem={openSystem}
               />
             ) : shell.page === "Devices" ? (
               <DevicesPage
@@ -570,11 +709,7 @@ export function App() {
                   select(device.entity);
                 }}
                 onSelectEntity={select}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
+                onOpenSystem={openSystem}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -583,11 +718,7 @@ export function App() {
             ) : shell.page === "Inventory" ? (
               <InventoryPage
                 onSelectEntity={select}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
+                onOpenSystem={openSystem}
               />
             ) : shell.page === "Autofactory" ? (
               <AutofactoryPage
@@ -597,15 +728,8 @@ export function App() {
                   select(device.entity);
                 }}
                 onSelectEntity={select}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenSystem={openSystem}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -619,15 +743,8 @@ export function App() {
                   select(device.entity);
                 }}
                 onSelectEntity={select}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenSystem={openSystem}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -637,15 +754,8 @@ export function App() {
               <SurveyPage
                 descriptors={descriptors}
                 onSelectEntity={select}
-                onOpenGalaxy={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("Galaxy");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenGalaxy={openGalaxy}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -655,15 +765,8 @@ export function App() {
               <MiningPage
                 descriptors={descriptors}
                 onSelectEntity={select}
-                onOpenGalaxy={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("Galaxy");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenGalaxy={openGalaxy}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -673,15 +776,8 @@ export function App() {
               <RelayPage
                 descriptors={descriptors}
                 onSelectEntity={select}
-                onOpenGalaxy={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("Galaxy");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenGalaxy={openGalaxy}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -690,11 +786,7 @@ export function App() {
             ) : shell.page === "Bootstrap" ? (
               <BootstrapPage
                 descriptors={descriptors}
-                onOpenGalaxy={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("Galaxy");
-                }}
+                onOpenGalaxy={openGalaxy}
                 onOpenHistory={() => {
                   navigate("History");
                 }}
@@ -706,17 +798,12 @@ export function App() {
             ) : shell.page === "Events" ? (
               <EventsPage
                 descriptors={descriptors}
-                onSelectEntity={select}
-                onOpenGalaxy={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("Galaxy");
+                onSelectEvent={(event) => {
+                  setSelectedEvent(event);
+                  select({ kind: "event", id: event.designation });
                 }}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
+                onOpenGalaxy={openGalaxy}
+                onOpenSystem={openSystem}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -726,15 +813,8 @@ export function App() {
               <TradePage
                 descriptors={descriptors}
                 onSelectEntity={select}
-                onOpenSystem={(system) => {
-                  setSelectedSystem(system);
-                  select({ kind: "system", id: system });
-                  navigate("System");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onOpenSystem={openSystem}
+                onSelectWorkflow={openWorkflow}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
@@ -749,19 +829,13 @@ export function App() {
             ) : shell.page === "Requirements" ? (
               <RequirementsPage
                 requirements={daemon.requirements}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onSelectWorkflow={openWorkflow}
               />
             ) : shell.page === "History" ? (
               <HistoryPage
                 workflows={workflows}
                 selectedExecution={selectedExecution}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onSelectWorkflow={openWorkflow}
                 onSelectEntity={select}
               />
             ) : shell.page === "Reports" ? (
@@ -786,10 +860,7 @@ export function App() {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
                 }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  navigate("Automations");
-                }}
+                onSelectWorkflow={openWorkflow}
                 onOpenSystem={(star) => {
                   setSelectedGalaxyStar(star);
                   setSelectedSystem(star.id);
@@ -814,6 +885,8 @@ export function App() {
                 }}
                 onSelectEntity={select}
               />
+            ) : shell.page === "Settings" ? (
+              <SettingsPage />
             ) : (
               <article className="page">
                 <p className="eyebrow">{group}</p>
@@ -853,6 +926,9 @@ export function App() {
               onClear={() => {
                 dispatch({ type: "clear_selection" });
               }}
+              onOpenGalaxy={openGalaxy}
+              onOpenSystem={openSystem}
+              onOpenWorkflow={openWorkflow}
             />
           ) : null}
         </div>

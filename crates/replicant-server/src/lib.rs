@@ -57,19 +57,20 @@ use replicant_protocol::{
     OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
     RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
     ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StandingSnapshot, StartWorkflowRequest, StartWorkflowResponse,
-    SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot, TradeControllerSummary,
-    TradeItemSummary, TradeSnapshot, TradeSummary, TriggerCondition as ProtocolTriggerCondition,
-    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
-    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
-    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
-    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowStatusCount, WorkflowSummary,
+    SettingsSnapshot, SnapshotMetadata, StandingSnapshot, StartWorkflowRequest,
+    StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
+    TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
+    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
+    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
+    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
+    WorkflowStatusCount, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
-    config::RuntimeConfig,
+    config::{self, RuntimeConfig},
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     intelligence::{
@@ -157,6 +158,7 @@ pub struct AppState {
     live: broadcast::Sender<LiveMessage>,
     revision: AtomicU64,
     publish_lock: StdMutex<()>,
+    daemon: DaemonConfig,
 }
 
 impl AppState {
@@ -165,6 +167,7 @@ impl AppState {
         client: Client,
         runtime_config: RuntimeConfig,
         repository: Arc<WorkflowRepository>,
+        daemon: DaemonConfig,
     ) -> Result<Arc<Self>, CatalogueError> {
         let catalogue = OperationCatalogue::new()?;
         let supervisor = WorkflowSupervisor::with_managed_client(
@@ -181,6 +184,7 @@ impl AppState {
             live: broadcast::channel(LIVE_BUFFER).0,
             revision: AtomicU64::new(revision),
             publish_lock: StdMutex::new(()),
+            daemon,
         }))
     }
 
@@ -245,6 +249,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/network", get(network))
         .route("/api/standing", get(standing_snapshot))
         .route("/api/leaderboards", get(leaderboards))
+        .route("/api/settings", get(settings))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -1924,6 +1929,22 @@ async fn relay_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, 
                 .is_some_and(|kind| kind.to_ascii_lowercase().contains("relay"))
         })
         .collect())
+}
+
+async fn settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<SettingsSnapshot>>, ApiError> {
+    Ok(Json(Versioned::current(SettingsSnapshot {
+        metadata: state.snapshot_metadata()?,
+        profile: state.daemon.profile.clone(),
+        bind_address: state.daemon.bind.to_string(),
+        managed_database_path: state.daemon.managed_database.display().to_string(),
+        runtime_database_path: state.daemon.runtime_database.display().to_string(),
+        log_filter: config::log_filter_directive(),
+        docker: config::docker_environment_detected(),
+        api_token_source: config::api_token_source(),
+        daemon_settings_require_restart: true,
+    })))
 }
 
 async fn standing_snapshot(
@@ -3893,6 +3914,15 @@ mod tests {
 
     use super::*;
 
+    fn test_daemon_config() -> DaemonConfig {
+        DaemonConfig {
+            profile: "test".to_owned(),
+            managed_database: PathBuf::from("replicant-client.sqlite"),
+            runtime_database: PathBuf::from("replicant-runtime.sqlite"),
+            bind: DEFAULT_BIND.parse().expect("default bind address"),
+        }
+    }
+
     async fn test_app() -> (Router, Client, Arc<AppState>) {
         let client = Client::builder()
             .in_memory()
@@ -3901,8 +3931,13 @@ mod tests {
             .await
             .expect("start test client");
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
-        let state = AppState::new(client.clone(), RuntimeConfig::new("test"), repository)
-            .expect("app state");
+        let state = AppState::new(
+            client.clone(),
+            RuntimeConfig::new("test"),
+            repository,
+            test_daemon_config(),
+        )
+        .expect("app state");
         (router(state.clone()), client, state)
     }
 
@@ -3916,8 +3951,13 @@ mod tests {
             .await
             .expect("start test client");
         let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
-        let state = AppState::new(client.clone(), RuntimeConfig::new("test"), repository)
-            .expect("app state");
+        let state = AppState::new(
+            client.clone(),
+            RuntimeConfig::new("test"),
+            repository,
+            test_daemon_config(),
+        )
+        .expect("app state");
         (router(state), client)
     }
 
@@ -4682,6 +4722,37 @@ mod tests {
             }
             assert!(!value.to_string().contains("token"));
         }
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_reports_environment_without_secrets() {
+        let (app, client, _) = test_app().await;
+        let response = app
+            .oneshot(
+                Request::get("/api/settings")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json(response).await;
+        let payload = &value["payload"];
+        assert_eq!(payload["profile"], "test");
+        assert!(payload["managed_database_path"].is_string());
+        assert!(payload["runtime_database_path"].is_string());
+        assert!(payload["bind_address"].is_string());
+        assert!(payload["log_filter"].is_string());
+        assert!(payload["docker"].is_boolean());
+        assert!(
+            ["environment", "secret_file", "unset"].contains(
+                &payload["api_token_source"]
+                    .as_str()
+                    .expect("api token source")
+            )
+        );
+        assert_eq!(payload["daemon_settings_require_restart"], true);
         client.close().await.expect("close client");
     }
 

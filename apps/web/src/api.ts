@@ -20,6 +20,7 @@ import {
   parseOperationResponse,
   parseOverviewResponse,
   parseReportsResponse,
+  parseSettingsResponse,
   parseSnapshotResponse,
   parseStandingResponse,
   parseSurveyResponse,
@@ -155,6 +156,9 @@ export const daemonApi = {
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;
+  },
+  async settings(signal?: AbortSignal) {
+    return parseSettingsResponse(await get("/api/settings", signal)).payload;
   },
   async galaxyScene(signal?: AbortSignal) {
     return parseGalaxySceneResponse(await get("/api/galaxy-scene", signal))

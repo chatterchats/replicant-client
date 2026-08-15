@@ -597,6 +597,12 @@ h1 {
   font-size: 0.78rem;
   line-height: 1.55;
 }
+.inspector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
 .clear-selection {
   margin: 12px 16px 16px;
   padding: 8px;
@@ -883,6 +889,41 @@ h1 {
 .field-error,
 .form-error {
   color: #ef8a96 !important;
+}
+.settings-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+}
+.settings-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 8px;
+  background: #1a302c;
+  padding: 20px;
+}
+.settings-card h2 {
+  margin: 0;
+}
+.settings-card dl {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 2fr;
+  gap: 8px 16px;
+  margin: 0;
+}
+.settings-card dt {
+  color: #78908c;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+.settings-card dd {
+  margin: 0;
+}
+.settings-note {
+  margin: 0;
+  color: #78908c;
+  font-size: 0.78rem;
 }
 .workflow-inspector {
   position: fixed;
@@ -1872,7 +1913,8 @@ h1 {
   }
   .workflow-row-main,
   .templates-layout,
-  .form-grid {
+  .form-grid,
+  .settings-card dl {
     grid-template-columns: 1fr;
   }
   .workflow-actions {

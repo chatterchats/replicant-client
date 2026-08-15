@@ -1,3 +1,6 @@
+/** @vitest-environment jsdom */
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
@@ -67,7 +70,7 @@ const props = {
   refreshing: false,
   refresh: vi.fn(),
   descriptors,
-  onSelectEntity: vi.fn(),
+  onSelectEvent: vi.fn(),
   onOpenGalaxy: vi.fn(),
   onOpenSystem: vi.fn(),
   onRunCommand: vi.fn(),
@@ -84,6 +87,35 @@ describe("EventsContent", () => {
     expect(html).toContain("Galaxy");
     expect(html).toContain("System");
     expect(eventCommands(descriptors)[0]?.descriptor.kind).toBe("event.plan");
+  });
+
+  it("inspects the full event, not just its location", () => {
+    const onSelectEvent = vi.fn();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <EventsContent
+          {...props}
+          onSelectEvent={onSelectEvent}
+          data={snapshot}
+          status="loaded"
+          error={null}
+        />,
+      );
+    });
+    const inspect = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Inspect",
+    );
+    act(() => {
+      inspect?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onSelectEvent).toHaveBeenCalledWith(snapshot.events[0]);
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
   });
 
   it("distinguishes loading, empty, and error states", () => {

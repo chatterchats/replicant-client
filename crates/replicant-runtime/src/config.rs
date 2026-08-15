@@ -8,12 +8,57 @@ use std::{
 };
 
 use replicant_client::{SecretString, StartupPolicy};
+use replicant_protocol::ApiTokenSource;
 
 /// Environment variable containing the Replicant Space API token.
 pub const API_TOKEN_ENV: &str = "RS_API_TOKEN";
 
 /// Environment variable naming a file containing the Replicant Space API token.
 pub const API_TOKEN_FILE_ENV: &str = "RS_API_TOKEN_FILE";
+
+/// Environment variable holding the `tracing` log filter directive.
+pub const LOG_FILTER_ENV: &str = "RUST_LOG";
+
+/// Default log filter directive used when `RUST_LOG` is unset.
+pub const DEFAULT_LOG_FILTER: &str = "info";
+
+/// Reports how the API token is currently configured, without exposing its value.
+#[must_use]
+pub fn api_token_source() -> ApiTokenSource {
+    api_token_source_from(|name| env::var(name), |path| Path::new(path).is_file())
+}
+
+fn api_token_source_from(
+    lookup: impl Fn(&str) -> Result<String, env::VarError>,
+    file_exists: impl Fn(&str) -> bool,
+) -> ApiTokenSource {
+    if lookup(API_TOKEN_ENV).is_ok_and(|token| !token.is_empty()) {
+        ApiTokenSource::Environment
+    } else if lookup(API_TOKEN_FILE_ENV).is_ok_and(|path| file_exists(&path)) {
+        ApiTokenSource::SecretFile
+    } else {
+        ApiTokenSource::Unset
+    }
+}
+
+/// Returns the effective `tracing` log filter directive for this process.
+#[must_use]
+pub fn log_filter_directive() -> String {
+    log_filter_directive_from(|name| env::var(name))
+}
+
+fn log_filter_directive_from(lookup: impl Fn(&str) -> Result<String, env::VarError>) -> String {
+    lookup(LOG_FILTER_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned())
+}
+
+/// Reports whether the current process appears to be running inside Docker.
+#[must_use]
+pub fn docker_environment_detected() -> bool {
+    Path::new("/.dockerenv").is_file()
+}
 
 /// Managed-client startup configuration for one local application instance.
 pub struct ManagedClientConfig {
@@ -174,6 +219,52 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "neither RS_API_TOKEN nor a readable RS_API_TOKEN_FILE is set"
+        );
+    }
+
+    #[test]
+    fn api_token_source_prefers_environment_over_file() {
+        assert_eq!(
+            api_token_source_from(|_| Ok("secret".to_owned()), |_| panic!("unused")),
+            ApiTokenSource::Environment,
+        );
+    }
+
+    #[test]
+    fn api_token_source_falls_back_to_an_existing_secret_file() {
+        assert_eq!(
+            api_token_source_from(
+                |name| match name {
+                    API_TOKEN_FILE_ENV => Ok("/run/secrets/token".to_owned()),
+                    _ => Err(env::VarError::NotPresent),
+                },
+                |_| true,
+            ),
+            ApiTokenSource::SecretFile,
+        );
+    }
+
+    #[test]
+    fn api_token_source_is_unset_without_a_resolvable_source() {
+        assert_eq!(
+            api_token_source_from(|_| Err(env::VarError::NotPresent), |_| false),
+            ApiTokenSource::Unset,
+        );
+    }
+
+    #[test]
+    fn log_filter_directive_defaults_when_unset() {
+        assert_eq!(
+            log_filter_directive_from(|_| Err(env::VarError::NotPresent)),
+            DEFAULT_LOG_FILTER,
+        );
+    }
+
+    #[test]
+    fn log_filter_directive_uses_the_environment_value() {
+        assert_eq!(
+            log_filter_directive_from(|_| Ok("debug,replicant_runtime=trace".to_owned())),
+            "debug,replicant_runtime=trace",
         );
     }
 

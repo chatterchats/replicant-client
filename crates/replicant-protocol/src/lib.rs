@@ -2100,6 +2100,43 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// How the upstream Replicant Space API token is currently configured.
+///
+/// The token value itself is never included in any frontend-safe DTO.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTokenSource {
+    /// Resolved from an environment variable.
+    Environment,
+    /// Resolved from a secret file path.
+    SecretFile,
+    /// Not currently resolvable.
+    Unset,
+}
+
+/// Frontend-safe, non-secret application and runtime settings projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SettingsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Active application profile name.
+    pub profile: String,
+    /// Local HTTP address the daemon listens on.
+    pub bind_address: String,
+    /// Managed SDK SQLite database location.
+    pub managed_database_path: String,
+    /// Workflow/runtime SQLite database location.
+    pub runtime_database_path: String,
+    /// Effective `tracing` log filter directive.
+    pub log_filter: String,
+    /// Whether the daemon process is running inside a Docker container.
+    pub docker: bool,
+    /// How the upstream API token is configured, never its value.
+    pub api_token_source: ApiTokenSource,
+    /// Whether changing the daemon-level settings above requires a restart.
+    pub daemon_settings_require_restart: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2417,6 +2454,20 @@ mod tests {
             boards: Vec::new(),
             selected_board: None,
             entries: Vec::new(),
+        }));
+        round_trip(&Versioned::current(SettingsSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 3,
+                generated_at_ms: 1,
+            },
+            profile: "default".to_owned(),
+            bind_address: "127.0.0.1:8080".to_owned(),
+            managed_database_path: "replicant-client.sqlite".to_owned(),
+            runtime_database_path: "replicant-runtime.sqlite".to_owned(),
+            log_filter: "info".to_owned(),
+            docker: false,
+            api_token_source: ApiTokenSource::Environment,
+            daemon_settings_require_restart: true,
         }));
         round_trip(&Versioned::current(AutofactorySnapshot {
             metadata: SnapshotMetadata {

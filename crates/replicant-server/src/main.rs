@@ -10,8 +10,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let log_filter = replicant_runtime::config::log_filter_directive();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(EnvFilter::try_new(&log_filter).unwrap_or_else(|_| EnvFilter::new("info")))
         .try_init()?;
 
     let config = DaemonConfig::from_env()?;
@@ -22,6 +23,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         client.clone(),
         RuntimeConfig::new(&config.profile),
         repository,
+        config.clone(),
     )?;
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(address = %config.bind, profile = %config.profile, "replicantd listening");

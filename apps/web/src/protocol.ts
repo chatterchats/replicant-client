@@ -429,6 +429,20 @@ export interface LeaderboardsSnapshot {
   entries: LeaderboardEntrySummary[];
 }
 
+export type ApiTokenSource = "environment" | "secret_file" | "unset";
+
+export interface SettingsSnapshot {
+  metadata: SnapshotMetadata;
+  profile: string;
+  bind_address: string;
+  managed_database_path: string;
+  runtime_database_path: string;
+  log_filter: string;
+  docker: boolean;
+  api_token_source: ApiTokenSource;
+  daemon_settings_require_restart: boolean;
+}
+
 export interface FactoryJobSummary {
   device_type: string;
   quantity: number;
@@ -904,6 +918,11 @@ function stringArray(value: unknown, name: string): string[] {
   return values;
 }
 
+function boolean(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`Invalid ${name}`);
+  return value;
+}
+
 const healthStatuses = ["healthy", "degraded", "unhealthy"] as const;
 const syncPhases = [
   "starting",
@@ -952,6 +971,7 @@ const domainSlices = [
   "operations",
 ] as const;
 const inventoryOwnerKinds = ["account", "replicant", "location"] as const;
+const apiTokenSources = ["environment", "secret_file", "unset"] as const;
 
 function health(value: unknown): DaemonHealth {
   const item = record(value, "daemon health");
@@ -2148,6 +2168,40 @@ export function parseLeaderboardsResponse(
           ),
         };
       }),
+    };
+  });
+}
+
+export function parseSettingsResponse(
+  value: unknown,
+): Versioned<SettingsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "settings snapshot");
+    if (
+      typeof snapshot.profile !== "string" ||
+      typeof snapshot.bind_address !== "string" ||
+      typeof snapshot.managed_database_path !== "string" ||
+      typeof snapshot.runtime_database_path !== "string" ||
+      typeof snapshot.log_filter !== "string"
+    )
+      throw new Error("Invalid settings snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      profile: snapshot.profile,
+      bind_address: snapshot.bind_address,
+      managed_database_path: snapshot.managed_database_path,
+      runtime_database_path: snapshot.runtime_database_path,
+      log_filter: snapshot.log_filter,
+      docker: boolean(snapshot.docker, "docker environment"),
+      api_token_source: oneOf(
+        snapshot.api_token_source,
+        apiTokenSources,
+        "API token source",
+      ),
+      daemon_settings_require_restart: boolean(
+        snapshot.daemon_settings_require_restart,
+        "daemon settings restart flag",
+      ),
     };
   });
 }

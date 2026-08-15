@@ -6,10 +6,12 @@ import {
   useEffect,
   useReducer,
   useRef,
+  useState,
 } from "react";
 
 import { daemonApi, daemonUrl } from "./api";
 import {
+  type AutomationControlAction,
   type AutomationStatus,
   type DaemonHealth,
   type DomainSlice,
@@ -387,3 +389,30 @@ export const useWorkflows = () => Object.values(useDaemonState().workflows);
 export const useActivity = () => useDaemonState().activity;
 export const useNotifications = () => useDaemonState().notifications;
 export const useGalaxyRevision = () => useDaemonState().galaxyRevision;
+
+export function useAutomationControl() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+
+  const control = (
+    action: AutomationControlAction,
+    workflowIds: string[] = [],
+  ) => {
+    const confirmed =
+      action !== "cancel" ||
+      window.confirm("Cancel every eligible workflow? This cannot be undone.");
+    if (!confirmed) return;
+    setBusy(true);
+    setError(undefined);
+    void daemonApi
+      .controlAutomation(action, workflowIds, action === "cancel")
+      .catch((err: unknown) => {
+        setError(String(err));
+      })
+      .finally(() => {
+        setBusy(false);
+      });
+  };
+
+  return { busy, error, control };
+}

@@ -72,11 +72,13 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   fetcher,
   isEmpty,
 }: {
-  slice: DomainSlice;
+  /** Omit for data with no corresponding live invalidation slice; use `refresh()` instead. */
+  slice?: DomainSlice;
   fetcher: (signal: AbortSignal) => Promise<T>;
   isEmpty: (value: T) => boolean;
 }): DomainQueryResult<T> {
-  const invalidation = useDaemonState().invalidated[slice];
+  const invalidated = useDaemonState().invalidated;
+  const invalidation = slice ? invalidated[slice] : undefined;
   const fetcherRef = useRef(fetcher);
   const isEmptyRef = useRef(isEmpty);
   fetcherRef.current = fetcher;

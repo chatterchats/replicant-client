@@ -4,7 +4,11 @@ import { useMemo, useState } from "react";
 import { daemonApi } from "./api";
 import { descriptorCommands, type DescriptorCommand } from "./CommandPalette";
 import { type DomainQueryStatus, useDomainQuery } from "./domainQuery";
-import type { DescriptorCatalog, EntityRef, EventsSnapshot } from "./protocol";
+import type {
+  DescriptorCatalog,
+  EventSummary,
+  EventsSnapshot,
+} from "./protocol";
 
 const empty = (snapshot: EventsSnapshot) => snapshot.events.length === 0;
 
@@ -17,7 +21,7 @@ export const eventCommands = (descriptors: DescriptorCatalog) =>
 
 export function EventsPage(props: {
   descriptors: DescriptorCatalog;
-  onSelectEntity: (entity: EntityRef) => void;
+  onSelectEvent: (event: EventSummary) => void;
   onOpenGalaxy: (system: string) => void;
   onOpenSystem: (system: string) => void;
   onRunCommand: (command: DescriptorCommand) => void;
@@ -37,7 +41,7 @@ export function EventsContent({
   refreshing,
   refresh,
   descriptors,
-  onSelectEntity,
+  onSelectEvent,
   onOpenGalaxy,
   onOpenSystem,
   onRunCommand,
@@ -48,7 +52,7 @@ export function EventsContent({
   refreshing: boolean;
   refresh: () => Promise<void>;
   descriptors: DescriptorCatalog;
-  onSelectEntity: (entity: EntityRef) => void;
+  onSelectEvent: (event: EventSummary) => void;
   onOpenGalaxy: (system: string) => void;
   onOpenSystem: (system: string) => void;
   onRunCommand: (command: DescriptorCommand) => void;
@@ -201,10 +205,7 @@ export function EventsContent({
                   <td>
                     <button
                       onClick={() => {
-                        onSelectEntity({
-                          kind: "location",
-                          id: event.location,
-                        });
+                        onSelectEvent(event);
                       }}
                     >
                       Inspect
