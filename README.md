@@ -240,6 +240,13 @@ python3 scripts/contract_policy_check.py
 
 `make ci` runs the complete repository gate.
 
+## Container deployment
+
+The production Docker and Docker Compose deployment is documented in
+[`docs/docker.md`](docs/docker.md). It runs the web UI and reverse proxy as the
+only host-published service; `replicantd` remains on the private Compose
+network with its SQLite state in a named volume.
+
 ## License
 
 MIT

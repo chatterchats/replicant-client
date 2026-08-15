@@ -1,0 +1,59 @@
+services:
+  replicantd:
+    image: replicant/replicantd:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REPLICANTD_BIND: 0.0.0.0:8080
+      REPLICANT_DB: /var/lib/replicant/replicant-client.sqlite
+      REPLICANT_RUNTIME_DB: /var/lib/replicant/replicant-runtime.sqlite
+      REPLICANT_PROFILE: ${REPLICANT_PROFILE:-default}
+      RS_API_TOKEN: ${RS_API_TOKEN:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "8080"
+    volumes:
+      - replicant-data:/var/lib/replicant
+    networks:
+      - app
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    image: replicant/web:local
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    depends_on:
+      replicantd:
+        condition: service_healthy
+    ports:
+      - "${REPLICANT_WEB_PORT:-8080}:8080"
+    networks:
+      - app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  app:
+    driver: bridge
+
+volumes:
+  replicant-data:
+    name: ${REPLICANT_DATA_VOLUME:-replicant-data}

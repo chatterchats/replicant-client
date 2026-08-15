@@ -3,7 +3,7 @@
 use std::{
     env,
     error::Error as StdError,
-    fmt,
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,9 @@ use replicant_client::{SecretString, StartupPolicy};
 
 /// Environment variable containing the Replicant Space API token.
 pub const API_TOKEN_ENV: &str = "RS_API_TOKEN";
+
+/// Environment variable naming a file containing the Replicant Space API token.
+pub const API_TOKEN_FILE_ENV: &str = "RS_API_TOKEN_FILE";
 
 /// Managed-client startup configuration for one local application instance.
 pub struct ManagedClientConfig {
@@ -22,14 +25,37 @@ pub struct ManagedClientConfig {
 impl ManagedClientConfig {
     /// Resolves the API token from the process environment and uses essential startup.
     pub fn from_env(database: impl Into<PathBuf>) -> Result<Self, MissingApiToken> {
-        Self::from_lookup(database, |name| env::var(name))
+        Self::from_sources(
+            database,
+            |name| env::var(name),
+            |path| fs::read_to_string(path),
+        )
     }
 
+    #[cfg(test)]
     fn from_lookup(
         database: impl Into<PathBuf>,
-        lookup: impl FnOnce(&str) -> Result<String, env::VarError>,
+        lookup: impl Fn(&str) -> Result<String, env::VarError>,
     ) -> Result<Self, MissingApiToken> {
-        let authentication_token = lookup(API_TOKEN_ENV).map_err(|_| MissingApiToken)?;
+        Self::from_sources(database, lookup, |_| Err(io::ErrorKind::NotFound.into()))
+    }
+
+    fn from_sources(
+        database: impl Into<PathBuf>,
+        lookup: impl Fn(&str) -> Result<String, env::VarError>,
+        read: impl Fn(&Path) -> io::Result<String>,
+    ) -> Result<Self, MissingApiToken> {
+        let authentication_token = lookup(API_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty())
+            .or_else(|| {
+                let path = lookup(API_TOKEN_FILE_ENV).ok()?;
+                read(Path::new(&path))
+                    .ok()
+                    .map(|token| token.trim().to_owned())
+            })
+            .filter(|token| !token.is_empty())
+            .ok_or(MissingApiToken)?;
         Ok(Self {
             authentication_token: SecretString::from(authentication_token),
             database: database.into(),
@@ -82,7 +108,10 @@ pub struct MissingApiToken;
 
 impl fmt::Display for MissingApiToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{API_TOKEN_ENV} is not set")
+        write!(
+            formatter,
+            "neither {API_TOKEN_ENV} nor a readable {API_TOKEN_FILE_ENV} is set"
+        )
     }
 }
 
@@ -142,6 +171,38 @@ mod tests {
             ManagedClientConfig::from_lookup("state.sqlite", |_| Err(env::VarError::NotPresent))
                 .expect_err("missing token should fail");
 
-        assert_eq!(error.to_string(), "RS_API_TOKEN is not set");
+        assert_eq!(
+            error.to_string(),
+            "neither RS_API_TOKEN nor a readable RS_API_TOKEN_FILE is set"
+        );
+    }
+
+    #[test]
+    fn token_file_is_trimmed_and_environment_takes_precedence() {
+        let file_config = ManagedClientConfig::from_sources(
+            "state.sqlite",
+            |name| match name {
+                API_TOKEN_FILE_ENV => Ok("/run/secrets/rs_api_token".to_owned()),
+                _ => Err(env::VarError::NotPresent),
+            },
+            |path| {
+                assert_eq!(path, Path::new("/run/secrets/rs_api_token"));
+                Ok("file-secret\n".to_owned())
+            },
+        )
+        .expect("resolve token file");
+        assert!(!format!("{file_config:?}").contains("file-secret"));
+
+        let env_config = ManagedClientConfig::from_sources(
+            "state.sqlite",
+            |name| match name {
+                API_TOKEN_ENV => Ok("environment-secret".to_owned()),
+                API_TOKEN_FILE_ENV => Ok("unused".to_owned()),
+                _ => Err(env::VarError::NotPresent),
+            },
+            |_| panic!("token file must not be read when RS_API_TOKEN is set"),
+        )
+        .expect("resolve environment token");
+        assert!(!format!("{env_config:?}").contains("environment-secret"));
     }
 }

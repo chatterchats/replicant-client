@@ -13,11 +13,15 @@ Configuration is environment-based:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `RS_API_TOKEN` | required | Replicant Space authentication token |
+| `RS_API_TOKEN_FILE` | unset | File containing the token when `RS_API_TOKEN` is absent |
 | `REPLICANT_PROFILE` | `default` | Local profile name |
 | `REPLICANT_DB` | `replicant-client.sqlite` | Managed SDK database |
 | `REPLICANT_RUNTIME_DB` | `replicant-runtime.sqlite` | Workflow/runtime database |
 | `REPLICANTD_BIND` | `127.0.0.1:8080` | HTTP listen address |
 | `RUST_LOG` | `info` | Tracing filter |
+
+A non-empty `RS_API_TOKEN` takes precedence over `RS_API_TOKEN_FILE`. Token
+files are trimmed when read and neither source is printed in logs or status.
 
 The default binding is loopback-only. Binding to a non-loopback address is an explicit advanced deployment choice and should only be done behind an authenticated same-origin proxy or on an isolated container network.
 
