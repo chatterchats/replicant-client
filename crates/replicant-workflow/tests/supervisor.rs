@@ -6,9 +6,9 @@ use std::sync::{
 };
 
 use replicant_workflow::{
-    BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent, WaitOutcome,
-    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry,
-    WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
+    AutomationPolicy, BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent,
+    WaitOutcome, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
+    WorkflowRegistry, WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -219,6 +219,44 @@ async fn pauses_and_resumes_cooperatively() {
     finish_remaining(&harness, 1).await;
     wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(harness.executions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn pause_all_survives_restart_and_blocks_executor_start() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-pause-all-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("open repository"));
+    let (id, harness, registry, supervisor) = setup(repository.clone(), false);
+    repository
+        .set_automation_policy(AutomationPolicy {
+            automatic_triggers_enabled: true,
+            workflows_paused: true,
+        })
+        .expect("persist global pause");
+    assert_eq!(supervisor.pause_all().expect("pause all"), 1);
+    drop(supervisor);
+    drop(repository);
+
+    let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry);
+    supervisor.tick().await.expect("reconcile while paused");
+    assert!(
+        repository
+            .automation_policy()
+            .expect("policy")
+            .workflows_paused
+    );
+    assert_eq!(
+        repository.read(id).expect("workflow").unwrap().status,
+        WorkflowStatus::Paused
+    );
+    assert_eq!(harness.executions.load(Ordering::SeqCst), 0);
+
+    drop(supervisor);
+    drop(repository);
+    std::fs::remove_file(path).expect("remove test database");
 }
 
 #[tokio::test]

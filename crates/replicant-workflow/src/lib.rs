@@ -11,10 +11,11 @@ mod repository;
 mod supervisor;
 
 pub use model::{
-    AutomationTrigger, ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass,
-    FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim, ResourceKey, TriggerCondition,
-    TriggerId, TriggerState, TriggerTarget, TriggerTargetClass, WaitIntent, WaitOutcome,
-    WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus,
+    AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
+    FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
+    ResourceKey, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
+    WaitIntent, WaitOutcome, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind,
+    WorkflowState, WorkflowStatus,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowRegistry};
 pub use repository::{RepositoryError, WorkflowRepository};

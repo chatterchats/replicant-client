@@ -414,7 +414,7 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         WorkflowRepository::open(&path),
         Err(RepositoryError::UnsupportedDatabaseSchema {
             found: 99,
-            supported: 4
+            supported: 7
         })
     ));
     fs::remove_file(path).expect("remove test database");

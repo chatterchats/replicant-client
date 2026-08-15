@@ -1,4 +1,5 @@
 import {
+  parseAutomationControlResponse,
   parseDescriptorsResponse,
   parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
@@ -12,7 +13,7 @@ import {
   parseWorkflowDetailResponse,
   parseWorkflowResponse,
 } from "./protocol";
-import type { TriggerRequest } from "./protocol";
+import type { AutomationControlAction, TriggerRequest } from "./protocol";
 
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const response = await fetch(path, { signal });
@@ -50,6 +51,19 @@ async function send(
 }
 
 export const daemonApi = {
+  async controlAutomation(
+    action: AutomationControlAction,
+    workflowIds: string[] = [],
+    confirmed = false,
+  ) {
+    return parseAutomationControlResponse(
+      await post("/api/automation/control", {
+        action,
+        workflow_ids: workflowIds,
+        confirmed,
+      }),
+    ).payload;
+  },
   async health(signal?: AbortSignal) {
     return parseHealthResponse(await get("/api/health", signal)).payload;
   },

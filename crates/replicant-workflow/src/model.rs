@@ -5,6 +5,24 @@ use uuid::Uuid;
 
 use crate::RepositoryError;
 
+/// Persisted global automation safety policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPolicy {
+    /// Whether non-manual triggers may launch new work.
+    pub automatic_triggers_enabled: bool,
+    /// Whether workflow executors are globally paused.
+    pub workflows_paused: bool,
+}
+
+impl Default for AutomationPolicy {
+    fn default() -> Self {
+        Self {
+            automatic_triggers_enabled: true,
+            workflows_paused: false,
+        }
+    }
+}
+
 /// Stable identifier for a persisted automation trigger.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

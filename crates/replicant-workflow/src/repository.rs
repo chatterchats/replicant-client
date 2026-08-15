@@ -11,10 +11,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    AutomationTrigger, ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass,
-    FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim, ResourceKey, TriggerId,
-    TriggerState, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind, WorkflowState,
-    WorkflowStatus,
+    AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
+    FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
+    ResourceKey, TriggerId, TriggerState, WorkflowActivity, WorkflowId, WorkflowInstance,
+    WorkflowKind, WorkflowState, WorkflowStatus,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
@@ -24,7 +24,8 @@ const WAIT_INTENT_SCHEMA: &str = include_str!("../migrations/0004_wait_intent.sq
 const FINITE_EXECUTION_SCHEMA: &str =
     include_str!("../migrations/0005_finite_execution_history.sql");
 const AUTOMATION_TRIGGER_SCHEMA: &str = include_str!("../migrations/0006_automation_triggers.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 6;
+const AUTOMATION_POLICY_SCHEMA: &str = include_str!("../migrations/0007_automation_policy.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 7;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -212,8 +213,43 @@ impl WorkflowRepository {
                 [],
             )?;
         }
+        if found < 7 {
+            transaction.execute_batch(AUTOMATION_POLICY_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (7)",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Reads the persisted global automation safety policy.
+    pub fn automation_policy(&self) -> Result<AutomationPolicy, RepositoryError> {
+        Ok(self.connection()?.query_row(
+            "SELECT automatic_triggers_enabled, workflows_paused
+             FROM automation_policy WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(AutomationPolicy {
+                    automatic_triggers_enabled: row.get(0)?,
+                    workflows_paused: row.get(1)?,
+                })
+            },
+        )?)
+    }
+
+    /// Replaces the persisted global automation safety policy.
+    pub fn set_automation_policy(
+        &self,
+        policy: AutomationPolicy,
+    ) -> Result<AutomationPolicy, RepositoryError> {
+        self.connection()?.execute(
+            "UPDATE automation_policy SET automatic_triggers_enabled = ?1, workflows_paused = ?2
+             WHERE singleton = 1",
+            params![policy.automatic_triggers_enabled, policy.workflows_paused],
+        )?;
+        Ok(policy)
     }
 
     /// Creates a persisted trigger definition.
@@ -330,8 +366,39 @@ impl WorkflowRepository {
         fired_at: i64,
         next_run_at: Option<i64>,
     ) -> Result<bool, RepositoryError> {
+        self.claim_trigger_firing_with_policy(id, dedupe_key, fired_at, next_run_at, false)
+    }
+
+    /// Atomically claims one automatic firing only while global automation permits it.
+    pub fn claim_automatic_trigger_firing(
+        &self,
+        id: TriggerId,
+        dedupe_key: &str,
+        fired_at: i64,
+        next_run_at: Option<i64>,
+    ) -> Result<bool, RepositoryError> {
+        self.claim_trigger_firing_with_policy(id, dedupe_key, fired_at, next_run_at, true)
+    }
+
+    fn claim_trigger_firing_with_policy(
+        &self,
+        id: TriggerId,
+        dedupe_key: &str,
+        fired_at: i64,
+        next_run_at: Option<i64>,
+        automatic: bool,
+    ) -> Result<bool, RepositoryError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if automatic
+            && !transaction.query_row(
+                "SELECT automatic_triggers_enabled FROM automation_policy WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(false);
+        }
         let enabled = transaction
             .query_row(
                 "SELECT enabled FROM automation_triggers WHERE id = ?1",

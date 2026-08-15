@@ -37,7 +37,12 @@ describe("parseHealthResponse", () => {
             last_event_at_ms: null,
             detail: null,
           },
+          automation: {
+            automatic_triggers_enabled: true,
+            workflows_paused: false,
+          },
           workflows: [],
+          notifications: [],
           requirements: [
             {
               id: "relay-sol",

@@ -938,12 +938,19 @@ export function AutomationsPage({
     workflow: WorkflowSummary,
     action: "pause" | "resume" | "cancel",
   ) => {
+    if (
+      action === "cancel" &&
+      !window.confirm(`Cancel ${workflow.kind}? This cannot be undone.`)
+    )
+      return;
     setError(null);
-    void daemonApi
-      .controlWorkflow(workflow.id, action)
-      .catch((reason: unknown) => {
-        setError(String(reason));
-      });
+    const request =
+      action === "cancel"
+        ? daemonApi.controlAutomation("cancel", [workflow.id], true)
+        : daemonApi.controlWorkflow(workflow.id, action);
+    void request.catch((reason: unknown) => {
+      setError(String(reason));
+    });
   };
 
   return (

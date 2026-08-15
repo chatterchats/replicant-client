@@ -43,6 +43,23 @@ export interface RuntimeSyncStatus {
   detail: string | null;
 }
 
+export interface AutomationStatus {
+  automatic_triggers_enabled: boolean;
+  workflows_paused: boolean;
+}
+
+export type AutomationControlAction =
+  | "enable_triggers"
+  | "disable_triggers"
+  | "pause_all"
+  | "resume_all"
+  | "cancel";
+
+export interface AutomationControlResponse {
+  automation: AutomationStatus;
+  affected_workflows: number;
+}
+
 export interface SnapshotMetadata {
   revision: number;
   generated_at_ms: number;
@@ -193,8 +210,10 @@ export interface WorkflowDetail {
 export interface RuntimeSnapshot {
   metadata: SnapshotMetadata;
   sync: RuntimeSyncStatus;
+  automation: AutomationStatus;
   workflows: WorkflowSummary[];
   requirements: RequirementSummary[];
+  notifications: Notification[];
 }
 
 export interface RequirementSummary {
@@ -345,6 +364,7 @@ export type LiveDelta =
   | { type: "workflow_activity"; data: WorkflowActivity }
   | { type: "operation_updated"; data: OperationUpdate }
   | { type: "notification"; data: Notification }
+  | { type: "automation_changed"; data: AutomationStatus }
   | {
       type: "daemon_status_changed";
       data: { health: DaemonHealth; sync: RuntimeSyncStatus };
@@ -466,6 +486,19 @@ function sync(value: unknown): RuntimeSyncStatus {
         ? null
         : number(item.last_event_at_ms, "last event time"),
     detail: nullableString(item.detail, "sync detail"),
+  };
+}
+
+function automation(value: unknown): AutomationStatus {
+  const item = record(value, "automation status");
+  if (
+    typeof item.automatic_triggers_enabled !== "boolean" ||
+    typeof item.workflows_paused !== "boolean"
+  )
+    throw new Error("Invalid automation status");
+  return {
+    automatic_triggers_enabled: item.automatic_triggers_enabled,
+    workflows_paused: item.workflows_paused,
   };
 }
 
@@ -872,10 +905,15 @@ export function parseSnapshotResponse(
     const requirements = item.requirements ?? [];
     if (!Array.isArray(requirements))
       throw new Error("Invalid snapshot requirements");
+    const notifications = item.notifications ?? [];
+    if (!Array.isArray(notifications))
+      throw new Error("Invalid snapshot notifications");
     return {
       metadata: metadata(item.metadata),
       sync: sync(item.sync),
+      automation: automation(item.automation),
       workflows: item.workflows.map(workflow),
+      notifications: notifications.map(notification),
       requirements: requirements.map((value) => {
         const requirement = record(value, "requirement");
         if (
@@ -1257,6 +1295,9 @@ export function parseLiveMessage(value: unknown): LiveMessage {
     case "notification":
       delta = { type, data: notification(data) };
       break;
+    case "automation_changed":
+      delta = { type, data: automation(data) };
+      break;
     case "daemon_status_changed": {
       const value = record(data, "daemon status");
       delta = {
@@ -1269,4 +1310,19 @@ export function parseLiveMessage(value: unknown): LiveMessage {
       throw new Error(`Unsupported live delta: ${type}`);
   }
   return { protocol_version: PROTOCOL_VERSION, revision, delta };
+}
+
+export function parseAutomationControlResponse(
+  value: unknown,
+): Versioned<AutomationControlResponse> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "automation control response");
+    return {
+      automation: automation(item.automation),
+      affected_workflows: number(
+        item.affected_workflows,
+        "affected workflow count",
+      ),
+    };
+  });
 }

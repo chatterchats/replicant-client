@@ -426,6 +426,9 @@ impl WorkflowSupervisor {
             self.claims_reconciled = true;
         }
         self.reap_finished().await?;
+        if self.repository.automation_policy()?.workflows_paused {
+            return Ok(());
+        }
         for instance in self.repository.list()? {
             if self.tasks.contains_key(&instance.id) {
                 continue;
@@ -479,6 +482,45 @@ impl WorkflowSupervisor {
             self.repository.release_claims(id)?;
         }
         Ok(())
+    }
+
+    /// Durably pauses every eligible workflow and requests cooperative stops.
+    pub fn pause_all(&self) -> Result<usize, SupervisorError> {
+        let mut paused = 0;
+        for instance in self.repository.list()? {
+            if instance.status.can_transition_to(WorkflowStatus::Paused)
+                && instance.status != WorkflowStatus::Paused
+            {
+                self.pause(instance.id)?;
+                paused += 1;
+            }
+        }
+        Ok(paused)
+    }
+
+    /// Durably resumes every paused workflow through reconciliation.
+    pub fn resume_all(&self) -> Result<usize, SupervisorError> {
+        let mut resumed = 0;
+        for instance in self.repository.list()? {
+            if instance.status == WorkflowStatus::Paused {
+                self.resume(instance.id)?;
+                resumed += 1;
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Durably cancels the selected workflows, or every eligible workflow when empty.
+    pub fn cancel_selected(&self, ids: &[WorkflowId]) -> Result<usize, SupervisorError> {
+        let instances = self.repository.list()?;
+        let mut cancelled = 0;
+        for instance in instances {
+            if !instance.status.is_terminal() && (ids.is_empty() || ids.contains(&instance.id)) {
+                self.cancel(instance.id)?;
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Returns whether this supervisor currently owns the instance executor.

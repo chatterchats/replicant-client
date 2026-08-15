@@ -141,6 +141,15 @@ pub struct RuntimeSyncStatus {
     pub detail: Option<String>,
 }
 
+/// Frontend-safe global automation safety state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationStatus {
+    /// Whether non-manual triggers may launch new work.
+    pub automatic_triggers_enabled: bool,
+    /// Whether workflow execution is globally paused.
+    pub workflows_paused: bool,
+}
+
 /// Metadata describing an application snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -414,11 +423,16 @@ pub struct RuntimeSnapshot {
     pub metadata: SnapshotMetadata,
     /// Current managed-client synchronization state.
     pub sync: RuntimeSyncStatus,
+    /// Persisted global automation safety state.
+    pub automation: AutomationStatus,
     /// Current persisted workflows.
     pub workflows: Vec<WorkflowSummary>,
     /// Desired-state requirements with current fulfillment progress.
     #[serde(default)]
     pub requirements: Vec<RequirementSummary>,
+    /// Current operational issues requiring visibility.
+    #[serde(default)]
+    pub notifications: Vec<Notification>,
 }
 
 /// Frontend-safe desired-state requirement evaluation.
@@ -628,6 +642,44 @@ pub struct WorkflowControlRequest {
 pub struct WorkflowControlResponse {
     /// Updated workflow state.
     pub workflow: WorkflowSummary,
+}
+
+/// Global automation safety command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationControlAction {
+    /// Permit automatic trigger launches.
+    EnableTriggers,
+    /// Suppress new automatic trigger launches.
+    DisableTriggers,
+    /// Pause all eligible workflows.
+    PauseAll,
+    /// Resume all paused workflows.
+    ResumeAll,
+    /// Cancel selected workflows, or all eligible workflows when no IDs are supplied.
+    Cancel,
+}
+
+/// Request to change global automation safety state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationControlRequest {
+    /// Requested safety operation.
+    pub action: AutomationControlAction,
+    /// Selected workflows for cancellation; empty means all eligible workflows.
+    #[serde(default)]
+    pub workflow_ids: Vec<WorkflowId>,
+    /// Explicit destructive-operation confirmation.
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// Result of a global automation safety command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationControlResponse {
+    /// Updated global safety state.
+    pub automation: AutomationStatus,
+    /// Number of workflows changed by the command.
+    pub affected_workflows: usize,
 }
 
 /// Severity of one workflow activity record.
@@ -1088,6 +1140,8 @@ pub enum LiveDelta {
     OperationUpdated(OperationUpdate),
     /// A notification was raised.
     Notification(Notification),
+    /// Global automation safety state changed.
+    AutomationChanged(AutomationStatus),
     /// Daemon health or synchronization changed.
     DaemonStatusChanged {
         /// Current daemon health.

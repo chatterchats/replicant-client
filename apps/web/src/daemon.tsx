@@ -10,6 +10,7 @@ import {
 
 import { daemonApi } from "./api";
 import {
+  type AutomationStatus,
   type DaemonHealth,
   type DomainSlice,
   type LiveMessage,
@@ -33,6 +34,7 @@ export interface DaemonState {
   syncing: boolean;
   health: DaemonHealth | null;
   sync: RuntimeSyncStatus | null;
+  automation: AutomationStatus;
   entities: Record<string, unknown>;
   workflows: Record<string, WorkflowSummary>;
   requirements: RequirementSummary[];
@@ -59,6 +61,10 @@ export const initialDaemonState: DaemonState = {
   syncing: true,
   health: null,
   sync: null,
+  automation: {
+    automatic_triggers_enabled: false,
+    workflows_paused: true,
+  },
   entities: {},
   workflows: {},
   requirements: [],
@@ -103,13 +109,14 @@ export function daemonReducer(
         syncing: action.snapshot.sync.phase !== "ready",
         health: action.health,
         sync: action.snapshot.sync,
+        automation: action.snapshot.automation,
         entities: {},
         workflows: Object.fromEntries(
           action.snapshot.workflows.map((workflow) => [workflow.id, workflow]),
         ),
         requirements: action.snapshot.requirements,
         activity: [],
-        notifications: [],
+        notifications: action.snapshot.notifications,
         operations: {},
         invalidated: [],
         needsResnapshot: false,
@@ -182,11 +189,20 @@ export function daemonReducer(
               [message.delta.data.id]: message.delta.data,
             },
           };
-        case "notification":
+        case "notification": {
+          const notification = message.delta.data;
           return {
             ...next,
-            notifications: [...state.notifications, message.delta.data],
+            notifications: [
+              ...state.notifications.filter(
+                (item) => item.id !== notification.id,
+              ),
+              notification,
+            ],
           };
+        }
+        case "automation_changed":
+          return { ...next, automation: message.delta.data };
         case "daemon_status_changed":
           return {
             ...next,

@@ -122,6 +122,8 @@ export function App() {
   const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
   const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
     useState<string>();
+  const [automationBusy, setAutomationBusy] = useState(false);
+  const [automationError, setAutomationError] = useState<string>();
   const daemon = useDaemonState();
   const health = useDaemonHealth();
   const { connection, syncing, revision } = useDaemonConnection();
@@ -243,6 +245,29 @@ export function App() {
   const select = (entity: SelectedEntity) => {
     dispatch({ type: "select", entity });
   };
+  const controlAutomation = (
+    action:
+      | "enable_triggers"
+      | "disable_triggers"
+      | "pause_all"
+      | "resume_all"
+      | "cancel",
+  ) => {
+    const confirmed =
+      action !== "cancel" ||
+      window.confirm("Cancel every eligible workflow? This cannot be undone.");
+    if (!confirmed) return;
+    setAutomationBusy(true);
+    setAutomationError(undefined);
+    void daemonApi
+      .controlAutomation(action, [], action === "cancel")
+      .catch((error: unknown) => {
+        setAutomationError(String(error));
+      })
+      .finally(() => {
+        setAutomationBusy(false);
+      });
+  };
 
   return (
     <div className="app-shell">
@@ -318,6 +343,53 @@ export function App() {
             <small>Warnings</small>
             <strong>{warnings.length}</strong>
           </span>
+          <div
+            className={`status-item automation-safety ${daemon.automation.workflows_paused ? "paused" : ""}`}
+            title={automationError}
+          >
+            <small>Automation safety</small>
+            <strong>
+              {daemon.automation.workflows_paused ? "Paused" : "Running"} ·
+              triggers{" "}
+              {daemon.automation.automatic_triggers_enabled ? "on" : "off"}
+            </strong>
+            <span>
+              <button
+                disabled={connection !== "connected" || automationBusy}
+                onClick={() => {
+                  controlAutomation(
+                    daemon.automation.workflows_paused
+                      ? "resume_all"
+                      : "pause_all",
+                  );
+                }}
+              >
+                {daemon.automation.workflows_paused ? "Resume" : "Pause all"}
+              </button>
+              <button
+                disabled={connection !== "connected" || automationBusy}
+                onClick={() => {
+                  controlAutomation(
+                    daemon.automation.automatic_triggers_enabled
+                      ? "disable_triggers"
+                      : "enable_triggers",
+                  );
+                }}
+              >
+                Triggers{" "}
+                {daemon.automation.automatic_triggers_enabled ? "off" : "on"}
+              </button>
+              <button
+                className="danger"
+                disabled={connection !== "connected" || automationBusy}
+                onClick={() => {
+                  controlAutomation("cancel");
+                }}
+              >
+                Cancel all
+              </button>
+            </span>
+          </div>
           <button
             className="palette-trigger"
             onClick={() => {

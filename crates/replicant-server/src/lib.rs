@@ -28,18 +28,20 @@ use replicant_client::{
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
-    ActivityLevel, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
+    ActivityLevel, AutomationControlAction, AutomationControlRequest, AutomationControlResponse,
+    AutomationStatus, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
     DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef, ErrorResponse,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
-    LiveDelta, LiveMessage, OperationClass, OperationKind, OperationStatus, OperationUpdate,
-    RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot,
-    RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase,
-    SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
-    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
-    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
-    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
-    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowSummary,
+    LiveDelta, LiveMessage, Notification, NotificationLevel, OperationClass, OperationKind,
+    OperationStatus, OperationUpdate, RequirementSummary, ResultSummary, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
+    StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
+    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
+    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
+    WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
@@ -51,11 +53,11 @@ use replicant_runtime::{
     workflows::{RequirementWorkflowCheckpoint, RequirementWorkflowConfig, WorkflowActivityEvent},
 };
 use replicant_workflow::{
-    AutomationTrigger, FiniteExecution as StoredFiniteExecution, FiniteExecutionClass,
-    FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger, RepositoryError, ResourceKey,
-    SupervisorError, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
-    WorkflowId, WorkflowInstance, WorkflowKind, WorkflowRepository, WorkflowStatus,
-    WorkflowSupervisor,
+    AutomationPolicy, AutomationTrigger, FiniteExecution as StoredFiniteExecution,
+    FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
+    RepositoryError, ResourceKey, SupervisorError, TriggerCondition, TriggerId, TriggerState,
+    TriggerTarget, TriggerTargetClass, WorkflowId, WorkflowInstance, WorkflowKind,
+    WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -206,6 +208,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(update_trigger).delete(delete_trigger),
         )
         .route("/api/triggers/{id}/fire", post(fire_trigger))
+        .route("/api/automation/control", post(control_automation))
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
@@ -228,6 +231,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
         .map(|workflow| (workflow.id.to_string(), workflow.revision))
         .collect::<BTreeMap<_, _>>();
     let mut activity_cursor = state.repository.latest_activity_id().unwrap_or_default();
+    let mut managed_phase = sync_phase(&state.client().status());
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -235,6 +239,23 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     tracing::error!(error = %error, "workflow supervisor tick failed");
                 }
                 publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
+                let status = state.client().status();
+                let phase = sync_phase(&status);
+                if phase != managed_phase {
+                    managed_phase = phase;
+                    let sync = runtime_sync_status(&state, &status);
+                    state.publish(LiveDelta::DaemonStatusChanged {
+                        health: DaemonHealth {
+                            status: health_status(&status),
+                            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            detail: status_detail(&status).map(str::to_owned),
+                        },
+                        sync: sync.clone(),
+                    });
+                    if matches!(phase, SyncPhase::Degraded | SyncPhase::Offline) {
+                        state.notify(sync_notification(&sync));
+                    }
+                }
             }
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 match revision {
@@ -316,9 +337,7 @@ async fn evaluate_schedules_and_parents(state: &Arc<AppState>) {
         match &trigger.condition {
             TriggerCondition::Schedule { interval_millis } => {
                 if *interval_millis <= 0 {
-                    let _ = state
-                        .repository
-                        .set_trigger_error(trigger.id, Some("schedule interval must be positive"));
+                    notify_trigger_error(state, &trigger, "schedule interval must be positive");
                     continue;
                 }
                 let Some(due) = trigger.next_run_at.filter(|due| *due <= now) else {
@@ -399,16 +418,12 @@ async fn evaluate_event_triggers(state: &Arc<AppState>) {
             query = query.for_device(device_code);
         }
         let Ok(events) = query.collect().await else {
-            let _ = state
-                .repository
-                .set_trigger_error(trigger.id, Some("managed event history unavailable"));
+            notify_trigger_error(state, &trigger, "managed event history unavailable");
             continue;
         };
         for event in events {
             if state.client().state().revision().is_err() {
-                let _ = state
-                    .repository
-                    .set_trigger_error(trigger.id, Some("managed projections unavailable"));
+                notify_trigger_error(state, &trigger, "managed projections unavailable");
                 break;
             }
             claim_and_launch(
@@ -439,18 +454,30 @@ async fn claim_and_launch(
     let now = now_millis().unwrap_or_default();
     match state
         .repository
-        .claim_trigger_firing(trigger.id, &dedupe_key, now, next_run_at)
+        .claim_automatic_trigger_firing(trigger.id, &dedupe_key, now, next_run_at)
     {
         Ok(true) => {
             if let Err(error) = launch_trigger(state, &trigger, parent_id).await {
-                let _ = state.repository.set_trigger_error(trigger.id, Some(&error));
+                notify_trigger_error(state, &trigger, &error);
             }
         }
         Ok(false) => {}
         Err(error) => {
-            tracing::error!(trigger_id = %trigger.id, error = %error, "trigger claim failed")
+            tracing::error!(trigger_id = %trigger.id, error = %error, "trigger claim failed");
+            notify_trigger_error(state, &trigger, "trigger firing could not be claimed");
         }
     }
+}
+
+fn notify_trigger_error(state: &AppState, trigger: &AutomationTrigger, error: &str) {
+    let _ = state.repository.set_trigger_error(trigger.id, Some(error));
+    state.notify(Notification {
+        id: EntityId(format!("trigger:{}:failed", trigger.id)),
+        level: NotificationLevel::Error,
+        title: "Automatic trigger failed".to_owned(),
+        message: format!("{}: {error}", trigger.name),
+        created_at_ms: now_millis().unwrap_or_default(),
+    });
 }
 
 async fn launch_trigger(
@@ -532,6 +559,9 @@ fn publish_workflow_updates(
             };
             if let Some(delta) = delta {
                 state.publish(delta);
+                if let Some(notification) = workflow_notification(&workflow) {
+                    state.notify(notification);
+                }
             }
         }
     }
@@ -654,16 +684,25 @@ async fn snapshot(
         .collect();
     let workflows = instances.iter().map(summary).collect();
     let status = state.client().status();
+    let triggers = state
+        .repository
+        .list_triggers()
+        .map_err(ApiError::repository)?;
     Ok(Json(Versioned::current(RuntimeSnapshot {
         metadata: state.snapshot_metadata()?,
         sync: RuntimeSyncStatus {
-            phase: sync_phase(&status),
             revision,
-            last_event_at_ms: None,
-            detail: status_detail(&status).map(str::to_owned),
+            ..runtime_sync_status(&state, &status)
         },
+        automation: automation_status(
+            state
+                .repository
+                .automation_policy()
+                .map_err(ApiError::repository)?,
+        ),
         workflows,
         requirements,
+        notifications: operational_notifications(&instances, &triggers, &status),
     })))
 }
 
@@ -942,10 +981,7 @@ async fn fire_trigger(
         )
         .map_err(ApiError::repository)?;
     if claimed && let Err(error) = launch_trigger(&state, &trigger, None).await {
-        state
-            .repository
-            .set_trigger_error(id, Some(&error))
-            .map_err(ApiError::repository)?;
+        notify_trigger_error(&state, &trigger, &error);
         return Err(ApiError::invalid("trigger launch failed"));
     }
     let trigger = state
@@ -1350,6 +1386,68 @@ async fn start_workflow(
     ))
 }
 
+async fn control_automation(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<AutomationControlRequest>, JsonRejection>,
+) -> Result<Json<Versioned<AutomationControlResponse>>, ApiError> {
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid automation control"))?;
+    if request.action == AutomationControlAction::Cancel && !request.confirmed {
+        return Err(ApiError::invalid(
+            "cancellation requires explicit confirmation",
+        ));
+    }
+    let mut policy = state
+        .repository
+        .automation_policy()
+        .map_err(ApiError::repository)?;
+    let supervisor = state.supervisor.lock().await;
+    let affected_workflows = match request.action {
+        AutomationControlAction::EnableTriggers => {
+            policy.automatic_triggers_enabled = true;
+            0
+        }
+        AutomationControlAction::DisableTriggers => {
+            policy.automatic_triggers_enabled = false;
+            0
+        }
+        AutomationControlAction::PauseAll => {
+            policy.workflows_paused = true;
+            state
+                .repository
+                .set_automation_policy(policy)
+                .map_err(ApiError::repository)?;
+            supervisor.pause_all().map_err(supervisor_error)?
+        }
+        AutomationControlAction::ResumeAll => {
+            policy.workflows_paused = false;
+            state
+                .repository
+                .set_automation_policy(policy)
+                .map_err(ApiError::repository)?;
+            supervisor.resume_all().map_err(supervisor_error)?
+        }
+        AutomationControlAction::Cancel => {
+            let ids = request
+                .workflow_ids
+                .iter()
+                .map(|id| parse_id(&id.0))
+                .collect::<Result<Vec<_>, _>>()?;
+            supervisor.cancel_selected(&ids).map_err(supervisor_error)?
+        }
+    };
+    drop(supervisor);
+    policy = state
+        .repository
+        .set_automation_policy(policy)
+        .map_err(ApiError::repository)?;
+    let automation = automation_status(policy);
+    state.publish(LiveDelta::AutomationChanged(automation));
+    Ok(Json(Versioned::current(AutomationControlResponse {
+        automation,
+        affected_workflows,
+    })))
+}
+
 async fn pause_workflow(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1389,9 +1487,7 @@ async fn control_workflow(
         Control::Resume => supervisor.resume(id),
         Control::Cancel => supervisor.cancel(id),
     }
-    .map_err(|error| match error {
-        SupervisorError::Repository(error) => ApiError::repository(error),
-    })?;
+    .map_err(supervisor_error)?;
     drop(supervisor);
     let instance = state
         .repository
@@ -1401,6 +1497,12 @@ async fn control_workflow(
     Ok(Json(Versioned::current(WorkflowControlResponse {
         workflow: summary(&instance),
     })))
+}
+
+fn supervisor_error(error: SupervisorError) -> ApiError {
+    match error {
+        SupervisorError::Repository(error) => ApiError::repository(error),
+    }
 }
 
 async fn workflow_activity(
@@ -1602,6 +1704,86 @@ fn stored_status(status: ProtocolStatus) -> WorkflowStatus {
         ProtocolStatus::Succeeded => WorkflowStatus::Succeeded,
         ProtocolStatus::Failed => WorkflowStatus::Failed,
         ProtocolStatus::Cancelled => WorkflowStatus::Cancelled,
+    }
+}
+
+fn automation_status(policy: AutomationPolicy) -> AutomationStatus {
+    AutomationStatus {
+        automatic_triggers_enabled: policy.automatic_triggers_enabled,
+        workflows_paused: policy.workflows_paused,
+    }
+}
+
+fn runtime_sync_status(state: &AppState, status: &ClientStatus) -> RuntimeSyncStatus {
+    RuntimeSyncStatus {
+        phase: sync_phase(status),
+        revision: state.client().state().revision().unwrap_or_default(),
+        last_event_at_ms: None,
+        detail: status_detail(status).map(str::to_owned),
+    }
+}
+
+fn operational_notifications(
+    workflows: &[WorkflowInstance],
+    triggers: &[AutomationTrigger],
+    status: &ClientStatus,
+) -> Vec<Notification> {
+    let mut notifications = workflows
+        .iter()
+        .filter_map(workflow_notification)
+        .chain(triggers.iter().filter_map(|trigger| {
+            trigger.last_error.as_ref().map(|error| Notification {
+                id: EntityId(format!("trigger:{}:failed", trigger.id)),
+                level: NotificationLevel::Error,
+                title: "Automatic trigger failed".to_owned(),
+                message: format!("{}: {error}", trigger.name),
+                created_at_ms: trigger.updated_at,
+            })
+        }))
+        .collect::<Vec<_>>();
+    let sync = RuntimeSyncStatus {
+        phase: sync_phase(status),
+        revision: 0,
+        last_event_at_ms: None,
+        detail: status_detail(status).map(str::to_owned),
+    };
+    if matches!(sync.phase, SyncPhase::Degraded | SyncPhase::Offline) {
+        notifications.push(sync_notification(&sync));
+    }
+    notifications
+}
+
+fn workflow_notification(workflow: &WorkflowInstance) -> Option<Notification> {
+    let error = workflow.last_error.as_deref()?;
+    let blocked = error.contains("claimed by workflow") || error.contains("ClaimConflict");
+    Some(Notification {
+        id: EntityId(format!("workflow:{}:attention", workflow.id)),
+        level: if blocked {
+            NotificationLevel::Warning
+        } else {
+            NotificationLevel::Error
+        },
+        title: if blocked {
+            "Blocked resource claim"
+        } else {
+            "Workflow needs attention"
+        }
+        .to_owned(),
+        message: format!("{}: {error}", workflow.kind),
+        created_at_ms: workflow.updated_at,
+    })
+}
+
+fn sync_notification(sync: &RuntimeSyncStatus) -> Notification {
+    Notification {
+        id: EntityId("managed-sync:degraded".to_owned()),
+        level: NotificationLevel::Warning,
+        title: "Managed synchronization degraded".to_owned(),
+        message: sync
+            .detail
+            .clone()
+            .unwrap_or_else(|| "SSE or managed state continuity needs attention".to_owned()),
+        created_at_ms: now_millis().unwrap_or_default(),
     }
 }
 
@@ -2008,6 +2190,114 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json(response).await["payload"]["code"], "invalid_request");
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn global_safety_controls_pause_disable_and_confirm_cancellation() {
+        let (app, client, state) = test_app().await;
+        let create_workflow = |kind: &str| {
+            state.repository.create(NewWorkflow {
+                kind: WorkflowKind::new(kind).expect("kind"),
+                schema_version: 1,
+                config: (),
+                checkpoint: (),
+                current_step: None,
+                parent_id: None,
+            })
+        };
+        let workflow = create_workflow("test.safety-one").expect("workflow");
+        let other = create_workflow("test.safety-two").expect("other workflow");
+        let control = |body: Value| {
+            Request::post("/api/automation/control")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request")
+        };
+
+        let response = app
+            .clone()
+            .oneshot(control(serde_json::json!({ "action": "pause_all" })))
+            .await
+            .expect("pause response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            json(response).await["payload"]["automation"]["workflows_paused"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            state.repository.read(workflow.id).unwrap().unwrap().status,
+            WorkflowStatus::Paused
+        );
+
+        let response = app
+            .clone()
+            .oneshot(control(serde_json::json!({ "action": "resume_all" })))
+            .await
+            .expect("resume response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.repository.read(workflow.id).unwrap().unwrap().status,
+            WorkflowStatus::Reconciling
+        );
+        app.clone()
+            .oneshot(control(serde_json::json!({ "action": "pause_all" })))
+            .await
+            .expect("second pause response");
+
+        let response = app
+            .clone()
+            .oneshot(control(serde_json::json!({ "action": "disable_triggers" })))
+            .await
+            .expect("disable response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state
+                .repository
+                .automation_policy()
+                .unwrap()
+                .automatic_triggers_enabled
+        );
+
+        let response = app
+            .clone()
+            .oneshot(control(serde_json::json!({ "action": "cancel" })))
+            .await
+            .expect("unconfirmed response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(control(serde_json::json!({
+                "action": "cancel",
+                "workflow_ids": [workflow.id.to_string()],
+                "confirmed": true
+            })))
+            .await
+            .expect("cancel response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.repository.read(workflow.id).unwrap().unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert_eq!(
+            state.repository.read(other.id).unwrap().unwrap().status,
+            WorkflowStatus::Paused
+        );
+        let response = app
+            .oneshot(control(serde_json::json!({
+                "action": "cancel",
+                "confirmed": true
+            })))
+            .await
+            .expect("cancel all response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.repository.read(other.id).unwrap().unwrap().status,
+            WorkflowStatus::Cancelled
+        );
+        assert!(!matches!(client.status(), ClientStatus::Closed));
         client.close().await.expect("close client");
     }
 
