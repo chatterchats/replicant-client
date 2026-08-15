@@ -463,6 +463,70 @@ pub struct RuntimeSnapshot {
     pub notifications: Vec<Notification>,
 }
 
+/// Summary-oriented operations dashboard projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OverviewSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Daemon availability.
+    pub health: DaemonHealth,
+    /// Managed-client synchronization state.
+    pub sync: RuntimeSyncStatus,
+    /// Global automation safety state.
+    pub automation: AutomationStatus,
+    /// Owned replicants and their current locations.
+    pub replicants: Vec<OverviewReplicant>,
+    /// Replicants currently traveling.
+    pub active_travel: Vec<OverviewTravel>,
+    /// Non-terminal workflows.
+    pub active_workflows: Vec<WorkflowSummary>,
+    /// Workflow totals grouped by lifecycle state.
+    pub workflow_counts: Vec<WorkflowStatusCount>,
+    /// Workflows with a persisted error or failed status.
+    pub attention_workflows: Vec<WorkflowSummary>,
+    /// Current operational notifications.
+    pub notifications: Vec<Notification>,
+    /// Most recent durable workflow activity, newest first.
+    pub recent_activity: Vec<WorkflowActivity>,
+}
+
+/// One owned replicant on the operations dashboard.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OverviewReplicant {
+    /// Replicant entity address.
+    pub entity: EntityRef,
+    /// Optional display name.
+    pub name: Option<String>,
+    /// Current containing system, when known.
+    pub system: Option<String>,
+    /// Current location, when known.
+    pub location: Option<String>,
+    /// Stable managed status wire value, when known.
+    pub status: Option<String>,
+}
+
+/// Active owned-replicant travel summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OverviewTravel {
+    /// Traveling replicant.
+    pub entity: EntityRef,
+    /// Origin location, when known.
+    pub from: Option<String>,
+    /// Destination location, when known.
+    pub to: Option<String>,
+    /// ISO-8601 arrival time, when known.
+    pub arrives_at: Option<String>,
+}
+
+/// Number of workflows in one lifecycle state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowStatusCount {
+    /// Lifecycle state.
+    pub status: WorkflowStatus,
+    /// Number of workflows in this state.
+    pub count: usize,
+}
+
 /// Frontend-safe desired-state requirement evaluation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequirementSummary {
@@ -1308,6 +1372,37 @@ mod tests {
                 entity_type: None,
                 status: Some("idle".to_owned()),
             }],
+        }));
+        round_trip(&Versioned::current(OverviewSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1_765_000_000_000,
+            },
+            health: DaemonHealth {
+                status: HealthStatus::Healthy,
+                daemon_version: "0.1.0".to_owned(),
+                detail: None,
+            },
+            sync: RuntimeSyncStatus {
+                phase: SyncPhase::Ready,
+                revision: 42,
+                last_event_at_ms: None,
+                detail: None,
+            },
+            automation: AutomationStatus {
+                automatic_triggers_enabled: true,
+                workflows_paused: false,
+            },
+            replicants: Vec::new(),
+            active_travel: Vec::new(),
+            active_workflows: vec![workflow()],
+            workflow_counts: vec![WorkflowStatusCount {
+                status: WorkflowStatus::Waiting,
+                count: 1,
+            }],
+            attention_workflows: Vec::new(),
+            notifications: Vec::new(),
+            recent_activity: Vec::new(),
         }));
 
         let json = serde_json::to_value(message).expect("serialize live message");

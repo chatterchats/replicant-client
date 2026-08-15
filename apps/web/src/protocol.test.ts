@@ -5,6 +5,7 @@ import {
   parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
+  parseOverviewResponse,
   parseSnapshotResponse,
   parseSystemSceneResponse,
   parseTriggerListResponse,
@@ -104,6 +105,34 @@ describe("parseHealthResponse", () => {
     }).payload;
     expect(index.metadata.revision).toBe(4);
     expect(index.entities[0]?.location).toBe("EARTH");
+  });
+
+  it("parses typed overview snapshots", () => {
+    const overview = parseOverviewResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 10 },
+        health: { status: "healthy", daemon_version: "test", detail: null },
+        sync: {
+          phase: "ready",
+          revision: 4,
+          last_event_at_ms: null,
+          detail: null,
+        },
+        automation: {
+          automatic_triggers_enabled: true,
+          workflows_paused: false,
+        },
+        replicants: [],
+        active_travel: [],
+        active_workflows: [],
+        workflow_counts: [{ status: "running", count: 2 }],
+        attention_workflows: [],
+        notifications: [],
+        recent_activity: [],
+      },
+    }).payload;
+    expect(overview.workflow_counts).toEqual([{ status: "running", count: 2 }]);
   });
 
   it("rejects unknown protocol versions and delta variants", () => {

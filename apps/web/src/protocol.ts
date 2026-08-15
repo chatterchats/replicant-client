@@ -75,6 +75,40 @@ export interface SnapshotMetadata {
   generated_at_ms: number;
 }
 
+export interface OverviewReplicant {
+  entity: EntityRef;
+  name: string | null;
+  system: string | null;
+  location: string | null;
+  status: string | null;
+}
+
+export interface OverviewTravel {
+  entity: EntityRef;
+  from: string | null;
+  to: string | null;
+  arrives_at: string | null;
+}
+
+export interface WorkflowStatusCount {
+  status: WorkflowStatus;
+  count: number;
+}
+
+export interface OverviewSnapshot {
+  metadata: SnapshotMetadata;
+  health: DaemonHealth;
+  sync: RuntimeSyncStatus;
+  automation: AutomationStatus;
+  replicants: OverviewReplicant[];
+  active_travel: OverviewTravel[];
+  active_workflows: WorkflowSummary[];
+  workflow_counts: WorkflowStatusCount[];
+  attention_workflows: WorkflowSummary[];
+  notifications: Notification[];
+  recent_activity: WorkflowActivity[];
+}
+
 export interface WorkflowSummary {
   id: string;
   kind: string;
@@ -948,6 +982,63 @@ function envelope<T>(
 
 export function parseHealthResponse(value: unknown): Versioned<DaemonHealth> {
   return envelope(value, health);
+}
+
+export function parseOverviewResponse(
+  value: unknown,
+): Versioned<OverviewSnapshot> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "overview snapshot");
+    return {
+      metadata: metadata(item.metadata),
+      health: health(item.health),
+      sync: sync(item.sync),
+      automation: automation(item.automation),
+      replicants: array(item.replicants, "overview replicants").map((value) => {
+        const replicant = record(value, "overview replicant");
+        return {
+          entity: entity(replicant.entity),
+          name: nullableString(replicant.name, "replicant name"),
+          system: nullableString(replicant.system, "replicant system"),
+          location: nullableString(replicant.location, "replicant location"),
+          status: nullableString(replicant.status, "replicant status"),
+        };
+      }),
+      active_travel: array(item.active_travel, "overview travel").map(
+        (value) => {
+          const travel = record(value, "overview travel");
+          return {
+            entity: entity(travel.entity),
+            from: nullableString(travel.from, "travel origin"),
+            to: nullableString(travel.to, "travel destination"),
+            arrives_at: nullableString(travel.arrives_at, "travel arrival"),
+          };
+        },
+      ),
+      active_workflows: array(item.active_workflows, "active workflows").map(
+        workflow,
+      ),
+      workflow_counts: array(item.workflow_counts, "workflow counts").map(
+        (value) => {
+          const count = record(value, "workflow count");
+          return {
+            status: oneOf(count.status, workflowStatuses, "workflow status"),
+            count: number(count.count, "workflow count"),
+          };
+        },
+      ),
+      attention_workflows: array(
+        item.attention_workflows,
+        "attention workflows",
+      ).map(workflow),
+      notifications: array(item.notifications, "overview notifications").map(
+        notification,
+      ),
+      recent_activity: array(item.recent_activity, "recent activity").map(
+        activity,
+      ),
+    };
+  });
 }
 
 export function parseSnapshotResponse(

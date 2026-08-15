@@ -34,14 +34,15 @@ use replicant_protocol::{
     EntitySummary, ErrorResponse, FiniteExecution as ProtocolFiniteExecution,
     FiniteExecutionHistoryResponse, FiniteExecutionStatus as ProtocolFiniteExecutionStatus,
     GalaxySceneSnapshot, HealthStatus, LiveDelta, LiveMessage, Notification, NotificationLevel,
-    OperationClass, OperationKind, OperationStatus, OperationUpdate, RequirementSummary,
-    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    OperationClass, OperationKind, OperationStatus, OperationUpdate, OverviewReplicant,
+    OverviewSnapshot, OverviewTravel, RequirementSummary, ResultSummary, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
+    StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
     TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
     TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
     WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
     WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
-    WorkflowSummary,
+    WorkflowStatusCount, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
@@ -196,6 +197,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/overview", get(overview))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -603,6 +605,9 @@ fn publish_workflow_updates(
                 state.publish(LiveDelta::DomainInvalidated {
                     slice: DomainSlice::Workflows,
                 });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Overview,
+                });
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
                 }
@@ -622,6 +627,9 @@ fn publish_workflow_updates(
                     step,
                     message,
                 }));
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Overview,
+                });
             }
         }
     }
@@ -748,6 +756,171 @@ async fn snapshot(
         requirements,
         notifications: operational_notifications(&instances, &triggers, &status),
     })))
+}
+
+async fn overview(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<OverviewSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let status = state.client().status();
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let triggers = state
+        .repository
+        .list_triggers()
+        .map_err(ApiError::repository)?;
+    let automation = automation_status(
+        state
+            .repository
+            .automation_policy()
+            .map_err(ApiError::repository)?,
+    );
+    let locations = state
+        .client()
+        .locations()
+        .find()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let location_systems = locations
+        .into_iter()
+        .map(|location| (location.id().to_string(), location.system))
+        .collect::<BTreeMap<_, _>>();
+    let mut replicants = Vec::new();
+    let mut active_travel = Vec::new();
+    for handle in state
+        .client()
+        .replicants()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+    {
+        let replicant = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        let entity = summary_ref(EntityKind::Replicant, replicant.key.id.to_string());
+        let location = replicant.location.map(|value| value.id.to_string());
+        if let Some(travel) = replicant.travel {
+            active_travel.push(OverviewTravel {
+                entity: entity.clone(),
+                from: travel.origin.map(|value| value.id.to_string()),
+                to: travel
+                    .final_destination
+                    .or(travel.destination)
+                    .map(|value| value.id.to_string()),
+                arrives_at: travel.final_arrives_at.or(travel.arrives_at),
+            });
+        }
+        replicants.push(OverviewReplicant {
+            entity,
+            name: replicant.name,
+            system: location
+                .as_ref()
+                .and_then(|value| location_systems.get(value).cloned().flatten()),
+            location,
+            status: wire_value(replicant.status.as_ref()),
+        });
+    }
+    replicants.sort_by(|left, right| left.entity.cmp(&right.entity));
+    active_travel.sort_by(|left, right| left.entity.cmp(&right.entity));
+
+    let workflow_rows = workflows
+        .iter()
+        .map(|instance| {
+            (
+                summary(instance),
+                instance.last_error.is_some() || instance.status == WorkflowStatus::Failed,
+            )
+        })
+        .collect();
+    let mut recent_activity = state
+        .repository
+        .activity_since(0)
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .rev()
+        .take(12)
+        .map(protocol_activity)
+        .collect::<Result<Vec<_>, _>>()?;
+    recent_activity.sort_by(|left, right| right.id.cmp(&left.id));
+    Ok(Json(Versioned::current(build_overview_snapshot(
+        metadata,
+        DaemonHealth {
+            status: health_status(&status),
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            detail: status_detail(&status).map(str::to_owned),
+        },
+        runtime_sync_status(&state, &status),
+        automation,
+        replicants,
+        active_travel,
+        workflow_rows,
+        operational_notifications(&workflows, &triggers, &status),
+        recent_activity,
+    ))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_overview_snapshot(
+    metadata: SnapshotMetadata,
+    health: DaemonHealth,
+    sync: RuntimeSyncStatus,
+    automation: AutomationStatus,
+    replicants: Vec<OverviewReplicant>,
+    active_travel: Vec<OverviewTravel>,
+    workflows: Vec<(WorkflowSummary, bool)>,
+    notifications: Vec<Notification>,
+    recent_activity: Vec<WorkflowActivity>,
+) -> OverviewSnapshot {
+    let statuses = [
+        ProtocolStatus::Queued,
+        ProtocolStatus::Running,
+        ProtocolStatus::Waiting,
+        ProtocolStatus::Paused,
+        ProtocolStatus::Reconciling,
+        ProtocolStatus::Succeeded,
+        ProtocolStatus::Failed,
+        ProtocolStatus::Cancelled,
+    ];
+    let workflow_counts = statuses
+        .into_iter()
+        .filter_map(|status| {
+            let count = workflows
+                .iter()
+                .filter(|(workflow, _)| workflow.status == status)
+                .count();
+            (count > 0).then_some(WorkflowStatusCount { status, count })
+        })
+        .collect();
+    let active_workflows = workflows
+        .iter()
+        .filter(|(workflow, _)| {
+            !matches!(
+                workflow.status,
+                ProtocolStatus::Succeeded | ProtocolStatus::Failed | ProtocolStatus::Cancelled
+            )
+        })
+        .map(|(workflow, _)| workflow.clone())
+        .collect();
+    let attention_workflows = workflows
+        .into_iter()
+        .filter_map(|(workflow, attention)| attention.then_some(workflow))
+        .collect();
+    OverviewSnapshot {
+        metadata,
+        health,
+        sync,
+        automation,
+        replicants,
+        active_travel,
+        active_workflows,
+        workflow_counts,
+        attention_workflows,
+        notifications,
+        recent_activity,
+    }
 }
 
 async fn entity_index(
@@ -1697,21 +1870,25 @@ async fn workflow_activity(
         .activity(id)
         .map_err(ApiError::repository)?
         .into_iter()
-        .map(|record| {
-            let (level, step, message) = present_activity(&record.message);
-            Ok(WorkflowActivity {
-                id: u64::try_from(record.id).map_err(|_| ApiError::internal())?,
-                workflow_id: ProtocolWorkflowId(record.workflow_id.to_string()),
-                occurred_at_ms: record.created_at,
-                level,
-                step,
-                message,
-            })
-        })
+        .map(protocol_activity)
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(Versioned::current(WorkflowActivityResponse {
         activity,
     })))
+}
+
+fn protocol_activity(
+    record: replicant_workflow::WorkflowActivity,
+) -> Result<WorkflowActivity, ApiError> {
+    let (level, step, message) = present_activity(&record.message);
+    Ok(WorkflowActivity {
+        id: u64::try_from(record.id).map_err(|_| ApiError::internal())?,
+        workflow_id: ProtocolWorkflowId(record.workflow_id.to_string()),
+        occurred_at_ms: record.created_at,
+        level,
+        step,
+        message,
+    })
 }
 
 fn read_workflow(repository: &WorkflowRepository, id: &str) -> Result<WorkflowInstance, ApiError> {
@@ -2238,12 +2415,71 @@ mod tests {
         serde_json::from_slice(&body).expect("JSON response")
     }
 
+    #[test]
+    fn overview_projection_groups_active_and_attention_work() {
+        let workflow = |id: &str, status| WorkflowSummary {
+            id: ProtocolWorkflowId(id.to_owned()),
+            kind: OperationKind("survey.route".to_owned()),
+            status,
+            current_step: Some("travel".to_owned()),
+            revision: 1,
+            updated_at_ms: 10,
+        };
+        let overview = build_overview_snapshot(
+            SnapshotMetadata {
+                revision: 7,
+                generated_at_ms: 10,
+            },
+            DaemonHealth {
+                status: HealthStatus::Healthy,
+                daemon_version: "test".to_owned(),
+                detail: None,
+            },
+            RuntimeSyncStatus {
+                phase: SyncPhase::Ready,
+                revision: 7,
+                last_event_at_ms: None,
+                detail: None,
+            },
+            AutomationStatus {
+                automatic_triggers_enabled: true,
+                workflows_paused: false,
+            },
+            vec![OverviewReplicant {
+                entity: summary_ref(EntityKind::Replicant, "R-1".to_owned()),
+                name: Some("Ada".to_owned()),
+                system: Some("SOL".to_owned()),
+                location: Some("EARTH".to_owned()),
+                status: Some("idle".to_owned()),
+            }],
+            Vec::new(),
+            vec![
+                (workflow("running", ProtocolStatus::Running), false),
+                (workflow("failed", ProtocolStatus::Failed), true),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(overview.replicants.len(), 1);
+        assert_eq!(overview.active_workflows.len(), 1);
+        assert_eq!(overview.attention_workflows.len(), 1);
+        assert_eq!(
+            overview
+                .workflow_counts
+                .iter()
+                .map(|item| item.count)
+                .sum::<usize>(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
         let (app, client, _) = test_app().await;
         for path in [
             "/api/health",
             "/api/snapshot",
+            "/api/overview",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
@@ -2760,9 +2996,25 @@ mod tests {
             updates.recv().await.expect("workflow update").delta,
             LiveDelta::WorkflowCreated(_)
         ));
+        for expected in [
+            DomainSlice::Entities,
+            DomainSlice::Workflows,
+            DomainSlice::Overview,
+        ] {
+            assert!(matches!(
+                updates.recv().await.expect("domain invalidation").delta,
+                LiveDelta::DomainInvalidated { slice } if slice == expected
+            ));
+        }
         assert!(matches!(
             updates.recv().await.expect("activity update").delta,
             LiveDelta::WorkflowActivity(_)
+        ));
+        assert!(matches!(
+            updates.recv().await.expect("overview invalidation").delta,
+            LiveDelta::DomainInvalidated {
+                slice: DomainSlice::Overview
+            }
         ));
         client.close().await.expect("close client");
     }

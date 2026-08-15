@@ -17,6 +17,7 @@ import {
 } from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
+import { OverviewPage } from "./OverviewPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
@@ -421,7 +422,21 @@ export function App() {
 
         <div className="workspace">
           <div className="content-column">
-            {shell.page === "Automations" ? (
+            {shell.page === "Overview" ? (
+              <OverviewPage
+                onNavigate={navigate}
+                onSelectEntity={select}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+              />
+            ) : shell.page === "Automations" ? (
               <AutomationsPage
                 entities={entities}
                 workflows={workflows}

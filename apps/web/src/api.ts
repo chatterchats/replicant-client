@@ -7,6 +7,7 @@ import {
   parseSystemSceneResponse,
   parseHealthResponse,
   parseOperationResponse,
+  parseOverviewResponse,
   parseSnapshotResponse,
   parseTriggerListResponse,
   parseTriggerResponse,
@@ -79,6 +80,9 @@ export const daemonApi = {
   },
   async snapshot(signal?: AbortSignal) {
     return parseSnapshotResponse(await get("/api/snapshot", signal)).payload;
+  },
+  async overview(signal?: AbortSignal) {
+    return parseOverviewResponse(await get("/api/overview", signal)).payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;
