@@ -1288,14 +1288,18 @@ h1 {
   margin: 24px 0 14px;
 }
 
-.device-filters label {
+.device-filters label,
+.system-filter-field {
   display: grid;
   gap: 5px;
   min-width: 120px;
 }
 
-.system-filter {
+.system-filter-field {
   min-width: 180px;
+}
+
+.system-filter {
   position: relative;
 }
 
@@ -1304,9 +1308,7 @@ h1 {
   border-radius: 5px;
   background: #1a302c;
   cursor: pointer;
-  display: grid;
-  gap: 3px;
-  min-height: 50px;
+  min-height: 34px;
   padding: 6px 28px 6px 9px;
   position: relative;
 }
@@ -1315,14 +1317,13 @@ h1 {
   content: "⌄";
   position: absolute;
   right: 10px;
-  top: 16px;
+  top: 7px;
 }
 
 .system-filter summary::marker {
   content: "";
 }
 
-.system-filter summary span,
 .system-filter small {
   color: #9fb6b2;
   font-size: 0.72rem;
@@ -1362,6 +1363,7 @@ h1 {
 }
 
 .device-filters label > span,
+.system-filter-field > span,
 .table-summary {
   color: #9fb6b2;
   font-size: 0.72rem;

@@ -341,39 +341,39 @@ function SystemFilter({
 }) {
   const options = systemOptions(devices);
   return (
-    <details className="system-filter">
-      <summary>
-        <span>System</span>
-        <strong>{value || "All systems"}</strong>
-      </summary>
-      <div>
-        <button
-          className={!value ? "selected" : ""}
-          onClick={(event) => {
-            onChange("");
-            event.currentTarget.closest("details")?.removeAttribute("open");
-          }}
-        >
-          <strong>All systems</strong>
-          <small>{devices.length} devices</small>
-        </button>
-        {options.map((option) => (
+    <div className="system-filter-field">
+      <span>System</span>
+      <details className="system-filter">
+        <summary>{value || "All systems"}</summary>
+        <div>
           <button
-            className={value === option.system ? "selected" : ""}
-            key={option.system}
+            className={!value ? "selected" : ""}
             onClick={(event) => {
-              onChange(option.system);
+              onChange("");
               event.currentTarget.closest("details")?.removeAttribute("open");
             }}
           >
-            <strong>{option.system}</strong>
-            <small>
-              {option.count} {option.count === 1 ? "device" : "devices"}
-            </small>
+            <strong>All systems</strong>
+            <small>{devices.length} devices</small>
           </button>
-        ))}
-      </div>
-    </details>
+          {options.map((option) => (
+            <button
+              className={value === option.system ? "selected" : ""}
+              key={option.system}
+              onClick={(event) => {
+                onChange(option.system);
+                event.currentTarget.closest("details")?.removeAttribute("open");
+              }}
+            >
+              <strong>{option.system}</strong>
+              <small>
+                {option.count} {option.count === 1 ? "device" : "devices"}
+              </small>
+            </button>
+          ))}
+        </div>
+      </details>
+    </div>
   );
 }
 
