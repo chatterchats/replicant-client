@@ -132,7 +132,7 @@ export interface DeviceFilters {
 export interface DeviceTreeRow {
   device: DeviceSummary;
   depth: number;
-  relationship: "attached" | "stowed" | null;
+  relationship: "attached" | "controlled" | "stowed" | null;
 }
 
 export interface DeviceGroup {
@@ -235,33 +235,47 @@ export function filterAndSortDevices(
     .sort((left, right) => {
       const a = deviceValue(left, sort);
       const b = deviceValue(right, sort);
-      const order =
+      let order =
         typeof a === "number" && typeof b === "number"
           ? a - b
           : String(a).localeCompare(String(b), undefined, { numeric: true });
+      if (order === 0 && sort === "type")
+        order = (left.system ?? "").localeCompare(right.system ?? "");
+      if (order === 0)
+        order = left.entity.id.localeCompare(right.entity.id, undefined, {
+          numeric: true,
+        });
       return descending ? -order : order;
     });
 }
 
-function physicalParent(
+function deviceParent(
   device: DeviceSummary,
   devices: Map<string, DeviceSummary>,
+  controlledBy: Map<string, string>,
 ) {
   if (device.stowed_in && devices.has(device.stowed_in))
     return { code: device.stowed_in, relationship: "stowed" as const };
   if (device.attached_to && devices.has(device.attached_to))
     return { code: device.attached_to, relationship: "attached" as const };
+  const controller = device.controller ?? controlledBy.get(device.entity.id);
+  if (controller && devices.has(controller))
+    return { code: controller, relationship: "controlled" as const };
   return null;
 }
 
 export function groupDevices(devices: DeviceSummary[]): DeviceGroup[] {
   const byCode = new Map(devices.map((device) => [device.entity.id, device]));
+  const controlledBy = new Map<string, string>();
+  for (const device of devices)
+    for (const child of device.controlled_devices)
+      controlledBy.set(child, device.entity.id);
   const order = new Map(
     devices.map((device, index) => [device.entity.id, index]),
   );
   const children = new Map<string, DeviceSummary[]>();
   for (const device of devices) {
-    const parent = physicalParent(device, byCode);
+    const parent = deviceParent(device, byCode, controlledBy);
     if (parent)
       children.set(parent.code, [...(children.get(parent.code) ?? []), device]);
   }
@@ -285,13 +299,13 @@ export function groupDevices(devices: DeviceSummary[]): DeviceGroup[] {
       { device, depth, relationship },
     ]);
     for (const child of children.get(device.entity.id) ?? []) {
-      const parent = physicalParent(child, byCode);
+      const parent = deviceParent(child, byCode, controlledBy);
       append(child, category, depth + 1, parent?.relationship ?? null);
     }
   };
 
   for (const device of devices) {
-    if (!physicalParent(device, byCode))
+    if (!deviceParent(device, byCode, controlledBy))
       append(device, deviceCategory(device.device_type), 0, null);
   }
   for (const device of devices)
@@ -431,7 +445,7 @@ export function DevicesContent({
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
   const [filters, setFilters] = useState(emptyFilters);
-  const [sort, setSort] = useState<DeviceSortKey>("code");
+  const [sort, setSort] = useState<DeviceSortKey>("type");
   const [descending, setDescending] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<DeviceCategory>>(
     () => new Set(["ftl_comms"]),

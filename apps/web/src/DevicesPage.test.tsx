@@ -95,14 +95,33 @@ describe("device fleet browser", () => {
     ]);
   });
 
-  it("groups known types and nests physically hosted devices after parents", () => {
-    const vessel = device("VESSEL", { device_type: "heaven_vessel" });
+  it("sorts by type and system while nesting hosted and controlled devices", () => {
+    const vessel = device("VESSEL", {
+      device_type: "heaven_vessel",
+      controlled_devices: ["DRONE"],
+    });
     const relay = device("RELAY", {
       device_type: "ftl_relay",
       stowed_in: "VESSEL",
     });
-    const mining = device("MINER", { device_type: "mining_drone" });
-    const groups = groupDevices([vessel, relay, mining]);
+    const drone = device("DRONE", {
+      device_type: "survey_drone",
+      controller: "VESSEL",
+    });
+    const laterSystem = device("MINER-B", {
+      device_type: "mining_drone",
+      system: "VEGA",
+    });
+    const earlierSystem = device("MINER-A", {
+      device_type: "mining_drone",
+      system: "ALPHA",
+    });
+    const ordered = filterAndSortDevices(
+      [laterSystem, relay, drone, vessel, earlierSystem],
+      filters,
+      "type",
+    );
+    const groups = groupDevices(ordered);
 
     expect(deviceCategory("ftl_relay")).toBe("ftl_comms");
     expect(deviceCategory("future_device")).toBe("other");
@@ -118,6 +137,11 @@ describe("device fleet browser", () => {
     ).toEqual([
       ["VESSEL", 0, null],
       ["RELAY", 1, "stowed"],
+      ["DRONE", 1, "controlled"],
+    ]);
+    expect(groups.at(1)?.rows.map((row) => row.device.entity.id)).toEqual([
+      "MINER-A",
+      "MINER-B",
     ]);
   });
 
