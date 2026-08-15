@@ -192,6 +192,22 @@ describe("daemonReducer", () => {
       }),
     });
     expect(state.invalidated.devices).toBe(12);
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(13, {
+        type: "domain_invalidated",
+        data: { slice: "events" },
+      }),
+    });
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(14, {
+        type: "domain_invalidated",
+        data: { slice: "trade" },
+      }),
+    });
+    expect(state.invalidated.events).toBe(13);
+    expect(state.invalidated.trade).toBe(14);
   });
 
   it("tracks reconnect state with capped backoff", () => {

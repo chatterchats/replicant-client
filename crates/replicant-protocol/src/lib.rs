@@ -425,6 +425,176 @@ pub struct BootstrapSnapshot {
     pub missions: Vec<BootstrapMissionSummary>,
 }
 
+/// Kind of requirement contributing to a location event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventRequirementKind {
+    /// A resource quantity.
+    Resource,
+    /// A device quantity.
+    Device,
+}
+
+/// Normalized requirement and progress for one event criterion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventRequirementSummary {
+    /// Requirement category.
+    pub kind: EventRequirementKind,
+    /// Open resource or device type.
+    pub item: String,
+    /// Total quantity required.
+    pub required: i64,
+    /// Quantity confirmed by event progress.
+    pub completed: i64,
+    /// Quantity still outstanding.
+    pub remaining: i64,
+}
+
+/// One alternative method for completing an event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventCriterionSummary {
+    /// Stable criterion name supplied by the event.
+    pub name: String,
+    /// Structured requirements and current progress.
+    pub requirements: Vec<EventRequirementSummary>,
+    /// Whether all known requirements are complete.
+    pub complete: bool,
+}
+
+/// A normalized resource or device reward.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventRewardItem {
+    /// Open resource or device type.
+    pub item: String,
+    /// Reward quantity.
+    pub quantity: i64,
+}
+
+/// Structured rewards supplied by an event.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventRewardsSummary {
+    /// Resource rewards.
+    pub resources: Vec<EventRewardItem>,
+    /// Device rewards, when the upstream event model supplies them.
+    pub devices: Vec<EventRewardItem>,
+    /// Experience reward.
+    pub xp: Option<i64>,
+    /// Civilisation-point reward.
+    pub civilisation_points: Option<i64>,
+    /// Completion achievement key.
+    pub completion_achievement: Option<String>,
+}
+
+/// One discovered location event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventSummary {
+    /// Stable event designation.
+    pub designation: String,
+    /// Display title.
+    pub title: String,
+    /// Open event type.
+    pub event_type: Option<String>,
+    /// Open event category when supplied separately.
+    pub category: Option<String>,
+    /// Event tier.
+    pub tier: Option<i64>,
+    /// Containing system.
+    pub system: String,
+    /// Event location.
+    pub location: String,
+    /// Display description.
+    pub description: Option<String>,
+    /// Alternative completion criteria.
+    pub criteria: Vec<EventCriterionSummary>,
+    /// Structured event rewards.
+    pub rewards: EventRewardsSummary,
+    /// Open completion status.
+    pub status: Option<String>,
+    /// Discovery timestamp supplied by the API.
+    pub discovered_at: Option<String>,
+    /// Completion timestamp supplied by the API.
+    pub completed_at: Option<String>,
+}
+
+/// Typed discovered-event dashboard projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Discovered location events.
+    pub events: Vec<EventSummary>,
+}
+
+/// One normalized item on either side of a player trade.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeItemSummary {
+    /// Open item category inferred from the upstream exchange object.
+    pub kind: String,
+    /// Open resource, device, currency, or item key.
+    pub item: String,
+    /// Quantity when modeled numerically.
+    pub quantity: Option<f64>,
+}
+
+/// One current trade offered by a controller.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeSummary {
+    /// Stable trade code.
+    pub trade_code: String,
+    /// Public trade name.
+    pub name: Option<String>,
+    /// Remaining stock.
+    pub current_stock: Option<i64>,
+    /// Initial stock.
+    pub initial_stock: Option<i64>,
+    /// Items required from the buyer.
+    pub requested: Vec<TradeItemSummary>,
+    /// Items returned to the buyer.
+    pub offered: Vec<TradeItemSummary>,
+    /// Server creation timestamp when supplied.
+    pub created_at: Option<String>,
+}
+
+/// One visible player trade controller and its current trades.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeControllerSummary {
+    /// Controller device address.
+    pub entity: EntityRef,
+    /// Public shop name.
+    pub shop_name: Option<String>,
+    /// Public description.
+    pub description: Option<String>,
+    /// Whether the shop is local to the viewing replicant.
+    pub is_local: bool,
+    /// Public owner name.
+    pub owner_name: Option<String>,
+    /// Public owner replicant code.
+    pub owner_replicant: Option<String>,
+    /// Public system.
+    pub system: Option<String>,
+    /// Public location.
+    pub location: Option<String>,
+    /// Total stock reported by the directory.
+    pub total_stock: Option<i64>,
+    /// Number of trades reported by the directory.
+    pub trade_count: Option<i64>,
+    /// Current normalized trades.
+    pub trades: Vec<TradeSummary>,
+    /// Active workflow claiming this controller, when present.
+    pub workflow: Option<WorkflowSummary>,
+}
+
+/// Typed managed trading dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TradeSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Replicant whose visible trade directory was used.
+    pub viewer: Option<EntityRef>,
+    /// Visible trade controllers and their current trades.
+    pub controllers: Vec<TradeControllerSummary>,
+}
+
 /// One active or queued Autofactory print job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FactoryJobSummary {
@@ -1916,6 +2086,82 @@ mod tests {
                 warnings: Vec::new(),
                 completed: false,
                 updated_at_ms: 10,
+            }],
+        }));
+        round_trip(&Versioned::current(EventsSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            events: vec![EventSummary {
+                designation: "EVT-1".to_owned(),
+                title: "First contact".to_owned(),
+                event_type: Some("unknown_future_type".to_owned()),
+                category: Some("unknown_future_category".to_owned()),
+                tier: Some(2),
+                system: "SOL".to_owned(),
+                location: "SOL-1".to_owned(),
+                description: None,
+                criteria: vec![EventCriterionSummary {
+                    name: "supply".to_owned(),
+                    requirements: vec![EventRequirementSummary {
+                        kind: EventRequirementKind::Resource,
+                        item: "iron".to_owned(),
+                        required: 10,
+                        completed: 4,
+                        remaining: 6,
+                    }],
+                    complete: false,
+                }],
+                rewards: EventRewardsSummary {
+                    resources: vec![EventRewardItem {
+                        item: "water".to_owned(),
+                        quantity: 2,
+                    }],
+                    ..EventRewardsSummary::default()
+                },
+                status: Some("active".to_owned()),
+                discovered_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                completed_at: None,
+            }],
+        }));
+        round_trip(&Versioned::current(TradeSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            viewer: Some(EntityRef {
+                kind: EntityKind::Replicant,
+                id: EntityId("R-1".to_owned()),
+            }),
+            controllers: vec![TradeControllerSummary {
+                entity: EntityRef {
+                    kind: EntityKind::Device,
+                    id: EntityId("TC-1".to_owned()),
+                },
+                shop_name: Some("Exchange".to_owned()),
+                description: None,
+                is_local: true,
+                owner_name: None,
+                owner_replicant: None,
+                system: Some("SOL".to_owned()),
+                location: Some("SOL-1".to_owned()),
+                total_stock: Some(1),
+                trade_count: Some(1),
+                trades: vec![TradeSummary {
+                    trade_code: "TRD-1".to_owned(),
+                    name: None,
+                    current_stock: Some(1),
+                    initial_stock: None,
+                    requested: Vec::new(),
+                    offered: vec![TradeItemSummary {
+                        kind: "resource".to_owned(),
+                        item: "iron".to_owned(),
+                        quantity: Some(2.0),
+                    }],
+                    created_at: None,
+                }],
+                workflow: None,
             }],
         }));
         round_trip(&Versioned::current(AutofactorySnapshot {

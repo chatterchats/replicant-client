@@ -3231,6 +3231,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "replicant-client",
+ "replicant-event-planner",
  "replicant-protocol",
  "replicant-runtime",
  "replicant-workflow",

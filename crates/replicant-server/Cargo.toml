@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 replicant-client = { version = "1.0.0", path = "../.." }
+replicant-event-planner = { version = "0.1.0", path = "../replicant-event-planner" }
 replicant-protocol = { version = "0.1.0", path = "../replicant-protocol" }
 replicant-runtime = { version = "0.1.0", path = "../replicant-runtime" }
 replicant-workflow = { version = "0.1.0", path = "../replicant-workflow" }

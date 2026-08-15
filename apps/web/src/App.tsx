@@ -24,10 +24,12 @@ import { InventoryPage } from "./InventoryPage";
 import { MiningPage } from "./MiningPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
+import { EventsPage } from "./EventsPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { RelayPage } from "./RelayPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
+import { TradePage } from "./TradePage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -690,6 +692,43 @@ export function App() {
                 }}
                 onOpenHistory={() => {
                   navigate("History");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Events" ? (
+              <EventsPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onOpenGalaxy={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("Galaxy");
+                }}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Trade" ? (
+              <TradePage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
                 }}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);

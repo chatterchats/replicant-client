@@ -230,6 +230,91 @@ export interface BootstrapSnapshot {
   missions: BootstrapMissionSummary[];
 }
 
+export interface EventRequirementSummary {
+  kind: "resource" | "device";
+  item: string;
+  required: number;
+  completed: number;
+  remaining: number;
+}
+
+export interface EventCriterionSummary {
+  name: string;
+  requirements: EventRequirementSummary[];
+  complete: boolean;
+}
+
+export interface EventRewardItem {
+  item: string;
+  quantity: number;
+}
+
+export interface EventRewardsSummary {
+  resources: EventRewardItem[];
+  devices: EventRewardItem[];
+  xp: number | null;
+  civilisation_points: number | null;
+  completion_achievement: string | null;
+}
+
+export interface EventSummary {
+  designation: string;
+  title: string;
+  event_type: string | null;
+  category: string | null;
+  tier: number | null;
+  system: string;
+  location: string;
+  description: string | null;
+  criteria: EventCriterionSummary[];
+  rewards: EventRewardsSummary;
+  status: string | null;
+  discovered_at: string | null;
+  completed_at: string | null;
+}
+
+export interface EventsSnapshot {
+  metadata: SnapshotMetadata;
+  events: EventSummary[];
+}
+
+export interface TradeItemSummary {
+  kind: string;
+  item: string;
+  quantity: number | null;
+}
+
+export interface TradeSummary {
+  trade_code: string;
+  name: string | null;
+  current_stock: number | null;
+  initial_stock: number | null;
+  requested: TradeItemSummary[];
+  offered: TradeItemSummary[];
+  created_at: string | null;
+}
+
+export interface TradeControllerSummary {
+  entity: EntityRef;
+  shop_name: string | null;
+  description: string | null;
+  is_local: boolean;
+  owner_name: string | null;
+  owner_replicant: string | null;
+  system: string | null;
+  location: string | null;
+  total_stock: number | null;
+  trade_count: number | null;
+  trades: TradeSummary[];
+  workflow: WorkflowSummary | null;
+}
+
+export interface TradeSnapshot {
+  metadata: SnapshotMetadata;
+  viewer: EntityRef | null;
+  controllers: TradeControllerSummary[];
+}
+
 export interface FactoryJobSummary {
   device_type: string;
   quantity: number;
@@ -1537,6 +1622,180 @@ export function parseBootstrapResponse(
           updated_at_ms: number(mission.updated_at_ms, "bootstrap update time"),
         };
       }),
+    };
+  });
+}
+
+export function parseEventsResponse(value: unknown): Versioned<EventsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "events snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      events: array(snapshot.events, "events").map((value) => {
+        const event = record(value, "event");
+        if (
+          typeof event.designation !== "string" ||
+          typeof event.title !== "string" ||
+          typeof event.system !== "string" ||
+          typeof event.location !== "string"
+        )
+          throw new Error("Invalid event");
+        const rewards = record(event.rewards, "event rewards");
+        const rewardItems = (value: unknown, name: string) =>
+          array(value, name).map((value) => {
+            const item = record(value, name);
+            if (typeof item.item !== "string")
+              throw new Error(`Invalid ${name}`);
+            return {
+              item: item.item,
+              quantity: number(item.quantity, `${name} quantity`),
+            };
+          });
+        return {
+          designation: event.designation,
+          title: event.title,
+          event_type: nullableString(event.event_type, "event type"),
+          category: nullableString(event.category, "event category"),
+          tier: optionalFiniteNumber(event.tier, "event tier"),
+          system: event.system,
+          location: event.location,
+          description: nullableString(event.description, "event description"),
+          criteria: array(event.criteria, "event criteria").map((value) => {
+            const criterion = record(value, "event criterion");
+            if (
+              typeof criterion.name !== "string" ||
+              typeof criterion.complete !== "boolean"
+            )
+              throw new Error("Invalid event criterion");
+            return {
+              name: criterion.name,
+              complete: criterion.complete,
+              requirements: array(
+                criterion.requirements,
+                "event requirements",
+              ).map((value) => {
+                const requirement = record(value, "event requirement");
+                if (typeof requirement.item !== "string")
+                  throw new Error("Invalid event requirement");
+                return {
+                  kind: oneOf(
+                    requirement.kind,
+                    ["resource", "device"] as const,
+                    "event requirement kind",
+                  ),
+                  item: requirement.item,
+                  required: number(requirement.required, "event required"),
+                  completed: number(requirement.completed, "event completed"),
+                  remaining: number(requirement.remaining, "event remaining"),
+                };
+              }),
+            };
+          }),
+          rewards: {
+            resources: rewardItems(rewards.resources, "event resource reward"),
+            devices: rewardItems(rewards.devices, "event device reward"),
+            xp: optionalFiniteNumber(rewards.xp, "event XP"),
+            civilisation_points: optionalFiniteNumber(
+              rewards.civilisation_points,
+              "event civilisation points",
+            ),
+            completion_achievement: nullableString(
+              rewards.completion_achievement,
+              "event achievement",
+            ),
+          },
+          status: nullableString(event.status, "event status"),
+          discovered_at: nullableString(
+            event.discovered_at,
+            "event discovery time",
+          ),
+          completed_at: nullableString(
+            event.completed_at,
+            "event completion time",
+          ),
+        };
+      }),
+    };
+  });
+}
+
+function parseTradeItems(value: unknown, name: string): TradeItemSummary[] {
+  return array(value, name).map((value) => {
+    const item = record(value, name);
+    if (typeof item.kind !== "string" || typeof item.item !== "string")
+      throw new Error(`Invalid ${name}`);
+    return {
+      kind: item.kind,
+      item: item.item,
+      quantity: optionalFiniteNumber(item.quantity, `${name} quantity`),
+    };
+  });
+}
+
+export function parseTradeResponse(value: unknown): Versioned<TradeSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "trade snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      viewer: snapshot.viewer === null ? null : entity(snapshot.viewer),
+      controllers: array(snapshot.controllers, "trade controllers").map(
+        (value) => {
+          const controller = record(value, "trade controller");
+          if (typeof controller.is_local !== "boolean")
+            throw new Error("Invalid trade controller");
+          return {
+            entity: entity(controller.entity),
+            shop_name: nullableString(controller.shop_name, "shop name"),
+            description: nullableString(
+              controller.description,
+              "shop description",
+            ),
+            is_local: controller.is_local,
+            owner_name: nullableString(controller.owner_name, "shop owner"),
+            owner_replicant: nullableString(
+              controller.owner_replicant,
+              "shop owner replicant",
+            ),
+            system: nullableString(controller.system, "shop system"),
+            location: nullableString(controller.location, "shop location"),
+            total_stock: optionalFiniteNumber(
+              controller.total_stock,
+              "shop stock",
+            ),
+            trade_count: optionalFiniteNumber(
+              controller.trade_count,
+              "shop trade count",
+            ),
+            trades: array(controller.trades, "trades").map((value) => {
+              const trade = record(value, "trade");
+              if (typeof trade.trade_code !== "string")
+                throw new Error("Invalid trade");
+              return {
+                trade_code: trade.trade_code,
+                name: nullableString(trade.name, "trade name"),
+                current_stock: optionalFiniteNumber(
+                  trade.current_stock,
+                  "trade stock",
+                ),
+                initial_stock: optionalFiniteNumber(
+                  trade.initial_stock,
+                  "initial trade stock",
+                ),
+                requested: parseTradeItems(trade.requested, "requested item"),
+                offered: parseTradeItems(trade.offered, "offered item"),
+                created_at: nullableString(
+                  trade.created_at,
+                  "trade creation time",
+                ),
+              };
+            }),
+            workflow:
+              controller.workflow === null
+                ? null
+                : workflow(controller.workflow),
+          };
+        },
+      ),
     };
   });
 }

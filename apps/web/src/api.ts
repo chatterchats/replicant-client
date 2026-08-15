@@ -9,6 +9,7 @@ import {
   parseMiningResponse,
   parseRelayResponse,
   parseEntityIndexResponse,
+  parseEventsResponse,
   parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
   parseSystemSceneResponse,
@@ -17,6 +18,7 @@ import {
   parseOverviewResponse,
   parseSnapshotResponse,
   parseSurveyResponse,
+  parseTradeResponse,
   parseTriggerListResponse,
   parseTriggerResponse,
   parseWorkflowActivityResponse,
@@ -119,6 +121,12 @@ export const daemonApi = {
   async bootstrap(signal?: AbortSignal) {
     return parseBootstrapResponse(await get("/api/missions/bootstrap", signal))
       .payload;
+  },
+  async events(signal?: AbortSignal) {
+    return parseEventsResponse(await get("/api/events", signal)).payload;
+  },
+  async trade(signal?: AbortSignal) {
+    return parseTradeResponse(await get("/api/trade", signal)).payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;

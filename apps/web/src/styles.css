@@ -260,6 +260,14 @@ h1 {
   margin-top: 8px;
   color: #78908c;
 }
+
+.trade-controller {
+  display: block;
+}
+
+.trade-controller .page-heading {
+  margin-bottom: 12px;
+}
 .workspace {
   min-height: 0;
   display: flex;

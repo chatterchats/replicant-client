@@ -10,12 +10,14 @@ import {
   parseMiningResponse,
   parseRelayResponse,
   parseEntityIndexResponse,
+  parseEventsResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
   parseOverviewResponse,
   parseSnapshotResponse,
   parseSurveyResponse,
   parseSystemSceneResponse,
+  parseTradeResponse,
   parseTriggerListResponse,
 } from "./protocol";
 
@@ -546,5 +548,92 @@ describe("parseHealthResponse", () => {
     }).payload;
     expect(triggers[0]?.condition.kind).toBe("schedule");
     expect(triggers[0]?.next_run_at_ms).toBe(3);
+  });
+
+  it("parses structured event progress and unknown labels", () => {
+    const event = parseEventsResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 1, generated_at_ms: 2 },
+        events: [
+          {
+            designation: "EVT-1",
+            title: "Anomaly",
+            event_type: "future_type",
+            category: "future_category",
+            tier: null,
+            system: "SOL",
+            location: "SOL-1",
+            description: null,
+            criteria: [
+              {
+                name: "supply",
+                complete: false,
+                requirements: [
+                  {
+                    kind: "resource",
+                    item: "iron",
+                    required: 10,
+                    completed: 4,
+                    remaining: 6,
+                  },
+                ],
+              },
+            ],
+            rewards: {
+              resources: [],
+              devices: [],
+              xp: null,
+              civilisation_points: null,
+              completion_achievement: null,
+            },
+            status: "active",
+            discovered_at: null,
+            completed_at: null,
+          },
+        ],
+      },
+    }).payload.events[0];
+    expect(event?.event_type).toBe("future_type");
+    expect(event?.category).toBe("future_category");
+    expect(event?.criteria[0]?.requirements[0]?.remaining).toBe(6);
+  });
+
+  it("parses trades with missing optional fields", () => {
+    const trade = parseTradeResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 1, generated_at_ms: 2 },
+        viewer: null,
+        controllers: [
+          {
+            entity: { kind: "device", id: "TC-1" },
+            shop_name: null,
+            description: null,
+            is_local: false,
+            owner_name: null,
+            owner_replicant: null,
+            system: null,
+            location: null,
+            total_stock: null,
+            trade_count: null,
+            trades: [
+              {
+                trade_code: "TRD-1",
+                name: null,
+                current_stock: null,
+                initial_stock: null,
+                requested: [],
+                offered: [],
+                created_at: null,
+              },
+            ],
+            workflow: null,
+          },
+        ],
+      },
+    }).payload.controllers[0];
+    expect(trade?.shop_name).toBeNull();
+    expect(trade?.trades[0]?.current_stock).toBeNull();
   });
 });

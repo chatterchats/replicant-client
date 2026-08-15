@@ -772,7 +772,21 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     Ok(())
 }
 
+/// Returns every location event discovered by the account.
+pub async fn discovered_events(
+    client: &Client,
+) -> crate::ReportResult<Vec<raw::events::LocationEvent>> {
+    fetch_events(client, None).await
+}
+
 async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::LocationEvent>> {
+    fetch_events(client, Some("active")).await
+}
+
+async fn fetch_events(
+    client: &Client,
+    status: Option<&str>,
+) -> crate::ReportResult<Vec<raw::events::LocationEvent>> {
     let mut cursor = None;
     let mut events = Vec::new();
     for _ in 0..100 {
@@ -780,7 +794,7 @@ async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::Loca
             .raw()
             .accounts()
             .events(&raw::accounts::AccountEventsQuery {
-                status: Some("active".into()),
+                status: status.map(str::to_owned),
                 cursor,
                 limit: Some(100),
             })
@@ -798,10 +812,11 @@ async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::Loca
         };
         cursor = Some(next);
     }
-    Err(app_error(
+    Err(io::Error::new(
         io::ErrorKind::InvalidData,
         "event listing exceeded the 100-page safety bound",
-    ))
+    )
+    .into())
 }
 
 async fn fetch_active_events_in_scope(
@@ -943,15 +958,18 @@ async fn fetch_earned_achievements(client: &Client) -> AnyResult<BTreeSet<String
         .collect())
 }
 
-fn normalize_event(raw_event: &raw::events::LocationEvent) -> AnyResult<EventDefinition> {
+/// Normalizes one open-shaped location-event payload for application projections.
+pub fn normalize_event(
+    raw_event: &raw::events::LocationEvent,
+) -> crate::ReportResult<EventDefinition> {
     let designation = raw_event.designation.clone().ok_or_else(|| {
-        app_error(
+        io::Error::new(
             io::ErrorKind::InvalidData,
             "location event omitted designation",
         )
     })?;
     let location = raw_event.location.clone().ok_or_else(|| {
-        app_error(
+        io::Error::new(
             io::ErrorKind::InvalidData,
             "location event omitted location",
         )

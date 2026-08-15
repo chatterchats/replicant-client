@@ -27,7 +27,9 @@ use replicant_client::{
     ClientDegradation, ClientStatus,
     domain::{Device, Inventory, InventoryOwner},
     managed::{Client, OperationStatus as ManagedOperationStatus},
+    raw::events::LocationEvent,
 };
+use replicant_event_planner::remaining_requirements;
 use replicant_protocol::{
     ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
     AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
@@ -35,8 +37,9 @@ use replicant_protocol::{
     BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary,
     CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim,
     DeviceSummary, DevicesSnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind,
-    EntityRef, EntitySummary, ErrorResponse, FactoryJobSummary,
-    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
+    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
+    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
     InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, MiningInstallationStatus,
@@ -45,7 +48,8 @@ use replicant_protocol::{
     OverviewTravel, RelayExpansionSummary, RelaySnapshot, RequirementSummary, ResultSummary,
     RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
     SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary,
-    SurveySnapshot, SyncPhase, SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
+    SurveySnapshot, SyncPhase, SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary,
+    TradeSnapshot, TradeSummary, TriggerCondition as ProtocolTriggerCondition,
     TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
     UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
     WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
@@ -56,10 +60,12 @@ use replicant_runtime::{
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
     config::RuntimeConfig,
+    event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
+    trade::{ShopTrade, TraderSummary, shop_trades, trade_viewers, trader_directory},
     workflows::{
         RelayWorkflowCheckpoint, RelayWorkflowConfig, RequirementWorkflowCheckpoint,
         RequirementWorkflowConfig, SurveyWorkflowCheckpoint, SurveyWorkflowConfig,
@@ -219,6 +225,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/missions/mining", get(mining_missions))
         .route("/api/missions/relay", get(relay_missions))
         .route("/api/missions/bootstrap", get(bootstrap_missions))
+        .route("/api/events", get(events))
+        .route("/api/trade", get(trade))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -1462,6 +1470,234 @@ async fn bootstrap_missions(
         metadata,
         missions,
     })))
+}
+
+async fn events(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<EventsSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let events = discovered_events(state.client())
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(events_snapshot(metadata, events)?)))
+}
+
+fn events_snapshot(
+    metadata: SnapshotMetadata,
+    events: Vec<LocationEvent>,
+) -> Result<EventsSnapshot, ApiError> {
+    let mut events = events
+        .into_iter()
+        .map(|event| event_summary(&event))
+        .collect::<Result<Vec<_>, _>>()?;
+    events.sort_by(|left, right| {
+        left.status
+            .cmp(&right.status)
+            .then_with(|| left.system.cmp(&right.system))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.designation.cmp(&right.designation))
+    });
+    Ok(EventsSnapshot { metadata, events })
+}
+
+fn event_summary(raw: &LocationEvent) -> Result<EventSummary, ApiError> {
+    let event = normalize_event(raw).map_err(|_| ApiError::unavailable())?;
+    let criteria = event
+        .criteria
+        .iter()
+        .map(|criterion| {
+            let remaining = remaining_requirements(&event, &criterion.name, &BTreeMap::new(), &[])
+                .map_err(|_| ApiError::unavailable())?;
+            let remaining_devices = remaining
+                .devices
+                .iter()
+                .map(|item| (item.device_type.as_str(), item.count))
+                .collect::<BTreeMap<_, _>>();
+            let mut requirements = criterion
+                .resources
+                .iter()
+                .map(|(item, required)| {
+                    let outstanding = *remaining.resources.get(item).unwrap_or(&0);
+                    EventRequirementSummary {
+                        kind: EventRequirementKind::Resource,
+                        item: item.clone(),
+                        required: *required,
+                        completed: required.saturating_sub(outstanding),
+                        remaining: outstanding,
+                    }
+                })
+                .collect::<Vec<_>>();
+            requirements.extend(criterion.devices.iter().map(|item| {
+                let outstanding = *remaining_devices
+                    .get(item.device_type.as_str())
+                    .unwrap_or(&0);
+                EventRequirementSummary {
+                    kind: EventRequirementKind::Device,
+                    item: item.device_type.clone(),
+                    required: item.count,
+                    completed: item.count.saturating_sub(outstanding),
+                    remaining: outstanding,
+                }
+            }));
+            Ok(EventCriterionSummary {
+                complete: !requirements.is_empty()
+                    && requirements.iter().all(|item| item.remaining == 0),
+                name: criterion.name.clone(),
+                requirements,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let category = raw
+        .extra
+        .get("category")
+        .or_else(|| raw.extra.get("event_category"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(EventSummary {
+        designation: event.designation,
+        title: event.title,
+        event_type: event.event_type,
+        category,
+        tier: event.tier,
+        system: event
+            .location
+            .split('-')
+            .next()
+            .unwrap_or(&event.location)
+            .to_ascii_uppercase(),
+        location: event.location,
+        description: event.description,
+        criteria,
+        rewards: EventRewardsSummary {
+            resources: event
+                .rewards
+                .resources
+                .into_iter()
+                .map(|(item, quantity)| EventRewardItem { item, quantity })
+                .collect(),
+            devices: Vec::new(),
+            xp: event.rewards.xp,
+            civilisation_points: event.rewards.civilisation_points,
+            completion_achievement: event.rewards.completion_achievement,
+        },
+        status: event.status,
+        discovered_at: raw.discovered_at.clone(),
+        completed_at: raw.completed_at.clone(),
+    })
+}
+
+async fn trade(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<TradeSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let Some(viewer) = trade_viewers(state.client())
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .into_iter()
+        .next()
+    else {
+        return Ok(Json(Versioned::current(TradeSnapshot {
+            metadata,
+            viewer: None,
+            controllers: Vec::new(),
+        })));
+    };
+    let viewer_code = viewer.key.id.as_str().to_owned();
+    let traders = trader_directory(state.client(), &viewer_code)
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let devices = device_rows(&state).await?;
+    let workflows = state
+        .repository
+        .list()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .map(|workflow| (workflow.id.to_string(), summary(&workflow)))
+        .collect::<BTreeMap<_, _>>();
+    let mut controllers = Vec::with_capacity(traders.len());
+    for trader in traders {
+        let trades = shop_trades(state.client(), &trader.controller_code)
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        let workflow = devices
+            .iter()
+            .find(|device| device.entity.id.0 == trader.controller_code)
+            .and_then(|device| device.claim.as_ref())
+            .and_then(|claim| workflows.get(&claim.workflow_id.0))
+            .cloned();
+        controllers.push(trade_controller_summary(trader, trades, workflow));
+    }
+    Ok(Json(Versioned::current(TradeSnapshot {
+        metadata,
+        viewer: Some(summary_ref(EntityKind::Replicant, viewer_code)),
+        controllers,
+    })))
+}
+
+fn trade_controller_summary(
+    trader: TraderSummary,
+    trades: Vec<ShopTrade>,
+    workflow: Option<WorkflowSummary>,
+) -> TradeControllerSummary {
+    TradeControllerSummary {
+        entity: summary_ref(EntityKind::Device, trader.controller_code),
+        shop_name: trader.shop_name,
+        description: trader.description,
+        is_local: trader.is_local,
+        owner_name: trader.owner_name,
+        owner_replicant: trader.owner_replicant_code,
+        system: trader.star,
+        location: trader.location,
+        total_stock: trader.total_stock,
+        trade_count: trader.trade_count,
+        trades: trades
+            .into_iter()
+            .filter(|trade| !trade.trade_code.is_empty())
+            .map(|trade| TradeSummary {
+                trade_code: trade.trade_code,
+                name: trade.name,
+                current_stock: trade.current_stock,
+                initial_stock: trade.initial_stock,
+                requested: trade_items(trade.criteria.as_ref()),
+                offered: trade_items(trade.rewards.as_ref()),
+                created_at: trade.created_at,
+            })
+            .collect(),
+        workflow,
+    }
+}
+
+fn trade_items(value: Option<&Value>) -> Vec<TradeItemSummary> {
+    let Some(Value::Object(items)) = value else {
+        return Vec::new();
+    };
+    let mut normalized = Vec::new();
+    for (kind_or_item, value) in items {
+        if let Value::Object(nested) = value {
+            normalized.extend(nested.iter().filter_map(|(item, quantity)| {
+                quantity.as_f64().map(|quantity| TradeItemSummary {
+                    kind: kind_or_item
+                        .strip_suffix('s')
+                        .unwrap_or(kind_or_item)
+                        .to_owned(),
+                    item: item.clone(),
+                    quantity: Some(quantity),
+                })
+            }));
+        } else if let Some(quantity) = value.as_f64() {
+            normalized.push(TradeItemSummary {
+                kind: "item".to_owned(),
+                item: kind_or_item.clone(),
+                quantity: Some(quantity),
+            });
+        }
+    }
+    normalized.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.item.cmp(&right.item))
+    });
+    normalized
 }
 
 fn bootstrap_mission_summaries(
@@ -3336,6 +3572,92 @@ mod tests {
             travel_destination: None,
             claim: None,
         }
+    }
+
+    #[test]
+    fn event_projection_normalizes_progress_and_keeps_unknown_labels() {
+        let event = serde_json::from_value::<LocationEvent>(serde_json::json!({
+            "designation": "SOL-1-EVT-1",
+            "location": "SOL-1",
+            "title": "Anomaly",
+            "event_type": "future_type",
+            "category": "future_category",
+            "status": "active",
+            "criteria": [{
+                "name": "supply",
+                "resources": {"iron": 10},
+                "devices": [{"device_type": "probe", "count": 2}]
+            }],
+            "progress": {
+                "resources": {"iron": 4},
+                "devices": {"probe": 1}
+            },
+            "rewards": {"resources": {"water": 3}, "xp": 5}
+        }))
+        .expect("event fixture");
+        let snapshot = events_snapshot(
+            SnapshotMetadata {
+                revision: 1,
+                generated_at_ms: 2,
+            },
+            vec![event],
+        )
+        .unwrap_or_else(|_| panic!("event projection"));
+        let event = &snapshot.events[0];
+        assert_eq!(event.event_type.as_deref(), Some("future_type"));
+        assert_eq!(event.category.as_deref(), Some("future_category"));
+        assert_eq!(event.system, "SOL");
+        assert_eq!(
+            event.criteria[0]
+                .requirements
+                .iter()
+                .map(|item| (item.item.as_str(), item.completed, item.remaining))
+                .collect::<Vec<_>>(),
+            vec![("iron", 4, 6), ("probe", 1, 1)]
+        );
+        assert_eq!(event.rewards.resources[0].item, "water");
+    }
+
+    #[test]
+    fn trade_projection_normalizes_nested_items_with_missing_optional_fields() {
+        let controller = trade_controller_summary(
+            TraderSummary {
+                controller_code: "TC-1".to_owned(),
+                ..TraderSummary::default()
+            },
+            vec![ShopTrade {
+                trade_code: "TRD-1".to_owned(),
+                criteria: Some(serde_json::json!({"resources": {"iron": 4}})),
+                rewards: Some(serde_json::json!({"devices": {"probe": 1}})),
+                ..ShopTrade::default()
+            }],
+            None,
+        );
+        assert_eq!(controller.entity.id.0, "TC-1");
+        assert_eq!(controller.shop_name, None);
+        assert_eq!(controller.trades[0].current_stock, None);
+        assert_eq!(controller.trades[0].requested[0].kind, "resource");
+        assert_eq!(controller.trades[0].requested[0].quantity, Some(4.0));
+        assert_eq!(controller.trades[0].offered[0].kind, "device");
+    }
+
+    #[tokio::test]
+    async fn trade_route_returns_an_empty_typed_snapshot_without_replicants() {
+        let (app, client, _) = test_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/trade")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = serde_json::from_value::<Versioned<TradeSnapshot>>(json(response).await)
+            .expect("typed trade response");
+        assert!(response.payload.controllers.is_empty());
+        client.close().await.expect("close client");
     }
 
     #[test]
