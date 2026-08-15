@@ -261,6 +261,83 @@ pub struct DevicesSnapshot {
     pub devices: Vec<DeviceSummary>,
 }
 
+/// Managed inventory ownership scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryOwnerKind {
+    /// Account-wide inventory.
+    Account,
+    /// Inventory carried by a replicant.
+    Replicant,
+    /// Inventory stored at a location.
+    Location,
+}
+
+/// One resource quantity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryQuantity {
+    /// Stable managed resource wire value.
+    pub resource: String,
+    /// Positive quantity available.
+    pub quantity: i64,
+}
+
+/// Inventory grouped by its managed owner and physical location.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryLocationSummary {
+    /// Managed ownership scope.
+    pub owner_kind: InventoryOwnerKind,
+    /// Managed owner identifier.
+    pub owner: String,
+    /// Containing system, when known.
+    pub system: Option<String>,
+    /// Physical location, when known.
+    pub location: Option<String>,
+    /// Total positive quantity at this scope.
+    pub total_quantity: i64,
+    /// Stable resource rows sorted by resource name.
+    pub resources: Vec<InventoryQuantity>,
+}
+
+/// One resource's quantity at an inventory scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryDistribution {
+    /// Managed ownership scope.
+    pub owner_kind: InventoryOwnerKind,
+    /// Managed owner identifier.
+    pub owner: String,
+    /// Containing system, when known.
+    pub system: Option<String>,
+    /// Physical location, when known.
+    pub location: Option<String>,
+    /// Positive quantity at this scope.
+    pub quantity: i64,
+}
+
+/// One resource aggregated across all managed inventory scopes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventoryResourceSummary {
+    /// Stable managed resource wire value.
+    pub resource: String,
+    /// Account-wide total quantity.
+    pub total_quantity: i64,
+    /// Stable distribution rows sorted by location and owner.
+    pub distribution: Vec<InventoryDistribution>,
+}
+
+/// Typed managed inventory projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InventorySnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Account-wide quantity across positive resource stacks.
+    pub total_quantity: i64,
+    /// Inventory scopes sorted by system, location, and owner.
+    pub locations: Vec<InventoryLocationSummary>,
+    /// Resources sorted by stable wire value.
+    pub resources: Vec<InventoryResourceSummary>,
+}
+
 /// Three-dimensional galactic coordinates in light-years.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GalaxyPoint {
@@ -1480,6 +1557,35 @@ mod tests {
                 directive_status: None,
                 travel_destination: None,
                 claim: None,
+            }],
+        }));
+        round_trip(&Versioned::current(InventorySnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1_765_000_000_000,
+            },
+            total_quantity: 12,
+            locations: vec![InventoryLocationSummary {
+                owner_kind: InventoryOwnerKind::Location,
+                owner: "EARTH".to_owned(),
+                system: Some("SOL".to_owned()),
+                location: Some("EARTH".to_owned()),
+                total_quantity: 12,
+                resources: vec![InventoryQuantity {
+                    resource: "silicates".to_owned(),
+                    quantity: 12,
+                }],
+            }],
+            resources: vec![InventoryResourceSummary {
+                resource: "silicates".to_owned(),
+                total_quantity: 12,
+                distribution: vec![InventoryDistribution {
+                    owner_kind: InventoryOwnerKind::Location,
+                    owner: "EARTH".to_owned(),
+                    system: Some("SOL".to_owned()),
+                    location: Some("EARTH".to_owned()),
+                    quantity: 12,
+                }],
             }],
         }));
         round_trip(&Versioned::current(OverviewSnapshot {

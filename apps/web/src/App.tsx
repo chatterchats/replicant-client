@@ -17,6 +17,7 @@ import {
 } from "./CommandPalette";
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
+import { InventoryPage } from "./InventoryPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
 import { RequirementsPage } from "./RequirementsPage";
@@ -564,6 +565,15 @@ export function App() {
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Inventory" ? (
+              <InventoryPage
+                onSelectEntity={select}
+                onOpenSystem={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("System");
                 }}
               />
             ) : shell.page === "Automations" ? (

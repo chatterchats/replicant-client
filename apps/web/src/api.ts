@@ -2,6 +2,7 @@ import {
   parseAutomationControlResponse,
   parseDescriptorsResponse,
   parseDevicesResponse,
+  parseInventoryResponse,
   parseEntityIndexResponse,
   parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
@@ -87,6 +88,9 @@ export const daemonApi = {
   },
   async devices(signal?: AbortSignal) {
     return parseDevicesResponse(await get("/api/devices", signal)).payload;
+  },
+  async inventory(signal?: AbortSignal) {
+    return parseInventoryResponse(await get("/api/inventory", signal)).payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;

@@ -147,6 +147,43 @@ export interface DevicesSnapshot {
   devices: DeviceSummary[];
 }
 
+export type InventoryOwnerKind = "account" | "replicant" | "location";
+
+export interface InventoryQuantity {
+  resource: string;
+  quantity: number;
+}
+
+export interface InventoryLocationSummary {
+  owner_kind: InventoryOwnerKind;
+  owner: string;
+  system: string | null;
+  location: string | null;
+  total_quantity: number;
+  resources: InventoryQuantity[];
+}
+
+export interface InventoryDistribution {
+  owner_kind: InventoryOwnerKind;
+  owner: string;
+  system: string | null;
+  location: string | null;
+  quantity: number;
+}
+
+export interface InventoryResourceSummary {
+  resource: string;
+  total_quantity: number;
+  distribution: InventoryDistribution[];
+}
+
+export interface InventorySnapshot {
+  metadata: SnapshotMetadata;
+  total_quantity: number;
+  locations: InventoryLocationSummary[];
+  resources: InventoryResourceSummary[];
+}
+
 export interface WorkflowSummary {
   id: string;
   kind: string;
@@ -581,6 +618,7 @@ const domainSlices = [
   "workflows",
   "operations",
 ] as const;
+const inventoryOwnerKinds = ["account", "replicant", "location"] as const;
 
 function health(value: unknown): DaemonHealth {
   const item = record(value, "daemon health");
@@ -1174,6 +1212,75 @@ export function parseDevicesResponse(
           claim,
         };
       }),
+    };
+  });
+}
+
+export function parseInventoryResponse(
+  value: unknown,
+): Versioned<InventorySnapshot> {
+  const owner = (value: unknown, name: string) => {
+    const item = record(value, name);
+    if (typeof item.owner !== "string") throw new Error(`Invalid ${name}`);
+    return {
+      owner_kind: oneOf(
+        item.owner_kind,
+        inventoryOwnerKinds,
+        "inventory owner",
+      ),
+      owner: item.owner,
+      system: nullableString(item.system, "inventory system"),
+      location: nullableString(item.location, "inventory location"),
+    };
+  };
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "inventory snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      total_quantity: number(snapshot.total_quantity, "inventory total"),
+      locations: array(snapshot.locations, "inventory locations").map(
+        (value) => {
+          const item = record(value, "inventory location");
+          return {
+            ...owner(item, "inventory location"),
+            total_quantity: number(item.total_quantity, "location total"),
+            resources: array(item.resources, "location resources").map(
+              (value) => {
+                const resource = record(value, "inventory quantity");
+                if (typeof resource.resource !== "string")
+                  throw new Error("Invalid inventory resource");
+                return {
+                  resource: resource.resource,
+                  quantity: number(resource.quantity, "resource quantity"),
+                };
+              },
+            ),
+          };
+        },
+      ),
+      resources: array(snapshot.resources, "inventory resources").map(
+        (value) => {
+          const item = record(value, "inventory resource");
+          if (typeof item.resource !== "string")
+            throw new Error("Invalid inventory resource");
+          return {
+            resource: item.resource,
+            total_quantity: number(item.total_quantity, "resource total"),
+            distribution: array(item.distribution, "resource distribution").map(
+              (value) => {
+                const distribution = record(value, "inventory distribution");
+                return {
+                  ...owner(distribution, "inventory distribution"),
+                  quantity: number(
+                    distribution.quantity,
+                    "distribution quantity",
+                  ),
+                };
+              },
+            ),
+          };
+        },
+      ),
     };
   });
 }

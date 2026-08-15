@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseHealthResponse,
   parseDevicesResponse,
+  parseInventoryResponse,
   parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
@@ -53,6 +54,59 @@ describe("parseDevicesResponse", () => {
       owner_name: null,
       claim: null,
     });
+  });
+});
+
+describe("parseInventoryResponse", () => {
+  it("parses typed location and resource aggregates", () => {
+    const parsed = parseInventoryResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 7, generated_at_ms: 10 },
+        total_quantity: 12,
+        locations: [
+          {
+            owner_kind: "location",
+            owner: "EARTH",
+            system: "SOL",
+            location: "EARTH",
+            total_quantity: 12,
+            resources: [{ resource: "silicates", quantity: 12 }],
+          },
+        ],
+        resources: [
+          {
+            resource: "silicates",
+            total_quantity: 12,
+            distribution: [
+              {
+                owner_kind: "location",
+                owner: "EARTH",
+                system: "SOL",
+                location: "EARTH",
+                quantity: 12,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(parsed.payload.resources[0]?.total_quantity).toBe(12);
+    expect(parsed.payload.locations[0]?.owner_kind).toBe("location");
+  });
+
+  it("rejects untyped quantities", () => {
+    expect(() =>
+      parseInventoryResponse({
+        protocol_version: 1,
+        payload: {
+          metadata: { revision: 1, generated_at_ms: 1 },
+          total_quantity: "12",
+          locations: [],
+          resources: [],
+        },
+      }),
+    ).toThrow("Invalid inventory total");
   });
 });
 

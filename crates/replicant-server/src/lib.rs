@@ -25,7 +25,7 @@ use axum::{
 };
 use replicant_client::{
     ClientDegradation, ClientStatus,
-    domain::Device,
+    domain::{Device, Inventory, InventoryOwner},
     managed::{Client, OperationStatus as ManagedOperationStatus},
 };
 use replicant_protocol::{
@@ -35,15 +35,17 @@ use replicant_protocol::{
     EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
-    LiveDelta, LiveMessage, Notification, NotificationLevel, OperationClass, OperationKind,
-    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
-    RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot,
-    RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase,
-    SystemSceneSnapshot, TriggerCondition as ProtocolTriggerCondition,
-    TriggerId as ProtocolTriggerId, TriggerListResponse, TriggerTarget as ProtocolTriggerTarget,
-    UpdateTriggerRequest, Versioned, WorkflowActivity, WorkflowActivityResponse,
-    WorkflowControlResponse, WorkflowDetail, WorkflowId as ProtocolWorkflowId,
-    WorkflowListResponse, WorkflowStatus as ProtocolStatus, WorkflowStatusCount, WorkflowSummary,
+    InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
+    InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, Notification,
+    NotificationLevel, OperationClass, OperationKind, OperationStatus, OperationUpdate,
+    OverviewReplicant, OverviewSnapshot, OverviewTravel, RequirementSummary, ResultSummary,
+    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
+    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
+    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
+    WorkflowStatusCount, WorkflowSummary,
 };
 use replicant_runtime::{
     ApplicationContext,
@@ -200,6 +202,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
+        .route("/api/inventory", get(inventory))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -1006,6 +1009,123 @@ async fn devices(
         metadata,
         devices: rows,
     })))
+}
+
+async fn inventory(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<InventorySnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let location_systems = state
+        .client()
+        .locations()
+        .find()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .into_iter()
+        .map(|location| (location.id().to_string(), location.system))
+        .collect();
+    let inventories = state
+        .client()
+        .state()
+        .inventories()
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(inventory_snapshot(
+        metadata,
+        inventories,
+        &location_systems,
+    ))))
+}
+
+fn inventory_snapshot(
+    metadata: SnapshotMetadata,
+    inventories: Vec<Inventory>,
+    location_systems: &BTreeMap<String, Option<String>>,
+) -> InventorySnapshot {
+    let mut locations = inventories
+        .into_iter()
+        .filter_map(|inventory| {
+            let (owner_kind, owner) = match inventory.owner {
+                InventoryOwner::Account(id) => {
+                    (InventoryOwnerKind::Account, id.as_str().to_owned())
+                }
+                InventoryOwner::Replicant(key) => {
+                    (InventoryOwnerKind::Replicant, key.id.as_str().to_owned())
+                }
+                InventoryOwner::Location(key) => {
+                    (InventoryOwnerKind::Location, key.id.as_str().to_owned())
+                }
+                _ => return None,
+            };
+            let mut resources = BTreeMap::<String, i64>::new();
+            for item in inventory.items.into_iter().filter(|item| item.quantity > 0) {
+                *resources.entry(item.resource).or_default() += item.quantity;
+            }
+            if resources.is_empty() {
+                return None;
+            }
+            let location = inventory.location.map(|key| key.id.to_string());
+            let system = location
+                .as_ref()
+                .and_then(|value| device_system(value, location_systems));
+            let resources = resources
+                .into_iter()
+                .map(|(resource, quantity)| InventoryQuantity { resource, quantity })
+                .collect::<Vec<_>>();
+            Some(InventoryLocationSummary {
+                owner_kind,
+                owner,
+                system,
+                location,
+                total_quantity: resources.iter().map(|item| item.quantity).sum(),
+                resources,
+            })
+        })
+        .collect::<Vec<_>>();
+    locations.sort_by(|left, right| {
+        (
+            &left.system,
+            &left.location,
+            left.owner_kind as u8,
+            &left.owner,
+        )
+            .cmp(&(
+                &right.system,
+                &right.location,
+                right.owner_kind as u8,
+                &right.owner,
+            ))
+    });
+
+    let mut resources = BTreeMap::<String, Vec<InventoryDistribution>>::new();
+    for location in &locations {
+        for item in &location.resources {
+            resources
+                .entry(item.resource.clone())
+                .or_default()
+                .push(InventoryDistribution {
+                    owner_kind: location.owner_kind,
+                    owner: location.owner.clone(),
+                    system: location.system.clone(),
+                    location: location.location.clone(),
+                    quantity: item.quantity,
+                });
+        }
+    }
+    let resources = resources
+        .into_iter()
+        .map(|(resource, distribution)| InventoryResourceSummary {
+            resource,
+            total_quantity: distribution.iter().map(|item| item.quantity).sum(),
+            distribution,
+        })
+        .collect::<Vec<_>>();
+    InventorySnapshot {
+        metadata,
+        total_quantity: resources.iter().map(|item| item.total_quantity).sum(),
+        locations,
+        resources,
+    }
 }
 
 fn device_summary(
@@ -2705,6 +2825,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inventory_projection_aggregates_positive_resources_deterministically() {
+        use replicant_client::domain::{AccountId, InventoryItem, LocationKey};
+
+        let inventory = |location: &str, items: Vec<(&str, i64)>| Inventory {
+            owner: InventoryOwner::Location(LocationKey::live(location.into())),
+            location: Some(LocationKey::live(location.into())),
+            items: items
+                .into_iter()
+                .map(|(resource, quantity)| InventoryItem {
+                    resource: resource.to_owned(),
+                    quantity,
+                })
+                .collect(),
+        };
+        let snapshot = inventory_snapshot(
+            SnapshotMetadata {
+                revision: 7,
+                generated_at_ms: 10,
+            },
+            vec![
+                Inventory {
+                    owner: InventoryOwner::Account(AccountId::from("ACCOUNT")),
+                    location: None,
+                    items: vec![InventoryItem {
+                        resource: "conductive".to_owned(),
+                        quantity: 5,
+                    }],
+                },
+                inventory("VEGA-2", vec![("silicates", 4), ("empty", 0)]),
+                inventory(
+                    "SOL-1",
+                    vec![("conductive", 3), ("silicates", 2), ("silicates", 1)],
+                ),
+                inventory("EMPTY-1", Vec::new()),
+            ],
+            &BTreeMap::from([
+                ("SOL-1".to_owned(), Some("SOL".to_owned())),
+                ("VEGA-2".to_owned(), Some("VEGA".to_owned())),
+            ]),
+        );
+
+        assert_eq!(snapshot.total_quantity, 15);
+        assert_eq!(
+            snapshot
+                .locations
+                .iter()
+                .map(|row| row.location.as_deref().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["", "SOL-1", "VEGA-2"]
+        );
+        assert_eq!(
+            snapshot
+                .resources
+                .iter()
+                .map(|row| (row.resource.as_str(), row.total_quantity))
+                .collect::<Vec<_>>(),
+            [("conductive", 8), ("silicates", 7)]
+        );
+        assert_eq!(snapshot.resources[1].distribution.len(), 2);
+    }
+
     #[tokio::test]
     async fn health_snapshot_and_catalogue_are_frontend_safe() {
         let (app, client, _) = test_app().await;
@@ -2713,6 +2895,7 @@ mod tests {
             "/api/snapshot",
             "/api/overview",
             "/api/devices",
+            "/api/inventory",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
@@ -2736,6 +2919,11 @@ mod tests {
             if path == "/api/devices" {
                 assert!(value["payload"]["metadata"]["revision"].is_number());
                 assert!(value["payload"]["devices"].is_array());
+            }
+            if path == "/api/inventory" {
+                assert!(value["payload"]["metadata"]["revision"].is_number());
+                assert!(value["payload"]["locations"].is_array());
+                assert!(value["payload"]["resources"].is_array());
             }
             assert!(!value.to_string().contains("token"));
         }
