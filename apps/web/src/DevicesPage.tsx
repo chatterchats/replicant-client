@@ -69,7 +69,6 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
   ],
   transport: [
     "ami_transport_controller",
-    "ami_trade_controller",
     "transport_drone",
     "transport_hauler",
     "cargo_freighter",
