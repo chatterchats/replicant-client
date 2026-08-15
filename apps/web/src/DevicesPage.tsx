@@ -135,6 +135,10 @@ export interface DeviceTreeRow {
   relationship: "attached" | "controlled" | "stowed" | null;
 }
 
+export interface VisibleDeviceTreeRow extends DeviceTreeRow {
+  hasChildren: boolean;
+}
+
 export interface DeviceGroup {
   category: DeviceCategory;
   label: string;
@@ -318,6 +322,25 @@ export function groupDevices(devices: DeviceSummary[]): DeviceGroup[] {
   });
 }
 
+export function visibleDeviceRows(
+  rows: DeviceTreeRow[],
+  collapsed: ReadonlySet<string>,
+): VisibleDeviceTreeRow[] {
+  const visible: VisibleDeviceTreeRow[] = [];
+  let hiddenBelowDepth: number | null = null;
+  for (const [index, row] of rows.entries()) {
+    if (hiddenBelowDepth !== null) {
+      if (row.depth > hiddenBelowDepth) continue;
+      hiddenBelowDepth = null;
+    }
+    const hasChildren = (rows[index + 1]?.depth ?? 0) > row.depth;
+    visible.push({ ...row, hasChildren });
+    if (hasChildren && collapsed.has(row.device.entity.id))
+      hiddenBelowDepth = row.depth;
+  }
+  return visible;
+}
+
 const uniqueStrings = (values: Array<string | null>) =>
   [...new Set(values.filter((value): value is string => Boolean(value)))].sort(
     (a, b) => a.localeCompare(b, undefined, { numeric: true }),
@@ -450,6 +473,9 @@ export function DevicesContent({
   const [descending, setDescending] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<DeviceCategory>>(
     () => new Set(["ftl_comms"]),
+  );
+  const [collapsedDevices, setCollapsedDevices] = useState<Set<string>>(
+    () => new Set(),
   );
   const allDevices = useMemo(() => data?.devices ?? [], [data?.devices]);
   const rows = useMemo(
@@ -652,140 +678,200 @@ export function DevicesContent({
                 </thead>
                 {groups.map((group) => {
                   const isCollapsed = collapsed.has(group.category);
+                  const branchIds = group.rows.flatMap((row, index) =>
+                    (group.rows[index + 1]?.depth ?? 0) > row.depth
+                      ? [row.device.entity.id]
+                      : [],
+                  );
+                  const hasCollapsedBranches = branchIds.some((id) =>
+                    collapsedDevices.has(id),
+                  );
+                  const visibleRows = visibleDeviceRows(
+                    group.rows,
+                    collapsedDevices,
+                  );
                   return (
                     <tbody key={group.category}>
                       <tr className="device-group-row">
                         <th colSpan={6}>
-                          <button
-                            aria-expanded={!isCollapsed}
-                            onClick={() => {
-                              toggleGroup(group.category);
-                            }}
-                          >
-                            <span aria-hidden="true">
-                              {isCollapsed ? "▸" : "▾"}
-                            </span>
-                            <strong>{group.label}</strong>
-                            <small>{group.rows.length} devices</small>
-                          </button>
+                          <div>
+                            <button
+                              className="group-toggle"
+                              aria-expanded={!isCollapsed}
+                              onClick={() => {
+                                toggleGroup(group.category);
+                              }}
+                            >
+                              <span aria-hidden="true">
+                                {isCollapsed ? "▸" : "▾"}
+                              </span>
+                              <strong>{group.label}</strong>
+                              <small>{group.rows.length} devices</small>
+                            </button>
+                            <button
+                              className="branch-toggle"
+                              disabled={branchIds.length === 0}
+                              onClick={() => {
+                                setCollapsedDevices((current) => {
+                                  const next = new Set(current);
+                                  for (const id of branchIds)
+                                    if (hasCollapsedBranches) next.delete(id);
+                                    else next.add(id);
+                                  return next;
+                                });
+                              }}
+                            >
+                              {hasCollapsedBranches
+                                ? "Expand all"
+                                : "Collapse all"}
+                            </button>
+                          </div>
                         </th>
                       </tr>
                       {isCollapsed
                         ? null
-                        : group.rows.map(({ device, depth, relationship }) => (
-                            <tr key={device.entity.id}>
-                              <td>
-                                <div
-                                  className="device-tree-cell"
-                                  style={{
-                                    paddingLeft: `${String(depth * 18)}px`,
-                                  }}
-                                >
-                                  {depth > 0 ? (
-                                    <span
-                                      className="tree-branch"
-                                      aria-hidden="true"
-                                    >
-                                      ↳
-                                    </span>
-                                  ) : null}
-                                  <div>
-                                    <DeviceSelection
-                                      device={device}
-                                      onSelectDevice={onSelectDevice}
-                                    />
-                                    {relationship ? (
-                                      <small className="relationship-label">
-                                        {relationship}
-                                      </small>
-                                    ) : null}
-                                    {device.tags.length ? (
-                                      <small>{device.tags.join(" · ")}</small>
-                                    ) : null}
-                                  </div>
-                                </div>
-                              </td>
-                              <td>
-                                <strong>
-                                  {device.device_type ?? "Unknown type"}
-                                </strong>
-                                <span
-                                  className={`status-chip ${normalizedDeviceStatus(device.status)}`}
-                                >
-                                  {device.status ?? "unknown"}
-                                </span>
-                              </td>
-                              <td>
-                                {device.owner_name ?? device.owner ?? (
-                                  <span className="muted">Unassigned</span>
-                                )}
-                              </td>
-                              <td>
-                                {device.system ? (
-                                  <button
-                                    className="entity-link"
-                                    onClick={() => {
-                                      if (device.system)
-                                        onOpenSystem(device.system);
+                        : visibleRows.map(
+                            ({ device, depth, relationship, hasChildren }) => (
+                              <tr key={device.entity.id}>
+                                <td>
+                                  <div
+                                    className="device-tree-cell"
+                                    style={{
+                                      paddingLeft: `${String(depth * 18)}px`,
                                     }}
                                   >
-                                    {device.system}
-                                  </button>
-                                ) : (
-                                  "—"
-                                )}
-                                {device.location ? (
-                                  <button
-                                    className="subtle-link"
-                                    onClick={() => {
-                                      if (device.location)
-                                        onSelectEntity({
-                                          kind: "location",
-                                          id: device.location,
-                                        });
-                                    }}
-                                  >
-                                    {device.location}
-                                  </button>
-                                ) : null}
-                              </td>
-                              <td>
-                                {device.operational_capacity_percent === null
-                                  ? "—"
-                                  : `${device.operational_capacity_percent.toFixed(0)}%`}
-                                {device.cargo_capacity === null ? null : (
-                                  <small>
-                                    Cargo {device.cargo_used ?? 0}/
-                                    {device.cargo_capacity}
-                                  </small>
-                                )}
-                              </td>
-                              <td>
-                                <details className="row-actions">
-                                  <summary>Actions</summary>
-                                  <div>
-                                    {actions.length ? (
-                                      actions.map((command) => (
-                                        <button
-                                          key={`${command.operationClass}:${command.descriptor.kind}`}
-                                          onClick={() => {
-                                            onSelectDevice(device);
-                                            onRunCommand(command);
-                                          }}
-                                        >
-                                          {command.descriptor.display_name}
-                                        </button>
-                                      ))
+                                    {hasChildren ? (
+                                      <button
+                                        className="tree-toggle"
+                                        aria-expanded={
+                                          !collapsedDevices.has(
+                                            device.entity.id,
+                                          )
+                                        }
+                                        aria-label={`${collapsedDevices.has(device.entity.id) ? "Expand" : "Collapse"} ${device.entity.id}`}
+                                        onClick={() => {
+                                          setCollapsedDevices((current) => {
+                                            const next = new Set(current);
+                                            if (next.has(device.entity.id))
+                                              next.delete(device.entity.id);
+                                            else next.add(device.entity.id);
+                                            return next;
+                                          });
+                                        }}
+                                      >
+                                        {collapsedDevices.has(device.entity.id)
+                                          ? "▸"
+                                          : "▾"}
+                                      </button>
                                     ) : (
-                                      <small>
-                                        No registered device actions.
-                                      </small>
+                                      <span className="tree-spacer" />
                                     )}
+                                    {depth > 0 ? (
+                                      <span
+                                        className="tree-branch"
+                                        aria-hidden="true"
+                                      >
+                                        ↳
+                                      </span>
+                                    ) : null}
+                                    <div>
+                                      <DeviceSelection
+                                        device={device}
+                                        onSelectDevice={onSelectDevice}
+                                      />
+                                      {relationship ? (
+                                        <small className="relationship-label">
+                                          {relationship}
+                                        </small>
+                                      ) : null}
+                                      {device.tags.length ? (
+                                        <small>{device.tags.join(" · ")}</small>
+                                      ) : null}
+                                    </div>
                                   </div>
-                                </details>
-                              </td>
-                            </tr>
-                          ))}
+                                </td>
+                                <td>
+                                  <strong>
+                                    {device.device_type ?? "Unknown type"}
+                                  </strong>
+                                  <span
+                                    className={`status-chip ${normalizedDeviceStatus(device.status)}`}
+                                  >
+                                    {device.status ?? "unknown"}
+                                  </span>
+                                </td>
+                                <td>
+                                  {device.owner_name ?? device.owner ?? (
+                                    <span className="muted">Unassigned</span>
+                                  )}
+                                </td>
+                                <td>
+                                  {device.system ? (
+                                    <button
+                                      className="entity-link"
+                                      onClick={() => {
+                                        if (device.system)
+                                          onOpenSystem(device.system);
+                                      }}
+                                    >
+                                      {device.system}
+                                    </button>
+                                  ) : (
+                                    "—"
+                                  )}
+                                  {device.location ? (
+                                    <button
+                                      className="subtle-link"
+                                      onClick={() => {
+                                        if (device.location)
+                                          onSelectEntity({
+                                            kind: "location",
+                                            id: device.location,
+                                          });
+                                      }}
+                                    >
+                                      {device.location}
+                                    </button>
+                                  ) : null}
+                                </td>
+                                <td>
+                                  {device.operational_capacity_percent === null
+                                    ? "—"
+                                    : `${device.operational_capacity_percent.toFixed(0)}%`}
+                                  {device.cargo_capacity === null ? null : (
+                                    <small>
+                                      Cargo {device.cargo_used ?? 0}/
+                                      {device.cargo_capacity}
+                                    </small>
+                                  )}
+                                </td>
+                                <td>
+                                  <details className="row-actions">
+                                    <summary>Actions</summary>
+                                    <div>
+                                      {actions.length ? (
+                                        actions.map((command) => (
+                                          <button
+                                            key={`${command.operationClass}:${command.descriptor.kind}`}
+                                            onClick={() => {
+                                              onSelectDevice(device);
+                                              onRunCommand(command);
+                                            }}
+                                          >
+                                            {command.descriptor.display_name}
+                                          </button>
+                                        ))
+                                      ) : (
+                                        <small>
+                                          No registered device actions.
+                                        </small>
+                                      )}
+                                    </div>
+                                  </details>
+                                </td>
+                              </tr>
+                            ),
+                          )}
                     </tbody>
                   );
                 })}

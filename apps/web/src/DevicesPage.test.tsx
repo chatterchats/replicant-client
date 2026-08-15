@@ -10,6 +10,7 @@ import {
   groupDevices,
   normalizedDeviceStatus,
   systemOptions,
+  visibleDeviceRows,
   type DeviceFilters,
 } from "./DevicesPage";
 import type { DeviceSummary, DevicesSnapshot } from "./protocol";
@@ -143,6 +144,22 @@ describe("device fleet browser", () => {
     expect(groups.at(1)?.rows.map((row) => row.device.entity.id)).toEqual([
       "MINER-A",
       "MINER-B",
+    ]);
+    const vesselRows = groups.at(0)?.rows ?? [];
+    expect(
+      visibleDeviceRows(vesselRows, new Set(["VESSEL"])).map(
+        (row) => row.device.entity.id,
+      ),
+    ).toEqual(["VESSEL"]);
+    expect(
+      visibleDeviceRows(vesselRows, new Set()).map((row) => [
+        row.device.entity.id,
+        row.hasChildren,
+      ]),
+    ).toEqual([
+      ["VESSEL", true],
+      ["RELAY", false],
+      ["DRONE", false],
     ]);
   });
 

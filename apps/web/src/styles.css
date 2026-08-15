@@ -1511,6 +1511,27 @@ h1 {
   width: 100%;
 }
 
+.device-group-row th > div {
+  display: flex;
+}
+
+.device-group-row .group-toggle {
+  flex: 1;
+  width: auto;
+}
+
+.device-group-row .branch-toggle {
+  color: #9fb6b2;
+  font-size: 0.72rem;
+  justify-content: flex-end;
+  width: auto;
+}
+
+.device-group-row .branch-toggle:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
 .device-group-row small {
   color: #78908c;
   font-weight: 400;
@@ -1528,6 +1549,20 @@ h1 {
 
 .tree-branch {
   color: #78908c;
+}
+
+.tree-spacer,
+.tree-toggle {
+  flex: 0 0 16px;
+  width: 16px;
+}
+
+.tree-toggle {
+  background: transparent;
+  border: 0;
+  color: #9fb6b2;
+  cursor: pointer;
+  padding: 0;
 }
 
 .relationship-label {
