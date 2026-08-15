@@ -121,6 +121,7 @@ export interface DeviceSummary {
   status: string | null;
   ownership: string;
   owner: string | null;
+  owner_name: string | null;
   system: string | null;
   location: string | null;
   tags: string[];
@@ -1122,6 +1123,10 @@ export function parseDevicesResponse(
           status: nullableString(device.status, "device status"),
           ownership: device.ownership,
           owner: nullableString(device.owner, "device owner"),
+          owner_name:
+            device.owner_name === undefined
+              ? null
+              : nullableString(device.owner_name, "device owner name"),
           system: nullableString(device.system, "device system"),
           location: nullableString(device.location, "device location"),
           tags: stringArray(device.tags, "device tags"),

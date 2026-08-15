@@ -211,6 +211,9 @@ pub struct DeviceSummary {
     pub ownership: String,
     /// Assigned replicant code, when present.
     pub owner: Option<String>,
+    /// Assigned replicant display name, when known.
+    #[serde(default)]
+    pub owner_name: Option<String>,
     /// Containing system, when known.
     pub system: Option<String>,
     /// Current location, when known.
@@ -1458,6 +1461,7 @@ mod tests {
                 status: None,
                 ownership: "owned".to_owned(),
                 owner: None,
+                owner_name: None,
                 system: None,
                 location: None,
                 tags: Vec::new(),

@@ -942,6 +942,24 @@ async fn devices(
         .into_iter()
         .map(|location| (location.id().to_string(), location.system))
         .collect::<BTreeMap<_, _>>();
+    let mut replicant_names = BTreeMap::new();
+    for handle in state
+        .client()
+        .replicants()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+    {
+        let replicant = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        if let Some(name) = replicant.name {
+            replicant_names.insert(replicant.key.id.to_string(), name);
+        }
+    }
     let workflows = state.repository.list().map_err(ApiError::repository)?;
     let mut claims = BTreeMap::new();
     for workflow in &workflows {
@@ -979,6 +997,7 @@ async fn devices(
         rows.push(device_summary(
             device,
             &location_systems,
+            &replicant_names,
             claims.remove(handle.id().as_str()),
         ));
     }
@@ -992,18 +1011,23 @@ async fn devices(
 fn device_summary(
     device: Device,
     location_systems: &BTreeMap<String, Option<String>>,
+    replicant_names: &BTreeMap<String, String>,
     claim: Option<DeviceClaim>,
 ) -> DeviceSummary {
     let location = device.location.map(|value| value.id.to_string());
+    let owner = device
+        .relationships
+        .assigned_replicant
+        .map(|value| value.id.to_string());
     DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
         status: wire_value(device.status.as_ref()),
         ownership: wire_value(Some(&device.access)).unwrap_or_else(|| "unknown".to_owned()),
-        owner: device
-            .relationships
-            .assigned_replicant
-            .map(|value| value.id.to_string()),
+        owner_name: owner
+            .as_ref()
+            .and_then(|value| replicant_names.get(value).cloned()),
+        owner,
         system: location
             .as_ref()
             .and_then(|value| device_system(value, location_systems)),
@@ -2660,6 +2684,7 @@ mod tests {
         let row = device_summary(
             device,
             &BTreeMap::from([("EARTH".to_owned(), Some("SOL".to_owned()))]),
+            &BTreeMap::from([("R-1".to_owned(), "Ada".to_owned())]),
             Some(DeviceClaim {
                 workflow_id: ProtocolWorkflowId("wf-1".to_owned()),
                 workflow_kind: OperationKind("transport.route".to_owned()),
@@ -2671,6 +2696,7 @@ mod tests {
         assert_eq!(row.status, None);
         assert_eq!(row.owner.as_deref(), Some("R-1"));
         assert_eq!(row.system.as_deref(), Some("SOL"));
+        assert_eq!(row.owner_name.as_deref(), Some("Ada"));
         assert_eq!(row.operational_capacity_percent, Some(75.0));
         assert_eq!(row.claim.expect("claim").workflow_id.0, "wf-1");
         assert_eq!(

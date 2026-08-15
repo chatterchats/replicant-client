@@ -119,7 +119,7 @@ function Inspector({
             <dt>Status</dt>
             <dd>{device.status ?? "Unknown"}</dd>
             <dt>Ownership</dt>
-            <dd>{device.owner ?? device.ownership}</dd>
+            <dd>{device.owner_name ?? device.owner ?? device.ownership}</dd>
             {device.system && (
               <>
                 <dt>System</dt>

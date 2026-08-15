@@ -193,7 +193,7 @@ function deviceValue(
     case "status":
       return normalizedDeviceStatus(device.status);
     case "owner":
-      return device.owner ?? "";
+      return device.owner_name ?? device.owner ?? "";
     case "system":
       return device.system ?? "";
     case "capacity":
@@ -215,6 +215,7 @@ export function filterAndSortDevices(
         device.device_type,
         device.status,
         device.owner,
+        device.owner_name,
         device.system,
         device.location,
         ...device.tags,
@@ -472,7 +473,16 @@ export function DevicesContent({
     [allDevices],
   );
   const owners = useMemo(
-    () => uniqueStrings(allDevices.map((device) => device.owner)),
+    () =>
+      [
+        ...new Map(
+          allDevices.flatMap((device) =>
+            device.owner
+              ? [[device.owner, device.owner_name ?? device.owner] as const]
+              : [],
+          ),
+        ),
+      ].sort((left, right) => left[1].localeCompare(right[1])),
     [allDevices],
   );
   const chooseSort = (next: DeviceSortKey) => {
@@ -592,8 +602,10 @@ export function DevicesContent({
                 }}
               >
                 <option value="">All replicants</option>
-                {owners.map((value) => (
-                  <option key={value}>{value}</option>
+                {owners.map(([id, name]) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
                 ))}
               </select>
             </label>
@@ -704,7 +716,7 @@ export function DevicesContent({
                                 </span>
                               </td>
                               <td>
-                                {device.owner ?? (
+                                {device.owner_name ?? device.owner ?? (
                                   <span className="muted">Unassigned</span>
                                 )}
                               </td>

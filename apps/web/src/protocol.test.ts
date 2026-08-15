@@ -50,6 +50,7 @@ describe("parseDevicesResponse", () => {
     expect(parsed.payload.devices[0]).toMatchObject({
       device_type: "future_device",
       status: null,
+      owner_name: null,
       claim: null,
     });
   });

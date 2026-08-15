@@ -23,6 +23,7 @@ const device = (
   status: "idle",
   ownership: "owned",
   owner: "R-1",
+  owner_name: "Ada",
   system: "SOL",
   location: "SOL-1",
   tags: [],
@@ -183,6 +184,7 @@ describe("device fleet browser", () => {
     expect(html).toContain("SOL");
     expect(html).toContain("1 device");
     expect(html).toContain("Other");
+    expect(html).toContain("Ada");
     expect(html).not.toContain("transport.route");
     expect(html).not.toContain("Claim");
   });
