@@ -30,13 +30,13 @@ use replicant_client::{
 use replicant_protocol::{
     ActivityLevel, AutomationControlAction, AutomationControlRequest, AutomationControlResponse,
     AutomationStatus, AutomationTrigger as ProtocolTrigger, CreateTriggerRequest, DaemonHealth,
-    DescriptorCatalog, DomainSlice, EntityId, EntityKind, EntityRef, ErrorResponse,
-    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
-    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
-    LiveDelta, LiveMessage, Notification, NotificationLevel, OperationClass, OperationKind,
-    OperationStatus, OperationUpdate, RequirementSummary, ResultSummary, RunOperationRequest,
-    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata,
-    StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    DescriptorCatalog, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind, EntityRef,
+    EntitySummary, ErrorResponse, FiniteExecution as ProtocolFiniteExecution,
+    FiniteExecutionHistoryResponse, FiniteExecutionStatus as ProtocolFiniteExecutionStatus,
+    GalaxySceneSnapshot, HealthStatus, LiveDelta, LiveMessage, Notification, NotificationLevel,
+    OperationClass, OperationKind, OperationStatus, OperationUpdate, RequirementSummary,
+    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
     TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
     TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
     WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
@@ -59,7 +59,7 @@ use replicant_workflow::{
     TriggerTarget, TriggerTargetClass, WorkflowId, WorkflowInstance, WorkflowKind,
     WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, watch};
 use tower_http::cors::CorsLayer;
@@ -196,6 +196,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
         .route("/ws", get(websocket))
@@ -239,7 +240,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Runs periodic persisted-workflow reconciliation until shutdown.
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
-    let mut revisions = state.client().state().watch_galaxy().ok();
+    let mut revisions = state.client().state().watch().ok();
     let mut operations = state.client().operations().watch().ok();
     let mut workflows = state
         .repository
@@ -277,7 +278,26 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
             }
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 match revision {
-                    Ok(_) => state.publish(LiveDelta::DomainInvalidated { slice: DomainSlice::Universe }),
+                    Ok(_) => {
+                        for slice in [
+                            DomainSlice::Entities,
+                            DomainSlice::Universe,
+                            DomainSlice::Overview,
+                            DomainSlice::Devices,
+                            DomainSlice::Inventory,
+                            DomainSlice::Autofactories,
+                            DomainSlice::Cargo,
+                            DomainSlice::Missions,
+                            DomainSlice::Events,
+                            DomainSlice::Trade,
+                            DomainSlice::Messages,
+                            DomainSlice::Network,
+                            DomainSlice::Standing,
+                            DomainSlice::Leaderboards,
+                        ] {
+                            state.publish(LiveDelta::DomainInvalidated { slice });
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(error = %error, "managed state watcher stopped");
                         revisions = None;
@@ -577,6 +597,12 @@ fn publish_workflow_updates(
             };
             if let Some(delta) = delta {
                 state.publish(delta);
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Entities,
+                });
+                state.publish(LiveDelta::DomainInvalidated {
+                    slice: DomainSlice::Workflows,
+                });
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
                 }
@@ -722,6 +748,127 @@ async fn snapshot(
         requirements,
         notifications: operational_notifications(&instances, &triggers, &status),
     })))
+}
+
+async fn entity_index(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<EntityIndexSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let entities = build_entity_index(&state, &workflows)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "entity index projection failed");
+            ApiError::unavailable()
+        })?;
+    Ok(Json(Versioned::current(EntityIndexSnapshot {
+        metadata,
+        entities,
+    })))
+}
+
+async fn build_entity_index(
+    state: &AppState,
+    workflows: &[WorkflowInstance],
+) -> replicant_client::Result<Vec<EntitySummary>> {
+    let locations = state.client().locations().find().collect().await?;
+    let location_systems = locations
+        .iter()
+        .map(|location| (location.id().to_string(), location.system.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut entities = locations
+        .into_iter()
+        .map(|location| {
+            let id = location.id().to_string();
+            EntitySummary {
+                entity: summary_ref(EntityKind::Location, id.clone()),
+                label: id.clone(),
+                secondary_label: wire_value(location.location_type.as_ref()),
+                system: location.system,
+                location: Some(id),
+                entity_type: wire_value(location.location_type.as_ref()),
+                status: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for system in location_systems
+        .values()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        entities.push(EntitySummary {
+            entity: summary_ref(EntityKind::System, (*system).clone()),
+            label: (*system).clone(),
+            secondary_label: None,
+            system: Some((*system).clone()),
+            location: None,
+            entity_type: None,
+            status: None,
+        });
+    }
+
+    for handle in state.client().replicants().find().owned().collect().await? {
+        let replicant = handle.snapshot().await?;
+        let location = replicant.location.map(|location| location.id.to_string());
+        entities.push(EntitySummary {
+            entity: summary_ref(EntityKind::Replicant, replicant.key.id.to_string()),
+            label: replicant.key.id.to_string(),
+            secondary_label: replicant.name,
+            system: location
+                .as_ref()
+                .and_then(|location| location_systems.get(location).cloned().flatten()),
+            location,
+            entity_type: None,
+            status: wire_value(replicant.status.as_ref()),
+        });
+    }
+
+    for handle in state.client().devices().find().collect().await? {
+        let device = handle.snapshot().await?;
+        let location = device.location.map(|location| location.id.to_string());
+        entities.push(EntitySummary {
+            entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
+            label: device.key.id.to_string(),
+            secondary_label: wire_value(device.device_type.as_ref()),
+            system: location
+                .as_ref()
+                .and_then(|location| location_systems.get(location).cloned().flatten()),
+            location,
+            entity_type: wire_value(device.device_type.as_ref()),
+            status: wire_value(device.status.as_ref()),
+        });
+    }
+
+    for workflow in workflows.iter().map(summary) {
+        entities.push(EntitySummary {
+            entity: EntityRef {
+                kind: EntityKind::Workflow,
+                id: EntityId(workflow.id.0.clone()),
+            },
+            label: workflow.kind.0,
+            secondary_label: Some(workflow.id.0),
+            system: None,
+            location: None,
+            entity_type: None,
+            status: wire_value(Some(&workflow.status)),
+        });
+    }
+    entities.sort_by(|left, right| left.entity.cmp(&right.entity));
+    Ok(entities)
+}
+
+fn summary_ref(kind: EntityKind, id: String) -> EntityRef {
+    EntityRef {
+        kind,
+        id: EntityId(id),
+    }
+}
+
+fn wire_value<T: Serialize>(value: Option<&T>) -> Option<String> {
+    value
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
 }
 
 async fn galaxy_scene(
@@ -2097,6 +2244,7 @@ mod tests {
         for path in [
             "/api/health",
             "/api/snapshot",
+            "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",
             "/api/descriptors",
@@ -2112,6 +2260,10 @@ mod tests {
                 value["protocol_version"],
                 replicant_protocol::PROTOCOL_VERSION
             );
+            if path == "/api/entities" {
+                assert!(value["payload"]["metadata"]["revision"].is_number());
+                assert!(value["payload"]["entities"].is_array());
+            }
             assert!(!value.to_string().contains("token"));
         }
         client.close().await.expect("close client");
@@ -2148,7 +2300,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_failure_payloads_and_notifications_redact_secrets() {
-        let (_, client, state) = test_app().await;
+        let (app, client, state) = test_app().await;
         let workflow = state
             .repository
             .create(NewWorkflow {
@@ -2186,6 +2338,22 @@ mod tests {
         assert!(!exported.contains("also-private"));
         assert!(!notifications.contains("do-not-export"));
         assert!(exported.contains("[redacted]"));
+        let entities = json(
+            app.oneshot(
+                Request::get("/api/entities")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response"),
+        )
+        .await;
+        assert_eq!(
+            entities["payload"]["entities"][0]["entity"]["kind"],
+            "workflow"
+        );
+        assert!(!entities.to_string().contains("do-not-export"));
+        assert!(!entities.to_string().contains("also-private"));
         client.close().await.expect("close client");
     }
 

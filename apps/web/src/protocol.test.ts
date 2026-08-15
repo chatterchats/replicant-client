@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseHealthResponse,
+  parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
   parseSnapshotResponse,
@@ -68,11 +69,41 @@ describe("parseHealthResponse", () => {
           type: "entity_upsert",
           data: {
             entity: { kind: "device", id: "D-1" },
-            value: { name: "Miner" },
+            value: {
+              entity: { kind: "device", id: "D-1" },
+              label: "D-1",
+              secondary_label: "mining_drone",
+              system: "SOL",
+              location: "EARTH",
+              entity_type: "mining_drone",
+              status: "idle",
+            },
           },
         },
       }).delta.type,
     ).toBe("entity_upsert");
+  });
+
+  it("parses typed entity index snapshots", () => {
+    const index = parseEntityIndexResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 10 },
+        entities: [
+          {
+            entity: { kind: "replicant", id: "R-1" },
+            label: "R-1",
+            secondary_label: "Ada",
+            system: "SOL",
+            location: "EARTH",
+            entity_type: null,
+            status: "idle",
+          },
+        ],
+      },
+    }).payload;
+    expect(index.metadata.revision).toBe(4);
+    expect(index.entities[0]?.location).toBe("EARTH");
   });
 
   it("rejects unknown protocol versions and delta variants", () => {

@@ -22,7 +22,7 @@ import { SystemPage } from "./SystemPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
-  EntityKind,
+  EntitySummary,
   FiniteExecution,
   GalaxyStar,
   SystemMarker,
@@ -71,6 +71,11 @@ function textField(value: unknown, ...fields: string[]): string | null {
   return null;
 }
 
+function isEntitySummary(value: unknown): value is EntitySummary {
+  const record = asRecord(value);
+  return typeof record?.label === "string" && asRecord(record.entity) !== null;
+}
+
 function Inspector({
   entity,
   value,
@@ -82,19 +87,47 @@ function Inspector({
   onClose: () => void;
   onClear: () => void;
 }) {
+  const summary = isEntitySummary(value) ? value : undefined;
   return (
     <aside className="inspector" aria-label="Selected entity inspector">
       <header className="drawer-header">
         <div>
           <small>{entity.kind}</small>
-          <strong>{entity.id}</strong>
+          <strong>{summary?.label ?? entity.id}</strong>
         </div>
         <button aria-label="Close inspector" onClick={onClose}>
           ×
         </button>
       </header>
       <div className="inspector-body">
-        {value === undefined ? (
+        {summary ? (
+          <dl>
+            {summary.secondary_label && (
+              <>
+                <dt>Type</dt>
+                <dd>{summary.secondary_label}</dd>
+              </>
+            )}
+            {summary.status && (
+              <>
+                <dt>Status</dt>
+                <dd>{summary.status}</dd>
+              </>
+            )}
+            {summary.system && (
+              <>
+                <dt>System</dt>
+                <dd>{summary.system}</dd>
+              </>
+            )}
+            {summary.location && (
+              <>
+                <dt>Location</dt>
+                <dd>{summary.location}</dd>
+              </>
+            )}
+          </dl>
+        ) : value === undefined ? (
           <p>This entity is not present in the current daemon projection.</p>
         ) : (
           <pre>{JSON.stringify(value, null, 2)}</pre>
@@ -162,14 +195,7 @@ export function App() {
   }, [shell.activityOpen, shell.inspectorOpen, shell.paletteOpen]);
 
   const entityList = useMemo(
-    () =>
-      Object.keys(entities).map((key) => {
-        const separator = key.indexOf(":");
-        return {
-          kind: key.slice(0, separator) as EntityKind,
-          id: key.slice(separator + 1),
-        };
-      }),
+    () => Object.values(entities).map((summary) => summary.entity),
     [entities],
   );
   const currentReplicant = entityList.find(
@@ -178,16 +204,8 @@ export function App() {
   const currentReplicantValue = currentReplicant
     ? entities[`replicant:${currentReplicant.id}`]
     : undefined;
-  const currentLocation = textField(
-    currentReplicantValue,
-    "location",
-    "location_code",
-  );
-  const currentSystem = textField(
-    currentReplicantValue,
-    "system",
-    "system_code",
-  );
+  const currentLocation = currentReplicantValue?.location ?? null;
+  const currentSystem = currentReplicantValue?.system ?? null;
   const activeWorkflows = workflows.filter((workflow) =>
     activeWorkflowStatuses.includes(workflow.status),
   );

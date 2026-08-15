@@ -56,7 +56,7 @@ pub struct EntityId(pub String);
 pub struct QueryId(pub String);
 
 /// Kind of normalized entity addressable by the local application.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EntityKind {
@@ -81,12 +81,31 @@ pub enum EntityKind {
 }
 
 /// Typed reference to a normalized application entity.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EntityRef {
     /// Entity category.
     pub kind: EntityKind,
     /// Stable entity identifier.
     pub id: EntityId,
+}
+
+/// Small frontend-safe description of an entity used by cross-cutting UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntitySummary {
+    /// Stable entity address.
+    pub entity: EntityRef,
+    /// Primary human-readable label.
+    pub label: String,
+    /// Optional supporting label such as a device type or replicant name.
+    pub secondary_label: Option<String>,
+    /// Containing system, when known.
+    pub system: Option<String>,
+    /// Current location, when known.
+    pub location: Option<String>,
+    /// Domain-specific type rendered as a stable wire value, when useful.
+    pub entity_type: Option<String>,
+    /// Domain-specific status rendered as a stable wire value, when useful.
+    pub status: Option<String>,
 }
 
 /// Daemon availability state.
@@ -157,6 +176,15 @@ pub struct SnapshotMetadata {
     pub revision: u64,
     /// Unix milliseconds when the snapshot was produced.
     pub generated_at_ms: i64,
+}
+
+/// Cross-cutting entity summaries returned by the daemon.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntityIndexSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Stable, normalized summaries sorted by entity address.
+    pub entities: Vec<EntitySummary>,
 }
 
 /// Three-dimensional galactic coordinates in light-years.
@@ -1035,14 +1063,34 @@ pub struct DescriptorCatalog {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DomainSlice {
+    /// Cross-cutting entity summaries.
+    Entities,
     /// Universe and galaxy data.
     Universe,
+    /// Operations overview.
+    Overview,
     /// Devices and their state.
     Devices,
     /// Inventory and cargo.
     Inventory,
     /// Autofactory state.
     Autofactories,
+    /// Cargo and carriers.
+    Cargo,
+    /// Survey, mining, relay, and bootstrap missions.
+    Missions,
+    /// Discovered events.
+    Events,
+    /// Trade controllers, orders, and trades.
+    Trade,
+    /// Managed messages and channels.
+    Messages,
+    /// Relay and account network state.
+    Network,
+    /// Achievement and reputation state.
+    Standing,
+    /// Leaderboard state.
+    Leaderboards,
     /// Workflow state.
     Workflows,
     /// Managed operation state.
@@ -1117,8 +1165,8 @@ pub enum LiveDelta {
     EntityUpsert {
         /// Entity address.
         entity: EntityRef,
-        /// Normalized frontend representation.
-        value: Value,
+        /// Normalized frontend summary.
+        value: EntitySummary,
     },
     /// A normalized entity was removed.
     EntityRemove {
@@ -1242,6 +1290,25 @@ mod tests {
     fn live_delta_round_trips_without_upstream_event_shape() {
         let message = LiveMessage::current(42, LiveDelta::WorkflowUpdated(workflow()));
         round_trip(&message);
+
+        round_trip(&Versioned::current(EntityIndexSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1_765_000_000_000,
+            },
+            entities: vec![EntitySummary {
+                entity: EntityRef {
+                    kind: EntityKind::Replicant,
+                    id: EntityId("R-1".to_owned()),
+                },
+                label: "R-1".to_owned(),
+                secondary_label: Some("Ada".to_owned()),
+                system: Some("SOL".to_owned()),
+                location: Some("EARTH".to_owned()),
+                entity_type: None,
+                status: Some("idle".to_owned()),
+            }],
+        }));
 
         let json = serde_json::to_value(message).expect("serialize live message");
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);

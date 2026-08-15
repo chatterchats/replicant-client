@@ -13,6 +13,8 @@ import {
   type AutomationStatus,
   type DaemonHealth,
   type DomainSlice,
+  type EntityIndexSnapshot,
+  type EntitySummary,
   type LiveMessage,
   type Notification,
   type OperationUpdate,
@@ -35,13 +37,13 @@ export interface DaemonState {
   health: DaemonHealth | null;
   sync: RuntimeSyncStatus | null;
   automation: AutomationStatus;
-  entities: Record<string, unknown>;
+  entities: Record<string, EntitySummary>;
   workflows: Record<string, WorkflowSummary>;
   requirements: RequirementSummary[];
   activity: WorkflowActivity[];
   notifications: Notification[];
   operations: Record<string, OperationUpdate>;
-  invalidated: DomainSlice[];
+  invalidated: Partial<Record<DomainSlice, number>>;
   needsResnapshot: boolean;
   error: string | null;
 }
@@ -50,7 +52,13 @@ export type DaemonAction =
   | { type: "connecting"; retry: boolean }
   | { type: "connected" }
   | { type: "disconnected"; error: string }
-  | { type: "snapshot"; snapshot: RuntimeSnapshot; health: DaemonHealth }
+  | {
+      type: "snapshot";
+      snapshot: RuntimeSnapshot;
+      health: DaemonHealth;
+      entities: EntityIndexSnapshot;
+    }
+  | { type: "entity_index"; entities: EntityIndexSnapshot }
   | { type: "live"; message: LiveMessage }
   | { type: "continuity_lost"; error: string };
 
@@ -71,7 +79,7 @@ export const initialDaemonState: DaemonState = {
   activity: [],
   notifications: [],
   operations: {},
-  invalidated: [],
+  invalidated: {},
   needsResnapshot: false,
   error: null,
 };
@@ -110,7 +118,12 @@ export function daemonReducer(
         health: action.health,
         sync: action.snapshot.sync,
         automation: action.snapshot.automation,
-        entities: {},
+        entities: Object.fromEntries(
+          action.entities.entities.map((summary) => [
+            key(summary.entity.kind, summary.entity.id),
+            summary,
+          ]),
+        ),
         workflows: Object.fromEntries(
           action.snapshot.workflows.map((workflow) => [workflow.id, workflow]),
         ),
@@ -118,9 +131,19 @@ export function daemonReducer(
         activity: [],
         notifications: action.snapshot.notifications,
         operations: {},
-        invalidated: [],
+        invalidated: {},
         needsResnapshot: false,
         error: null,
+      };
+    case "entity_index":
+      return {
+        ...state,
+        entities: Object.fromEntries(
+          action.entities.entities.map((summary) => [
+            key(summary.entity.kind, summary.entity.id),
+            summary,
+          ]),
+        ),
       };
     case "live": {
       const { message } = action;
@@ -163,9 +186,10 @@ export function daemonReducer(
               message.delta.data.slice === "universe"
                 ? message.revision
                 : state.galaxyRevision,
-            invalidated: state.invalidated.includes(message.delta.data.slice)
-              ? state.invalidated
-              : [...state.invalidated, message.delta.data.slice],
+            invalidated: {
+              ...state.invalidated,
+              [message.delta.data.slice]: message.revision,
+            },
           };
         case "workflow_created":
         case "workflow_updated":
@@ -243,12 +267,13 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     const connect = async () => {
       dispatch({ type: "connecting", retry: attempt > 0 });
       try {
-        const [health, snapshot] = await Promise.all([
+        const [health, snapshot, entities] = await Promise.all([
           daemonApi.health(controller.signal),
           daemonApi.snapshot(controller.signal),
+          daemonApi.entities(controller.signal),
         ]);
         if (controller.signal.aborted) return;
-        dispatch({ type: "snapshot", snapshot, health });
+        dispatch({ type: "snapshot", snapshot, health, entities });
         socket = new WebSocket(socketUrl());
         socketRef.current = socket;
         socket.addEventListener("open", () => {
@@ -303,12 +328,13 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
 
     const resnapshot = async () => {
       try {
-        const [health, snapshot] = await Promise.all([
+        const [health, snapshot, entities] = await Promise.all([
           daemonApi.health(controller.signal),
           daemonApi.snapshot(controller.signal),
+          daemonApi.entities(controller.signal),
         ]);
         if (!controller.signal.aborted)
-          dispatch({ type: "snapshot", snapshot, health });
+          dispatch({ type: "snapshot", snapshot, health, entities });
       } catch (error) {
         if (!controller.signal.aborted) {
           dispatch({ type: "continuity_lost", error: String(error) });
@@ -323,6 +349,23 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       if (timer !== undefined) clearTimeout(timer);
     };
   }, [state.needsResnapshot]);
+
+  useEffect(() => {
+    if (state.invalidated.entities === undefined) return;
+    const controller = new AbortController();
+    void daemonApi
+      .entities(controller.signal)
+      .then((entities) => {
+        dispatch({ type: "entity_index", entities });
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted)
+          dispatch({ type: "continuity_lost", error: String(error) });
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [state.invalidated.entities]);
 
   return <DaemonContext value={state}>{children}</DaemonContext>;
 }

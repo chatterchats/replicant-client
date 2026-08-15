@@ -6,7 +6,12 @@ import {
   retryDelay,
   socketUrl,
 } from "./daemon";
-import type { DaemonHealth, LiveMessage, RuntimeSnapshot } from "./protocol";
+import type {
+  DaemonHealth,
+  EntityIndexSnapshot,
+  LiveMessage,
+  RuntimeSnapshot,
+} from "./protocol";
 
 const health: DaemonHealth = {
   status: "healthy",
@@ -29,6 +34,20 @@ const snapshot: RuntimeSnapshot = {
   requirements: [],
   notifications: [],
 };
+const entities: EntityIndexSnapshot = {
+  metadata: snapshot.metadata,
+  entities: [
+    {
+      entity: { kind: "replicant", id: "R-1" },
+      label: "R-1",
+      secondary_label: "Ada",
+      system: "SOL",
+      location: "EARTH",
+      entity_type: null,
+      status: "idle",
+    },
+  ],
+};
 
 function live(revision: number, delta: LiveMessage["delta"]): LiveMessage {
   return { protocol_version: 1, revision, delta };
@@ -40,6 +59,7 @@ describe("daemonReducer", () => {
       type: "snapshot",
       snapshot,
       health,
+      entities,
     });
     state = daemonReducer(state, {
       type: "live",
@@ -47,7 +67,15 @@ describe("daemonReducer", () => {
         type: "entity_upsert",
         data: {
           entity: { kind: "device", id: "D-1" },
-          value: { name: "Miner" },
+          value: {
+            entity: { kind: "device", id: "D-1" },
+            label: "D-1",
+            secondary_label: "mining_drone",
+            system: "SOL",
+            location: "EARTH",
+            entity_type: "mining_drone",
+            status: "idle",
+          },
         },
       }),
     });
@@ -66,7 +94,8 @@ describe("daemonReducer", () => {
     });
 
     expect(state.revision).toBe(12);
-    expect(state.entities["device:D-1"]).toEqual({ name: "Miner" });
+    expect(state.entities["device:D-1"]?.label).toBe("D-1");
+    expect(state.entities["replicant:R-1"]?.location).toBe("EARTH");
     expect(state.notifications).toHaveLength(1);
     expect(state.galaxyRevision).toBe(10);
   });
@@ -76,6 +105,7 @@ describe("daemonReducer", () => {
       type: "snapshot",
       snapshot,
       health,
+      entities,
     });
     state = daemonReducer(state, {
       type: "live",
@@ -103,6 +133,7 @@ describe("daemonReducer", () => {
         metadata: { ...snapshot.metadata, revision: 13 },
       },
       health,
+      entities,
     });
     expect(state.needsResnapshot).toBe(false);
     expect(state.revision).toBe(13);
@@ -113,6 +144,7 @@ describe("daemonReducer", () => {
       type: "snapshot",
       snapshot,
       health,
+      entities,
     });
     state = daemonReducer(state, {
       type: "live",
@@ -131,9 +163,28 @@ describe("daemonReducer", () => {
         metadata: { ...snapshot.metadata, revision: 11 },
       },
       health,
+      entities,
     });
     expect(state.needsResnapshot).toBe(false);
     expect(state.revision).toBe(11);
+  });
+
+  it("tracks invalidations by slice revision for targeted refetches", () => {
+    let state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(11, {
+        type: "domain_invalidated",
+        data: { slice: "inventory" },
+      }),
+    });
+    expect(state.invalidated.inventory).toBe(11);
+    expect(state.invalidated.devices).toBeUndefined();
   });
 
   it("tracks reconnect state with capped backoff", () => {

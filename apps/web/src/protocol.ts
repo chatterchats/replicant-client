@@ -23,10 +23,20 @@ export type EntityKind =
   | "operation"
   | "workflow";
 export type DomainSlice =
+  | "entities"
   | "universe"
+  | "overview"
   | "devices"
   | "inventory"
   | "autofactories"
+  | "cargo"
+  | "missions"
+  | "events"
+  | "trade"
+  | "messages"
+  | "network"
+  | "standing"
+  | "leaderboards"
   | "workflows"
   | "operations";
 
@@ -329,6 +339,21 @@ export interface EntityRef {
   id: string;
 }
 
+export interface EntitySummary {
+  entity: EntityRef;
+  label: string;
+  secondary_label: string | null;
+  system: string | null;
+  location: string | null;
+  entity_type: string | null;
+  status: string | null;
+}
+
+export interface EntityIndexSnapshot {
+  metadata: SnapshotMetadata;
+  entities: EntitySummary[];
+}
+
 export interface WorkflowActivity {
   id: number;
   workflow_id: string;
@@ -356,7 +381,10 @@ export interface Notification {
 
 export type LiveDelta =
   | { type: "snapshot"; data: SnapshotMetadata }
-  | { type: "entity_upsert"; data: { entity: EntityRef; value: unknown } }
+  | {
+      type: "entity_upsert";
+      data: { entity: EntityRef; value: EntitySummary };
+    }
   | { type: "entity_remove"; data: { entity: EntityRef } }
   | { type: "domain_invalidated"; data: { slice: DomainSlice } }
   | { type: "workflow_created"; data: WorkflowSummary }
@@ -457,10 +485,20 @@ const entityKinds = [
   "workflow",
 ] as const;
 const domainSlices = [
+  "entities",
   "universe",
+  "overview",
   "devices",
   "inventory",
   "autofactories",
+  "cargo",
+  "missions",
+  "events",
+  "trade",
+  "messages",
+  "network",
+  "standing",
+  "leaderboards",
   "workflows",
   "operations",
 ] as const;
@@ -775,6 +813,23 @@ function entity(value: unknown): EntityRef {
   return { kind: oneOf(item.kind, entityKinds, "entity kind"), id: item.id };
 }
 
+function entitySummary(value: unknown): EntitySummary {
+  const item = record(value, "entity summary");
+  if (typeof item.label !== "string") throw new Error("Invalid entity label");
+  return {
+    entity: entity(item.entity),
+    label: item.label,
+    secondary_label: nullableString(
+      item.secondary_label,
+      "entity secondary label",
+    ),
+    system: nullableString(item.system, "entity system"),
+    location: nullableString(item.location, "entity location"),
+    entity_type: nullableString(item.entity_type, "entity type"),
+    status: nullableString(item.status, "entity status"),
+  };
+}
+
 function finiteExecution(value: unknown): FiniteExecution {
   const item = record(value, "finite execution");
   const summary = record(item.summary, "result summary");
@@ -953,6 +1008,18 @@ export function parseSnapshotResponse(
           ),
         };
       }),
+    };
+  });
+}
+
+export function parseEntityIndexResponse(
+  value: unknown,
+): Versioned<EntityIndexSnapshot> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "entity index");
+    return {
+      metadata: metadata(item.metadata),
+      entities: array(item.entities, "entity index entries").map(entitySummary),
     };
   });
 }
@@ -1263,9 +1330,19 @@ export function parseLiveMessage(value: unknown): LiveMessage {
       break;
     case "entity_upsert": {
       const value = record(data, "entity upsert");
+      const parsedEntity = entity(value.entity);
+      const summary = entitySummary(value.value);
+      if (
+        parsedEntity.kind !== summary.entity.kind ||
+        parsedEntity.id !== summary.entity.id
+      )
+        throw new Error("Mismatched entity summary");
       delta = {
         type,
-        data: { entity: entity(value.entity), value: value.value },
+        data: {
+          entity: parsedEntity,
+          value: summary,
+        },
       };
       break;
     }

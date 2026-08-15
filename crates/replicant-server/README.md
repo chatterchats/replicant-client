@@ -29,6 +29,7 @@ The daemon exposes these local routes:
 
 - `GET /api/health`
 - `GET /api/snapshot`
+- `GET /api/entities`
 - `GET /ws` (WebSocket upgrade)
 - `GET /api/descriptors`
 - `GET, POST /api/workflows`
