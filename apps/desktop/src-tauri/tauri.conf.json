@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "space.replicant.desktop",
   "build": {
-    "beforeDevCommand": "npm --prefix ../../web run dev",
+    "beforeDevCommand": "npm --prefix ../web run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "node ../scripts/build-web.mjs",
+    "beforeBuildCommand": "node scripts/build-web.mjs",
     "frontendDist": "../../web/dist"
   },
   "app": {

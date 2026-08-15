@@ -32,6 +32,8 @@ test("packages a loopback sidecar without JavaScript shell permission", () => {
     readFileSync(`${desktop}/src-tauri/capabilities/default.json`, "utf8"),
   );
   assert.deepEqual(config.bundle.externalBin, ["binaries/replicantd"]);
+  assert.equal(config.build.beforeDevCommand, "npm --prefix ../web run dev");
+  assert.equal(config.build.beforeBuildCommand, "node scripts/build-web.mjs");
   assert.match(config.app.security.csp, /127\.0\.0\.1:8080/);
   assert.deepEqual(capability.permissions, ["core:default"]);
 });
