@@ -147,6 +147,46 @@ export interface DevicesSnapshot {
   devices: DeviceSummary[];
 }
 
+export interface SurveyMissionSummary {
+  workflow: WorkflowSummary;
+  replicant: string;
+  vessel: string;
+  center: string;
+  phase: string;
+  completed_systems: number;
+  total_systems: number;
+  next_system: string | null;
+  controller: string | null;
+  drones: string[];
+}
+
+export interface SurveySnapshot {
+  metadata: SnapshotMetadata;
+  missions: SurveyMissionSummary[];
+  fleet: DeviceSummary[];
+}
+
+export type MiningInstallationStatus = "complete" | "partial";
+
+export interface MiningInstallationSummary {
+  id: string;
+  system: string | null;
+  location: string | null;
+  controller: DeviceSummary | null;
+  miners: DeviceSummary[];
+  survey_controller: DeviceSummary | null;
+  survey_drones: DeviceSummary[];
+  maintenance_device: DeviceSummary | null;
+  missing: string[];
+  status: MiningInstallationStatus;
+}
+
+export interface MiningSnapshot {
+  metadata: SnapshotMetadata;
+  installations: MiningInstallationSummary[];
+  workflows: WorkflowSummary[];
+}
+
 export interface FactoryJobSummary {
   device_type: string;
   quantity: number;
@@ -1264,6 +1304,91 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
     ),
     claim,
   };
+}
+
+export function parseSurveyResponse(value: unknown): Versioned<SurveySnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "survey snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      missions: array(snapshot.missions, "survey missions").map((value) => {
+        const mission = record(value, "survey mission");
+        if (
+          typeof mission.replicant !== "string" ||
+          typeof mission.vessel !== "string" ||
+          typeof mission.center !== "string" ||
+          typeof mission.phase !== "string"
+        )
+          throw new Error("Invalid survey mission");
+        return {
+          workflow: workflow(mission.workflow),
+          replicant: mission.replicant,
+          vessel: mission.vessel,
+          center: mission.center,
+          phase: mission.phase,
+          completed_systems: number(
+            mission.completed_systems,
+            "completed survey systems",
+          ),
+          total_systems: number(mission.total_systems, "survey systems"),
+          next_system: nullableString(mission.next_system, "next system"),
+          controller: nullableString(mission.controller, "survey controller"),
+          drones: stringArray(mission.drones, "survey drones"),
+        };
+      }),
+      fleet: array(snapshot.fleet, "survey fleet").map(parseDeviceSummary),
+    };
+  });
+}
+
+export function parseMiningResponse(value: unknown): Versioned<MiningSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "mining snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      installations: array(snapshot.installations, "mining installations").map(
+        (value) => {
+          const installation = record(value, "mining installation");
+          if (typeof installation.id !== "string")
+            throw new Error("Invalid mining installation");
+          return {
+            id: installation.id,
+            system: nullableString(installation.system, "mining system"),
+            location: nullableString(installation.location, "mining location"),
+            controller:
+              installation.controller === null
+                ? null
+                : parseDeviceSummary(installation.controller),
+            miners: array(installation.miners, "mining drones").map(
+              parseDeviceSummary,
+            ),
+            survey_controller:
+              installation.survey_controller === null
+                ? null
+                : parseDeviceSummary(installation.survey_controller),
+            survey_drones: array(
+              installation.survey_drones,
+              "mining survey drones",
+            ).map(parseDeviceSummary),
+            maintenance_device:
+              installation.maintenance_device === null
+                ? null
+                : parseDeviceSummary(installation.maintenance_device),
+            missing: stringArray(
+              installation.missing,
+              "missing mining devices",
+            ),
+            status: oneOf(
+              installation.status,
+              ["complete", "partial"] as const,
+              "mining installation status",
+            ),
+          };
+        },
+      ),
+      workflows: array(snapshot.workflows, "mining workflows").map(workflow),
+    };
+  });
 }
 
 function parseFactoryJob(value: unknown): FactoryJobSummary {

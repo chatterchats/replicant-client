@@ -52,21 +52,10 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
     "replicant_interface",
     "matrix_container",
   ],
-  mining: [
-    "ami_mining_controller",
-    "mining_drone",
-  ],
-  survey: [
-    "ami_survey_controller",
-    "survey_drone",
-  ],
-  ftl_comms: [
-    "ftl_beacon",
-    "ftl_relay",
-  ],
-  maintenance: [
-    "maintenance_drone",
-  ],
+  mining: ["ami_mining_controller", "mining_drone"],
+  survey: ["ami_survey_controller", "survey_drone"],
+  ftl_comms: ["ftl_beacon", "ftl_relay"],
+  maintenance: ["maintenance_drone"],
   transport: [
     "ami_transport_controller",
     "transport_drone",
@@ -80,9 +69,7 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
     "surge_platform",
     "fusion_barge",
   ],
-  manufacturing: [
-    "autofactory",
-  ],
+  manufacturing: ["autofactory"],
 };
 
 const categoryByType = new Map(

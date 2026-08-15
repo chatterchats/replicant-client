@@ -20,10 +20,12 @@ import {
 import { GalaxyPage } from "./GalaxyPage";
 import { HistoryPage } from "./HistoryPage";
 import { InventoryPage } from "./InventoryPage";
+import { MiningPage } from "./MiningPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
 import { RequirementsPage } from "./RequirementsPage";
 import { SystemPage } from "./SystemPage";
+import { SurveyPage } from "./SurveyPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -612,6 +614,42 @@ export function App() {
                   setSelectedSystem(system);
                   select({ kind: "system", id: system });
                   navigate("System");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Survey" ? (
+              <SurveyPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onOpenGalaxy={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("Galaxy");
+                }}
+                onSelectWorkflow={(workflowId) => {
+                  setSelectedAutomationWorkflow(workflowId);
+                  navigate("Automations");
+                }}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Mining" ? (
+              <MiningPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onOpenGalaxy={(system) => {
+                  setSelectedSystem(system);
+                  select({ kind: "system", id: system });
+                  navigate("Galaxy");
                 }}
                 onSelectWorkflow={(workflowId) => {
                   setSelectedAutomationWorkflow(workflowId);

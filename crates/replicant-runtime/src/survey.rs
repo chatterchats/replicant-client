@@ -4607,7 +4607,9 @@ pub struct SurveyPlanSummary {
     pub systems: Vec<String>,
 }
 
-fn summarize_plan(plan: &RoutePlan) -> SurveyPlanSummary {
+/// Builds a frontend-safe summary from a durable survey checkpoint.
+#[must_use]
+pub fn summarize_plan(plan: &SurveyExecutionState) -> SurveyPlanSummary {
     SurveyPlanSummary {
         replicant: plan.replicant.clone(),
         vessel: plan.vessel.clone(),

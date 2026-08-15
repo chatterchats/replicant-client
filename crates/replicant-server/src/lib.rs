@@ -38,11 +38,12 @@ use replicant_protocol::{
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
-    InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, Notification,
-    NotificationLevel, OperationClass, OperationKind, OperationStatus, OperationUpdate,
-    OverviewReplicant, OverviewSnapshot, OverviewTravel, RequirementSummary, ResultSummary,
-    RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SnapshotMetadata, StartWorkflowRequest, StartWorkflowResponse, SyncPhase, SystemSceneSnapshot,
+    InventoryResourceSummary, InventorySnapshot, LiveDelta, LiveMessage, MiningInstallationStatus,
+    MiningInstallationSummary, MiningSnapshot, Notification, NotificationLevel, OperationClass,
+    OperationKind, OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot,
+    OverviewTravel, RequirementSummary, ResultSummary, RunOperationRequest, RunOperationResponse,
+    RuntimeSnapshot, RuntimeSyncStatus, SnapshotMetadata, StartWorkflowRequest,
+    StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
     TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
     TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
     WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
@@ -55,8 +56,12 @@ use replicant_runtime::{
     config::RuntimeConfig,
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
+    survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
-    workflows::{RequirementWorkflowCheckpoint, RequirementWorkflowConfig, WorkflowActivityEvent},
+    workflows::{
+        RequirementWorkflowCheckpoint, RequirementWorkflowConfig, SurveyWorkflowCheckpoint,
+        SurveyWorkflowConfig, WorkflowActivityEvent,
+    },
 };
 use replicant_workflow::{
     AutomationPolicy, AutomationTrigger, FiniteExecution as StoredFiniteExecution,
@@ -207,6 +212,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/inventory", get(inventory))
         .route("/api/autofactories", get(autofactories))
         .route("/api/cargo", get(cargo))
+        .route("/api/missions/survey", get(survey_missions))
+        .route("/api/missions/mining", get(mining_missions))
         .route("/api/entities", get(entity_index))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
@@ -1213,6 +1220,196 @@ fn cargo_snapshot(metadata: SnapshotMetadata, carriers: Vec<CargoCarrierSummary>
             .filter_map(|carrier| carrier.device.attach_capacity)
             .sum(),
         carriers,
+    }
+}
+
+fn active_workflow(status: WorkflowStatus) -> bool {
+    matches!(
+        status,
+        WorkflowStatus::Queued
+            | WorkflowStatus::Running
+            | WorkflowStatus::Waiting
+            | WorkflowStatus::Paused
+            | WorkflowStatus::Reconciling
+    )
+}
+
+async fn survey_missions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<SurveySnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let devices = device_rows(&state).await?;
+    let mut fleet_codes = std::collections::BTreeSet::new();
+    let mut missions = Vec::new();
+    for workflow in state.repository.list().map_err(ApiError::repository)? {
+        if workflow.kind.as_str() != "survey.route" || !active_workflow(workflow.status) {
+            continue;
+        }
+        let config = workflow
+            .config::<SurveyWorkflowConfig>()
+            .map_err(ApiError::repository)?;
+        let checkpoint = workflow
+            .checkpoint::<SurveyWorkflowCheckpoint>()
+            .map_err(ApiError::repository)?;
+        let plan = checkpoint.state.as_ref().map(summarize_plan);
+        let controller = plan
+            .as_ref()
+            .and_then(|plan| plan.controller.clone())
+            .or_else(|| config.options.controller.clone());
+        let drones = plan
+            .as_ref()
+            .map(|plan| plan.drones.clone())
+            .or_else(|| config.options.drones.clone())
+            .unwrap_or_default();
+        fleet_codes.insert(config.options.vessel.clone());
+        fleet_codes.extend(controller.iter().cloned());
+        fleet_codes.extend(drones.iter().cloned());
+        missions.push(SurveyMissionSummary {
+            workflow: summary(&workflow),
+            replicant: plan
+                .as_ref()
+                .map(|plan| plan.replicant.clone())
+                .unwrap_or_else(|| config.options.replicant.clone()),
+            vessel: plan
+                .as_ref()
+                .map(|plan| plan.vessel.clone())
+                .unwrap_or_else(|| config.options.vessel.clone()),
+            center: plan
+                .as_ref()
+                .map(|plan| plan.center.clone())
+                .unwrap_or_else(|| config.options.center.clone()),
+            phase: plan
+                .as_ref()
+                .map(|plan| plan.phase.clone())
+                .or_else(|| workflow.current_step.clone())
+                .unwrap_or_else(|| "queued".to_owned()),
+            completed_systems: plan.as_ref().map_or(0, |plan| plan.completed_stops),
+            total_systems: plan.as_ref().map_or(0, |plan| plan.total_stops),
+            next_system: plan.and_then(|plan| plan.next_system),
+            controller,
+            drones,
+        });
+    }
+    missions.sort_by(|left, right| left.workflow.id.cmp(&right.workflow.id));
+    Ok(Json(Versioned::current(SurveySnapshot {
+        metadata,
+        missions,
+        fleet: devices
+            .into_iter()
+            .filter(|device| fleet_codes.contains(&device.entity.id.0))
+            .collect(),
+    })))
+}
+
+async fn mining_missions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<MiningSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let workflows = state
+        .repository
+        .list()
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .filter(|workflow| {
+            active_workflow(workflow.status)
+                && (workflow.kind.as_str().contains("mining")
+                    || workflow
+                        .current_step
+                        .as_deref()
+                        .is_some_and(|step| step.contains("mining")))
+        })
+        .map(|workflow| summary(&workflow))
+        .collect();
+    Ok(Json(Versioned::current(MiningSnapshot {
+        metadata,
+        installations: mining_installations(device_rows(&state).await?),
+        workflows,
+    })))
+}
+
+fn mining_installations(devices: Vec<DeviceSummary>) -> Vec<MiningInstallationSummary> {
+    const TYPES: [&str; 5] = [
+        "ami_mining_controller",
+        "mining_drone",
+        "ami_survey_controller",
+        "survey_drone",
+        "maintenance_drone",
+    ];
+    let mut locations = BTreeMap::<String, Vec<DeviceSummary>>::new();
+    for device in devices.into_iter().filter(|device| {
+        device
+            .device_type
+            .as_deref()
+            .is_some_and(|kind| TYPES.contains(&kind))
+    }) {
+        let key = format!(
+            "{}/{}",
+            device.system.as_deref().unwrap_or("unknown"),
+            device.location.as_deref().unwrap_or("unknown")
+        );
+        locations.entry(key).or_default().push(device);
+    }
+    locations
+        .into_iter()
+        .map(|(id, devices)| mining_installation(id, devices))
+        .collect()
+}
+
+fn mining_installation(id: String, devices: Vec<DeviceSummary>) -> MiningInstallationSummary {
+    let find = |kind: &str| {
+        devices
+            .iter()
+            .find(|device| device.device_type.as_deref() == Some(kind))
+            .cloned()
+    };
+    let controller = find("ami_mining_controller");
+    let survey_controller = find("ami_survey_controller");
+    let adopted = |kind: &str, controller: Option<&DeviceSummary>| {
+        let controller = controller.map(|device| device.entity.id.0.as_str());
+        devices
+            .iter()
+            .filter(|device| {
+                device.device_type.as_deref() == Some(kind)
+                    && device.controller.as_deref() == controller
+                    && controller.is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let miners = adopted("mining_drone", controller.as_ref());
+    let survey_drones = adopted("survey_drone", survey_controller.as_ref());
+    let maintenance_device = find("maintenance_drone");
+    let mut missing = Vec::new();
+    if controller.is_none() {
+        missing.push("mining controller".to_owned());
+    }
+    if miners.len() < 4 {
+        missing.push(format!("{} adopted mining drones", 4 - miners.len()));
+    }
+    if survey_controller.is_none() {
+        missing.push("survey controller".to_owned());
+    }
+    if survey_drones.len() < 2 {
+        missing.push(format!("{} adopted survey drones", 2 - survey_drones.len()));
+    }
+    if maintenance_device.is_none() {
+        missing.push("maintenance drone".to_owned());
+    }
+    MiningInstallationSummary {
+        system: devices.first().and_then(|device| device.system.clone()),
+        location: devices.first().and_then(|device| device.location.clone()),
+        controller,
+        miners,
+        survey_controller,
+        survey_drones,
+        maintenance_device,
+        status: if missing.is_empty() {
+            MiningInstallationStatus::Complete
+        } else {
+            MiningInstallationStatus::Partial
+        },
+        missing,
+        id,
     }
 }
 
@@ -3166,6 +3363,83 @@ mod tests {
     }
 
     #[test]
+    fn mining_projection_reports_partial_adopted_installations() {
+        let mut controller = projected_device("MC-1");
+        controller.device_type = Some("ami_mining_controller".to_owned());
+        controller.system = Some("SOL".to_owned());
+        controller.location = Some("SOL-BELT".to_owned());
+        let mut miner = projected_device("MD-1");
+        miner.device_type = Some("mining_drone".to_owned());
+        miner.system = controller.system.clone();
+        miner.location = controller.location.clone();
+        miner.controller = Some("MC-1".to_owned());
+
+        let rows = mining_installations(vec![controller, miner]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, MiningInstallationStatus::Partial);
+        assert_eq!(rows[0].miners.len(), 1);
+        assert!(
+            rows[0]
+                .missing
+                .contains(&"3 adopted mining drones".to_owned())
+        );
+        assert!(rows[0].missing.contains(&"survey controller".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn survey_projection_reads_registered_workflow_state() {
+        use replicant_runtime::{
+            survey::{SurveyMode, SurveyOptions},
+            workflows::{SurveyWorkflowConfig, new_survey_workflow},
+        };
+
+        let (app, client, state) = test_app().await;
+        let workflow = state
+            .repository
+            .create(new_survey_workflow(SurveyWorkflowConfig {
+                options: SurveyOptions {
+                    mode: SurveyMode::Run,
+                    replicant: "R-1".to_owned(),
+                    vessel: "V-1".to_owned(),
+                    center: "SOL".to_owned(),
+                    radius_ly: 10.0,
+                    system_limit: 5,
+                    star_detail_concurrency: 1,
+                    mission_file: PathBuf::from("survey.json"),
+                    controller: Some("SC-1".to_owned()),
+                    drones: Some(vec!["SD-1".to_owned()]),
+                    replace_plan: false,
+                    include_explored: false,
+                    travel_timeout: Duration::from_secs(1),
+                    survey_timeout: Duration::from_secs(1),
+                    maintenance_home: "SOL".to_owned(),
+                    maintenance_interval: 40,
+                    maintenance_threshold_pct: 25.0,
+                    maintenance_resume_pct: 95.0,
+                    maintenance_check_interval: Duration::from_secs(1),
+                },
+            }))
+            .expect("survey workflow");
+        let response = app
+            .oneshot(
+                Request::get("/api/missions/survey")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let value = json(response).await;
+        assert_eq!(
+            value["payload"]["missions"][0]["workflow"]["id"],
+            workflow.id.to_string()
+        );
+        assert_eq!(value["payload"]["missions"][0]["center"], "SOL");
+        assert_eq!(value["payload"]["missions"][0]["controller"], "SC-1");
+        client.close().await.expect("close client");
+    }
+
+    #[test]
     fn queued_factory_jobs_accept_current_upstream_field_names() {
         let job = factory_job_from_queue(
             &[
@@ -3194,6 +3468,8 @@ mod tests {
             "/api/inventory",
             "/api/autofactories",
             "/api/cargo",
+            "/api/missions/survey",
+            "/api/missions/mining",
             "/api/entities",
             "/api/galaxy-scene",
             "/api/system-scene/SOL",

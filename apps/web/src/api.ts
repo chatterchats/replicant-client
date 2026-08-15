@@ -5,6 +5,7 @@ import {
   parseDescriptorsResponse,
   parseDevicesResponse,
   parseInventoryResponse,
+  parseMiningResponse,
   parseEntityIndexResponse,
   parseFiniteExecutionHistoryResponse,
   parseGalaxySceneResponse,
@@ -13,6 +14,7 @@ import {
   parseOperationResponse,
   parseOverviewResponse,
   parseSnapshotResponse,
+  parseSurveyResponse,
   parseTriggerListResponse,
   parseTriggerResponse,
   parseWorkflowActivityResponse,
@@ -100,6 +102,14 @@ export const daemonApi = {
   },
   async cargo(signal?: AbortSignal) {
     return parseCargoResponse(await get("/api/cargo", signal)).payload;
+  },
+  async survey(signal?: AbortSignal) {
+    return parseSurveyResponse(await get("/api/missions/survey", signal))
+      .payload;
+  },
+  async mining(signal?: AbortSignal) {
+    return parseMiningResponse(await get("/api/missions/mining", signal))
+      .payload;
   },
   async entities(signal?: AbortSignal) {
     return parseEntityIndexResponse(await get("/api/entities", signal)).payload;

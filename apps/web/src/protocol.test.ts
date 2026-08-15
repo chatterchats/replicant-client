@@ -6,11 +6,13 @@ import {
   parseHealthResponse,
   parseDevicesResponse,
   parseInventoryResponse,
+  parseMiningResponse,
   parseEntityIndexResponse,
   parseGalaxySceneResponse,
   parseLiveMessage,
   parseOverviewResponse,
   parseSnapshotResponse,
+  parseSurveyResponse,
   parseSystemSceneResponse,
   parseTriggerListResponse,
 } from "./protocol";
@@ -82,6 +84,67 @@ describe("parseDevicesResponse", () => {
       owner_name: null,
       claim: null,
     });
+  });
+});
+
+describe("mission projection parsers", () => {
+  const workflow = {
+    id: "WF-1",
+    kind: "survey.route",
+    status: "running",
+    current_step: "traveling",
+    revision: 2,
+    updated_at_ms: 10,
+  };
+
+  it("parses structured Survey progress and partial Mining sets", () => {
+    const survey = parseSurveyResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 3, generated_at_ms: 10 },
+        missions: [
+          {
+            workflow,
+            replicant: "R-1",
+            vessel: "V-1",
+            center: "SOL",
+            phase: "traveling",
+            completed_systems: 2,
+            total_systems: 4,
+            next_system: "VEGA",
+            controller: null,
+            drones: [],
+          },
+        ],
+        fleet: [rawDevice],
+      },
+    });
+    expect(survey.payload.missions[0]?.next_system).toBe("VEGA");
+
+    const mining = parseMiningResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 3, generated_at_ms: 10 },
+        installations: [
+          {
+            id: "SOL/SOL-1",
+            system: "SOL",
+            location: "SOL-1",
+            controller: null,
+            miners: [],
+            survey_controller: null,
+            survey_drones: [],
+            maintenance_device: null,
+            missing: ["mining controller"],
+            status: "partial",
+          },
+        ],
+        workflows: [{ ...workflow, kind: "mining.expansion" }],
+      },
+    });
+    expect(mining.payload.installations[0]?.missing).toEqual([
+      "mining controller",
+    ]);
   });
 });
 

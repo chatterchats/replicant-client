@@ -261,6 +261,88 @@ pub struct DevicesSnapshot {
     pub devices: Vec<DeviceSummary>,
 }
 
+/// One durable Survey workflow and its structured route progress.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurveyMissionSummary {
+    /// Persisted workflow lifecycle.
+    pub workflow: WorkflowSummary,
+    /// Assigned replicant.
+    pub replicant: String,
+    /// Survey carrier or vessel.
+    pub vessel: String,
+    /// Route centre.
+    pub center: String,
+    /// Current execution phase.
+    pub phase: String,
+    /// Number of completed route stops.
+    pub completed_systems: usize,
+    /// Total route stops.
+    pub total_systems: usize,
+    /// Next system in the route, when present.
+    pub next_system: Option<String>,
+    /// Assigned survey controller.
+    pub controller: Option<String>,
+    /// Assigned survey drones.
+    pub drones: Vec<String>,
+}
+
+/// Typed Survey mission dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurveySnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Active durable Survey missions.
+    pub missions: Vec<SurveyMissionSummary>,
+    /// Managed devices assigned to those missions.
+    pub fleet: Vec<DeviceSummary>,
+}
+
+/// Completeness of one discovered mining installation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiningInstallationStatus {
+    /// Every required managed device is present and adopted.
+    Complete,
+    /// At least one installation device exists, but the set is incomplete.
+    Partial,
+}
+
+/// Managed devices forming one mining installation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MiningInstallationSummary {
+    /// Stable location-derived row identity.
+    pub id: String,
+    /// Containing system, when known.
+    pub system: Option<String>,
+    /// Installation location, when known.
+    pub location: Option<String>,
+    /// Mining controller, when present.
+    pub controller: Option<DeviceSummary>,
+    /// Mining drones at this installation.
+    pub miners: Vec<DeviceSummary>,
+    /// Survey controller, when present.
+    pub survey_controller: Option<DeviceSummary>,
+    /// Survey drones at this installation.
+    pub survey_drones: Vec<DeviceSummary>,
+    /// Maintenance device, when present.
+    pub maintenance_device: Option<DeviceSummary>,
+    /// Missing device requirements, suitable for operator display.
+    pub missing: Vec<String>,
+    /// Derived installation completeness.
+    pub status: MiningInstallationStatus,
+}
+
+/// Typed Mining mission dashboard projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MiningSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Discovered managed mining installations.
+    pub installations: Vec<MiningInstallationSummary>,
+    /// Active mining-related durable workflows, when registered.
+    pub workflows: Vec<WorkflowSummary>,
+}
+
 /// One active or queued Autofactory print job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FactoryJobSummary {
@@ -1669,6 +1751,44 @@ mod tests {
                 generated_at_ms: 1_765_000_000_000,
             },
             devices: vec![device()],
+        }));
+        round_trip(&Versioned::current(SurveySnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            missions: vec![SurveyMissionSummary {
+                workflow: workflow(),
+                replicant: "R-1".to_owned(),
+                vessel: "V-1".to_owned(),
+                center: "SOL".to_owned(),
+                phase: "surveying".to_owned(),
+                completed_systems: 2,
+                total_systems: 4,
+                next_system: Some("VEGA".to_owned()),
+                controller: Some("SC-1".to_owned()),
+                drones: vec!["SD-1".to_owned()],
+            }],
+            fleet: vec![device()],
+        }));
+        round_trip(&Versioned::current(MiningSnapshot {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 1,
+            },
+            installations: vec![MiningInstallationSummary {
+                id: "SOL/SOL-BELT".to_owned(),
+                system: Some("SOL".to_owned()),
+                location: Some("SOL-BELT".to_owned()),
+                controller: None,
+                miners: Vec::new(),
+                survey_controller: None,
+                survey_drones: Vec::new(),
+                maintenance_device: None,
+                missing: vec!["mining controller".to_owned()],
+                status: MiningInstallationStatus::Partial,
+            }],
+            workflows: Vec::new(),
         }));
         round_trip(&Versioned::current(AutofactorySnapshot {
             metadata: SnapshotMetadata {
