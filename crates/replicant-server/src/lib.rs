@@ -1006,7 +1006,7 @@ fn device_summary(
             .map(|value| value.id.to_string()),
         system: location
             .as_ref()
-            .and_then(|value| location_systems.get(value).cloned().flatten()),
+            .and_then(|value| device_system(value, location_systems)),
         location,
         tags: device.tags,
         attached_to: device
@@ -1062,6 +1062,21 @@ fn device_summary(
         }),
         claim,
     }
+}
+
+fn device_system(
+    location: &str,
+    location_systems: &BTreeMap<String, Option<String>>,
+) -> Option<String> {
+    location_systems
+        .get(location)
+        .cloned()
+        .flatten()
+        .or_else(|| {
+            location
+                .split_once('-')
+                .map(|(system, _)| system.to_owned())
+        })
 }
 
 async fn entity_index(
@@ -2658,6 +2673,10 @@ mod tests {
         assert_eq!(row.system.as_deref(), Some("SOL"));
         assert_eq!(row.operational_capacity_percent, Some(75.0));
         assert_eq!(row.claim.expect("claim").workflow_id.0, "wf-1");
+        assert_eq!(
+            device_system("THYFFAWFF-1-L4", &BTreeMap::new()).as_deref(),
+            Some("THYFFAWFF")
+        );
     }
 
     #[tokio::test]

@@ -1264,8 +1264,15 @@ h1 {
 .page-heading,
 .device-filters,
 .device-table td > small,
-.claim-link small {
+.fleet-summary,
+.device-tree-cell {
   display: flex;
+}
+
+.devices-page {
+  max-width: none;
+  width: 100%;
+  padding: 24px 30px 60px;
 }
 
 .page-heading {
@@ -1287,6 +1294,73 @@ h1 {
   min-width: 120px;
 }
 
+.system-filter {
+  min-width: 180px;
+  position: relative;
+}
+
+.system-filter summary {
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 5px;
+  background: #1a302c;
+  cursor: pointer;
+  display: grid;
+  gap: 3px;
+  min-height: 50px;
+  padding: 6px 28px 6px 9px;
+  position: relative;
+}
+
+.system-filter summary::after {
+  content: "⌄";
+  position: absolute;
+  right: 10px;
+  top: 16px;
+}
+
+.system-filter summary::marker {
+  content: "";
+}
+
+.system-filter summary span,
+.system-filter small {
+  color: #9fb6b2;
+  font-size: 0.72rem;
+}
+
+.system-filter > div {
+  background: #1a302c;
+  border: 1px solid rgba(159, 188, 193, 0.24);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px #0009;
+  display: grid;
+  left: 0;
+  max-height: min(420px, 55vh);
+  min-width: 230px;
+  overflow: auto;
+  padding: 5px;
+  position: absolute;
+  top: calc(100% + 5px);
+  z-index: 4;
+}
+
+.system-filter > div button {
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.system-filter > div button:hover,
+.system-filter > div button.selected {
+  background: rgba(65, 212, 200, 0.1);
+}
+
 .device-filters label > span,
 .table-summary {
   color: #9fb6b2;
@@ -1306,7 +1380,26 @@ h1 {
 }
 
 .device-search {
-  flex: 1 1 280px;
+  flex: 1 1 320px;
+}
+
+.fleet-summary {
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.fleet-summary > div {
+  display: flex;
+  gap: 6px;
+}
+
+.fleet-summary button {
+  border: 1px solid rgba(159, 188, 193, 0.16);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  padding: 5px 8px;
 }
 
 .device-table-wrap {
@@ -1321,7 +1414,7 @@ h1 {
   width: 100%;
 }
 
-.device-table th {
+.device-table > thead th {
   background: #1a302c;
   position: sticky;
   text-align: left;
@@ -1329,15 +1422,14 @@ h1 {
   z-index: 1;
 }
 
-.device-table th,
+.device-table > thead th,
 .device-table td {
   border-bottom: 1px solid rgba(159, 188, 193, 0.16);
   padding: 9px 11px;
   vertical-align: top;
 }
 
-.device-table td > small,
-.claim-link small {
+.device-table td > small {
   color: #9fb6b2;
   margin-top: 3px;
 }
@@ -1345,7 +1437,6 @@ h1 {
 .table-sort,
 .entity-link,
 .subtle-link,
-.claim-link,
 .row-actions button {
   border: 0;
   background: transparent;
@@ -1356,13 +1447,12 @@ h1 {
 
 .table-sort,
 .entity-link,
-.subtle-link,
-.claim-link {
+.subtle-link {
   cursor: pointer;
 }
 
 .entity-link,
-.claim-link {
+.device-group-row strong {
   color: #41d4c8;
 }
 
@@ -1395,9 +1485,53 @@ h1 {
 }
 
 .row-actions button:hover,
-.entity-link:hover,
-.claim-link:hover {
+.entity-link:hover {
   text-decoration: underline;
+}
+
+.device-group-row th {
+  background: #152724;
+  border-bottom: 1px solid rgba(159, 188, 193, 0.24);
+  padding: 0;
+  text-align: left;
+}
+
+.device-group-row button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  gap: 9px;
+  padding: 9px 11px;
+  text-align: left;
+  width: 100%;
+}
+
+.device-group-row small {
+  color: #78908c;
+  font-weight: 400;
+}
+
+.device-tree-cell {
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.device-tree-cell > div {
+  display: grid;
+  gap: 3px;
+}
+
+.tree-branch {
+  color: #78908c;
+}
+
+.relationship-label {
+  color: #83eee5;
+  font-size: 0.68rem;
+  text-transform: capitalize;
 }
 
 .inline-warning {

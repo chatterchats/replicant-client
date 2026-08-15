@@ -205,17 +205,6 @@ function Inspector({
                 <dd>{device.travel_destination}</dd>
               </>
             )}
-            {device.claim && (
-              <>
-                <dt>Workflow claim</dt>
-                <dd>
-                  {device.claim.workflow_kind}
-                  <small>
-                    {device.claim.workflow_id} · {device.claim.workflow_status}
-                  </small>
-                </dd>
-              </>
-            )}
           </dl>
         ) : summary ? (
           <dl>
@@ -571,11 +560,6 @@ export function App() {
                   setSelectedSystem(system);
                   select({ kind: "system", id: system });
                   navigate("System");
-                }}
-                onSelectWorkflow={(workflowId) => {
-                  setSelectedAutomationWorkflow(workflowId);
-                  select({ kind: "workflow", id: workflowId });
-                  navigate("Automations");
                 }}
                 onRunCommand={(command) => {
                   setGalaxyCommand(command);

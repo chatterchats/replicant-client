@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DeviceSelection,
   DevicesContent,
+  deviceCategory,
   filterAndSortDevices,
+  groupDevices,
+  normalizedDeviceStatus,
+  systemOptions,
   type DeviceFilters,
 } from "./DevicesPage";
 import type { DeviceSummary, DevicesSnapshot } from "./protocol";
@@ -20,7 +24,7 @@ const device = (
   ownership: "owned",
   owner: "R-1",
   system: "SOL",
-  location: "EARTH",
+  location: "SOL-1",
   tags: [],
   attached_to: null,
   stowed_in: null,
@@ -45,9 +49,7 @@ const filters: DeviceFilters = {
   status: "",
   type: "",
   system: "",
-  location: "",
-  ownership: "",
-  claim: "",
+  owner: "",
 };
 
 function click(node: ReactNode): boolean {
@@ -61,33 +63,62 @@ function click(node: ReactNode): boolean {
 }
 
 describe("device fleet browser", () => {
-  it("searches, filters, and sorts normalized device fields", () => {
+  it("consolidates activity statuses and filters by owning replicant", () => {
     const rows = [
-      device("D-10", { tags: ["hauler"], location: "MARS", system: "SOL" }),
-      device("D-2", {
-        device_type: "survey_drone",
-        owner: "R-2",
-        status: "active",
-      }),
-      device("D-1", { ownership: "public", owner: null }),
+      device("D-1", { status: "mining (Conductive)", owner: "R-1" }),
+      device("D-2", { status: "mining (Silicates)", owner: "R-2" }),
+      device("D-3", { status: "repairing hull", owner: "R-1" }),
     ];
-    expect(
-      filterAndSortDevices(rows, { ...filters, search: "hauler" }, "code").map(
-        (row) => row.entity.id,
-      ),
-    ).toEqual(["D-10"]);
+    expect(normalizedDeviceStatus(rows[0]?.status ?? null)).toBe("mining");
+    expect(normalizedDeviceStatus(rows[2]?.status ?? null)).toBe("repairing");
     expect(
       filterAndSortDevices(
         rows,
-        { ...filters, status: "active", type: "survey_drone" },
+        { ...filters, status: "mining", owner: "R-2" },
         "code",
       ).map((row) => row.entity.id),
     ).toEqual(["D-2"]);
+  });
+
+  it("orders systems by device count and then system name", () => {
+    const rows = [
+      device("A", { system: "VEGA" }),
+      device("B", { system: "SOL" }),
+      device("C", { system: "SOL" }),
+      device("D", { system: "ALPHA" }),
+      device("E", { system: null }),
+    ];
+    expect(systemOptions(rows)).toEqual([
+      { system: "SOL", count: 2 },
+      { system: "ALPHA", count: 1 },
+      { system: "VEGA", count: 1 },
+    ]);
+  });
+
+  it("groups known types and nests physically hosted devices after parents", () => {
+    const vessel = device("VESSEL", { device_type: "heaven_vessel" });
+    const relay = device("RELAY", {
+      device_type: "ftl_relay",
+      stowed_in: "VESSEL",
+    });
+    const mining = device("MINER", { device_type: "mining_drone" });
+    const groups = groupDevices([vessel, relay, mining]);
+
+    expect(deviceCategory("ftl_relay")).toBe("ftl_comms");
+    expect(deviceCategory("future_device")).toBe("other");
+    expect(groups.map((group) => group.label)).toEqual(["Vessel", "Mining"]);
     expect(
-      filterAndSortDevices(rows, filters, "code", true).map(
-        (row) => row.entity.id,
-      ),
-    ).toEqual(["D-10", "D-2", "D-1"]);
+      groups
+        .at(0)
+        ?.rows.map((row) => [
+          row.device.entity.id,
+          row.depth,
+          row.relationship,
+        ]),
+    ).toEqual([
+      ["VESSEL", 0, null],
+      ["RELAY", 1, "stowed"],
+    ]);
   });
 
   it("selects a row for the global inspector", () => {
@@ -97,7 +128,7 @@ describe("device fleet browser", () => {
     expect(onSelectDevice).toHaveBeenCalledWith(row);
   });
 
-  it("presents claims and unknown device types without raw JSON", () => {
+  it("renders counted systems and collapsible category headers without claims", () => {
     const snapshot: DevicesSnapshot = {
       metadata: { revision: 7, generated_at_ms: 10 },
       devices: [
@@ -122,12 +153,13 @@ describe("device fleet browser", () => {
         onSelectDevice={() => undefined}
         onSelectEntity={() => undefined}
         onOpenSystem={() => undefined}
-        onSelectWorkflow={() => undefined}
         onRunCommand={() => undefined}
       />,
     );
-    expect(html).toContain("future_device");
-    expect(html).toContain("transport.route");
-    expect(html).toContain("wf-1");
+    expect(html).toContain("SOL");
+    expect(html).toContain("1 device");
+    expect(html).toContain("Other");
+    expect(html).not.toContain("transport.route");
+    expect(html).not.toContain("Claim");
   });
 });
