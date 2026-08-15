@@ -671,36 +671,6 @@ export function App() {
                     )}
                   </div>
                 </section>
-
-                {entityList.length || workflows.length ? (
-                  <section className="entity-list" aria-label="Live entities">
-                    <h2>Live entities</h2>
-                    <div>
-                      {entityList.map((entity) => (
-                        <button
-                          key={`${entity.kind}:${entity.id}`}
-                          onClick={() => {
-                            select(entity);
-                          }}
-                        >
-                          <small>{entity.kind}</small>
-                          {entity.id}
-                        </button>
-                      ))}
-                      {workflows.map((workflow) => (
-                        <button
-                          key={workflow.id}
-                          onClick={() => {
-                            select({ kind: "workflow", id: workflow.id });
-                          }}
-                        >
-                          <small>workflow · {workflow.status}</small>
-                          {workflow.kind}
-                        </button>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
               </article>
             )}
           </div>

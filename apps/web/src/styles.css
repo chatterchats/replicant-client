@@ -534,34 +534,6 @@ h1 {
 .error-state {
   color: #ef6b7a;
 }
-.entity-list {
-  margin-top: 36px;
-}
-.entity-list h2 {
-  font-size: 0.8rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.entity-list > div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.entity-list button {
-  display: grid;
-  gap: 3px;
-  min-width: 140px;
-  border: 1px solid rgba(159, 188, 193, 0.16);
-  border-radius: 6px;
-  background: #1a302c;
-  padding: 10px 12px;
-  text-align: left;
-  cursor: pointer;
-}
-.entity-list button:hover {
-  border-color: rgba(65, 212, 200, 0.55);
-}
-.entity-list small,
 .drawer-header small {
   color: #78908c;
   text-transform: uppercase;
