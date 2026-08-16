@@ -482,11 +482,16 @@ fn mark_event_continuity_degraded(client: &Client) {
     });
 }
 
+/// The durable, coalesced work item standing for "event continuity is
+/// degraded and needs reconciliation". Its successful completion is the
+/// signal [`run_reconciliation_worker`] uses to restore `event_catchup`.
+const EVENT_CONTINUITY_WORK_ID: &str = "account:event-continuity";
+
 fn schedule_continuity_reconciliation(client: &Client) -> Result<()> {
     client
         .managed_state()
         .enqueue_reconciliation(
-            "account:event-continuity",
+            EVENT_CONTINUITY_WORK_ID,
             &Realm::Live,
             "account",
             &serde_json::json!({ "id": "account" }),
@@ -926,6 +931,11 @@ async fn run_reconciliation_worker(weak: WeakClient, idle_interval: Duration) {
                         let _ = client
                             .managed_state()
                             .complete_reconciliation_work(&work.work_id);
+                        if work.work_id == EVENT_CONTINUITY_WORK_ID {
+                            client.set_readiness(|readiness| {
+                                readiness.event_catchup = ReadinessComponent::Ready;
+                            });
+                        }
                     }
                     Err(_) => {
                         let _ = client
