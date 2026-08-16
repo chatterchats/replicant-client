@@ -17,6 +17,10 @@ const INF_COMPONENT: u32 = u32::MAX / 8;
 const EPSILON: f64 = 1e-9;
 const EXACT_TERMINAL_LIMIT: usize = 20;
 const EXACT_EXECUTION_STOP_LIMIT: usize = 16;
+/// Upper bound on `2^terminals * candidate_nodes` DP states. Each state costs
+/// 16 bytes across the `dp` and `parent` tables, so this caps exact-solver
+/// memory at roughly 1 GiB even after corridor pruning.
+const EXACT_STATE_LIMIT: usize = 64_000_000;
 
 /// A position in the galaxy, measured in light-years.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -208,6 +212,18 @@ pub enum PlannerError {
         actual: usize,
         /// Maximum exact-solver terminal count.
         limit: usize,
+    },
+    /// Even after corridor pruning, the exact search table would not fit in
+    /// memory. Requesting fewer targets per plan resolves this.
+    #[error(
+        "exact planning over {nodes} candidate systems with {terminals} terminals exceeds the \
+         supported search size; plan fewer targets at once"
+    )]
+    ExactSearchTooLarge {
+        /// Candidate systems remaining after corridor pruning.
+        nodes: usize,
+        /// Number of start-plus-target terminals requested.
+        terminals: usize,
     },
     /// No connected network exists in the supplied graph.
     #[error("no relay network connects every requested system")]
@@ -658,12 +674,15 @@ impl Cost {
     }
 }
 
+/// DP back-pointer. Payloads are `u32` so one entry costs 8 bytes instead of
+/// 16: vertex indices are bounded by the star catalogue and submasks by
+/// `2^EXACT_TERMINAL_LIMIT`, both far below `u32::MAX`.
 #[derive(Clone, Copy, Debug, Default)]
 enum Parent {
     #[default]
     None,
-    Move(usize),
-    Split(usize),
+    Move(u32),
+    Split(u32),
 }
 
 /// Solves the exact minimum-new-relay Steiner tree.
@@ -689,25 +708,18 @@ pub fn plan_relay_network_with_ranges(
     if request.targets.is_empty() {
         return Err(PlannerError::NoTargets);
     }
-    let graph = StarGraph::with_relay_ranges(stars, request.max_hop_ly, &relay_ranges_ly)?;
-    let start = graph.resolve(&request.start)?;
+    let full_graph = StarGraph::with_relay_ranges(stars, request.max_hop_ly, &relay_ranges_ly)?;
 
-    let mut target_names = request.targets;
+    let mut target_names = request.targets.clone();
     target_names.sort();
     target_names.dedup();
     target_names.retain(|target| target != &request.start);
     if target_names.is_empty() {
         return Err(PlannerError::NoTargets);
     }
-    let targets = target_names
-        .iter()
-        .map(|target| graph.resolve(target))
-        .collect::<Result<Vec<_>, _>>()?;
 
-    let terminals = std::iter::once(start)
-        .chain(targets.iter().copied())
-        .collect::<Vec<_>>();
-    let terminal_count = terminals.len();
+    let full_context = SolverContext::resolve(&full_graph, &request, &target_names)?;
+    let terminal_count = full_context.targets.len() + 1;
     if terminal_count > EXACT_TERMINAL_LIMIT {
         return Err(PlannerError::TooManyTerminals {
             actual: terminal_count,
@@ -715,24 +727,42 @@ pub fn plan_relay_network_with_ranges(
         });
     }
 
-    let active = request
-        .active_relay_systems
-        .iter()
-        .filter_map(|system| graph.index.get(system).copied())
-        .collect::<BTreeSet<_>>();
-    let inactive = request
-        .inactive_relay_systems
-        .iter()
-        .filter_map(|system| graph.index.get(system).copied())
-        .collect::<BTreeSet<_>>();
+    // The Dreyfus-Wagner tables are `2^terminals x nodes`, which is hopeless
+    // on a full star catalogue. Restrict the exact search to the corridor of
+    // systems that can still participate in an optimal tree; the reduction is
+    // provably lossless (see `prune_to_relay_corridor`). Existing account
+    // relays cost zero new units, so with `--reuse-account-relays` the
+    // corridor automatically hugs the already-covered systems and shrinks
+    // further. Execution-route metrics still use the full graph below, so
+    // travel legs may cut through pruned systems.
+    let (graph, context) = match prune_to_relay_corridor(&full_graph, &full_context) {
+        Some(kept_stars) => {
+            let graph =
+                StarGraph::with_relay_ranges(kept_stars, request.max_hop_ly, &relay_ranges_ly)?;
+            let context = SolverContext::resolve(&graph, &request, &target_names)?;
+            (graph, context)
+        }
+        None => (full_graph.clone(), full_context),
+    };
+    let SolverContext {
+        start,
+        targets,
+        active,
+        inactive,
+        node_cost,
+    } = context;
 
-    let node_cost = (0..graph.stars.len())
-        .map(|index| {
-            Cost::node(index != start && !active.contains(&index) && !inactive.contains(&index))
-        })
+    let terminals = std::iter::once(start)
+        .chain(targets.iter().copied())
         .collect::<Vec<_>>();
     let mask_count = 1usize << terminal_count;
     let node_count = graph.stars.len();
+    if mask_count.saturating_mul(node_count) > EXACT_STATE_LIMIT {
+        return Err(PlannerError::ExactSearchTooLarge {
+            nodes: node_count,
+            terminals: terminal_count,
+        });
+    }
     let mut dp = vec![vec![Cost::INF; node_count]; mask_count];
     let mut parent = vec![vec![Parent::None; node_count]; mask_count];
 
@@ -756,7 +786,7 @@ pub fn plan_relay_network_with_ranges(
                         .subtract_node(node_cost[vertex]);
                     if candidate < dp[mask][vertex] {
                         dp[mask][vertex] = candidate;
-                        parent[mask][vertex] = Parent::Split(submask);
+                        parent[mask][vertex] = Parent::Split(submask as u32);
                     }
                 }
             }
@@ -785,6 +815,7 @@ pub fn plan_relay_network_with_ranges(
     let tree = prune_nonterminal_leaves(tree, &terminal_set);
     orient(
         &graph,
+        &full_graph,
         start,
         &targets,
         &active,
@@ -792,6 +823,176 @@ pub fn plan_relay_network_with_ranges(
         request.max_hop_ly,
         tree,
     )
+}
+
+/// Resolved solver inputs for one specific [`StarGraph`]. Vertex indices are
+/// graph-local, so corridor pruning requires re-resolution on the new graph.
+struct SolverContext {
+    start: usize,
+    targets: Vec<usize>,
+    active: BTreeSet<usize>,
+    inactive: BTreeSet<usize>,
+    node_cost: Vec<Cost>,
+}
+
+impl SolverContext {
+    fn resolve(
+        graph: &StarGraph,
+        request: &RelayNetworkRequest,
+        target_names: &[String],
+    ) -> Result<Self, PlannerError> {
+        let start = graph.resolve(&request.start)?;
+        let targets = target_names
+            .iter()
+            .map(|target| graph.resolve(target))
+            .collect::<Result<Vec<_>, _>>()?;
+        let active = request
+            .active_relay_systems
+            .iter()
+            .filter_map(|system| graph.index.get(system).copied())
+            .collect::<BTreeSet<_>>();
+        let inactive = request
+            .inactive_relay_systems
+            .iter()
+            .filter_map(|system| graph.index.get(system).copied())
+            .collect::<BTreeSet<_>>();
+        let node_cost = (0..graph.stars.len())
+            .map(|index| {
+                Cost::node(index != start && !active.contains(&index) && !inactive.contains(&index))
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            start,
+            targets,
+            active,
+            inactive,
+            node_cost,
+        })
+    }
+}
+
+/// Catalogues at or below this size are solved without pruning; the rebuild
+/// would cost more than the DP saves.
+const PRUNE_MINIMUM_NODES: usize = 64;
+
+/// Restricts the exact search to systems that can still appear in an optimal
+/// relay tree.
+///
+/// After non-terminal leaves are pruned, every vertex of an optimal Steiner
+/// tree lies on a tree path between two terminals. The new-relay count along
+/// that path cannot exceed the whole tree's count, which in turn cannot exceed
+/// any feasible solution's count. A system is therefore kept only when routing
+/// between its two cheapest terminals *through it* stays within the greedy
+/// feasible bound. Only the primary (new-relay) objective is tested, which
+/// keeps the reduction lossless under the lexicographic `(relays, hops)` cost.
+/// Systems carrying existing account relays cost zero new units, so corridors
+/// naturally widen to hug already-covered space and shrink elsewhere.
+///
+/// Returns `None` when pruning should be skipped: the catalogue is already
+/// small, a terminal is unreachable (disconnected diagnostics need the full
+/// graph), or nothing would be removed.
+fn prune_to_relay_corridor(graph: &StarGraph, context: &SolverContext) -> Option<Vec<Star>> {
+    let node_count = graph.stars.len();
+    if node_count <= PRUNE_MINIMUM_NODES {
+        return None;
+    }
+    let terminals = std::iter::once(context.start)
+        .chain(context.targets.iter().copied())
+        .collect::<Vec<_>>();
+
+    let mut from_terminal = Vec::with_capacity(terminals.len());
+    for terminal in &terminals {
+        let mut values = vec![Cost::INF; node_count];
+        let mut parents = vec![Parent::None; node_count];
+        values[*terminal] = context.node_cost[*terminal];
+        metric_closure(graph, &context.node_cost, &mut values, &mut parents);
+        if terminals.iter().any(|other| values[*other] == Cost::INF) {
+            return None;
+        }
+        from_terminal.push(values);
+    }
+    let bound = greedy_tree_relay_bound(graph, context, &terminals)?;
+
+    let terminal_set = terminals.iter().copied().collect::<BTreeSet<_>>();
+    let mut kept = Vec::with_capacity(node_count);
+    for vertex in 0..node_count {
+        if terminal_set.contains(&vertex) {
+            kept.push(graph.stars[vertex].clone());
+            continue;
+        }
+        // The two cheapest terminal approaches; their sum counts this vertex's
+        // own relay cost twice, so it is subtracted once.
+        let mut cheapest = INF_COMPONENT;
+        let mut second_cheapest = INF_COMPONENT;
+        for values in &from_terminal {
+            let relays = values[vertex].new_relays;
+            if relays < cheapest {
+                second_cheapest = cheapest;
+                cheapest = relays;
+            } else if relays < second_cheapest {
+                second_cheapest = relays;
+            }
+        }
+        if second_cheapest >= INF_COMPONENT {
+            continue;
+        }
+        let through = cheapest
+            .saturating_add(second_cheapest)
+            .saturating_sub(context.node_cost[vertex].new_relays);
+        if through <= bound {
+            kept.push(graph.stars[vertex].clone());
+        }
+    }
+    (kept.len() < node_count).then_some(kept)
+}
+
+/// New-relay count of a feasible tree built by nearest-terminal insertion.
+/// This is the upper bound that anchors [`prune_to_relay_corridor`].
+fn greedy_tree_relay_bound(
+    graph: &StarGraph,
+    context: &SolverContext,
+    terminals: &[usize],
+) -> Option<u32> {
+    let node_count = graph.stars.len();
+    let mut in_tree = vec![false; node_count];
+    in_tree[context.start] = true;
+    let mut remaining = terminals
+        .iter()
+        .copied()
+        .filter(|terminal| *terminal != context.start)
+        .collect::<BTreeSet<_>>();
+    let mut total = 0u32;
+    while !remaining.is_empty() {
+        let mut values = vec![Cost::INF; node_count];
+        let mut parents = vec![Parent::None; node_count];
+        for (vertex, member) in in_tree.iter().enumerate() {
+            if *member {
+                values[vertex] = Cost {
+                    new_relays: 0,
+                    hops: 0,
+                };
+            }
+        }
+        metric_closure(graph, &context.node_cost, &mut values, &mut parents);
+        let next = remaining
+            .iter()
+            .copied()
+            .min_by_key(|terminal| (values[*terminal], *terminal))?;
+        if values[next] == Cost::INF {
+            return None;
+        }
+        total = total.saturating_add(values[next].new_relays);
+        let mut current = next;
+        while !in_tree[current] {
+            in_tree[current] = true;
+            match parents[current] {
+                Parent::Move(previous) => current = previous as usize,
+                _ => break,
+            }
+        }
+        remaining.remove(&next);
+    }
+    Some(total)
 }
 
 fn metric_closure(
@@ -817,7 +1018,7 @@ fn metric_closure(
             });
             if candidate < values[*neighbor] {
                 values[*neighbor] = candidate;
-                parents[*neighbor] = Parent::Move(current);
+                parents[*neighbor] = Parent::Move(current as u32);
                 heap.push((Reverse(candidate), Reverse(*neighbor)));
             }
         }
@@ -836,10 +1037,12 @@ fn reconstruct(
     }
     match parent[mask][vertex] {
         Parent::Move(previous) => {
+            let previous = previous as usize;
             edges.insert(ordered_edge(vertex, previous));
             reconstruct(mask, previous, parent, edges, visited)
         }
         Parent::Split(submask) => {
+            let submask = submask as usize;
             if submask == 0 || submask == mask {
                 return Err(PlannerError::Reconstruction);
             }
@@ -904,8 +1107,13 @@ fn prune_nonterminal_leaves(
     edges
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal orientation step; grouping these into a struct would only move the noise"
+)]
 fn orient(
     graph: &StarGraph,
+    execution_graph: &StarGraph,
     start: usize,
     targets: &[usize],
     active: &BTreeSet<usize>,
@@ -999,8 +1207,12 @@ fn orient(
             }
         }
     }
+    // Deployment travel is not constrained to the pruned relay corridor, so
+    // the trip metrics run on the full catalogue graph. The start index is
+    // re-resolved because pruning renumbers vertices.
+    let execution_start = execution_graph.resolve(&graph.stars[start].designation)?;
     let (execution_order, execution_order_optimal, execution_hops, execution_distance_ly) =
-        optimize_execution_order(graph, start, &nodes)?;
+        optimize_execution_order(execution_graph, execution_start, &nodes)?;
 
     Ok(RelayNetworkPlan {
         start: graph.stars[start].designation.clone(),
@@ -1539,6 +1751,97 @@ mod tests {
         assert_eq!(plan.edges[0].parent, "HUB");
         assert_eq!(plan.edges[0].child, "REMOTE");
         assert_eq!(plan.edges[0].distance_ly, 12.0);
+    }
+
+    #[test]
+    fn corridor_pruning_preserves_the_exact_plan_on_a_large_catalogue() {
+        // A 10-system chain surrounded by a large far-away cloud that can
+        // never be part of an optimal tree. The catalogue exceeds
+        // PRUNE_MINIMUM_NODES so the pruned code path is exercised.
+        let mut stars = (0..10)
+            .map(|index| star(&format!("CHAIN{index:02}"), index as f64 * 6.0))
+            .collect::<Vec<_>>();
+        for index in 0..200 {
+            stars.push(star_at(
+                &format!("CLOUD{index:03}"),
+                (index % 20) as f64 * 6.0,
+                500.0 + (index / 20) as f64 * 6.0,
+                0.0,
+            ));
+        }
+        let request = |targets: Vec<String>| RelayNetworkRequest {
+            start: "CHAIN00".into(),
+            targets,
+            active_relay_systems: BTreeSet::new(),
+            inactive_relay_systems: BTreeSet::new(),
+            max_hop_ly: 7.499,
+        };
+        let plan = plan_relay_network(stars.clone(), request(vec!["CHAIN09".into()]))
+            .expect("pruned plan");
+        assert_eq!(plan.new_relay_systems.len(), 9);
+        assert_eq!(plan.execution_order.len(), 9);
+        assert!(plan.execution_order_optimal);
+        assert!(
+            plan.nodes
+                .iter()
+                .all(|node| node.system.starts_with("CHAIN"))
+        );
+
+        // The same plan on the corridor-only catalogue must be identical:
+        // pruning is lossless.
+        let corridor_only = stars
+            .iter()
+            .filter(|star| star.designation.starts_with("CHAIN"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let unpruned = plan_relay_network(corridor_only, request(vec!["CHAIN09".into()]))
+            .expect("small-catalogue plan");
+        assert_eq!(plan.nodes, unpruned.nodes);
+        assert_eq!(plan.edges, unpruned.edges);
+        assert_eq!(plan.execution_order, unpruned.execution_order);
+    }
+
+    #[test]
+    fn corridor_pruning_keeps_detours_through_account_relays() {
+        // The direct axis has a hole that only an off-axis chain of existing
+        // account relays can bridge; pruning must keep that chain even though
+        // it is geometrically off the corridor.
+        let mut stars = vec![
+            star_at("A", 0.0, 0.0, 0.0),
+            star_at("GOAL", 28.0, 0.0, 0.0),
+            star_at("R1", 5.0, 5.0, 0.0),
+            star_at("R2", 11.0, 7.0, 0.0),
+            star_at("R3", 17.0, 5.0, 0.0),
+            star_at("EDGE", 23.0, 3.0, 0.0),
+        ];
+        for index in 0..120 {
+            stars.push(star_at(
+                &format!("CLOUD{index:03}"),
+                (index % 12) as f64 * 6.0,
+                -400.0 - (index / 12) as f64 * 6.0,
+                0.0,
+            ));
+        }
+        let plan = plan_relay_network(
+            stars,
+            RelayNetworkRequest {
+                start: "A".into(),
+                targets: vec!["GOAL".into()],
+                active_relay_systems: BTreeSet::from(["R1".into(), "R2".into(), "R3".into()]),
+                inactive_relay_systems: BTreeSet::new(),
+                max_hop_ly: 7.499,
+            },
+        )
+        .expect("detour through account relays");
+        let systems = plan
+            .nodes
+            .iter()
+            .map(|node| node.system.as_str())
+            .collect::<Vec<_>>();
+        assert!(systems.contains(&"R1"));
+        assert!(systems.contains(&"R2"));
+        assert!(systems.contains(&"R3"));
+        assert_eq!(plan.new_relay_systems, vec!["EDGE", "GOAL"]);
     }
 
     #[test]

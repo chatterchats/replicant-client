@@ -689,6 +689,9 @@ fn assess_criterion(
             device.is_inactive()
                 && device.is_free_standing()
                 && device.location.as_deref() == Some(context.home_location.as_str())
+                // Deliberately empties the pool when the home hub *is* the
+                // event body: devices already standing there were counted as
+                // event stock above and must not be double-claimed here.
                 && device.location.as_deref() != Some(&event.location)
                 && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
         })
@@ -702,6 +705,7 @@ fn assess_criterion(
             .then_with(|| left.code.cmp(&right.code))
     });
     let mut reused_devices = Vec::new();
+    let mut reused_codes = BTreeSet::new();
     let mut print_devices = Vec::new();
     for requirement in &remaining_devices {
         let mut needed = requirement.count;
@@ -710,7 +714,7 @@ fn assess_criterion(
                 break;
             }
             if device.device_type != requirement.device_type
-                || reused_devices.contains(&device.code)
+                || reused_codes.contains(device.code.as_str())
                 || device
                     .tags
                     .iter()
@@ -718,6 +722,7 @@ fn assess_criterion(
             {
                 continue;
             }
+            reused_codes.insert(device.code.clone());
             reused_devices.push(device.code.clone());
             needed -= 1;
         }

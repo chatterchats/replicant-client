@@ -3251,6 +3251,7 @@ dependencies = [
 name = "replicant-transport"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "replicant-client",
  "serde",
  "serde_json",

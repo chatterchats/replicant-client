@@ -440,10 +440,22 @@ pub async fn discover_factories<B: PrintTime>(
     blueprints: &BTreeMap<String, B>,
 ) -> Result<Vec<FactoryState>, PrintingError> {
     let factory_codes = discover_factory_codes(client, hub).await?;
+    factory_states_for_codes(client, &factory_codes, blueprints).await
+}
 
+/// Reads live queue state for known Autofactory codes, skipping factories
+/// that cannot currently accept print jobs.
+///
+/// Factory codes at a hub are far more stable than their queue contents, so
+/// polling callers can discover codes once and refresh only the states.
+async fn factory_states_for_codes<B: PrintTime>(
+    client: &Client,
+    factory_codes: &[String],
+    blueprints: &BTreeMap<String, B>,
+) -> Result<Vec<FactoryState>, PrintingError> {
     let mut factories = Vec::with_capacity(factory_codes.len());
     for code in factory_codes {
-        let detail = client.raw().devices().get(&code).await?.value;
+        let detail = client.raw().devices().get(code).await?.value;
         if factory_status_blocks_printing(detail.status.as_deref()) {
             debug!(
                 factory = %code,
@@ -452,7 +464,7 @@ pub async fn discover_factories<B: PrintTime>(
             );
             continue;
         }
-        factories.push(factory_state_from_detail(&code, &detail, blueprints)?);
+        factories.push(factory_state_from_detail(code, &detail, blueprints)?);
     }
     Ok(factories)
 }
@@ -489,6 +501,11 @@ fn factory_state_from_detail<B: PrintTime>(
         .and_then(|printing| printing.eta_seconds)
         .unwrap_or(0.0)
         .max(0.0);
+    // Queued jobs whose type is missing from the blueprint set (locked or
+    // foreign prints) still occupy the factory. Estimating them at zero would
+    // make busy factories look idle and skew balancing, so they fall back to
+    // the typical known print time instead.
+    let fallback_seconds = typical_print_seconds(blueprints);
     let queued_seconds = detail
         .print_queue
         .iter()
@@ -496,11 +513,12 @@ fn factory_state_from_detail<B: PrintTime>(
             let quantity = integer_field(job, &["quantity", "count"])
                 .unwrap_or(1)
                 .max(1);
-            string_field(job, &["device_type", "type"])
+            let seconds_per_unit = string_field(job, &["device_type", "type"])
                 .and_then(|device_type| blueprints.get(device_type))
-                .map_or(0.0, |blueprint| {
-                    blueprint.print_time_seconds().max(0.0) * quantity as f64
-                })
+                .map_or(fallback_seconds, |blueprint| {
+                    blueprint.print_time_seconds().max(0.0)
+                });
+            seconds_per_unit * quantity as f64
         })
         .sum::<f64>();
     Ok(FactoryState {
@@ -511,6 +529,25 @@ fn factory_state_from_detail<B: PrintTime>(
         waiting_for_resources: detail.status.as_deref() == Some("waiting_for_resources"),
         remaining_seconds: active_seconds + queued_seconds,
     })
+}
+
+/// Mean positive print time across the known blueprint set, used as the load
+/// estimate for queued jobs with unknown blueprints.
+fn typical_print_seconds<B: PrintTime>(blueprints: &BTreeMap<String, B>) -> f64 {
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for blueprint in blueprints.values() {
+        let seconds = blueprint.print_time_seconds();
+        if seconds > 0.0 {
+            total += seconds;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f64
+    }
 }
 
 /// Returns the live number of available queue slots on one Autofactory.
@@ -827,78 +864,16 @@ async fn queue_print_batch_once(
     if factories.is_empty() {
         return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
     }
-    let available_factories = factories
-        .iter()
-        .filter(|factory| factory.available_slots() > 0)
-        .filter(|factory| {
-            options
-                .factory_codes
-                .as_ref()
-                .is_none_or(|codes| codes.contains(&factory.code))
-        })
-        .collect::<Vec<_>>();
-    if available_factories.is_empty() {
-        return Ok((report, false));
-    }
-
-    let workloads = available_factories
-        .iter()
-        .map(|factory| factory.workload())
-        .collect::<Vec<_>>();
-    let schedule = schedule_prints(&remaining, blueprints, &workloads)?;
-    let mut slots = available_factories
-        .iter()
-        .map(|factory| (factory.code.clone(), factory.available_slots()))
-        .collect::<BTreeMap<_, _>>();
-
-    for batch in schedule.batches {
-        let available = slots.get(&batch.factory_code).copied().unwrap_or(0);
-        let quantity =
-            usize::try_from(batch.quantity).map_err(|_| ScheduleError::InvalidQuantity {
-                device_type: batch.device_type.clone(),
-                quantity: batch.quantity,
-            })?;
-        let to_submit = available.min(quantity);
-        for _ in 0..to_submit {
-            let operation = if flatpack {
-                enqueue_print_flatpacked(
-                    client,
-                    &batch.factory_code,
-                    &batch.device_type,
-                    1,
-                    &options.tags,
-                )
-                .await?
-            } else {
-                enqueue_print(
-                    client,
-                    &batch.factory_code,
-                    &batch.device_type,
-                    1,
-                    &options.tags,
-                )
-                .await?
-            };
-            *remaining.entry(batch.device_type.clone()).or_default() -= 1;
-            *report.queued.entry(batch.device_type.clone()).or_default() += 1;
-            *report
-                .by_factory
-                .entry(batch.factory_code.clone())
-                .or_default() += 1;
-            report
-                .operation_ids
-                .push(operation.id().as_str().to_owned());
-            info!(
-                factory = %batch.factory_code,
-                device_type = %batch.device_type,
-                flatpacked = flatpack,
-                "queued dependency-safe print unit"
-            );
-        }
-        slots.insert(batch.factory_code, available.saturating_sub(to_submit));
-    }
-
-    remaining.retain(|_, quantity| *quantity > 0);
+    submit_schedulable(
+        client,
+        &mut remaining,
+        &mut report,
+        options,
+        blueprints,
+        flatpack,
+        &factories,
+    )
+    .await?;
     Ok((report, remaining.is_empty()))
 }
 
@@ -915,99 +890,32 @@ async fn queue_print_batch(
         flatpack,
         ..QueueReport::default()
     };
+    remaining.retain(|_, quantity| *quantity > 0);
     if remaining.is_empty() {
         return Ok(report);
     }
 
+    // Factory codes at the hub are stable relative to their queue contents:
+    // discover them once, then poll only the per-factory details each round.
+    // Discovery is re-run when a round submits nothing, so factories that are
+    // delivered or unfurled at the hub mid-wait are still picked up.
+    let mut factory_codes = discover_factory_codes(client, &options.hub).await?;
     let deadline = Instant::now() + options.wait_timeout;
     loop {
-        remaining.retain(|_, quantity| *quantity > 0);
-        if remaining.is_empty() {
-            return Ok(report);
-        }
-
-        let factories = discover_factories(client, &options.hub, blueprints).await?;
-        if factories.is_empty() {
+        if factory_codes.is_empty() {
             return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
         }
-        let available_factories = factories
-            .iter()
-            .filter(|factory| factory.available_slots() > 0)
-            .filter(|factory| {
-                options
-                    .factory_codes
-                    .as_ref()
-                    .is_none_or(|codes| codes.contains(&factory.code))
-            })
-            .collect::<Vec<_>>();
-        if available_factories.is_empty() {
-            if Instant::now() >= deadline {
-                return Err(PrintingError::TimedOut { remaining });
-            }
-            info!("waiting for Autofactory queue capacity");
-            sleep(options.poll_interval).await;
-            continue;
-        }
-        let workloads = available_factories
-            .iter()
-            .map(|factory| factory.workload())
-            .collect::<Vec<_>>();
-        let schedule = schedule_prints(&remaining, blueprints, &workloads)?;
-        let mut slots = available_factories
-            .iter()
-            .map(|factory| (factory.code.clone(), factory.available_slots()))
-            .collect::<BTreeMap<_, _>>();
-        let mut submitted = 0usize;
-
-        for batch in schedule.batches {
-            let available = slots.get(&batch.factory_code).copied().unwrap_or(0);
-            let quantity =
-                usize::try_from(batch.quantity).map_err(|_| ScheduleError::InvalidQuantity {
-                    device_type: batch.device_type.clone(),
-                    quantity: batch.quantity,
-                })?;
-            let to_submit = available.min(quantity);
-            for _ in 0..to_submit {
-                let operation = if flatpack {
-                    enqueue_print_flatpacked(
-                        client,
-                        &batch.factory_code,
-                        &batch.device_type,
-                        1,
-                        &options.tags,
-                    )
-                    .await?
-                } else {
-                    enqueue_print(
-                        client,
-                        &batch.factory_code,
-                        &batch.device_type,
-                        1,
-                        &options.tags,
-                    )
-                    .await?
-                };
-                *remaining.entry(batch.device_type.clone()).or_default() -= 1;
-                *report.queued.entry(batch.device_type.clone()).or_default() += 1;
-                *report
-                    .by_factory
-                    .entry(batch.factory_code.clone())
-                    .or_default() += 1;
-                report
-                    .operation_ids
-                    .push(operation.id().as_str().to_owned());
-                submitted += 1;
-                info!(
-                    factory = %batch.factory_code,
-                    device_type = %batch.device_type,
-                    flatpack,
-                    "queued distributed print unit"
-                );
-            }
-            slots.insert(batch.factory_code, available.saturating_sub(to_submit));
-        }
-
-        remaining.retain(|_, quantity| *quantity > 0);
+        let factories = factory_states_for_codes(client, &factory_codes, blueprints).await?;
+        let submitted = submit_schedulable(
+            client,
+            &mut remaining,
+            &mut report,
+            options,
+            blueprints,
+            flatpack,
+            &factories,
+        )
+        .await?;
         if remaining.is_empty() {
             return Ok(report);
         }
@@ -1016,9 +924,95 @@ async fn queue_print_batch(
         }
         if submitted == 0 {
             info!("waiting for Autofactory queue capacity");
+            factory_codes = discover_factory_codes(client, &options.hub).await?;
         }
         sleep(options.poll_interval).await;
     }
+}
+
+/// One live scheduling pass: assigns `remaining` across the given factories
+/// and submits as much as their free queue slots allow. Same-type units bound
+/// for the same factory go out as a single quantity-batched durable operation
+/// instead of one operation per unit.
+///
+/// Returns the number of units accepted this pass; `remaining` and `report`
+/// are updated in place.
+async fn submit_schedulable(
+    client: &Client,
+    remaining: &mut QuantityMap,
+    report: &mut QueueReport,
+    options: &QueueOptions,
+    blueprints: &BTreeMap<String, Blueprint>,
+    flatpack: bool,
+    factories: &[FactoryState],
+) -> Result<usize, PrintingError> {
+    let available_factories = factories
+        .iter()
+        .filter(|factory| factory.available_slots() > 0)
+        .filter(|factory| {
+            options
+                .factory_codes
+                .as_ref()
+                .is_none_or(|codes| codes.contains(&factory.code))
+        })
+        .collect::<Vec<_>>();
+    if available_factories.is_empty() {
+        return Ok(0);
+    }
+
+    let workloads = available_factories
+        .iter()
+        .map(|factory| factory.workload())
+        .collect::<Vec<_>>();
+    let schedule = schedule_prints(remaining, blueprints, &workloads)?;
+    let mut slots = available_factories
+        .iter()
+        .map(|factory| (factory.code.clone(), factory.available_slots()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut submitted = 0usize;
+    for batch in schedule.batches {
+        let available = slots.get(&batch.factory_code).copied().unwrap_or(0);
+        let quantity =
+            usize::try_from(batch.quantity).map_err(|_| ScheduleError::InvalidQuantity {
+                device_type: batch.device_type.clone(),
+                quantity: batch.quantity,
+            })?;
+        let to_submit = available.min(quantity);
+        if to_submit == 0 {
+            continue;
+        }
+        let submit_quantity = i64::try_from(to_submit).unwrap_or(i64::MAX);
+        let operation = enqueue_print_configured(
+            client,
+            &batch.factory_code,
+            &batch.device_type,
+            submit_quantity,
+            &options.tags,
+            flatpack,
+        )
+        .await?;
+        *remaining.entry(batch.device_type.clone()).or_default() -= submit_quantity;
+        *report.queued.entry(batch.device_type.clone()).or_default() += submit_quantity;
+        *report
+            .by_factory
+            .entry(batch.factory_code.clone())
+            .or_default() += submit_quantity;
+        report
+            .operation_ids
+            .push(operation.id().as_str().to_owned());
+        submitted += to_submit;
+        info!(
+            factory = %batch.factory_code,
+            device_type = %batch.device_type,
+            quantity = submit_quantity,
+            flatpacked = flatpack,
+            "queued distributed print batch"
+        );
+        slots.insert(batch.factory_code, available.saturating_sub(to_submit));
+    }
+    remaining.retain(|_, quantity| *quantity > 0);
+    Ok(submitted)
 }
 
 fn component_dependency_types(
@@ -1078,22 +1072,7 @@ async fn waiting_parent_requests(
     client: &Client,
     hub: &str,
 ) -> Result<Vec<PrintRequest>, PrintingError> {
-    let handles = client
-        .devices()
-        .find()
-        .owned()
-        .of_type(DeviceType::from(AUTOFACTORY))
-        .at(hub)
-        .collect()
-        .await?;
-    let mut factory_codes = Vec::new();
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
-        if device_type(&snapshot) == Some(AUTOFACTORY) && device_location(&snapshot) == Some(hub) {
-            factory_codes.push(handle.id().as_str().to_owned());
-        }
-    }
-    factory_codes.sort();
+    let factory_codes = discover_factory_codes(client, hub).await?;
 
     let mut requests = Vec::new();
     for factory_code in factory_codes {
@@ -1136,24 +1115,7 @@ async fn wait_for_existing_component_work(
     let mut saw_pending = false;
     let mut clear_after_pending = false;
     loop {
-        let handles = client
-            .devices()
-            .find()
-            .owned()
-            .of_type(DeviceType::from(AUTOFACTORY))
-            .at(hub)
-            .collect()
-            .await?;
-        let mut factory_codes = Vec::new();
-        for handle in handles {
-            let snapshot = handle.snapshot().await?;
-            if device_type(&snapshot) == Some(AUTOFACTORY)
-                && device_location(&snapshot) == Some(hub)
-            {
-                factory_codes.push(handle.id().as_str().to_owned());
-            }
-        }
-        factory_codes.sort();
+        let factory_codes = discover_factory_codes(client, hub).await?;
 
         let mut pending_factories = BTreeSet::new();
         let mut pending_types = BTreeSet::new();

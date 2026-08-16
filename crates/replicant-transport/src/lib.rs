@@ -10,9 +10,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
+use futures::future;
 use replicant_client::{Client, Device, Operation, OperationStatus, raw};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -22,6 +24,11 @@ use tracing::info;
 
 /// Resource quantities keyed by Replicant Space resource type.
 pub type ResourceMap = BTreeMap<String, i64>;
+
+/// Maximum number of transports auto-selected when the caller does not pin an
+/// explicit [`CarrierPreference`]. Trips run concurrently per transport, so
+/// this bounds how much of the free fleet one delivery may claim.
+const DEFAULT_TRANSPORT_LIMIT: usize = 3;
 
 const RESERVED_TAG_PREFIXES: &[&str] = &[
     "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
@@ -649,9 +656,13 @@ fn select_payload_devices(
             });
         }
     }
+    // Keep the origin-preference order (exact match, then belts, then the
+    // rest) established by the per-selector sorts above; a plain lexicographic
+    // sort on the location string would silently undo it.
     selected.sort_by(|left, right| {
-        left.origin
-            .cmp(&right.origin)
+        origin_location_rank(origin, &left.origin)
+            .cmp(&origin_location_rank(origin, &right.origin))
+            .then_with(|| left.origin.cmp(&right.origin))
             .then_with(|| left.device_type.cmp(&right.device_type))
             .then_with(|| left.code.cmp(&right.code))
     });
@@ -750,17 +761,31 @@ async fn select_transports(
     });
 
     let mut selected = Vec::new();
+    let mut selected_capacity = 0i64;
     for candidate in eligible {
+        let enough = match preference {
+            // An explicit preference pins the exact transport count.
+            Some(preference) => selected.len() >= preference.quantity,
+            // Otherwise take just enough hulls to cover the demand in one
+            // concurrent wave, bounded so a single delivery cannot claim the
+            // whole free fleet.
+            None => {
+                !selected.is_empty()
+                    && (selected_capacity >= demand.max(1)
+                        || selected.len() >= DEFAULT_TRANSPORT_LIMIT)
+            }
+        };
+        if enough {
+            break;
+        }
         if kind == CapacityKind::Cargo {
             let detail = client.raw().devices().get(&candidate.code).await?.value;
             if detail.controller_device_code.is_some() || !cargo_map(&detail).is_empty() {
                 continue;
             }
         }
+        selected_capacity = selected_capacity.saturating_add(kind.capacity(candidate));
         selected.push(candidate.code.clone());
-        if selected.len() == quantity {
-            break;
-        }
     }
 
     if selected.len() < quantity {
@@ -802,55 +827,97 @@ async fn deliver_resource_pickups(
 
     let mut delivered = ResourceMap::new();
     for pickup in pickups {
-        let mut remaining = pickup.resources.clone();
-        while !remaining.is_empty() {
-            let before = sum_resources(&remaining);
-            for code in transports {
-                settle_transport_between(client, code, &pickup.location, destination, options)
-                    .await?;
-                ensure_device_at(client, code, &pickup.location, options).await?;
-                let mut detail = client.raw().devices().get(code).await?.value;
-                ensure_uncontrolled(&detail, code)?;
-                if !cargo_map(&detail).is_empty() {
-                    deposit_all(client, code, options).await?;
-                    detail = client.raw().devices().get(code).await?.value;
-                }
-                let capacity = detail.cargo_capacity.unwrap_or(0);
-                if capacity <= 0 {
-                    return Err(TransportError::Invalid(format!(
-                        "transport {code} has no usable cargo capacity"
-                    )));
-                }
-                let manifest = take_manifest(&remaining, capacity);
-                if manifest.is_empty() {
-                    continue;
-                }
-                info!(
-                    transport = %code,
-                    origin = %pickup.location,
-                    destination = %destination,
-                    manifest = %format_resources(&manifest),
-                    "delivering resource manifest"
-                );
-                collect_resources(client, code, &manifest, options).await?;
-                ensure_device_at(client, code, destination, options).await?;
-                deposit_resources(client, code, Some(&manifest), options).await?;
-                subtract_resources(&mut remaining, &manifest);
-                merge_resources(&mut delivered, &manifest);
-                if remaining.is_empty() {
-                    break;
-                }
-                ensure_device_at(client, code, &pickup.location, options).await?;
-            }
-            if sum_resources(&remaining) >= before {
-                return Err(TransportError::Invalid(format!(
-                    "no cargo transport made progress on remaining manifest {}",
-                    format_resources(&remaining)
-                )));
-            }
+        // Every selected transport runs its own trip loop concurrently,
+        // reserving manifest slices under the lock so no unit is carried
+        // twice. Any worker error aborts the whole pickup, matching the
+        // previous sequential semantics.
+        let remaining = Mutex::new(pickup.resources.clone());
+        let pickup_delivered = Mutex::new(ResourceMap::new());
+        future::try_join_all(transports.iter().map(|code| {
+            run_cargo_trips(
+                client,
+                code,
+                &pickup.location,
+                destination,
+                &remaining,
+                &pickup_delivered,
+                options,
+            )
+        }))
+        .await?;
+        let remaining = into_inner(remaining);
+        if !remaining.is_empty() {
+            return Err(TransportError::Invalid(format!(
+                "no cargo transport made progress on remaining manifest {}",
+                format_resources(&remaining)
+            )));
         }
+        merge_resources(&mut delivered, &into_inner(pickup_delivered));
     }
     Ok(delivered)
+}
+
+/// One cargo transport's trip loop between a pickup location and the
+/// destination. Runs until the shared remaining manifest is drained.
+async fn run_cargo_trips(
+    client: &Client,
+    code: &str,
+    origin: &str,
+    destination: &str,
+    remaining: &Mutex<ResourceMap>,
+    delivered: &Mutex<ResourceMap>,
+    options: DeliveryOptions,
+) -> Result<()> {
+    loop {
+        if lock(remaining).is_empty() {
+            return Ok(());
+        }
+        settle_transport_between(client, code, origin, destination, options).await?;
+        ensure_device_at(client, code, origin, options).await?;
+        let mut detail = client.raw().devices().get(code).await?.value;
+        ensure_uncontrolled(&detail, code)?;
+        if !cargo_map(&detail).is_empty() {
+            deposit_all(client, code, options).await?;
+            detail = client.raw().devices().get(code).await?.value;
+        }
+        let capacity = detail.cargo_capacity.unwrap_or(0);
+        if capacity <= 0 {
+            return Err(TransportError::Invalid(format!(
+                "transport {code} has no usable cargo capacity"
+            )));
+        }
+        // Reserve while holding the lock so concurrent transports never take
+        // the same units. A failed trip aborts the whole delivery, so a
+        // reservation is never silently dropped.
+        let manifest = {
+            let mut remaining = lock(remaining);
+            let manifest = take_manifest(&remaining, capacity);
+            subtract_resources(&mut remaining, &manifest);
+            manifest
+        };
+        if manifest.is_empty() {
+            return Ok(());
+        }
+        info!(
+            transport = %code,
+            origin = %origin,
+            destination = %destination,
+            manifest = %format_resources(&manifest),
+            "delivering resource manifest"
+        );
+        collect_resources(client, code, &manifest, options).await?;
+        ensure_device_at(client, code, destination, options).await?;
+        deposit_resources(client, code, Some(&manifest), options).await?;
+        merge_resources(&mut lock(delivered), &manifest);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn into_inner<T>(mutex: Mutex<T>) -> T {
+    mutex.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
 async fn deliver_payload_devices(
@@ -883,9 +950,11 @@ async fn deliver_payload_devices(
 
     let mut delivered = Vec::new();
     for (origin, remaining_payloads) in by_origin {
-        // Resume-safe cleanup comes first. A previous run may have reached the
-        // destination and detached the payload, or arrived with it still
-        // attached to one of the selected carriers.
+        // Resume-safe cleanup comes first, sequentially. A previous run may
+        // have (a) already delivered payloads now standing free at the
+        // destination, (b) reached the destination with payloads still
+        // attached, or (c) attached payloads at the origin before travelling.
+        // The concurrent trips below assume every carrier starts empty.
         for payload in &remaining_payloads {
             if device_already_delivered(client, &payload.code, destination).await? {
                 if options.unfurl_modular_payload {
@@ -903,19 +972,15 @@ async fn deliver_payload_devices(
                 .iter()
                 .filter_map(reference_code)
                 .collect::<Vec<_>>();
-            let unexpected = attached
-                .iter()
-                .filter(|code| !payload_codes.contains(code.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !unexpected.is_empty() {
-                return Err(TransportError::Invalid(format!(
-                    "carrier {carrier} contains non-delivery attachments: {}",
-                    unexpected.join(", ")
-                )));
+            ensure_only_delivery_attachments(carrier, &attached, &payload_codes)?;
+            if attached.is_empty() {
+                continue;
             }
-            if !attached.is_empty() && detail.location.as_deref() == Some(destination) {
-                detach_devices(client, carrier, &attached, options).await?;
+            // Detach wherever the carrier settled: at the destination the
+            // payload counts as delivered, anywhere else it re-enters the
+            // still-needed pool for the trips below.
+            detach_devices(client, carrier, &attached, options).await?;
+            if detail.location.as_deref() == Some(destination) {
                 if options.unfurl_modular_payload {
                     unfurl_modular_devices(client, &attached, options).await?;
                 }
@@ -925,90 +990,138 @@ async fn deliver_payload_devices(
         delivered.sort();
         delivered.dedup();
 
-        let mut remaining = remaining_payloads
+        // Every selected carrier runs its own trip loop concurrently,
+        // reserving payload devices under the lock so no device is attached
+        // by two carriers.
+        let remaining = remaining_payloads
             .into_iter()
             .filter(|payload| !delivered.contains(&payload.code))
             .collect::<Vec<_>>();
-        while !remaining.is_empty() {
-            let before = remaining.len();
-            for carrier in carriers {
-                settle_transport_between(client, carrier, &origin, destination, options).await?;
-                ensure_device_at(client, carrier, &origin, options).await?;
-                let detail = client.raw().devices().get(carrier).await?.value;
-                let existing = detail
-                    .attached_devices
-                    .iter()
-                    .filter_map(reference_code)
-                    .collect::<Vec<_>>();
-                if !existing.is_empty() {
-                    let unexpected = existing
-                        .iter()
-                        .filter(|code| !payload_codes.contains(code.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !unexpected.is_empty() {
-                        return Err(TransportError::Invalid(format!(
-                            "carrier {carrier} contains non-delivery attachments: {}",
-                            unexpected.join(", ")
-                        )));
-                    }
-                    // An interrupted run may have attached the planned payload
-                    // at the origin before travelling. Detach it so the trip can
-                    // be rebuilt from the still-needed set below.
-                    detach_devices(client, carrier, &existing, options).await?;
-                }
-
-                let capacity = detail.attach_capacity.unwrap_or(0).max(0);
-                if capacity == 0 {
-                    continue;
-                }
-                let trip_count = usize::try_from(capacity)
-                    .unwrap_or(usize::MAX)
-                    .min(remaining.len());
-                let selected = remaining
-                    .iter()
-                    .take(trip_count)
-                    .map(|payload| payload.code.clone())
-                    .collect::<Vec<_>>();
-                if selected.is_empty() {
-                    continue;
-                }
-                for code in &selected {
-                    ensure_attachable_device(client, code, options).await?;
-                }
-                info!(
-                    carrier = %carrier,
-                    origin = %origin,
-                    destination = %destination,
-                    payload = %selected.join(","),
-                    "delivering device payload"
-                );
-                attach_devices(client, carrier, &selected, options).await?;
-                ensure_device_at(client, carrier, destination, options).await?;
-                detach_devices(client, carrier, &selected, options).await?;
-                if options.unfurl_modular_payload {
-                    unfurl_modular_devices(client, &selected, options).await?;
-                }
-                delivered.extend(selected.iter().cloned());
-                delivered.sort();
-                delivered.dedup();
-                remaining.retain(|payload| !selected.contains(&payload.code));
-                if remaining.is_empty() {
-                    break;
-                }
-                ensure_device_at(client, carrier, &origin, options).await?;
-            }
-            if remaining.len() >= before {
-                return Err(TransportError::Invalid(format!(
-                    "no carrier made progress on {} remaining payload device(s) from {origin}",
-                    remaining.len()
-                )));
-            }
+        let remaining = Mutex::new(remaining);
+        let origin_delivered = Mutex::new(Vec::<String>::new());
+        future::try_join_all(carriers.iter().map(|carrier| {
+            run_carrier_trips(
+                client,
+                carrier,
+                &origin,
+                destination,
+                &payload_codes,
+                &remaining,
+                &origin_delivered,
+                options,
+            )
+        }))
+        .await?;
+        let leftover = into_inner(remaining);
+        if !leftover.is_empty() {
+            return Err(TransportError::Invalid(format!(
+                "no carrier made progress on {} remaining payload device(s) from {origin}",
+                leftover.len()
+            )));
         }
+        delivered.extend(into_inner(origin_delivered));
+        delivered.sort();
+        delivered.dedup();
     }
     delivered.sort();
     delivered.dedup();
     Ok(delivered)
+}
+
+/// One attachment carrier's trip loop between an origin and the destination.
+/// Runs until the shared payload pool is drained.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal worker sharing per-origin delivery state; a struct would only relocate the noise"
+)]
+async fn run_carrier_trips(
+    client: &Client,
+    carrier: &str,
+    origin: &str,
+    destination: &str,
+    payload_codes: &BTreeSet<String>,
+    remaining: &Mutex<Vec<PayloadDevice>>,
+    delivered: &Mutex<Vec<String>>,
+    options: DeliveryOptions,
+) -> Result<()> {
+    loop {
+        if lock(remaining).is_empty() {
+            return Ok(());
+        }
+        settle_transport_between(client, carrier, origin, destination, options).await?;
+        ensure_device_at(client, carrier, origin, options).await?;
+        let detail = client.raw().devices().get(carrier).await?.value;
+        let existing = detail
+            .attached_devices
+            .iter()
+            .filter_map(reference_code)
+            .collect::<Vec<_>>();
+        if !existing.is_empty() {
+            ensure_only_delivery_attachments(carrier, &existing, payload_codes)?;
+            // Another automation attached delivery payloads mid-run; drop them
+            // back at the origin so this trip starts from a clean carrier.
+            detach_devices(client, carrier, &existing, options).await?;
+        }
+
+        let capacity = detail.attach_capacity.unwrap_or(0).max(0);
+        if capacity == 0 {
+            return Ok(());
+        }
+        // Reserve while holding the lock so concurrent carriers never claim
+        // the same payload device. A failed trip aborts the whole delivery,
+        // so a reservation is never silently dropped.
+        let selected = {
+            let mut remaining = lock(remaining);
+            let take = usize::try_from(capacity)
+                .unwrap_or(usize::MAX)
+                .min(remaining.len());
+            remaining.drain(..take).collect::<Vec<_>>()
+        };
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let selected = selected
+            .iter()
+            .map(|payload| payload.code.clone())
+            .collect::<Vec<_>>();
+        for code in &selected {
+            ensure_attachable_device(client, code, options).await?;
+        }
+        info!(
+            carrier = %carrier,
+            origin = %origin,
+            destination = %destination,
+            payload = %selected.join(","),
+            "delivering device payload"
+        );
+        attach_devices(client, carrier, &selected, options).await?;
+        ensure_device_at(client, carrier, destination, options).await?;
+        detach_devices(client, carrier, &selected, options).await?;
+        if options.unfurl_modular_payload {
+            unfurl_modular_devices(client, &selected, options).await?;
+        }
+        lock(delivered).extend(selected);
+    }
+}
+
+fn ensure_only_delivery_attachments(
+    carrier: &str,
+    attached: &[String],
+    payload_codes: &BTreeSet<String>,
+) -> Result<()> {
+    let unexpected = attached
+        .iter()
+        .filter(|code| !payload_codes.contains(code.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unexpected.is_empty() {
+        Ok(())
+    } else {
+        Err(TransportError::Invalid(format!(
+            "carrier {carrier} contains non-delivery attachments: {}",
+            unexpected.join(", ")
+        )))
+    }
 }
 async fn device_already_delivered(client: &Client, code: &str, destination: &str) -> Result<bool> {
     let detail = client.raw().devices().get(code).await?.value;
@@ -1068,7 +1181,7 @@ async fn ensure_device_at(
     {
         return Ok(());
     }
-    if let Some(travel) = &snapshot.travel {
+    let operation = if let Some(travel) = &snapshot.travel {
         let planned = travel
             .final_destination
             .as_ref()
@@ -1080,6 +1193,7 @@ async fn ensure_device_at(
                 planned
             )));
         }
+        None
     } else {
         info!(device = %code, destination = %destination, "dispatching transport travel");
         let operation = handle
@@ -1090,9 +1204,10 @@ async fn ensure_device_at(
             })
             .await?;
         ensure_operation_accepted(&operation).await?;
-    }
+        Some(operation)
+    };
 
-    wait_for_device(client, code, options, |device| {
+    wait_for_device(client, code, operation.as_ref(), options, |device| {
         device.travel.is_none()
             && device
                 .location
@@ -1102,9 +1217,16 @@ async fn ensure_device_at(
     .await
 }
 
+/// Polls the managed device state until `predicate` holds.
+///
+/// When the wait was triggered by a durable operation, passing it here aborts
+/// the poll as soon as that operation is classified as rejected, instead of
+/// running out the full `wait_timeout` against a state change that will never
+/// happen.
 async fn wait_for_device(
     client: &Client,
     code: &str,
+    operation: Option<&Operation>,
     options: DeliveryOptions,
     predicate: impl Fn(&Device) -> bool,
 ) -> Result<()> {
@@ -1114,6 +1236,7 @@ async fn wait_for_device(
         if predicate(&snapshot) {
             return Ok(());
         }
+        ensure_operation_not_rejected(operation, code).await?;
         if Instant::now() >= deadline {
             return Err(TransportError::TimedOut(format!(
                 "timed out waiting for device {code} state"
@@ -1121,6 +1244,23 @@ async fn wait_for_device(
         }
         sleep(options.poll_interval).await;
     }
+}
+
+/// Errors when a watched durable operation has been definitively rejected.
+async fn ensure_operation_not_rejected(operation: Option<&Operation>, code: &str) -> Result<()> {
+    let Some(operation) = operation else {
+        return Ok(());
+    };
+    let outcome = operation.outcome().await?;
+    if operation_rejected(outcome.status) {
+        return Err(TransportError::Operation(format!(
+            "operation {} ended as {:?} while waiting for device {code}: {:?}",
+            operation.id().as_str(),
+            outcome.status,
+            outcome.response
+        )));
+    }
+    Ok(())
 }
 
 async fn ensure_attachable_device(
@@ -1137,7 +1277,7 @@ async fn ensure_attachable_device(
     if detail.stowed_in_device_code.is_some() {
         let operation = client.devices().get(code).await?.deploy().await?;
         ensure_operation_accepted(&operation).await?;
-        wait_for_raw_device(client, code, options, |device| {
+        wait_for_raw_device(client, code, Some(&operation), options, |device| {
             device.stowed_in_device_code.is_none()
         })
         .await?;
@@ -1148,13 +1288,13 @@ async fn ensure_attachable_device(
         return Ok(());
     }
     if status_is(&detail, "compacting") {
-        return wait_for_raw_device(client, code, options, |device| {
+        return wait_for_raw_device(client, code, None, options, |device| {
             status_is(device, "compacted")
         })
         .await;
     }
     if status_is(&detail, "unfurling") {
-        wait_for_raw_device(client, code, options, |device| {
+        wait_for_raw_device(client, code, None, options, |device| {
             !status_is(device, "unfurling")
         })
         .await?;
@@ -1178,7 +1318,7 @@ async fn ensure_attachable_device(
     info!(device = %code, "compacting modular payload for transport");
     let operation = client.devices().get(code).await?.compact().await?;
     ensure_operation_accepted(&operation).await?;
-    wait_for_raw_device(client, code, options, |device| {
+    wait_for_raw_device(client, code, Some(&operation), options, |device| {
         status_is(device, "compacted")
             && device.attached_to_device_code.is_none()
             && device.stowed_in_device_code.is_none()
@@ -1209,7 +1349,7 @@ async fn attach_devices(
         .await?;
     ensure_operation_accepted(&operation).await?;
     for code in devices {
-        wait_for_device(client, code, options, |device| {
+        wait_for_device(client, code, Some(&operation), options, |device| {
             device
                 .relationships
                 .attached_to
@@ -1247,7 +1387,7 @@ async fn detach_devices(
         .await?;
     ensure_operation_accepted(&operation).await?;
     for code in devices {
-        wait_for_device(client, code, options, |device| {
+        wait_for_device(client, code, Some(&operation), options, |device| {
             device.relationships.attached_to.is_none()
         })
         .await?;
@@ -1266,7 +1406,7 @@ async fn unfurl_modular_devices(
             continue;
         }
         if status_is(&detail, "unfurling") {
-            wait_for_raw_device(client, code, options, |device| {
+            wait_for_raw_device(client, code, None, options, |device| {
                 !status_is(device, "unfurling")
             })
             .await?;
@@ -1283,7 +1423,7 @@ async fn unfurl_modular_devices(
         info!(device = %code, "unfurling modular payload after delivery");
         let operation = client.devices().get(code).await?.unfurl().await?;
         ensure_operation_accepted(&operation).await?;
-        wait_for_raw_device(client, code, options, |device| {
+        wait_for_raw_device(client, code, Some(&operation), options, |device| {
             !status_is(device, "compacted")
                 && !status_is(device, "compacting")
                 && !status_is(device, "unfurling")
@@ -1313,7 +1453,7 @@ async fn collect_resources(
         })
         .await?;
     ensure_operation_accepted(&operation).await?;
-    wait_for_raw_device(client, code, options, |device| {
+    wait_for_raw_device(client, code, Some(&operation), options, |device| {
         let cargo = cargo_map(device);
         resources.iter().all(|(resource, quantity)| {
             cargo.get(resource).copied().unwrap_or(0)
@@ -1351,7 +1491,7 @@ async fn deposit_resources(
         })
         .await?;
     ensure_operation_accepted(&operation).await?;
-    wait_for_raw_device(client, code, options, |device| {
+    wait_for_raw_device(client, code, Some(&operation), options, |device| {
         let cargo = cargo_map(device);
         requested.iter().all(|(resource, quantity)| {
             cargo.get(resource).copied().unwrap_or(0)
@@ -1368,6 +1508,7 @@ async fn deposit_resources(
 async fn wait_for_raw_device(
     client: &Client,
     code: &str,
+    operation: Option<&Operation>,
     options: DeliveryOptions,
     predicate: impl Fn(&raw::devices::DeviceStatus) -> bool,
 ) -> Result<()> {
@@ -1377,6 +1518,7 @@ async fn wait_for_raw_device(
         if predicate(&detail) {
             return Ok(());
         }
+        ensure_operation_not_rejected(operation, code).await?;
         if Instant::now() >= deadline {
             return Err(TransportError::TimedOut(format!(
                 "timed out waiting for device {code} cargo/state"
@@ -1386,12 +1528,19 @@ async fn wait_for_raw_device(
     }
 }
 
+/// Verifies the immediate durable classification of a submitted command.
+///
+/// The submission call has already registered and classified the operation;
+/// non-terminal states such as `reconciliation_required` or
+/// `awaiting_evidence` resolve through the event stream or a later reconcile,
+/// not by blocking here. (Previously this waited up to 30 seconds for a
+/// terminal status that rarely arrives that early, stalling every device
+/// command for the full timeout.) Physical effects are verified separately by
+/// the device-state waits, which also abort early if the operation is
+/// rejected after this check.
 async fn ensure_operation_accepted(operation: &Operation) -> Result<()> {
-    let outcome = operation.wait_timeout(Duration::from_secs(30)).await?;
-    if matches!(
-        outcome.status,
-        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
-    ) {
+    let outcome = operation.outcome().await?;
+    if operation_rejected(outcome.status) {
         return Err(TransportError::Operation(format!(
             "operation {} ended as {:?}: {:?}",
             operation.id().as_str(),
@@ -1400,6 +1549,13 @@ async fn ensure_operation_accepted(operation: &Operation) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn operation_rejected(status: OperationStatus) -> bool {
+    matches!(
+        status,
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+    )
 }
 
 fn ensure_uncontrolled(device: &raw::devices::DeviceStatus, code: &str) -> Result<()> {
@@ -1564,10 +1720,6 @@ fn merge_resources(target: &mut ResourceMap, addition: &ResourceMap) {
     for (resource, amount) in addition {
         *target.entry(resource.clone()).or_default() += amount;
     }
-}
-
-fn sum_resources(resources: &ResourceMap) -> i64 {
-    resources.values().copied().sum()
 }
 
 fn format_resources(resources: &ResourceMap) -> String {

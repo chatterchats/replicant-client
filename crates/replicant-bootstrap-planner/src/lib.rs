@@ -257,12 +257,10 @@ pub fn missing_carriers(
     if carrier_capacity <= 0 {
         return Err(PlannerError::MissingCarrierCapacity);
     }
-    let missing = payload_slots.saturating_sub(existing_capacity);
-    Ok(if missing == 0 {
-        0
-    } else {
-        (missing + carrier_capacity - 1) / carrier_capacity
-    })
+    Ok(div_ceil(
+        payload_slots.saturating_sub(existing_capacity),
+        carrier_capacity,
+    ))
 }
 
 /// Split a payload between the minimum newly printed carrier reserve and only
@@ -318,16 +316,21 @@ pub fn select_dense_belts(
     for candidate in candidates.iter().filter(|candidate| {
         candidate.density.eq_ignore_ascii_case("dense") || candidate.designation == capital_belt
     }) {
-        let replace = by_system.get(&candidate.system).is_none_or(|current| {
-            candidate.designation == capital_belt
-                || (current.designation != capital_belt
-                    && candidate
-                        .distance_from_capital_ly
-                        .partial_cmp(&current.distance_from_capital_ly)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| candidate.designation.cmp(&current.designation))
-                        == Ordering::Less)
-        });
+        // Per system, the capital belt always wins; otherwise the closer belt
+        // wins, with the designation as a deterministic tie-break.
+        let replace = match by_system.get(&candidate.system) {
+            None => true,
+            Some(_) if candidate.designation == capital_belt => true,
+            Some(current) if current.designation == capital_belt => false,
+            Some(current) => {
+                candidate
+                    .distance_from_capital_ly
+                    .partial_cmp(&current.distance_from_capital_ly)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| candidate.designation.cmp(&current.designation))
+                    == Ordering::Less
+            }
+        };
         if replace {
             by_system.insert(candidate.system.clone(), candidate.clone());
         }
