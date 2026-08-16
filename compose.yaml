@@ -5,7 +5,11 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      # Bound to the compose network, not the host: the web container reaches
+      # it by service name and only its own port is published.
       REPLICANTD_BIND: 0.0.0.0:8080
+      # Required for any non-loopback bind. `make token` writes one into .env.
+      REPLICANTD_TOKEN: ${REPLICANTD_TOKEN:?set REPLICANTD_TOKEN; the daemon can start workflows and run actions}
       REPLICANT_DB: /var/lib/replicant/replicant-client.sqlite
       REPLICANT_RUNTIME_DB: /var/lib/replicant/replicant-runtime.sqlite
       REPLICANT_PROFILE: ${REPLICANT_PROFILE:-default}

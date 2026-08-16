@@ -33,6 +33,7 @@ const snapshot: RuntimeSnapshot = {
   workflows: [],
   requirements: [],
   notifications: [],
+  slice_revisions: {},
 };
 const entities: EntityIndexSnapshot = {
   metadata: snapshot.metadata,
@@ -100,7 +101,77 @@ describe("daemonReducer", () => {
     expect(state.galaxyRevision).toBe(10);
   });
 
-  it("resnapshots after a revision gap and ignores uncertain deltas", () => {
+  it("applies invalidations across a revision gap without resnapshotting", () => {
+    let state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+    // Revision 11 was missed. Invalidations carry the revision each slice
+    // reached, so the affected pages refetch and no full resnapshot is needed.
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(12, {
+        type: "domain_invalidated",
+        data: { slice: "devices" },
+      }),
+    });
+    expect(state.needsResnapshot).toBe(false);
+    expect(state.invalidated.devices).toBe(12);
+    expect(state.revision).toBe(12);
+
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(13, {
+        type: "domain_invalidated",
+        data: { slice: "inventory" },
+      }),
+    });
+    expect(state.invalidated.inventory).toBe(13);
+    expect(state.revision).toBe(13);
+  });
+
+  it("ignores replayed messages at or below the loaded revision", () => {
+    const state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+    // Buffered while the snapshot was in flight; already reflected in it.
+    const unchanged = daemonReducer(state, {
+      type: "live",
+      message: live(10, {
+        type: "domain_invalidated",
+        data: { slice: "devices" },
+      }),
+    });
+    expect(unchanged).toBe(state);
+    expect(unchanged.invalidated.devices).toBeUndefined();
+  });
+
+  it("applies coalesced invalidations for every slice they carry", () => {
+    let state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(14, {
+        type: "domains_invalidated",
+        data: { slices: { devices: 14, inventory: 14, universe: 14 } },
+      }),
+    });
+    expect(state.invalidated.devices).toBe(14);
+    expect(state.invalidated.inventory).toBe(14);
+    expect(state.galaxyRevision).toBe(14);
+    expect(state.needsResnapshot).toBe(false);
+  });
+
+  it("keeps the highest revision seen per slice", () => {
     let state = daemonReducer(initialDaemonState, {
       type: "snapshot",
       snapshot,
@@ -110,33 +181,30 @@ describe("daemonReducer", () => {
     state = daemonReducer(state, {
       type: "live",
       message: live(12, {
-        type: "domain_invalidated",
-        data: { slice: "devices" },
+        type: "domains_invalidated",
+        data: { slices: { devices: 12 } },
       }),
     });
-    expect(state.needsResnapshot).toBe(true);
-    expect(state.syncing).toBe(true);
-
-    const unchanged = daemonReducer(state, {
+    state = daemonReducer(state, {
       type: "live",
       message: live(13, {
-        type: "domain_invalidated",
-        data: { slice: "inventory" },
+        type: "domains_invalidated",
+        data: { slices: { devices: 11, inventory: 13 } },
       }),
     });
-    expect(unchanged).toBe(state);
+    expect(state.invalidated.devices).toBe(12);
+    expect(state.invalidated.inventory).toBe(13);
+  });
 
-    state = daemonReducer(state, {
+  it("seeds slice revisions from the snapshot", () => {
+    const state = daemonReducer(initialDaemonState, {
       type: "snapshot",
-      snapshot: {
-        ...snapshot,
-        metadata: { ...snapshot.metadata, revision: 13 },
-      },
+      snapshot: { ...snapshot, slice_revisions: { devices: 9, cargo: 7 } },
       health,
       entities,
     });
-    expect(state.needsResnapshot).toBe(false);
-    expect(state.revision).toBe(13);
+    expect(state.invalidated.devices).toBe(9);
+    expect(state.invalidated.cargo).toBe(7);
   });
 
   it("resnapshots without disconnecting when the socket starts ahead", () => {

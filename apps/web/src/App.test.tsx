@@ -55,6 +55,7 @@ const snapshot: RuntimeSnapshot = {
   workflows: [],
   requirements: [],
   notifications: [],
+  slice_revisions: {},
 };
 const entities: EntityIndexSnapshot = { metadata, entities: [] };
 const descriptors: DescriptorCatalog = {

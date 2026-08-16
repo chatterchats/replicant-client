@@ -571,6 +571,64 @@ impl WorkflowRepository {
         Ok(execution)
     }
 
+    /// Records an execution that has started but not finished.
+    ///
+    /// Returned immediately to the caller so long-running actions can be
+    /// followed through history and live updates rather than by blocking an
+    /// HTTP request until they complete.
+    pub fn begin_finite_execution(
+        &self,
+        operation_class: FiniteExecutionClass,
+        kind: &str,
+        started_at: i64,
+    ) -> Result<FiniteExecution, RepositoryError> {
+        let execution = FiniteExecution {
+            id: Uuid::new_v4().to_string(),
+            operation_class,
+            kind: kind.to_owned(),
+            status: FiniteExecutionStatus::Running,
+            started_at,
+            finished_at: started_at,
+            result: None,
+            error: None,
+        };
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO finite_executions (
+                id, operation_class, kind, status, started_at, finished_at, result_json, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+            params![
+                execution.id,
+                execution.operation_class.as_str(),
+                execution.kind,
+                execution.status.as_str(),
+                execution.started_at,
+                execution.finished_at,
+            ],
+        )?;
+        Ok(execution)
+    }
+
+    /// Completes an execution previously opened by
+    /// [`WorkflowRepository::begin_finite_execution`].
+    pub fn complete_finite_execution(
+        &self,
+        id: &str,
+        status: FiniteExecutionStatus,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let result_json = result.map(serde_json::to_string).transpose()?;
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE finite_executions
+             SET status = ?2, finished_at = ?3, result_json = ?4, error = ?5
+             WHERE id = ?1",
+            params![id, status.as_str(), now_millis()?, result_json, error],
+        )?;
+        Ok(())
+    }
+
     /// Lists finite executions newest first.
     pub fn finite_execution_history(&self) -> Result<Vec<FiniteExecution>, RepositoryError> {
         let connection = self.connection()?;
@@ -585,6 +643,7 @@ impl WorkflowRepository {
                 value => return Err(invalid_stored_execution(value)),
             };
             let status = match row.get::<_, String>(3)?.as_str() {
+                "running" => FiniteExecutionStatus::Running,
                 "succeeded" => FiniteExecutionStatus::Succeeded,
                 "skipped" => FiniteExecutionStatus::Skipped,
                 "failed" => FiniteExecutionStatus::Failed,

@@ -31,6 +31,7 @@ export type DomainSlice =
   | "autofactories"
   | "cargo"
   | "missions"
+  | "history"
   | "events"
   | "trade"
   | "messages"
@@ -640,7 +641,8 @@ export interface DescriptorCatalog {
 export type OperationDescriptor =
   ReportDescriptor | ActionDescriptor | WorkflowDescriptor;
 
-export type FiniteExecutionStatus = "succeeded" | "skipped" | "failed";
+export type FiniteExecutionStatus =
+  "running" | "succeeded" | "skipped" | "failed";
 
 export interface ResultSummary {
   succeeded: number;
@@ -680,6 +682,8 @@ export interface RuntimeSnapshot {
   workflows: WorkflowSummary[];
   requirements: RequirementSummary[];
   notifications: Notification[];
+  /** Revision each domain slice had reached when the snapshot was produced. */
+  slice_revisions: Partial<Record<DomainSlice, number>>;
 }
 
 export interface RequirementSummary {
@@ -827,9 +831,11 @@ export interface OperationUpdate {
   updated_at_ms: number;
 }
 
+export type NotificationLevel = "info" | "warning" | "error";
+
 export interface Notification {
   id: string;
-  level: "info" | "warning" | "error";
+  level: NotificationLevel;
   title: string;
   message: string;
   created_at_ms: number;
@@ -843,6 +849,10 @@ export type LiveDelta =
     }
   | { type: "entity_remove"; data: { entity: EntityRef } }
   | { type: "domain_invalidated"; data: { slice: DomainSlice } }
+  | {
+      type: "domains_invalidated";
+      data: { slices: Partial<Record<DomainSlice, number>> };
+    }
   | { type: "workflow_created"; data: WorkflowSummary }
   | { type: "workflow_updated"; data: WorkflowSummary }
   | { type: "workflow_activity"; data: WorkflowActivity }
@@ -961,6 +971,7 @@ const domainSlices = [
   "autofactories",
   "cargo",
   "missions",
+  "history",
   "events",
   "trade",
   "messages",
@@ -1332,7 +1343,7 @@ function finiteExecution(value: unknown): FiniteExecution {
     kind: item.kind,
     status: oneOf(
       item.status,
-      ["succeeded", "skipped", "failed"] as const,
+      ["running", "succeeded", "skipped", "failed"] as const,
       "finite execution status",
     ),
     summary: {
@@ -2386,6 +2397,16 @@ export function parseSnapshotResponse(
       automation: automation(item.automation),
       workflows: item.workflows.map(workflow),
       notifications: notifications.map(notification),
+      slice_revisions: Object.fromEntries(
+        Object.entries(
+          item.slice_revisions === undefined
+            ? {}
+            : record(item.slice_revisions, "slice revisions"),
+        ).map(([slice, revision]) => [
+          oneOf(slice, domainSlices, "domain slice"),
+          number(revision, "slice revision"),
+        ]),
+      ),
       requirements: requirements.map((value) => {
         const requirement = record(value, "requirement");
         if (
@@ -2761,6 +2782,22 @@ export function parseLiveMessage(value: unknown): LiveMessage {
       delta = {
         type,
         data: { slice: oneOf(value.slice, domainSlices, "domain slice") },
+      };
+      break;
+    }
+    case "domains_invalidated": {
+      const value = record(data, "domain invalidation");
+      const slices = record(value.slices, "invalidated slices");
+      delta = {
+        type,
+        data: {
+          slices: Object.fromEntries(
+            Object.entries(slices).map(([slice, revision]) => [
+              oneOf(slice, domainSlices, "domain slice"),
+              number(revision, "slice revision"),
+            ]),
+          ),
+        },
       };
       break;
     }

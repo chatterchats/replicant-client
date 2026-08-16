@@ -42,11 +42,72 @@ export function daemonUrl(path: string, origin?: string): string {
   return `${(origin ?? configuredOrigin)?.replace(/\/+$/, "") ?? ""}${path}`;
 }
 
+/** Milliseconds before an unanswered daemon request is abandoned. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Shared secret for daemons started with `REPLICANTD_TOKEN`.
+ *
+ * Loopback daemons usually run without one; this is for remote or container
+ * deployments, where the daemon refuses to start unauthenticated.
+ */
+export function daemonToken(): string | undefined {
+  const configured = (
+    import.meta as unknown as {
+      env: { VITE_REPLICANT_DAEMON_TOKEN?: string };
+    }
+  ).env.VITE_REPLICANT_DAEMON_TOKEN;
+  return configured === undefined || configured === "" ? undefined : configured;
+}
+
+function authHeaders(base?: Record<string, string>): Record<string, string> {
+  const token = daemonToken();
+  return token === undefined
+    ? (base ?? {})
+    : { ...base, Authorization: `Bearer ${token}` };
+}
+
+/**
+ * Aborts a request that outlives the caller's signal or the timeout.
+ *
+ * Without a timeout a wedged daemon left requests pending forever instead of
+ * surfacing an error and letting the reconnect path run.
+ */
+function withTimeout(signal?: AbortSignal): {
+  signal: AbortSignal;
+  done: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error("replicantd did not respond in time"));
+  }, REQUEST_TIMEOUT_MS);
+  const abort = () => {
+    controller.abort(signal?.reason as unknown);
+  };
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort);
+  return {
+    signal: controller.signal,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+    },
+  };
+}
+
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
-  const response = await fetch(daemonUrl(path), { signal });
-  if (!response.ok)
-    throw new Error(`replicantd returned ${String(response.status)}`);
-  return response.json() as Promise<unknown>;
+  const request = withTimeout(signal);
+  try {
+    const response = await fetch(daemonUrl(path), {
+      signal: request.signal,
+      headers: authHeaders(),
+    });
+    if (!response.ok)
+      throw new Error(`replicantd returned ${String(response.status)}`);
+    return (await response.json()) as unknown;
+  } finally {
+    request.done();
+  }
 }
 
 async function post(path: string, body?: unknown): Promise<unknown> {
@@ -58,12 +119,20 @@ async function send(
   path: string,
   body?: unknown,
 ): Promise<unknown> {
-  const response = await fetch(daemonUrl(path), {
-    method,
-    headers:
-      body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const request = withTimeout();
+  let response: Response;
+  try {
+    response = await fetch(daemonUrl(path), {
+      method,
+      signal: request.signal,
+      headers: authHeaders(
+        body === undefined ? undefined : { "Content-Type": "application/json" },
+      ),
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } finally {
+    request.done();
+  }
   if (response.status === 204) return null;
   const value = (await response.json()) as unknown;
   if (!response.ok) {

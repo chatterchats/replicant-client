@@ -1,4 +1,7 @@
 services:
   replicantd:
+    # Publishes the daemon to the host. REPLICANTD_TOKEN (required by the base
+    # compose file) is what keeps this from being an open control plane; bind
+    # to 127.0.0.1 explicitly so it is not exposed beyond this machine.
     ports:
-      - "${REPLICANTD_PORT:-8080}:8080"
+      - "127.0.0.1:${REPLICANTD_PORT:-8080}:8080"

@@ -26,7 +26,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         config.clone(),
     )?;
     let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(address = %config.bind, profile = %config.profile, "replicantd listening");
+    tracing::info!(
+        address = %config.bind,
+        profile = %config.profile,
+        authenticated = config.token.is_some(),
+        "replicantd listening"
+    );
+    if config.token.is_none() {
+        tracing::info!(
+            "no REPLICANTD_TOKEN set; loopback-only access is assumed to be local and trusted"
+        );
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let supervisor = tokio::spawn(run_supervisor(state.clone(), shutdown_rx.clone()));

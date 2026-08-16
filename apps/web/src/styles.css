@@ -1,8 +1,51 @@
 :root {
-  color: #eff8f6;
-  background: #12201e;
+  /* Design tokens. Colours were previously repeated as literals throughout
+     this file, which made consistent theming and any restyle impractical. */
+  --surface: #12201e;
+  --surface-raised: #172a27;
+  --surface-overlay: #1b302c;
+  --text: #eff8f6;
+  --text-muted: #9fb6b2;
+  --accent: #41d4c8;
+  --accent-contrast: #062824;
+  --danger: #ff8a7a;
+  --warning: #ffc978;
+  --success: #7fdba1;
+  --border: rgba(159, 188, 193, 0.16);
+  --border-strong: rgba(159, 188, 193, 0.32);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --shadow-overlay: 0 18px 48px rgba(0, 0, 0, 0.45);
+
+  color: var(--text);
+  background: var(--surface);
   font-family: Inter, "Segoe UI", system-ui, sans-serif;
   font-synthesis: none;
+}
+
+/* Keyboard navigation is a first-class path here (⌘K palette, drawer
+   toggles), so focus must always be visible. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 * {
@@ -1935,5 +1978,227 @@ h1 {
   }
   .activity-item p {
     grid-column: 1 / -1;
+  }
+}
+
+/* Toasts, notification centre, and confirmation modal. */
+.toast-stack {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: 20;
+  display: grid;
+  gap: var(--space-2);
+  width: min(380px, calc(100vw - 2 * var(--space-5)));
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-overlay);
+}
+.toast.error {
+  border-left-color: var(--danger);
+}
+.toast.warning {
+  border-left-color: var(--warning);
+}
+.toast.info {
+  border-left-color: var(--accent);
+}
+.toast p {
+  margin: var(--space-1) 0 0;
+  color: var(--text-muted);
+}
+.toast-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.toast-actions button {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+.toast-dismiss {
+  border-color: transparent !important;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.notification-center {
+  position: fixed;
+  top: 64px;
+  right: var(--space-5);
+  z-index: 15;
+  width: min(420px, calc(100vw - 2 * var(--space-5)));
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+  padding: var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-overlay);
+}
+.notification-center header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+}
+.notification-center h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.notification-center ul {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.notification-center li button {
+  display: grid;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.notification-center li.error button {
+  border-left-color: var(--danger);
+}
+.notification-center li.warning button {
+  border-left-color: var(--warning);
+}
+.notification-center li.info button {
+  border-left-color: var(--accent);
+}
+.notification-center p,
+.notification-center time {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.notification-level {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.notifications-trigger {
+  cursor: pointer;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: rgba(4, 12, 11, 0.62);
+}
+.confirm-dialog {
+  width: min(520px, 100%);
+  padding: var(--space-5);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-overlay);
+}
+.confirm-dialog h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 1.1rem;
+}
+.confirm-dialog > p {
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+}
+.confirm-items {
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+}
+.confirm-typed {
+  display: grid;
+  gap: var(--space-1);
+  margin-bottom: var(--space-4);
+  font-size: 0.9rem;
+}
+.confirm-typed input {
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: inherit;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+.confirm-actions button {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+.confirm-actions button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.confirm-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Mobile: the sidebar is hidden, so the status bar carries navigation. */
+.nav-toggle {
+  display: none;
+}
+@media (max-width: 720px) {
+  .nav-toggle {
+    display: inline-flex;
+    align-items: center;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    cursor: pointer;
+  }
+  .app-shell.nav-open {
+    grid-template-columns: 1fr;
+  }
+  .app-shell.nav-open .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 25;
+    display: flex;
+    width: min(280px, 86vw);
+    box-shadow: var(--shadow-overlay);
+  }
+  .toast-stack,
+  .notification-center {
+    right: var(--space-3);
+    left: var(--space-3);
+    width: auto;
   }
 }

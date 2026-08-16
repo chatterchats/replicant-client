@@ -37,6 +37,9 @@ import { StandingPage } from "./StandingPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
 import { TradePage } from "./TradePage";
+import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
+import { NotificationCenter, NotificationToasts } from "./Notifications";
+import { absoluteTime, relativeTime } from "./time";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -51,6 +54,8 @@ import type {
 } from "./protocol";
 import {
   initialShellState,
+  routeFromHash,
+  routeToHash,
   shellReducer,
   type SelectedEntity,
 } from "./shellState";
@@ -408,7 +413,18 @@ function Inspector({
 }
 
 export function App() {
-  const [shell, dispatch] = useReducer(shellReducer, initialShellState);
+  const [shell, dispatch] = useReducer(shellReducer, initialShellState, () => {
+    const route = routeFromHash(window.location.hash, {
+      page: initialShellState.page,
+      entity: null,
+    });
+    return {
+      ...initialShellState,
+      page: route.page,
+      selectedEntity: route.entity,
+      inspectorOpen: route.entity !== null,
+    };
+  });
   const [descriptors, setDescriptors] = useState<DescriptorCatalog>({
     reports: [],
     actions: [],
@@ -424,6 +440,18 @@ export function App() {
   const [galaxyCommand, setGalaxyCommand] = useState<DescriptorCommand>();
   const [selectedAutomationWorkflow, setSelectedAutomationWorkflow] =
     useState<string>();
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(
+    null,
+  );
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  // The sidebar is hidden at narrow widths; this opens it as a sheet so
+  // navigation does not depend on the keyboard-only command palette.
+  const [navOpen, setNavOpen] = useState(false);
+  const [commandResult, setCommandResult] = useState<{
+    message: string;
+    actionLabel: string;
+    onAction: () => void;
+  } | null>(null);
   const {
     busy: automationBusy,
     error: automationError,
@@ -445,6 +473,34 @@ export function App() {
       .catch(() => undefined);
     return () => {
       controller.abort();
+    };
+  }, []);
+
+  // Page and selection are mirrored into the location hash so a refresh keeps
+  // the current view and every page is linkable.
+  useEffect(() => {
+    const hash = routeToHash({
+      page: shell.page,
+      entity: shell.selectedEntity,
+    });
+    if (window.location.hash !== hash) window.history.pushState(null, "", hash);
+  }, [shell.page, shell.selectedEntity]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      dispatch({
+        type: "restore",
+        route: routeFromHash(window.location.hash, {
+          page: initialShellState.page,
+          entity: null,
+        }),
+      });
+    };
+    window.addEventListener("popstate", onPopState);
+    window.addEventListener("hashchange", onPopState);
+    return () => {
+      window.removeEventListener("popstate", onPopState);
+      window.removeEventListener("hashchange", onPopState);
     };
   }, []);
 
@@ -539,6 +595,7 @@ export function App() {
 
   const navigate = (destination: string) => {
     dispatch({ type: "navigate", page: destination });
+    setNavOpen(false);
   };
   const select = (entity: SelectedEntity) => {
     if (entity.kind !== "device") setSelectedDevice(undefined);
@@ -561,7 +618,7 @@ export function App() {
   };
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${navOpen ? "nav-open" : ""}`}>
       <aside className="sidebar">
         <header className="brand">
           <span className="brand-mark">RS</span>
@@ -601,6 +658,16 @@ export function App() {
       <main>
         <header className="status-bar">
           <button
+            aria-expanded={navOpen}
+            aria-label="Toggle navigation"
+            className="nav-toggle"
+            onClick={() => {
+              setNavOpen((open) => !open);
+            }}
+          >
+            ☰
+          </button>
+          <button
             className="status-item identity"
             disabled={!currentReplicant}
             onClick={() => {
@@ -630,10 +697,20 @@ export function App() {
             <small>Active workflows</small>
             <strong>{activeWorkflows.length}</strong>
           </button>
-          <span className={`status-item ${warnings.length ? "warning" : ""}`}>
-            <small>Warnings</small>
-            <strong>{warnings.length}</strong>
-          </span>
+          <button
+            aria-expanded={notificationsOpen}
+            className={`status-item notifications-trigger ${warnings.length ? "warning" : ""}`}
+            onClick={() => {
+              setNotificationsOpen((open) => !open);
+            }}
+          >
+            <small>Notifications</small>
+            <strong>
+              {warnings.length > 0
+                ? `${String(warnings.length)} need attention`
+                : `${String(notifications.length)} total`}
+            </strong>
+          </button>
           <div
             className={`status-item automation-safety ${daemon.automation.workflows_paused ? "paused" : ""}`}
             title={automationError}
@@ -672,9 +749,26 @@ export function App() {
               </button>
               <button
                 className="danger"
-                disabled={connection !== "connected" || automationBusy}
+                disabled={
+                  connection !== "connected" ||
+                  automationBusy ||
+                  activeWorkflows.length === 0
+                }
                 onClick={() => {
-                  controlAutomation("cancel");
+                  setConfirmRequest({
+                    title: "Cancel every eligible workflow?",
+                    message: `This cancels ${String(activeWorkflows.length)} running or queued workflow(s) and cannot be undone. Work already committed upstream is not rolled back.`,
+                    items: activeWorkflows.map(
+                      (workflow) =>
+                        `${workflow.kind} · ${workflow.id.slice(0, 8)} (${workflow.status})`,
+                    ),
+                    confirmLabel: "Cancel all workflows",
+                    requireTyped: "cancel all",
+                    destructive: true,
+                    onConfirm: () => {
+                      controlAutomation("cancel");
+                    },
+                  });
                 }}
               >
                 Cancel all
@@ -964,10 +1058,14 @@ export function App() {
                     >
                       <time
                         dateTime={new Date(item.occurred_at_ms).toISOString()}
+                        title={absoluteTime(item.occurred_at_ms)}
                       >
-                        {new Date(item.occurred_at_ms).toLocaleTimeString()}
+                        {relativeTime(item.occurred_at_ms)}
                       </time>
-                      <strong>{item.workflow_id}</strong>
+                      <strong>
+                        {daemon.workflows[item.workflow_id]?.kind ?? "workflow"}{" "}
+                        · {item.workflow_id.slice(0, 8)}
+                      </strong>
                       <span>{item.step ?? item.level}</span>
                       <p>{item.message}</p>
                     </button>
@@ -993,15 +1091,83 @@ export function App() {
           onNavigate={navigate}
           initialCommand={galaxyCommand}
           onWorkflowStarted={(workflow) => {
+            // Deliberately does not navigate: the user started this from
+            // wherever they were working, and being moved to another page
+            // loses that context. Offer the destination instead.
             setSelectedAutomationWorkflow(workflow.id);
-            navigate("Automations");
+            setCommandResult({
+              message: `Started ${workflow.kind}`,
+              actionLabel: "View in Automations",
+              onAction: () => {
+                navigate("Automations");
+              },
+            });
           }}
           onOperationFinished={(execution) => {
             setSelectedExecution(execution);
-            navigate("History");
+            setCommandResult({
+              message:
+                execution.status === "running"
+                  ? `${execution.kind} started`
+                  : `${execution.kind} ${execution.status}`,
+              actionLabel: "View in History",
+              onAction: () => {
+                navigate("History");
+              },
+            });
           }}
         />
       ) : null}
+
+      <NotificationToasts
+        onSelect={() => {
+          setNotificationsOpen(true);
+        }}
+      />
+      {commandResult && (
+        <div className="toast-stack command-result" role="status">
+          <article className="toast info">
+            <div>
+              <strong>{commandResult.message}</strong>
+            </div>
+            <div className="toast-actions">
+              <button
+                onClick={() => {
+                  commandResult.onAction();
+                  setCommandResult(null);
+                }}
+              >
+                {commandResult.actionLabel}
+              </button>
+              <button
+                aria-label="Dismiss"
+                className="toast-dismiss"
+                onClick={() => {
+                  setCommandResult(null);
+                }}
+              >
+                ×
+              </button>
+            </div>
+          </article>
+        </div>
+      )}
+      {notificationsOpen && (
+        <NotificationCenter
+          onClose={() => {
+            setNotificationsOpen(false);
+          }}
+          onSelect={() => {
+            navigate("History");
+          }}
+        />
+      )}
+      <ConfirmDialog
+        onClose={() => {
+          setConfirmRequest(null);
+        }}
+        request={confirmRequest}
+      />
     </div>
   );
 }

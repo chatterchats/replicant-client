@@ -189,9 +189,15 @@ impl FiniteExecutionClass {
     }
 }
 
-/// Terminal application-level status for one finite execution.
+/// Application-level status for one finite execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FiniteExecutionStatus {
+    /// Execution is still in progress.
+    ///
+    /// Long actions are recorded before they start so the caller gets an id
+    /// immediately and can follow progress instead of holding an HTTP request
+    /// open for the whole run.
+    Running,
     /// Execution completed useful work.
     Succeeded,
     /// Execution completed but found no work to perform.
@@ -203,6 +209,7 @@ pub enum FiniteExecutionStatus {
 impl FiniteExecutionStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Skipped => "skipped",
             Self::Failed => "failed",

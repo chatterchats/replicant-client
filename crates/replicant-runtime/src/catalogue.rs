@@ -317,6 +317,23 @@ impl OperationCatalogue {
         }
     }
 
+    /// Checks that an action kind exists and its parameters are well formed,
+    /// without running it.
+    ///
+    /// Lets callers that execute actions asynchronously still reject bad
+    /// requests synchronously.
+    pub fn validate_action(
+        &self,
+        kind: &str,
+        parameters: &BTreeMap<String, Value>,
+    ) -> Result<(), CatalogueError> {
+        let kind = self
+            .resolve_kind(OperationClass::Action, kind)
+            .ok_or_else(|| unknown(OperationClass::Action, kind))?;
+        self.validate(OperationClass::Action, kind, parameters.clone(), false)
+            .map(drop)
+    }
+
     fn validate(
         &self,
         class: OperationClass,

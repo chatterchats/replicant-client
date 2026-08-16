@@ -1,7 +1,7 @@
 //! HTTP query/command API for the local `replicantd` process.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -19,7 +19,8 @@ use axum::{
         rejection::JsonRejection,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -98,7 +99,16 @@ use serde_json::{Map, Value};
 use tokio::sync::{Mutex, broadcast, watch};
 use tower_http::cors::CorsLayer;
 
-const LIVE_BUFFER: usize = 32;
+/// Live broadcast capacity. Deltas are coalesced per supervisor tick, so this
+/// holds many seconds of updates even during heavy fleet activity; lagging
+/// subscribers recover by revision comparison rather than by reconnecting.
+const LIVE_BUFFER: usize = 1024;
+
+fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -116,6 +126,12 @@ pub struct DaemonConfig {
     pub runtime_database: PathBuf,
     /// Local HTTP listen address.
     pub bind: SocketAddr,
+    /// Shared secret required on every request when present.
+    ///
+    /// Loopback binds may run without a token because reaching the socket
+    /// already implies local access. Any non-loopback bind requires one: see
+    /// [`DaemonConfig::validate`].
+    pub token: Option<String>,
 }
 
 impl DaemonConfig {
@@ -132,13 +148,53 @@ impl DaemonConfig {
             .unwrap_or_else(|_| DEFAULT_BIND.to_owned())
             .parse()
             .map_err(ConfigError::Bind)?;
-        Ok(Self {
+        let token = env::var("REPLICANTD_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty());
+        let config = Self {
             profile,
             managed_database,
             runtime_database,
             bind,
-        })
+            token,
+        };
+        config.validate()?;
+        Ok(config)
     }
+
+    /// Rejects configurations that would expose an unauthenticated daemon.
+    ///
+    /// Every route can start workflows, run actions, and cancel automation, so
+    /// a daemon reachable from outside the machine must require a token.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.token.is_none() && !is_loopback(self.bind) {
+            return Err(ConfigError::MissingToken(self.bind));
+        }
+        Ok(())
+    }
+
+    /// Returns whether one presented credential matches the configured token.
+    #[must_use]
+    pub fn authorized(&self, presented: Option<&str>) -> bool {
+        let Some(expected) = self.token.as_deref() else {
+            return true;
+        };
+        presented.is_some_and(|presented| constant_time_eq(presented, expected))
+    }
+}
+
+/// Compares two secrets without leaking their common prefix length through
+/// timing.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 /// Invalid daemon configuration.
@@ -147,6 +203,12 @@ pub enum ConfigError {
     /// The configured listen address is invalid.
     #[error("invalid REPLICANTD_BIND: {0}")]
     Bind(std::net::AddrParseError),
+    /// A non-loopback bind was requested without a shared secret.
+    #[error(
+        "REPLICANTD_BIND={0} is reachable beyond this machine, so REPLICANTD_TOKEN must be set; \
+         every daemon route can start workflows and run actions"
+    )]
+    MissingToken(SocketAddr),
 }
 
 /// Shared daemon services. HTTP handlers never construct managed clients.
@@ -158,6 +220,16 @@ pub struct AppState {
     live: broadcast::Sender<LiveMessage>,
     revision: AtomicU64,
     publish_lock: StdMutex<()>,
+    /// Slices invalidated since the last flush, coalesced so one tick of
+    /// managed churn costs one live message instead of one per slice.
+    pending_slices: StdMutex<BTreeSet<DomainSlice>>,
+    /// Revision each slice last reached, served with snapshots so a client can
+    /// tell whether its cached projection is current.
+    slice_revisions: StdMutex<BTreeMap<DomainSlice, u64>>,
+    /// Device projection memoized against the managed revision it was built
+    /// from. `/api/devices`, `/api/autofactories`, and the relay projection all
+    /// rebuild the identical row set, previously once per request.
+    device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
     daemon: DaemonConfig,
 }
 
@@ -184,6 +256,9 @@ impl AppState {
             live: broadcast::channel(LIVE_BUFFER).0,
             revision: AtomicU64::new(revision),
             publish_lock: StdMutex::new(()),
+            pending_slices: StdMutex::new(BTreeSet::new()),
+            slice_revisions: StdMutex::new(BTreeMap::new()),
+            device_rows: tokio::sync::Mutex::new(None),
             daemon,
         }))
     }
@@ -200,23 +275,55 @@ impl AppState {
     }
 
     fn publish(&self, delta: LiveDelta) {
-        let _guard = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = lock(&self.publish_lock);
         let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.live.send(LiveMessage::current(revision, delta));
     }
 
+    /// Marks a slice dirty without publishing.
+    ///
+    /// Dirty slices are flushed once per supervisor tick by
+    /// [`AppState::flush_invalidations`].
+    fn invalidate(&self, slice: DomainSlice) {
+        lock(&self.pending_slices).insert(slice);
+    }
+
+    /// Publishes one coalesced invalidation for everything marked dirty.
+    fn flush_invalidations(&self) {
+        let slices = std::mem::take(&mut *lock(&self.pending_slices));
+        if slices.is_empty() {
+            return;
+        }
+        let guard = lock(&self.publish_lock);
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut current = lock(&self.slice_revisions);
+        let slices = slices
+            .into_iter()
+            .map(|slice| {
+                current.insert(slice, revision);
+                (slice, revision)
+            })
+            .collect::<BTreeMap<_, _>>();
+        drop(current);
+        let _ = self.live.send(LiveMessage::current(
+            revision,
+            LiveDelta::DomainsInvalidated { slices },
+        ));
+        drop(guard);
+    }
+
     fn snapshot_metadata(&self) -> Result<SnapshotMetadata, ApiError> {
-        let _guard = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Deliberately lock-free: metadata is read on every GET, and taking the
+        // publish lock here contended with the publisher during exactly the
+        // bursts that make reads frequent.
         Ok(SnapshotMetadata {
             revision: self.revision.load(Ordering::Relaxed),
             generated_at_ms: now_millis()?,
         })
+    }
+
+    fn slice_revisions(&self) -> BTreeMap<DomainSlice, u64> {
+        lock(&self.slice_revisions).clone()
     }
 
     fn resnapshot_message(&self) -> Result<LiveMessage, ApiError> {
@@ -225,6 +332,40 @@ impl AppState {
             metadata.revision,
             LiveDelta::Snapshot(metadata),
         ))
+    }
+}
+
+/// Rejects requests that do not present the configured shared secret.
+///
+/// Accepts either `Authorization: Bearer <token>` or a `token` query parameter;
+/// the latter exists because browser `WebSocket` construction cannot set
+/// headers. `/api/health` stays open so container health checks and the
+/// frontend's reachability probe work without credentials — it exposes only
+/// liveness and a version string.
+async fn authenticate(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if state.daemon.token.is_none() || request.uri().path() == "/api/health" {
+        return next.run(request).await;
+    }
+    let header_token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    let query_token = request.uri().query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            pair.strip_prefix("token=")
+                .map(|token| token.trim_end_matches('#'))
+        })
+    });
+    if state.daemon.authorized(header_token.or(query_token)) {
+        next.run(request).await
+    } else {
+        ApiError::unauthorized().into_response()
     }
 }
 
@@ -271,6 +412,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/workflows/{id}/pause", post(pause_workflow))
         .route("/api/workflows/{id}/resume", post(resume_workflow))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(
             CorsLayer::new()
                 .allow_origin([
@@ -286,7 +428,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                     axum::http::Method::PUT,
                     axum::http::Method::DELETE,
                 ])
-                .allow_headers([axum::http::header::CONTENT_TYPE]),
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ]),
         )
         .with_state(state)
 }
@@ -312,6 +457,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     tracing::error!(error = %error, "workflow supervisor tick failed");
                 }
                 publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
+                state.flush_invalidations();
                 let status = state.client().status();
                 let phase = sync_phase(&status);
                 if phase != managed_phase {
@@ -333,6 +479,10 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 match revision {
                     Ok(_) => {
+                        // Marked here, flushed as one coalesced message on the
+                        // next tick: a busy account bumps the managed revision
+                        // continuously, and one message per slice per bump was
+                        // the dominant source of live-channel churn.
                         for slice in [
                             DomainSlice::Entities,
                             DomainSlice::Universe,
@@ -349,7 +499,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                             DomainSlice::Standing,
                             DomainSlice::Leaderboards,
                         ] {
-                            state.publish(LiveDelta::DomainInvalidated { slice });
+                            state.invalidate(slice);
                         }
                     }
                     Err(error) => {
@@ -384,24 +534,35 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
 
 /// Evaluates durable automation definitions from local managed events and projections.
 pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    // Schedules need second-level checks; the full event sweep is a safety net
+    // for anything the stream missed and does not need that cadence.
     let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut sweep = tokio::time::interval(Duration::from_secs(60));
     let mut events = state.client().events().watch().await.ok();
     let mut revisions = state.client().state().watch().ok();
     evaluate_schedules_and_parents(&state).await;
-    evaluate_event_triggers(&state).await;
+    evaluate_event_triggers_for(&state, &[]).await;
     evaluate_state_triggers(&state).await;
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 evaluate_schedules_and_parents(&state).await;
-                evaluate_event_triggers(&state).await;
+            }
+            _ = sweep.tick() => {
+                evaluate_event_triggers_for(&state, &[]).await;
             }
             event = async { events.as_mut().expect("guarded").next().await }, if events.is_some() => {
-                if let Err(error) = event {
-                    tracing::warn!(error = %error, "trigger event watcher lagged; recovering from durable history");
-                    events = state.client().events().watch().await.ok();
+                match event {
+                    // Evaluate only the triggers watching this event name.
+                    Ok(event) => {
+                        evaluate_event_triggers_for(&state, &[event.name.as_str().to_owned()]).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "trigger event watcher lagged; recovering from durable history");
+                        events = state.client().events().watch().await.ok();
+                        evaluate_event_triggers_for(&state, &[]).await;
+                    }
                 }
-                evaluate_event_triggers(&state).await;
             }
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 if let Err(error) = revision {
@@ -489,7 +650,12 @@ async fn evaluate_state_triggers(state: &Arc<AppState>) {
     }
 }
 
-async fn evaluate_event_triggers(state: &Arc<AppState>) {
+/// Evaluates game-event triggers.
+///
+/// `names` restricts work to triggers watching an event that just arrived;
+/// an empty slice evaluates all of them (startup and periodic sweeps). Without
+/// it, every wake ran one durable history query per event trigger.
+async fn evaluate_event_triggers_for(state: &Arc<AppState>, names: &[String]) {
     let Ok(triggers) = state.repository.list_triggers() else {
         return;
     };
@@ -502,6 +668,9 @@ async fn evaluate_event_triggers(state: &Arc<AppState>) {
         else {
             continue;
         };
+        if !names.is_empty() && !names.iter().any(|name| name == event_name) {
+            continue;
+        }
         let mut query = state.client().events().history().named(event_name);
         if let Some(cursor) = &trigger.event_cursor {
             query = query.after(cursor);
@@ -573,7 +742,7 @@ fn notify_trigger_error(state: &AppState, trigger: &AutomationTrigger, error: &s
 }
 
 async fn launch_trigger(
-    state: &AppState,
+    state: &Arc<AppState>,
     trigger: &AutomationTrigger,
     parent_id: Option<WorkflowId>,
 ) -> Result<(), String> {
@@ -589,48 +758,29 @@ async fn launch_trigger(
             .map(drop)
             .map_err(|error| error.to_string()),
         TriggerTargetClass::Action => {
+            // Spawned, not awaited: a triggered action can run for hours, and
+            // awaiting it here stalled evaluation of every other schedule and
+            // event trigger until it finished.
             let started_at = now_millis().map_err(|error| error.message)?;
-            match state
-                .catalogue
-                .run_action(
-                    state.client(),
+            let execution = state
+                .repository
+                .begin_finite_execution(
+                    FiniteExecutionClass::Action,
                     &trigger.target.kind,
-                    trigger.target.parameters.clone(),
+                    started_at,
                 )
-                .await
-            {
-                Ok(result) => {
-                    let result = sanitize_result(result);
-                    let (summary, status) = summarize_result(&result);
-                    persist_execution(
-                        state,
-                        FiniteExecutionClass::Action,
-                        &trigger.target.kind,
-                        status,
-                        started_at,
-                        Some(&result),
-                        None,
-                        summary,
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    persist_execution(
-                        state,
-                        FiniteExecutionClass::Action,
-                        &trigger.target.kind,
-                        StoredFiniteExecutionStatus::Failed,
-                        started_at,
-                        None,
-                        Some("triggered action failed"),
-                        ResultSummary {
-                            failed: 1,
-                            ..ResultSummary::default()
-                        },
-                    );
-                    Err(error.to_string())
-                }
-            }
+                .map_err(|error| error.to_string())?;
+            let spawned = state.clone();
+            let kind = trigger.target.kind.clone();
+            let parameters = trigger.target.parameters.clone();
+            tokio::spawn(async move {
+                let outcome = spawned
+                    .catalogue
+                    .run_action(spawned.client(), &kind, parameters)
+                    .await;
+                finish_action(&spawned, &execution.id, &kind, outcome);
+            });
+            Ok(())
         }
     }
 }
@@ -651,27 +801,17 @@ fn publish_workflow_updates(
             };
             if let Some(delta) = delta {
                 state.publish(delta);
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Entities,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Workflows,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Overview,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Devices,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Autofactories,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Cargo,
-                });
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Missions,
-                });
+                for slice in [
+                    DomainSlice::Entities,
+                    DomainSlice::Workflows,
+                    DomainSlice::Overview,
+                    DomainSlice::Devices,
+                    DomainSlice::Autofactories,
+                    DomainSlice::Cargo,
+                    DomainSlice::Missions,
+                ] {
+                    state.invalidate(slice);
+                }
                 if let Some(notification) = workflow_notification(&workflow) {
                     state.notify(notification);
                 }
@@ -691,9 +831,7 @@ fn publish_workflow_updates(
                     step,
                     message,
                 }));
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Overview,
-                });
+                state.invalidate(DomainSlice::Overview);
             }
         }
     }
@@ -713,7 +851,13 @@ fn operation_status(status: ManagedOperationStatus) -> OperationStatus {
         ManagedOperationStatus::Cancelled
         | ManagedOperationStatus::Rejected
         | ManagedOperationStatus::Failed => OperationStatus::Failed,
-        _ => OperationStatus::Ambiguous,
+        // Deliberately not a wildcard: the managed crate marks this enum
+        // non-exhaustive, and a silent catch-all would mislabel any status
+        // added upstream rather than failing the build here.
+        status => {
+            tracing::warn!(?status, "unmapped managed operation status");
+            OperationStatus::Ambiguous
+        }
     }
 }
 
@@ -737,14 +881,21 @@ async fn live_connection(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         tokio::select! {
             update = updates.recv() => match update {
+                // Messages at or below the revision the client already has
+                // from its HTTP snapshot are redundant.
                 Ok(update) if update.revision <= initial_revision => {}
                 Ok(update) => if send_live(&mut socket, update).await.is_err() { break; },
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if let Ok(message) = state.resnapshot_message() {
-                        let _ = send_live(&mut socket, message).await;
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Keep the connection: the client recovers by comparing the
+                    // slice revisions in a fresh snapshot against what it has
+                    // loaded. Closing here forced a full reconnect during
+                    // exactly the bursts that caused the lag.
+                    tracing::debug!(skipped, "live subscriber lagged; sending resnapshot marker");
+                    if let Ok(message) = state.resnapshot_message()
+                        && send_live(&mut socket, message).await.is_err()
+                    {
+                        break;
                     }
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -819,6 +970,7 @@ async fn snapshot(
         workflows,
         requirements,
         notifications: operational_notifications(&instances, &triggers, &status),
+        slice_revisions: state.slice_revisions(),
     })))
 }
 
@@ -991,14 +1143,36 @@ async fn devices(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<DevicesSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let devices = device_rows(&state).await?;
+    let devices = device_rows(&state).await?.as_ref().clone();
     Ok(Json(Versioned::current(DevicesSnapshot {
         metadata,
         devices,
     })))
 }
 
-async fn device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
+/// Returns device rows for the current managed revision, building them only
+/// when that revision has moved.
+///
+/// Holding the lock across the build also collapses concurrent callers into
+/// one upstream pass instead of three identical ones.
+async fn device_rows(state: &Arc<AppState>) -> Result<Arc<Vec<DeviceSummary>>, ApiError> {
+    let revision = state
+        .client()
+        .state()
+        .revision()
+        .map_err(|_| ApiError::unavailable())?;
+    let mut cached = state.device_rows.lock().await;
+    if let Some((cached_revision, rows)) = cached.as_ref()
+        && *cached_revision == revision
+    {
+        return Ok(rows.clone());
+    }
+    let rows = Arc::new(build_device_rows(state).await?);
+    *cached = Some((revision, rows.clone()));
+    Ok(rows)
+}
+
+async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
     let location_systems = state
         .client()
         .locations()
@@ -1079,8 +1253,9 @@ async fn autofactories(
     let mut factories = Vec::new();
     for device in device_rows(&state)
         .await?
-        .into_iter()
+        .iter()
         .filter(|device| device.device_type.as_deref() == Some("autofactory"))
+        .cloned()
     {
         let detail = state
             .client()
@@ -1204,12 +1379,13 @@ async fn cargo(
 ) -> Result<Json<Versioned<CargoSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
     let mut carriers = Vec::new();
-    for device in device_rows(&state).await?.into_iter().filter(|device| {
+    for device in device_rows(&state).await?.iter().filter(|device| {
         device.cargo_capacity.unwrap_or_default() > 0
             || device.attach_capacity.unwrap_or_default() > 0
             || !device.attached_devices.is_empty()
             || !device.stowed_devices.is_empty()
     }) {
+        let device = device.clone();
         let detail = state
             .client()
             .raw()
@@ -1278,6 +1454,7 @@ async fn survey_missions(
 ) -> Result<Json<Versioned<SurveySnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
     let devices = device_rows(&state).await?;
+    let devices = devices.as_ref();
     let mut fleet_codes = std::collections::BTreeSet::new();
     let mut missions = Vec::new();
     for workflow in state.repository.list().map_err(ApiError::repository)? {
@@ -1334,8 +1511,9 @@ async fn survey_missions(
         metadata,
         missions,
         fleet: devices
-            .into_iter()
+            .iter()
             .filter(|device| fleet_codes.contains(&device.entity.id.0))
+            .cloned()
             .collect(),
     })))
 }
@@ -1361,7 +1539,7 @@ async fn mining_missions(
         .collect();
     Ok(Json(Versioned::current(MiningSnapshot {
         metadata,
-        installations: mining_installations(device_rows(&state).await?),
+        installations: mining_installations(device_rows(&state).await?.as_ref().clone()),
         workflows,
     })))
 }
@@ -1381,7 +1559,7 @@ async fn relay_missions(
     .map_err(|_| ApiError::unavailable())?;
     Ok(Json(Versioned::current(relay_snapshot(
         metadata,
-        device_rows(&state).await?,
+        device_rows(&state).await?.as_ref().clone(),
         scene,
         &workflows,
     )?)))
@@ -1630,6 +1808,7 @@ async fn trade(
         .await
         .map_err(|_| ApiError::unavailable())?;
     let devices = device_rows(&state).await?;
+    let devices = devices.as_ref();
     let workflows = state
         .repository
         .list()
@@ -1921,7 +2100,8 @@ fn network_snapshot(
 async fn relay_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
     Ok(device_rows(state)
         .await?
-        .into_iter()
+        .iter()
+        .cloned()
         .filter(|device| {
             device
                 .device_type
@@ -2630,6 +2810,14 @@ async fn run_report(
     )
 }
 
+/// Starts an action and returns as soon as it is durably recorded.
+///
+/// Actions can run for hours (`bootstrap.deliver` travels and unloads), so the
+/// work is spawned and its outcome is published over the live channel rather
+/// than held open on the HTTP request. Awaiting it inline meant any proxy read
+/// timeout severed the response while the action kept running, and a user who
+/// retried on that apparent failure started a second copy against the same
+/// devices.
 async fn run_action(
     State(state): State<Arc<AppState>>,
     Path(kind): Path<String>,
@@ -2639,17 +2827,83 @@ async fn run_action(
         .map_err(|_| ApiError::invalid("invalid action parameters"))?
         .0;
     let started_at = now_millis()?;
-    let result = state
+    // Rejects unknown kinds and invalid parameters before anything is
+    // recorded, so callers still get synchronous validation errors.
+    state
         .catalogue
-        .run_action(state.client(), &kind, request.parameters)
-        .await;
-    operation_response(
-        &state,
-        FiniteExecutionClass::Action,
-        &kind,
-        started_at,
-        result,
-    )
+        .validate_action(&kind, &request.parameters)
+        .map_err(ApiError::catalogue)?;
+
+    let execution = state
+        .repository
+        .begin_finite_execution(FiniteExecutionClass::Action, &kind, started_at)
+        .map_err(ApiError::repository)?;
+    let execution = present_execution(execution, ResultSummary::default());
+
+    let spawned = state.clone();
+    let execution_id = execution.id.clone();
+    let spawned_kind = kind.clone();
+    tokio::spawn(async move {
+        let outcome = spawned
+            .catalogue
+            .run_action(spawned.client(), &spawned_kind, request.parameters)
+            .await;
+        finish_action(&spawned, &execution_id, &spawned_kind, outcome);
+    });
+
+    Ok(Json(Versioned::current(RunOperationResponse {
+        result: Value::Null,
+        execution,
+    })))
+}
+
+/// Records an action's outcome and announces it to connected clients.
+fn finish_action(
+    state: &AppState,
+    execution_id: &str,
+    kind: &str,
+    outcome: Result<Value, CatalogueError>,
+) {
+    let (status, result, error) = match outcome {
+        Ok(result) => {
+            let result = sanitize_result(result);
+            let (_, status) = summarize_result(&result);
+            (status, Some(result), None)
+        }
+        Err(error) => {
+            tracing::warn!(kind, error = %error, "action execution failed");
+            (
+                StoredFiniteExecutionStatus::Failed,
+                None,
+                Some("execution failed"),
+            )
+        }
+    };
+    if let Err(repository_error) =
+        state
+            .repository
+            .complete_finite_execution(execution_id, status, result.as_ref(), error)
+    {
+        tracing::error!(
+            error = %repository_error,
+            kind,
+            "action outcome was not persisted"
+        );
+    }
+    if kind.starts_with("bootstrap.") {
+        state.invalidate(DomainSlice::Missions);
+    }
+    state.invalidate(DomainSlice::History);
+    state.flush_invalidations();
+    if status == StoredFiniteExecutionStatus::Failed {
+        state.notify(Notification {
+            id: EntityId(format!("action:{execution_id}:failed")),
+            level: NotificationLevel::Error,
+            title: "Action failed".to_owned(),
+            message: format!("{kind} did not complete"),
+            created_at_ms: now_millis().unwrap_or_default(),
+        });
+    }
 }
 
 fn operation_response(
@@ -2674,9 +2928,8 @@ fn operation_response(
                 summary,
             );
             if kind.starts_with("bootstrap.") {
-                state.publish(LiveDelta::DomainInvalidated {
-                    slice: DomainSlice::Missions,
-                });
+                state.invalidate(DomainSlice::Missions);
+                state.flush_invalidations();
             }
             Ok(Json(Versioned::current(RunOperationResponse {
                 result,
@@ -3094,6 +3347,7 @@ fn present_execution(
         },
         kind: OperationKind(execution.kind),
         status: match execution.status {
+            StoredFiniteExecutionStatus::Running => ProtocolFiniteExecutionStatus::Running,
             StoredFiniteExecutionStatus::Succeeded => ProtocolFiniteExecutionStatus::Succeeded,
             StoredFiniteExecutionStatus::Skipped => ProtocolFiniteExecutionStatus::Skipped,
             StoredFiniteExecutionStatus::Failed => ProtocolFiniteExecutionStatus::Failed,
@@ -3803,6 +4057,14 @@ impl ApiError {
         }
     }
 
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "a valid daemon token is required",
+        }
+    }
+
     fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -3920,6 +4182,7 @@ mod tests {
             managed_database: PathBuf::from("replicant-client.sqlite"),
             runtime_database: PathBuf::from("replicant-runtime.sqlite"),
             bind: DEFAULT_BIND.parse().expect("default bind address"),
+            token: None,
         }
     }
 
@@ -5247,6 +5510,20 @@ mod tests {
             updates.recv().await.expect("workflow update").delta,
             LiveDelta::WorkflowCreated(_)
         ));
+        assert!(matches!(
+            updates.recv().await.expect("activity update").delta,
+            LiveDelta::WorkflowActivity(_)
+        ));
+
+        // Invalidations are coalesced: one flush carries every slice the
+        // workflow change and its activity touched, each with the revision it
+        // reached, instead of one message per slice.
+        state.flush_invalidations();
+        let LiveDelta::DomainsInvalidated { slices } =
+            updates.recv().await.expect("coalesced invalidation").delta
+        else {
+            panic!("expected a coalesced domain invalidation");
+        };
         for expected in [
             DomainSlice::Entities,
             DomainSlice::Workflows,
@@ -5256,21 +5533,14 @@ mod tests {
             DomainSlice::Cargo,
             DomainSlice::Missions,
         ] {
-            assert!(matches!(
-                updates.recv().await.expect("domain invalidation").delta,
-                LiveDelta::DomainInvalidated { slice } if slice == expected
-            ));
+            assert!(slices.contains_key(&expected), "missing slice {expected:?}");
         }
-        assert!(matches!(
-            updates.recv().await.expect("activity update").delta,
-            LiveDelta::WorkflowActivity(_)
-        ));
-        assert!(matches!(
-            updates.recv().await.expect("overview invalidation").delta,
-            LiveDelta::DomainInvalidated {
-                slice: DomainSlice::Overview
-            }
-        ));
+        assert!(
+            slices
+                .values()
+                .all(|revision| *revision == state.revision.load(Ordering::Relaxed))
+        );
+        assert_eq!(state.slice_revisions(), slices);
         client.close().await.expect("close client");
     }
 
@@ -5286,12 +5556,105 @@ mod tests {
             Ok(Value::Null),
         )
         .unwrap_or_else(|_| panic!("operation response"));
+        let LiveDelta::DomainsInvalidated { slices } =
+            updates.recv().await.expect("mission invalidation").delta
+        else {
+            panic!("expected a coalesced domain invalidation");
+        };
+        assert!(slices.contains_key(&DomainSlice::Missions));
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    #[test]
+    fn non_loopback_binds_require_a_token() {
+        let mut config = test_daemon_config();
+        config.bind = "0.0.0.0:8080".parse().expect("wildcard bind");
         assert!(matches!(
-            updates.recv().await.expect("mission invalidation").delta,
-            LiveDelta::DomainInvalidated {
-                slice: DomainSlice::Missions
-            }
+            config.validate(),
+            Err(ConfigError::MissingToken(_))
         ));
+        config.token = Some("secret".to_owned());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tokens_are_compared_in_full_and_exactly() {
+        let mut config = test_daemon_config();
+        assert!(
+            config.authorized(None),
+            "no token configured accepts anyone"
+        );
+        config.token = Some("secret".to_owned());
+        assert!(config.authorized(Some("secret")));
+        assert!(!config.authorized(Some("secre")), "prefixes are rejected");
+        assert!(!config.authorized(Some("secretx")));
+        assert!(!config.authorized(None));
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_token_are_rejected_but_health_stays_open() {
+        let (_, client, state) = test_app().await;
+        let mut config = state.daemon.clone();
+        config.token = Some("secret".to_owned());
+        let guarded = AppState::new(
+            client.clone(),
+            RuntimeConfig::new("test"),
+            state.repository.clone(),
+            config,
+        )
+        .expect("guarded state");
+        let app = router(guarded);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapshot")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapshot")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+
+        // WebSocket clients cannot set headers, so a query token is accepted.
+        let query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapshot?token=secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_ne!(query.status(), StatusCode::UNAUTHORIZED);
+
+        // Health backs container health checks and must not need credentials.
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(health.status(), StatusCode::OK);
         client.close().await.expect("close client");
     }
 

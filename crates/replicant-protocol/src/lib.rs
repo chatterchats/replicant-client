@@ -1296,6 +1296,12 @@ pub struct RuntimeSnapshot {
     /// Current operational issues requiring visibility.
     #[serde(default)]
     pub notifications: Vec<Notification>,
+    /// Revision each domain slice had reached when this snapshot was produced.
+    ///
+    /// Lets a reconnecting or lagging client decide which projections are
+    /// stale by comparison instead of discarding everything and refetching.
+    #[serde(default)]
+    pub slice_revisions: BTreeMap<DomainSlice, u64>,
 }
 
 /// Summary-oriented operations dashboard projection.
@@ -1499,6 +1505,8 @@ pub struct RunOperationResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FiniteExecutionStatus {
+    /// Execution is still in progress.
+    Running,
     /// Execution completed useful work.
     Succeeded,
     /// Execution completed but found no work to perform.
@@ -1958,7 +1966,7 @@ pub struct DescriptorCatalog {
 }
 
 /// Application slice that a frontend should reload after invalidation.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DomainSlice {
@@ -1978,6 +1986,8 @@ pub enum DomainSlice {
     Cargo,
     /// Survey, mining, relay, and bootstrap missions.
     Missions,
+    /// Finite report and action execution history.
+    History,
     /// Discovered events.
     Events,
     /// Trade controllers, orders, and trades.
@@ -2076,6 +2086,17 @@ pub enum LiveDelta {
     DomainInvalidated {
         /// Invalidated application slice.
         slice: DomainSlice,
+    },
+    /// One or more domain slices should be queried again.
+    ///
+    /// Coalesces a tick's worth of invalidations into a single message and
+    /// carries the revision each slice reached, so a client that missed
+    /// messages recovers by comparing revisions instead of reconnecting. A
+    /// single managed-state change previously produced fourteen separate
+    /// `DomainInvalidated` messages.
+    DomainsInvalidated {
+        /// Revision reached per invalidated slice.
+        slices: BTreeMap<DomainSlice, u64>,
     },
     /// A workflow was created.
     WorkflowCreated(WorkflowSummary),
