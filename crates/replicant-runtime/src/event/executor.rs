@@ -1023,7 +1023,7 @@ async fn release_preflight_claims(
                     ..Default::default()
                 })
                 .await?;
-            ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+            ensure_operation_accepted(&operation).await?;
             wait_for_device_snapshot(client, config, &claim.device_code, |device| {
                 removable
                     .iter()
@@ -1756,7 +1756,7 @@ async fn submit_available_print_batches(
         plan.execution.print_batches[index].operation_id = Some(operation.id().as_str().to_owned());
         plan.execution.print_batches[index].submitted = true;
         save_plan(&config.plan_path, plan)?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         queue_slots.insert(factory_code, slots - 1);
         submitted += 1;
     }
@@ -2235,7 +2235,7 @@ async fn claim_device(
                 ..Default::default()
             })
             .await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         wait_for_device_snapshot(client, config, code, |device| {
             desired_tags
                 .iter()
@@ -2252,7 +2252,7 @@ async fn claim_device(
         .map(|replicant| replicant.id.as_str());
     if assigned != Some(plan.selected_replicant.as_str()) {
         let operation = handle.change_owner(plan.selected_replicant.clone()).await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         wait_for_device_snapshot(client, config, code, |device| {
             device
                 .relationships
@@ -2418,7 +2418,7 @@ async fn ensure_free_standing(client: &Client, config: &Config, code: &str) -> A
     }
     if detail.stowed_in_device_code.is_some() {
         let operation = client.devices().get(code).await?.deploy().await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         wait_for_raw_device(client, config, code, |device| {
             device.stowed_in_device_code.is_none()
         })
@@ -2506,7 +2506,7 @@ async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) 
 
     info!(device = %code, "compacting modular event payload for carrier attachment");
     let operation = client.devices().get(code).await?.compact().await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     wait_for_raw_device(client, config, code, |device| {
         status_is(device, "compacted")
             && device.attached_to_device_code.is_none()
@@ -2659,6 +2659,7 @@ fn transport_options(config: &Config) -> DeliveryOptions {
         poll_interval: POLL_INTERVAL,
         unfurl_modular_payload: true,
         return_transports: false,
+        ..DeliveryOptions::default()
     }
 }
 
@@ -2808,7 +2809,7 @@ async fn install_beacon(
             ));
         }
         let operation = client.devices().get(&code).await?.deploy().await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         wait_for_raw_device(client, config, &code, |device| {
             device.location.as_deref() == Some(plan.event.location.as_str())
                 && device.attached_to_device_code.is_none()
@@ -3009,7 +3010,7 @@ async fn resolve_event(
         .location_events()
         .resolve(&plan.event.location, &plan.event.designation)
         .await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     wait_for_event_completion(
         client,
         config,
@@ -3575,7 +3576,7 @@ async fn cleanup_claims(
                     ..Default::default()
                 })
                 .await?;
-            ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+            ensure_operation_accepted(&operation).await?;
             wait_for_device_snapshot(client, config, &claim.device_code, |device| {
                 removable
                     .iter()
@@ -3633,7 +3634,7 @@ async fn cleanup_component_tags(
                 ..Default::default()
             })
             .await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
         wait_for_device_snapshot(client, config, &code, |device| {
             removable
                 .iter()
@@ -3734,7 +3735,7 @@ async fn start_device_travel_to(client: &Client, code: &str, destination: &str) 
                 via: None,
             })
             .await?;
-        ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+        ensure_operation_accepted(&operation).await?;
     }
     Ok(())
 }
@@ -3903,7 +3904,7 @@ async fn start_replicant_travel_to(
         "dispatching replicant travel"
     );
     let operation = handle.travel().to(destination).depart().await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     Ok(origin)
 }
 
@@ -4078,7 +4079,7 @@ async fn collect_resources(
             resources: resource_json(resources),
         })
         .await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     wait_for_raw_device(client, config, code, |device| {
         let cargo = cargo_map(device);
         resources.iter().all(|(resource, quantity)| {
@@ -4116,7 +4117,7 @@ async fn deposit_resources(
             resources: resources.map(resource_json),
         })
         .await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     wait_for_raw_device(client, config, code, |device| {
         let cargo = cargo_map(device);
         requested.iter().all(|(resource, quantity)| {
@@ -4153,7 +4154,7 @@ async fn attach_devices(
             targets: None,
         })
         .await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     for code in devices {
         wait_for_raw_device(client, config, code, |device| {
             device.attached_to_device_code.as_deref() == Some(carrier)
@@ -4187,7 +4188,7 @@ async fn detach_devices(
             },
         ))
         .await?;
-    ensure_operation_accepted(&operation, Duration::from_secs(30)).await?;
+    ensure_operation_accepted(&operation).await?;
     for code in devices {
         wait_for_raw_device(client, config, code, |device| {
             device.attached_to_device_code.is_none()
@@ -4417,8 +4418,18 @@ fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
     }
 }
 
-async fn ensure_operation_accepted(operation: &Operation, wait: Duration) -> AnyResult<()> {
-    let outcome = operation.wait_timeout(wait).await?;
+/// Verifies the immediate durable classification of a submitted command.
+///
+/// Managed mutation construction has already completed the one durable HTTP
+/// submission and persisted its classification. Successful device mutations
+/// normally stay in `AwaitingEvidence`/`ReconciliationRequired` until the event
+/// engine reconciles them, so blocking for a terminal status here stalled every
+/// campaign command for the full timeout without adding any safety. Each call
+/// site below performs its own state-specific verification (the
+/// `wait_for_device_snapshot` / `wait_for_raw_device` calls that follow), which
+/// is what actually establishes ordering.
+async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
+    let outcome = operation.outcome().await?;
     if matches!(
         outcome.status,
         OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed

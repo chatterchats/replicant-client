@@ -11,8 +11,8 @@ use replicant_client::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::time::sleep;
-use tracing::{debug, info};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info, warn};
 
 use crate::{
     Blueprint, FactoryWorkload, PrintRequest, PrintTime, QuantityMap, ScheduleError,
@@ -901,6 +901,8 @@ async fn queue_print_batch(
     // delivered or unfurled at the hub mid-wait are still picked up.
     let mut factory_codes = discover_factory_codes(client, &options.hub).await?;
     let deadline = Instant::now() + options.wait_timeout;
+    // Best-effort: if the event stream is unavailable, fall back to polling.
+    let mut watch = client.events().watch().await.ok();
     loop {
         if factory_codes.is_empty() {
             return Err(PrintingError::NoFactoryAtHub(options.hub.clone()));
@@ -926,7 +928,54 @@ async fn queue_print_batch(
             info!("waiting for Autofactory queue capacity");
             factory_codes = discover_factory_codes(client, &options.hub).await?;
         }
-        sleep(options.poll_interval).await;
+        wait_for_queue_capacity(&mut watch, deadline, options.poll_interval).await;
+    }
+}
+
+/// Waits for a print to finish, bounded by the caller's poll interval.
+///
+/// Queue slots free up when a print completes, so waking on that event reacts
+/// faster than a flat sleep while removing the idle re-reads of every factory
+/// detail in between. The poll interval remains the upper bound, so a missed
+/// or filtered event costs at most one ordinary polling round.
+///
+/// Every consumer of this crate previously had to build this loop above the
+/// crate to get event-driven queueing; owning it here means they all benefit.
+async fn wait_for_queue_capacity(
+    watch: &mut Option<replicant_client::EventWatch>,
+    deadline: Instant,
+    poll_interval: Duration,
+) {
+    let Some(active) = watch.as_mut() else {
+        sleep(poll_interval).await;
+        return;
+    };
+    let poll_deadline = (Instant::now() + poll_interval).min(deadline);
+    loop {
+        let remaining = poll_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(remaining, active.next()).await {
+            Ok(Ok(event))
+                if matches!(
+                    event.name.as_str(),
+                    "print.completed" | "device.print_completed"
+                ) =>
+            {
+                return;
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return,
+            Ok(Err(error)) => {
+                // A watcher gap means the stream can no longer be trusted for
+                // this wait; fall back to plain polling for the rest of it.
+                warn!(%error, "event watcher gap; falling back to polling for queue capacity");
+                *watch = None;
+                sleep(poll_interval).await;
+                return;
+            }
+        }
     }
 }
 

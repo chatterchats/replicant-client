@@ -45,6 +45,8 @@ use crate::{config::ManagedClientConfig, start_managed_client};
 use replicant_client::{
     Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, raw,
 };
+// Workflow device claims are shared vocabulary; see
+// `replicant_protocol::RESERVED_WORKFLOW_TAG_PREFIXES`.
 use replicant_printing::{
     Blueprint as PrintingBlueprint, FactoryWorkload, QuantityMap,
     managed::{
@@ -55,6 +57,7 @@ use replicant_printing::{
     },
     schedule_prints,
 };
+use replicant_protocol::{workflow_reserved, workflow_tag_reserved};
 use replicant_route_planner::{
     NetworkNode, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
     Star as PlannerStar, plan_relay_network_with_ranges,
@@ -77,14 +80,14 @@ const FTL_RELAY: &str = "ftl_relay";
 const SYSTEM_HUB: &str = "system_hub";
 const RELAYING: &str = "relaying";
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Upper bound between authoritative refreshes while waiting on the event
+/// stream. Event-driven waits wake immediately on a relevant event; this only
+/// bounds how long a missed event can delay progress.
+const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_DEVICE_TAG_CHARS: usize = 32;
 const RELAY_MISSION_TAG_PREFIX: &str = "relay-m:";
 const RELAY_SITE_TAG_PREFIX: &str = "relay-s:";
 const RELAY_BATCH_TAG_PREFIX: &str = "relay-b:";
-const RESERVED_WORKFLOW_TAG_PREFIXES: &[&str] = &[
-    "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
-    "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
-];
 
 /// Error type returned by the reusable relay workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -4352,6 +4355,13 @@ async fn travel_to(
     }
 }
 
+/// Waits until one device's authoritative state satisfies `predicate`.
+///
+/// The wait wakes on events for this specific device and otherwise refreshes
+/// on the authoritative poll interval. An earlier version woke on *any*
+/// account event and issued a remote device read per wake, so a busy account
+/// (a mining or survey mission streaming events in parallel) turned every
+/// relay wait into a per-event fetch storm.
 async fn wait_for_device(
     client: &Client,
     config: &Config,
@@ -4371,7 +4381,40 @@ async fn wait_for_device(
                 format!("timed out waiting for device {code}"),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &[]).await?;
+        wait_for_device_event(&mut watch, deadline, code).await?;
+    }
+}
+
+/// Waits for an event naming `code`, bounded by the authoritative poll
+/// interval so a missed or filtered event cannot stall the wait.
+async fn wait_for_device_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    code: &str,
+) -> AnyResult<()> {
+    let poll_deadline = (Instant::now() + AUTHORITATIVE_POLL_INTERVAL).min(deadline);
+    loop {
+        let remaining = poll_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if event
+                    .device
+                    .as_ref()
+                    .is_some_and(|device| device.id.as_str() == code) =>
+            {
+                return Ok(());
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(()),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; falling back to authoritative refresh");
+                sleep(Duration::from_millis(250)).await;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -4383,6 +4426,8 @@ async fn wait_for_parent_connection(
 ) -> AnyResult<()> {
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
+    // Each pass costs a remote `/network` read, so wake on events naming this
+    // relay rather than on any account event.
     loop {
         let network = client.devices().get(relay_code).await?.network().await?;
         if network
@@ -4400,7 +4445,7 @@ async fn wait_for_parent_connection(
                 ),
             ));
         }
-        wait_for_relevant_event(&mut watch, deadline, &[]).await?;
+        wait_for_device_event(&mut watch, deadline, relay_code).await?;
     }
 }
 
@@ -4650,6 +4695,13 @@ fn print_plan(plan: &MissionPlan) {
             );
         }
     }
+    if !plan.network.relay_tree_optimal {
+        println!(
+            "  Note: the exact minimum-relay search was too large for this target set, so this \
+             is a feasible plan that may use more new relays than strictly necessary. Planning \
+             fewer targets at once will restore the exact solver."
+        );
+    }
     println!(
         "  Single-pass planner traversal: {} hops, {:.4} routed ly including one return ({})",
         plan.network.execution_hops,
@@ -4772,16 +4824,6 @@ fn print_plan(plan: &MissionPlan) {
     }
     println!();
     println!("Return destination: {}", plan.hub_location);
-}
-
-fn workflow_tag_reserved(tag: &str) -> bool {
-    RESERVED_WORKFLOW_TAG_PREFIXES
-        .iter()
-        .any(|prefix| tag.starts_with(prefix))
-}
-
-fn workflow_reserved(tags: &[String]) -> bool {
-    tags.iter().any(|tag| workflow_tag_reserved(tag))
 }
 
 fn device_has_command(device: &Device, command: &str) -> bool {

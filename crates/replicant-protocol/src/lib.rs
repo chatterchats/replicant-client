@@ -11,6 +11,35 @@ use serde_json::Value;
 /// Current local application protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Device-tag prefixes that mark a device as claimed by a running workflow.
+///
+/// Every workflow tags the devices it owns so that other workflows do not
+/// select, move, or repurpose them mid-mission. This list is the single
+/// authority: it previously existed as verbatim copies in the transport and
+/// relay layers, where a prefix added to one copy and not the other would let
+/// one workflow fly off with another's claimed hardware.
+///
+/// Use [`workflow_tag_reserved`] / [`workflow_reserved`] rather than matching
+/// these directly.
+pub const RESERVED_WORKFLOW_TAG_PREFIXES: &[&str] = &[
+    "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
+    "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
+];
+
+/// Returns whether one tag marks a device as claimed by a running workflow.
+#[must_use]
+pub fn workflow_tag_reserved(tag: &str) -> bool {
+    RESERVED_WORKFLOW_TAG_PREFIXES
+        .iter()
+        .any(|prefix| tag.starts_with(prefix))
+}
+
+/// Returns whether any tag marks a device as claimed by a running workflow.
+#[must_use]
+pub fn workflow_reserved(tags: &[String]) -> bool {
+    tags.iter().any(|tag| workflow_tag_reserved(tag.as_str()))
+}
+
 /// A request or response payload carrying its wire protocol version.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Versioned<T> {

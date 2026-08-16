@@ -3253,6 +3253,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "replicant-client",
+ "replicant-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

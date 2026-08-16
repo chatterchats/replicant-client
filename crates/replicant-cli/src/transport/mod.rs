@@ -12,7 +12,7 @@ use std::{
 use replicant_runtime::{config::ManagedClientConfig, start_managed_client};
 use replicant_transport::{
     CarrierPreference, DeliveryOptions, DeliveryRequest, DeviceRequest, ResourceMap,
-    execute_delivery, plan_delivery,
+    execute_delivery, plan_delivery_with,
 };
 use tracing_subscriber::{EnvFilter, prelude::*};
 
@@ -29,6 +29,7 @@ struct Config {
     database: PathBuf,
     wait_timeout: Duration,
     poll_interval: Duration,
+    transport_limit: usize,
     return_carriers: bool,
     unfurl_modular_payload: bool,
     dry_run: bool,
@@ -60,6 +61,11 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(5),
         );
+        let mut transport_limit = env::var("RS_TRANSPORT_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or_else(|| DeliveryOptions::default().transport_limit);
         let mut return_carriers = false;
         let mut unfurl_modular_payload = true;
         let mut dry_run = false;
@@ -159,6 +165,13 @@ impl Config {
                         "--poll-seconds",
                     )?);
                 }
+                "--transport-limit" => {
+                    transport_limit = usize::try_from(parse_positive_u64(
+                        &required_argument(&mut arguments, "--transport-limit")?,
+                        "--transport-limit",
+                    )?)
+                    .unwrap_or(usize::MAX);
+                }
                 "--return-carriers" => return_carriers = true,
                 "--no-unfurl" => unfurl_modular_payload = false,
                 "--dry-run" | "--plan" => dry_run = true,
@@ -216,6 +229,7 @@ impl Config {
             database,
             wait_timeout,
             poll_interval,
+            transport_limit,
             return_carriers,
             unfurl_modular_payload,
             dry_run,
@@ -232,7 +246,15 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     client.ready().await?;
 
-    let plan_result = plan_delivery(&client, &config.request).await;
+    let options = DeliveryOptions {
+        wait_timeout: config.wait_timeout,
+        poll_interval: config.poll_interval,
+        unfurl_modular_payload: config.unfurl_modular_payload,
+        return_transports: config.return_carriers,
+        transport_limit: config.transport_limit,
+    };
+
+    let plan_result = plan_delivery_with(&client, &config.request, options).await;
     let plan = match plan_result {
         Ok(plan) => plan,
         Err(error) => {
@@ -248,17 +270,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         return Ok(());
     }
 
-    let result = execute_delivery(
-        &client,
-        &plan,
-        DeliveryOptions {
-            wait_timeout: config.wait_timeout,
-            poll_interval: config.poll_interval,
-            unfurl_modular_payload: config.unfurl_modular_payload,
-            return_transports: config.return_carriers,
-        },
-    )
-    .await;
+    let result = execute_delivery(&client, &plan, options).await;
     let close_result = client.close().await;
     let report = result?;
     close_result?;
@@ -447,7 +459,7 @@ fn print_help() {
         "Replicant point-to-point transport\n\n\
 Usage:\n  replicant-cli transport --origin ORIGIN --destination LOCATION [PAYLOAD] [OPTIONS]\n\n\
 Payload:\n  --devices N DEVICE_TYPE   Move N free inactive devices (repeatable)\n  --device-tag TAG          Move every eligible device with TAG (repeatable)\n  --carbon N                Move Carbon\n  --conductive N            Move Conductive\n  --rares N                 Move Rares\n  --silicates N             Move Silicates\n  --structural N            Move Structural\n  --volatiles N             Move Volatiles\n  --resource N TYPE         Move any open resource type (repeatable)\n\n\
-Routing and carrier selection:\n  --origin LOCATION|SYSTEM  Exact source location, or search the whole source system\n  --destination LOCATION    Exact delivery location\n  --carrier TYPE            Require one transport of TYPE\n  --carrier N TYPE          Require N transports of TYPE\n  --return-carriers         Return transports after delivery (exact origin only)\n  --no-unfurl               Leave compacted modular payload compacted after delivery\n\n\
+Routing and carrier selection:\n  --origin LOCATION|SYSTEM  Exact source location, or search the whole source system\n  --destination LOCATION    Exact delivery location\n  --carrier TYPE            Require one transport of TYPE\n  --carrier N TYPE          Require N transports of TYPE\n  --transport-limit N       Max transports auto-selected when no --carrier is given (default: 3)\n  --return-carriers         Return transports after delivery (exact origin only)\n  --no-unfurl               Leave compacted modular payload compacted after delivery\n\n\
 Shared options:\n  --database PATH           Managed SQLite database\n  --wait-timeout-secs N     Travel/state wait timeout (default: 21600)\n  --poll-seconds N          State poll interval (default: 5)\n  --dry-run, --plan         Resolve payload/carriers without moving anything\n  --verbose                 Show transport tracing in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit plan/report as JSON\n  -h, --help                Show this help\n\n\
 Examples:\n  replicant-cli transport --origin SCEPTURUM --devices 36 exotic_matter_injector \\\n    --carrier 1 mobile_fleet --destination TWAFFY-OBJ-1\n\n\
   replicant-cli transport --origin SCEPTURUM --device-tag twaffy-obj-1 \\\n    --carrier 1 mobile_fleet --destination TWAFFY-OBJ-1\n\n\

@@ -130,6 +130,21 @@ pub struct RelayNetworkPlan {
     pub execution_distance_ly: f64,
     /// Sum of selected tree-edge distances.
     pub total_edge_distance_ly: f64,
+    /// Whether the relay tree itself is proven minimum-new-relay.
+    ///
+    /// `true` for the exact Dreyfus-Wagner solution. `false` when the search
+    /// was too large even after corridor pruning and a feasible greedy tree
+    /// was returned instead; the plan is still valid and dependency-safe, but
+    /// may use more new relays than strictly necessary.
+    ///
+    /// Defaults to `true` when absent so mission plans persisted before this
+    /// field existed still load: every such plan came from the exact solver.
+    #[serde(default = "exact_by_default")]
+    pub relay_tree_optimal: bool,
+}
+
+fn exact_by_default() -> bool {
+    true
 }
 
 /// Planner input.
@@ -705,6 +720,18 @@ pub fn plan_relay_network_with_ranges(
     request: RelayNetworkRequest,
     relay_ranges_ly: BTreeMap<String, f64>,
 ) -> Result<RelayNetworkPlan, PlannerError> {
+    plan_relay_network_within(stars, request, relay_ranges_ly, EXACT_STATE_LIMIT)
+}
+
+/// Solver body with an explicit exact-search budget, so the fallback path is
+/// reachable in tests without allocating a catalogue that actually exhausts
+/// memory.
+fn plan_relay_network_within(
+    stars: Vec<Star>,
+    request: RelayNetworkRequest,
+    relay_ranges_ly: BTreeMap<String, f64>,
+    state_limit: usize,
+) -> Result<RelayNetworkPlan, PlannerError> {
     if request.targets.is_empty() {
         return Err(PlannerError::NoTargets);
     }
@@ -744,6 +771,38 @@ pub fn plan_relay_network_with_ranges(
         }
         None => (full_graph.clone(), full_context),
     };
+    let terminals = std::iter::once(context.start)
+        .chain(context.targets.iter().copied())
+        .collect::<Vec<_>>();
+    let mask_count = 1usize << terminal_count;
+    let node_count = graph.stars.len();
+    if mask_count.saturating_mul(node_count) > state_limit {
+        // The exact tables would not fit in memory even after pruning. Rather
+        // than refuse the request, fall back to the same feasible tree that
+        // anchors the pruning bound and mark the plan as non-optimal, so the
+        // caller still gets a deployable network with an honest quality flag.
+        let tree = greedy_terminal_tree(&graph, &context, &terminals).ok_or(
+            PlannerError::ExactSearchTooLarge {
+                nodes: node_count,
+                terminals: terminal_count,
+            },
+        )?;
+        let terminal_set = terminals.iter().copied().collect::<BTreeSet<_>>();
+        let tree = deterministic_spanning_tree(context.start, &tree.edges);
+        let tree = prune_nonterminal_leaves(tree, &terminal_set);
+        return orient(
+            &graph,
+            &full_graph,
+            context.start,
+            &context.targets,
+            &context.active,
+            &context.inactive,
+            request.max_hop_ly,
+            tree,
+            false,
+        );
+    }
+
     let SolverContext {
         start,
         targets,
@@ -751,18 +810,6 @@ pub fn plan_relay_network_with_ranges(
         inactive,
         node_cost,
     } = context;
-
-    let terminals = std::iter::once(start)
-        .chain(targets.iter().copied())
-        .collect::<Vec<_>>();
-    let mask_count = 1usize << terminal_count;
-    let node_count = graph.stars.len();
-    if mask_count.saturating_mul(node_count) > EXACT_STATE_LIMIT {
-        return Err(PlannerError::ExactSearchTooLarge {
-            nodes: node_count,
-            terminals: terminal_count,
-        });
-    }
     let mut dp = vec![vec![Cost::INF; node_count]; mask_count];
     let mut parent = vec![vec![Parent::None; node_count]; mask_count];
 
@@ -822,6 +869,7 @@ pub fn plan_relay_network_with_ranges(
         &inactive,
         request.max_hop_ly,
         tree,
+        true,
     )
 }
 
@@ -953,9 +1001,29 @@ fn greedy_tree_relay_bound(
     context: &SolverContext,
     terminals: &[usize],
 ) -> Option<u32> {
+    greedy_terminal_tree(graph, context, terminals).map(|tree| tree.new_relays)
+}
+
+/// A feasible relay tree built by nearest-terminal insertion.
+struct GreedyTree {
+    edges: BTreeSet<(usize, usize)>,
+    new_relays: u32,
+}
+
+/// Builds a feasible tree by repeatedly attaching the cheapest remaining
+/// terminal to the tree built so far.
+///
+/// This both anchors the corridor-pruning bound and serves as the fallback
+/// plan when the exact search would not fit in memory.
+fn greedy_terminal_tree(
+    graph: &StarGraph,
+    context: &SolverContext,
+    terminals: &[usize],
+) -> Option<GreedyTree> {
     let node_count = graph.stars.len();
     let mut in_tree = vec![false; node_count];
     in_tree[context.start] = true;
+    let mut edges = BTreeSet::new();
     let mut remaining = terminals
         .iter()
         .copied()
@@ -986,13 +1054,20 @@ fn greedy_tree_relay_bound(
         while !in_tree[current] {
             in_tree[current] = true;
             match parents[current] {
-                Parent::Move(previous) => current = previous as usize,
+                Parent::Move(previous) => {
+                    let previous = previous as usize;
+                    edges.insert(ordered_edge(current, previous));
+                    current = previous;
+                }
                 _ => break,
             }
         }
         remaining.remove(&next);
     }
-    Some(total)
+    Some(GreedyTree {
+        edges,
+        new_relays: total,
+    })
 }
 
 fn metric_closure(
@@ -1120,6 +1195,7 @@ fn orient(
     inactive: &BTreeSet<usize>,
     max_hop_ly: f64,
     edges: BTreeSet<(usize, usize)>,
+    relay_tree_optimal: bool,
 ) -> Result<RelayNetworkPlan, PlannerError> {
     let mut adjacency = BTreeMap::<usize, Vec<usize>>::new();
     for &(left, right) in &edges {
@@ -1231,6 +1307,7 @@ fn orient(
         execution_order_optimal,
         execution_hops,
         execution_distance_ly,
+        relay_tree_optimal,
     })
 }
 
@@ -1751,6 +1828,50 @@ mod tests {
         assert_eq!(plan.edges[0].parent, "HUB");
         assert_eq!(plan.edges[0].child, "REMOTE");
         assert_eq!(plan.edges[0].distance_ly, 12.0);
+    }
+
+    #[test]
+    fn oversized_searches_fall_back_to_a_feasible_plan_instead_of_failing() {
+        // Same chain as the pruning test, but with a search budget too small
+        // for the exact tables. The plan must still be produced, connect the
+        // target, and honestly report that its relay tree is not proven
+        // minimal.
+        let mut stars = (0..10)
+            .map(|index| star(&format!("CHAIN{index:02}"), index as f64 * 6.0))
+            .collect::<Vec<_>>();
+        for index in 0..200 {
+            stars.push(star_at(
+                &format!("CLOUD{index:03}"),
+                (index % 20) as f64 * 6.0,
+                500.0 + (index / 20) as f64 * 6.0,
+                0.0,
+            ));
+        }
+        let request = RelayNetworkRequest {
+            start: "CHAIN00".into(),
+            targets: vec!["CHAIN09".into()],
+            active_relay_systems: BTreeSet::new(),
+            inactive_relay_systems: BTreeSet::new(),
+            max_hop_ly: 7.499,
+        };
+
+        let fallback =
+            plan_relay_network_within(stars.clone(), request.clone(), BTreeMap::new(), 1)
+                .expect("fallback plan");
+        assert!(!fallback.relay_tree_optimal);
+        assert!(fallback.nodes.iter().any(|node| node.system == "CHAIN09"));
+        assert!(
+            fallback
+                .nodes
+                .iter()
+                .all(|node| node.system.starts_with("CHAIN"))
+        );
+
+        // On this geometry the only route is the chain itself, so the feasible
+        // plan matches the exact one; the flag is the difference.
+        let exact = plan_relay_network(stars, request).expect("exact plan");
+        assert!(exact.relay_tree_optimal);
+        assert_eq!(fallback.new_relay_systems, exact.new_relay_systems);
     }
 
     #[test]

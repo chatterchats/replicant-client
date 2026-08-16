@@ -18,8 +18,8 @@ use replicant_printing::managed::{enqueue_print, factory_queue_slots};
 use replicant_printing::schedule_prints;
 use replicant_transport::{DeliveryOptions, PayloadDevice, deliver_devices_with};
 use serde_json::Value;
-use tokio::time::sleep;
-use tracing::info;
+use tokio::time::timeout;
+use tracing::{info, warn};
 
 use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
@@ -29,7 +29,55 @@ use super::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Upper bound between authoritative refreshes while waiting on the event
+/// stream. Waits wake immediately on a relevant event; this only bounds how
+/// long a missed or filtered-out event can delay progress.
+const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Why a mission wait loop woke up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissionWake {
+    /// A relevant upstream event arrived.
+    Event,
+    /// The authoritative poll interval elapsed.
+    Poll,
+    /// The event watcher reported a gap and state must be re-read.
+    Gap,
+}
+
+/// Waits for an event that could advance the mission, bounded by the
+/// authoritative poll interval.
+///
+/// Mission progress is driven by device and print events. Sleeping a flat
+/// interval between full-account refreshes meant every wait re-read the entire
+/// device census every few seconds regardless of whether anything had changed;
+/// waking on the event stream keeps the reaction time while cutting the idle
+/// refreshes by an order of magnitude.
+async fn wait_for_mission_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    names: &[&str],
+) -> AnyResult<MissionWake> {
+    let poll_deadline = (Instant::now() + AUTHORITATIVE_POLL_INTERVAL).min(deadline);
+    loop {
+        let remaining = poll_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(MissionWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event)) if names.is_empty() || names.contains(&event.name.as_str()) => {
+                return Ok(MissionWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(MissionWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; refreshing mining mission state");
+                return Ok(MissionWake::Gap);
+            }
+        }
+    }
+}
 
 pub(crate) async fn execute(
     client: &Client,
@@ -376,6 +424,7 @@ async fn submit_print_batches(
 ) -> AnyResult<()> {
     let blueprints = fetch_blueprints(client).await?;
     let deadline = Instant::now() + config.wait_timeout;
+    let mut watch = client.events().watch().await?;
     let mut reported_factories = false;
     loop {
         reconcile_print_batches(client, mission).await?;
@@ -425,6 +474,10 @@ async fn submit_print_batches(
 
         let mut submitted_any = false;
         let mut unaffordable = None;
+        // One inventory read per pass, not per candidate batch. Submitted costs
+        // are deducted locally so several batches can still be funded from one
+        // read without over-committing the same materials.
+        let mut available = hub_inventory(client, &mission.hub_location).await?;
         for index in pending {
             let batch = mission.print_batches[index].clone();
             let available_slots = slots.get(&batch.factory_code).copied().unwrap_or(0);
@@ -436,11 +489,11 @@ async fn submit_print_batches(
                 batch.quantity,
                 &blueprints,
             )?;
-            let available = hub_inventory(client, &mission.hub_location).await?;
             if !contains_quantities(&available, &cost) {
-                unaffordable = Some((cost, available));
+                unaffordable = Some((cost, available.clone()));
                 continue;
             }
+            deduct_quantities(&mut available, &cost);
 
             mission.print_batches[index].submission_started = true;
             save_plan(&config.plan_path, mission)?;
@@ -496,7 +549,15 @@ async fn submit_print_batches(
                 "waiting for hub inventory before submitting next print batch"
             );
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(&mut watch, deadline, &[]).await?;
+    }
+}
+
+/// Subtracts submitted batch costs from a locally held inventory snapshot.
+fn deduct_quantities(available: &mut QuantityMap, cost: &QuantityMap) {
+    for (resource, quantity) in cost {
+        let remaining = available.entry(resource.clone()).or_default();
+        *remaining = remaining.saturating_sub(*quantity);
     }
 }
 
@@ -603,6 +664,7 @@ async fn wait_for_print_outputs(
     purpose: PrintPurpose,
 ) -> AnyResult<()> {
     let deadline = Instant::now() + config.wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
         reconcile_print_batches(client, mission).await?;
         if purpose == PrintPurpose::Site {
@@ -629,7 +691,12 @@ async fn wait_for_print_outputs(
                 ),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(
+            &mut watch,
+            deadline,
+            &["print.completed", "device.print_completed"],
+        )
+        .await?;
     }
 }
 
@@ -924,6 +991,7 @@ async fn deploy_sites(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     let deadline = Instant::now() + config.wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
         reconcile(client, config, mission).await?;
         if mission
@@ -956,7 +1024,7 @@ async fn deploy_sites(
                 format!("timed out deploying mining sites: {pending}"),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(&mut watch, deadline, &[]).await?;
     }
 }
 
@@ -1064,6 +1132,7 @@ async fn dispatch_ready_sites(
                 poll_interval: POLL_INTERVAL,
                 unfurl_modular_payload: false,
                 return_transports: true,
+                ..DeliveryOptions::default()
             },
         )
     }))
@@ -1205,6 +1274,7 @@ async fn configure_site(
     }
 
     let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let mut watch = client.events().watch().await?;
     loop {
         let devices = refresh_device_snapshots(client).await?;
         if audit_site(&devices, &site.belt).operational {
@@ -1219,7 +1289,7 @@ async fn configure_site(
                 ),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(&mut watch, deadline, &[]).await?;
     }
     info!(system = %site.system, belt = %site.belt, "mining site operational");
     mission.sites[index].phase = SitePhase::Operational;
@@ -1376,6 +1446,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         ensure_operation_accepted(&transport.launch().await?).await?;
     }
     let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let mut watch = client.events().watch().await?;
     loop {
         let devices = refresh_device_snapshots(client).await?;
         if audit_route(&devices, &route.system, &route.belt, hub).active {
@@ -1387,7 +1458,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
                 format!("ferry route for {} did not verify as active", route.system),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(&mut watch, deadline, &[]).await?;
     }
     info!(
         system = %route.system,
@@ -1404,6 +1475,7 @@ async fn return_and_release_carriers(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     let deadline = Instant::now() + config.wait_timeout;
+    let mut watch = client.events().watch().await?;
     loop {
         let mut pending = 0usize;
         for site in &mut mission.sites {
@@ -1442,7 +1514,7 @@ async fn return_and_release_carriers(
                 format!("timed out waiting for {pending} Surge Carrier(s) to return"),
             ));
         }
-        sleep(POLL_INTERVAL).await;
+        wait_for_mission_event(&mut watch, deadline, &["travel.arrived"]).await?;
     }
 }
 

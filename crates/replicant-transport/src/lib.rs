@@ -16,6 +16,9 @@ use std::{
 
 use futures::future;
 use replicant_client::{Client, Device, Operation, OperationStatus, raw};
+// Workflow device claims are shared vocabulary; the prefix list lives in one
+// place so transport can never disagree with a workflow about what is claimed.
+use replicant_protocol::workflow_reserved;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -29,11 +32,6 @@ pub type ResourceMap = BTreeMap<String, i64>;
 /// explicit [`CarrierPreference`]. Trips run concurrently per transport, so
 /// this bounds how much of the free fleet one delivery may claim.
 const DEFAULT_TRANSPORT_LIMIT: usize = 3;
-
-const RESERVED_TAG_PREFIXES: &[&str] = &[
-    "evt-m:", "evt-r:", "boot-m:", "boot-r:", "region:", "mine-m:", "mine-b:", "mine-r:",
-    "mine-s:", "relay-m:", "relay-b:", "relay-s:", "infra-r:", "infra-s:",
-];
 
 /// One requested device type and quantity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +124,11 @@ pub struct DeliveryOptions {
     pub unfurl_modular_payload: bool,
     /// Return selected transport devices after delivery.
     pub return_transports: bool,
+    /// Maximum transports auto-selected for one delivery when the caller does
+    /// not pin an explicit [`CarrierPreference`]. Trips run concurrently per
+    /// transport, so this bounds how much of the free fleet one delivery may
+    /// claim from other workflows.
+    pub transport_limit: usize,
 }
 
 impl Default for DeliveryOptions {
@@ -135,6 +138,7 @@ impl Default for DeliveryOptions {
             poll_interval: Duration::from_secs(5),
             unfurl_modular_payload: true,
             return_transports: false,
+            transport_limit: DEFAULT_TRANSPORT_LIMIT,
         }
     }
 }
@@ -189,7 +193,19 @@ struct TransportCandidate {
 }
 
 /// Resolves a high-level request into concrete payload and transport devices.
+///
+/// Uses [`DeliveryOptions::default`] for selection policy; call
+/// [`plan_delivery_with`] to tune how many transports one delivery may claim.
 pub async fn plan_delivery(client: &Client, request: &DeliveryRequest) -> Result<DeliveryPlan> {
+    plan_delivery_with(client, request, DeliveryOptions::default()).await
+}
+
+/// Resolves a high-level request using explicit selection options.
+pub async fn plan_delivery_with(
+    client: &Client,
+    request: &DeliveryRequest,
+    options: DeliveryOptions,
+) -> Result<DeliveryPlan> {
     validate_request(request)?;
 
     let inventories = fetch_inventories(client).await?;
@@ -239,6 +255,7 @@ pub async fn plan_delivery(client: &Client, request: &DeliveryRequest) -> Result
             resource_demand,
             CapacityKind::Cargo,
             request.carrier.as_ref(),
+            options,
         )
         .await?
     };
@@ -251,6 +268,7 @@ pub async fn plan_delivery(client: &Client, request: &DeliveryRequest) -> Result
             device_demand,
             CapacityKind::Attachment,
             request.carrier.as_ref(),
+            options,
         )
         .await?
     };
@@ -740,6 +758,7 @@ async fn select_transports(
     demand: i64,
     kind: CapacityKind,
     preference: Option<&CarrierPreference>,
+    options: DeliveryOptions,
 ) -> Result<Vec<String>> {
     let quantity = preference.map_or(1, |preference| preference.quantity);
     let mut eligible = candidates
@@ -772,7 +791,7 @@ async fn select_transports(
             None => {
                 !selected.is_empty()
                     && (selected_capacity >= demand.max(1)
-                        || selected.len() >= DEFAULT_TRANSPORT_LIMIT)
+                        || selected.len() >= options.transport_limit.max(1))
             }
         };
         if enough {
@@ -1223,6 +1242,11 @@ async fn ensure_device_at(
 /// the poll as soon as that operation is classified as rejected, instead of
 /// running out the full `wait_timeout` against a state change that will never
 /// happen.
+///
+/// While a device is in transit the poll interval scales with its reported
+/// ETA: a long freighter leg no longer costs one remote read every
+/// `poll_interval` for its whole duration, while short hops keep reacting
+/// promptly.
 async fn wait_for_device(
     client: &Client,
     code: &str,
@@ -1242,8 +1266,27 @@ async fn wait_for_device(
                 "timed out waiting for device {code} state"
             )));
         }
-        sleep(options.poll_interval).await;
+        let eta_seconds = snapshot
+            .travel
+            .as_ref()
+            .and_then(|travel| travel.eta_seconds);
+        sleep(travel_poll_interval(eta_seconds, options.poll_interval)).await;
     }
+}
+
+/// Scales the poll interval to a device's reported travel ETA.
+///
+/// A device that will not arrive for another ten minutes does not need to be
+/// re-read every few seconds; one that is nearly there, or that reports no
+/// ETA, keeps the caller's configured interval.
+fn travel_poll_interval(eta_seconds: Option<i64>, configured: Duration) -> Duration {
+    let scaled = match eta_seconds.unwrap_or(0) {
+        eta if eta >= 300 => Duration::from_secs(60),
+        eta if eta >= 60 => Duration::from_secs(30),
+        eta if eta > 0 => Duration::from_secs(10),
+        _ => configured,
+    };
+    scaled.max(configured)
 }
 
 /// Errors when a watched durable operation has been definitively rejected.
@@ -1524,7 +1567,12 @@ async fn wait_for_raw_device(
                 "timed out waiting for device {code} cargo/state"
             )));
         }
-        sleep(options.poll_interval).await;
+        let eta_seconds = detail
+            .travel
+            .as_ref()
+            .and_then(|travel| travel.eta_seconds)
+            .map(|eta| eta as i64);
+        sleep(travel_poll_interval(eta_seconds, options.poll_interval)).await;
     }
 }
 
@@ -1641,14 +1689,6 @@ fn eligible_payload(device: &Device) -> bool {
         && device.relationships.attached_to.is_none()
         && device.relationships.stowed_in.is_none()
         && device.relationships.controller.is_none()
-}
-
-fn workflow_reserved(tags: &[String]) -> bool {
-    tags.iter().any(|tag| {
-        RESERVED_TAG_PREFIXES
-            .iter()
-            .any(|prefix| tag.starts_with(prefix))
-    })
 }
 
 fn scope_matches(origin: &str, location: &str) -> bool {
@@ -1773,6 +1813,27 @@ mod tests {
         assert!(capacity_rank(400, 350) < capacity_rank(900, 350));
         assert!(capacity_rank(400, 350) < capacity_rank(300, 350));
         assert!(capacity_rank(300, 350) < capacity_rank(100, 350));
+    }
+
+    #[test]
+    fn travel_poll_interval_scales_with_eta_but_never_below_configured() {
+        let configured = Duration::from_secs(5);
+        assert_eq!(
+            travel_poll_interval(Some(600), configured),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            travel_poll_interval(Some(90), configured),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            travel_poll_interval(Some(5), configured),
+            Duration::from_secs(10)
+        );
+        assert_eq!(travel_poll_interval(None, configured), configured);
+        // A caller asking for slower polling than the ETA tier is honored.
+        let slow = Duration::from_secs(120);
+        assert_eq!(travel_poll_interval(Some(600), slow), slow);
     }
 
     #[test]
