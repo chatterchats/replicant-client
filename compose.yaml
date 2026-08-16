@@ -42,6 +42,14 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+    environment:
+      # nginx adds this to proxied /api/ and /ws requests, so the secret stays
+      # server-side instead of being shipped in the JS bundle. Rotating it is a
+      # `docker compose up -d web` away; no rebuild.
+      REPLICANTD_TOKEN: ${REPLICANTD_TOKEN:?set REPLICANTD_TOKEN; run `make token`}
+      # Restricts the entrypoint's template rendering to this prefix so nginx's
+      # own $variables are left untouched.
+      NGINX_ENVSUBST_FILTER: "^REPLICANTD_"
     depends_on:
       replicantd:
         condition: service_healthy

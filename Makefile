@@ -137,6 +137,8 @@ docker-up:
 docker-down:
 	$(DOCKER_COMPOSE) down
 
+# Probes go through the web container, which injects the daemon credential,
+# so no token is needed here even though the daemon requires one.
 docker-smoke: docker-check
 	$(DOCKER_COMPOSE) up -d --wait
 	curl --fail --silent "http://127.0.0.1:$${REPLICANT_WEB_PORT:-8080}/healthz" >/dev/null

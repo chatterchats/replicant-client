@@ -20,7 +20,9 @@ COPY --from=wasm /wasm ./src/wasm/galaxy_renderer
 RUN npm run build:web
 
 FROM nginxinc/nginx-unprivileged:1.28-alpine
-COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
+# Rendered at container start so the daemon token is a runtime value: the
+# image contains no secret and rotating one needs only a restart.
+COPY apps/web/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=builder /src/dist /usr/share/nginx/html
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

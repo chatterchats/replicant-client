@@ -46,10 +46,12 @@ export function daemonUrl(path: string, origin?: string): string {
 const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
- * Shared secret for daemons started with `REPLICANTD_TOKEN`.
+ * Shared secret for talking to an authenticated daemon *directly*.
  *
- * Loopback daemons usually run without one; this is for remote or container
- * deployments, where the daemon refuses to start unauthenticated.
+ * Not needed for the packaged stack: there the browser calls same-origin paths
+ * and nginx adds the credential server-side, so the token never reaches the
+ * page. Set this only when pointing a development build straight at a remote
+ * daemon that bypasses that proxy.
  */
 export function daemonToken(): string | undefined {
   const configured = (
