@@ -6,13 +6,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { DaemonProvider } from "./daemon";
 import type {
+  AccountEventsSnapshot,
   AutofactorySnapshot,
+  BlueprintsSnapshot,
   AutomationControlResponse,
+  BobnetSnapshot,
   BootstrapSnapshot,
   CargoSnapshot,
   DaemonHealth,
   DescriptorCatalog,
   DevicesSnapshot,
+  DirectorySnapshot,
   EntityIndexSnapshot,
   EventsSnapshot,
   GalaxySceneSnapshot,
@@ -26,10 +30,12 @@ import type {
   ReportsSnapshot,
   RuntimeSnapshot,
   SettingsSnapshot,
+  SimulationsSnapshot,
   StandingSnapshot,
   SurveySnapshot,
   SystemSceneSnapshot,
   TradeSnapshot,
+  TutorialsSnapshot,
 } from "./protocol";
 
 const metadata = { revision: 1, generated_at_ms: 1 };
@@ -77,6 +83,20 @@ const overview: OverviewSnapshot = {
   recent_activity: [],
 };
 const devices: DevicesSnapshot = { metadata, devices: [] };
+const activity: AccountEventsSnapshot = { metadata, cursor: null, events: [] };
+const simulations: SimulationsSnapshot = {
+  metadata,
+  interfaces: [],
+  managed_history: [],
+  account_history: [],
+};
+const blueprints: BlueprintsSnapshot = { metadata, blueprints: [] };
+const directory: DirectorySnapshot = { metadata, query: null, replicants: [] };
+const tutorials: TutorialsSnapshot = {
+  metadata,
+  tutorials: [],
+  selected: null,
+};
 const inventory: InventorySnapshot = {
   metadata,
   total_quantity: 0,
@@ -119,13 +139,19 @@ const trade: TradeSnapshot = { metadata, viewer: null, controllers: [] };
 const reports: ReportsSnapshot = { metadata, reports: [], executions: [] };
 const messages: MessagesSnapshot = {
   metadata,
-  relays: [],
-  selected_relay: null,
-  channels: [],
-  relay_messages: [],
   inbox: [],
   unread_count: 0,
+};
+const bobnet: BobnetSnapshot = {
+  metadata,
+  sources: [],
+  selected_source: null,
+  channels: [],
+  messages: [],
+  replicants: [],
   next_cursor: null,
+  total_messages: null,
+  error: null,
 };
 const network: NetworkSnapshot = {
   metadata,
@@ -197,6 +223,11 @@ vi.mock("./api", async (importOriginal) => {
       descriptors: () => Promise.resolve(descriptors),
       overview: () => Promise.resolve(overview),
       devices: () => Promise.resolve(devices),
+      activity: () => Promise.resolve(activity),
+      simulations: () => Promise.resolve(simulations),
+      blueprints: () => Promise.resolve(blueprints),
+      directory: () => Promise.resolve(directory),
+      tutorials: () => Promise.resolve(tutorials),
       inventory: () => Promise.resolve(inventory),
       autofactories: () => Promise.resolve(autofactories),
       cargo: () => Promise.resolve(cargo),
@@ -208,6 +239,7 @@ vi.mock("./api", async (importOriginal) => {
       trade: () => Promise.resolve(trade),
       reports: () => Promise.resolve(reports),
       messages: () => Promise.resolve(messages),
+      bobnet: () => Promise.resolve(bobnet),
       network: () => Promise.resolve(network),
       standing: () => Promise.resolve(standing),
       leaderboards: () => Promise.resolve(leaderboards),
@@ -242,24 +274,32 @@ const destinations = [
   "Overview",
   "Galaxy",
   "System",
+  "Observatory",
+  "Cloning",
   "Devices",
   "Inventory",
   "Autofactory",
   "Cargo",
+  "Blueprints",
   "Survey",
   "Mining",
   "Relay",
-  "Events",
+  "Galaxy Events",
   "Bootstrap",
   "Trade",
+  "Simulations",
   "Automations",
   "Requirements",
   "History",
+  "Activity",
   "Reports",
   "Messages",
+  "BobNet",
   "Network",
+  "Directory",
   "Standing",
   "Leaderboards",
+  "Tutorials",
   "Settings",
 ];
 

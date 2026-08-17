@@ -59,6 +59,9 @@ export function EventsContent({
 }) {
   const [search, setSearch] = useState("");
   const operations = useMemo(() => eventCommands(descriptors), [descriptors]);
+  const fulfillment = operations.find(
+    (command) => command.descriptor.kind === "event.fulfillment",
+  );
   const events = (data?.events ?? []).filter((event) =>
     [
       event.designation,
@@ -71,11 +74,13 @@ export function EventsContent({
     ].some((value) => value?.toLowerCase().includes(search.toLowerCase())),
   );
   if (!data && status === "loading")
-    return <article className="page loading-state">Loading Events…</article>;
+    return (
+      <article className="page loading-state">Loading Galaxy Events…</article>
+    );
   if (!data && status === "error")
     return (
       <article className="page error-state">
-        <h1>Events unavailable</h1>
+        <h1>Galaxy Events unavailable</h1>
         <p>{error}</p>
         <button onClick={() => void refresh()}>Retry</button>
       </article>
@@ -86,7 +91,7 @@ export function EventsContent({
       <header className="page-heading">
         <div>
           <p className="eyebrow">Missions</p>
-          <h1>Events</h1>
+          <h1>Galaxy Events</h1>
           <p className="lede">
             Discovered location events, confirmed progress, and rewards.
           </p>
@@ -224,6 +229,21 @@ export function EventsContent({
                     >
                       System
                     </button>
+                    {fulfillment && (
+                      <button
+                        onClick={() => {
+                          onRunCommand({
+                            ...fulfillment,
+                            initialParameters: {
+                              event: event.designation,
+                              plan_file: `plans/events/${event.designation}.json`,
+                            },
+                          });
+                        }}
+                      >
+                        Fulfill
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

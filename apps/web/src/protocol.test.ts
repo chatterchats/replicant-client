@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseAutofactoryResponse,
+  parseBobnetResponse,
   parseBootstrapResponse,
   parseCargoResponse,
   parseHealthResponse,
@@ -653,16 +654,44 @@ describe("parseHealthResponse", () => {
       parseMessagesResponse(
         envelope({
           metadata,
-          relays: [],
-          selected_relay: null,
-          channels: [],
-          relay_messages: [],
           inbox: [],
           unread_count: null,
-          next_cursor: null,
         }),
       ).payload.unread_count,
     ).toBeNull();
+    expect(
+      parseBobnetResponse(
+        envelope({
+          metadata,
+          sources: [rawDevice],
+          selected_source: "D-1",
+          channels: [{ name: "#general", last_active: null }],
+          messages: [
+            {
+              id: 1,
+              channel: "#general",
+              body: "hello",
+              sender: "R-1",
+              sender_name: "Ada",
+              is_npc_or_system: false,
+              current_system: "SOL",
+              created_at: null,
+            },
+          ],
+          replicants: [
+            {
+              entity: { kind: "replicant", id: "R-1" },
+              name: "Ada",
+              status: "active",
+              location: "SOL-1",
+            },
+          ],
+          next_cursor: null,
+          total_messages: 1,
+          error: null,
+        }),
+      ).payload.messages[0]?.sender_name,
+    ).toBe("Ada");
     expect(
       parseNetworkResponse(
         envelope({

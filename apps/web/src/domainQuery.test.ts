@@ -32,6 +32,31 @@ describe("domain request gate", () => {
     expect(values).toEqual([1, 2]);
   });
 
+  it("can ignore invalidations while a current projection request is active", async () => {
+    let finish: ((value: number) => void) | undefined;
+    const fetcher = vi.fn(
+      () =>
+        new Promise<number>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const gate = createRequestGate(
+      fetcher,
+      () => undefined,
+      () => undefined,
+      vi.fn(),
+    );
+
+    const first = gate.run({ queueIfActive: false });
+    void gate.run({ queueIfActive: false });
+    void gate.run({ queueIfActive: false });
+    finish?.(1);
+    await first;
+    await Promise.resolve();
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("aborts an in-flight request when disposed", () => {
     let signal: AbortSignal | undefined;
     const gate = createRequestGate(

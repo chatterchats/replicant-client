@@ -44,9 +44,9 @@ pub struct BobnetMessageItem {
     pub id: Option<i64>,
     /// Message body.
     pub message: Option<String>,
-    /// The sending replicant's code, if not an NPC/system message.
+    /// Sending replicant code when supplied. NPC senders may also have codes.
     pub replicant_code: Option<String>,
-    /// The sending replicant's display name, if not an NPC/system message.
+    /// Sending replicant display name when supplied. NPC senders may also have names.
     pub replicant_name: Option<String>,
     /// When the message was sent, RFC3339.
     pub time: Option<String>,

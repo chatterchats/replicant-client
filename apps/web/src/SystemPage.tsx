@@ -7,7 +7,8 @@ import {
 } from "react";
 
 import { daemonApi } from "./api";
-import { type DescriptorCommand } from "./CommandPalette";
+import { descriptorCommands, type DescriptorCommand } from "./CommandPalette";
+import { useDomainQuery } from "./domainQuery";
 import { useGalaxyRevision } from "./daemon";
 import type {
   DescriptorCatalog,
@@ -229,10 +230,17 @@ export function SystemPage({
               "relay",
               "event",
               "resource site",
+              "megastructure",
             ].map((kind) => (
               <span key={kind}>{kind}</span>
             ))}
           </div>
+          <ClaimsPanel
+            system={system}
+            descriptors={descriptors}
+            onSelectEntity={onSelectEntity}
+            onRunCommand={onRunCommand}
+          />
           {menu ? (
             <menu
               className="galaxy-context-menu system-context-menu"
@@ -271,5 +279,117 @@ export function SystemPage({
         </>
       )}
     </article>
+  );
+}
+
+function ClaimsPanel({
+  system,
+  descriptors,
+  onSelectEntity,
+  onRunCommand,
+}: {
+  system: string;
+  descriptors: DescriptorCatalog;
+  onSelectEntity: (entity: EntityRef) => void;
+  onRunCommand: (command: DescriptorCommand) => void;
+}) {
+  const { data, error } = useDomainQuery({
+    slice: "devices",
+    fetcher: daemonApi.devices,
+    isEmpty: (snapshot) =>
+      !snapshot.devices.some(
+        (device) =>
+          device.system === system &&
+          (device.device_type === "system_hub" ||
+            device.device_type?.includes("ward")),
+      ),
+  });
+  const claims = (data?.devices ?? []).filter(
+    (device) =>
+      device.system === system &&
+      (device.device_type === "system_hub" ||
+        device.device_type?.includes("ward")),
+  );
+  if (!claims.length && !error) return null;
+
+  const commands = descriptorCommands(descriptors);
+  const command = (
+    kind: string,
+    device: string,
+    parameters: Record<string, unknown> = {},
+  ) => {
+    const found = commands.find((item) => item.descriptor.kind === kind);
+    return found
+      ? { ...found, initialParameters: { device, ...parameters } }
+      : undefined;
+  };
+
+  return (
+    <section className="connection-card" aria-label="System claims">
+      <h2>Claims & wards</h2>
+      <p>
+        Owned system hubs, naming rights, entry controls, and wards for {system}
+        .
+      </p>
+      {error && <p className="inline-warning">{error}</p>}
+      {claims.map((device) => {
+        const isHub = device.device_type === "system_hub";
+        const isWard = device.device_type?.includes("ward") === true;
+        const entry = command("hub.set_entry_point", device.entity.id);
+        const welcome = command("hub.set_welcome_message", device.entity.id);
+        const rename = command("hub.rename", device.entity.id);
+        const activate = command("device.lifecycle", device.entity.id, {
+          command: "activate",
+        });
+        const deactivate = command("device.lifecycle", device.entity.id, {
+          command: "deactivate",
+        });
+        const deploy = command("device.lifecycle", device.entity.id, {
+          command: "deploy",
+        });
+        const lifecycle = command("device.lifecycle", device.entity.id);
+        return (
+          <div className="asset-operations" key={device.entity.id}>
+            <button onClick={() => onSelectEntity(device.entity)}>
+              <strong>{device.device_type}</strong> · {device.entity.id} ·{" "}
+              {device.status ?? "unknown"}
+            </button>
+            {isHub && rename && (
+              <button onClick={() => onRunCommand(rename)}>
+                Naming rights
+              </button>
+            )}
+            {isHub && entry && (
+              <button onClick={() => onRunCommand(entry)}>
+                Set entry point
+              </button>
+            )}
+            {isHub && welcome && (
+              <button onClick={() => onRunCommand(welcome)}>
+                Welcome message
+              </button>
+            )}
+            {isWard && deploy && (
+              <button onClick={() => onRunCommand(deploy)}>Deploy ward</button>
+            )}
+            {isWard && activate && (
+              <button onClick={() => onRunCommand(activate)}>
+                Activate / evict miners
+              </button>
+            )}
+            {isWard && deactivate && (
+              <button onClick={() => onRunCommand(deactivate)}>
+                Deactivate ward
+              </button>
+            )}
+            {lifecycle && (
+              <button onClick={() => onRunCommand(lifecycle)}>
+                More controls
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </section>
   );
 }

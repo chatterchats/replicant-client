@@ -18,6 +18,17 @@ const descriptors: DescriptorCatalog = {
       applicable_to: ["system"],
       parameters: [],
     },
+    {
+      kind: "relay.expansion",
+      display_name: "Relay expansion",
+      aliases: [],
+      description: "Expand relays",
+      category: "relay",
+      operation_class: "action",
+      risk: "elevated",
+      applicable_to: ["system"],
+      parameters: [],
+    },
   ],
   workflows: [],
 };
@@ -73,7 +84,10 @@ describe("MiningContent", () => {
     expect(html).toContain("mining controller");
     expect(html).toContain("Plan mining expansion");
     expect(html).toContain("mining.expansion · running");
-    const command = miningCommands(descriptors)[0];
+    const commands = miningCommands(descriptors);
+    expect(commands).toHaveLength(1);
+    expect(html).not.toContain("Relay expansion");
+    const command = commands[0];
     expect(command?.operationClass).toBe("action");
     if (command) run(command);
     expect(run).toHaveBeenCalledWith(command);

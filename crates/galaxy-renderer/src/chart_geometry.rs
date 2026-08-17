@@ -110,6 +110,9 @@ pub fn build_star_point_vertices(stars: &[GlStar]) -> Vec<f32> {
                 hex_to_rgba(star_color(&star.color, &star.spectral_type), 0.14),
                 5.5,
             );
+            if star.is_megastructure {
+                push_megastructure_marker(&mut vertices, star.x, star.y, star.z, false);
+            }
             continue;
         }
         if star.current {
@@ -135,6 +138,9 @@ pub fn build_star_point_vertices(stars: &[GlStar]) -> Vec<f32> {
             if star.is_hub {
                 push_hub_marker(&mut vertices, star.x, star.y, star.z, true);
             }
+            if star.is_megastructure {
+                push_megastructure_marker(&mut vertices, star.x, star.y, star.z, true);
+            }
             continue;
         }
         match star.exploration.as_str() {
@@ -156,6 +162,9 @@ pub fn build_star_point_vertices(stars: &[GlStar]) -> Vec<f32> {
                     push_hub_marker(&mut vertices, star.x, star.y, star.z, false);
                 }
             }
+        }
+        if star.is_megastructure {
+            push_megastructure_marker(&mut vertices, star.x, star.y, star.z, false);
         }
     }
     vertices
@@ -652,6 +661,25 @@ fn push_hub_marker(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, is_current: 
     push_point(vertices, x, y, z, [0.1, 0.96, 0.86, 0.24], if is_current { 46.0 } else { 42.0 });
     push_point(vertices, x, y, z, [0.98, 0.82, 0.34, 0.36], if is_current { 34.0 } else { 30.0 });
     push_point(vertices, x, y, z, [1.0, 0.97, 0.78, 0.95], if is_current { 20.0 } else { 18.0 });
+}
+
+fn push_megastructure_marker(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, is_current: bool) {
+    push_point(
+        vertices,
+        x,
+        y,
+        z,
+        [0.74, 0.48, 1.0, 0.2],
+        if is_current { 56.0 } else { 50.0 },
+    );
+    push_point(
+        vertices,
+        x,
+        y,
+        z,
+        [0.91, 0.76, 1.0, 0.5],
+        if is_current { 40.0 } else { 36.0 },
+    );
 }
 
 fn push_line(

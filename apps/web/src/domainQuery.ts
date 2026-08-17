@@ -14,10 +14,18 @@ export interface DomainQueryResult<T> {
   refresh: () => Promise<void>;
 }
 
+interface RequestRunOptions {
+  /** Whether another request should run after the active request completes. */
+  queueIfActive?: boolean;
+}
+
 interface RequestGate {
-  run: () => Promise<void>;
+  run: (options?: RequestRunOptions) => Promise<void>;
   abort: () => void;
 }
+
+/** Coalesce noisy managed-state invalidations without making pages feel stale. */
+const AUTO_INVALIDATION_DELAY_MS = 1_500;
 
 export function createRequestGate<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
@@ -30,10 +38,10 @@ export function createRequestGate<T>(
   let queued = false;
   let disposed = false;
 
-  const run = (): Promise<void> => {
+  const run = (options: RequestRunOptions = {}): Promise<void> => {
     if (disposed) return Promise.resolve();
     if (active) {
-      queued = true;
+      if (options.queueIfActive ?? true) queued = true;
       return active;
     }
     controller = new AbortController();
@@ -91,15 +99,22 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
     metadata: null,
   });
   const gateRef = useRef<RequestGate | null>(null);
+  const explicitRefreshRef = useRef(false);
+  const automaticTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasAutomaticallyRequestedRef = useRef(false);
   if (!gateRef.current) {
     gateRef.current = createRequestGate(
       (signal) => fetcherRef.current(signal),
       () => {
+        const explicit = explicitRefreshRef.current;
+        explicitRefreshRef.current = false;
         setResult((current) => ({
           ...current,
           status: current.data === undefined ? "loading" : current.status,
           error: null,
-          refreshing: current.data !== undefined,
+          // Background invalidation refreshes keep useful stale data visible
+          // without turning every page's Refresh button into a strobe.
+          refreshing: explicit && current.data !== undefined,
         }));
       },
       (data) => {
@@ -124,13 +139,37 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   const gate = gateRef.current;
   useEffect(
     () => () => {
+      if (automaticTimerRef.current !== null)
+        clearTimeout(automaticTimerRef.current);
       gate.abort();
     },
     [gate],
   );
   useEffect(() => {
-    void gate.run();
+    if (automaticTimerRef.current !== null) return;
+    // The first projection fetch must remain immediate. Only subsequent live
+    // invalidations are debounced/coalesced.
+    const delay = hasAutomaticallyRequestedRef.current
+      ? AUTO_INVALIDATION_DELAY_MS
+      : 0;
+    automaticTimerRef.current = setTimeout(() => {
+      automaticTimerRef.current = null;
+      hasAutomaticallyRequestedRef.current = true;
+      // An in-flight projection is already sampling current managed state, so
+      // do not queue another fetch merely because more revisions arrived while
+      // it was running. A later invalidation will schedule the next refresh.
+      void gate.run({ queueIfActive: false });
+    }, delay);
   }, [gate, invalidation]);
-  const refresh = useCallback(() => gate.run(), [gate]);
+  const refresh = useCallback(() => {
+    // A manual refresh supersedes any pending background invalidation fetch.
+    if (automaticTimerRef.current !== null) {
+      clearTimeout(automaticTimerRef.current);
+      automaticTimerRef.current = null;
+    }
+    hasAutomaticallyRequestedRef.current = true;
+    explicitRefreshRef.current = true;
+    return gate.run();
+  }, [gate]);
   return { ...result, refresh };
 }

@@ -211,11 +211,15 @@ fn build_scene(
 }
 
 fn location_kind(location: &Location) -> SystemMarkerKind {
+    if location.unknown.contains_key("megastructure") {
+        return SystemMarkerKind::Megastructure;
+    }
     match location.location_type.as_ref().map(|value| value.as_str()) {
         Some("planet") => SystemMarkerKind::Planet,
         Some("moon") => SystemMarkerKind::Moon,
         Some("belt") => SystemMarkerKind::Belt,
         Some("lagrange") => SystemMarkerKind::Lagrange,
+        Some("megastructure") => SystemMarkerKind::Megastructure,
         _ => SystemMarkerKind::Location,
     }
 }

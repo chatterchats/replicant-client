@@ -434,6 +434,14 @@ impl StoreProxy {
     pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
         self.0.execute_blocking(|store| store.read_events())
     }
+    pub(crate) fn read_events_desc(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.0
+            .execute_blocking(move |store| store.read_events_desc(limit, offset))
+    }
     pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
         let cursor = cursor.to_owned();
         self.0
@@ -1451,6 +1459,25 @@ impl Store {
             .connection
             .prepare("SELECT event_json FROM event_journal ORDER BY appended_at, event_id")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn read_events_desc(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT event_json FROM event_journal \
+             ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit, offset], |row| row.get::<_, String>(0))?;
         let mut events = Vec::new();
         for row in rows {
             events.push(serde_json::from_str(&row?)?);

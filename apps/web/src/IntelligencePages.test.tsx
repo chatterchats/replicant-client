@@ -1,12 +1,18 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import {
+  BobNetContent,
+  channelMessages,
+  normalizeBobnetChannel,
+} from "./BobNetPage";
 import { LeaderboardsContent } from "./LeaderboardsPage";
-import { MessagesContent } from "./MessagesPage";
+import { filterInboxMessages, MessagesContent } from "./MessagesPage";
 import { NetworkContent } from "./NetworkPage";
 import { ReportsContent } from "./ReportsPage";
 import { StandingContent } from "./StandingPage";
 import type {
+  BobnetSnapshot,
   LeaderboardsSnapshot,
   MessagesSnapshot,
   NetworkSnapshot,
@@ -79,38 +85,141 @@ describe("Intelligence pages", () => {
     expect(html).toContain("Run report");
   });
 
-  it("renders inbox and relay history with sender context", () => {
+  it("keeps the Messages page focused on the account inbox", () => {
     const data: MessagesSnapshot = {
       metadata,
-      relays: [device.entity],
-      selected_relay: "RELAY-1",
-      channels: [{ name: "general", last_active: null }],
-      relay_messages: [
+      inbox: [
         {
           id: 1,
-          channel: "general",
+          title: "Notice",
+          body: "Signal received",
+          category: "system",
+          message_type: "system",
+          is_read: false,
+          created_at: null,
+        },
+      ],
+      unread_count: 1,
+    };
+    const html = renderToStaticMarkup(
+      <MessagesContent {...common} data={data} />,
+    );
+    expect(html).toContain("Signal received");
+    expect(html).not.toContain("Relay history");
+  });
+
+  it("renders BobNet as channel chat with sender selection", () => {
+    const data: BobnetSnapshot = {
+      metadata,
+      sources: [device],
+      selected_source: "RELAY-1",
+      channels: [{ name: "#general", last_active: null }],
+      messages: [
+        {
+          id: 1,
+          channel: "#general",
           body: "Signal received",
           sender: null,
           sender_name: null,
           is_npc_or_system: true,
           current_system: null,
-          created_at: null,
+          created_at: "2026-08-16T12:00:00Z",
         },
       ],
-      inbox: [],
-      unread_count: 0,
+      replicants: [
+        {
+          entity: { kind: "replicant", id: "R-1" },
+          name: "Ada",
+          status: "active",
+          location: "SOL-1",
+        },
+      ],
       next_cursor: null,
+      total_messages: 1,
+      error: null,
     };
     const html = renderToStaticMarkup(
-      <MessagesContent
+      <BobNetContent
         {...common}
         data={data}
-        onRelayChange={vi.fn()}
+        includeNpcs
+        onIncludeNpcsChange={vi.fn()}
         onSelectEntity={vi.fn()}
       />,
     );
+    expect(html).toContain("#general");
     expect(html).toContain("Signal received");
-    expect(html).toContain("NPC / system");
+    expect(html).toContain("Ada");
+    expect(html).not.toContain("History source");
+    expect(html).not.toContain("Inspect history source");
+
+    const playersOnly = renderToStaticMarkup(
+      <BobNetContent
+        {...common}
+        data={data}
+        includeNpcs={false}
+        onIncludeNpcsChange={vi.fn()}
+        onSelectEntity={vi.fn()}
+      />,
+    );
+    expect(playersOnly).not.toContain("Signal received");
+    expect(playersOnly).toContain("Include NPC / system chatter");
+    expect(normalizeBobnetChannel("general")).toBe("#general");
+    expect(
+      channelMessages(
+        [
+          { ...data.messages[0]!, id: 2, created_at: "2026-08-16T12:02:00Z" },
+          { ...data.messages[0]!, id: 1, created_at: "2026-08-16T12:01:00Z" },
+        ],
+        "general",
+      ).map((message) => message.id),
+    ).toEqual([1, 2]);
+  });
+
+  it("sorts inbox newest-first and filters by type, unread state, and text", () => {
+    const messages = [
+      {
+        id: 1,
+        title: "Old system notice",
+        body: "Nothing urgent",
+        category: "system",
+        message_type: "system",
+        is_read: true,
+        created_at: "2026-08-14T12:00:00Z",
+      },
+      {
+        id: 2,
+        title: "Delivery alert",
+        body: "Conductive delivery is ready",
+        category: "mission",
+        message_type: "mission",
+        is_read: false,
+        created_at: "2026-08-16T12:00:00Z",
+      },
+      {
+        id: 3,
+        title: "System update",
+        body: "Relay maintenance",
+        category: "system",
+        message_type: "system",
+        is_read: false,
+        created_at: "2026-08-15T12:00:00Z",
+      },
+    ];
+
+    expect(
+      filterInboxMessages(messages, "", "", false).map((message) => message.id),
+    ).toEqual([2, 3, 1]);
+    expect(
+      filterInboxMessages(messages, "conductive", "mission", true).map(
+        (message) => message.id,
+      ),
+    ).toEqual([2]);
+    expect(
+      filterInboxMessages(messages, "relay", "system", true).map(
+        (message) => message.id,
+      ),
+    ).toEqual([3]);
   });
 
   it("renders actual account and relay network status", () => {
@@ -192,13 +301,7 @@ describe("Intelligence pages", () => {
     ).toContain("Loading Reports");
     expect(
       renderToStaticMarkup(
-        <MessagesContent
-          {...common}
-          status="error"
-          error="offline"
-          onRelayChange={vi.fn()}
-          onSelectEntity={vi.fn()}
-        />,
+        <MessagesContent {...common} status="error" error="offline" />,
       ),
     ).toContain("Messages unavailable");
     expect(

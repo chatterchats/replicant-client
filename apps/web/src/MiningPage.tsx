@@ -19,7 +19,7 @@ const empty = (snapshot: MiningSnapshot) =>
 
 export const miningCommands = (descriptors: DescriptorCatalog) =>
   applicableDescriptorCommands(descriptors, "system").filter((command) =>
-    /mining|expansion/i.test(
+    /mining/i.test(
       `${command.descriptor.kind} ${command.descriptor.category} ${command.descriptor.display_name}`,
     ),
   );

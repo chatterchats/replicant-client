@@ -554,6 +554,74 @@ pub struct EventsSnapshot {
     pub events: Vec<EventSummary>,
 }
 
+/// One durable account event from the managed event journal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountEventSummary {
+    /// Stable stream/event identifier.
+    pub id: String,
+    /// Event name, for example `ami.survey.digest`.
+    pub name: String,
+    /// Normalized event category.
+    pub category: String,
+    /// Related device when one was identified by the managed event reducer.
+    pub device: Option<EntityRef>,
+    /// Related replicant when one was identified.
+    pub replicant: Option<EntityRef>,
+    /// Related system when one was identified.
+    pub system: Option<String>,
+    /// Related location when one was identified.
+    pub location: Option<String>,
+    /// Upstream event timestamp.
+    pub occurred_at: String,
+    /// Sanitized event-specific payload.
+    pub payload: Value,
+    /// Whether this is an AMI digest intended as a fleet activity summary.
+    pub ami_digest: bool,
+}
+
+/// Filterable account event-log projection, distinct from location events.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountEventsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Durable account-event cursor after the most recent managed apply.
+    pub cursor: Option<String>,
+    /// Matching events in newest-first presentation order.
+    pub events: Vec<AccountEventSummary>,
+}
+
+/// One diagnostic entry from an owned device's upstream event log.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceLogSummary {
+    /// Server numeric log identifier when supplied.
+    pub id: Option<i64>,
+    /// Event timestamp.
+    pub created_at: Option<String>,
+    /// Device code supplied by the log entry.
+    pub device_code: Option<String>,
+    /// Device type supplied by the log entry.
+    pub device_type: Option<String>,
+    /// Open event type.
+    pub event_type: Option<String>,
+    /// Human-readable log message.
+    pub message: Option<String>,
+    /// Event-specific payload.
+    pub payload: Value,
+}
+
+/// Bounded diagnostic log projection for one device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceLogsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Device whose log was requested.
+    pub device: EntityRef,
+    /// Log entries returned by the upstream diagnostic endpoint.
+    pub events: Vec<DeviceLogSummary>,
+    /// Cursor for the next upstream page, when any.
+    pub next_cursor: Option<i64>,
+}
+
 /// One normalized item on either side of a player trade.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TradeItemSummary {
@@ -624,6 +692,227 @@ pub struct TradeSnapshot {
     pub controllers: Vec<TradeControllerSummary>,
 }
 
+/// One simulation scenario offered by a replicant interface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SimulationScenarioSummary {
+    /// Stable scenario code.
+    pub code: String,
+    /// Display name.
+    pub name: Option<String>,
+    /// Short scenario description.
+    pub description: Option<String>,
+    /// Extended rules description.
+    pub long_description: Option<String>,
+    /// Objective type.
+    pub objective_type: Option<String>,
+    /// Objective target.
+    pub objective_target: Option<i64>,
+    /// Timeout in hours.
+    pub timeout_hours: Option<f64>,
+    /// Scenario version.
+    pub version: Option<i64>,
+    /// Entry cost as a normalized resource list.
+    pub entry_cost: Vec<InventoryQuantity>,
+}
+
+/// One active or archived simulation run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SimulationRunSummary {
+    /// Simulation run identifier.
+    pub id: i64,
+    /// Interface device for active runs, when known.
+    pub interface: Option<EntityRef>,
+    /// Whether the authenticated account owns the run.
+    pub is_mine: bool,
+    /// Replicant code when available from durable history.
+    pub replicant: Option<EntityRef>,
+    /// Replicant display name for active public runs.
+    pub replicant_name: Option<String>,
+    /// Scenario code.
+    pub scenario_code: Option<String>,
+    /// Scenario display name.
+    pub scenario_name: Option<String>,
+    /// Managed lifecycle for locally tracked owned runs.
+    pub lifecycle: Option<String>,
+    /// Start timestamp.
+    pub started_at: Option<String>,
+    /// Completion timestamp.
+    pub completed_at: Option<String>,
+    /// Abandonment timestamp.
+    pub abandoned_at: Option<String>,
+    /// Timeout timestamp.
+    pub timed_out_at: Option<String>,
+    /// Competitive score in seconds for completed history.
+    pub score_seconds: Option<i64>,
+    /// Resources mined in the run.
+    pub resources_mined: Option<i64>,
+    /// Devices printed in the run.
+    pub devices_printed: Option<i64>,
+    /// Timeout in hours for an active run.
+    pub timeout_hours: Option<f64>,
+}
+
+/// One discovered datacentre `replicant_interface` and its live scenario state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SimulationInterfaceSummary {
+    /// Interface device.
+    pub device: DeviceSummary,
+    /// Scenarios currently offered by this interface.
+    pub scenarios: Vec<SimulationScenarioSummary>,
+    /// Runs currently active on this interface.
+    pub active: Vec<SimulationRunSummary>,
+    /// Non-fatal live-read error, allowing other interfaces/history to render.
+    pub error: Option<String>,
+}
+
+/// Simulation browser, active-run, and personal-history projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SimulationsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Known owned simulator interfaces.
+    pub interfaces: Vec<SimulationInterfaceSummary>,
+    /// Durable managed simulation realm history.
+    pub managed_history: Vec<SimulationRunSummary>,
+    /// Fresh account run history, including score/outcome counters.
+    pub account_history: Vec<SimulationRunSummary>,
+}
+
+/// One unlocked account blueprint with manufacturing metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlueprintSummary {
+    /// Device type printed by the blueprint.
+    pub device_type: String,
+    /// Short description.
+    pub short_description: Option<String>,
+    /// Full description.
+    pub description: Option<String>,
+    /// Base print time in seconds.
+    pub print_time_seconds: Option<f64>,
+    /// Resource cost.
+    pub resources: Vec<InventoryQuantity>,
+    /// Component cost.
+    pub components: Vec<InventoryQuantity>,
+    /// Device feature flags.
+    pub features: Vec<String>,
+    /// Supported AMI directives.
+    pub directives: Vec<String>,
+    /// Cargo capacity.
+    pub cargo_capacity: Option<i64>,
+    /// Attach capacity.
+    pub attach_capacity: Option<i64>,
+    /// Stow capacity.
+    pub stow_capacity: Option<i64>,
+    /// Autofactory queue size, when applicable.
+    pub queue_size: Option<i64>,
+}
+
+/// Unlocked blueprint catalogue projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlueprintsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Unlocked blueprints.
+    pub blueprints: Vec<BlueprintSummary>,
+}
+
+/// One result from the public replicant directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryReplicantSummary {
+    /// Replicant address.
+    pub entity: EntityRef,
+    /// Public display name.
+    pub name: Option<String>,
+    /// Last known location.
+    pub last_location: Option<String>,
+    /// Whether the entry represents an NPC.
+    pub is_npc: Option<bool>,
+}
+
+/// Public multiplayer directory projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorySnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Optional search phrase that produced the page.
+    pub query: Option<String>,
+    /// Directory entries.
+    pub replicants: Vec<DirectoryReplicantSummary>,
+}
+
+/// Public profile detail for one replicant selected from the directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryReplicantDetail {
+    /// Replicant address.
+    pub entity: EntityRef,
+    /// Public display name.
+    pub name: Option<String>,
+    /// Whether the profile represents an NPC.
+    pub is_npc: Option<bool>,
+    /// Public status when supplied by the game API.
+    pub status: Option<String>,
+    /// Current public location when supplied.
+    pub location: Option<String>,
+    /// Hosted vessel/device when publicly visible.
+    pub hosted_device: Option<EntityRef>,
+}
+
+/// Typed response for one public replicant profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryReplicantDetailSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Selected public profile.
+    pub replicant: DirectoryReplicantDetail,
+}
+
+/// One tutorial objective.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TutorialStepSummary {
+    /// Stable objective key.
+    pub key: Option<String>,
+    /// Objective description.
+    pub description: Option<String>,
+    /// API/gameplay hint.
+    pub hint: Option<String>,
+    /// Whether the objective is complete.
+    pub completed: Option<bool>,
+    /// Whether this is the current objective.
+    pub current: Option<bool>,
+}
+
+/// Tutorial progress with optional detail steps.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TutorialSummary {
+    /// Stable tutorial slug.
+    pub slug: String,
+    /// Display name.
+    pub name: Option<String>,
+    /// Description.
+    pub description: Option<String>,
+    /// Tutorial order.
+    pub order: Option<i64>,
+    /// Whether the tutorial is complete.
+    pub completed: Option<bool>,
+    /// Current step index.
+    pub current_step: Option<i64>,
+    /// Total steps.
+    pub total_steps: Option<i64>,
+    /// Detailed steps when requested for this tutorial.
+    pub steps: Vec<TutorialStepSummary>,
+}
+
+/// Account tutorial/onboarding projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TutorialsSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Tutorials in server-defined order.
+    pub tutorials: Vec<TutorialSummary>,
+    /// Detailed tutorial whose steps were fetched, when any.
+    pub selected: Option<TutorialSummary>,
+}
+
 /// Typed report catalogue and recent execution projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReportsSnapshot {
@@ -672,11 +961,11 @@ pub struct BobnetMessageSummary {
     pub channel: Option<String>,
     /// Message body.
     pub body: Option<String>,
-    /// Sending replicant code; absent for NPC/system messages.
+    /// Sending replicant code when supplied; NPC senders may also have codes.
     pub sender: Option<String>,
-    /// Sending replicant display name when supplied.
+    /// Sending replicant display name when supplied; NPC senders may also have names.
     pub sender_name: Option<String>,
-    /// Whether the message lacks a player replicant sender.
+    /// Whether the message was identified as NPC/system chatter.
     pub is_npc_or_system: bool,
     /// Sender's current system when supplied.
     pub current_system: Option<String>,
@@ -684,25 +973,51 @@ pub struct BobnetMessageSummary {
     pub created_at: Option<String>,
 }
 
-/// Typed account inbox and optional relay-history projection.
+/// Typed account notification inbox projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessagesSnapshot {
     /// Snapshot identity and creation time.
     pub metadata: SnapshotMetadata,
-    /// Known relay-capable device addresses.
-    pub relays: Vec<EntityRef>,
-    /// Relay selected for history, when requested.
-    pub selected_relay: Option<String>,
-    /// Channels visible to the selected relay.
-    pub channels: Vec<BobnetChannelSummary>,
-    /// History visible to the selected relay.
-    pub relay_messages: Vec<BobnetMessageSummary>,
     /// Account-wide notification inbox.
     pub inbox: Vec<InboxMessageSummary>,
     /// Account-wide unread count when supplied.
     pub unread_count: Option<i64>,
-    /// Opaque next relay-history cursor when supplied.
+}
+
+/// One owned replicant that can be selected as a BobNet sender.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BobnetReplicantSummary {
+    /// Replicant address.
+    pub entity: EntityRef,
+    /// Display name when supplied.
+    pub name: Option<String>,
+    /// Current managed status when supplied.
+    pub status: Option<String>,
+    /// Current location when supplied.
+    pub location: Option<String>,
+}
+
+/// IRC-style BobNet session projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BobnetSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Active relay/hub devices that can provide channel history.
+    pub sources: Vec<DeviceSummary>,
+    /// History source selected for this response.
+    pub selected_source: Option<String>,
+    /// Channels visible through the selected source.
+    pub channels: Vec<BobnetChannelSummary>,
+    /// Recent history visible through the selected source.
+    pub messages: Vec<BobnetMessageSummary>,
+    /// Owned replicants available as message senders.
+    pub replicants: Vec<BobnetReplicantSummary>,
+    /// Opaque cursor for older history, when supplied.
     pub next_cursor: Option<i64>,
+    /// Total messages visible to the source when supplied.
+    pub total_messages: Option<i64>,
+    /// Non-fatal history/channel read warning.
+    pub error: Option<String>,
 }
 
 /// One relay-capable managed device and its observed channel availability.
@@ -1066,6 +1381,9 @@ pub struct GalaxyStar {
     pub has_life: bool,
     /// Whether an active owned relay is present.
     pub has_relay: bool,
+    /// Whether committed location data identifies a megastructure in the system.
+    #[serde(default)]
+    pub has_megastructure: bool,
 }
 
 /// A connection between two known systems.
@@ -1210,6 +1528,8 @@ pub enum SystemMarkerKind {
     Event,
     /// Known resource extraction site.
     ResourceSite,
+    /// Known datacentre or other megastructure location.
+    Megastructure,
 }
 
 /// One renderer-ready object in a system scene.
@@ -1988,12 +2308,24 @@ pub enum DomainSlice {
     Missions,
     /// Finite report and action execution history.
     History,
-    /// Discovered events.
+    /// Discovered location events.
     Events,
+    /// Durable account event journal and AMI digests.
+    Activity,
     /// Trade controllers, orders, and trades.
     Trade,
-    /// Managed messages and channels.
+    /// Simulation interfaces, runs, and scenarios.
+    Simulations,
+    /// Unlocked manufacturing blueprints.
+    Blueprints,
+    /// Public replicant directory.
+    Directory,
+    /// Tutorial progress.
+    Tutorials,
+    /// Account notification inbox.
     Messages,
+    /// BobNet channel discovery and relay history.
+    Bobnet,
     /// Relay and account network state.
     Network,
     /// Achievement and reputation state.
@@ -2476,13 +2808,19 @@ mod tests {
         }));
         round_trip(&Versioned::current(MessagesSnapshot {
             metadata: intelligence_metadata.clone(),
-            relays: Vec::new(),
-            selected_relay: None,
-            channels: Vec::new(),
-            relay_messages: Vec::new(),
             inbox: Vec::new(),
             unread_count: None,
+        }));
+        round_trip(&Versioned::current(BobnetSnapshot {
+            metadata: intelligence_metadata.clone(),
+            sources: Vec::new(),
+            selected_source: None,
+            channels: Vec::new(),
+            messages: Vec::new(),
+            replicants: Vec::new(),
             next_cursor: None,
+            total_messages: None,
+            error: None,
         }));
         round_trip(&Versioned::current(NetworkSnapshot {
             metadata: intelligence_metadata.clone(),

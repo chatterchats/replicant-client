@@ -196,6 +196,115 @@ struct ProspectBlocked {
     outward_ratio: Option<f64>,
 }
 
+/// Result of one automatic sparse-direction prospect submission.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AutoProspectReport {
+    /// Observatory chosen for the attempt.
+    pub observatory: String,
+    /// Catalogue star containing the observatory, when known.
+    pub star: Option<String>,
+    /// Sparse direction submitted to the game server.
+    pub direction: Option<[f64; 3]>,
+    /// Number of candidate directions tried before a prospect started.
+    pub attempts: usize,
+    /// Durable managed operation identifier.
+    pub operation_id: String,
+    /// Final managed operation status.
+    pub status: String,
+}
+
+/// Uses the same catalogue-density ranking as the observatory CLI to choose a
+/// deployed observatory and retry sparse directions until one prospect starts.
+/// Supplying `observatory_code` pins selection to that device; `None` chooses
+/// the sparsest eligible owned observatory automatically.
+pub async fn auto_prospect(
+    client: &Client,
+    observatory_code: Option<&str>,
+) -> crate::AnyResult<AutoProspectReport> {
+    let selector = Selector {
+        observatories: observatory_code
+            .map(|code| vec![code.to_owned()])
+            .unwrap_or_default(),
+        all: false,
+        tag: None,
+    };
+    let config = ProspectConfig {
+        selector,
+        database: PathBuf::new(),
+        direction: ProspectDirection::Auto,
+        analysis_radius_ly: DEFAULT_ANALYSIS_RADIUS_LY,
+        samples: DEFAULT_AUTO_SAMPLES,
+        attempts: DEFAULT_AUTO_ATTEMPTS,
+        dry_run: false,
+    };
+    let catalogue = refresh_catalogue(client).await?;
+    let sol = sol_position(&catalogue);
+    let mut observatories = load_observatories(client, &config.selector, &catalogue, sol).await?;
+    if observatory_code.is_none() {
+        let selected = choose_best_prospect_observatory(
+            &observatories,
+            &catalogue,
+            sol,
+            config.analysis_radius_ly,
+        )
+        .ok_or_else(|| {
+            app_error("no deployed observatory with usable catalogue coordinates was found")
+        })?
+        .clone();
+        observatories = vec![selected];
+    }
+    let observatory = observatories
+        .first()
+        .ok_or_else(|| app_error("no Galactic Observatory device matched the selection"))?;
+    if !observatory.advertised("prospect") {
+        return Err(app_error(format!(
+            "{} does not currently advertise the prospect command",
+            observatory.code
+        )));
+    }
+    let candidates = prospect_directions(&config, observatory, &catalogue, sol)?;
+    for (index, candidate) in candidates.into_iter().take(config.attempts).enumerate() {
+        let handle = client.devices().get(&observatory.code).await?;
+        let operation = handle.prospect(candidate.direction).await?;
+        let operation_id = operation.id().to_string();
+        let outcome = operation.outcome().await?;
+        match classify_prospect_outcome(&outcome) {
+            ProspectSubmission::Started => {
+                return Ok(AutoProspectReport {
+                    observatory: observatory.code.clone(),
+                    star: observatory.star.clone(),
+                    direction: candidate.direction,
+                    attempts: index + 1,
+                    operation_id,
+                    status: format!("{:?}", outcome.status).to_ascii_lowercase(),
+                });
+            }
+            ProspectSubmission::Blocked(_) => continue,
+            ProspectSubmission::Rejected => {
+                return Err(app_error(format!(
+                    "{} rejected automatic prospect attempt {}",
+                    observatory.code,
+                    index + 1
+                )));
+            }
+            ProspectSubmission::Ambiguous => {
+                return Ok(AutoProspectReport {
+                    observatory: observatory.code.clone(),
+                    star: observatory.star.clone(),
+                    direction: candidate.direction,
+                    attempts: index + 1,
+                    operation_id,
+                    status: "ambiguous".to_owned(),
+                });
+            }
+        }
+    }
+    Err(app_error(format!(
+        "{} had no sparse prospect direction accepted after {} attempts",
+        observatory.code, config.attempts
+    )))
+}
+
 /// Runs the compatibility CLI adapter for observatory reports, plans, and actions.
 pub async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let command = parse_command(arguments)?;

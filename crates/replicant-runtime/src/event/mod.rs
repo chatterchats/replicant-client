@@ -438,6 +438,89 @@ struct EventMissionPlan {
     execution: executor::ExecutionState,
 }
 
+/// Inputs for creating a restart-safe single-event mission plan without the interactive CLI.
+#[derive(Clone, Debug)]
+pub struct EventPlanningRequest {
+    /// Event designation to fulfill.
+    pub event: String,
+    /// Completion criterion name when the event offers more than one path.
+    pub criterion: Option<String>,
+    /// Replicant name or code assigned to the mission.
+    pub replicant: String,
+    /// Manufacturing/staging home location.
+    pub home: String,
+    /// Destination for the durable mission plan.
+    pub plan_file: PathBuf,
+    /// Whether an existing plan may be replaced.
+    pub replace_plan: bool,
+}
+
+/// Creates and persists one event mission plan using the same planner as `replicant-cli event --plan`.
+pub async fn plan_event_mission(
+    client: &Client,
+    request: &EventPlanningRequest,
+) -> AnyResult<EventExecutionState> {
+    client.ready().await?;
+    client.sync().domain(SyncDomain::Replicants).await?;
+
+    let event_scope = EventScope::All;
+    let events = fetch_active_events_in_scope(client, &event_scope).await?;
+    let earned = fetch_earned_achievements(client).await?;
+    let selected_event = select_event(
+        &events,
+        Some(request.event.as_str()),
+        Command::Plan,
+        &earned,
+    )?;
+    let event = normalize_event(selected_event)?;
+    let replicant =
+        select_replicant(client, Some(request.replicant.as_str()), Command::Plan).await?;
+
+    if request.plan_file.exists() && !request.replace_plan {
+        if campaign::is_campaign_file(&request.plan_file)? {
+            return Err(app_error(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "an event campaign already exists at {}",
+                    request.plan_file.display()
+                ),
+            ));
+        }
+        let existing = load_plan(&request.plan_file)?;
+        if !existing.phase.is_terminal() {
+            return Err(app_error(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "active mission {} already exists at {}",
+                    existing.mission_id,
+                    request.plan_file.display()
+                ),
+            ));
+        }
+    }
+
+    let context = build_context(client, &event, &earned, &request.home).await?;
+    let event_plan = plan_event(event, &context)?;
+    let selected_criterion = select_criterion(&event_plan, request.criterion.as_deref(), false)?;
+    let mission_id = uuid::Uuid::new_v4().simple().to_string();
+    let plan = EventMissionPlan {
+        version: PLAN_VERSION,
+        mission_id: mission_id.clone(),
+        mission_tag: mission_tag(&mission_id),
+        phase: MissionPhase::Planned,
+        selected_replicant: replicant.key.id.as_str().to_owned(),
+        home_location: request.home.clone(),
+        event_scope,
+        event: event_plan.event,
+        selected_criterion,
+        grants_unearned_achievement: event_plan.grants_unearned_achievement,
+        claimed_devices: Vec::new(),
+        execution: executor::ExecutionState::default(),
+    };
+    save_plan(&request.plan_file, &plan)?;
+    Ok(mission_state(&plan))
+}
+
 /// Inputs for resuming a persisted event mission or campaign.
 #[derive(Clone, Debug)]
 pub struct EventExecutionRequest {

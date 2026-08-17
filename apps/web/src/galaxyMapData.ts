@@ -81,6 +81,7 @@ export function mapGalaxyScene(
       exploration: star.exploration,
       is_hub: star.has_hub,
       is_relay: star.has_relay,
+      is_megastructure: star.has_megastructure === true,
       dimmed: false,
       ...star.position,
     })),

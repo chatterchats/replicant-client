@@ -70,7 +70,6 @@ export function CargoPage(props: {
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
   const query = useDomainQuery({
-    slice: "cargo",
     fetcher: (signal) => daemonApi.cargo(signal),
     isEmpty: empty,
   });

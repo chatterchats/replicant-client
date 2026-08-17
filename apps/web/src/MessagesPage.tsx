@@ -1,52 +1,50 @@
-import { useState } from "react";
+/* eslint-disable react-refresh/only-export-components */
+import { useMemo, useState } from "react";
 
 import { daemonApi } from "./api";
 import { type DomainQueryStatus, useDomainQuery } from "./domainQuery";
-import type { EntityRef, MessagesSnapshot } from "./protocol";
+import type { InboxMessageSummary, MessagesSnapshot } from "./protocol";
 
-const empty = (snapshot: MessagesSnapshot) =>
-  snapshot.relays.length +
-    snapshot.inbox.length +
-    snapshot.relay_messages.length ===
-  0;
+const empty = (snapshot: MessagesSnapshot) => snapshot.inbox.length === 0;
 
-export function MessagesPage({
-  onSelectEntity,
-}: {
-  onSelectEntity: (entity: EntityRef) => void;
-}) {
-  const [relay, setRelay] = useState<string>();
-  return (
-    <MessagesQuery
-      key={relay ?? "inbox"}
-      relay={relay}
-      onRelayChange={setRelay}
-      onSelectEntity={onSelectEntity}
-    />
-  );
+function messageTime(value: string | null): number {
+  if (!value) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
 }
 
-function MessagesQuery({
-  relay,
-  onRelayChange,
-  onSelectEntity,
-}: {
-  relay?: string;
-  onRelayChange: (relay?: string) => void;
-  onSelectEntity: (entity: EntityRef) => void;
-}) {
+export function filterInboxMessages(
+  messages: InboxMessageSummary[],
+  search: string,
+  messageType: string,
+  unreadOnly: boolean,
+): InboxMessageSummary[] {
+  const needle = search.trim().toLowerCase();
+  return messages
+    .filter((message) => {
+      if (messageType && message.message_type !== messageType) return false;
+      if (unreadOnly && message.is_read !== false) return false;
+      if (!needle) return true;
+      return [message.title, message.body]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    })
+    .sort(
+      (left, right) =>
+        messageTime(right.created_at) - messageTime(left.created_at) ||
+        (right.id ?? Number.NEGATIVE_INFINITY) -
+          (left.id ?? Number.NEGATIVE_INFINITY),
+    );
+}
+
+export function MessagesPage() {
   const query = useDomainQuery({
-    slice: "messages",
-    fetcher: (signal) => daemonApi.messages(relay, signal),
+    fetcher: (signal) => daemonApi.messages(signal),
     isEmpty: empty,
   });
-  return (
-    <MessagesContent
-      {...query}
-      onRelayChange={onRelayChange}
-      onSelectEntity={onSelectEntity}
-    />
-  );
+  return <MessagesContent {...query} />;
 }
 
 export function MessagesContent({
@@ -55,17 +53,33 @@ export function MessagesContent({
   error,
   refreshing,
   refresh,
-  onRelayChange,
-  onSelectEntity,
 }: {
   data?: MessagesSnapshot;
   status: DomainQueryStatus;
   error: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
-  onRelayChange: (relay?: string) => void;
-  onSelectEntity: (entity: EntityRef) => void;
 }) {
+  const [search, setSearch] = useState("");
+  const [messageType, setMessageType] = useState("");
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const messageTypes = useMemo(
+    () =>
+      [
+        ...new Set(
+          (data?.inbox ?? [])
+            .map((message) => message.message_type)
+            .filter((value): value is string => Boolean(value)),
+        ),
+      ].sort((left, right) => left.localeCompare(right)),
+    [data?.inbox],
+  );
+  const filteredInbox = useMemo(
+    () =>
+      filterInboxMessages(data?.inbox ?? [], search, messageType, unreadOnly),
+    [data?.inbox, messageType, search, unreadOnly],
+  );
+
   if (!data && status === "loading")
     return <article className="page loading-state">Loading Messages…</article>;
   if (!data && status === "error")
@@ -83,7 +97,7 @@ export function MessagesContent({
           <p className="eyebrow">Intelligence</p>
           <h1>Messages</h1>
           <p className="lede">
-            Account inbox and relay-observed BobNet history.
+            Account notifications, mission notices, and system messages.
           </p>
         </div>
         <button disabled={refreshing} onClick={() => void refresh()}>
@@ -91,95 +105,85 @@ export function MessagesContent({
         </button>
       </header>
       {error && <p className="inline-warning">Refresh failed: {error}</p>}
-      <label className="inventory-search">
-        Relay history
-        <select
-          value={data?.selected_relay ?? ""}
-          onChange={(event) => {
-            onRelayChange(event.target.value || undefined);
-          }}
-        >
-          <option value="">Account inbox only</option>
-          {data?.relays.map((relay) => (
-            <option key={relay.id} value={relay.id}>
-              {relay.id}
-            </option>
-          ))}
-        </select>
-      </label>
-      {data?.selected_relay && (
-        <section>
-          <h2>Relay history · {data.selected_relay}</h2>
-          <div className="result-links">
-            {data.channels.map((channel) => (
-              <span className="status-chip" key={channel.name}>
-                {channel.name}
-              </span>
-            ))}
-            <button
-              onClick={() => {
-                onSelectEntity({
-                  kind: "device",
-                  id: data.selected_relay ?? "",
-                });
-              }}
-            >
-              Inspect relay
-            </button>
-          </div>
-          {data.relay_messages.length ? (
-            <div className="message-list">
-              {data.relay_messages.map((message, index) => (
-                <article key={message.id ?? index}>
-                  <header>
-                    {message.sender ? (
-                      <button
-                        onClick={() => {
-                          onSelectEntity({
-                            kind: "replicant",
-                            id: message.sender ?? "",
-                          });
-                        }}
-                      >
-                        {message.sender_name ?? message.sender}
-                      </button>
-                    ) : (
-                      <strong>NPC / system</strong>
-                    )}
-                    <small>{message.channel ?? "Unknown channel"}</small>
-                    {message.created_at && <time>{message.created_at}</time>}
-                  </header>
-                  <p>{message.body ?? "No message body."}</p>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="empty-state">No relay history is available.</p>
-          )}
-        </section>
-      )}
       <section>
         <h2>Account inbox</h2>
-        {data?.unread_count !== null && <p>{data?.unread_count} unread</p>}
-        {data?.inbox.length ? (
+        <div className="message-filters">
+          <label>
+            <span>Search</span>
+            <input
+              type="search"
+              placeholder="Title or message body"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Message type</span>
+            <select
+              value={messageType}
+              onChange={(event) => setMessageType(event.target.value)}
+            >
+              <option value="">All types</option>
+              {messageTypes.map((type) => (
+                <option key={type} value={type}>
+                  {type}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="message-unread-filter">
+            <input
+              type="checkbox"
+              checked={unreadOnly}
+              onChange={(event) => setUnreadOnly(event.target.checked)}
+            />
+            Unread only
+          </label>
+        </div>
+        <p className="table-summary">
+          {filteredInbox.length} shown
+          {typeof data?.unread_count === "number" &&
+            ` · ${data.unread_count} unread`}
+        </p>
+        {filteredInbox.length ? (
           <div className="message-list">
-            {data.inbox.map((message, index) => (
+            {filteredInbox.map((message, index) => (
               <article key={message.id ?? index}>
-                <header>
-                  <strong>
+                <header className="message-card-header">
+                  <strong className="message-card-title">
                     {message.title ?? message.message_type ?? "Message"}
                   </strong>
-                  <span className="status-chip">
-                    {message.is_read === false ? "unread" : "read"}
-                  </span>
-                  {message.created_at && <time>{message.created_at}</time>}
+                  <div className="message-card-badges">
+                    <span className="status-chip">
+                      {message.is_read === false ? "unread" : "read"}
+                    </span>
+                    {message.message_type && (
+                      <span className="status-chip">
+                        {message.message_type}
+                      </span>
+                    )}
+                  </div>
+                  {(message.category || message.created_at) && (
+                    <div className="message-card-meta">
+                      {message.category && <span>{message.category}</span>}
+                      {message.created_at && (
+                        <time dateTime={message.created_at}>
+                          {new Date(message.created_at).toLocaleString()}
+                        </time>
+                      )}
+                    </div>
+                  )}
                 </header>
                 <p>{message.body ?? "No message body."}</p>
               </article>
             ))}
           </div>
         ) : (
-          <p className="empty-state">No account messages.</p>
+          <p className="empty-state">
+            {data?.inbox.length
+              ? "No account messages match the current filters."
+              : "No account messages."}
+          </p>
         )}
       </section>
     </article>

@@ -25,6 +25,7 @@
 
   color: var(--text);
   background: var(--surface);
+  color-scheme: dark;
   font-family: Inter, "Segoe UI", system-ui, sans-serif;
   font-synthesis: none;
 }
@@ -58,11 +59,55 @@ body {
 }
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
+
+/* Native form controls default to a bright OS theme in several Linux/browser
+   combinations. Give every control a readable dark baseline; specialized
+   components below can still override these values. */
 button {
-  color: inherit;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 7px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: rgba(65, 212, 200, 0.5);
+  background: var(--surface-overlay);
+  color: #83eee5;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select,
+textarea {
+  min-height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: #0b1917;
+  color: var(--text);
+  padding: 6px 9px;
+  color-scheme: dark;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 0.72;
+}
+select option {
+  background: #0b1917;
+  color: var(--text);
+}
+input[type="checkbox"],
+input[type="radio"],
+meter {
+  accent-color: var(--accent);
 }
 
 .app-shell {
@@ -263,8 +308,9 @@ kbd {
   font-size: 0.75rem;
 }
 .page {
-  max-width: 820px;
-  padding: 48px;
+  width: 100%;
+  max-width: none;
+  padding: 24px 30px 60px;
 }
 .page .eyebrow {
   margin-left: 0;
@@ -540,6 +586,12 @@ h1 {
   border-color: #70d89b;
   background: #24563a;
 }
+
+.system-marker.megastructure > span {
+  border-width: 3px;
+  border-radius: 4px;
+  transform: rotate(45deg);
+}
 .system-marker small {
   margin-top: 4px;
   padding: 2px 4px;
@@ -670,10 +722,89 @@ h1 {
 .activity-toggle span:nth-child(3) {
   color: #78908c;
 }
+.activity-drawer-content {
+  border-top: 1px solid rgba(159, 188, 193, 0.1);
+}
+.activity-drawer-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px 8px;
+}
+.activity-drawer-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px 10px;
+  color: #78908c;
+}
+.activity-drawer-tabs button[aria-selected="true"] {
+  border-bottom-color: #41d4c8;
+  color: #eff8f6;
+}
 .activity-list {
-  max-height: 220px;
+  max-height: 260px;
   overflow: auto;
   padding: 0 12px 12px;
+}
+.ami-report-drawer {
+  max-height: min(420px, 55vh);
+  overflow: auto;
+  padding: 0 12px 12px;
+}
+.ami-report-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  padding: 6px 0 10px;
+  background: #0e1b19;
+}
+.ami-report-toolbar label {
+  display: grid;
+  gap: 4px;
+  min-width: 220px;
+  color: #9fb6b2;
+  font-size: 0.75rem;
+}
+.ami-report-list {
+  display: grid;
+  gap: 6px;
+}
+.ami-report-card {
+  border: 1px solid rgba(159, 188, 193, 0.15);
+  border-left: 2px solid #41d4c8;
+  border-radius: 6px;
+  background: rgba(26, 48, 44, 0.55);
+}
+.ami-report-card > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+.ami-report-card > summary::-webkit-details-marker {
+  display: none;
+}
+.ami-report-card > summary span {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.ami-report-card > summary small,
+.ami-report-card > summary time {
+  color: #78908c;
+}
+.ami-report-card-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 10px 10px;
 }
 .activity-item {
   width: 100%;
@@ -1024,6 +1155,7 @@ h1 {
 .palette-backdrop {
   position: fixed;
   inset: 0;
+  z-index: 40;
   display: grid;
   align-items: start;
   justify-items: center;
@@ -1368,9 +1500,39 @@ h1 {
 }
 
 .page-heading {
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 24px;
+  margin-bottom: var(--space-4);
+}
+
+/* Page identity is intentionally compact: the category path and page name read
+   as one breadcrumb-like title instead of spending a quarter of the viewport on
+   a hero header. The page name remains accented for quick visual scanning. */
+.page-heading > div > .eyebrow {
+  display: inline;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 1.5rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  text-transform: none;
+}
+.page-heading > div > .eyebrow + h1 {
+  display: inline;
+  margin: 0;
+  color: var(--accent);
+  font-size: 1.5rem;
+  line-height: 1.2;
+}
+.page-heading > div > .eyebrow + h1::before {
+  content: " / ";
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.page-heading > div > .lede {
+  display: none;
 }
 
 .device-filters {
@@ -1868,6 +2030,10 @@ h1 {
   gap: 8px;
 }
 
+.intelligence-grid .asset-operations {
+  align-content: start;
+}
+
 .intelligence-grid .asset-operations button,
 .message-list article,
 .intelligence-card-grid article {
@@ -1889,10 +2055,165 @@ h1 {
   white-space: pre-wrap;
 }
 
+.message-card-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 12px;
+  align-items: start;
+}
+.message-card-title {
+  min-width: 0;
+}
+.message-card-badges {
+  display: flex !important;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 5px;
+}
+.message-card-badges .status-chip {
+  margin: 0;
+  white-space: nowrap;
+}
+.message-card-meta {
+  grid-column: 1 / -1;
+  display: flex !important;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #78908c;
+  font-size: 0.76rem;
+}
+
+.message-filters {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0 8px;
+}
+
+.message-filters label:not(.message-unread-filter) {
+  display: grid;
+  gap: 5px;
+  min-width: 180px;
+}
+
+.message-filters label > span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.message-filters label:first-child {
+  flex: 1 1 320px;
+}
+
+.message-unread-filter {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 4px;
+  color: var(--text-muted);
+}
+
 .intelligence-card-grid {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.activity-table-wrap {
+  max-height: calc(100vh - 300px);
+}
+.activity-details-cell {
+  min-width: 300px;
+}
+.activity-details-cell > details > summary {
+  color: #83eee5;
+  cursor: pointer;
+}
+.activity-event-details {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  min-width: min(520px, 70vw);
+}
+.activity-event-details.compact {
+  min-width: 0;
+  margin-top: 0;
+}
+.activity-digest-section {
+  display: grid;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid rgba(159, 188, 193, 0.12);
+  border-radius: 6px;
+  background: rgba(13, 28, 31, 0.46);
+}
+.activity-digest-section h4 {
+  margin: 0;
+  color: #83eee5;
+  font-size: 0.76rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.activity-directive strong {
+  font-size: 0.95rem;
+}
+.activity-metrics,
+.activity-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.activity-payload-fields {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+.activity-payload-fields > div {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.45fr) minmax(140px, 1fr);
+  gap: 10px;
+  padding-top: 5px;
+  border-top: 1px solid rgba(159, 188, 193, 0.08);
+}
+.activity-payload-fields > div:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.activity-payload-fields dt {
+  color: #78908c;
+  font-size: 0.72rem;
+}
+.activity-payload-fields dd {
+  min-width: 0;
+  margin: 0;
+}
+.activity-payload-list {
+  display: grid;
+  gap: 5px;
+}
+.activity-payload-list-item {
+  padding: 6px;
+  border: 1px solid rgba(159, 188, 193, 0.08);
+  border-radius: 4px;
+}
+.activity-device-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 6px;
+}
+.activity-device-card {
+  display: grid;
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid rgba(159, 188, 193, 0.1);
+  border-radius: 4px;
+}
+.activity-device-card small {
+  color: #78908c;
 }
 
 .cargo-table .workflow-link,
@@ -2200,5 +2521,291 @@ h1 {
     right: var(--space-3);
     left: var(--space-3);
     width: auto;
+  }
+}
+
+/* BobNet keeps chat dense and terminal-like without introducing a second theme. */
+.bobnet-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  padding-bottom: var(--space-3);
+}
+.bobnet-page-heading {
+  flex: 0 0 auto;
+  margin-bottom: var(--space-3);
+}
+.bobnet-client {
+  display: grid;
+  grid-template-columns: minmax(190px, 230px) minmax(420px, 1fr) minmax(
+      190px,
+      230px
+    );
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+.bobnet-sidebar {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3);
+  background: var(--surface-raised);
+}
+.bobnet-channels {
+  border-right: 1px solid var(--border);
+}
+.bobnet-nicks {
+  border-left: 1px solid var(--border);
+}
+.bobnet-sidebar-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.bobnet-sidebar-heading small,
+.bobnet-chat-header small,
+.bobnet-nick-list small,
+.bobnet-channel-list small {
+  color: var(--text-muted);
+}
+.bobnet-channel-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+.bobnet-channel-entry input,
+.bobnet-channel-entry button {
+  min-width: 0;
+}
+.bobnet-channel-list,
+.bobnet-nick-list {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+}
+.bobnet-channel-list button,
+.bobnet-nick-list button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.bobnet-channel-list button:hover,
+.bobnet-nick-list button:hover,
+.bobnet-channel-list button.active,
+.bobnet-nick-list button.active {
+  background: var(--surface-overlay);
+}
+.bobnet-channel-list button.active,
+.bobnet-nick-list button.active {
+  color: var(--accent);
+}
+.bobnet-sidebar-empty {
+  margin: var(--space-3) 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+.bobnet-chat {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+.bobnet-chat-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+.bobnet-chat-header > div {
+  display: grid;
+  gap: 2px;
+}
+.bobnet-chat-header > div strong {
+  font-size: 1.05rem;
+  color: var(--accent);
+}
+.bobnet-transcript {
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-3) var(--space-4);
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+.bobnet-line {
+  display: grid;
+  grid-template-columns: 54px minmax(90px, auto) minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: start;
+  padding: 2px 0;
+}
+.bobnet-line > time {
+  color: var(--text-muted);
+}
+.bobnet-nick,
+.bobnet-system-link {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+}
+.bobnet-system-nick {
+  color: var(--warning);
+  font-weight: 500;
+}
+.bobnet-line.system .bobnet-line-body {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.bobnet-line-body {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.bobnet-system-link {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+.bobnet-empty-transcript {
+  margin: var(--space-5) 0;
+  color: var(--text-muted);
+  text-align: center;
+}
+.bobnet-composer {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-3);
+  border-top: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+.bobnet-composer-prompt {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--accent);
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bobnet-composer textarea {
+  min-height: 48px;
+  max-height: 140px;
+  resize: vertical;
+}
+.bobnet-send-status {
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+.bobnet-npc-toggle {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  margin-top: var(--space-4);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+@media (max-width: 1180px) {
+  .bobnet-client {
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  }
+  .bobnet-nicks {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-3);
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+  .bobnet-nicks .bobnet-sidebar-heading {
+    display: none;
+  }
+  .bobnet-nick-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+  .bobnet-nick-list button {
+    width: auto;
+  }
+  .bobnet-npc-toggle {
+    margin-top: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .bobnet-page {
+    height: auto;
+    overflow: visible;
+  }
+  .bobnet-client {
+    display: block;
+    min-height: 0;
+  }
+  .bobnet-channels,
+  .bobnet-nicks {
+    border: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .bobnet-channel-list,
+  .bobnet-nick-list {
+    display: flex;
+    overflow-x: auto;
+  }
+  .bobnet-channel-list button,
+  .bobnet-nick-list button {
+    width: auto;
+    white-space: nowrap;
+  }
+  .bobnet-chat {
+    min-height: 560px;
+  }
+  .bobnet-chat-header,
+  .bobnet-composer {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .bobnet-line {
+    grid-template-columns: 48px minmax(80px, auto) minmax(0, 1fr);
+  }
+  .bobnet-system-link {
+    display: none;
+  }
+  .bobnet-nicks {
+    grid-template-columns: 1fr;
   }
 }

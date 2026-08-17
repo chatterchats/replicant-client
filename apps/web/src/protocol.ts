@@ -33,8 +33,14 @@ export type DomainSlice =
   | "missions"
   | "history"
   | "events"
+  | "activity"
   | "trade"
+  | "simulations"
+  | "blueprints"
+  | "directory"
+  | "tutorials"
   | "messages"
+  | "bobnet"
   | "network"
   | "standing"
   | "leaderboards"
@@ -279,6 +285,159 @@ export interface EventsSnapshot {
   events: EventSummary[];
 }
 
+export interface AccountEventSummary {
+  id: string;
+  name: string;
+  category: string;
+  device: EntityRef | null;
+  replicant: EntityRef | null;
+  system: string | null;
+  location: string | null;
+  occurred_at: string;
+  payload: Record<string, unknown>;
+  ami_digest: boolean;
+}
+
+export interface AccountEventsSnapshot {
+  metadata: SnapshotMetadata;
+  cursor: string | null;
+  events: AccountEventSummary[];
+}
+
+export interface DeviceLogSummary {
+  id: number | null;
+  created_at: string | null;
+  device_code: string | null;
+  device_type: string | null;
+  event_type: string | null;
+  message: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface DeviceLogsSnapshot {
+  metadata: SnapshotMetadata;
+  device: EntityRef;
+  events: DeviceLogSummary[];
+  next_cursor: number | null;
+}
+
+export interface SimulationScenarioSummary {
+  code: string;
+  name: string | null;
+  description: string | null;
+  long_description: string | null;
+  objective_type: string | null;
+  objective_target: number | null;
+  timeout_hours: number | null;
+  version: number | null;
+  entry_cost: InventoryQuantity[];
+}
+
+export interface SimulationRunSummary {
+  id: number;
+  interface: EntityRef | null;
+  is_mine: boolean;
+  replicant: EntityRef | null;
+  replicant_name: string | null;
+  scenario_code: string | null;
+  scenario_name: string | null;
+  lifecycle: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  abandoned_at: string | null;
+  timed_out_at: string | null;
+  score_seconds: number | null;
+  resources_mined: number | null;
+  devices_printed: number | null;
+  timeout_hours: number | null;
+}
+
+export interface SimulationInterfaceSummary {
+  device: DeviceSummary;
+  scenarios: SimulationScenarioSummary[];
+  active: SimulationRunSummary[];
+  error: string | null;
+}
+
+export interface SimulationsSnapshot {
+  metadata: SnapshotMetadata;
+  interfaces: SimulationInterfaceSummary[];
+  managed_history: SimulationRunSummary[];
+  account_history: SimulationRunSummary[];
+}
+
+export interface BlueprintSummary {
+  device_type: string;
+  short_description: string | null;
+  description: string | null;
+  print_time_seconds: number | null;
+  resources: InventoryQuantity[];
+  components: InventoryQuantity[];
+  features: string[];
+  directives: string[];
+  cargo_capacity: number | null;
+  attach_capacity: number | null;
+  stow_capacity: number | null;
+  queue_size: number | null;
+}
+
+export interface BlueprintsSnapshot {
+  metadata: SnapshotMetadata;
+  blueprints: BlueprintSummary[];
+}
+
+export interface DirectoryReplicantSummary {
+  entity: EntityRef;
+  name: string | null;
+  last_location: string | null;
+  is_npc: boolean | null;
+}
+
+export interface DirectorySnapshot {
+  metadata: SnapshotMetadata;
+  query: string | null;
+  replicants: DirectoryReplicantSummary[];
+}
+
+export interface DirectoryReplicantDetail {
+  entity: EntityRef;
+  name: string | null;
+  is_npc: boolean | null;
+  status: string | null;
+  location: string | null;
+  hosted_device: EntityRef | null;
+}
+
+export interface DirectoryReplicantDetailSnapshot {
+  metadata: SnapshotMetadata;
+  replicant: DirectoryReplicantDetail;
+}
+
+export interface TutorialStepSummary {
+  key: string | null;
+  description: string | null;
+  hint: string | null;
+  completed: boolean | null;
+  current: boolean | null;
+}
+
+export interface TutorialSummary {
+  slug: string;
+  name: string | null;
+  description: string | null;
+  order: number | null;
+  completed: boolean | null;
+  current_step: number | null;
+  total_steps: number | null;
+  steps: TutorialStepSummary[];
+}
+
+export interface TutorialsSnapshot {
+  metadata: SnapshotMetadata;
+  tutorials: TutorialSummary[];
+  selected: TutorialSummary | null;
+}
+
 export interface TradeItemSummary {
   kind: string;
   item: string;
@@ -350,13 +509,27 @@ export interface BobnetMessageSummary {
 
 export interface MessagesSnapshot {
   metadata: SnapshotMetadata;
-  relays: EntityRef[];
-  selected_relay: string | null;
-  channels: BobnetChannelSummary[];
-  relay_messages: BobnetMessageSummary[];
   inbox: InboxMessageSummary[];
   unread_count: number | null;
+}
+
+export interface BobnetReplicantSummary {
+  entity: EntityRef;
+  name: string | null;
+  status: string | null;
+  location: string | null;
+}
+
+export interface BobnetSnapshot {
+  metadata: SnapshotMetadata;
+  sources: DeviceSummary[];
+  selected_source: string | null;
+  channels: BobnetChannelSummary[];
+  messages: BobnetMessageSummary[];
+  replicants: BobnetReplicantSummary[];
   next_cursor: number | null;
+  total_messages: number | null;
+  error: string | null;
 }
 
 export interface NetworkRelaySummary {
@@ -715,6 +888,7 @@ export interface GalaxyStar {
   has_hub: boolean;
   has_life: boolean;
   has_relay: boolean;
+  has_megastructure?: boolean;
 }
 
 export interface GalaxySceneSnapshot {
@@ -756,7 +930,8 @@ export type SystemMarkerKind =
   | "factory"
   | "relay"
   | "event"
-  | "resource_site";
+  | "resource_site"
+  | "megastructure";
 
 export interface SystemPoint {
   x: number;
@@ -973,8 +1148,14 @@ const domainSlices = [
   "missions",
   "history",
   "events",
+  "activity",
   "trade",
+  "simulations",
+  "blueprints",
+  "directory",
+  "tutorials",
   "messages",
+  "bobnet",
   "network",
   "standing",
   "leaderboards",
@@ -1877,6 +2058,352 @@ export function parseEventsResponse(value: unknown): Versioned<EventsSnapshot> {
   });
 }
 
+export function parseActivityResponse(
+  value: unknown,
+): Versioned<AccountEventsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "account activity snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      cursor: nullableString(snapshot.cursor, "account event cursor"),
+      events: array(snapshot.events, "account events").map((value) => {
+        const event = record(value, "account event");
+        if (
+          typeof event.id !== "string" ||
+          typeof event.name !== "string" ||
+          typeof event.category !== "string" ||
+          typeof event.occurred_at !== "string" ||
+          typeof event.ami_digest !== "boolean"
+        )
+          throw new Error("Invalid account event");
+        return {
+          id: event.id,
+          name: event.name,
+          category: event.category,
+          device: event.device === null ? null : entity(event.device),
+          replicant: event.replicant === null ? null : entity(event.replicant),
+          system: nullableString(event.system, "event system"),
+          location: nullableString(event.location, "event location"),
+          occurred_at: event.occurred_at,
+          payload: record(event.payload, "event payload"),
+          ami_digest: event.ami_digest,
+        };
+      }),
+    };
+  });
+}
+
+export function parseDeviceLogsResponse(
+  value: unknown,
+): Versioned<DeviceLogsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "device logs snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      device: entity(snapshot.device),
+      events: array(snapshot.events, "device logs").map((value) => {
+        const event = record(value, "device log");
+        return {
+          id: optionalFiniteNumber(event.id, "device log id"),
+          created_at: nullableString(event.created_at, "device log time"),
+          device_code: nullableString(event.device_code, "device log code"),
+          device_type: nullableString(event.device_type, "device log type"),
+          event_type: nullableString(event.event_type, "device log event type"),
+          message: nullableString(event.message, "device log message"),
+          payload: record(event.payload, "device log payload"),
+        };
+      }),
+      next_cursor: optionalFiniteNumber(
+        snapshot.next_cursor,
+        "device log cursor",
+      ),
+    };
+  });
+}
+
+function parseInventoryQuantities(
+  value: unknown,
+  name: string,
+): InventoryQuantity[] {
+  return array(value, name).map((value) => {
+    const item = record(value, name);
+    if (typeof item.resource !== "string") throw new Error(`Invalid ${name}`);
+    return {
+      resource: item.resource,
+      quantity: number(item.quantity, `${name} quantity`),
+    };
+  });
+}
+
+function parseSimulationRun(value: unknown): SimulationRunSummary {
+  const run = record(value, "simulation run");
+  if (typeof run.is_mine !== "boolean")
+    throw new Error("Invalid simulation run");
+  return {
+    id: number(run.id, "simulation id"),
+    interface: run.interface === null ? null : entity(run.interface),
+    is_mine: run.is_mine,
+    replicant: run.replicant === null ? null : entity(run.replicant),
+    replicant_name: nullableString(run.replicant_name, "simulation replicant"),
+    scenario_code: nullableString(run.scenario_code, "scenario code"),
+    scenario_name: nullableString(run.scenario_name, "scenario name"),
+    lifecycle: nullableString(run.lifecycle, "simulation lifecycle"),
+    started_at: nullableString(run.started_at, "simulation start"),
+    completed_at: nullableString(run.completed_at, "simulation completion"),
+    abandoned_at: nullableString(run.abandoned_at, "simulation abandonment"),
+    timed_out_at: nullableString(run.timed_out_at, "simulation timeout"),
+    score_seconds: optionalFiniteNumber(run.score_seconds, "simulation score"),
+    resources_mined: optionalFiniteNumber(
+      run.resources_mined,
+      "resources mined",
+    ),
+    devices_printed: optionalFiniteNumber(
+      run.devices_printed,
+      "devices printed",
+    ),
+    timeout_hours: optionalFiniteNumber(
+      run.timeout_hours,
+      "simulation timeout hours",
+    ),
+  };
+}
+
+export function parseSimulationsResponse(
+  value: unknown,
+): Versioned<SimulationsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "simulations snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      interfaces: array(snapshot.interfaces, "simulation interfaces").map(
+        (value) => {
+          const item = record(value, "simulation interface");
+          return {
+            device: parseDeviceSummary(item.device),
+            scenarios: array(item.scenarios, "simulation scenarios").map(
+              (value) => {
+                const scenario = record(value, "simulation scenario");
+                if (typeof scenario.code !== "string")
+                  throw new Error("Invalid simulation scenario");
+                return {
+                  code: scenario.code,
+                  name: nullableString(scenario.name, "scenario name"),
+                  description: nullableString(
+                    scenario.description,
+                    "scenario description",
+                  ),
+                  long_description: nullableString(
+                    scenario.long_description,
+                    "scenario rules",
+                  ),
+                  objective_type: nullableString(
+                    scenario.objective_type,
+                    "scenario objective",
+                  ),
+                  objective_target: optionalFiniteNumber(
+                    scenario.objective_target,
+                    "scenario target",
+                  ),
+                  timeout_hours: optionalFiniteNumber(
+                    scenario.timeout_hours,
+                    "scenario timeout",
+                  ),
+                  version: optionalFiniteNumber(
+                    scenario.version,
+                    "scenario version",
+                  ),
+                  entry_cost: parseInventoryQuantities(
+                    scenario.entry_cost,
+                    "scenario entry cost",
+                  ),
+                };
+              },
+            ),
+            active: array(item.active, "active simulations").map(
+              parseSimulationRun,
+            ),
+            error: nullableString(item.error, "simulation interface error"),
+          };
+        },
+      ),
+      managed_history: array(
+        snapshot.managed_history,
+        "managed simulation history",
+      ).map(parseSimulationRun),
+      account_history: array(
+        snapshot.account_history,
+        "account simulation history",
+      ).map(parseSimulationRun),
+    };
+  });
+}
+
+export function parseBlueprintsResponse(
+  value: unknown,
+): Versioned<BlueprintsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "blueprints snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      blueprints: array(snapshot.blueprints, "blueprints").map((value) => {
+        const blueprint = record(value, "blueprint");
+        if (typeof blueprint.device_type !== "string")
+          throw new Error("Invalid blueprint");
+        return {
+          device_type: blueprint.device_type,
+          short_description: nullableString(
+            blueprint.short_description,
+            "blueprint short description",
+          ),
+          description: nullableString(
+            blueprint.description,
+            "blueprint description",
+          ),
+          print_time_seconds: optionalFiniteNumber(
+            blueprint.print_time_seconds,
+            "blueprint print time",
+          ),
+          resources: parseInventoryQuantities(
+            blueprint.resources,
+            "blueprint resource",
+          ),
+          components: parseInventoryQuantities(
+            blueprint.components,
+            "blueprint component",
+          ),
+          features: stringArray(blueprint.features, "blueprint features"),
+          directives: stringArray(blueprint.directives, "blueprint directives"),
+          cargo_capacity: optionalFiniteNumber(
+            blueprint.cargo_capacity,
+            "blueprint cargo capacity",
+          ),
+          attach_capacity: optionalFiniteNumber(
+            blueprint.attach_capacity,
+            "blueprint attach capacity",
+          ),
+          stow_capacity: optionalFiniteNumber(
+            blueprint.stow_capacity,
+            "blueprint stow capacity",
+          ),
+          queue_size: optionalFiniteNumber(
+            blueprint.queue_size,
+            "blueprint queue size",
+          ),
+        };
+      }),
+    };
+  });
+}
+
+export function parseDirectoryResponse(
+  value: unknown,
+): Versioned<DirectorySnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "directory snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      query: nullableString(snapshot.query, "directory query"),
+      replicants: array(snapshot.replicants, "directory replicants").map(
+        (value) => {
+          const row = record(value, "directory replicant");
+          return {
+            entity: entity(row.entity),
+            name: nullableString(row.name, "replicant name"),
+            last_location: nullableString(
+              row.last_location,
+              "replicant location",
+            ),
+            is_npc:
+              row.is_npc === null
+                ? null
+                : boolean(row.is_npc, "replicant NPC flag"),
+          };
+        },
+      ),
+    };
+  });
+}
+
+export function parseDirectoryReplicantResponse(
+  value: unknown,
+): Versioned<DirectoryReplicantDetailSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "directory replicant snapshot");
+    const profile = record(snapshot.replicant, "directory replicant profile");
+    return {
+      metadata: metadata(snapshot.metadata),
+      replicant: {
+        entity: entity(profile.entity),
+        name: nullableString(profile.name, "replicant name"),
+        is_npc:
+          profile.is_npc === null
+            ? null
+            : boolean(profile.is_npc, "replicant NPC flag"),
+        status: nullableString(profile.status, "replicant status"),
+        location: nullableString(profile.location, "replicant location"),
+        hosted_device:
+          profile.hosted_device === null ? null : entity(profile.hosted_device),
+      },
+    };
+  });
+}
+
+function parseTutorial(value: unknown): TutorialSummary {
+  const tutorial = record(value, "tutorial");
+  if (typeof tutorial.slug !== "string") throw new Error("Invalid tutorial");
+  return {
+    slug: tutorial.slug,
+    name: nullableString(tutorial.name, "tutorial name"),
+    description: nullableString(tutorial.description, "tutorial description"),
+    order: optionalFiniteNumber(tutorial.order, "tutorial order"),
+    completed:
+      tutorial.completed === null
+        ? null
+        : boolean(tutorial.completed, "tutorial completion"),
+    current_step: optionalFiniteNumber(
+      tutorial.current_step,
+      "tutorial current step",
+    ),
+    total_steps: optionalFiniteNumber(
+      tutorial.total_steps,
+      "tutorial total steps",
+    ),
+    steps: array(tutorial.steps, "tutorial steps").map((value) => {
+      const step = record(value, "tutorial step");
+      return {
+        key: nullableString(step.key, "tutorial step key"),
+        description: nullableString(
+          step.description,
+          "tutorial step description",
+        ),
+        hint: nullableString(step.hint, "tutorial step hint"),
+        completed:
+          step.completed === null
+            ? null
+            : boolean(step.completed, "tutorial step completion"),
+        current:
+          step.current === null
+            ? null
+            : boolean(step.current, "tutorial current flag"),
+      };
+    }),
+  };
+}
+
+export function parseTutorialsResponse(
+  value: unknown,
+): Versioned<TutorialsSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "tutorials snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      tutorials: array(snapshot.tutorials, "tutorials").map(parseTutorial),
+      selected:
+        snapshot.selected === null ? null : parseTutorial(snapshot.selected),
+    };
+  });
+}
+
 function parseTradeItems(value: unknown, name: string): TradeItemSummary[] {
   return array(value, name).map((value) => {
     const item = record(value, name);
@@ -1968,6 +2495,25 @@ function bobnetChannel(value: unknown): BobnetChannelSummary {
   };
 }
 
+function bobnetMessage(value: unknown): BobnetMessageSummary {
+  const message = record(value, "BobNet message");
+  if (typeof message.is_npc_or_system !== "boolean")
+    throw new Error("Invalid BobNet message");
+  return {
+    id: optionalFiniteNumber(message.id, "BobNet message ID"),
+    channel: nullableString(message.channel, "BobNet message channel"),
+    body: nullableString(message.body, "BobNet message body"),
+    sender: nullableString(message.sender, "BobNet message sender"),
+    sender_name: nullableString(message.sender_name, "BobNet sender name"),
+    is_npc_or_system: message.is_npc_or_system,
+    current_system: nullableString(
+      message.current_system,
+      "BobNet sender system",
+    ),
+    created_at: nullableString(message.created_at, "BobNet message time"),
+  };
+}
+
 export function parseReportsResponse(
   value: unknown,
 ): Versioned<ReportsSnapshot> {
@@ -1990,32 +2536,6 @@ export function parseMessagesResponse(
     const snapshot = record(payload, "messages snapshot");
     return {
       metadata: metadata(snapshot.metadata),
-      relays: array(snapshot.relays, "message relays").map(entity),
-      selected_relay: nullableString(snapshot.selected_relay, "selected relay"),
-      channels: array(snapshot.channels, "message channels").map(bobnetChannel),
-      relay_messages: array(snapshot.relay_messages, "relay messages").map(
-        (value) => {
-          const message = record(value, "relay message");
-          if (typeof message.is_npc_or_system !== "boolean")
-            throw new Error("Invalid relay message");
-          return {
-            id: optionalFiniteNumber(message.id, "relay message ID"),
-            channel: nullableString(message.channel, "message channel"),
-            body: nullableString(message.body, "message body"),
-            sender: nullableString(message.sender, "message sender"),
-            sender_name: nullableString(
-              message.sender_name,
-              "message sender name",
-            ),
-            is_npc_or_system: message.is_npc_or_system,
-            current_system: nullableString(
-              message.current_system,
-              "sender system",
-            ),
-            created_at: nullableString(message.created_at, "message time"),
-          };
-        },
-      ),
       inbox: array(snapshot.inbox, "inbox messages").map((value) => {
         const message = record(value, "inbox message");
         if (message.is_read !== null && typeof message.is_read !== "boolean")
@@ -2031,7 +2551,44 @@ export function parseMessagesResponse(
         };
       }),
       unread_count: optionalFiniteNumber(snapshot.unread_count, "unread count"),
-      next_cursor: optionalFiniteNumber(snapshot.next_cursor, "message cursor"),
+    };
+  });
+}
+
+export function parseBobnetResponse(value: unknown): Versioned<BobnetSnapshot> {
+  return envelope(value, (payload) => {
+    const snapshot = record(payload, "BobNet snapshot");
+    return {
+      metadata: metadata(snapshot.metadata),
+      sources: array(snapshot.sources, "BobNet sources").map(
+        parseDeviceSummary,
+      ),
+      selected_source: nullableString(
+        snapshot.selected_source,
+        "BobNet source",
+      ),
+      channels: array(snapshot.channels, "BobNet channels").map(bobnetChannel),
+      messages: array(snapshot.messages, "BobNet messages").map(bobnetMessage),
+      replicants: array(snapshot.replicants, "BobNet replicants").map(
+        (value) => {
+          const replicant = record(value, "BobNet replicant");
+          return {
+            entity: entity(replicant.entity),
+            name: nullableString(replicant.name, "BobNet replicant name"),
+            status: nullableString(replicant.status, "BobNet replicant status"),
+            location: nullableString(
+              replicant.location,
+              "BobNet replicant location",
+            ),
+          };
+        },
+      ),
+      next_cursor: optionalFiniteNumber(snapshot.next_cursor, "BobNet cursor"),
+      total_messages: optionalFiniteNumber(
+        snapshot.total_messages,
+        "BobNet total messages",
+      ),
+      error: nullableString(snapshot.error, "BobNet warning"),
     };
   });
 }
@@ -2497,6 +3054,7 @@ export function parseGalaxySceneResponse(
           has_hub: star.has_hub,
           has_life: star.has_life,
           has_relay: star.has_relay,
+          has_megastructure: star.has_megastructure === true,
         };
       }),
       relay_edges: array(item.relay_edges, "galaxy relay edges").map((value) =>
@@ -2605,6 +3163,7 @@ export function parseSystemSceneResponse(
               "relay",
               "event",
               "resource_site",
+              "megastructure",
             ] as const,
             "system marker kind",
           ),

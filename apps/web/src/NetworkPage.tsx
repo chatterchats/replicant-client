@@ -11,7 +11,6 @@ export function NetworkPage({
   onSelectEntity: (entity: EntityRef) => void;
 }) {
   const query = useDomainQuery({
-    slice: "network",
     fetcher: (signal) => daemonApi.network(signal),
     isEmpty: empty,
   });
@@ -33,6 +32,10 @@ export function NetworkContent({
   refresh: () => Promise<void>;
   onSelectEntity: (entity: EntityRef) => void;
 }) {
+  const channelSource = data?.relays.find(
+    (relay) => relay.channels.length > 0 || relay.error,
+  );
+  const availableChannels = channelSource?.channels ?? [];
   if (!data && status === "loading")
     return <article className="page loading-state">Loading Network…</article>;
   if (!data && status === "error")
@@ -92,6 +95,30 @@ export function NetworkContent({
         )}
       </section>
       <section>
+        <h2>Available BobNet channels</h2>
+        {availableChannels.length ? (
+          <div className="result-links">
+            {availableChannels.map((channel) => (
+              <span className="status-chip" key={channel.name}>
+                {channel.name}
+                {channel.last_active ? ` · ${channel.last_active}` : ""}
+              </span>
+            ))}
+          </div>
+        ) : channelSource?.error ? (
+          <p className="inline-warning">{channelSource.error}</p>
+        ) : (
+          <p className="empty-state">No channels discovered.</p>
+        )}
+        {channelSource && (
+          <small>
+            Channel discovery uses one relay-capable device (
+            {channelSource.device.entity.id}) because the API returns the same
+            global channel list from any active relay.
+          </small>
+        )}
+      </section>
+      <section>
         <h2>Relay devices</h2>
         {data?.relays.length ? (
           <div className="inventory-table-wrap">
@@ -99,9 +126,8 @@ export function NetworkContent({
               <thead>
                 <tr>
                   <th>Relay</th>
-                  <th>Connectivity</th>
+                  <th>Status</th>
                   <th>Location</th>
-                  <th>Observed channels</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -111,20 +137,11 @@ export function NetworkContent({
                     <td>{relay.device.entity.id}</td>
                     <td>
                       <span className="status-chip">
-                        {relay.error
-                          ? "unavailable"
-                          : (relay.device.status ?? "available")}
+                        {relay.device.status ?? "available"}
                       </span>
-                      {relay.error && <small>{relay.error}</small>}
                     </td>
                     <td>
                       {relay.device.location ?? relay.device.system ?? "—"}
-                    </td>
-                    <td>
-                      {relay.channels.map((channel) => (
-                        <small key={channel.name}>{channel.name}</small>
-                      ))}
-                      {!relay.channels.length && <small>None observed</small>}
                     </td>
                     <td>
                       <button

@@ -537,6 +537,9 @@ pub fn location_detail(
             Value::Array(sites.iter().cloned().map(Value::Object).collect()),
         );
     }
+    if let Some(megastructure) = &raw.megastructure {
+        unknown.insert("megastructure".into(), Value::Object(megastructure.clone()));
+    }
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),

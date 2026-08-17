@@ -25,7 +25,6 @@ export function AutofactoryPage(props: {
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
   const query = useDomainQuery({
-    slice: "autofactories",
     fetcher: (signal) => daemonApi.autofactories(signal),
     isEmpty: empty,
   });

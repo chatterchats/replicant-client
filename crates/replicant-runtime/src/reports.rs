@@ -153,18 +153,34 @@ pub async fn nearby_belt_report(
         return Err(io::Error::other("the account has no owned replicants").into());
     }
 
+    // The daemon continuously persists per-replicant star knowledge. Reuse
+    // that committed view first instead of re-walking every paginated star
+    // list each time somebody opens the report page. Only bootstrap the cache
+    // from upstream when this installation has no explored-star knowledge yet.
     let mut explored = BTreeSet::new();
-    for replicant in replicants {
-        let report = client
-            .galaxy()
-            .sync_replicant_stars(replicant.id().as_str())
-            .await?;
+    for replicant in &replicants {
         explored.extend(
-            report
-                .explored_designations()
-                .iter()
-                .map(|designation| designation.as_str().to_owned()),
+            client
+                .galaxy()
+                .replicant_star_knowledge(replicant.id().as_str())
+                .into_iter()
+                .filter(|star| star.explored == Some(true))
+                .map(|star| star.star.id.as_str().to_owned()),
         );
+    }
+    if explored.is_empty() {
+        for replicant in &replicants {
+            let report = client
+                .galaxy()
+                .sync_replicant_stars(replicant.id().as_str())
+                .await?;
+            explored.extend(
+                report
+                    .explored_designations()
+                    .iter()
+                    .map(|designation| designation.as_str().to_owned()),
+            );
+        }
     }
 
     let mut catalogue = client.galaxy().catalogue();
@@ -205,7 +221,31 @@ pub async fn nearby_belt_report(
         .collect::<Vec<_>>();
     nearby.sort_by(|left, right| left.designation.cmp(&right.designation));
 
-    let fetched = stream::iter(nearby.into_iter().map(|system| {
+    // Explored-system hydration already commits the system root used by this
+    // report. Consume those local rows immediately and perform upstream reads
+    // only for systems that have not been hydrated yet. On a warm daemon this
+    // turns a radius report from N remote requests into a local query.
+    let mut cached_locations = client
+        .locations()
+        .find()
+        .in_realm(Realm::Live)
+        .collect()
+        .await?
+        .into_iter()
+        .map(|location| (location.id().as_str().to_owned(), location))
+        .collect::<BTreeMap<_, _>>();
+    let examined_systems = nearby.len();
+    let mut belts = Vec::new();
+    let mut missing = Vec::new();
+    for system in nearby {
+        if let Some(location) = cached_locations.remove(&system.designation) {
+            belts.extend(belts_from_location(&system, &location));
+        } else {
+            missing.push(system);
+        }
+    }
+
+    let fetched = stream::iter(missing.into_iter().map(|system| {
         let locations = client.locations();
         async move {
             let result = locations.get(&system.designation).await;
@@ -216,9 +256,7 @@ pub async fn nearby_belt_report(
     .collect::<Vec<_>>()
     .await;
 
-    let examined_systems = fetched.len();
     let mut failures = Vec::new();
-    let mut belts = Vec::new();
     for (system, result) in fetched {
         match result {
             Ok(location) => belts.extend(belts_from_location(&system, &location)),
@@ -238,7 +276,6 @@ pub async fn nearby_belt_report(
         failures,
     })
 }
-
 fn validate_request(request: &NearbyBeltReportRequest) -> ReportResult<()> {
     if request.origin.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "origin must not be empty").into());

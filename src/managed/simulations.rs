@@ -275,6 +275,22 @@ impl SimulationsGateway {
     /// committed before this method returns; history is additive and never
     /// reconciles absence into deletion.
     pub async fn history(&self) -> Result<Vec<domain::Simulation>> {
+        let entries = self.history_detailed().await?;
+        entries
+            .iter()
+            .map(|entry| {
+                domain::simulation_history(entry, observed_at())
+                    .map(|observation| observation.value)
+                    .map_err(normalization)
+            })
+            .collect()
+    }
+
+    /// Refreshes account simulation history and returns the authoritative
+    /// server entries after committing their normalized managed projections.
+    /// This preserves score and outcome counters that are intentionally not
+    /// part of the smaller durable [`domain::Simulation`] model.
+    pub async fn history_detailed(&self) -> Result<Vec<raw::simulations::SimulationHistoryEntry>> {
         self.client.ensure_open()?;
         let response = self
             .client
@@ -283,18 +299,15 @@ impl SimulationsGateway {
             .simulations()
             .await?
             .value;
-        let mut simulations = Vec::with_capacity(response.simulations.len());
         for entry in &response.simulations {
             let observation =
                 domain::simulation_history(entry, observed_at()).map_err(normalization)?;
-            let value = observation.value.clone();
             self.client
                 .managed_state()
                 .persist_simulation(observation)
                 .map_err(persistence_error)?;
-            simulations.push(value);
         }
-        Ok(simulations)
+        Ok(response.simulations)
     }
 }
 

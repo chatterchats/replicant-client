@@ -24,13 +24,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use futures_util::StreamExt;
 use replicant_client::{
     ClientDegradation, ClientStatus,
-    domain::{Device, Inventory, InventoryOwner},
+    domain::{Device, Inventory, InventoryOwner, Realm},
     managed::{Client, OperationStatus as ManagedOperationStatus},
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
-        bobnet::{DeviceChannelsResponse, DeviceMessagesResponse},
+        bobnet::DeviceChannelsResponse,
+        devices::{DeviceListQuery, DeviceStatus as RawDeviceStatus},
         events::LocationEvent,
         leaderboards::{LeaderboardIndexResponse, LeaderboardResponse},
         messages::MessageListResponse,
@@ -39,31 +41,37 @@ use replicant_client::{
 };
 use replicant_event_planner::remaining_requirements;
 use replicant_protocol::{
-    AccountReplicantSummary, AchievementSummary, ActivityLevel, AutofactoryAvailability,
-    AutofactorySnapshot, AutofactorySummary, AutofactoryUtilization, AutomationControlAction,
-    AutomationControlRequest, AutomationControlResponse, AutomationStatus,
-    AutomationTrigger as ProtocolTrigger, BobnetChannelSummary, BobnetMessageSummary,
-    BootstrapMissionSummary, BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary,
-    CargoSnapshot, CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim,
-    DeviceSummary, DevicesSnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind,
-    EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
-    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
-    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
-    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
-    InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
-    InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
-    LeaderboardEntrySummary, LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot,
-    MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
-    NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
-    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
-    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
-    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SettingsSnapshot, SnapshotMetadata, StandingSnapshot, StartWorkflowRequest,
+    AccountEventSummary, AccountEventsSnapshot, AccountReplicantSummary, AchievementSummary,
+    ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
+    AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
+    AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
+    BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary, BobnetMessageSummary,
+    BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot,
+    CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
+    DescriptorCatalog, DeviceClaim, DeviceLogSummary, DeviceLogsSnapshot, DeviceSummary,
+    DevicesSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
+    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
+    EntityKind, EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary,
+    EventRequirementKind, EventRequirementSummary, EventRewardItem, EventRewardsSummary,
+    EventSummary, EventsSnapshot, FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution,
+    FiniteExecutionHistoryResponse, FiniteExecutionStatus as ProtocolFiniteExecutionStatus,
+    GalaxySceneSnapshot, HealthStatus, InboxMessageSummary, InventoryDistribution,
+    InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity, InventoryResourceSummary,
+    InventorySnapshot, LeaderboardBoardSummary, LeaderboardEntrySummary, LeaderboardsSnapshot,
+    LiveDelta, LiveMessage, MessagesSnapshot, MiningInstallationStatus, MiningInstallationSummary,
+    MiningSnapshot, NetworkRelaySummary, NetworkSnapshot, Notification, NotificationLevel,
+    OperationClass, OperationKind, OperationStatus, OperationUpdate, OverviewReplicant,
+    OverviewSnapshot, OverviewTravel, RelayExpansionSummary, RelaySnapshot, ReportsSnapshot,
+    ReputationSummary, RequirementSummary, ResultSummary, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SettingsSnapshot,
+    SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
+    SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartWorkflowRequest,
     StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
     TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
     TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
-    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, UpdateTriggerRequest, Versioned,
-    WorkflowActivity, WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
+    TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, TutorialStepSummary,
+    TutorialSummary, TutorialsSnapshot, UpdateTriggerRequest, Versioned, WorkflowActivity,
+    WorkflowActivityResponse, WorkflowControlResponse, WorkflowDetail,
     WorkflowId as ProtocolWorkflowId, WorkflowListResponse, WorkflowStatus as ProtocolStatus,
     WorkflowStatusCount, WorkflowSummary,
 };
@@ -74,13 +82,11 @@ use replicant_runtime::{
     config::{self, RuntimeConfig},
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
-    intelligence::{
-        account_profile, inbox, leaderboard, leaderboard_index, relay_history, standing,
-    },
+    intelligence::{account_profile, inbox, leaderboard, leaderboard_index, standing},
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
-    trade::{ShopTrade, TraderSummary, shop_trades, trade_viewers, trader_directory},
+    trade::{ShopTrade, TraderSummary, shop_trades, trader_directory},
     workflows::{
         RelayWorkflowCheckpoint, RelayWorkflowConfig, RequirementWorkflowCheckpoint,
         RequirementWorkflowConfig, SurveyWorkflowCheckpoint, SurveyWorkflowConfig,
@@ -111,6 +117,7 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const UPSTREAM_FANOUT: usize = 8;
 
 /// Default loopback address used by the daemon.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -384,9 +391,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/missions/relay", get(relay_missions))
         .route("/api/missions/bootstrap", get(bootstrap_missions))
         .route("/api/events", get(events))
+        .route("/api/activity", get(account_activity))
+        .route("/api/devices/{code}/logs", get(device_logs))
+        .route("/api/simulations", get(simulations))
+        .route("/api/blueprints", get(blueprints))
+        .route("/api/directory", get(directory))
+        .route("/api/directory/{code}", get(directory_replicant))
+        .route("/api/tutorials", get(tutorials))
         .route("/api/trade", get(trade))
         .route("/api/reports", get(reports))
         .route("/api/messages", get(messages))
+        .route("/api/bobnet", get(bobnet))
         .route("/api/network", get(network))
         .route("/api/standing", get(standing_snapshot))
         .route("/api/leaderboards", get(leaderboards))
@@ -441,6 +456,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut revisions = state.client().state().watch().ok();
     let mut operations = state.client().operations().watch().ok();
+    let mut bobnet = state.client().bobnet().watch().await.ok();
     let mut workflows = state
         .repository
         .list()
@@ -457,6 +473,20 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     tracing::error!(error = %error, "workflow supervisor tick failed");
                 }
                 publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
+                let mut stop_bobnet_watch = false;
+                if let Some(watch) = bobnet.as_mut() {
+                    match watch.try_next() {
+                        Ok(events) if !events.is_empty() => state.invalidate(DomainSlice::Bobnet),
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(error = %error, "BobNet event watch stopped");
+                            stop_bobnet_watch = true;
+                        }
+                    }
+                }
+                if stop_bobnet_watch {
+                    bobnet = None;
+                }
                 state.flush_invalidations();
                 let status = state.client().status();
                 let phase = sync_phase(&status);
@@ -493,7 +523,12 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                             DomainSlice::Cargo,
                             DomainSlice::Missions,
                             DomainSlice::Events,
+                            DomainSlice::Activity,
                             DomainSlice::Trade,
+                            DomainSlice::Simulations,
+                            DomainSlice::Blueprints,
+                            DomainSlice::Directory,
+                            DomainSlice::Tutorials,
                             DomainSlice::Messages,
                             DomainSlice::Network,
                             DomainSlice::Standing,
@@ -1246,25 +1281,76 @@ async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, 
     Ok(rows)
 }
 
+/// Reads full device status in paginated list calls instead of issuing one
+/// upstream GET per device. Managed state intentionally stores a smaller
+/// normalized device model, while cargo and factory queue details still live
+/// only on the raw status payload.
+async fn raw_device_details(
+    client: &Client,
+    device_type: Option<&str>,
+) -> Result<BTreeMap<String, RawDeviceStatus>, ApiError> {
+    let mut cursor = None;
+    let mut details = BTreeMap::new();
+    loop {
+        let response = client
+            .raw()
+            .devices()
+            .list(&DeviceListQuery {
+                device_type: device_type.map(str::to_owned),
+                cursor,
+                limit: Some(50),
+                ..DeviceListQuery::default()
+            })
+            .await
+            .map_err(|_| ApiError::unavailable())?
+            .value;
+        for detail in response.devices {
+            if let Some(code) = detail.device_code.clone() {
+                details.insert(code, detail);
+            }
+        }
+        let Some(next) = response.next_cursor else {
+            break;
+        };
+        if cursor == Some(next) {
+            break;
+        }
+        cursor = Some(next);
+    }
+    Ok(details)
+}
+
 async fn autofactories(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<AutofactorySnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let mut factories = Vec::new();
-    for device in device_rows(&state)
-        .await?
+    let device_rows = device_rows(&state).await?;
+    let factory_devices = device_rows
         .iter()
         .filter(|device| device.device_type.as_deref() == Some("autofactory"))
         .cloned()
-    {
-        let detail = state
-            .client()
-            .raw()
-            .devices()
-            .get(&device.entity.id.0)
-            .await
-            .map_err(|_| ApiError::unavailable())?
-            .value;
+        .collect::<Vec<_>>();
+    if factory_devices.is_empty() {
+        return Ok(Json(Versioned::current(autofactory_snapshot(
+            metadata,
+            Vec::new(),
+        ))));
+    }
+    let mut details = raw_device_details(state.client(), Some("autofactory")).await?;
+    let mut factories = Vec::with_capacity(factory_devices.len());
+    for device in factory_devices {
+        let detail = if let Some(detail) = details.remove(&device.entity.id.0) {
+            detail
+        } else {
+            state
+                .client()
+                .raw()
+                .devices()
+                .get(&device.entity.id.0)
+                .await
+                .map_err(|_| ApiError::unavailable())?
+                .value
+        };
         let current_job = detail.printing.map(|printing| FactoryJobSummary {
             device_type: printing.device_type.unwrap_or_else(|| "unknown".to_owned()),
             quantity: 1,
@@ -1374,26 +1460,93 @@ fn number_field(value: &Map<String, Value>, names: &[&str]) -> Option<f64> {
         .find_map(|name| value.get(*name).and_then(Value::as_f64))
 }
 
+fn group_device_codes_by_type(
+    devices: &[DeviceSummary],
+) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
+    let mut codes_by_type = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut untyped_codes = BTreeSet::new();
+    for device in devices {
+        if let Some(device_type) = device.device_type.as_ref() {
+            codes_by_type
+                .entry(device_type.clone())
+                .or_default()
+                .insert(device.entity.id.0.clone());
+        } else {
+            untyped_codes.insert(device.entity.id.0.clone());
+        }
+    }
+    (codes_by_type, untyped_codes)
+}
+
 async fn cargo(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<CargoSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let mut carriers = Vec::new();
-    for device in device_rows(&state).await?.iter().filter(|device| {
-        device.cargo_capacity.unwrap_or_default() > 0
-            || device.attach_capacity.unwrap_or_default() > 0
-            || !device.attached_devices.is_empty()
-            || !device.stowed_devices.is_empty()
-    }) {
-        let device = device.clone();
-        let detail = state
-            .client()
-            .raw()
-            .devices()
-            .get(&device.entity.id.0)
-            .await
-            .map_err(|_| ApiError::unavailable())?
-            .value;
+    let device_rows = device_rows(&state).await?;
+    let carrier_devices = device_rows
+        .iter()
+        .filter(|device| {
+            device.cargo_capacity.unwrap_or_default() > 0
+                || device.attach_capacity.unwrap_or_default() > 0
+                || !device.attached_devices.is_empty()
+                || !device.stowed_devices.is_empty()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if carrier_devices.is_empty() {
+        return Ok(Json(Versioned::current(cargo_snapshot(
+            metadata,
+            Vec::new(),
+        ))));
+    }
+    // The upstream list endpoint can filter by one device type, but not by a
+    // list of device codes. Group the already-known carriers by type and make
+    // one paginated bulk-list pass per unique type instead of one GET per
+    // carrier. Multiple type passes may run concurrently, while pagination
+    // within each type remains sequential.
+    let (carrier_codes_by_type, untyped_carrier_codes) =
+        group_device_codes_by_type(&carrier_devices);
+
+    let client = state.client().clone();
+    let detail_results = futures_util::stream::iter(carrier_codes_by_type.into_iter().map(
+        |(device_type, expected_codes)| {
+            let client = client.clone();
+            async move {
+                let details = raw_device_details(&client, Some(&device_type)).await?;
+                Ok::<_, ApiError>((expected_codes, details))
+            }
+        },
+    ))
+    .buffered(UPSTREAM_FANOUT)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut details = BTreeMap::new();
+    for result in detail_results {
+        let (expected_codes, mut type_details) = result?;
+        for code in expected_codes {
+            if let Some(detail) = type_details.remove(&code) {
+                details.insert(code, detail);
+            }
+        }
+    }
+
+    // Device type is expected to be present in managed state. If an older or
+    // forward-compatible device arrives without one, fall back to a single
+    // unfiltered bulk-list pass rather than reintroducing per-device GETs.
+    if !untyped_carrier_codes.is_empty() {
+        let mut all_details = raw_device_details(state.client(), None).await?;
+        for code in untyped_carrier_codes {
+            if let Some(detail) = all_details.remove(&code) {
+                details.insert(code, detail);
+            }
+        }
+    }
+    let mut carriers = Vec::with_capacity(carrier_devices.len());
+    for device in carrier_devices {
+        let detail = details
+            .remove(&device.entity.id.0)
+            .ok_or_else(ApiError::unavailable)?;
         let mut resources = detail
             .cargo
             .into_iter()
@@ -1549,18 +1702,11 @@ async fn relay_missions(
 ) -> Result<Json<Versioned<RelaySnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
     let workflows = state.repository.list().map_err(ApiError::repository)?;
-    let scene = build_galaxy_scene(
-        state.client(),
-        &workflows,
-        metadata.revision,
-        metadata.generated_at_ms,
-    )
-    .await
-    .map_err(|_| ApiError::unavailable())?;
+    let devices = device_rows(&state).await?.as_ref().clone();
     Ok(Json(Versioned::current(relay_snapshot(
         metadata,
-        device_rows(&state).await?.as_ref().clone(),
-        scene,
+        devices,
+        state.client().galaxy().catalogue(),
         &workflows,
     )?)))
 }
@@ -1568,16 +1714,11 @@ async fn relay_missions(
 fn relay_snapshot(
     metadata: SnapshotMetadata,
     devices: Vec<DeviceSummary>,
-    scene: GalaxySceneSnapshot,
+    stars: Vec<replicant_client::Star>,
     workflows: &[WorkflowInstance],
 ) -> Result<RelaySnapshot, ApiError> {
     const RELAY_TYPES: [&str; 3] = ["ftl_relay", "system_hub", "deep_space_relay_station"];
-    let connected = scene
-        .stars
-        .iter()
-        .filter(|star| star.has_relay)
-        .map(|star| star.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
+    const RELAY_RANGE_LY: f64 = 7.499;
     let relay_capable = |device: &&DeviceSummary| {
         device
             .device_type
@@ -1589,16 +1730,44 @@ fn relay_snapshot(
             && device.ownership == "owned"
             && device.attached_to.is_none()
             && device.stowed_in.is_none()
-            && device
-                .system
-                .as_deref()
-                .is_some_and(|system| connected.contains(system))
+            && device.system.is_some()
             && device
                 .status
                 .as_deref()
                 .is_some_and(|status| matches!(status, "active" | "relaying"))
     };
     let relays = devices.iter().filter(deployed).cloned().collect::<Vec<_>>();
+    let connected = relays
+        .iter()
+        .filter_map(|device| device.system.clone())
+        .collect::<BTreeSet<_>>();
+    let positions = stars
+        .into_iter()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.to_string(), position))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let relay_nodes = connected
+        .iter()
+        .filter(|system| positions.contains_key(*system))
+        .collect::<Vec<_>>();
+    let mut relay_edges = Vec::new();
+    for (index, from) in relay_nodes.iter().enumerate() {
+        for to in relay_nodes.iter().skip(index + 1) {
+            let from_position = positions[*from];
+            let to_position = positions[*to];
+            let dx = from_position.x - to_position.x;
+            let dy = from_position.y - to_position.y;
+            let dz = from_position.z - to_position.z;
+            if dx * dx + dy * dy + dz * dz <= RELAY_RANGE_LY * RELAY_RANGE_LY {
+                relay_edges.push(replicant_protocol::GalaxyEdge {
+                    from: (*from).clone(),
+                    to: (*to).clone(),
+                });
+            }
+        }
+    }
     let deployed_codes = relays
         .iter()
         .map(|device| device.entity.id.0.as_str())
@@ -1652,7 +1821,7 @@ fn relay_snapshot(
         relays,
         staged_relays,
         connected_systems: connected.len(),
-        relay_edges: scene.relay_edges,
+        relay_edges,
         expansions,
     })
 }
@@ -1787,16 +1956,548 @@ fn event_summary(raw: &LocationEvent) -> Result<EventSummary, ApiError> {
     })
 }
 
+#[derive(Default, Deserialize)]
+struct ActivityQuery {
+    device: Option<String>,
+    name: Option<String>,
+    ami_only: Option<bool>,
+    limit: Option<usize>,
+}
+
+async fn account_activity(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<Versioned<AccountEventsSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let mut history = state.client().events().history();
+    if let Some(device) = query
+        .device
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        history = history.for_device(device.trim());
+    }
+    if let Some(name) = query
+        .name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        history = history.named(name.trim());
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
+    // AMI digest is a prefix/suffix predicate rather than one exact event
+    // name, so modestly over-read recent local history before filtering.
+    let history_limit = if query.ami_only.unwrap_or(false) {
+        limit.saturating_mul(20).min(5_000)
+    } else {
+        limit
+    };
+    let mut events = history
+        .latest(history_limit)
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    if query.ami_only.unwrap_or(false) {
+        events.retain(|event| {
+            event.name.as_str().starts_with("ami.") && event.name.as_str().ends_with(".digest")
+        });
+    }
+    events.reverse();
+    events.truncate(limit);
+    let events = events
+        .into_iter()
+        .map(|event| AccountEventSummary {
+            id: event.id.as_str().to_owned(),
+            name: event.name.as_str().to_owned(),
+            category: event.category.as_str().to_owned(),
+            device: event
+                .device
+                .map(|key| summary_ref(EntityKind::Device, key.id.as_str())),
+            replicant: event
+                .replicant
+                .map(|key| summary_ref(EntityKind::Replicant, key.id.as_str())),
+            system: event.star.map(|key| key.id.as_str().to_owned()),
+            location: event.location.map(|key| key.id.as_str().to_owned()),
+            occurred_at: event.occurred_at,
+            payload: Value::Object(event.payload.into_iter().collect()),
+            ami_digest: event.name.as_str().starts_with("ami.")
+                && event.name.as_str().ends_with(".digest"),
+        })
+        .collect();
+    Ok(Json(Versioned::current(AccountEventsSnapshot {
+        metadata,
+        cursor: state
+            .client()
+            .events()
+            .cursor()
+            .map_err(|_| ApiError::unavailable())?,
+        events,
+    })))
+}
+
+#[derive(Default, Deserialize)]
+struct DeviceLogsQueryParams {
+    cursor: Option<i64>,
+    limit: Option<i64>,
+    latest: Option<bool>,
+}
+
+async fn device_logs(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+    Query(query): Query<DeviceLogsQueryParams>,
+) -> Result<Json<Versioned<DeviceLogsSnapshot>>, ApiError> {
+    let handle = state
+        .client()
+        .devices()
+        .get(&code)
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let response = handle
+        .logs(&replicant_client::raw::devices::DeviceLogsQuery {
+            cursor: query.cursor,
+            limit: query.limit.or(Some(100)),
+            latest: query.latest,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(DeviceLogsSnapshot {
+        metadata: state.snapshot_metadata()?,
+        device: summary_ref(EntityKind::Device, code),
+        events: response
+            .events
+            .into_iter()
+            .map(|event| DeviceLogSummary {
+                id: event.id,
+                created_at: event.created_at,
+                device_code: event.device_code,
+                device_type: event.device_type,
+                event_type: event.event_type,
+                message: event.message,
+                payload: Value::Object(event.payload.unwrap_or_default()),
+            })
+            .collect(),
+        next_cursor: response.next_cursor,
+    })))
+}
+
+async fn simulations(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<SimulationsSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let devices = device_rows(&state).await?;
+    let simulator_devices = devices
+        .iter()
+        .filter(|device| device.device_type.as_deref() == Some("replicant_interface"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let gateway = state.client().simulations();
+    let mut interfaces = Vec::with_capacity(simulator_devices.len());
+    for device in simulator_devices {
+        let code = device.entity.id.0.clone();
+        match (gateway.scenarios(&code).await, gateway.active(&code).await) {
+            (Ok(scenarios), Ok(active)) => interfaces.push(SimulationInterfaceSummary {
+                device,
+                scenarios: scenarios
+                    .scenarios
+                    .into_iter()
+                    .filter_map(|scenario| {
+                        scenario.code.map(|code| SimulationScenarioSummary {
+                            code,
+                            name: scenario.name,
+                            description: scenario.description,
+                            long_description: scenario.long_description,
+                            objective_type: scenario.objective_type,
+                            objective_target: scenario.objective_target,
+                            timeout_hours: scenario.timeout_hours,
+                            version: scenario.version,
+                            entry_cost: json_quantities(scenario.entry_cost.unwrap_or_default()),
+                        })
+                    })
+                    .collect(),
+                active: active
+                    .simulations
+                    .into_iter()
+                    .filter_map(|run| {
+                        run.simulation_id.map(|id| SimulationRunSummary {
+                            id,
+                            interface: Some(summary_ref(EntityKind::Device, code.clone())),
+                            is_mine: run.is_mine.unwrap_or(false),
+                            replicant: None,
+                            replicant_name: run.replicant_name,
+                            scenario_code: run.scenario_code,
+                            scenario_name: run.scenario_name,
+                            lifecycle: Some("active".to_owned()),
+                            started_at: run.started_at,
+                            completed_at: None,
+                            abandoned_at: None,
+                            timed_out_at: None,
+                            score_seconds: None,
+                            resources_mined: None,
+                            devices_printed: None,
+                            timeout_hours: run.timeout_hours,
+                        })
+                    })
+                    .collect(),
+                error: None,
+            }),
+            (scenarios, active) => interfaces.push(SimulationInterfaceSummary {
+                device,
+                scenarios: scenarios
+                    .ok()
+                    .map(|response| {
+                        response
+                            .scenarios
+                            .into_iter()
+                            .filter_map(|scenario| {
+                                scenario.code.map(|code| SimulationScenarioSummary {
+                                    code,
+                                    name: scenario.name,
+                                    description: scenario.description,
+                                    long_description: scenario.long_description,
+                                    objective_type: scenario.objective_type,
+                                    objective_target: scenario.objective_target,
+                                    timeout_hours: scenario.timeout_hours,
+                                    version: scenario.version,
+                                    entry_cost: json_quantities(
+                                        scenario.entry_cost.unwrap_or_default(),
+                                    ),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                active: active
+                    .ok()
+                    .map(|response| {
+                        response
+                            .simulations
+                            .into_iter()
+                            .filter_map(|run| {
+                                run.simulation_id.map(|id| SimulationRunSummary {
+                                    id,
+                                    interface: Some(summary_ref(EntityKind::Device, code.clone())),
+                                    is_mine: run.is_mine.unwrap_or(false),
+                                    replicant: None,
+                                    replicant_name: run.replicant_name,
+                                    scenario_code: run.scenario_code,
+                                    scenario_name: run.scenario_name,
+                                    lifecycle: Some("active".to_owned()),
+                                    started_at: run.started_at,
+                                    completed_at: None,
+                                    abandoned_at: None,
+                                    timed_out_at: None,
+                                    score_seconds: None,
+                                    resources_mined: None,
+                                    devices_printed: None,
+                                    timeout_hours: run.timeout_hours,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                error: Some("Some live simulation details are unavailable".to_owned()),
+            }),
+        }
+    }
+    let account_history = gateway
+        .history_detailed()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let managed_history = gateway
+        .find()
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(SimulationsSnapshot {
+        metadata,
+        interfaces,
+        managed_history: managed_history
+            .into_iter()
+            .map(simulation_domain_summary)
+            .collect(),
+        account_history: account_history
+            .into_iter()
+            .filter_map(simulation_history_summary)
+            .collect(),
+    })))
+}
+
+fn simulation_history_summary(
+    run: replicant_client::raw::simulations::SimulationHistoryEntry,
+) -> Option<SimulationRunSummary> {
+    Some(SimulationRunSummary {
+        id: run.id?,
+        interface: None,
+        is_mine: true,
+        replicant: None,
+        replicant_name: None,
+        scenario_code: run.scenario_code,
+        scenario_name: run.scenario_name,
+        lifecycle: Some(
+            if run.completed_at.is_some() {
+                "completed"
+            } else if run.abandoned_at.is_some() {
+                "abandoned"
+            } else if run.timed_out_at.is_some() {
+                "timed_out"
+            } else {
+                "archived"
+            }
+            .to_owned(),
+        ),
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        abandoned_at: run.abandoned_at,
+        timed_out_at: run.timed_out_at,
+        score_seconds: run.score_seconds,
+        resources_mined: run.resources_mined,
+        devices_printed: run.devices_printed,
+        timeout_hours: None,
+    })
+}
+
+fn simulation_domain_summary(run: replicant_client::domain::Simulation) -> SimulationRunSummary {
+    SimulationRunSummary {
+        id: run.id.get(),
+        interface: None,
+        is_mine: run.is_mine,
+        replicant: run
+            .replicant_code
+            .map(|code| summary_ref(EntityKind::Replicant, code)),
+        replicant_name: None,
+        scenario_code: run.scenario_code,
+        scenario_name: run.scenario_name,
+        lifecycle: wire_value(Some(&run.lifecycle)),
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        abandoned_at: None,
+        timed_out_at: None,
+        score_seconds: None,
+        resources_mined: None,
+        devices_printed: None,
+        timeout_hours: None,
+    }
+}
+
+fn json_quantities(values: Map<String, Value>) -> Vec<InventoryQuantity> {
+    let mut rows = values
+        .into_iter()
+        .filter_map(|(resource, value)| {
+            value
+                .as_i64()
+                .map(|quantity| InventoryQuantity { resource, quantity })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.resource.cmp(&right.resource));
+    rows
+}
+
+async fn blueprints(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<BlueprintsSnapshot>>, ApiError> {
+    let response = state
+        .client()
+        .raw()
+        .blueprints()
+        .list()
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .value;
+    let mut blueprints = response
+        .blueprints
+        .into_iter()
+        .filter_map(|blueprint| {
+            blueprint.device_type.map(|device_type| BlueprintSummary {
+                device_type,
+                short_description: blueprint.short_description,
+                description: blueprint.description,
+                print_time_seconds: blueprint.print_time,
+                resources: json_quantities(blueprint.resources.unwrap_or_default()),
+                components: json_quantities(blueprint.components.unwrap_or_default()),
+                features: blueprint.features.unwrap_or_default(),
+                directives: blueprint.directives.unwrap_or_default(),
+                cargo_capacity: blueprint.cargo_capacity,
+                attach_capacity: blueprint.attach_capacity,
+                stow_capacity: blueprint.stow_capacity,
+                queue_size: blueprint.queue_size,
+            })
+        })
+        .collect::<Vec<_>>();
+    blueprints.sort_by(|left, right| left.device_type.cmp(&right.device_type));
+    Ok(Json(Versioned::current(BlueprintsSnapshot {
+        metadata: state.snapshot_metadata()?,
+        blueprints,
+    })))
+}
+
+#[derive(Default, Deserialize)]
+struct DirectoryQuery {
+    name: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn directory(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DirectoryQuery>,
+) -> Result<Json<Versioned<DirectorySnapshot>>, ApiError> {
+    let search = replicant_client::raw::replicants::ReplicantListQuery {
+        cursor: None,
+        limit: query.limit.or(Some(100)),
+        latest: None,
+        name: query.name.clone().filter(|value| !value.trim().is_empty()),
+    };
+    let replicants = state
+        .client()
+        .directory()
+        .search(&search)
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    Ok(Json(Versioned::current(DirectorySnapshot {
+        metadata: state.snapshot_metadata()?,
+        query: query.name,
+        replicants: replicants
+            .into_iter()
+            .map(|profile| DirectoryReplicantSummary {
+                entity: summary_ref(EntityKind::Replicant, profile.id.as_str()),
+                name: profile.name,
+                last_location: profile
+                    .last_location
+                    .map(|location| location.as_str().to_owned()),
+                is_npc: profile.is_npc,
+            })
+            .collect(),
+    })))
+}
+
+async fn directory_replicant(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+) -> Result<Json<Versioned<DirectoryReplicantDetailSnapshot>>, ApiError> {
+    let replicant = state
+        .client()
+        .directory()
+        .replicant(&code)
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let profile = DirectoryReplicantDetail {
+        entity: summary_ref(EntityKind::Replicant, replicant.key.id.as_str()),
+        name: replicant.name,
+        is_npc: replicant.is_npc,
+        status: wire_value(replicant.status.as_ref()),
+        location: replicant.location.map(|location| location.id.to_string()),
+        hosted_device: replicant
+            .hosted_device
+            .map(|device| summary_ref(EntityKind::Device, device.id.as_str())),
+    };
+    Ok(Json(Versioned::current(DirectoryReplicantDetailSnapshot {
+        metadata: state.snapshot_metadata()?,
+        replicant: profile,
+    })))
+}
+
+#[derive(Default, Deserialize)]
+struct TutorialsQuery {
+    slug: Option<String>,
+}
+
+async fn tutorials(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TutorialsQuery>,
+) -> Result<Json<Versioned<TutorialsSnapshot>>, ApiError> {
+    let list = state
+        .client()
+        .tutorials()
+        .list()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let tutorials = list
+        .tutorials
+        .into_iter()
+        .filter_map(|tutorial| {
+            tutorial.slug.map(|slug| TutorialSummary {
+                slug,
+                name: tutorial.name,
+                description: tutorial.description,
+                order: tutorial.order,
+                completed: tutorial.completed,
+                current_step: tutorial.current_step,
+                total_steps: tutorial.total_steps,
+                steps: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = if let Some(slug) = query
+        .slug
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let detail = state
+            .client()
+            .tutorials()
+            .get(slug)
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        Some(TutorialSummary {
+            slug: detail.slug.unwrap_or_else(|| slug.to_owned()),
+            name: detail.name,
+            description: detail.description,
+            order: detail.order,
+            completed: detail.completed,
+            current_step: detail.current_step,
+            total_steps: detail.total_steps,
+            steps: detail
+                .steps
+                .into_iter()
+                .map(|step| TutorialStepSummary {
+                    key: step.key,
+                    description: step.description,
+                    hint: step.hint,
+                    completed: step.completed,
+                    current: step.current,
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+    Ok(Json(Versioned::current(TutorialsSnapshot {
+        metadata: state.snapshot_metadata()?,
+        tutorials,
+        selected,
+    })))
+}
+
 async fn trade(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<TradeSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let Some(viewer) = trade_viewers(state.client())
+    // The daemon already maintains the owned replicant projection. Do not
+    // force a redundant upstream replicant sync just to choose a directory
+    // viewer every time the Trade page opens.
+    let handles = state
+        .client()
+        .replicants()
+        .find()
+        .owned()
+        .collect()
         .await
-        .map_err(|_| ApiError::unavailable())?
-        .into_iter()
-        .next()
-    else {
+        .map_err(|_| ApiError::unavailable())?;
+    let mut viewers = Vec::with_capacity(handles.len());
+    for handle in handles {
+        viewers.push(
+            handle
+                .snapshot()
+                .await
+                .map_err(|_| ApiError::unavailable())?,
+        );
+    }
+    viewers.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
+    });
+    let Some(viewer) = viewers.into_iter().next() else {
         return Ok(Json(Versioned::current(TradeSnapshot {
             metadata,
             viewer: None,
@@ -1816,11 +2517,22 @@ async fn trade(
         .into_iter()
         .map(|workflow| (workflow.id.to_string(), summary(&workflow)))
         .collect::<BTreeMap<_, _>>();
-    let mut controllers = Vec::with_capacity(traders.len());
-    for trader in traders {
-        let trades = shop_trades(state.client(), &trader.controller_code)
-            .await
-            .map_err(|_| ApiError::unavailable())?;
+    let client = state.client().clone();
+    let trade_results = futures_util::stream::iter(traders.into_iter().map(|trader| {
+        let client = client.clone();
+        async move {
+            let trades = shop_trades(&client, &trader.controller_code)
+                .await
+                .map_err(|_| ApiError::unavailable())?;
+            Ok::<_, ApiError>((trader, trades))
+        }
+    }))
+    .buffered(UPSTREAM_FANOUT)
+    .collect::<Vec<_>>()
+    .await;
+    let mut controllers = Vec::with_capacity(trade_results.len());
+    for result in trade_results {
+        let (trader, trades) = result?;
         let workflow = devices
             .iter()
             .find(|device| device.entity.id.0 == trader.controller_code)
@@ -1926,133 +2638,327 @@ async fn reports(
     })))
 }
 
-#[derive(Deserialize)]
-struct MessagesQuery {
-    relay: Option<String>,
-}
-
 async fn messages(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
-    let metadata = state.snapshot_metadata()?;
-    let relays = relay_device_rows(&state).await?;
-    if let Some(relay) = query.relay.as_deref()
-        && !relays.iter().any(|device| device.entity.id.0 == relay)
-    {
-        return Err(ApiError::invalid("unknown relay device"));
-    }
     let inbox = inbox(state.client(), 100)
         .await
         .map_err(|_| ApiError::unavailable())?;
-    let relay_data = if let Some(relay) = query.relay.as_deref() {
-        Some(
-            relay_history(state.client(), relay, 100)
-                .await
-                .map_err(|_| ApiError::unavailable())?,
-        )
-    } else {
-        None
-    };
     Ok(Json(Versioned::current(messages_snapshot(
-        metadata,
-        relays,
-        query.relay,
+        state.snapshot_metadata()?,
         inbox,
-        relay_data,
     ))))
 }
 
-fn messages_snapshot(
-    metadata: SnapshotMetadata,
-    relays: Vec<DeviceSummary>,
-    selected_relay: Option<String>,
-    inbox: MessageListResponse,
-    relay_data: Option<(DeviceChannelsResponse, DeviceMessagesResponse)>,
-) -> MessagesSnapshot {
-    let (channels, relay_messages, next_cursor) = relay_data.map_or_else(
-        || (Vec::new(), Vec::new(), None),
-        |(channels, messages)| {
+fn messages_snapshot(metadata: SnapshotMetadata, inbox: MessageListResponse) -> MessagesSnapshot {
+    let unread_count = inbox.unread_message_count;
+    let mut inbox = inbox
+        .messages
+        .into_iter()
+        .map(|message| InboxMessageSummary {
+            id: message.id,
+            title: message.title,
+            body: message.body,
+            category: message.category,
+            message_type: message.message_type,
+            is_read: message.is_read,
+            created_at: message.created_at,
+        })
+        .collect::<Vec<_>>();
+    inbox.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    MessagesSnapshot {
+        metadata,
+        inbox,
+        unread_count,
+    }
+}
+
+#[derive(Deserialize)]
+struct BobnetQuery {
+    source: Option<String>,
+    cursor: Option<i64>,
+    limit: Option<i64>,
+    include_npcs: Option<bool>,
+}
+
+async fn bobnet(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BobnetQuery>,
+) -> Result<Json<Versioned<BobnetSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let sources = bobnet_history_source_rows(&state).await?;
+    let selected_source = if let Some(source) = query.source.as_deref() {
+        if !sources.iter().any(|device| device.entity.id.0 == source) {
+            return Err(ApiError::invalid("unknown BobNet history source"));
+        }
+        Some(source.to_owned())
+    } else {
+        sources.first().map(|device| device.entity.id.0.clone())
+    };
+    let replicants = bobnet_replicants(state.client()).await?;
+    let Some(source) = selected_source.as_deref() else {
+        return Ok(Json(Versioned::current(BobnetSnapshot {
+            metadata,
+            sources,
+            selected_source: None,
+            channels: Vec::new(),
+            messages: Vec::new(),
+            replicants,
+            next_cursor: None,
+            total_messages: None,
+            error: None,
+        })));
+    };
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let include_npcs = query.include_npcs.unwrap_or(true);
+    let bobnet = state.client().bobnet();
+    let channels_future = tokio::time::timeout(Duration::from_secs(8), bobnet.channels(source));
+
+    // BobNet NPCs are still replicants and can carry both a replicant code and
+    // display name, so sender presence cannot classify them. Read the same
+    // window with and without NPC chatter and use the differential to annotate
+    // the complete history. Both reads run concurrently and the web client can
+    // then toggle NPC visibility without another daemon/API request.
+    let all_history = bobnet
+        .history(source.to_owned())
+        .include_npcs(true)
+        .limit(limit);
+    let player_history = bobnet
+        .history(source.to_owned())
+        .include_npcs(false)
+        .limit(limit);
+    let cursor = query.cursor;
+    let all_messages_future = async move {
+        if let Some(cursor) = cursor {
+            all_history.cursor(cursor).list().await
+        } else {
+            all_history.latest(limit).await
+        }
+    };
+    let player_messages_future = async move {
+        if let Some(cursor) = cursor {
+            player_history.cursor(cursor).list().await
+        } else {
+            player_history.latest(limit).await
+        }
+    };
+    let (channels_result, messages_result, player_messages_result) = tokio::join!(
+        channels_future,
+        tokio::time::timeout(Duration::from_secs(8), all_messages_future),
+        tokio::time::timeout(Duration::from_secs(8), player_messages_future),
+    );
+
+    let mut warnings = Vec::new();
+    let channels = match channels_result {
+        Ok(Ok(channels)) => channel_summaries(channels),
+        Ok(Err(error)) => {
+            warnings.push(format!("channel discovery failed: {error}"));
+            Vec::new()
+        }
+        Err(_) => {
+            warnings.push("channel discovery timed out".to_owned());
+            Vec::new()
+        }
+    };
+    let player_message_keys = match player_messages_result {
+        Ok(Ok(messages)) => Some(
+            messages
+                .messages
+                .iter()
+                .map(bobnet_message_identity)
+                .collect::<BTreeSet<_>>(),
+        ),
+        Ok(Err(error)) => {
+            warnings.push(format!("player-only history read failed: {error}"));
+            None
+        }
+        Err(_) => {
+            warnings.push("player-only history read timed out".to_owned());
+            None
+        }
+    };
+    let (mut messages, next_cursor, total_messages) = match messages_result {
+        Ok(Ok(messages)) => {
+            let next_cursor = messages.next_cursor;
+            let total_messages = messages.total_messages.or(messages.total);
             (
-                channels
-                    .channels
-                    .into_iter()
-                    .filter_map(|channel| {
-                        channel.name.map(|name| BobnetChannelSummary {
-                            name,
-                            last_active: channel.last_active,
-                        })
-                    })
-                    .collect(),
                 messages
                     .messages
                     .into_iter()
-                    .map(|message| BobnetMessageSummary {
-                        id: message.id,
-                        channel: message.channel,
-                        body: message.message,
-                        is_npc_or_system: message.replicant_code.is_none(),
-                        sender: message.replicant_code,
-                        sender_name: message.replicant_name,
-                        current_system: message.current_star,
-                        created_at: message.time,
-                    })
-                    .collect(),
-                messages.next_cursor,
+                    .map(|message| bobnet_message_summary(message, player_message_keys.as_ref()))
+                    .collect::<Vec<_>>(),
+                next_cursor,
+                total_messages,
             )
-        },
-    );
-    MessagesSnapshot {
-        metadata,
-        relays: relays.into_iter().map(|device| device.entity).collect(),
-        selected_relay,
-        channels,
-        relay_messages,
-        unread_count: inbox.unread_message_count,
-        inbox: inbox
-            .messages
-            .into_iter()
-            .map(|message| InboxMessageSummary {
-                id: message.id,
-                title: message.title,
-                body: message.body,
-                category: message.category,
-                message_type: message.message_type,
-                is_read: message.is_read,
-                created_at: message.created_at,
-            })
-            .collect(),
-        next_cursor,
+        }
+        Ok(Err(error)) => {
+            warnings.push(format!("history read failed: {error}"));
+            (Vec::new(), None, None)
+        }
+        Err(_) => {
+            warnings.push("history read timed out".to_owned());
+            (Vec::new(), None, None)
+        }
+    };
+    if !include_npcs {
+        messages.retain(|message| !message.is_npc_or_system);
     }
+    messages.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+
+    Ok(Json(Versioned::current(BobnetSnapshot {
+        metadata,
+        sources,
+        selected_source: Some(source.to_owned()),
+        channels,
+        messages,
+        replicants,
+        next_cursor,
+        total_messages,
+        error: (!warnings.is_empty()).then(|| warnings.join(" · ")),
+    })))
+}
+
+fn bobnet_message_identity(message: &replicant_client::raw::bobnet::BobnetMessageItem) -> String {
+    if let Some(id) = message.id {
+        return format!("id:{id}");
+    }
+    format!(
+        "message:{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+        message.channel.as_deref().unwrap_or_default(),
+        message.time.as_deref().unwrap_or_default(),
+        message.replicant_code.as_deref().unwrap_or_default(),
+        message.replicant_name.as_deref().unwrap_or_default(),
+        message.current_star.as_deref().unwrap_or_default(),
+        message.message.as_deref().unwrap_or_default(),
+    )
+}
+
+fn bobnet_message_summary(
+    message: replicant_client::raw::bobnet::BobnetMessageItem,
+    player_message_keys: Option<&BTreeSet<String>>,
+) -> BobnetMessageSummary {
+    let is_npc_or_system = message.replicant_code.is_none()
+        || player_message_keys
+            .is_some_and(|keys| !keys.contains(&bobnet_message_identity(&message)));
+    BobnetMessageSummary {
+        id: message.id,
+        channel: message.channel,
+        body: message.message,
+        is_npc_or_system,
+        sender: message.replicant_code,
+        sender_name: message.replicant_name,
+        current_system: message.current_star,
+        created_at: message.time,
+    }
+}
+
+async fn bobnet_replicants(client: &Client) -> Result<Vec<BobnetReplicantSummary>, ApiError> {
+    let handles = client
+        .replicants()
+        .find()
+        .owned()
+        .in_realm(Realm::Live)
+        .collect()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    let mut replicants = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let replicant = handle
+            .snapshot()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        replicants.push(BobnetReplicantSummary {
+            entity: summary_ref(EntityKind::Replicant, replicant.key.id.as_str()),
+            name: replicant.name,
+            status: replicant.status.map(|status| status.as_str().to_owned()),
+            location: replicant
+                .location
+                .map(|location| location.id.as_str().to_owned()),
+        });
+    }
+    replicants.sort_by(|left, right| {
+        left.name
+            .as_deref()
+            .unwrap_or(left.entity.id.0.as_str())
+            .cmp(right.name.as_deref().unwrap_or(right.entity.id.0.as_str()))
+    });
+    Ok(replicants)
 }
 
 async fn network(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<NetworkSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let account = account_profile(state.client())
-        .await
-        .map_err(|_| ApiError::unavailable())?;
-    let mut relays = Vec::new();
-    for device in relay_device_rows(&state).await? {
-        match state.client().bobnet().channels(&device.entity.id.0).await {
-            Ok(channels) => relays.push(NetworkRelaySummary {
-                device,
-                channels: channel_summaries(channels),
-                error: None,
-            }),
-            Err(_) => relays.push(NetworkRelaySummary {
-                device,
-                channels: Vec::new(),
-                error: Some("Channel status unavailable".to_owned()),
-            }),
+    let relay_devices = relay_device_rows(&state).await?;
+    let mut relays = relay_devices
+        .into_iter()
+        .map(|device| NetworkRelaySummary {
+            device,
+            channels: Vec::new(),
+            error: None,
+        })
+        .collect::<Vec<_>>();
+
+    // The game documents channel discovery as a global list obtainable from
+    // any active relay-capable device. Asking every relay for the same list was
+    // an N+1 read that became pathological on large relay networks. Probe one
+    // active relay (or the first known relay as a fallback) and keep the rest
+    // of the page entirely local.
+    let source_index = relays
+        .iter()
+        .position(|relay| relay.device.status.as_deref() == Some("active"))
+        .or_else(|| (!relays.is_empty()).then_some(0));
+    let source_code = source_index.map(|index| relays[index].device.entity.id.0.clone());
+    let account_future =
+        tokio::time::timeout(Duration::from_secs(8), account_profile(state.client()));
+    let channels_future = async {
+        let Some(relay_code) = source_code.as_deref() else {
+            return None;
+        };
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(6),
+                state.client().bobnet().channels(relay_code),
+            )
+            .await,
+        )
+    };
+    let (account_result, channel_result) = tokio::join!(account_future, channels_future);
+
+    // Account profile and BobNet channel discovery are volatile reads. Keep
+    // either one from holding the entire page hostage: managed relay state is
+    // still useful when one remote endpoint is temporarily slow.
+    let account = match account_result {
+        Ok(Ok(account)) => account,
+        _ => AccountMeResponse::default(),
+    };
+    if let (Some(index), Some(result)) = (source_index, channel_result) {
+        match result {
+            Ok(Ok(channels)) => relays[index].channels = channel_summaries(channels),
+            Ok(Err(_)) => {
+                relays[index].error = Some("Channel discovery unavailable".to_owned());
+            }
+            Err(_) => {
+                relays[index].error = Some("Channel discovery timed out".to_owned());
+            }
         }
     }
+
     Ok(Json(Versioned::current(network_snapshot(
         metadata, account, relays,
     ))))
 }
-
 fn channel_summaries(channels: DeviceChannelsResponse) -> Vec<BobnetChannelSummary> {
     channels
         .channels
@@ -2097,18 +3003,49 @@ fn network_snapshot(
     }
 }
 
+fn is_bobnet_history_device(device: &DeviceSummary) -> bool {
+    device.device_type.as_deref().is_some_and(|kind| {
+        matches!(
+            kind,
+            "ftl_relay" | "system_hub" | "deep_space_relay_station"
+        )
+    })
+}
+
 async fn relay_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
     Ok(device_rows(state)
         .await?
         .iter()
-        .cloned()
         .filter(|device| {
             device
                 .device_type
                 .as_deref()
                 .is_some_and(|kind| kind.to_ascii_lowercase().contains("relay"))
         })
+        .cloned()
         .collect())
+}
+
+async fn bobnet_history_source_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
+    let mut sources = device_rows(state)
+        .await?
+        .iter()
+        .filter(|device| is_bobnet_history_device(device))
+        .filter(|device| {
+            device
+                .status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "active" | "relaying"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        left.system
+            .cmp(&right.system)
+            .then_with(|| left.location.cmp(&right.location))
+            .then_with(|| left.entity.id.0.cmp(&right.entity.id.0))
+    });
+    Ok(sources)
 }
 
 async fn settings(
@@ -2204,16 +3141,15 @@ async fn leaderboards(
                     .boards
                     .iter()
                     .filter_map(|board| board.key.as_deref())
-                    .find(|key| is_standard_leaderboard(key))
+                    .next()
             })
             .map(str::to_owned)
     });
     if selected.as_deref().is_some_and(|key| {
-        !is_standard_leaderboard(key)
-            || !index
-                .boards
-                .iter()
-                .any(|board| board.key.as_deref() == Some(key))
+        !index
+            .boards
+            .iter()
+            .any(|board| board.key.as_deref() == Some(key))
     }) {
         return Err(ApiError::invalid("unknown leaderboard"));
     }
@@ -2232,20 +3168,6 @@ async fn leaderboards(
     ))))
 }
 
-fn is_standard_leaderboard(key: &str) -> bool {
-    matches!(
-        key,
-        "colony_moon"
-            | "colony_planet"
-            | "distance"
-            | "fleet"
-            | "megastructure"
-            | "reputation"
-            | "trades"
-            | "xp"
-    )
-}
-
 fn leaderboards_snapshot(
     metadata: SnapshotMetadata,
     index: LeaderboardIndexResponse,
@@ -2258,13 +3180,11 @@ fn leaderboards_snapshot(
             .boards
             .into_iter()
             .filter_map(|board| {
-                board.key.and_then(|key| {
-                    is_standard_leaderboard(&key).then(|| LeaderboardBoardSummary {
-                        key,
-                        name: board.name,
-                        description: board.description,
-                        board_type: board.r#type,
-                    })
+                board.key.map(|key| LeaderboardBoardSummary {
+                    key,
+                    name: board.name,
+                    description: board.description,
+                    board_type: board.r#type,
                 })
             })
             .collect(),
@@ -2742,10 +3662,10 @@ async fn build_entity_index(
     Ok(entities)
 }
 
-fn summary_ref(kind: EntityKind, id: String) -> EntityRef {
+fn summary_ref(kind: EntityKind, id: impl Into<String>) -> EntityRef {
     EntityRef {
         kind,
-        id: EntityId(id),
+        id: EntityId(id.into()),
     }
 }
 
@@ -2890,9 +3810,7 @@ fn finish_action(
             "action outcome was not persisted"
         );
     }
-    if kind.starts_with("bootstrap.") {
-        state.invalidate(DomainSlice::Missions);
-    }
+    invalidate_action_slices(state, kind);
     state.invalidate(DomainSlice::History);
     state.flush_invalidations();
     if status == StoredFiniteExecutionStatus::Failed {
@@ -2903,6 +3821,63 @@ fn finish_action(
             message: format!("{kind} did not complete"),
             created_at_ms: now_millis().unwrap_or_default(),
         });
+    }
+}
+
+fn invalidate_action_slices(state: &AppState, kind: &str) {
+    let slices: &[DomainSlice] = if kind.starts_with("bobnet.") {
+        &[DomainSlice::Bobnet]
+    } else if kind.starts_with("bootstrap.") {
+        &[
+            DomainSlice::Missions,
+            DomainSlice::Devices,
+            DomainSlice::Cargo,
+        ]
+    } else if kind.starts_with("trade.") {
+        &[
+            DomainSlice::Trade,
+            DomainSlice::Devices,
+            DomainSlice::Inventory,
+            DomainSlice::Cargo,
+        ]
+    } else if kind.starts_with("simulation.") {
+        &[
+            DomainSlice::Simulations,
+            DomainSlice::Devices,
+            DomainSlice::Overview,
+        ]
+    } else if kind.starts_with("replicant.") {
+        &[
+            DomainSlice::Overview,
+            DomainSlice::Entities,
+            DomainSlice::Devices,
+            DomainSlice::Universe,
+        ]
+    } else if kind.starts_with("device.") {
+        &[
+            DomainSlice::Devices,
+            DomainSlice::Inventory,
+            DomainSlice::Cargo,
+        ]
+    } else if kind.starts_with("observatory.") {
+        &[
+            DomainSlice::Devices,
+            DomainSlice::Universe,
+            DomainSlice::Activity,
+        ]
+    } else if kind.starts_with("clone.") {
+        &[
+            DomainSlice::Entities,
+            DomainSlice::Overview,
+            DomainSlice::Devices,
+        ]
+    } else if kind.starts_with("hub.") {
+        &[DomainSlice::Devices, DomainSlice::Universe]
+    } else {
+        &[]
+    };
+    for slice in slices {
+        state.invalidate(*slice);
     }
 }
 
@@ -2927,10 +3902,8 @@ fn operation_response(
                 None,
                 summary,
             );
-            if kind.starts_with("bootstrap.") {
-                state.invalidate(DomainSlice::Missions);
-                state.flush_invalidations();
-            }
+            invalidate_action_slices(state, kind);
+            state.flush_invalidations();
             Ok(Json(Versioned::current(RunOperationResponse {
                 result,
                 execution,
@@ -4381,23 +5354,37 @@ mod tests {
             "unread_message_count": 1
         }))
         .expect("message fixture");
-        let relay_channels = serde_json::from_value(serde_json::json!({
-            "channels": [{"name": "general", "last_active": null}]
-        }))
-        .expect("channel fixture");
-        let relay_messages = serde_json::from_value(serde_json::json!({
-            "messages": [{"id": 2, "message": "hello", "replicant_code": null}]
-        }))
-        .expect("relay message fixture");
-        let messages = messages_snapshot(
-            metadata.clone(),
-            vec![projected_device("RELAY-1")],
-            Some("RELAY-1".to_owned()),
-            inbox,
-            Some((relay_channels, relay_messages)),
-        );
+        let messages = messages_snapshot(metadata.clone(), inbox);
         assert_eq!(messages.unread_count, Some(1));
-        assert!(messages.relay_messages[0].is_npc_or_system);
+        assert_eq!(messages.inbox[0].title.as_deref(), Some("Notice"));
+
+        let system_message = serde_json::from_value(serde_json::json!({
+            "id": 2, "message": "hello", "replicant_code": null
+        }))
+        .expect("system message fixture");
+        assert!(bobnet_message_summary(system_message, None).is_npc_or_system);
+
+        // NPCs such as Riker/Bill can still have replicant codes. Classification
+        // therefore comes from the include_npcs=true/false history differential.
+        let npc_message = serde_json::from_value(serde_json::json!({
+            "id": 3,
+            "message": "Another meeting with the UN.",
+            "replicant_code": "4BBA7CBE",
+            "replicant_name": "Riker"
+        }))
+        .expect("NPC message fixture");
+        let player_message = serde_json::from_value(serde_json::json!({
+            "id": 4,
+            "message": "hello from a player",
+            "replicant_code": "PLAYER01",
+            "replicant_name": "Player"
+        }))
+        .expect("player message fixture");
+        let player_message_keys = BTreeSet::from([bobnet_message_identity(&player_message)]);
+        assert!(bobnet_message_summary(npc_message, Some(&player_message_keys)).is_npc_or_system);
+        assert!(
+            !bobnet_message_summary(player_message, Some(&player_message_keys)).is_npc_or_system
+        );
 
         let account: AccountMeResponse = serde_json::from_value(serde_json::json!({
             "name": "Operator",
@@ -4476,6 +5463,7 @@ mod tests {
         for route in [
             "/api/reports",
             "/api/messages",
+            "/api/bobnet",
             "/api/network",
             "/api/standing",
             "/api/leaderboards",
@@ -4713,6 +5701,33 @@ mod tests {
     }
 
     #[test]
+    fn carrier_bulk_refresh_groups_codes_by_device_type() {
+        let mut surge_one = projected_device("SURGE-1");
+        surge_one.device_type = Some("surge_carrier".to_owned());
+        let mut surge_two = projected_device("SURGE-2");
+        surge_two.device_type = Some("surge_carrier".to_owned());
+        let mut fleet = projected_device("FLEET-1");
+        fleet.device_type = Some("mobile_fleet".to_owned());
+        let untyped = projected_device("UNKNOWN-1");
+
+        let (by_type, untyped_codes) =
+            group_device_codes_by_type(&[surge_one, surge_two, fleet, untyped]);
+
+        assert_eq!(
+            by_type.get("surge_carrier"),
+            Some(&BTreeSet::from([
+                "SURGE-1".to_owned(),
+                "SURGE-2".to_owned(),
+            ]))
+        );
+        assert_eq!(
+            by_type.get("mobile_fleet"),
+            Some(&BTreeSet::from(["FLEET-1".to_owned()]))
+        );
+        assert_eq!(untyped_codes, BTreeSet::from(["UNKNOWN-1".to_owned()]));
+    }
+
+    #[test]
     fn mining_projection_reports_partial_adopted_installations() {
         let mut controller = projected_device("MC-1");
         controller.device_type = Some("ami_mining_controller".to_owned());
@@ -4771,31 +5786,19 @@ mod tests {
                 generated_at_ms: 10,
             },
             vec![deployed, staged],
-            GalaxySceneSnapshot {
-                revision: 4,
-                generated_at_ms: 10,
-                stars: vec![replicant_protocol::GalaxyStar {
-                    id: "SOL".to_owned(),
-                    name: None,
-                    spectral_type: None,
-                    position: replicant_protocol::GalaxyPoint {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    exploration: replicant_protocol::GalaxyExploration::Explored,
-                    current: false,
-                    has_hub: false,
-                    has_life: false,
-                    has_relay: true,
-                }],
-                relay_edges: Vec::new(),
-                active_travel: Vec::new(),
-                signals: Vec::new(),
-                highlights: Vec::new(),
-                overlays: Vec::new(),
-                workflow_targets: Vec::new(),
-            },
+            vec![replicant_client::Star {
+                key: replicant_client::domain::StarKey::live(replicant_client::StarId::from("SOL")),
+                name: None,
+                spectral_type: None,
+                entry_point: None,
+                position: Some(replicant_client::domain::GalacticPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }),
+                has_hub: None,
+                region: None,
+            }],
             &[workflow],
         )
         .unwrap_or_else(|_| panic!("relay snapshot"));

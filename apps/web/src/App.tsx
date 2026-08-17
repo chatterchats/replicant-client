@@ -11,9 +11,16 @@ import {
   useWorkflows,
 } from "./daemon";
 import { AutomationsPage } from "./AutomationsPage";
+import { ActivityPage } from "./ActivityPage";
+import { AmiReportsDrawer } from "./AmiReportsDrawer";
 import { AutofactoryPage } from "./AutofactoryPage";
+import { BlueprintsPage } from "./BlueprintsPage";
+import { BobNetPage } from "./BobNetPage";
 import { BootstrapPage } from "./BootstrapPage";
 import { CargoPage } from "./CargoPage";
+import { CloningPage } from "./CloningPage";
+import { DeviceLogPanel } from "./DeviceLogPanel";
+import { DirectoryPage } from "./DirectoryPage";
 import {
   CommandPalette,
   type CommandContext,
@@ -26,6 +33,7 @@ import { LeaderboardsPage } from "./LeaderboardsPage";
 import { MessagesPage } from "./MessagesPage";
 import { MiningPage } from "./MiningPage";
 import { NetworkPage } from "./NetworkPage";
+import { ObservatoryPage } from "./ObservatoryPage";
 import { OverviewPage } from "./OverviewPage";
 import { DevicesPage } from "./DevicesPage";
 import { EventsPage } from "./EventsPage";
@@ -33,10 +41,12 @@ import { RequirementsPage } from "./RequirementsPage";
 import { RelayPage } from "./RelayPage";
 import { ReportsPage } from "./ReportsPage";
 import { SettingsPage } from "./SettingsPage";
+import { SimulationsPage } from "./SimulationsPage";
 import { StandingPage } from "./StandingPage";
 import { SystemPage } from "./SystemPage";
 import { SurveyPage } from "./SurveyPage";
 import { TradePage } from "./TradePage";
+import { TutorialsPage } from "./TutorialsPage";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import { NotificationCenter, NotificationToasts } from "./Notifications";
 import { absoluteTime, relativeTime } from "./time";
@@ -61,13 +71,34 @@ import {
 } from "./shellState";
 
 const navigation = [
-  ["Operations", ["Overview", "Galaxy", "System"]],
-  ["Assets", ["Devices", "Inventory", "Autofactory", "Cargo"]],
-  ["Missions", ["Survey", "Mining", "Relay", "Events", "Bootstrap", "Trade"]],
+  ["Operations", ["Overview", "Galaxy", "System", "Observatory", "Cloning"]],
+  ["Assets", ["Devices", "Inventory", "Autofactory", "Cargo", "Blueprints"]],
+  [
+    "Missions",
+    [
+      "Survey",
+      "Mining",
+      "Relay",
+      "Galaxy Events",
+      "Bootstrap",
+      "Trade",
+      "Simulations",
+    ],
+  ],
   ["Automation", ["Automations", "Requirements", "History"]],
   [
     "Intelligence",
-    ["Reports", "Messages", "Network", "Standing", "Leaderboards"],
+    [
+      "Activity",
+      "Reports",
+      "Messages",
+      "BobNet",
+      "Network",
+      "Directory",
+      "Standing",
+      "Leaderboards",
+      "Tutorials",
+    ],
   ],
 ] as const;
 
@@ -373,6 +404,7 @@ function Inspector({
         ) : (
           <pre>{JSON.stringify(value, null, 2)}</pre>
         )}
+        {device ? <DeviceLogPanel device={device.entity.id} /> : null}
       </div>
       {targetSystem || entity.kind === "workflow" ? (
         <div className="inspector-actions">
@@ -444,6 +476,9 @@ export function App() {
     null,
   );
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [activityTab, setActivityTab] = useState<"workflow" | "ami">(
+    "workflow",
+  );
   // The sidebar is hidden at narrow widths; this opens it as a sheet so
   // navigation does not depend on the keyboard-only command palette.
   const [navOpen, setNavOpen] = useState(false);
@@ -889,7 +924,7 @@ export function App() {
                   dispatch({ type: "set_palette", open: true });
                 }}
               />
-            ) : shell.page === "Events" ? (
+            ) : shell.page === "Galaxy Events" || shell.page === "Events" ? (
               <EventsPage
                 descriptors={descriptors}
                 onSelectEvent={(event) => {
@@ -935,7 +970,9 @@ export function App() {
             ) : shell.page === "Reports" ? (
               <ReportsPage entities={entities} onSelectEntity={select} />
             ) : shell.page === "Messages" ? (
-              <MessagesPage onSelectEntity={select} />
+              <MessagesPage />
+            ) : shell.page === "BobNet" ? (
+              <BobNetPage onSelectEntity={select} />
             ) : shell.page === "Network" ? (
               <NetworkPage onSelectEntity={select} />
             ) : shell.page === "Standing" ? (
@@ -978,6 +1015,42 @@ export function App() {
                   navigate("Galaxy");
                 }}
                 onSelectEntity={select}
+              />
+            ) : shell.page === "Observatory" ? (
+              <ObservatoryPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Cloning" ? (
+              <CloningPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+              />
+            ) : shell.page === "Blueprints" ? (
+              <BlueprintsPage />
+            ) : shell.page === "Activity" ? (
+              <ActivityPage onSelectEntity={select} />
+            ) : shell.page === "Directory" ? (
+              <DirectoryPage />
+            ) : shell.page === "Tutorials" ? (
+              <TutorialsPage />
+            ) : shell.page === "Simulations" ? (
+              <SimulationsPage
+                descriptors={descriptors}
+                onSelectEntity={select}
+                onRunCommand={(command) => {
+                  setGalaxyCommand(command);
+                  dispatch({ type: "set_palette", open: true });
+                }}
+                onOpenLeaderboards={() => navigate("Leaderboards")}
               />
             ) : shell.page === "Settings" ? (
               <SettingsPage />
@@ -1029,7 +1102,7 @@ export function App() {
 
         <section
           className={`activity-drawer ${shell.activityOpen ? "open" : ""}`}
-          aria-label="Workflow activity"
+          aria-label="Activity"
         >
           <button
             className="activity-toggle"
@@ -1043,35 +1116,64 @@ export function App() {
             <span aria-hidden="true">{shell.activityOpen ? "⌄" : "⌃"}</span>
           </button>
           {shell.activityOpen ? (
-            <div className="activity-list">
-              {activity.length ? (
-                activity
-                  .slice()
-                  .reverse()
-                  .map((item) => (
-                    <button
-                      className={`activity-item ${item.level}`}
-                      key={item.id}
-                      onClick={() => {
-                        select({ kind: "workflow", id: item.workflow_id });
-                      }}
-                    >
-                      <time
-                        dateTime={new Date(item.occurred_at_ms).toISOString()}
-                        title={absoluteTime(item.occurred_at_ms)}
-                      >
-                        {relativeTime(item.occurred_at_ms)}
-                      </time>
-                      <strong>
-                        {daemon.workflows[item.workflow_id]?.kind ?? "workflow"}{" "}
-                        · {item.workflow_id.slice(0, 8)}
-                      </strong>
-                      <span>{item.step ?? item.level}</span>
-                      <p>{item.message}</p>
-                    </button>
-                  ))
+            <div className="activity-drawer-content">
+              <div
+                className="activity-drawer-tabs"
+                role="tablist"
+                aria-label="Activity views"
+              >
+                <button
+                  role="tab"
+                  aria-selected={activityTab === "workflow"}
+                  onClick={() => setActivityTab("workflow")}
+                >
+                  Workflow activity
+                </button>
+                <button
+                  role="tab"
+                  aria-selected={activityTab === "ami"}
+                  onClick={() => setActivityTab("ami")}
+                >
+                  AMI reports
+                </button>
+              </div>
+              {activityTab === "workflow" ? (
+                <div className="activity-list">
+                  {activity.length ? (
+                    activity
+                      .slice()
+                      .reverse()
+                      .map((item) => (
+                        <button
+                          className={`activity-item ${item.level}`}
+                          key={item.id}
+                          onClick={() => {
+                            select({ kind: "workflow", id: item.workflow_id });
+                          }}
+                        >
+                          <time
+                            dateTime={new Date(
+                              item.occurred_at_ms,
+                            ).toISOString()}
+                            title={absoluteTime(item.occurred_at_ms)}
+                          >
+                            {relativeTime(item.occurred_at_ms)}
+                          </time>
+                          <strong>
+                            {daemon.workflows[item.workflow_id]?.kind ??
+                              "workflow"}{" "}
+                            · {item.workflow_id.slice(0, 8)}
+                          </strong>
+                          <span>{item.step ?? item.level}</span>
+                          <p>{item.message}</p>
+                        </button>
+                      ))
+                  ) : (
+                    <p className="empty-state">No workflow activity yet.</p>
+                  )}
+                </div>
               ) : (
-                <p className="empty-state">No workflow activity yet.</p>
+                <AmiReportsDrawer onSelectEntity={select} />
               )}
             </div>
           ) : null}

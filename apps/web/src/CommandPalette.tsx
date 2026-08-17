@@ -18,6 +18,7 @@ export type CommandContext = Partial<Record<ContextKind, string>>;
 export interface DescriptorCommand {
   descriptor: OperationDescriptor;
   operationClass: OperationClass;
+  initialParameters?: Record<string, unknown>;
 }
 
 export function descriptorCommands(
@@ -116,7 +117,10 @@ export function CommandPalette({
   );
   const [values, setValues] = useState<Record<string, unknown>>(() =>
     initialCommand
-      ? resolveContextDefaults(initialCommand.descriptor, context)
+      ? {
+          ...resolveContextDefaults(initialCommand.descriptor, context),
+          ...initialCommand.initialParameters,
+        }
       : {},
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -136,7 +140,10 @@ export function CommandPalette({
 
   const choose = (command: DescriptorCommand) => {
     setSelected(command);
-    setValues(resolveContextDefaults(command.descriptor, context));
+    setValues({
+      ...resolveContextDefaults(command.descriptor, context),
+      ...command.initialParameters,
+    });
   };
 
   const run = async () => {

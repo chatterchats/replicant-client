@@ -660,6 +660,18 @@ impl StateEngine {
             .read_events()
     }
 
+    pub(crate) fn events_desc(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.store
+            .lock()
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .read_events_desc(limit, offset)
+    }
+
     /// Persists a baseline watermark with no accompanying event.
     pub(crate) fn set_event_cursor(&self, cursor: &str) -> Result<(), StoreError> {
         self.store

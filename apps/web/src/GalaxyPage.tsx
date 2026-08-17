@@ -11,8 +11,10 @@ import {
 import { GalaxyMapWasm } from "./GalaxyMapWasm";
 import {
   applicableDescriptorCommands,
+  descriptorCommands,
   type DescriptorCommand,
 } from "./CommandPalette";
+import { useDomainQuery } from "./domainQuery";
 import type {
   DescriptorCatalog,
   GalaxySceneSnapshot,
@@ -83,6 +85,11 @@ export function GalaxyPage({
   onOpenSystem: (star: GalaxyStar) => void;
 }) {
   const galaxyRevision = useGalaxyRevision();
+  const deviceQuery = useDomainQuery({
+    slice: "devices",
+    fetcher: daemonApi.devices,
+    isEmpty: (snapshot) => snapshot.devices.length === 0,
+  });
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState(loadSettings);
@@ -155,6 +162,31 @@ export function GalaxyPage({
       : (scene?.stars.find((star) => star.current)?.id ??
         scene?.stars[0]?.id ??
         "");
+  const operations = descriptorCommands(descriptors);
+  const teleport = operations.find(
+    (command) => command.descriptor.kind === "replicant.teleport",
+  );
+  const slingshot = operations.find(
+    (command) => command.descriptor.kind === "replicant.slingshot",
+  );
+  const teleportTargets = menu
+    ? (deviceQuery.data?.devices ?? []).filter(
+        (device) =>
+          device.system === menu.star.id &&
+          device.device_type === "empty_replicant_matrix",
+      )
+    : [];
+  const targetMatrices = new Set(
+    teleportTargets.map((device) => device.entity.id),
+  );
+  const linkedSlingshots = menu
+    ? (deviceQuery.data?.devices ?? []).filter(
+        (device) =>
+          device.device_type === "ftl_slingshot" &&
+          device.linked_device !== null &&
+          targetMatrices.has(device.linked_device),
+      )
+    : [];
 
   return (
     <article className="galaxy-map">
@@ -287,13 +319,56 @@ export function GalaxyPage({
               Open system
             </button>
           </li>
+          {teleportTargets.map((matrix) =>
+            teleport ? (
+              <li key={`teleport:${matrix.entity.id}`}>
+                <button
+                  onClick={() => {
+                    setMenu(undefined);
+                    onRunCommand({
+                      ...teleport,
+                      initialParameters: { target: matrix.entity.id },
+                    });
+                  }}
+                >
+                  <small>action</small>
+                  Teleport here · {matrix.entity.id}
+                </button>
+              </li>
+            ) : null,
+          )}
+          {linkedSlingshots.map((device) =>
+            slingshot ? (
+              <li key={`slingshot:${device.entity.id}`}>
+                <button
+                  onClick={() => {
+                    setMenu(undefined);
+                    onRunCommand({
+                      ...slingshot,
+                      initialParameters: { slingshot: device.entity.id },
+                    });
+                  }}
+                >
+                  <small>action</small>
+                  Slingshot here · {device.entity.id}
+                </button>
+              </li>
+            ) : null,
+          )}
           {applicableDescriptorCommands(descriptors, "system").map(
             (command) => (
               <li key={`${command.operationClass}:${command.descriptor.kind}`}>
                 <button
                   onClick={() => {
                     setMenu(undefined);
-                    onRunCommand(command);
+                    onRunCommand(
+                      command.descriptor.kind === "replicant.travel"
+                        ? {
+                            ...command,
+                            initialParameters: { destination: menu.star.id },
+                          }
+                        : command,
+                    );
                   }}
                 >
                   <small>{command.operationClass}</small>

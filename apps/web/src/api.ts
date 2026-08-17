@@ -1,10 +1,16 @@
 import {
+  parseActivityResponse,
   parseAutofactoryResponse,
+  parseBlueprintsResponse,
+  parseBobnetResponse,
   parseAutomationControlResponse,
   parseBootstrapResponse,
   parseCargoResponse,
   parseDescriptorsResponse,
+  parseDeviceLogsResponse,
   parseDevicesResponse,
+  parseDirectoryReplicantResponse,
+  parseDirectoryResponse,
   parseInventoryResponse,
   parseLeaderboardsResponse,
   parseMessagesResponse,
@@ -21,10 +27,12 @@ import {
   parseOverviewResponse,
   parseReportsResponse,
   parseSettingsResponse,
+  parseSimulationsResponse,
   parseSnapshotResponse,
   parseStandingResponse,
   parseSurveyResponse,
   parseTradeResponse,
+  parseTutorialsResponse,
   parseTriggerListResponse,
   parseTriggerResponse,
   parseWorkflowActivityResponse,
@@ -42,8 +50,10 @@ export function daemonUrl(path: string, origin?: string): string {
   return `${(origin ?? configuredOrigin)?.replace(/\/+$/, "") ?? ""}${path}`;
 }
 
-/** Milliseconds before an unanswered daemon request is abandoned. */
+/** Milliseconds before an ordinary unanswered daemon request is abandoned. */
 const REQUEST_TIMEOUT_MS = 30_000;
+/** Reports may intentionally refresh a bounded set of upstream systems. */
+const REPORT_TIMEOUT_MS = 110_000;
 
 /**
  * Shared secret for talking to an authenticated daemon *directly*.
@@ -75,14 +85,17 @@ function authHeaders(base?: Record<string, string>): Record<string, string> {
  * Without a timeout a wedged daemon left requests pending forever instead of
  * surfacing an error and letting the reconnect path run.
  */
-function withTimeout(signal?: AbortSignal): {
+function withTimeout(
+  signal?: AbortSignal,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): {
   signal: AbortSignal;
   done: () => void;
 } {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort(new Error("replicantd did not respond in time"));
-  }, REQUEST_TIMEOUT_MS);
+  }, timeoutMs);
   const abort = () => {
     controller.abort(signal?.reason as unknown);
   };
@@ -112,16 +125,21 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   }
 }
 
-async function post(path: string, body?: unknown): Promise<unknown> {
-  return send("POST", path, body);
+async function post(
+  path: string,
+  body?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<unknown> {
+  return send("POST", path, body, timeoutMs);
 }
 
 async function send(
   method: "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
-  const request = withTimeout();
+  const request = withTimeout(undefined, timeoutMs);
   let response: Response;
   try {
     response = await fetch(daemonUrl(path), {
@@ -202,15 +220,77 @@ export const daemonApi = {
   async events(signal?: AbortSignal) {
     return parseEventsResponse(await get("/api/events", signal)).payload;
   },
+  async activity(
+    options: {
+      device?: string;
+      name?: string;
+      amiOnly?: boolean;
+      limit?: number;
+    } = {},
+    signal?: AbortSignal,
+  ) {
+    const params = new URLSearchParams();
+    if (options.device) params.set("device", options.device);
+    if (options.name) params.set("name", options.name);
+    if (options.amiOnly) params.set("ami_only", "true");
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const query = params.size > 0 ? `?${params.toString()}` : "";
+    return parseActivityResponse(await get(`/api/activity${query}`, signal))
+      .payload;
+  },
+  async deviceLogs(code: string, signal?: AbortSignal) {
+    return parseDeviceLogsResponse(
+      await get(
+        `/api/devices/${encodeURIComponent(code)}/logs?limit=100`,
+        signal,
+      ),
+    ).payload;
+  },
+  async simulations(signal?: AbortSignal) {
+    return parseSimulationsResponse(await get("/api/simulations", signal))
+      .payload;
+  },
+  async blueprints(signal?: AbortSignal) {
+    return parseBlueprintsResponse(await get("/api/blueprints", signal))
+      .payload;
+  },
+  async directory(name?: string, signal?: AbortSignal) {
+    const query = name ? `?name=${encodeURIComponent(name)}` : "";
+    return parseDirectoryResponse(await get(`/api/directory${query}`, signal))
+      .payload;
+  },
+  async directoryReplicant(code: string, signal?: AbortSignal) {
+    return parseDirectoryReplicantResponse(
+      await get(`/api/directory/${encodeURIComponent(code)}`, signal),
+    ).payload;
+  },
+  async tutorials(slug?: string, signal?: AbortSignal) {
+    const query = slug ? `?slug=${encodeURIComponent(slug)}` : "";
+    return parseTutorialsResponse(await get(`/api/tutorials${query}`, signal))
+      .payload;
+  },
   async trade(signal?: AbortSignal) {
     return parseTradeResponse(await get("/api/trade", signal)).payload;
   },
   async reports(signal?: AbortSignal) {
     return parseReportsResponse(await get("/api/reports", signal)).payload;
   },
-  async messages(relay?: string, signal?: AbortSignal) {
-    const query = relay ? `?relay=${encodeURIComponent(relay)}` : "";
-    return parseMessagesResponse(await get(`/api/messages${query}`, signal))
+  async messages(signal?: AbortSignal) {
+    return parseMessagesResponse(await get("/api/messages", signal)).payload;
+  },
+  async bobnet(
+    options: { source?: string; includeNpcs?: boolean; cursor?: number } = {},
+    signal?: AbortSignal,
+  ) {
+    const query = new URLSearchParams();
+    if (options.source) query.set("source", options.source);
+    if (typeof options.includeNpcs === "boolean")
+      query.set("include_npcs", String(options.includeNpcs));
+    if (typeof options.cursor === "number")
+      query.set("cursor", String(options.cursor));
+    query.set("limit", "100");
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return parseBobnetResponse(await get(`/api/bobnet${suffix}`, signal))
       .payload;
   },
   async network(signal?: AbortSignal) {
@@ -295,6 +375,7 @@ export const daemonApi = {
       await post(
         `/api/${operationClass === "report" ? "reports" : "actions"}/${encodeURIComponent(kind)}`,
         { parameters },
+        operationClass === "report" ? REPORT_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
       ),
     ).payload;
   },

@@ -121,6 +121,13 @@ impl RelayHistoryQuery {
         self
     }
 
+    /// Caps the number of messages returned by a cursor-based page.
+    #[must_use]
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.query.limit = Some(limit);
+        self
+    }
+
     /// Fetches the most recent `limit` messages.
     pub async fn latest(mut self, limit: i64) -> Result<raw::bobnet::DeviceMessagesResponse> {
         self.query.latest = Some(true);
@@ -179,6 +186,34 @@ mod tests {
             .latest(20)
             .await
             .expect("relay history");
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn history_cursor_honours_requested_page_size() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY1/messages"))
+            .and(query_param("cursor", "42"))
+            .and(query_param("limit", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [], "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        client
+            .bobnet()
+            .history("RELAY1")
+            .cursor(42)
+            .limit(100)
+            .list()
+            .await
+            .expect("relay history page");
 
         server.verify().await;
         client.close().await.expect("close");

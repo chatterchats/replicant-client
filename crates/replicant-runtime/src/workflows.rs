@@ -1,4 +1,4 @@
-//! Durable workflow adapters for the survey and relay runtime services.
+//! Durable workflow adapters for the application's restart-safe runtime services.
 
 use std::{
     collections::BTreeSet,
@@ -16,6 +16,8 @@ use serde_json::Value;
 
 use crate::{
     catalogue::OperationCatalogue,
+    event::{EventExecutionRequest, EventPlanningRequest, execute_event, plan_event_mission},
+    mining::{MiningExpansionRequest, execute_expansion},
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
         restore_relay_checkpoint,
@@ -46,15 +48,27 @@ pub fn requirement_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("requirement.fulfillment").expect("static workflow kind is valid")
 }
 
+/// Stable mining-expansion workflow kind.
+pub fn mining_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("mining.expansion").expect("static workflow kind is valid")
+}
+
+/// Stable persisted event-execution workflow kind.
+pub fn event_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("event.fulfillment").expect("static workflow kind is valid")
+}
+
 fn requirement_action_kind() -> WorkflowKind {
     WorkflowKind::new("requirement.action").expect("static workflow kind is valid")
 }
 
-/// Registers both application workflow kinds.
+/// Registers all application workflow kinds.
 pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(SurveyWorkflowFactory::new()))?;
     registry.register(Arc::new(RelayWorkflowFactory::new()))?;
     registry.register(Arc::new(RequirementWorkflowFactory::new()))?;
+    registry.register(Arc::new(MiningWorkflowFactory::new()))?;
+    registry.register(Arc::new(EventWorkflowFactory::new()))?;
     registry.register(Arc::new(RequirementActionFactory::new()))
 }
 
@@ -104,6 +118,255 @@ pub struct RequirementWorkflowCheckpoint {
     pub plan: Option<FulfillmentPlan>,
     /// Child workflows already created by this orchestration.
     pub children: Vec<WorkflowId>,
+}
+
+/// Persisted mining expansion inputs. The child mission file remains the detailed restart checkpoint.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiningWorkflowConfig {
+    /// Systems that should receive mining installations.
+    pub systems: Vec<String>,
+    /// Replicant that owns and executes the expansion.
+    pub replicant: String,
+    /// Manufacturing hub used for staging and printing.
+    pub hub: String,
+    /// Existing mining mission file used for detailed restart reconciliation.
+    pub mission_file: std::path::PathBuf,
+    /// Maximum duration for managed-state waits.
+    pub wait_timeout_seconds: u64,
+    /// Maximum number of system deployments advanced concurrently.
+    pub max_concurrency: usize,
+}
+
+/// Lightweight workflow checkpoint around the mining mission file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MiningWorkflowCheckpoint {
+    /// Whether execution has entered the existing mining mission executor.
+    pub started: bool,
+}
+
+/// Persisted event execution inputs. The event plan/campaign file is the detailed restart checkpoint.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventWorkflowConfig {
+    /// Event designation to plan before first execution. `None` resumes an existing plan/campaign.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Completion criterion when the selected event offers multiple paths.
+    #[serde(default)]
+    pub criterion: Option<String>,
+    /// Replicant assigned when a new event plan is created.
+    #[serde(default)]
+    pub replicant: Option<String>,
+    /// Manufacturing/staging home used when a new event plan is created.
+    #[serde(default)]
+    pub home: Option<String>,
+    /// Event plan or campaign file used for detailed restart reconciliation.
+    pub plan_file: std::path::PathBuf,
+    /// Replace an existing plan when creating a new mission.
+    #[serde(default)]
+    pub replace_plan: bool,
+    /// Maximum duration for managed-state waits.
+    pub wait_timeout_seconds: u64,
+}
+
+/// Lightweight workflow checkpoint around the event mission/campaign file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EventWorkflowCheckpoint {
+    /// Whether execution has entered the existing event executor.
+    pub started: bool,
+}
+
+/// Factory for durable mining expansions backed by the existing restart-safe mission file.
+pub struct MiningWorkflowFactory(WorkflowKind);
+impl MiningWorkflowFactory {
+    /// Creates the stable mining workflow factory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(mining_workflow_kind())
+    }
+}
+impl Default for MiningWorkflowFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl WorkflowFactory for MiningWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.0
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        SCHEMA_VERSION
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(MiningWorkflow))
+    }
+}
+struct MiningWorkflow;
+impl WorkflowExecutor for MiningWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let config: MiningWorkflowConfig =
+                context.config().map_err(|error| error.to_string())?;
+            let mut checkpoint: MiningWorkflowCheckpoint =
+                context.checkpoint().map_err(|error| error.to_string())?;
+            let client = context
+                .managed_client()
+                .cloned()
+                .ok_or_else(|| "mining workflow requires a managed client".to_owned())?;
+            claim(context, ResourceKey::Replicant(config.replicant.clone()))?;
+            claim(
+                context,
+                ResourceKey::Namespaced {
+                    namespace: "location".to_owned(),
+                    key: config.hub.clone(),
+                },
+            )?;
+            checkpoint.started = true;
+            context
+                .advance_to("executing", &checkpoint)
+                .map_err(|error| error.to_string())?;
+            emit(
+                context,
+                &WorkflowActivityEvent::StepEntered {
+                    step: "executing".to_owned(),
+                },
+            )?;
+            let request = MiningExpansionRequest {
+                systems: config.systems,
+                replicant: config.replicant,
+                hub: config.hub,
+                mission_file: config.mission_file,
+                wait_timeout: Duration::from_secs(config.wait_timeout_seconds),
+                max_concurrency: config.max_concurrency,
+            };
+            match execute_expansion(&client, &request).await {
+                Ok(report) => {
+                    emit(context, &WorkflowActivityEvent::Completion)?;
+                    context
+                        .mark_succeeded(Some(report))
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    emit(
+                        context,
+                        &WorkflowActivityEvent::Failure {
+                            error: message.clone(),
+                        },
+                    )?;
+                    Err(message)
+                }
+            }
+        })
+    }
+}
+
+/// Factory for durable event mission/campaign execution backed by its persisted plan file.
+pub struct EventWorkflowFactory(WorkflowKind);
+impl EventWorkflowFactory {
+    /// Creates the stable event workflow factory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(event_workflow_kind())
+    }
+}
+impl Default for EventWorkflowFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl WorkflowFactory for EventWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.0
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        SCHEMA_VERSION
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(EventWorkflow))
+    }
+}
+struct EventWorkflow;
+impl WorkflowExecutor for EventWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let config: EventWorkflowConfig =
+                context.config().map_err(|error| error.to_string())?;
+            let mut checkpoint: EventWorkflowCheckpoint =
+                context.checkpoint().map_err(|error| error.to_string())?;
+            let client = context
+                .managed_client()
+                .cloned()
+                .ok_or_else(|| "event workflow requires a managed client".to_owned())?;
+            claim(
+                context,
+                ResourceKey::Namespaced {
+                    namespace: "event_plan".to_owned(),
+                    key: config.plan_file.display().to_string(),
+                },
+            )?;
+            if !checkpoint.started
+                && let Some(event) = config.event.as_deref()
+                && (!config.plan_file.exists() || config.replace_plan)
+            {
+                let replicant = config
+                    .replicant
+                    .clone()
+                    .ok_or_else(|| "event workflow planning requires a replicant".to_owned())?;
+                let home = config.home.clone().ok_or_else(|| {
+                    "event workflow planning requires a manufacturing home".to_owned()
+                })?;
+                plan_event_mission(
+                    &client,
+                    &EventPlanningRequest {
+                        event: event.to_owned(),
+                        criterion: config.criterion.clone(),
+                        replicant,
+                        home,
+                        plan_file: config.plan_file.clone(),
+                        replace_plan: config.replace_plan,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            checkpoint.started = true;
+            context
+                .advance_to("executing", &checkpoint)
+                .map_err(|error| error.to_string())?;
+            emit(
+                context,
+                &WorkflowActivityEvent::StepEntered {
+                    step: "executing".to_owned(),
+                },
+            )?;
+            let request = EventExecutionRequest::new(
+                config.plan_file,
+                Duration::from_secs(config.wait_timeout_seconds),
+            );
+            match execute_event(&client, &request).await {
+                Ok(report) => {
+                    emit(context, &WorkflowActivityEvent::Completion)?;
+                    context
+                        .mark_succeeded(Some(report))
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    emit(
+                        context,
+                        &WorkflowActivityEvent::Failure {
+                            error: message.clone(),
+                        },
+                    )?;
+                    Err(message)
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -696,6 +959,34 @@ pub fn new_relay_workflow(
         schema_version: SCHEMA_VERSION,
         config,
         checkpoint: RelayWorkflowCheckpoint::default(),
+        current_step: Some("queued".to_owned()),
+        parent_id: None,
+    }
+}
+
+/// Creates a queued durable mining-expansion workflow.
+pub fn new_mining_workflow(
+    config: MiningWorkflowConfig,
+) -> NewWorkflow<MiningWorkflowConfig, MiningWorkflowCheckpoint> {
+    NewWorkflow {
+        kind: mining_workflow_kind(),
+        schema_version: SCHEMA_VERSION,
+        config,
+        checkpoint: MiningWorkflowCheckpoint::default(),
+        current_step: Some("queued".to_owned()),
+        parent_id: None,
+    }
+}
+
+/// Creates a queued durable event-execution workflow.
+pub fn new_event_workflow(
+    config: EventWorkflowConfig,
+) -> NewWorkflow<EventWorkflowConfig, EventWorkflowCheckpoint> {
+    NewWorkflow {
+        kind: event_workflow_kind(),
+        schema_version: SCHEMA_VERSION,
+        config,
+        checkpoint: EventWorkflowCheckpoint::default(),
         current_step: Some("queued".to_owned()),
         parent_id: None,
     }

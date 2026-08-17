@@ -129,6 +129,7 @@ pub struct EventHistoryQuery {
     after: Option<String>,
     device_code: Option<String>,
     event_name: Option<String>,
+    latest: Option<usize>,
 }
 
 impl EventHistoryQuery {
@@ -138,6 +139,7 @@ impl EventHistoryQuery {
             after: None,
             device_code: None,
             event_name: None,
+            latest: None,
         }
     }
 
@@ -162,15 +164,19 @@ impl EventHistoryQuery {
         self
     }
 
+    /// Returns at most the newest `limit` matching events. The result remains
+    /// sorted in stable event-ID order so existing consumers can reverse it
+    /// when they want newest-first presentation.
+    #[must_use]
+    pub fn latest(mut self, limit: usize) -> Self {
+        self.latest = Some(limit.max(1));
+        self
+    }
+
     /// Collects a stable event-ID-ordered view from the durable local journal.
     pub async fn collect(self) -> Result<Vec<Event>> {
         self.client.ensure_open()?;
-        let mut events = self
-            .client
-            .managed_state()
-            .events()
-            .map_err(persistence_error)?;
-        events.retain(|event| {
+        let matches = |event: &Event| {
             self.after
                 .as_deref()
                 .is_none_or(|cursor| stream_id_is_after(event.id.as_str(), cursor))
@@ -184,7 +190,39 @@ impl EventHistoryQuery {
                     .event_name
                     .as_deref()
                     .is_none_or(|event_name| event.name.as_str() == event_name)
-        });
+        };
+        let mut events = if let Some(limit) = self.latest {
+            // Read newest rows in bounded pages rather than deserializing the
+            // entire durable event journal for every Activity-page refresh.
+            // Filtering is applied per page so device/name queries still
+            // return the requested number of matching events when available.
+            let page_size = limit.clamp(100, 1_000);
+            let mut offset = 0usize;
+            let mut matched = Vec::with_capacity(limit);
+            loop {
+                let page = self
+                    .client
+                    .managed_state()
+                    .events_desc(page_size, offset)
+                    .map_err(persistence_error)?;
+                let page_len = page.len();
+                matched.extend(page.into_iter().filter(&matches));
+                if matched.len() >= limit || page_len < page_size {
+                    break;
+                }
+                offset = offset.saturating_add(page_len);
+            }
+            matched.truncate(limit);
+            matched
+        } else {
+            let mut all = self
+                .client
+                .managed_state()
+                .events()
+                .map_err(persistence_error)?;
+            all.retain(matches);
+            all
+        };
         events.sort_by(|left, right| stream_id_cmp(left.id.as_str(), right.id.as_str()));
         Ok(events)
     }
@@ -1413,6 +1451,41 @@ mod tests {
             client.events().cursor().expect("cursor").as_deref(),
             Some("10-1")
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn managed_event_history_latest_reads_only_the_newest_matches() {
+        let client = restore_only_client().await;
+        for (id, device) in [("100-0", "D1"), ("101-0", "D2"), ("102-0", "D1")] {
+            let event = Event {
+                id: crate::domain::EventId::from(id),
+                realm: Some(Realm::Live),
+                name: crate::domain::EventName::from("ami.survey.digest"),
+                category: crate::domain::EventCategory::from("directive"),
+                device: Some(DeviceKey::live(DeviceId::from(device))),
+                replicant: None,
+                location: None,
+                star: None,
+                occurred_at: "2026-08-16T00:00:00Z".into(),
+                payload: BTreeMap::new(),
+            };
+            client
+                .managed_state()
+                .apply_event(&event, event.id.as_str())
+                .expect("persist event");
+        }
+
+        let events = client
+            .events()
+            .history()
+            .for_device("D1")
+            .latest(1)
+            .collect()
+            .await
+            .expect("latest local history");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id.as_str(), "102-0");
         client.close().await.expect("close");
     }
 

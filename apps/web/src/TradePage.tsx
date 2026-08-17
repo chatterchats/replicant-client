@@ -31,6 +31,15 @@ const exchange = (items: TradeItemSummary[]) =>
         .join(" + ")
     : "Nothing specified";
 
+const withParameters = (
+  operations: DescriptorCommand[],
+  kind: string,
+  initialParameters: Record<string, unknown>,
+): DescriptorCommand | undefined => {
+  const operation = operations.find((item) => item.descriptor.kind === kind);
+  return operation ? { ...operation, initialParameters } : undefined;
+};
+
 export function TradePage(props: {
   descriptors: DescriptorCatalog;
   onSelectEntity: (entity: EntityRef) => void;
@@ -39,7 +48,6 @@ export function TradePage(props: {
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
   const query = useDomainQuery({
-    slice: "trade",
     fetcher: (signal) => daemonApi.trade(signal),
     isEmpty: empty,
   });
@@ -187,6 +195,38 @@ export function TradeContent({
               >
                 Inspect
               </button>
+              {controller.is_local &&
+                withParameters(operations, "trade.create", {
+                  controller: controller.entity.id,
+                }) && (
+                  <button
+                    onClick={() =>
+                      onRunCommand(
+                        withParameters(operations, "trade.create", {
+                          controller: controller.entity.id,
+                        })!,
+                      )
+                    }
+                  >
+                    Create trade
+                  </button>
+                )}
+              {controller.is_local &&
+                withParameters(operations, "trade.configure_shop", {
+                  controller: controller.entity.id,
+                }) && (
+                  <button
+                    onClick={() =>
+                      onRunCommand(
+                        withParameters(operations, "trade.configure_shop", {
+                          controller: controller.entity.id,
+                        })!,
+                      )
+                    }
+                  >
+                    Configure shop
+                  </button>
+                )}
               {controller.system && (
                 <button
                   onClick={() => {
@@ -218,6 +258,7 @@ export function TradeContent({
                       <th>Buyer gives</th>
                       <th>Buyer receives</th>
                       <th>Stock</th>
+                      <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -233,6 +274,43 @@ export function TradeContent({
                           {trade.current_stock ?? "?"}
                           {trade.initial_stock !== null &&
                             " / " + String(trade.initial_stock)}
+                        </td>
+                        <td>
+                          {withParameters(operations, "trade.execute", {
+                            controller: controller.entity.id,
+                            trade_code: trade.trade_code,
+                          }) && (
+                            <button
+                              onClick={() =>
+                                onRunCommand(
+                                  withParameters(operations, "trade.execute", {
+                                    controller: controller.entity.id,
+                                    trade_code: trade.trade_code,
+                                  })!,
+                                )
+                              }
+                            >
+                              Buy
+                            </button>
+                          )}
+                          {controller.is_local &&
+                            withParameters(operations, "trade.delete", {
+                              controller: controller.entity.id,
+                              trade_code: trade.trade_code,
+                            }) && (
+                              <button
+                                onClick={() =>
+                                  onRunCommand(
+                                    withParameters(operations, "trade.delete", {
+                                      controller: controller.entity.id,
+                                      trade_code: trade.trade_code,
+                                    })!,
+                                  )
+                                }
+                              >
+                                Delete
+                              </button>
+                            )}
                         </td>
                       </tr>
                     ))}

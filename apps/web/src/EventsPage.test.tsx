@@ -123,7 +123,7 @@ describe("EventsContent", () => {
       renderToStaticMarkup(
         <EventsContent {...props} status="loading" error={null} />,
       ),
-    ).toContain("Loading Events");
+    ).toContain("Loading Galaxy Events");
     expect(
       renderToStaticMarkup(
         <EventsContent
@@ -138,6 +138,6 @@ describe("EventsContent", () => {
       renderToStaticMarkup(
         <EventsContent {...props} status="error" error="offline" />,
       ),
-    ).toContain("Events unavailable");
+    ).toContain("Galaxy Events unavailable");
   });
 });

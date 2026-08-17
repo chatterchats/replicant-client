@@ -20,6 +20,8 @@ pub struct GlStar {
     #[serde(default)]
     pub is_relay: bool,
     #[serde(default)]
+    pub is_megastructure: bool,
+    #[serde(default)]
     pub dimmed: bool,
     pub x: f32,
     pub y: f32,

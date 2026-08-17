@@ -21,6 +21,7 @@ const scene: GalaxySceneSnapshot = {
       has_hub: true,
       has_life: true,
       has_relay: true,
+      has_megastructure: true,
     },
     {
       id: "ALPHA",
@@ -64,6 +65,7 @@ describe("galaxy map mapping", () => {
     const geometry = mapGalaxyScene(scene, visible, defaultGalaxyLayers);
 
     expect(visible.map((star) => star.id)).toEqual(["SOL", "ALPHA"]);
+    expect(geometry.stars[0]?.is_megastructure).toBe(true);
     expect(geometry.relays).toEqual([
       {
         from: { x: 0, y: 0, z: 0 },

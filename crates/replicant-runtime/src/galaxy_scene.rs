@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use replicant_client::{Client, Device, Replicant, Star, StarKnowledge, TravelState};
+use replicant_client::{Client, Device, Location, Replicant, Star, StarKnowledge, TravelState};
 use replicant_protocol::{
     EntityId, EntityKind, EntityRef, GalaxyEdge, GalaxyExploration, GalaxyHighlight, GalaxyOverlay,
     GalaxyOverlayKind, GalaxyPoint, GalaxySceneSnapshot, GalaxySignal, GalaxyStar, GalaxyTravel,
@@ -38,10 +38,12 @@ pub async fn galaxy_scene(
     for handle in device_handles {
         devices.push(handle.snapshot().await?);
     }
+    let locations = client.locations().find().collect().await?;
 
     Ok(build_scene(
         stars,
         knowledge,
+        locations,
         devices,
         replicants,
         workflow_targets(workflows),
@@ -91,6 +93,7 @@ fn workflow_targets(workflows: &[WorkflowInstance]) -> Vec<Target> {
 fn build_scene(
     stars: Vec<Star>,
     knowledge: Vec<StarKnowledge>,
+    locations: Vec<Location>,
     devices: Vec<Device>,
     replicants: Vec<Replicant>,
     targets: Vec<Target>,
@@ -136,6 +139,24 @@ fn build_scene(
         );
     }
 
+    let megastructure_systems = locations
+        .iter()
+        .filter(|location| {
+            location.unknown.contains_key("megastructure")
+                || location
+                    .location_type
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == "megastructure")
+        })
+        .filter_map(|location| {
+            location
+                .system
+                .clone()
+                .filter(|system| known_systems.contains(system))
+                .or_else(|| resolve_system(location.id().as_str(), &known_systems))
+        })
+        .collect::<BTreeSet<_>>();
+
     let mut device_counts = BTreeMap::<String, u32>::new();
     let mut relay_systems = BTreeSet::new();
     for device in &devices {
@@ -178,6 +199,7 @@ fn build_scene(
                 has_hub: star.has_hub == Some(true),
                 has_life: life.contains(&id),
                 has_relay: relay_systems.contains(&id),
+                has_megastructure: megastructure_systems.contains(&id),
                 id,
             })
         })
@@ -418,6 +440,7 @@ mod tests {
         };
         let scene = build_scene(
             vec![star("SOL", 0.0), star("ALPHA", 7.0)],
+            Vec::new(),
             Vec::new(),
             vec![relay("R1", "SOL-1"), relay("R2", "ALPHA-1")],
             Vec::new(),

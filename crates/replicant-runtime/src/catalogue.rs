@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-use replicant_client::managed::Client;
+use replicant_client::{managed::Client, raw};
 use replicant_protocol::{
     ActionDescriptor, DescriptorCatalog, EntityKind, MutationRisk, OperationClass, OperationKind,
     ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
@@ -20,13 +20,15 @@ use crate::{
         tag_devices,
     },
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
+    observatory::auto_prospect,
     relay::RelayExpansionRequest,
     reports::nearby_belt_report,
     survey::{SurveyMode, SurveyOptions},
     workflows::{
-        RelayWorkflowConfig, RequirementWorkflowConfig, SurveyWorkflowConfig, new_relay_workflow,
-        new_requirement_workflow, new_survey_workflow, register, relay_workflow_kind,
-        requirement_workflow_kind, survey_workflow_kind,
+        EventWorkflowConfig, MiningWorkflowConfig, RelayWorkflowConfig, RequirementWorkflowConfig,
+        SurveyWorkflowConfig, event_workflow_kind, mining_workflow_kind, new_event_workflow,
+        new_mining_workflow, new_relay_workflow, new_requirement_workflow, new_survey_workflow,
+        register, relay_workflow_kind, requirement_workflow_kind, survey_workflow_kind,
     },
 };
 
@@ -177,6 +179,351 @@ impl OperationCatalogue {
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
+            "bobnet.send" => {
+                let input: BobnetSendAction = decode(parameters)?;
+                let channel = normalize_bobnet_channel(&input.channel)?;
+                let text = input.text.trim();
+                if text.is_empty() {
+                    return Err(CatalogueError::Invalid(
+                        "message text must not be empty".to_owned(),
+                    ));
+                }
+                managed_operation_value(
+                    client
+                        .bobnet()
+                        .send(&input.replicant, channel, text.to_owned())
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "replicant.travel" => {
+                let input: ReplicantTravelAction = decode(parameters)?;
+                let handle = client
+                    .replicants()
+                    .get_owned(&input.replicant)
+                    .await
+                    .map_err(runtime_error)?;
+                let mut travel = handle.travel().to(input.destination);
+                if input.route == "direct" {
+                    travel = travel.via_direct();
+                }
+                managed_operation_value(travel.depart().await.map_err(runtime_error)?).await
+            }
+            "replicant.teleport" => {
+                let input: ReplicantTeleportAction = decode(parameters)?;
+                let handle = client
+                    .replicants()
+                    .get_owned(&input.replicant)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .teleport(raw::replicants::TeleportRequest {
+                            target: input.target,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "replicant.slingshot" => {
+                let input: ReplicantSlingshotAction = decode(parameters)?;
+                let handle = client
+                    .replicants()
+                    .get_owned(&input.replicant)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .teleport_via_slingshot(input.slingshot)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "simulation.start" => {
+                let input: SimulationStartAction = decode(parameters)?;
+                managed_operation_value(
+                    client
+                        .simulations()
+                        .start(&input.interface, &input.replicant, &input.scenario)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "simulation.abandon" => {
+                let input: SimulationAbandonAction = decode(parameters)?;
+                managed_operation_value(
+                    client
+                        .simulations()
+                        .abandon(&input.interface, input.simulation_id)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "trade.execute" => {
+                let input: TradeExecuteAction = decode(parameters)?;
+                managed_operation_value(
+                    client
+                        .trading()
+                        .execute(&input.controller, &input.trade_code)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "trade.create" => {
+                let input: TradeCreateAction = decode(parameters)?;
+                let request = serde_json::json!({
+                    "name": input.name,
+                    "stock": input.stock,
+                    "criteria": {
+                        "resources": json_object(&input.criteria_resources_json)?,
+                        "devices": json_object(&input.criteria_devices_json)?,
+                    },
+                    "rewards": {
+                        "resources": json_object(&input.reward_resources_json)?,
+                        "devices": json_object(&input.reward_devices_json)?,
+                    },
+                });
+                let request = request.as_object().cloned().ok_or_else(|| {
+                    CatalogueError::Invalid("trade request must be an object".to_owned())
+                })?;
+                managed_operation_value(
+                    client
+                        .trading()
+                        .create(&input.controller, request)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "trade.delete" => {
+                let input: TradeDeleteAction = decode(parameters)?;
+                managed_operation_value(
+                    client
+                        .trading()
+                        .delete(&input.controller, &input.trade_code)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "trade.configure_shop" => {
+                let input: TradeShopAction = decode(parameters)?;
+                let mut configuration = raw::JsonObject::new();
+                configuration.insert("name".to_owned(), Value::String(input.name));
+                if let Some(description) =
+                    input.description.filter(|value| !value.trim().is_empty())
+                {
+                    configuration.insert("description".to_owned(), Value::String(description));
+                }
+                if let Some(announcement) =
+                    input.announcement.filter(|value| !value.trim().is_empty())
+                {
+                    configuration.insert("announcement".to_owned(), Value::String(announcement));
+                }
+                let handle = client
+                    .devices()
+                    .get(&input.controller)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::SetDirective {
+                            directive: "trade".to_owned(),
+                            configuration: Some(configuration),
+                            notify: None,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.travel" => {
+                let input: DeviceTravelAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Travel {
+                            destination: input.destination,
+                            dry_run: None,
+                            via: None,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.lifecycle" => {
+                let input: DeviceLifecycleAction = decode(parameters)?;
+                let operation = if input.command == "retrieve" {
+                    client.devices().retrieve(&input.device).await
+                } else {
+                    let handle = client
+                        .devices()
+                        .get(&input.device)
+                        .await
+                        .map_err(runtime_error)?;
+                    let command = match input.command.as_str() {
+                        "activate" => raw::devices::DeviceCommand::Activate,
+                        "deactivate" => raw::devices::DeviceCommand::Deactivate,
+                        "decommission" => raw::devices::DeviceCommand::Decommission,
+                        "deploy" => raw::devices::DeviceCommand::Deploy,
+                        "compact" => raw::devices::DeviceCommand::Compact,
+                        "unfurl" => raw::devices::DeviceCommand::Unfurl,
+                        "recall" => raw::devices::DeviceCommand::Recall,
+                        "withdraw" => raw::devices::DeviceCommand::Withdraw,
+                        _ => {
+                            return Err(CatalogueError::Invalid(
+                                "unsupported device lifecycle command".to_owned(),
+                            ));
+                        }
+                    };
+                    handle.command(command).await
+                }
+                .map_err(runtime_error)?;
+                managed_operation_value(operation).await
+            }
+            "observatory.auto_prospect" => {
+                let input: ObservatoryAutoProspectAction = decode(parameters)?;
+                serialize(
+                    auto_prospect(client, input.device.as_deref())
+                        .await
+                        .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+                )
+            }
+            "observatory.prospect" => {
+                let input: ObservatoryProspectAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(handle.prospect(None).await.map_err(runtime_error)?).await
+            }
+            "observatory.prospect_direction" => {
+                let input: ObservatoryProspectDirectionAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .prospect(Some([input.x, input.y, input.z]))
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "observatory.triangulate" => {
+                let input: ObservatoryTriangulateAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .triangulate(input.signature, [input.x, input.y, input.z])
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "clone.stow_target" => {
+                let input: CloneStowTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.matrix)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Stow {
+                            target: Some(input.cradle),
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "clone.replicate" => {
+                let input: CloneReplicateAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.source)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Replicate {
+                            target: input.target,
+                            name: input.name,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "hub.set_entry_point" => {
+                let input: HubDeviceAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::SetEntryPoint)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "hub.set_welcome_message" => {
+                let input: HubWelcomeAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::SetWelcomeMessage {
+                            message: input.message,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "hub.rename" => {
+                let input: HubRenameAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Rename {
+                            designation: input.designation,
+                            name: input.name,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
             "bootstrap.stage" => serialize(
                 stage_bootstrap(client, &decode::<BootstrapStart>(parameters)?.request())
                     .await
@@ -231,6 +578,33 @@ impl OperationCatalogue {
                 let parameters: RelayStart = decode(parameters)?;
                 let mut workflow = new_relay_workflow(RelayWorkflowConfig {
                     request: parameters.into_request(),
+                });
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "mining.expansion" => {
+                let parameters: MiningStart = decode(parameters)?;
+                let mut workflow = new_mining_workflow(MiningWorkflowConfig {
+                    systems: csv(parameters.systems_csv),
+                    replicant: parameters.replicant,
+                    hub: parameters.hub,
+                    mission_file: parameters.mission_file,
+                    wait_timeout_seconds: parameters.wait_timeout_seconds,
+                    max_concurrency: parameters.max_concurrency,
+                });
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "event.fulfillment" => {
+                let parameters: EventStart = decode(parameters)?;
+                let mut workflow = new_event_workflow(EventWorkflowConfig {
+                    event: parameters.event,
+                    criterion: parameters.criterion,
+                    replicant: parameters.replicant,
+                    home: parameters.home,
+                    plan_file: parameters.plan_file,
+                    replace_plan: parameters.replace_plan,
+                    wait_timeout_seconds: parameters.wait_timeout_seconds,
                 });
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
@@ -558,6 +932,313 @@ fn descriptors() -> DescriptorCatalog {
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
             },
+            simple_action(
+                "bobnet.send",
+                "Send BobNet message",
+                "Broadcast a message from an owned replicant to a BobNet channel.",
+                "communications",
+                MutationRisk::Low,
+                vec![EntityKind::Replicant],
+                vec![
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    required("channel", "Channel", ParameterKind::String),
+                    required("text", "Message", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "replicant.travel",
+                "Travel replicant",
+                "Start normal replicant travel to a system or location.",
+                "navigation",
+                MutationRisk::Elevated,
+                vec![
+                    EntityKind::Replicant,
+                    EntityKind::System,
+                    EntityKind::Location,
+                ],
+                vec![
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    required("destination", "Destination", ParameterKind::Location),
+                    enum_parameter("route", "Route", &["auto", "direct"], "auto"),
+                ],
+            ),
+            simple_action(
+                "replicant.teleport",
+                "Teleport replicant",
+                "Teleport a replicant to a target replicant matrix.",
+                "navigation",
+                MutationRisk::Elevated,
+                vec![EntityKind::Replicant, EntityKind::Device],
+                vec![
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    required("target", "Target matrix", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "replicant.slingshot",
+                "Teleport via slingshot",
+                "Teleport through an FTL slingshot's configured linked matrix.",
+                "navigation",
+                MutationRisk::Elevated,
+                vec![EntityKind::Replicant, EntityKind::Device],
+                vec![
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    required("slingshot", "FTL slingshot", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "simulation.start",
+                "Start simulation",
+                "Enter a scenario through a datacentre replicant interface.",
+                "simulations",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device, EntityKind::Replicant],
+                vec![
+                    required("interface", "Replicant interface", ParameterKind::Device),
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    required("scenario", "Scenario code", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "simulation.abandon",
+                "Abandon simulation",
+                "Abandon a running simulation.",
+                "simulations",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device, EntityKind::Replicant],
+                vec![
+                    required("interface", "Replicant interface", ParameterKind::Device),
+                    bounded(
+                        required("simulation_id", "Simulation ID", ParameterKind::Integer),
+                        Some(1.0),
+                        None,
+                    ),
+                ],
+            ),
+            simple_action(
+                "trade.execute",
+                "Execute trade",
+                "Fulfill one unit of a listed trade.",
+                "trade",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device, EntityKind::Replicant],
+                vec![
+                    required("controller", "Trade controller", ParameterKind::Device),
+                    required("trade_code", "Trade code", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "trade.create",
+                "Create trade",
+                "Create a stocked trade on an owned trade controller.",
+                "trade",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("controller", "Trade controller", ParameterKind::Device),
+                    required("name", "Trade name", ParameterKind::String),
+                    bounded(
+                        required("stock", "Stock", ParameterKind::Integer),
+                        Some(1.0),
+                        None,
+                    ),
+                    defaulted(
+                        "criteria_resources_json",
+                        "Buyer resources JSON",
+                        ParameterKind::String,
+                        "{}",
+                    ),
+                    defaulted(
+                        "criteria_devices_json",
+                        "Buyer devices JSON",
+                        ParameterKind::String,
+                        "{}",
+                    ),
+                    defaulted(
+                        "reward_resources_json",
+                        "Reward resources JSON",
+                        ParameterKind::String,
+                        "{}",
+                    ),
+                    defaulted(
+                        "reward_devices_json",
+                        "Reward devices JSON",
+                        ParameterKind::String,
+                        "{}",
+                    ),
+                ],
+            ),
+            simple_action(
+                "trade.delete",
+                "Delete trade",
+                "Delete an owned trade and release its escrow.",
+                "trade",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("controller", "Trade controller", ParameterKind::Device),
+                    required("trade_code", "Trade code", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "trade.configure_shop",
+                "Configure shop",
+                "Set the public name, description, and BobNet announcement for an owned trade controller.",
+                "trade",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("controller", "Trade controller", ParameterKind::Device),
+                    required("name", "Shop name", ParameterKind::String),
+                    optional("description", "Description", ParameterKind::String),
+                    optional("announcement", "BobNet announcement", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "device.travel",
+                "Travel device",
+                "Send one travel-capable device to a location or system.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device, EntityKind::Location, EntityKind::System],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("destination", "Destination", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
+                "device.lifecycle",
+                "Control device",
+                "Run a standard managed lifecycle command on one device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    enum_parameter(
+                        "command",
+                        "Command",
+                        &[
+                            "activate",
+                            "deactivate",
+                            "decommission",
+                            "deploy",
+                            "compact",
+                            "unfurl",
+                            "recall",
+                            "withdraw",
+                            "retrieve",
+                        ],
+                        "activate",
+                    ),
+                ],
+            ),
+            simple_action(
+                "observatory.auto_prospect",
+                "Auto prospect sparse space",
+                "Use the runtime catalogue-density planner to choose an observatory and retry sparse directions.",
+                "observatory",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![optional("device", "Observatory", ParameterKind::Device)],
+            ),
+            simple_action(
+                "observatory.prospect",
+                "Prospect outward",
+                "Start the game server's default outward Galactic Observatory prospect.",
+                "observatory",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![required("device", "Observatory", ParameterKind::Device)],
+            ),
+            simple_action(
+                "observatory.prospect_direction",
+                "Prospect direction",
+                "Start a Galactic Observatory prospect along an explicit direction vector.",
+                "observatory",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Observatory", ParameterKind::Device),
+                    required("x", "Direction X", ParameterKind::Number),
+                    required("y", "Direction Y", ParameterKind::Number),
+                    required("z", "Direction Z", ParameterKind::Number),
+                ],
+            ),
+            simple_action(
+                "observatory.triangulate",
+                "Triangulate discovery",
+                "Triangulate a spectral signature from a target coordinate.",
+                "observatory",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Observatory", ParameterKind::Device),
+                    required("signature", "Signature", ParameterKind::String),
+                    required("x", "Target X", ParameterKind::Number),
+                    required("y", "Target Y", ParameterKind::Number),
+                    required("z", "Target Z", ParameterKind::Number),
+                ],
+            ),
+            simple_action(
+                "clone.stow_target",
+                "Stow clone target",
+                "Stow an empty replicant matrix in a cradle device before replication.",
+                "replicants",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("matrix", "Empty target matrix", ParameterKind::Device),
+                    required("cradle", "Cradle device", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "clone.replicate",
+                "Create replicant",
+                "Replicate from the source replicant matrix into a prepared empty target matrix.",
+                "replicants",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device, EntityKind::Replicant],
+                vec![
+                    required("source", "Source replicant matrix", ParameterKind::Device),
+                    required("target", "Empty target matrix", ParameterKind::Device),
+                    optional("name", "Replicant name", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "hub.set_entry_point",
+                "Set system entry point",
+                "Designate an owned system hub as the interstellar entry point.",
+                "claims",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![required("device", "System hub", ParameterKind::Device)],
+            ),
+            simple_action(
+                "hub.set_welcome_message",
+                "Set hub welcome message",
+                "Update the welcome message on an owned system hub.",
+                "claims",
+                MutationRisk::Low,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "System hub", ParameterKind::Device),
+                    optional("message", "Welcome message", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "hub.rename",
+                "Rename system hub",
+                "Exercise an owned system hub's naming rights by updating its designation and display name.",
+                "claims",
+                MutationRisk::Low,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "System hub", ParameterKind::Device),
+                    required("designation", "Designation", ParameterKind::String),
+                    required("name", "Display name", ParameterKind::String),
+                ],
+            ),
             bootstrap_action(
                 "bootstrap.stage",
                 "Stage bootstrap ark",
@@ -576,6 +1257,48 @@ fn descriptors() -> DescriptorCatalog {
         ],
         workflows: workflow_descriptors(),
     }
+}
+
+fn simple_action(
+    kind: &str,
+    display_name: &str,
+    description: &str,
+    category: &str,
+    risk: MutationRisk,
+    applicable_to: Vec<EntityKind>,
+    parameters: Vec<ParameterDescriptor>,
+) -> ActionDescriptor {
+    ActionDescriptor {
+        kind: operation_kind(kind),
+        display_name: display_name.to_owned(),
+        aliases: Vec::new(),
+        description: description.to_owned(),
+        category: category.to_owned(),
+        operation_class: OperationClass::Action,
+        risk,
+        applicable_to,
+        parameters,
+    }
+}
+
+fn runtime_error(error: replicant_client::Error) -> CatalogueError {
+    CatalogueError::Runtime(error.to_string())
+}
+
+async fn managed_operation_value(
+    operation: replicant_client::managed::Operation,
+) -> Result<Value, CatalogueError> {
+    let outcome = operation.outcome().await.map_err(runtime_error)?;
+    Ok(serde_json::json!({
+        "operation_id": operation.id().as_str(),
+        "status": format!("{:?}", outcome.status).to_ascii_lowercase(),
+        "response": outcome.response,
+    }))
+}
+
+fn json_object(input: &str) -> Result<raw::JsonObject, CatalogueError> {
+    serde_json::from_str::<raw::JsonObject>(input)
+        .map_err(|error| CatalogueError::Invalid(format!("invalid JSON object: {error}")))
 }
 
 fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
@@ -751,6 +1474,93 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             supported_triggers: all_trigger_kinds(),
         },
         WorkflowDescriptor {
+            kind: operation_kind(mining_workflow_kind().as_str()),
+            display_name: "Mining expansion".to_owned(),
+            aliases: strings(&["mining"]),
+            description: "Stage and deploy restart-safe mining installations to one or more systems."
+                .to_owned(),
+            category: "mining".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![
+                EntityKind::System,
+                EntityKind::Location,
+                EntityKind::Replicant,
+            ],
+            parameters: vec![
+                required("replicant", "Replicant", ParameterKind::Replicant),
+                required("hub", "Manufacturing hub", ParameterKind::Location),
+                required(
+                    "systems_csv",
+                    "Target systems (comma-separated)",
+                    ParameterKind::System,
+                ),
+                required("mission_file", "Mission file", ParameterKind::String),
+                bounded(
+                    defaulted(
+                        "wait_timeout_seconds",
+                        "Wait timeout (seconds)",
+                        ParameterKind::Integer,
+                        21_600,
+                    ),
+                    Some(1.0),
+                    None,
+                ),
+                bounded(
+                    defaulted(
+                        "max_concurrency",
+                        "Maximum concurrency",
+                        ParameterKind::Integer,
+                        4,
+                    ),
+                    Some(1.0),
+                    None,
+                ),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(event_workflow_kind().as_str()),
+            display_name: "Event fulfillment".to_owned(),
+            aliases: strings(&["event"]),
+            description:
+                "Plan and execute a discovered event, or resume an existing event mission/campaign, as a durable workflow."
+                    .to_owned(),
+            category: "events".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location],
+            parameters: vec![
+                optional("event", "Event designation", ParameterKind::String),
+                optional("criterion", "Completion criterion", ParameterKind::String),
+                optional("replicant", "Replicant", ParameterKind::Replicant),
+                optional("home", "Manufacturing home", ParameterKind::Location),
+                defaulted(
+                    "plan_file",
+                    "Event plan file",
+                    ParameterKind::String,
+                    "event-mission.json",
+                ),
+                defaulted(
+                    "replace_plan",
+                    "Replace existing plan",
+                    ParameterKind::Boolean,
+                    false,
+                ),
+                bounded(
+                    defaulted(
+                        "wait_timeout_seconds",
+                        "Wait timeout (seconds)",
+                        ParameterKind::Integer,
+                        21_600,
+                    ),
+                    Some(1.0),
+                    None,
+                ),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
             kind: operation_kind(requirement_workflow_kind().as_str()),
             display_name: "Fulfill requirement".to_owned(),
             aliases: strings(&["requirement"]),
@@ -886,6 +1696,141 @@ fn bootstrap_action(kind: &str, display_name: &str, description: &str) -> Action
     }
 }
 
+fn normalize_bobnet_channel(channel: &str) -> Result<String, CatalogueError> {
+    let channel = channel.trim();
+    if channel.is_empty() {
+        return Err(CatalogueError::Invalid(
+            "BobNet channel must not be empty".to_owned(),
+        ));
+    }
+    Ok(if channel.starts_with('#') {
+        channel.to_owned()
+    } else {
+        format!("#{channel}")
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BobnetSendAction {
+    replicant: String,
+    channel: String,
+    text: String,
+}
+#[derive(Debug, Deserialize)]
+struct ReplicantTravelAction {
+    replicant: String,
+    destination: String,
+    route: String,
+}
+#[derive(Debug, Deserialize)]
+struct ReplicantTeleportAction {
+    replicant: String,
+    target: String,
+}
+#[derive(Debug, Deserialize)]
+struct ReplicantSlingshotAction {
+    replicant: String,
+    slingshot: String,
+}
+#[derive(Debug, Deserialize)]
+struct SimulationStartAction {
+    interface: String,
+    replicant: String,
+    scenario: String,
+}
+#[derive(Debug, Deserialize)]
+struct SimulationAbandonAction {
+    interface: String,
+    simulation_id: i64,
+}
+#[derive(Debug, Deserialize)]
+struct TradeExecuteAction {
+    controller: String,
+    trade_code: String,
+}
+#[derive(Debug, Deserialize)]
+struct TradeCreateAction {
+    controller: String,
+    name: String,
+    stock: i64,
+    criteria_resources_json: String,
+    criteria_devices_json: String,
+    reward_resources_json: String,
+    reward_devices_json: String,
+}
+#[derive(Debug, Deserialize)]
+struct TradeDeleteAction {
+    controller: String,
+    trade_code: String,
+}
+#[derive(Debug, Deserialize)]
+struct TradeShopAction {
+    controller: String,
+    name: String,
+    description: Option<String>,
+    announcement: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceTravelAction {
+    device: String,
+    destination: String,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceLifecycleAction {
+    device: String,
+    command: String,
+}
+#[derive(Debug, Deserialize)]
+struct ObservatoryAutoProspectAction {
+    device: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct ObservatoryProspectAction {
+    device: String,
+}
+#[derive(Debug, Deserialize)]
+struct ObservatoryProspectDirectionAction {
+    device: String,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+#[derive(Debug, Deserialize)]
+struct ObservatoryTriangulateAction {
+    device: String,
+    signature: String,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+#[derive(Debug, Deserialize)]
+struct CloneStowTargetAction {
+    matrix: String,
+    cradle: String,
+}
+#[derive(Debug, Deserialize)]
+struct CloneReplicateAction {
+    source: String,
+    target: String,
+    name: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct HubDeviceAction {
+    device: String,
+}
+#[derive(Debug, Deserialize)]
+struct HubWelcomeAction {
+    device: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubRenameAction {
+    device: String,
+    designation: String,
+    name: String,
+}
+
 #[derive(Deserialize)]
 struct SurveyStart {
     #[serde(default = "default_survey_mode")]
@@ -957,6 +1902,35 @@ struct RelayStart {
     mission_file: PathBuf,
     #[serde(default = "default_max_hop")]
     max_hop_ly: f64,
+    #[serde(default = "default_timeout")]
+    wait_timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct MiningStart {
+    replicant: String,
+    hub: String,
+    systems_csv: String,
+    mission_file: PathBuf,
+    #[serde(default = "default_timeout")]
+    wait_timeout_seconds: u64,
+    #[serde(default = "default_mining_concurrency")]
+    max_concurrency: usize,
+}
+
+#[derive(Deserialize)]
+struct EventStart {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    criterion: Option<String>,
+    #[serde(default)]
+    replicant: Option<String>,
+    #[serde(default)]
+    home: Option<String>,
+    plan_file: PathBuf,
+    #[serde(default)]
+    replace_plan: bool,
     #[serde(default = "default_timeout")]
     wait_timeout_seconds: u64,
 }
@@ -1034,6 +2008,9 @@ fn default_maintenance_check() -> u64 {
 fn default_max_hop() -> f64 {
     7.499
 }
+fn default_mining_concurrency() -> usize {
+    4
+}
 
 #[cfg(test)]
 mod tests {
@@ -1062,6 +2039,29 @@ mod tests {
                 .workflow_registry()
                 .contains(&relay_workflow_kind())
         );
+        assert!(
+            catalogue
+                .workflow_registry()
+                .contains(&mining_workflow_kind())
+        );
+        assert!(
+            catalogue
+                .workflow_registry()
+                .contains(&event_workflow_kind())
+        );
+    }
+
+    #[test]
+    fn bobnet_channels_are_normalized_to_irc_form() {
+        assert_eq!(
+            normalize_bobnet_channel("general").expect("channel"),
+            "#general"
+        );
+        assert_eq!(
+            normalize_bobnet_channel(" #trade ").expect("channel"),
+            "#trade"
+        );
+        assert!(normalize_bobnet_channel("   ").is_err());
     }
 
     #[test]
