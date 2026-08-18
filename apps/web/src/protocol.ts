@@ -85,6 +85,8 @@ export type DirectorGoalKind =
   | "enhance_star_catalogue"
   | "expand_mining_ops"
   | "event_completion"
+  | "blueprint_acquisition"
+  | "maintain_system_hubs"
   | "expand_ftl_network"
   | "establish_beacons";
 export type DirectorGoalStatus = "satisfied" | "active" | "blocked" | "waiting";
@@ -3497,6 +3499,8 @@ const directorGoalKinds = [
   "enhance_star_catalogue",
   "expand_mining_ops",
   "event_completion",
+  "blueprint_acquisition",
+  "maintain_system_hubs",
   "expand_ftl_network",
   "establish_beacons",
 ] as const;

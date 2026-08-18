@@ -153,6 +153,84 @@ describe("parseDirectorResponse", () => {
       priority: 500,
     });
   });
+
+  it("accepts the Blueprint Acquisition standing goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 20 },
+        mode: "advisory",
+        regions: [],
+        goals: [
+          {
+            id: "blueprint_acquisition",
+            kind: "blueprint_acquisition",
+            region: null,
+            status: "active",
+            objective: "Learn missing blueprints from owned devices",
+            blocker: null,
+            next_action: "Sacrifice owned service_bot DEVICE-1 at Autofactory FACTORY-1",
+            progress_current: 8,
+            progress_total: 9,
+            active_workflows: [],
+            enabled: true,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]?.kind).toBe("blueprint_acquisition");
+  });
+
+  it("accepts the Maintain System Hubs standing goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 20 },
+        mode: "automatic",
+        regions: [],
+        goals: [
+          {
+            id: "maintain_system_hubs:alpha",
+            kind: "maintain_system_hubs",
+            region: "alpha",
+            status: "active",
+            objective: "Keep every operational System Hub in alpha supplied",
+            blocker: null,
+            next_action: "move structural 400 to SCEPTURUM-7-L4",
+            progress_current: 2,
+            progress_total: 3,
+            active_workflows: ["WF-HUB"],
+            enabled: true,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]?.kind).toBe("maintain_system_hubs");
+  });
 });
 
 describe("mission projection parsers", () => {

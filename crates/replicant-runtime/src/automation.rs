@@ -12,13 +12,14 @@ use std::{
 };
 
 use replicant_client::{
-    Client, DeviceType, MiningDirective, Operation, OperationStatus, SurveyDirective,
+    Client, Device, DeviceType, MiningDirective, Operation, OperationId, OperationStatus, SurveyDirective,
     domain::AccessScope,
 };
 use replicant_printing::{
     PrintRequest,
     managed::{QueueOptions, printing_status_in_system, queue_prints_with_components},
 };
+use replicant_protocol::workflow_reserved;
 use replicant_transport::{
     DeliveryOptions, DeliveryPlan, DeliveryRequest, DeviceRequest, ResourceMap, execute_delivery,
     plan_delivery,
@@ -96,6 +97,11 @@ pub fn logistics_manifest_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.manifest").expect("static workflow kind is valid")
 }
 
+/// Durable coordinator for learning one missing blueprint from an owned device.
+pub fn blueprint_acquire_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("blueprint.acquire").expect("static workflow kind is valid")
+}
+
 /// Intent-native directed exploration workflow backed by the relay expansion engine.
 pub fn exploration_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("exploration.frontier").expect("static workflow kind is valid")
@@ -142,6 +148,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsManifestWorkflowFactory::new()))?;
+    registry.register(Arc::new(BlueprintAcquireWorkflowFactory::new()))?;
     registry.register(Arc::new(ExplorationWorkflowFactory::new()))?;
     registry.register(Arc::new(EventDeliveryWorkflowFactory::new()))?;
     registry.register(Arc::new(EventTourWorkflowFactory::new()))?;
@@ -317,6 +324,10 @@ pub struct LogisticsManifestIntent {
     /// Device quantities to move together.
     #[serde(default)]
     pub devices: Vec<DeviceRequest>,
+    /// Exact physical device codes to move. Coordinators use this when a
+    /// selected device identity must survive restart/replanning.
+    #[serde(default)]
+    pub device_codes: Vec<String>,
     /// Optional tagged device groups to include.
     #[serde(default)]
     pub device_tags: Vec<String>,
@@ -338,6 +349,46 @@ pub struct LogisticsWorkflowCheckpoint {
     pub plan: Option<DeliveryPlan>,
     /// Whether execution entered the reusable transport executor.
     pub started: bool,
+}
+
+/// Intent for learning one blueprint by sacrificing an already-owned device.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlueprintAcquireIntent {
+    /// Device type whose blueprint must become unlocked.
+    pub device_type: String,
+    /// Optional regional affinity used by Director selection and observability.
+    #[serde(default)]
+    pub preferred_region: Option<String>,
+    /// Goal/requirement identities that requested this capability.
+    #[serde(default)]
+    pub requested_by: Vec<String>,
+    /// Optional preselected owned sacrificial device.
+    #[serde(default)]
+    pub source_device: Option<String>,
+    /// Optional preselected owned Autofactory code.
+    #[serde(default)]
+    pub autofactory: Option<String>,
+}
+
+/// Restart-safe owned-copy blueprint acquisition checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BlueprintAcquireCheckpoint {
+    /// Selected sacrificial device code.
+    pub source_device: Option<String>,
+    /// Selected owned Autofactory code.
+    pub autofactory: Option<String>,
+    /// Exact Autofactory location used as the decommission destination.
+    pub autofactory_location: Option<String>,
+    /// Child manifest that moves the selected physical device when necessary.
+    pub logistics_child: Option<WorkflowId>,
+    /// Irreversible decommission intent was durably checkpointed.
+    pub decommission_authorized: bool,
+    /// A managed decommission operation was submitted during some invocation.
+    pub decommission_submitted: bool,
+    /// Durable managed operation ID for restart-safe decommission recovery.
+    pub decommission_operation: Option<String>,
+    /// The account blueprint catalogue has observed the desired blueprint.
+    pub blueprint_verified: bool,
 }
 
 /// Directed frontier-expansion intent.
@@ -564,6 +615,11 @@ workflow_factory!(
     LogisticsManifestWorkflowFactory,
     LogisticsManifestWorkflow,
     logistics_manifest_workflow_kind
+);
+workflow_factory!(
+    BlueprintAcquireWorkflowFactory,
+    BlueprintAcquireWorkflow,
+    blueprint_acquire_workflow_kind
 );
 workflow_factory!(
     ExplorationWorkflowFactory,
@@ -1056,6 +1112,7 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             let request = manifest_delivery_request(&intent);
             if request.resources.is_empty()
                 && request.devices.is_empty()
+                && request.device_codes.is_empty()
                 && request.device_tags.is_empty()
             {
                 return Err("logistics manifest must contain at least one payload".to_owned());
@@ -1098,6 +1155,262 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                 .await
                 .map_err(string_error)?;
             context.mark_succeeded(Some(report)).map_err(string_error)
+        })
+    }
+}
+
+struct BlueprintAcquireWorkflow;
+impl WorkflowExecutor for BlueprintAcquireWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: BlueprintAcquireIntent = context.config().map_err(string_error)?;
+            let device_type = intent.device_type.trim();
+            if device_type.is_empty() {
+                return Err("blueprint acquisition requires a device type".to_owned());
+            }
+            let client = managed_client(context)?;
+            let mut checkpoint: BlueprintAcquireCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            claim_target(context, "blueprint-acquire", &device_type.to_ascii_lowercase())?;
+
+            if blueprint_is_known(&client, device_type).await? {
+                checkpoint.blueprint_verified = true;
+                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "device_type": device_type,
+                        "strategy": "already_known",
+                    })))
+                    .map_err(string_error);
+            }
+
+            if let Some(operation_id) = checkpoint.decommission_operation.clone() {
+                context
+                    .advance_to("recovering_decommission", &checkpoint)
+                    .map_err(string_error)?;
+                let operation = client
+                    .operations()
+                    .get(OperationId::new(operation_id.clone()));
+                if let Err(error) = await_success(&operation).await {
+                    if !blueprint_is_known(&client, device_type).await? {
+                        return Err(format!(
+                            "managed decommission operation {operation_id} could not be recovered: {error}"
+                        ));
+                    }
+                }
+                if wait_for_blueprint(&client, device_type, 24).await? {
+                    checkpoint.blueprint_verified = true;
+                    context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "device_type": device_type,
+                            "strategy": "owned",
+                            "source_device": checkpoint.source_device,
+                            "autofactory": checkpoint.autofactory,
+                            "recovered_operation": operation_id,
+                        })))
+                        .map_err(string_error);
+                }
+                return Err(format!(
+                    "decommission operation {operation_id} completed but blueprint {device_type} was not observed"
+                ));
+            }
+
+            let devices = refresh_owned_devices(&client).await?;
+            if checkpoint.decommission_authorized {
+                // There is an intentionally conservative crash window between durably
+                // authorizing this irreversible command and receiving/persisting the
+                // managed operation ID. Never submit a second decommission from that
+                // state. The managed operation journal will recover a prepared
+                // operation after restart; this workflow only observes the resulting
+                // blueprint until the ambiguity resolves.
+                if wait_for_blueprint(&client, device_type, 24).await? {
+                    checkpoint.blueprint_verified = true;
+                    context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                    return context
+                        .mark_succeeded(Some(serde_json::json!({
+                            "device_type": device_type,
+                            "strategy": "owned",
+                            "source_device": checkpoint.source_device,
+                            "autofactory": checkpoint.autofactory,
+                            "reconciled_after_authorization": true,
+                        })))
+                        .map_err(string_error);
+                }
+                let source_state = checkpoint
+                    .source_device
+                    .as_deref()
+                    .and_then(|code| {
+                        devices
+                            .iter()
+                            .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+                    })
+                    .map(|device| {
+                        if blueprint_source_is_releasable(device, device_type) {
+                            "still present"
+                        } else {
+                            "present but no longer releasable"
+                        }
+                    })
+                    .unwrap_or("no longer present");
+                context
+                    .advance_to("reconciling_decommission", &checkpoint)
+                    .map_err(string_error)?;
+                context
+                    .emit_activity(format!(
+                        "decommission authorization is awaiting blueprint evidence; source is {source_state}; automatic resubmission is suppressed"
+                    ))
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            let source = resolve_blueprint_source(&intent, &checkpoint, &devices)?;
+            let factory = resolve_blueprint_factory(&intent, &checkpoint, &devices, &source)?;
+            let source_location = source
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str().to_owned())
+                .ok_or_else(|| format!("blueprint source {} has no location", source.key.id))?;
+            let factory_location = factory
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str().to_owned())
+                .ok_or_else(|| format!("Autofactory {} has no location", factory.key.id))?;
+            let source_code = source.key.id.as_str().to_owned();
+            let factory_code = factory.key.id.as_str().to_owned();
+
+            checkpoint.source_device = Some(source_code.clone());
+            checkpoint.autofactory = Some(factory_code.clone());
+            checkpoint.autofactory_location = Some(factory_location.clone());
+            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+            claim(context, ResourceKey::Autofactory(factory_code.clone()))?;
+
+            if !source_location.eq_ignore_ascii_case(&factory_location) {
+                let child_id = match checkpoint.logistics_child {
+                    Some(id) => id,
+                    None => {
+                        let existing = context
+                            .child_workflows()
+                            .map_err(string_error)?
+                            .into_iter()
+                            .filter(|workflow| workflow.kind == logistics_manifest_workflow_kind())
+                            .find_map(|workflow| {
+                                let config = workflow.config::<LogisticsManifestIntent>().ok()?;
+                                (config.device_codes.iter().any(|code| code == &source_code)
+                                    && config.destination.eq_ignore_ascii_case(&factory_location))
+                                .then_some(workflow.id)
+                            });
+                        let id = match existing {
+                            Some(id) => id,
+                            None => {
+                                let child = context
+                                    .create_child(new_logistics_manifest_workflow(
+                                        LogisticsManifestIntent {
+                                            origin: source_location.clone(),
+                                            destination: factory_location.clone(),
+                                            device_codes: vec![source_code.clone()],
+                                            return_transports: true,
+                                            purpose: format!(
+                                                "blueprint-acquire:{}:{}",
+                                                device_type.to_ascii_lowercase(),
+                                                source_code
+                                            ),
+                                            ..LogisticsManifestIntent::default()
+                                        },
+                                    ))
+                                    .map_err(string_error)?;
+                                context
+                                    .repository()
+                                    .acquire_claim(child.id, ResourceKey::Device(source_code.clone()))
+                                    .map_err(string_error)?;
+                                child.id
+                            }
+                        };
+                        checkpoint.logistics_child = Some(id);
+                        context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                        id
+                    }
+                };
+
+                loop {
+                    let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+                        return Err(format!("blueprint logistics child {child_id} disappeared"));
+                    };
+                    match child.status {
+                        WorkflowStatus::Succeeded => break,
+                        WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                            return Err(format!(
+                                "blueprint logistics child {child_id} ended as {:?}: {}",
+                                child.status,
+                                child.last_error.unwrap_or_default()
+                            ));
+                        }
+                        _ => {
+                            context.advance_to("awaiting_transport", &checkpoint).map_err(string_error)?;
+                            match context.control_request().map_err(string_error)? {
+                                replicant_workflow::ControlRequest::Continue => {}
+                                replicant_workflow::ControlRequest::Pause
+                                | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+
+            if blueprint_is_known(&client, device_type).await? {
+                checkpoint.blueprint_verified = true;
+                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "device_type": device_type,
+                        "strategy": "owned",
+                        "source_device": source_code,
+                        "autofactory": factory_code,
+                    })))
+                    .map_err(string_error);
+            }
+
+            let source_handle = client.devices().get(&source_code).await.map_err(string_error)?;
+            let source_now = source_handle.snapshot().await.map_err(string_error)?;
+            let current_location = source_now
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str())
+                .unwrap_or_default();
+            if !current_location.eq_ignore_ascii_case(&factory_location) {
+                return Err(format!(
+                    "selected blueprint source {source_code} is at {current_location}, not Autofactory location {factory_location}"
+                ));
+            }
+            claim_device(context, &source_code)?;
+
+            checkpoint.decommission_authorized = true;
+            context.advance_to("decommissioning", &checkpoint).map_err(string_error)?;
+            let operation = source_handle
+                .command(replicant_client::raw::devices::DeviceCommand::Decommission)
+                .await
+                .map_err(string_error)?;
+            checkpoint.decommission_submitted = true;
+            checkpoint.decommission_operation = Some(operation.id().as_str().to_owned());
+            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+            await_success(&operation).await?;
+
+            if wait_for_blueprint(&client, device_type, 24).await? {
+                checkpoint.blueprint_verified = true;
+                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                return context
+                    .mark_succeeded(Some(serde_json::json!({
+                        "device_type": device_type,
+                        "strategy": "owned",
+                        "source_device": source_code,
+                        "autofactory": factory_code,
+                    })))
+                    .map_err(string_error);
+            }
+            Err(format!(
+                "decommission of {source_code} completed but blueprint {device_type} was not observed"
+            ))
         })
     }
 }
@@ -1741,6 +2054,17 @@ pub fn new_logistics_manifest_workflow(
     )
 }
 
+/// Creates a queued owned-copy blueprint acquisition workflow.
+pub fn new_blueprint_acquire_workflow(
+    intent: BlueprintAcquireIntent,
+) -> NewWorkflow<BlueprintAcquireIntent, BlueprintAcquireCheckpoint> {
+    queued_workflow(
+        blueprint_acquire_workflow_kind(),
+        intent,
+        BlueprintAcquireCheckpoint::default(),
+    )
+}
+
 /// Creates a queued directed exploration workflow.
 pub fn new_exploration_workflow(
     intent: ExplorationIntent,
@@ -1918,6 +2242,135 @@ fn claim_target(context: &WorkflowContext, namespace: &str, key: &str) -> Result
             key: key.to_owned(),
         },
     )
+}
+
+async fn refresh_owned_devices(client: &Client) -> Result<Vec<Device>, String> {
+    let handles = client.devices().refresh_many().collect().await.map_err(string_error)?;
+    let mut devices = Vec::with_capacity(handles.len());
+    for handle in handles {
+        devices.push(handle.snapshot().await.map_err(string_error)?);
+    }
+    devices.sort_by(|left, right| left.key.id.cmp(&right.key.id));
+    Ok(devices)
+}
+
+async fn blueprint_is_known(client: &Client, device_type: &str) -> Result<bool, String> {
+    Ok(client
+        .blueprints()
+        .unlocked_device_types()
+        .await
+        .map_err(string_error)?
+        .into_iter()
+        .any(|known| known.as_str().eq_ignore_ascii_case(device_type)))
+}
+
+async fn wait_for_blueprint(
+    client: &Client,
+    device_type: &str,
+    attempts: usize,
+) -> Result<bool, String> {
+    for attempt in 0..attempts.max(1) {
+        if blueprint_is_known(client, device_type).await? {
+            return Ok(true);
+        }
+        if attempt + 1 < attempts.max(1) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_blueprint_source(
+    intent: &BlueprintAcquireIntent,
+    checkpoint: &BlueprintAcquireCheckpoint,
+    devices: &[Device],
+) -> Result<Device, String> {
+    let pinned = checkpoint
+        .source_device
+        .as_deref()
+        .or(intent.source_device.as_deref());
+    if let Some(code) = pinned.filter(|code| !code.trim().is_empty()) {
+        let device = devices
+            .iter()
+            .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
+            .ok_or_else(|| format!("selected blueprint source {code} is no longer owned"))?;
+        if !blueprint_source_is_releasable(device, &intent.device_type) {
+            return Err(format!("selected blueprint source {code} is no longer releasable"));
+        }
+        return Ok(device.clone());
+    }
+    devices
+        .iter()
+        .filter(|device| blueprint_source_is_releasable(device, &intent.device_type))
+        .min_by_key(|device| device.key.id.clone())
+        .cloned()
+        .ok_or_else(|| format!("no releasable owned {} device is available", intent.device_type))
+}
+
+fn resolve_blueprint_factory(
+    intent: &BlueprintAcquireIntent,
+    checkpoint: &BlueprintAcquireCheckpoint,
+    devices: &[Device],
+    source: &Device,
+) -> Result<Device, String> {
+    let pinned = checkpoint.autofactory.as_deref().or(intent.autofactory.as_deref());
+    if let Some(code) = pinned.filter(|code| !code.trim().is_empty()) {
+        return devices
+            .iter()
+            .find(|device| {
+                device.key != source.key
+                    && device.key.id.as_str().eq_ignore_ascii_case(code)
+                    && device.access == AccessScope::Owned
+                    && device.device_type.as_ref() == Some(&DeviceType::Autofactory)
+                    && device.location.is_some()
+            })
+            .cloned()
+            .ok_or_else(|| format!("selected Autofactory {code} is not available"));
+    }
+    let source_location = source.location.as_ref().map(|location| location.id.as_str());
+    devices
+        .iter()
+        .filter(|device| {
+            device.key != source.key
+                && device.access == AccessScope::Owned
+                && device.device_type.as_ref() == Some(&DeviceType::Autofactory)
+                && device.location.is_some()
+        })
+        .min_by_key(|factory| {
+            let same_location = source_location.is_some_and(|source_location| {
+                factory
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(source_location))
+            });
+            (!same_location, factory.key.id.clone())
+        })
+        .cloned()
+        .ok_or_else(|| "no owned Autofactory is available for blueprint acquisition".to_owned())
+}
+
+fn blueprint_source_is_releasable(device: &Device, device_type: &str) -> bool {
+    device.access == AccessScope::Owned
+        && !workflow_reserved(&device.tags)
+        && device
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str().eq_ignore_ascii_case(device_type))
+        && device.location.is_some()
+        && device.travel.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.relationships.controller.is_none()
+        && device.relationships.hosting_replicant.is_none()
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+        && device.status.as_ref().is_some_and(|status| {
+            matches!(
+                status.as_str().to_ascii_lowercase().as_str(),
+                "inactive" | "deactivated" | "idle" | "recalled" | "compacted"
+            )
+        })
 }
 
 async fn resolve_survey_assignment(
@@ -2187,6 +2640,7 @@ fn delivery_request(intent: &LogisticsIntent) -> DeliveryRequest {
         destination: intent.destination.clone(),
         resources,
         devices,
+        device_codes: Vec::new(),
         device_tags,
         carrier: None,
     }
@@ -2198,6 +2652,7 @@ fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryReques
         destination: intent.destination.clone(),
         resources: intent.resources.clone(),
         devices: intent.devices.clone(),
+        device_codes: intent.device_codes.clone(),
         device_tags: intent.device_tags.clone(),
         carrier: None,
     }
@@ -2349,6 +2804,7 @@ mod tests {
             logistics_manifest_workflow_kind().as_str(),
             "logistics.manifest"
         );
+        assert_eq!(blueprint_acquire_workflow_kind().as_str(), "blueprint.acquire");
         assert_eq!(exploration_workflow_kind().as_str(), "exploration.frontier");
         assert_eq!(event_delivery_workflow_kind().as_str(), "event.delivery");
         assert_eq!(event_tour_workflow_kind().as_str(), "event.tour");
@@ -2365,6 +2821,53 @@ mod tests {
     }
 
     #[test]
+    fn blueprint_checkpoint_preserves_irreversible_operation_across_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "replicant-blueprint-acquire-restart-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = WorkflowRepository::open(&path).expect("open workflow repository");
+        let workflow = repository
+            .create(queued_workflow(
+                blueprint_acquire_workflow_kind(),
+                BlueprintAcquireIntent {
+                    device_type: "service_bot".to_owned(),
+                    preferred_region: Some("alpha".to_owned()),
+                    requested_by: vec!["blueprint:service_bot".to_owned()],
+                    source_device: Some("DEVICE-1".to_owned()),
+                    autofactory: Some("FACTORY-1".to_owned()),
+                },
+                BlueprintAcquireCheckpoint {
+                    source_device: Some("DEVICE-1".to_owned()),
+                    autofactory: Some("FACTORY-1".to_owned()),
+                    autofactory_location: Some("SCEPTURUM-BELT-1".to_owned()),
+                    logistics_child: None,
+                    decommission_authorized: true,
+                    decommission_submitted: true,
+                    decommission_operation: Some("OP-1".to_owned()),
+                    blueprint_verified: false,
+                },
+            ))
+            .expect("create blueprint workflow");
+        let workflow_id = workflow.id;
+        drop(repository);
+
+        let repository = WorkflowRepository::open(&path).expect("reopen workflow repository");
+        let restored = repository
+            .read(workflow_id)
+            .expect("read workflow")
+            .expect("workflow exists");
+        let checkpoint: BlueprintAcquireCheckpoint = restored.checkpoint().expect("checkpoint");
+        assert!(checkpoint.decommission_authorized);
+        assert!(checkpoint.decommission_submitted);
+        assert_eq!(checkpoint.decommission_operation.as_deref(), Some("OP-1"));
+        assert_eq!(checkpoint.source_device.as_deref(), Some("DEVICE-1"));
+
+        drop(repository);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn manifest_intent_builds_one_mixed_delivery_request() {
         let request = manifest_delivery_request(&LogisticsManifestIntent {
             origin: "SCEPTURUM-BELT-1".to_owned(),
@@ -2376,11 +2879,13 @@ mod tests {
                 quantity: 1,
                 device_type: "maintenance_drone".to_owned(),
             }],
+            device_codes: vec!["DEVICE-EXACT".to_owned()],
             purpose: "system hub upkeep".to_owned(),
             ..LogisticsManifestIntent::default()
         });
         assert_eq!(request.resources.get("structural"), Some(&400));
         assert_eq!(request.resources.get("carbon"), Some(&80));
         assert_eq!(request.devices.len(), 1);
+        assert_eq!(request.device_codes, ["DEVICE-EXACT"]);
     }
 }

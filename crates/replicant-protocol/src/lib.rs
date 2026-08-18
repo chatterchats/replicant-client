@@ -224,6 +224,10 @@ pub enum DirectorGoalKind {
     ExpandMiningOps,
     /// Batch-plan and complete active location events in each region.
     EventCompletion,
+    /// Learn missing account-wide blueprints from known acquisition opportunities.
+    BlueprintAcquisition,
+    /// Keep every operational System Hub supplied with its reported upkeep resources.
+    MaintainSystemHubs,
     /// Extend relay reach where regional work requires it.
     ExpandFtlNetwork,
     /// Ensure useful known systems receive monitoring beacons.

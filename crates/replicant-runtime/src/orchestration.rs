@@ -16,13 +16,15 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Device, DeviceType, Location, Replicant, Star, domain::GalacticPosition,
+    Client, Device, DeviceType, Location, Replicant, Star,
+    domain::{GalacticPosition, Inventory, InventoryOwner},
 };
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
     DirectorRegionSummary, DirectorReplicantAssignment, DirectorSnapshot, DirectorWorkforceSummary,
-    SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
+    SnapshotMetadata, WorkflowId as ProtocolWorkflowId, workflow_reserved,
 };
+use replicant_transport::ResourceMap;
 use replicant_workflow::{
     ResourceKey, WorkflowId, WorkflowInstance, WorkflowRepository, WorkflowStatus,
 };
@@ -32,10 +34,12 @@ use serde_json::Value;
 use crate::{
     ApplicationError,
     automation::{
-        EventCampaignIntent, MiningCampaignIntent, ObservatoryIntent, RegionEstablishIntent,
-        ReplicantProvisionIntent, ScanTourIntent, new_event_campaign_workflow,
-        new_mining_campaign_workflow, new_observatory_workflow, new_region_establish_workflow,
-        new_replicant_provision_workflow, new_scan_tour_workflow,
+        BlueprintAcquireIntent, EventCampaignIntent, LogisticsManifestIntent, MiningCampaignIntent,
+        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
+        blueprint_acquire_workflow_kind, new_blueprint_acquire_workflow,
+        new_event_campaign_workflow, new_logistics_manifest_workflow, new_mining_campaign_workflow,
+        new_observatory_workflow, new_region_establish_workflow, new_replicant_provision_workflow,
+        new_scan_tour_workflow,
     },
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
@@ -145,6 +149,30 @@ struct WorkerView {
     role_affinity: Option<String>,
     busy_workflow: Option<WorkflowId>,
     racing_vessel: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct HubMaintenanceView {
+    system: String,
+    location: String,
+    deficits: ResourceMap,
+    grace_period_remaining: Option<i64>,
+    degraded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HubSupplySource {
+    origin: String,
+    description: String,
+}
+
+#[derive(Clone, Debug)]
+struct StockLocation {
+    location: String,
+    system: String,
+    region: Option<String>,
+    is_belt: bool,
+    resources: ResourceMap,
 }
 
 struct GoalReconcileContext<'a> {
@@ -342,6 +370,39 @@ pub async fn reconcile_director(
         elapsed_ms = started.elapsed().as_millis(),
         "Director managed world phase complete"
     );
+    let mut hub_refresh_errors = BTreeMap::new();
+    let hub_codes = devices
+        .iter()
+        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    for code in hub_codes {
+        match client.devices().refresh(&code).await {
+            Ok(handle) => match handle.snapshot().await {
+                Ok(refreshed) => {
+                    if let Some(device) = devices
+                        .iter_mut()
+                        .find(|device| device.key.id.as_str() == code.as_str())
+                    {
+                        *device = refreshed;
+                    }
+                }
+                Err(error) => {
+                    hub_refresh_errors.insert(code, error.to_string());
+                }
+            },
+            Err(error) => {
+                hub_refresh_errors.insert(code, error.to_string());
+            }
+        }
+    }
+    let inventories = client.state().inventories()?;
+    tracing::debug!(
+        phase = "inventory",
+        count = inventories.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "Director loaded durable managed inventory projections"
+    );
     tracing::debug!(phase = "replicants", "Director loading managed world state");
     let replicant_handles = client.replicants().find().owned().collect().await?;
     let mut replicants = Vec::with_capacity(replicant_handles.len());
@@ -410,19 +471,21 @@ pub async fn reconcile_director(
 
     let goal_controls = load_goal_controls(&repository)?;
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
-    let observatory_blueprint_known = if goal_enabled(
+    let blueprint_snapshot_needed = goal_enabled(
         &goal_controls,
-        DirectorGoalKind::ExpandStarCatalogue,
-    ) && !devices.iter().any(|device| {
-        device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
-    }) {
+        DirectorGoalKind::BlueprintAcquisition,
+    ) || (goal_enabled(&goal_controls, DirectorGoalKind::ExpandStarCatalogue)
+        && !devices.iter().any(|device| {
+            device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
+        }));
+    let unlocked_blueprints = if blueprint_snapshot_needed {
         match client.blueprints().unlocked_device_types().await {
-            Ok(blueprints) => Some(blueprints.contains(&DeviceType::GalacticObservatory)),
+            Ok(blueprints) => Some(blueprints),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
                     phase = "requirements",
-                    "Director could not inspect managed blueprint state for catalogue blocker"
+                    "Director could not inspect managed blueprint state"
                 );
                 None
             }
@@ -430,6 +493,9 @@ pub async fn reconcile_director(
     } else {
         None
     };
+    let observatory_blueprint_known = unlocked_blueprints
+        .as_ref()
+        .map(|blueprints| blueprints.contains(&DeviceType::GalacticObservatory));
     let mut goals = Vec::new();
     let mut reserved_workers = BTreeSet::new();
     let automatic = settings.mode == DirectorMode::Automatic && allow_launch;
@@ -523,6 +589,17 @@ pub async fn reconcile_director(
     };
 
     for region in &established_regions {
+        goals.push(reconcile_maintain_system_hubs(
+            &goal_context,
+            region,
+            &regions,
+            &devices,
+            &locations,
+            &inventories,
+            &hub_refresh_errors,
+            &location_systems,
+            &system_regions,
+        )?);
         let regional_events = event_designations_by_region
             .get(&region.region)
             .map(Vec::as_slice)
@@ -576,6 +653,15 @@ pub async fn reconcile_director(
             "Existing event/bootstrap automation may still deploy required beacons",
         ));
     }
+
+    goals.push(reconcile_blueprint_acquisition(
+        &goal_context,
+        &devices,
+        unlocked_blueprints.as_ref(),
+        &location_systems,
+        &system_regions,
+        &mut requirements,
+    )?);
 
     let worker_demand = requirements.worker_demand_by_region();
     let pending_worker_demand = worker_demand.values().sum::<usize>();
@@ -911,6 +997,846 @@ fn reconcile_expand_star_catalogue(
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
+}
+
+fn reconcile_blueprint_acquisition(
+    context: &GoalReconcileContext<'_>,
+    devices: &[Device],
+    unlocked_blueprints: Option<&BTreeSet<DeviceType>>,
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    requirements: &mut DirectorRequirementGraph,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::BlueprintAcquisition;
+    let enabled = goal_enabled(context.controls, kind);
+    let id = goal_instance_id(kind, None);
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, context.workflows);
+    let mut active = nonterminal_ids(&runtime, context.workflows);
+    let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
+    if active.is_empty() {
+        if let Some(existing) = active_blueprint_acquisition_workflow(context.workflows) {
+            runtime.active_workflows = vec![existing];
+            active = vec![existing];
+        }
+    }
+
+    if !enabled {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Waiting,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: None,
+            next_action: Some("Enable this standing goal to acquire missing blueprints".to_owned()),
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
+
+    let Some(unlocked_blueprints) = unlocked_blueprints else {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Blocked,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: Some("Managed blueprint catalogue could not be refreshed".to_owned()),
+            next_action: Some("Retry the managed blueprint snapshot before selecting a sacrificial device".to_owned()),
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    };
+
+    let priorities = requirements.current_blueprint_priorities();
+    let owned_types = devices
+        .iter()
+        .filter_map(|device| device.device_type.clone())
+        .collect::<BTreeSet<_>>();
+    let mut tracked_types = owned_types.clone();
+    tracked_types.extend(
+        priorities
+            .keys()
+            .map(|device_type| DeviceType::from(device_type.as_str())),
+    );
+    let known_tracked = tracked_types
+        .iter()
+        .filter(|device_type| unlocked_blueprints.contains(*device_type))
+        .count();
+    let mut missing = tracked_types
+        .iter()
+        .filter(|device_type| !unlocked_blueprints.contains(*device_type))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| {
+        priorities
+            .get(right.as_str())
+            .copied()
+            .unwrap_or_default()
+            .cmp(&priorities.get(left.as_str()).copied().unwrap_or_default())
+            .then_with(|| left.cmp(right))
+    });
+
+    if missing.is_empty() {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Satisfied,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: None,
+            next_action: Some("No owned-copy blueprint opportunities are currently missing".to_owned()),
+            progress_current: known_tracked as u64,
+            progress_total: tracked_types.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
+
+    if !active.is_empty() {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Active,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: None,
+            next_action: Some("Allow the current owned-copy acquisition to finish and verify its blueprint".to_owned()),
+            progress_current: known_tracked as u64,
+            progress_total: tracked_types.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
+
+    if recently_launched {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Waiting,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: None,
+            next_action: Some(
+                "Wait for the owned-copy acquisition retry cooldown before selecting another irreversible device"
+                    .to_owned(),
+            ),
+            progress_current: known_tracked as u64,
+            progress_total: tracked_types.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
+
+    let (claimed, claimed_factories) =
+        active_blueprint_claims(context.repository, context.workflows)?;
+    let factories = devices
+        .iter()
+        .filter(|device| {
+            device.device_type.as_ref() == Some(&DeviceType::Autofactory)
+                && device.location.is_some()
+                && !claimed_factories.contains(device.key.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let selection = missing.iter().find_map(|device_type| {
+        let source = devices
+            .iter()
+            .filter(|device| {
+                director_blueprint_source_releasable(device, device_type)
+                    && !claimed.contains(device.key.id.as_str())
+            })
+            .min_by_key(|device| device.key.id.clone())?;
+        let source_location = source.location.as_ref()?.id.as_str();
+        let source_system = location_systems.get(source_location).map(String::as_str);
+        let source_region = source_system.and_then(|system| system_regions.get(system));
+        let factory = factories
+            .iter()
+            .copied()
+            .filter(|factory| factory.key.id.as_str() != source.key.id.as_str())
+            .min_by_key(|factory| {
+                let factory_location = factory
+                    .location
+                    .as_ref()
+                    .map(|location| location.id.as_str())
+                    .unwrap_or_default();
+                let factory_system = location_systems.get(factory_location).map(String::as_str);
+                let factory_region = factory_system.and_then(|system| system_regions.get(system));
+                let rank = if factory_location.eq_ignore_ascii_case(source_location) {
+                    0
+                } else if source_system.is_some() && factory_system == source_system {
+                    1
+                } else if source_region.is_some() && factory_region == source_region {
+                    2
+                } else {
+                    3
+                };
+                (rank, factory.key.id.clone())
+            })?;
+        Some((device_type.clone(), source, factory, source_region.cloned()))
+    });
+
+    let Some((device_type, source, factory, preferred_region)) = selection else {
+        let requested_without_copy = missing
+            .iter()
+            .find(|device_type| priorities.get(device_type.as_str()).copied().unwrap_or_default() > 0)
+            .map(|device_type| device_type.as_str().to_owned());
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Blocked,
+            objective: "Learn missing blueprints from owned devices before buying replacements"
+                .to_owned(),
+            blocker: Some(match requested_without_copy {
+                Some(device_type) => format!(
+                    "Blueprint {device_type} is required but no releasable owned copy and Autofactory pair is available; shop acquisition is not enabled in Phase 3"
+                ),
+                None => "Missing blueprints exist, but their owned copies are busy, attached, stowed, active, or no separate owned Autofactory is available".to_owned(),
+            }),
+            next_action: Some("Wait for an owned copy to become releasable or implement the later shop-purchase path".to_owned()),
+            progress_current: known_tracked as u64,
+            progress_total: tracked_types.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    };
+
+    let requirement = DirectorRequirement::Blueprint {
+        device_type: device_type.as_str().to_owned(),
+    };
+    let requirement_id = requirement.identity()?;
+    let is_required = priorities.contains_key(device_type.as_str());
+    let next_action = format!(
+        "Sacrifice owned {} {} at Autofactory {} to learn {}",
+        device_type.as_str(),
+        source.key.id,
+        factory.key.id,
+        device_type.as_str()
+    );
+    if context.automatic {
+        let workflow = context.repository.create(new_blueprint_acquire_workflow(
+            BlueprintAcquireIntent {
+                device_type: device_type.as_str().to_owned(),
+                preferred_region,
+                requested_by: is_required.then_some(requirement_id.clone()).into_iter().collect(),
+                source_device: Some(source.key.id.as_str().to_owned()),
+                autofactory: Some(factory.key.id.as_str().to_owned()),
+            },
+        ))?;
+        if is_required {
+            requirements.attach_workflow(&requirement_id, workflow.id)?;
+        }
+        tracing::info!(
+            event = "director.blueprint.strategy_selected",
+            workflow_id = %workflow.id,
+            device_type = %device_type.as_str(),
+            source_device = %source.key.id,
+            autofactory = %factory.key.id,
+            strategy = "owned",
+            "Director launched owned-copy blueprint acquisition"
+        );
+        runtime.active_workflows = vec![workflow.id];
+        runtime.last_launch_at_ms = Some(context.now);
+    }
+    save_goal_runtime(context.repository, &id, &runtime)?;
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: None,
+        status: DirectorGoalStatus::Active,
+        objective: "Learn missing blueprints from owned devices before buying replacements".to_owned(),
+        blocker: None,
+        next_action: Some(next_action),
+        progress_current: known_tracked as u64,
+        progress_total: tracked_types.len() as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
+}
+
+fn active_blueprint_acquisition_workflow(workflows: &[WorkflowInstance]) -> Option<WorkflowId> {
+    workflows
+        .iter()
+        .filter(|workflow| {
+            workflow.kind == blueprint_acquire_workflow_kind() && !workflow.status.is_terminal()
+        })
+        .max_by_key(|workflow| workflow.created_at)
+        .map(|workflow| workflow.id)
+}
+
+fn director_blueprint_source_releasable(device: &Device, device_type: &DeviceType) -> bool {
+    device.device_type.as_ref() == Some(device_type)
+        && !workflow_reserved(&device.tags)
+        && device.location.is_some()
+        && device.travel.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.relationships.controller.is_none()
+        && device.relationships.hosting_replicant.is_none()
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+        && device.status.as_ref().is_some_and(|status| {
+            matches!(
+                status.as_str().to_ascii_lowercase().as_str(),
+                "inactive" | "deactivated" | "idle" | "recalled" | "compacted"
+            )
+        })
+}
+
+fn active_blueprint_claims(
+    repository: &WorkflowRepository,
+    workflows: &[WorkflowInstance],
+) -> Result<(BTreeSet<String>, BTreeSet<String>), ApplicationError> {
+    let mut devices = BTreeSet::new();
+    let mut autofactories = BTreeSet::new();
+    for workflow in workflows.iter().filter(|workflow| !workflow.status.is_terminal()) {
+        for claim in repository.claims(workflow.id)? {
+            match claim.resource {
+                ResourceKey::Device(code) => {
+                    devices.insert(code);
+                }
+                ResourceKey::Autofactory(code) => {
+                    autofactories.insert(code);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((devices, autofactories))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_maintain_system_hubs(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    regions: &BTreeMap<String, RegionView>,
+    devices: &[Device],
+    locations: &[Location],
+    inventories: &[Inventory],
+    hub_refresh_errors: &BTreeMap<String, String>,
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::MaintainSystemHubs;
+    let enabled = goal_enabled(context.controls, kind);
+    let id = goal_instance_id(kind, Some(&region.region));
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, context.workflows);
+    let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
+    let stocks = stock_locations(
+        inventories,
+        locations,
+        location_systems,
+        system_regions,
+        regions,
+    );
+    let mut hubs = devices
+        .iter()
+        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
+        .filter(|device| {
+            device
+                .status
+                .as_ref()
+                .is_some_and(|status| status.as_str() == "active")
+        })
+        .filter_map(|device| {
+            let system = device_system(device, location_systems)?;
+            let belongs = system_regions
+                .get(&system)
+                .is_some_and(|candidate| candidate == &region.region)
+                || (system_regions.get(&system).is_none()
+                    && region.hub_system.as_deref() == Some(system.as_str()));
+            belongs.then_some((device, system))
+        })
+        .collect::<Vec<_>>();
+    hubs.sort_by(|(left, _), (right, _)| left.key.id.cmp(&right.key.id));
+
+    if !enabled {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: Some(region.region.clone()),
+            status: DirectorGoalStatus::Waiting,
+            objective: format!("Keep every operational System Hub in {} supplied", region.region),
+            blocker: None,
+            next_action: Some("Enable this standing goal".to_owned()),
+            progress_current: 0,
+            progress_total: hubs.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
+
+    let mut supplied = 0usize;
+    let mut blockers = Vec::new();
+    let mut actions = Vec::new();
+    let mut active_count = 0usize;
+    let mut ready_count = 0usize;
+    let mut launched_any = false;
+
+    for (hub, system) in &hubs {
+        let code = hub.key.id.as_str().to_owned();
+        let Some(location) = hub
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str().to_owned())
+        else {
+            blockers.push(format!("hub {code} has no exact managed location"));
+            continue;
+        };
+        if let Some(error) = hub_refresh_errors.get(&code) {
+            blockers.push(format!(
+                "{code} @ {location}: managed hub refresh failed ({error}); refusing automatic supply from stale upkeep state"
+            ));
+            continue;
+        }
+        let deficits = match exact_upkeep_deficits(hub) {
+            Ok(deficits) => deficits,
+            Err(error) => {
+                tracing::warn!(
+                    event = "director.hub.upkeep_unrecognized",
+                    region = %region.region,
+                    hub = %code,
+                    error = %error,
+                    "Director cannot safely normalize System Hub upkeep"
+                );
+                blockers.push(format!("{code} @ {location}: {error}"));
+                continue;
+            }
+        };
+        let patrol_available =
+            patrol_available_in_system(devices, system.as_str(), location_systems);
+        let degraded = hub_is_degraded(hub);
+        if deficits.is_empty() {
+            supplied += 1;
+            tracing::debug!(
+                event = "director.hub.upkeep_observed",
+                region = %region.region,
+                hub = %code,
+                location = %location,
+                missing = "none",
+                "System Hub has no reported upkeep deficit"
+            );
+            if degraded && !patrol_available {
+                blockers.push(format!(
+                    "{code} @ {location} is degraded but {system} has no maintenance drone on patrol"
+                ));
+            }
+            continue;
+        }
+
+        let manifest = format_resource_manifest(&deficits);
+        tracing::info!(
+            event = "director.hub.supply_required",
+            region = %region.region,
+            hub = %code,
+            location = %location,
+            grace_period_remaining = ?hub.grace_period_remaining,
+            missing = %manifest,
+            "System Hub requires upkeep supply"
+        );
+
+        if !patrol_available {
+            blockers.push(format!(
+                "{code} @ {location} needs {manifest}, and {system} has no maintenance drone on patrol"
+            ));
+        }
+
+        if let Some(workflow_id) = active_hub_supply_workflow(
+            context.workflows,
+            &region.region,
+            &code,
+            &location,
+        )? {
+            active_count += 1;
+            if !runtime.active_workflows.contains(&workflow_id) {
+                runtime.active_workflows.push(workflow_id);
+            }
+            actions.push(format!("finish supplying {code} @ {location}: {manifest}"));
+            continue;
+        }
+
+        let view = HubMaintenanceView {
+            system: (*system).clone(),
+            location: location.clone(),
+            deficits: deficits.clone(),
+            grace_period_remaining: hub.grace_period_remaining,
+            degraded,
+        };
+        let Some(source) = choose_hub_supply_source(&view, region, &stocks) else {
+            blockers.push(format!(
+                "{code} @ {location} is missing {manifest}, but no {} source can supply the complete manifest",
+                if hub_at_risk(&view) { "reachable" } else { "regional" }
+            ));
+            continue;
+        };
+
+        ready_count += 1;
+        actions.push(format!(
+            "move {manifest} from {} to {location} for {code}",
+            source.description
+        ));
+        if context.automatic && !recently_launched {
+            let purpose = hub_supply_purpose(&region.region, &code);
+            let workflow = context.repository.create(new_logistics_manifest_workflow(
+                LogisticsManifestIntent {
+                    origin: source.origin,
+                    destination: location.clone(),
+                    resources: deficits,
+                    devices: Vec::new(),
+                    device_codes: Vec::new(),
+                    device_tags: Vec::new(),
+                    return_transports: true,
+                    region: Some(region.region.clone()),
+                    purpose,
+                },
+            ))?;
+            tracing::info!(
+                event = "director.hub.supply_workflow_created",
+                workflow_id = %workflow.id,
+                region = %region.region,
+                hub = %code,
+                location = %location,
+                missing = %manifest,
+                "Director launched System Hub supply manifest"
+            );
+            runtime.active_workflows.push(workflow.id);
+            active_count += 1;
+            launched_any = true;
+        }
+    }
+
+    runtime
+        .active_workflows
+        .sort_by_key(|workflow_id| workflow_id.to_string());
+    runtime.active_workflows.dedup();
+    if launched_any {
+        runtime.last_launch_at_ms = Some(context.now);
+    }
+    save_goal_runtime(context.repository, &id, &runtime)?;
+
+    let total = hubs.len();
+    let blocker = (!blockers.is_empty()).then(|| summarize_messages(&blockers));
+    let next_action = if !actions.is_empty() {
+        Some(summarize_messages(&actions))
+    } else if total == 0 {
+        Some("Wait for an operational regional System Hub".to_owned())
+    } else if supplied == total && blocker.is_none() {
+        Some("Keep observing reported hub upkeep requirements".to_owned())
+    } else if recently_launched {
+        Some("Wait briefly before retrying failed hub supply work".to_owned())
+    } else {
+        blocker
+            .as_ref()
+            .map(|_| "Resolve the reported System Hub maintenance blocker".to_owned())
+    };
+    let status = if total == 0 {
+        DirectorGoalStatus::Waiting
+    } else if active_count > 0 || ready_count > 0 {
+        DirectorGoalStatus::Active
+    } else if blocker.is_some() {
+        DirectorGoalStatus::Blocked
+    } else if supplied == total {
+        DirectorGoalStatus::Satisfied
+    } else {
+        DirectorGoalStatus::Waiting
+    };
+
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: format!("Keep every operational System Hub in {} supplied", region.region),
+        blocker,
+        next_action,
+        progress_current: supplied as u64,
+        progress_total: total as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
+}
+
+fn exact_upkeep_deficits(device: &Device) -> Result<ResourceMap, String> {
+    let mut deficits = ResourceMap::new();
+    for requirement in &device.upkeep_requirements {
+        let resource = ["resource_type", "resource"]
+            .into_iter()
+            .find_map(|key| requirement.get(key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "upkeep requirement has no explicit resource field (keys: {})",
+                    requirement.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?;
+        let missing = [
+            "missing",
+            "remaining",
+            "deficit",
+            "missing_quantity",
+            "quantity_missing",
+        ]
+        .into_iter()
+        .find_map(|key| requirement.get(key).and_then(json_integral_i64))
+        .ok_or_else(|| {
+            format!(
+                "upkeep requirement for {resource} has no explicit deficit field; refusing to infer from total requirement"
+            )
+        })?;
+        if missing < 0 {
+            return Err(format!(
+                "upkeep requirement for {resource} reports negative deficit {missing}"
+            ));
+        }
+        if missing > 0 {
+            *deficits.entry(resource.to_owned()).or_default() += missing;
+        }
+    }
+    Ok(deficits)
+}
+
+fn json_integral_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn hub_is_degraded(device: &Device) -> bool {
+    let Some(capacity) = device.operational_capacity else {
+        return false;
+    };
+    capacity.percent() < 100.0
+}
+
+fn patrol_available_in_system(
+    devices: &[Device],
+    system: &str,
+    location_systems: &BTreeMap<String, String>,
+) -> bool {
+    devices.iter().any(|device| {
+        device.device_type.as_ref() == Some(&DeviceType::MaintenanceDrone)
+            && device_system(device, location_systems).as_deref() == Some(system)
+            && !device
+                .status
+                .as_ref()
+                .is_some_and(|status| matches!(status.as_str(), "offline" | "deactivated"))
+            && device
+                .active_directive
+                .as_ref()
+                .and_then(|directive| directive.directive.as_ref())
+                .is_some_and(|directive| directive.as_str() == "patrol")
+    })
+}
+
+fn stock_locations(
+    inventories: &[Inventory],
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    regions: &BTreeMap<String, RegionView>,
+) -> Vec<StockLocation> {
+    let belt_locations = locations
+        .iter()
+        .filter(|location| {
+            location
+                .location_type
+                .as_ref()
+                .is_some_and(|kind| kind.as_str() == "belt")
+        })
+        .map(|location| location.key.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut stocks = inventories
+        .iter()
+        .filter_map(|inventory| {
+            let InventoryOwner::Location(owner) = &inventory.owner else {
+                return None;
+            };
+            let location = owner.id.as_str().to_owned();
+            let system = location_systems
+                .get(&location)
+                .cloned()
+                .unwrap_or_else(|| system_prefix(&location).to_owned());
+            let region = system_regions
+                .get(&system)
+                .cloned()
+                .or_else(|| operational_region_for_system(&system, regions));
+            let resources = inventory
+                .items
+                .iter()
+                .filter(|item| item.quantity > 0)
+                .map(|item| (item.resource.clone(), item.quantity))
+                .collect::<ResourceMap>();
+            (!resources.is_empty()).then_some(StockLocation {
+                is_belt: belt_locations.contains(&location),
+                location,
+                system,
+                region,
+                resources,
+            })
+        })
+        .collect::<Vec<_>>();
+    stocks.sort_by(|left, right| left.location.cmp(&right.location));
+    stocks
+}
+
+fn choose_hub_supply_source(
+    hub: &HubMaintenanceView,
+    region: &RegionView,
+    stocks: &[StockLocation],
+) -> Option<HubSupplySource> {
+    let usable = stocks
+        .iter()
+        .filter(|stock| stock.location != hub.location)
+        .collect::<Vec<_>>();
+
+    if let Some(stock) = usable.iter().copied().find(|stock| {
+        stock.system == hub.system
+            && stock.is_belt
+            && resources_cover(&stock.resources, &hub.deficits)
+    }) {
+        return Some(HubSupplySource {
+            origin: stock.location.clone(),
+            description: stock.location.clone(),
+        });
+    }
+    if system_resources_cover(&usable, &hub.system, &hub.deficits) {
+        return Some(HubSupplySource {
+            origin: hub.system.clone(),
+            description: format!("{} system inventory", hub.system),
+        });
+    }
+    if let Some(home) = region.hub_system.as_deref()
+        && home != hub.system
+        && system_resources_cover(&usable, home, &hub.deficits)
+    {
+        return Some(HubSupplySource {
+            origin: home.to_owned(),
+            description: format!("{home} regional home inventory"),
+        });
+    }
+
+    let mut regional_systems = usable
+        .iter()
+        .filter(|stock| stock.region.as_deref() == Some(region.region.as_str()))
+        .map(|stock| stock.system.clone())
+        .collect::<BTreeSet<_>>();
+    regional_systems.remove(&hub.system);
+    if let Some(system) = regional_systems
+        .into_iter()
+        .find(|system| system_resources_cover(&usable, system, &hub.deficits))
+    {
+        return Some(HubSupplySource {
+            description: format!("{system} regional inventory"),
+            origin: system,
+        });
+    }
+
+    if hub_at_risk(hub) {
+        let local_region = &region.region;
+        let cross_region_systems = usable
+            .iter()
+            .filter(|stock| stock.region.as_deref() != Some(local_region.as_str()))
+            .map(|stock| stock.system.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(system) = cross_region_systems
+            .into_iter()
+            .find(|system| system_resources_cover(&usable, system, &hub.deficits))
+        {
+            return Some(HubSupplySource {
+                description: format!("{system} emergency cross-region inventory"),
+                origin: system,
+            });
+        }
+    }
+    None
+}
+
+fn resources_cover(resources: &ResourceMap, deficits: &ResourceMap) -> bool {
+    deficits.iter().all(|(resource, required)| {
+        resources
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(resource))
+            .map(|(_, available)| *available)
+            .unwrap_or(0)
+            >= *required
+    })
+}
+
+fn system_resources_cover(
+    stocks: &[&StockLocation],
+    system: &str,
+    deficits: &ResourceMap,
+) -> bool {
+    let mut aggregate = ResourceMap::new();
+    for stock in stocks.iter().filter(|stock| stock.system == system) {
+        for (resource, quantity) in &stock.resources {
+            *aggregate.entry(resource.clone()).or_default() += quantity;
+        }
+    }
+    resources_cover(&aggregate, deficits)
+}
+
+fn hub_at_risk(hub: &HubMaintenanceView) -> bool {
+    hub.grace_period_remaining.is_some_and(|remaining| remaining <= 0) || hub.degraded
+}
+
+fn hub_supply_purpose(region: &str, hub: &str) -> String {
+    format!("director:maintain_system_hubs:{region}:{hub}")
+}
+
+fn active_hub_supply_workflow(
+    workflows: &[WorkflowInstance],
+    region: &str,
+    hub: &str,
+    destination: &str,
+) -> Result<Option<WorkflowId>, ApplicationError> {
+    let purpose = hub_supply_purpose(region, hub);
+    for workflow in workflows.iter().filter(|workflow| {
+        workflow.kind.as_str() == "logistics.manifest" && !workflow.status.is_terminal()
+    }) {
+        let intent = workflow.config::<LogisticsManifestIntent>()?;
+        if intent.purpose == purpose && intent.destination.eq_ignore_ascii_case(destination) {
+            return Ok(Some(workflow.id));
+        }
+    }
+    Ok(None)
+}
+
+fn format_resource_manifest(resources: &ResourceMap) -> String {
+    resources
+        .iter()
+        .map(|(resource, quantity)| format!("{resource} {quantity}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn summarize_messages(messages: &[String]) -> String {
+    const LIMIT: usize = 3;
+    let mut summary = messages.iter().take(LIMIT).cloned().collect::<Vec<_>>().join("; ");
+    if messages.len() > LIMIT {
+        summary.push_str(&format!("; +{} more", messages.len() - LIMIT));
+    }
+    summary
 }
 
 fn reconcile_event_completion(
@@ -2205,18 +3131,26 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::EnhanceStarCatalogue => "Survey known regional star systems",
         DirectorGoalKind::ExpandMiningOps => "Expand useful regional mining infrastructure",
         DirectorGoalKind::EventCompletion => "Complete worthwhile active regional events",
+        DirectorGoalKind::BlueprintAcquisition => {
+            "Learn missing blueprints from known owned-device opportunities"
+        }
+        DirectorGoalKind::MaintainSystemHubs => {
+            "Keep operational System Hubs supplied with reported upkeep resources"
+        }
         DirectorGoalKind::ExpandFtlNetwork => "Maintain and extend regional FTL reach",
         DirectorGoalKind::EstablishBeacons => "Maintain beacon coverage at useful known systems",
     }
 }
 
-fn all_goal_kinds() -> [DirectorGoalKind; 7] {
+fn all_goal_kinds() -> [DirectorGoalKind; 9] {
     [
         DirectorGoalKind::EstablishRegions,
         DirectorGoalKind::ExpandStarCatalogue,
         DirectorGoalKind::EnhanceStarCatalogue,
         DirectorGoalKind::ExpandMiningOps,
         DirectorGoalKind::EventCompletion,
+        DirectorGoalKind::BlueprintAcquisition,
+        DirectorGoalKind::MaintainSystemHubs,
         DirectorGoalKind::ExpandFtlNetwork,
         DirectorGoalKind::EstablishBeacons,
     ]
@@ -2231,6 +3165,8 @@ pub fn goal_kind_key(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::EnhanceStarCatalogue => "enhance_star_catalogue",
         DirectorGoalKind::ExpandMiningOps => "expand_mining_ops",
         DirectorGoalKind::EventCompletion => "event_completion",
+        DirectorGoalKind::BlueprintAcquisition => "blueprint_acquisition",
+        DirectorGoalKind::MaintainSystemHubs => "maintain_system_hubs",
         DirectorGoalKind::ExpandFtlNetwork => "expand_ftl_network",
         DirectorGoalKind::EstablishBeacons => "establish_beacons",
     }
@@ -2274,6 +3210,30 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
 
+    fn test_hub_device() -> Device {
+        Device {
+            key: replicant_client::DeviceKey::live("HUB1".into()),
+            device_type: Some(DeviceType::SystemHub),
+            status: Some(replicant_client::DeviceStatus::Active),
+            location: Some(replicant_client::LocationKey::live("SCEPTURUM-7-L4".into())),
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: replicant_client::DeviceRelationships::default(),
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: replicant_client::domain::OperationalCapacity::new(100.0),
+            grace_period_remaining: Some(86_400),
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: None,
+            access: replicant_client::domain::AccessScope::Owned,
+        }
+    }
+
     #[test]
     fn sol_aliases_are_canonical() {
         for value in ["SOL", "solregion", "sol-zone", "sol_zone", "solzone"] {
@@ -2298,6 +3258,164 @@ mod tests {
         assert!(!default_goal_enabled(DirectorGoalKind::ExpandFtlNetwork));
         assert!(!default_goal_enabled(DirectorGoalKind::EstablishBeacons));
         assert!(default_goal_enabled(DirectorGoalKind::EventCompletion));
+        assert!(default_goal_enabled(DirectorGoalKind::BlueprintAcquisition));
+        assert!(default_goal_enabled(DirectorGoalKind::MaintainSystemHubs));
+    }
+
+    #[test]
+    fn blueprint_source_must_be_idle_and_releasable() {
+        let mut device = test_hub_device();
+        device.key = replicant_client::DeviceKey::live("DEVICE-1".into());
+        device.device_type = Some(DeviceType::from("service_bot"));
+        device.status = Some(replicant_client::DeviceStatus::Idle);
+        device.location = Some(replicant_client::LocationKey::live("SCEPTURUM-BELT-1".into()));
+        assert!(director_blueprint_source_releasable(
+            &device,
+            &DeviceType::from("service_bot")
+        ));
+
+        device.relationships.hosting_replicant = Some(replicant_client::ReplicantKey::live(
+            "CHAT-1".into(),
+        ));
+        assert!(!director_blueprint_source_releasable(
+            &device,
+            &DeviceType::from("service_bot")
+        ));
+    }
+
+    #[test]
+    fn hub_upkeep_parser_uses_only_explicit_deficits() {
+        let mut hub = test_hub_device();
+        hub.upkeep_requirements = vec![
+            BTreeMap::from([
+                ("resource".to_owned(), Value::from("structural")),
+                ("required".to_owned(), Value::from(400)),
+                ("missing".to_owned(), Value::from(120)),
+            ]),
+            BTreeMap::from([
+                ("resource_type".to_owned(), Value::from("carbon")),
+                ("remaining".to_owned(), Value::from(80)),
+            ]),
+        ];
+
+        let deficits = exact_upkeep_deficits(&hub).expect("parse explicit deficits");
+        assert_eq!(deficits.get("structural"), Some(&120));
+        assert_eq!(deficits.get("carbon"), Some(&80));
+
+        hub.upkeep_requirements = vec![BTreeMap::from([
+            ("resource".to_owned(), Value::from("structural")),
+            ("required".to_owned(), Value::from(400)),
+        ])];
+        let error = exact_upkeep_deficits(&hub).expect_err("total alone is ambiguous");
+        assert!(error.contains("refusing to infer"));
+    }
+
+    #[test]
+    fn hub_supply_prefers_same_system_belt_stock() {
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("SCEPTURUM".to_owned()),
+            hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
+            known_systems: BTreeSet::new(),
+        };
+        let hub = HubMaintenanceView {
+            system: "SCEPTURUM".to_owned(),
+            location: "SCEPTURUM-7-L4".to_owned(),
+            deficits: BTreeMap::from([
+                ("carbon".to_owned(), 80),
+                ("structural".to_owned(), 400),
+            ]),
+            grace_period_remaining: Some(86_400),
+            degraded: false,
+        };
+        let stocks = vec![
+            StockLocation {
+                location: "SCEPTURUM-4".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: false,
+                resources: BTreeMap::from([
+                    ("carbon".to_owned(), 500),
+                    ("structural".to_owned(), 500),
+                ]),
+            },
+            StockLocation {
+                location: "SCEPTURUM-BELT-1".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: true,
+                resources: BTreeMap::from([
+                    ("carbon".to_owned(), 80),
+                    ("structural".to_owned(), 400),
+                ]),
+            },
+        ];
+
+        let source = choose_hub_supply_source(&hub, &region, &stocks).expect("source");
+        assert_eq!(source.origin, "SCEPTURUM-BELT-1");
+    }
+
+    #[test]
+    fn hub_supply_uses_cross_region_stock_only_when_at_risk() {
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("SCEPTURUM".to_owned()),
+            hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
+            known_systems: BTreeSet::new(),
+        };
+        let mut hub = HubMaintenanceView {
+            system: "ALPHA-EDGE".to_owned(),
+            location: "ALPHA-EDGE-3-L4".to_owned(),
+            deficits: BTreeMap::from([("structural".to_owned(), 400)]),
+            grace_period_remaining: Some(86_400),
+            degraded: false,
+        };
+        let stocks = vec![StockLocation {
+            location: "THYFFAWFF-BELT-1".to_owned(),
+            system: "THYFFAWFF".to_owned(),
+            region: Some("beta".to_owned()),
+            is_belt: true,
+            resources: BTreeMap::from([("structural".to_owned(), 1_000)]),
+        }];
+
+        assert!(choose_hub_supply_source(&hub, &region, &stocks).is_none());
+        hub.degraded = true;
+        let source = choose_hub_supply_source(&hub, &region, &stocks).expect("emergency source");
+        assert_eq!(source.origin, "THYFFAWFF");
+    }
+
+    #[test]
+    fn hub_supply_workflow_is_reused_by_deterministic_purpose() {
+        let path = std::env::temp_dir().join(format!(
+            "replicant-director-hub-supply-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = WorkflowRepository::open(&path).expect("open workflow repository");
+        let created = repository
+            .create(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin: "SCEPTURUM-BELT-1".to_owned(),
+                destination: "SCEPTURUM-7-L4".to_owned(),
+                resources: BTreeMap::from([("structural".to_owned(), 400)]),
+                devices: Vec::new(),
+                device_codes: Vec::new(),
+                device_tags: Vec::new(),
+                return_transports: true,
+                region: Some("alpha".to_owned()),
+                purpose: hub_supply_purpose("alpha", "HUB1"),
+            }))
+            .expect("create manifest");
+        let workflows = repository.list().expect("list workflows");
+
+        assert_eq!(
+            active_hub_supply_workflow(&workflows, "alpha", "HUB1", "SCEPTURUM-7-L4")
+                .expect("inspect manifests"),
+            Some(created.id)
+        );
+
+        drop(repository);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

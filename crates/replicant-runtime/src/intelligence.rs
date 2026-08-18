@@ -13,13 +13,23 @@ use replicant_client::{
 
 use crate::ReportResult;
 
-/// Reads the account inbox without adding it to durable managed state.
-pub async fn inbox(client: &Client, limit: i64) -> ReportResult<MessageListResponse> {
+/// Reads one page of the account inbox without adding it to managed state.
+pub async fn inbox_page(
+    client: &Client,
+    cursor: Option<i64>,
+    limit: i64,
+) -> ReportResult<MessageListResponse> {
     let query = MessageListQuery {
+        cursor,
         limit: Some(limit),
         ..MessageListQuery::default()
     };
     Ok(client.raw().messages().list(&query).await?.value)
+}
+
+/// Reads the first page of the account inbox.
+pub async fn inbox(client: &Client, limit: i64) -> ReportResult<MessageListResponse> {
+    inbox_page(client, None, limit).await
 }
 
 /// Reads one relay's observed channels and recent history.

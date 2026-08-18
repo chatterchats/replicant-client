@@ -299,6 +299,70 @@ impl DirectorRequirementGraph {
         Ok(id)
     }
 
+    /// Returns Blueprint requirements raised by current goal blockers, keyed
+    /// by device type with their effective requester priority.
+    #[must_use]
+    pub fn current_blueprint_priorities(&self) -> BTreeMap<String, u32> {
+        let mut priorities = BTreeMap::new();
+        for record in self.records.values() {
+            let requested_now = record.requesters.iter().any(|requester| {
+                self.seen_requesters
+                    .contains(&(record.id.clone(), requester.goal_id.clone()))
+            });
+            if !requested_now
+                || !matches!(
+                    record.status,
+                    DirectorRequirementStatus::Pending
+                        | DirectorRequirementStatus::Active
+                        | DirectorRequirementStatus::Blocked
+                )
+            {
+                continue;
+            }
+            let DirectorRequirement::Blueprint { device_type } = &record.requirement else {
+                continue;
+            };
+            let priority = record
+                .requesters
+                .iter()
+                .filter(|requester| {
+                    self.seen_requesters
+                        .contains(&(record.id.clone(), requester.goal_id.clone()))
+                })
+                .map(|requester| requester.priority)
+                .max()
+                .unwrap_or_default();
+            priorities
+                .entry(device_type.clone())
+                .and_modify(|existing| *existing = (*existing).max(priority))
+                .or_insert(priority);
+        }
+        priorities
+    }
+
+    /// Associates resolver work with a requirement raised during this pass.
+    /// This is purely explanatory/deduplication state; satisfaction still
+    /// comes from observing that requesting goals no longer raise it.
+    pub fn attach_workflow(
+        &mut self,
+        requirement_id: &str,
+        workflow_id: WorkflowId,
+    ) -> Result<(), ApplicationError> {
+        let Some(record) = self.records.get_mut(requirement_id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown Director requirement {requirement_id}"),
+            )
+            .into());
+        };
+        if !record.active_workflows.contains(&workflow_id) {
+            record.active_workflows.push(workflow_id);
+            record.active_workflows.sort();
+        }
+        record.status = DirectorRequirementStatus::Active;
+        Ok(())
+    }
+
     /// Returns current worker pressure grouped by region.
     #[must_use]
     pub fn worker_demand_by_region(&self) -> BTreeMap<String, usize> {
@@ -495,6 +559,30 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].requesters.len(), 2);
         assert_eq!(summaries[0].priority, 900);
+    }
+
+    #[test]
+    fn current_blueprint_priorities_only_include_requirements_refreshed_this_pass() {
+        let repository = repository();
+        let mut graph = DirectorRequirementGraph::load(&repository, 100).expect("load graph");
+        graph
+            .raise(
+                DirectorRequirement::Blueprint {
+                    device_type: "galactic_observatory".to_owned(),
+                },
+                "expand_star_catalogue",
+                "catalogue blocker",
+                400,
+            )
+            .expect("raise blueprint");
+        assert_eq!(
+            graph.current_blueprint_priorities().get("galactic_observatory"),
+            Some(&400)
+        );
+        graph.persist(&repository).expect("persist graph");
+
+        let graph = DirectorRequirementGraph::load(&repository, 200).expect("reload graph");
+        assert!(graph.current_blueprint_priorities().is_empty());
     }
 
     #[test]

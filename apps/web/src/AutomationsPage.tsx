@@ -859,6 +859,8 @@ const goalLabels: Record<DirectorGoalKind, string> = {
   enhance_star_catalogue: "Enhance Star Catalogue",
   expand_mining_ops: "Expand Mining Ops",
   event_completion: "Event Completion",
+  blueprint_acquisition: "Blueprint Acquisition",
+  maintain_system_hubs: "Maintain System Hubs",
   expand_ftl_network: "Expand FTL Network",
   establish_beacons: "Establish Beacons",
 };

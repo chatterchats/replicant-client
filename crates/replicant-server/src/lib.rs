@@ -35,7 +35,6 @@ use replicant_client::{
         devices::{DeviceListQuery, DeviceStatus as RawDeviceStatus},
         events::LocationEvent,
         leaderboards::{LeaderboardIndexResponse, LeaderboardResponse},
-        messages::MessageListResponse,
         reputation::AccountReputationResponse,
     },
 };
@@ -87,7 +86,7 @@ use replicant_runtime::{
     config::{self, RuntimeConfig},
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
-    intelligence::{account_profile, inbox, leaderboard, leaderboard_index, standing},
+    intelligence::{account_profile, inbox_page, leaderboard, leaderboard_index, standing},
     orchestration::{
         assign_replicant_region, cached_director_snapshot, parse_goal_kind, reconcile_director,
         set_director_mode, set_goal_enabled,
@@ -262,6 +261,7 @@ pub struct AppState {
     /// from. `/api/devices`, `/api/autofactories`, and the relay projection all
     /// rebuild the identical row set, previously once per request.
     device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
+    message_sync: Mutex<()>,
     director_reconcile: Mutex<()>,
     director_wake: Notify,
     daemon: DaemonConfig,
@@ -293,6 +293,7 @@ impl AppState {
             pending_slices: StdMutex::new(BTreeSet::new()),
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
+            message_sync: Mutex::new(()),
             director_reconcile: Mutex::new(()),
             director_wake: Notify::new(),
             daemon,
@@ -2861,44 +2862,147 @@ async fn reports(
     })))
 }
 
+const MESSAGE_CACHE_NAMESPACE: &str = "messages";
+const MESSAGE_CACHE_KEY: &str = "inbox";
+const MESSAGE_PAGE_SIZE: i64 = 100;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MessageInboxCache {
+    #[serde(default)]
+    inbox: Vec<InboxMessageSummary>,
+    last_cursor: Option<i64>,
+    unread_count: Option<i64>,
+}
+
 async fn messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
-    let inbox = inbox(state.client(), 100)
-        .await
-        .map_err(|_| ApiError::unavailable())?;
-    Ok(Json(Versioned::current(messages_snapshot(
-        state.snapshot_metadata()?,
-        inbox,
-    ))))
+    let _guard = state.message_sync.lock().await;
+    let cache = sync_message_cache(&state).await?;
+    Ok(Json(Versioned::current(MessagesSnapshot {
+        metadata: state.snapshot_metadata()?,
+        inbox: cache.inbox,
+        unread_count: cache.unread_count,
+    })))
 }
 
-fn messages_snapshot(metadata: SnapshotMetadata, inbox: MessageListResponse) -> MessagesSnapshot {
-    let unread_count = inbox.unread_message_count;
-    let mut inbox = inbox
-        .messages
-        .into_iter()
-        .map(|message| InboxMessageSummary {
-            id: message.id,
-            title: message.title,
-            body: message.body,
-            category: message.category,
-            message_type: message.message_type,
-            is_read: message.is_read,
-            created_at: message.created_at,
-        })
-        .collect::<Vec<_>>();
+async fn sync_message_cache(state: &AppState) -> Result<MessageInboxCache, ApiError> {
+    let mut cache = load_message_cache(&state.repository)?;
+    let mut cursor = cache.last_cursor;
+
+    loop {
+        let page = inbox_page(state.client(), cursor, MESSAGE_PAGE_SIZE)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    cursor,
+                    "account message sync failed"
+                );
+                ApiError::unavailable()
+            })?;
+        let next_cursor = page.next_cursor;
+        let previous_unread_count = cache.unread_count;
+        let previous_cursor = cache.last_cursor;
+        cache.unread_count = page.unread_message_count.or(cache.unread_count);
+        let page_messages = page
+            .messages
+            .into_iter()
+            .map(inbox_message_summary)
+            .collect::<Vec<_>>();
+        let page_last_id = page_messages.last().and_then(|message| message.id);
+        let page_had_messages = !page_messages.is_empty();
+        merge_inbox_messages(&mut cache.inbox, page_messages);
+
+        // `next_cursor` is the authoritative checkpoint while another page
+        // exists. On the final page retain the last observed message ID so a
+        // later refresh can request only messages added after this sync.
+        cache.last_cursor = next_cursor.or(page_last_id).or(cache.last_cursor);
+        if page_had_messages
+            || cache.last_cursor != previous_cursor
+            || cache.unread_count != previous_unread_count
+        {
+            persist_message_cache(&state.repository, &cache)?;
+        }
+
+        let Some(next) = next_cursor else {
+            break;
+        };
+        if cursor == Some(next) {
+            tracing::warn!(cursor = next, "account message pagination cursor did not advance");
+            break;
+        }
+        cursor = Some(next);
+    }
+
+    Ok(cache)
+}
+
+fn load_message_cache(repository: &WorkflowRepository) -> Result<MessageInboxCache, ApiError> {
+    let Some((value, _revision)) = repository
+        .read_document(MESSAGE_CACHE_NAMESPACE, MESSAGE_CACHE_KEY)
+        .map_err(ApiError::repository)?
+    else {
+        return Ok(MessageInboxCache::default());
+    };
+    serde_json::from_value(value).map_err(|error| {
+        tracing::error!(error = %error, "persisted message cache is invalid");
+        ApiError::internal()
+    })
+}
+
+fn persist_message_cache(
+    repository: &WorkflowRepository,
+    cache: &MessageInboxCache,
+) -> Result<(), ApiError> {
+    repository
+        .put_document(MESSAGE_CACHE_NAMESPACE, MESSAGE_CACHE_KEY, cache)
+        .map_err(ApiError::repository)?;
+    Ok(())
+}
+
+fn inbox_message_summary(message: replicant_client::raw::messages::Message) -> InboxMessageSummary {
+    InboxMessageSummary {
+        id: message.id,
+        title: message.title,
+        body: message.body,
+        category: message.category,
+        message_type: message.message_type,
+        is_read: message.is_read,
+        created_at: message.created_at,
+    }
+}
+
+fn merge_inbox_messages(
+    inbox: &mut Vec<InboxMessageSummary>,
+    incoming: Vec<InboxMessageSummary>,
+) {
+    let mut by_id = BTreeMap::new();
+    let mut without_id = Vec::new();
+    for message in inbox.drain(..) {
+        if let Some(id) = message.id {
+            by_id.insert(id, message);
+        } else if !without_id.contains(&message) {
+            without_id.push(message);
+        }
+    }
+
+    for message in incoming {
+        if let Some(id) = message.id {
+            by_id.insert(id, message);
+        } else if !without_id.contains(&message) {
+            without_id.push(message);
+        }
+    }
+
+    inbox.extend(by_id.into_values());
+    inbox.extend(without_id);
     inbox.sort_by(|left, right| {
         right
             .created_at
             .cmp(&left.created_at)
             .then_with(|| right.id.cmp(&left.id))
     });
-    MessagesSnapshot {
-        metadata,
-        inbox,
-        unread_count,
-    }
 }
 
 #[derive(Deserialize)]
@@ -5768,14 +5872,13 @@ mod tests {
             revision: 1,
             generated_at_ms: 2,
         };
-        let inbox = serde_json::from_value(serde_json::json!({
-            "messages": [{"id": 1, "title": "Notice", "is_read": false}],
-            "unread_message_count": 1
+        let message = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "Notice", "is_read": false
         }))
         .expect("message fixture");
-        let messages = messages_snapshot(metadata.clone(), inbox);
-        assert_eq!(messages.unread_count, Some(1));
-        assert_eq!(messages.inbox[0].title.as_deref(), Some("Notice"));
+        let message = inbox_message_summary(message);
+        assert_eq!(message.is_read, Some(false));
+        assert_eq!(message.title.as_deref(), Some("Notice"));
 
         let system_message = serde_json::from_value(serde_json::json!({
             "id": 2, "message": "hello", "replicant_code": null
@@ -5844,6 +5947,88 @@ mod tests {
                 .map(|item| item.id.0.as_str()),
             Some("R-1")
         );
+    }
+
+    #[test]
+    fn message_cache_merges_pages_without_duplicates_and_survives_reload() {
+        let repository = WorkflowRepository::open_in_memory().expect("runtime database");
+        let mut cache = MessageInboxCache::default();
+        merge_inbox_messages(
+            &mut cache.inbox,
+            vec![
+                InboxMessageSummary {
+                    id: Some(1),
+                    title: Some("Older".to_owned()),
+                    body: None,
+                    category: None,
+                    message_type: Some("system".to_owned()),
+                    is_read: Some(true),
+                    created_at: Some("2026-08-18T10:00:00Z".to_owned()),
+                },
+                InboxMessageSummary {
+                    id: Some(2),
+                    title: Some("Original".to_owned()),
+                    body: None,
+                    category: None,
+                    message_type: Some("social".to_owned()),
+                    is_read: Some(false),
+                    created_at: Some("2026-08-18T11:00:00Z".to_owned()),
+                },
+            ],
+        );
+        merge_inbox_messages(
+            &mut cache.inbox,
+            vec![
+                InboxMessageSummary {
+                    id: Some(2),
+                    title: Some("Updated".to_owned()),
+                    body: None,
+                    category: None,
+                    message_type: Some("social".to_owned()),
+                    is_read: Some(true),
+                    created_at: Some("2026-08-18T11:00:00Z".to_owned()),
+                },
+                InboxMessageSummary {
+                    id: Some(3),
+                    title: Some("Newest".to_owned()),
+                    body: None,
+                    category: None,
+                    message_type: Some("system".to_owned()),
+                    is_read: Some(false),
+                    created_at: Some("2026-08-18T12:00:00Z".to_owned()),
+                },
+            ],
+        );
+        cache.last_cursor = Some(3);
+        cache.unread_count = Some(1);
+        assert!(persist_message_cache(&repository, &cache).is_ok());
+
+        let restored = match load_message_cache(&repository) {
+            Ok(cache) => cache,
+            Err(_) => panic!("load message cache"),
+        };
+        assert_eq!(restored.last_cursor, Some(3));
+        assert_eq!(restored.unread_count, Some(1));
+        assert_eq!(restored.inbox.len(), 3);
+        assert_eq!(restored.inbox[0].id, Some(3));
+        assert_eq!(restored.inbox[1].title.as_deref(), Some("Updated"));
+        assert_eq!(restored.inbox[1].is_read, Some(true));
+    }
+
+    #[test]
+    fn message_cache_preserves_messages_without_ids() {
+        let message = InboxMessageSummary {
+            id: None,
+            title: Some("No ID".to_owned()),
+            body: Some("fallback".to_owned()),
+            category: None,
+            message_type: None,
+            is_read: Some(false),
+            created_at: Some("2026-08-18T12:00:00Z".to_owned()),
+        };
+        let mut inbox = vec![message.clone()];
+        merge_inbox_messages(&mut inbox, vec![message]);
+        assert_eq!(inbox.len(), 1);
     }
 
     #[tokio::test]

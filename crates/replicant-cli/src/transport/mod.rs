@@ -223,6 +223,7 @@ impl Config {
                 destination: destination.trim().to_ascii_uppercase(),
                 resources,
                 devices,
+                device_codes: Vec::new(),
                 device_tags,
                 carrier,
             },
