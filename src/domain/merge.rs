@@ -99,6 +99,9 @@ pub fn merge_device(
         incoming.value.stow_capacity = existing.value.stow_capacity;
         incoming.value.stow_used = existing.value.stow_used;
         incoming.value.operational_capacity = existing.value.operational_capacity;
+        incoming.value.grace_period_remaining = existing.value.grace_period_remaining;
+        incoming.value.upkeep_requirements = existing.value.upkeep_requirements;
+        incoming.value.system_status = existing.value.system_status;
         incoming.value.active_directive = existing.value.active_directive;
         incoming.value.travel = existing.value.travel;
     }

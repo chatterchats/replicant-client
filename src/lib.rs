@@ -93,9 +93,9 @@ pub mod managed {
     pub use events::{EventCatchUpReport, EventHistoryQuery, EventWatch, EventsGateway};
     pub use galaxy::{CatalogueReport, GalaxyGateway, ReplicantStarSyncReport};
     pub use gateways::{
-        AccountGateway, AutofactoryPrintOptions, DeviceHandle, DeviceQuery, DeviceQueryChange,
-        DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway, DirectoryGateway,
-        InventoryGateway, LocationDiagnostic, LocationPredicateDiagnostic,
+        AccountGateway, AutofactoryPrintOptions, BlueprintsGateway, DeviceHandle, DeviceQuery,
+        DeviceQueryChange, DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway,
+        DirectoryGateway, InventoryGateway, LocationDiagnostic, LocationPredicateDiagnostic,
         LocationPredicateOutcome, LocationQuery, LocationQueryDiagnostics, ReplicantHandle,
         ReplicantQuery, ReplicantsGateway, TutorialsGateway,
     };
@@ -116,8 +116,9 @@ pub mod managed {
 
 #[cfg(feature = "managed")]
 pub use managed::{
-    AccountGateway, AutofactoryPrintOptions, BobnetGateway, BobnetWatch, CatalogueReport, Client,
-    ClientBuilder, ClientDegradation, ClientStatus, ConfirmAccountWipe, DeviceHandle, DeviceQuery,
+    AccountGateway, AutofactoryPrintOptions, BlueprintsGateway, BobnetGateway, BobnetWatch,
+    CatalogueReport, Client, ClientBuilder, ClientDegradation, ClientStatus, ConfirmAccountWipe,
+    DeviceHandle, DeviceQuery,
     DeviceQueryChange, DeviceQuerySubscription, DeviceRefreshQuery, DeviceWatch, DevicesGateway,
     DirectoryGateway, DynamicCommand, EventCatchUpReport, EventHistoryQuery, EventStreamOptions,
     EventWatch, EventsGateway, FleetController, GalaxyGateway, GalaxyRevisionWatch,

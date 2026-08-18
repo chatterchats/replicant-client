@@ -7,6 +7,7 @@ import type {
   AutomationTrigger,
   DirectorGoalKind,
   DirectorGoalSummary,
+  DirectorRequirementKind,
   DirectorSnapshot,
   EntityKind,
   OperationDescriptor,
@@ -862,6 +863,13 @@ const goalLabels: Record<DirectorGoalKind, string> = {
   establish_beacons: "Establish Beacons",
 };
 
+const requirementLabels: Record<DirectorRequirementKind, string> = {
+  blueprint: "Blueprint",
+  logistics: "Logistics",
+  worker_capacity: "Worker Capacity",
+  connectivity: "Connectivity",
+};
+
 function goalProgress(goal: DirectorGoalSummary) {
   if (goal.progress_total === 0) return null;
   return `${String(goal.progress_current)} / ${String(goal.progress_total)}`;
@@ -910,6 +918,9 @@ function DirectorView() {
   );
   const goalPolicies = Array.from(
     new Map(data.goals.map((goal) => [goal.kind, goal.enabled])).entries(),
+  );
+  const activeRequirements = data.requirements.filter(
+    (requirement) => requirement.status !== "satisfied",
   );
 
   return (
@@ -976,6 +987,34 @@ function DirectorView() {
         >
           {data.workforce.scale_reason}
         </p>
+      ) : null}
+
+      {activeRequirements.length ? (
+        <section className="director-policy">
+          <h3>Shared requirements</h3>
+          <div className="director-goal-grid">
+            {activeRequirements.map((requirement) => (
+              <article
+                className={`director-goal ${requirement.status}`}
+                key={requirement.id}
+              >
+                <header>
+                  <div>
+                    <span>{requirement.region ?? "Global"}</span>
+                    <h3>{requirementLabels[requirement.kind]}</h3>
+                  </div>
+                  <span>priority {requirement.priority}</span>
+                </header>
+                <p>{requirement.target}</p>
+                {requirement.requesters.map((requester) => (
+                  <p key={requester.goal_id}>
+                    <b>{requester.goal_id}:</b> {requester.reason}
+                  </p>
+                ))}
+              </article>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       <section className="director-policy">

@@ -12,9 +12,9 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::domain::{
-    self, AccessScope, Account, AccountId, Atmosphere, Device, DeviceCommand, DeviceFeature,
-    DeviceId, DeviceKey, DeviceStatus, DeviceType, Knowledge, LifeStage, Location, LocationType,
-    Realm, Replicant, ReplicantId, ReplicantKey, ReplicantStatus,
+    self, AccessScope, Account, AccountId, Atmosphere, Blueprint, Device, DeviceCommand,
+    DeviceFeature, DeviceId, DeviceKey, DeviceStatus, DeviceType, Knowledge, LifeStage, Location,
+    LocationType, Realm, Replicant, ReplicantId, ReplicantKey, ReplicantStatus,
 };
 use crate::raw;
 use crate::{Client, Error, Result};
@@ -750,6 +750,56 @@ impl TutorialsGateway {
     pub async fn get(&self, slug: &str) -> Result<raw::tutorials::TutorialDetail> {
         self.client.ensure_open()?;
         Ok(self.client.managed_raw().tutorials().get(slug).await?.value)
+    }
+}
+
+/// Managed blueprint catalogue gateway.
+///
+/// Blueprint knowledge is account-wide and server-authoritative. This gateway
+/// keeps the raw endpoint behind the managed client boundary and returns only
+/// normalized domain values, allowing Director/runtime callers to avoid raw
+/// HTTP without inventing a durable cache before one is needed.
+#[derive(Clone, Debug)]
+pub struct BlueprintsGateway {
+    client: Client,
+}
+
+impl BlueprintsGateway {
+    pub(crate) fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Lists the account's currently unlocked blueprints as normalized values.
+    pub async fn list(&self) -> Result<Vec<Blueprint>> {
+        let started_at = Instant::now();
+        self.client.ensure_open()?;
+        let response = self.client.managed_raw().blueprints().list().await?;
+        let mut blueprints = response
+            .value
+            .blueprints
+            .iter()
+            .map(domain::blueprint)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(normalization)?;
+        blueprints.sort_by(|left, right| left.id.cmp(&right.id));
+        info!(
+            target: "replicant_client::gateway::blueprints",
+            event = "blueprints.list_completed",
+            blueprints = blueprints.len(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "completed managed blueprint catalogue read"
+        );
+        Ok(blueprints)
+    }
+
+    /// Returns the currently unlocked blueprint device types.
+    pub async fn unlocked_device_types(&self) -> Result<BTreeSet<DeviceType>> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter_map(|blueprint| blueprint.device_type)
+            .collect())
     }
 }
 
@@ -2501,6 +2551,9 @@ mod tests {
                 stow_capacity: None,
                 stow_used: None,
                 operational_capacity: None,
+                grace_period_remaining: None,
+                upkeep_requirements: Vec::new(),
+                system_status: None,
                 active_directive: None,
                 travel: None,
                 access: AccessScope::Owned,

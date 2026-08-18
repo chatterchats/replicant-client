@@ -317,6 +317,69 @@ pub struct DirectorGoalSummary {
     pub enabled: bool,
 }
 
+/// Shared prerequisite categories raised by Automation Director goals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorRequirementKind {
+    /// An account-wide printable device blueprint is required.
+    Blueprint,
+    /// A resource/device manifest must be delivered.
+    Logistics,
+    /// A region needs more simultaneously useful Replicant capacity.
+    WorkerCapacity,
+    /// A strategic system must become reachable through the FTL mesh.
+    Connectivity,
+}
+
+/// Durable lifecycle of one shared Director prerequisite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorRequirementStatus {
+    /// The dependency is known but no resolver work has started yet.
+    Pending,
+    /// Resolver work is currently active.
+    Active,
+    /// The dependency is feasible but currently blocked on another prerequisite.
+    Blocked,
+    /// The Director currently considers the dependency satisfied.
+    Satisfied,
+    /// The dependency cannot currently be automated safely.
+    Unavailable,
+}
+
+/// One standing goal requesting a shared Director prerequisite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorRequirementRequester {
+    /// Stable requesting goal instance ID.
+    pub goal_id: String,
+    /// Human-readable explanation of why this goal needs the dependency.
+    pub reason: String,
+    /// Goal-specific dependency pressure used for prioritization.
+    pub priority: u32,
+}
+
+/// Frontend-safe summary of one durable shared Director prerequisite.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorRequirementSummary {
+    /// Deterministic requirement identity used for durable deduplication.
+    pub id: String,
+    /// Requirement category.
+    pub kind: DirectorRequirementKind,
+    /// Current durable lifecycle.
+    pub status: DirectorRequirementStatus,
+    /// Regional scope when applicable.
+    pub region: Option<String>,
+    /// Concise target description.
+    pub target: String,
+    /// Highest current requester priority.
+    pub priority: u32,
+    /// Goals currently requesting this prerequisite.
+    pub requesters: Vec<DirectorRequirementRequester>,
+    /// Resolver/coordinator workflows currently satisfying this prerequisite.
+    #[serde(default)]
+    pub active_workflows: Vec<WorkflowId>,
+}
+
 /// Grow-only workforce pressure summary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectorWorkforceSummary {
@@ -349,6 +412,9 @@ pub struct DirectorSnapshot {
     pub goals: Vec<DirectorGoalSummary>,
     /// Replicant assignments and utilization.
     pub replicants: Vec<DirectorReplicantAssignment>,
+    /// Durable cross-goal prerequisites raised during reconciliation.
+    #[serde(default)]
+    pub requirements: Vec<DirectorRequirementSummary>,
     /// Empire-wide workforce pressure.
     pub workforce: DirectorWorkforceSummary,
 }

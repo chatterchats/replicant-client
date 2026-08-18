@@ -2507,27 +2507,39 @@ fn json_quantities(values: Map<String, Value>) -> Vec<InventoryQuantity> {
 async fn blueprints(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<BlueprintsSnapshot>>, ApiError> {
-    let response = state
+    let mut blueprints = state
         .client()
-        .raw()
         .blueprints()
         .list()
         .await
         .map_err(|_| ApiError::unavailable())?
-        .value;
-    let mut blueprints = response
-        .blueprints
         .into_iter()
         .filter_map(|blueprint| {
             blueprint.device_type.map(|device_type| BlueprintSummary {
-                device_type,
+                device_type: device_type.as_str().to_owned(),
                 short_description: blueprint.short_description,
                 description: blueprint.description,
-                print_time_seconds: blueprint.print_time,
-                resources: json_quantities(blueprint.resources.unwrap_or_default()),
-                components: json_quantities(blueprint.components.unwrap_or_default()),
-                features: blueprint.features.unwrap_or_default(),
-                directives: blueprint.directives.unwrap_or_default(),
+                print_time_seconds: blueprint.print_time_seconds,
+                resources: blueprint
+                    .resources
+                    .into_iter()
+                    .map(|(resource, quantity)| InventoryQuantity { resource, quantity })
+                    .collect(),
+                components: blueprint
+                    .components
+                    .into_iter()
+                    .map(|(resource, quantity)| InventoryQuantity { resource, quantity })
+                    .collect(),
+                features: blueprint
+                    .features
+                    .into_iter()
+                    .map(|feature| feature.as_str().to_owned())
+                    .collect(),
+                directives: blueprint
+                    .directives
+                    .into_iter()
+                    .map(|directive| directive.as_str().to_owned())
+                    .collect(),
                 cargo_capacity: blueprint.cargo_capacity,
                 attach_capacity: blueprint.attach_capacity,
                 stow_capacity: blueprint.stow_capacity,
@@ -5973,6 +5985,9 @@ mod tests {
             stow_capacity: Some(100),
             stow_used: Some(25),
             operational_capacity: OperationalCapacity::new(0.75),
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
             active_directive: None,
             travel: None,
             access: AccessScope::Owned,

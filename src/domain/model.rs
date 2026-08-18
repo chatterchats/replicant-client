@@ -126,6 +126,20 @@ pub struct Device {
     /// a 0-1 fraction; callers should normalize before comparing thresholds.
     #[serde(default)]
     pub operational_capacity: Option<OperationalCapacity>,
+    /// Remaining grace period, in seconds, before the device's upkeep model
+    /// is enforced. This is retained without interpreting the associated
+    /// upkeep payload until the live System Hub shape is captured.
+    #[serde(default)]
+    pub grace_period_remaining: Option<i64>,
+    /// Forward-compatible System Hub/device upkeep requirements. The upstream
+    /// API intentionally leaves these objects open-shaped, so the managed
+    /// domain preserves them verbatim instead of guessing a schema.
+    #[serde(default)]
+    pub upkeep_requirements: Vec<BTreeMap<String, Value>>,
+    /// Forward-compatible system-specific status detail. Kept open-shaped for
+    /// the same reason as `upkeep_requirements`.
+    #[serde(default)]
+    pub system_status: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub active_directive: Option<ActiveDeviceDirective>,
     #[serde(default)]
@@ -465,13 +479,32 @@ pub enum SimulationLifecycle {
     Ended,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Blueprint {
     pub id: BlueprintId,
     pub device_type: Option<DeviceType>,
+    #[serde(default)]
+    pub short_description: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub print_time_seconds: Option<f64>,
+    #[serde(default)]
+    pub resources: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub components: BTreeMap<String, i64>,
     pub features: Vec<DeviceFeature>,
     pub directives: Vec<DeviceDirective>,
+    #[serde(default)]
+    pub cargo_capacity: Option<i64>,
+    #[serde(default)]
+    pub attach_capacity: Option<i64>,
+    #[serde(default)]
+    pub stow_capacity: Option<i64>,
+    #[serde(default)]
+    pub queue_size: Option<i64>,
+    /// Sanitized forward-compatible blueprint fields not yet modeled.
+    #[serde(default)]
+    pub unknown: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

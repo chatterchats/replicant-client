@@ -288,9 +288,91 @@ fn device(
         stow_capacity: raw.stow_capacity,
         stow_used: raw.stow_used,
         operational_capacity: raw.operational_capacity.and_then(OperationalCapacity::new),
+        grace_period_remaining: raw.grace_period_remaining,
+        upkeep_requirements: raw
+            .upkeep_requirements
+            .iter()
+            .map(|value| value.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+            .collect(),
+        system_status: raw
+            .system_status
+            .as_ref()
+            .map(|value| value.iter().map(|(key, value)| (key.clone(), value.clone())).collect()),
         active_directive: active_device_directive(raw),
         travel: travel_state(&raw.travel, &realm),
         access,
+    })
+}
+
+/// Normalizes one unlocked account blueprint into the managed domain.
+///
+/// Blueprint resource/component maps are typed only when the server supplies
+/// integral quantities. Unsupported values are retained in `unknown` so a
+/// future API change does not silently discard evidence.
+pub fn blueprint(raw: &raw::blueprints::Blueprint) -> Result<Blueprint, NormalizeError> {
+    let device_type = required(raw.device_type.as_ref(), "device_type")?;
+    let mut unknown = raw.extra.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+
+    fn quantities(
+        raw: Option<&raw::JsonObject>,
+        unknown: &mut BTreeMap<String, Value>,
+        unknown_key: &str,
+    ) -> BTreeMap<String, i64> {
+        let mut typed = BTreeMap::new();
+        let mut unsupported = serde_json::Map::new();
+        if let Some(raw) = raw {
+            for (key, value) in raw {
+                if let Some(quantity) = value.as_i64() {
+                    typed.insert(key.clone(), quantity);
+                } else {
+                    unsupported.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        if !unsupported.is_empty() {
+            unknown.insert(unknown_key.to_owned(), Value::Object(unsupported));
+        }
+        typed
+    }
+
+    let resources = quantities(raw.resources.as_ref(), &mut unknown, "resources");
+    let components = quantities(raw.components.as_ref(), &mut unknown, "components");
+    if let Some(strength) = raw.strength {
+        unknown.insert("strength".to_owned(), serde_json::json!(strength));
+    }
+    if let Some(current_hubs) = raw.current_hubs {
+        unknown.insert("current_hubs".to_owned(), serde_json::json!(current_hubs));
+    }
+
+    Ok(Blueprint {
+        id: BlueprintId::new(device_type.clone()),
+        device_type: Some(DeviceType::from(device_type)),
+        short_description: raw.short_description.clone(),
+        description: raw.description.clone(),
+        print_time_seconds: raw.print_time,
+        resources,
+        components,
+        features: raw
+            .features
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(DeviceFeature::from)
+            .collect(),
+        directives: raw
+            .directives
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(DeviceDirective::from)
+            .collect(),
+        cargo_capacity: raw.cargo_capacity,
+        attach_capacity: raw.attach_capacity,
+        stow_capacity: raw.stow_capacity,
+        queue_size: raw.queue_size,
+        unknown,
     })
 }
 
@@ -972,6 +1054,11 @@ mod location_tests {
             "stow_capacity": 5,
             "stow_used": 3,
             "operational_capacity": 19.5,
+            "grace_period_remaining": 7200,
+            "upkeep_requirements": [
+                {"resource": "structural", "required": 400, "missing": 120}
+            ],
+            "system_status": {"maintenance": "waiting_for_resources"},
             "available_commands": ["withdraw", "stow"],
             "ami_directive": {
                 "directive": "survey_system",
@@ -1052,6 +1139,22 @@ mod location_tests {
             device.operational_capacity.map(OperationalCapacity::raw),
             Some(19.5)
         );
+        assert_eq!(device.grace_period_remaining, Some(7200));
+        assert_eq!(device.upkeep_requirements.len(), 1);
+        assert_eq!(
+            device.upkeep_requirements[0]
+                .get("missing")
+                .and_then(Value::as_i64),
+            Some(120)
+        );
+        assert_eq!(
+            device
+                .system_status
+                .as_ref()
+                .and_then(|status| status.get("maintenance"))
+                .and_then(Value::as_str),
+            Some("waiting_for_resources")
+        );
         let directive = device
             .active_directive
             .as_ref()
@@ -1072,6 +1175,43 @@ mod location_tests {
         );
         assert_eq!(travel.eta_seconds, Some(42));
         assert_eq!(travel.stage.as_deref(), Some("recalling"));
+    }
+
+    #[test]
+    fn blueprint_normalization_exposes_typed_print_metadata_and_preserves_unknown_values() {
+        let raw: raw::blueprints::Blueprint = serde_json::from_value(serde_json::json!({
+            "device_type": "deep_space_relay_station",
+            "short_description": "Long-range relay",
+            "description": "A relay intended for sparse frontier links.",
+            "print_time": 1800,
+            "resources": {"structural": 900, "future_fractional": 1.5},
+            "components": {"compute_core": 2},
+            "features": ["travel", "future_feature"],
+            "directives": ["future_directive"],
+            "cargo_capacity": 10,
+            "future_field": {"range_ly": 10.0}
+        }))
+        .expect("blueprint should decode");
+
+        let blueprint = blueprint(&raw).expect("blueprint should normalize");
+        assert_eq!(blueprint.id.as_str(), "deep_space_relay_station");
+        assert_eq!(
+            blueprint.device_type.as_ref().map(DeviceType::as_str),
+            Some("deep_space_relay_station")
+        );
+        assert_eq!(blueprint.print_time_seconds, Some(1800.0));
+        assert_eq!(blueprint.resources.get("structural"), Some(&900));
+        assert_eq!(blueprint.components.get("compute_core"), Some(&2));
+        assert_eq!(
+            blueprint
+                .unknown
+                .get("resources")
+                .and_then(Value::as_object)
+                .and_then(|resources| resources.get("future_fractional"))
+                .and_then(Value::as_f64),
+            Some(1.5)
+        );
+        assert!(blueprint.unknown.contains_key("future_field"));
     }
 
     #[test]

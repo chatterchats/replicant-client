@@ -207,6 +207,7 @@ const director: DirectorSnapshot = {
   regions: [],
   goals: [],
   replicants: [],
+  requirements: [],
   workforce: {
     total: 0,
     busy: 0,

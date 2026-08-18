@@ -37,6 +37,9 @@ use crate::{
         new_mining_campaign_workflow, new_observatory_workflow, new_region_establish_workflow,
         new_replicant_provision_workflow, new_scan_tour_workflow,
     },
+    director_requirements::{
+        DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
+    },
     event::active_events,
 };
 
@@ -63,6 +66,12 @@ const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // directly reach at least one known star inside the region.
 const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
 const EVENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+
+const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
+const PRIORITY_EVENT_COMPLETION: u32 = 700;
+const PRIORITY_CATALOGUE: u32 = 500;
+const PRIORITY_MINING: u32 = 450;
+const PRIORITY_CATALOGUE_BLUEPRINT: u32 = 400;
 
 /// Durable Automation Director settings.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,25 +145,6 @@ struct WorkerView {
     role_affinity: Option<String>,
     busy_workflow: Option<WorkflowId>,
     racing_vessel: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ReconcileDemand {
-    by_region: BTreeMap<String, usize>,
-}
-
-impl ReconcileDemand {
-    fn add(&mut self, region: &str) {
-        self.add_count(region, 1);
-    }
-
-    fn add_count(&mut self, region: &str, count: usize) {
-        *self.by_region.entry(region.to_owned()).or_default() += count;
-    }
-
-    fn total(&self) -> usize {
-        self.by_region.values().sum()
-    }
 }
 
 struct GoalReconcileContext<'a> {
@@ -263,6 +253,7 @@ pub fn cached_director_snapshot(
                 regions: Vec::new(),
                 goals,
                 replicants: Vec::new(),
+                requirements: load_requirement_summaries(repository)?,
                 workforce: DirectorWorkforceSummary {
                     total: 0,
                     busy: 0,
@@ -308,6 +299,7 @@ fn apply_durable_snapshot_overrides(
             .map(|replicant| replicant.code.clone())
             .collect();
     }
+    snapshot.requirements = load_requirement_summaries(repository)?;
 
     Ok(())
 }
@@ -417,8 +409,28 @@ pub async fn reconcile_director(
     }
 
     let goal_controls = load_goal_controls(&repository)?;
+    let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
+    let observatory_blueprint_known = if goal_enabled(
+        &goal_controls,
+        DirectorGoalKind::ExpandStarCatalogue,
+    ) && !devices.iter().any(|device| {
+        device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
+    }) {
+        match client.blueprints().unlocked_device_types().await {
+            Ok(blueprints) => Some(blueprints.contains(&DeviceType::GalacticObservatory)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    phase = "requirements",
+                    "Director could not inspect managed blueprint state for catalogue blocker"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut goals = Vec::new();
-    let mut demand = ReconcileDemand::default();
     let mut reserved_workers = BTreeSet::new();
     let automatic = settings.mode == DirectorMode::Automatic && allow_launch;
     let goal_context = GoalReconcileContext {
@@ -434,13 +446,15 @@ pub async fn reconcile_director(
         &regions,
         &workers,
         &mut reserved_workers,
-        &mut demand,
+        &mut requirements,
     )?);
 
     goals.push(reconcile_expand_star_catalogue(
         &goal_context,
         &devices,
         &settings,
+        observatory_blueprint_known,
+        &mut requirements,
     )?);
 
     let established_regions = regions
@@ -520,7 +534,7 @@ pub async fn reconcile_director(
             event_discovery_error.as_deref(),
             &workers,
             &mut reserved_workers,
-            &mut demand,
+            &mut requirements,
         )?);
         goals.push(reconcile_enhance_catalogue(
             client,
@@ -528,7 +542,7 @@ pub async fn reconcile_director(
             region,
             &workers,
             &mut reserved_workers,
-            &mut demand,
+            &mut requirements,
         )?);
         goals.push(reconcile_expand_mining(
             &repository,
@@ -542,7 +556,7 @@ pub async fn reconcile_director(
             &goal_controls,
             automatic,
             &mut reserved_workers,
-            &mut demand,
+            &mut requirements,
             now,
         )?);
         goals.push(waiting_goal(
@@ -563,6 +577,8 @@ pub async fn reconcile_director(
         ));
     }
 
+    let worker_demand = requirements.worker_demand_by_region();
+    let pending_worker_demand = worker_demand.values().sum::<usize>();
     let mut workforce_states = load_workforce_states(&repository)?;
     let scale_recommendations = reconcile_workforce(
         &repository,
@@ -571,7 +587,7 @@ pub async fn reconcile_director(
         &workers,
         &workflows,
         &reserved_workers,
-        &demand,
+        &worker_demand,
         &mut workforce_states,
         automatic,
         now,
@@ -590,9 +606,8 @@ pub async fn reconcile_director(
     };
     let scale_up_recommended = !scale_recommendations.is_empty();
     let scale_reason = scale_recommendations.first().cloned().or_else(|| {
-        (demand.total() > 0).then(|| format!(
-            "{} regional assignment(s) are worker-blocked; waiting for the grow-only scale policy",
-            demand.total()
+        (pending_worker_demand > 0).then(|| format!(
+            "{pending_worker_demand} regional assignment(s) are worker-blocked; waiting for the grow-only scale policy"
         ))
     });
 
@@ -617,13 +632,14 @@ pub async fn reconcile_director(
             .cmp(&right.region)
             .then_with(|| goal_kind_key(left.kind).cmp(goal_kind_key(right.kind)))
     });
+    let requirement_summaries = requirements.persist(&repository)?;
 
     tracing::info!(
         regions = regions.len(),
         established_regions = established_regions.len(),
         workers = workers.len(),
         busy_workers = busy_count,
-        pending_worker_demand = demand.total(),
+        pending_worker_demand,
         scale_up_recommended,
         elapsed_ms = started.elapsed().as_millis(),
         "Director planning pass complete"
@@ -650,12 +666,13 @@ pub async fn reconcile_director(
                 role_affinity: worker.role_affinity,
             })
             .collect(),
+        requirements: requirement_summaries,
         workforce: DirectorWorkforceSummary {
             total,
             busy: busy_count,
             idle,
             idle_ratio,
-            pending_worker_demand: demand.total(),
+            pending_worker_demand,
             scale_up_recommended,
             scale_reason,
         },
@@ -673,7 +690,7 @@ fn reconcile_establish_regions(
     regions: &BTreeMap<String, RegionView>,
     workers: &[WorkerView],
     reserved: &mut BTreeSet<String>,
-    demand: &mut ReconcileDemand,
+    requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EstablishRegions;
     let enabled = goal_enabled(context.controls, kind);
@@ -715,11 +732,21 @@ fn reconcile_establish_regions(
             .collect::<Vec<_>>();
         if target_workers.len() < 2 {
             let needed = 2usize.saturating_sub(target_workers.len());
-            demand.add_count(&target.region, needed);
-            blocker = Some(format!(
+            let reason = format!(
                 "{} needs {needed} additional permanently assigned bootstrap worker(s)",
                 target.region
-            ));
+            );
+            requirements.raise(
+                DirectorRequirement::WorkerCapacity {
+                    region: target.region.clone(),
+                    count: needed,
+                    affinity: Some("bootstrap".to_owned()),
+                },
+                &id,
+                reason.clone(),
+                PRIORITY_REGION_ESTABLISHMENT,
+            )?;
+            blocker = Some(reason);
             next_action = Some(format!(
                 "Grow the {} workforce to two Replicants before dispatching the regional ark",
                 target.region
@@ -793,6 +820,8 @@ fn reconcile_expand_star_catalogue(
     context: &GoalReconcileContext<'_>,
     devices: &[Device],
     settings: &DirectorSettings,
+    observatory_blueprint_known: Option<bool>,
+    requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandStarCatalogue;
     let enabled = goal_enabled(context.controls, kind);
@@ -814,10 +843,24 @@ fn reconcile_expand_star_catalogue(
             Some("Enable this standing goal to prospect for undiscovered stars".to_owned()),
         )
     } else if observatories == 0 {
+        if observatory_blueprint_known == Some(false) {
+            requirements.raise(
+                DirectorRequirement::Blueprint {
+                    device_type: DeviceType::GalacticObservatory.as_str().to_owned(),
+                },
+                &id,
+                "Expanding the star catalogue requires a galactic observatory blueprint",
+                PRIORITY_CATALOGUE_BLUEPRINT,
+            )?;
+        }
         (
             DirectorGoalStatus::Blocked,
             Some("No owned galactic observatory is available".to_owned()),
-            Some("Build and deploy a galactic observatory".to_owned()),
+            Some(if observatory_blueprint_known == Some(false) {
+                "Acquire the galactic observatory blueprint, then build and deploy one".to_owned()
+            } else {
+                "Build and deploy a galactic observatory".to_owned()
+            }),
         )
     } else if !active.is_empty() {
         (
@@ -877,7 +920,7 @@ fn reconcile_event_completion(
     event_discovery_error: Option<&str>,
     workers: &[WorkerView],
     reserved: &mut BTreeSet<String>,
-    demand: &mut ReconcileDemand,
+    requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EventCompletion;
     let enabled = goal_enabled(context.controls, kind);
@@ -937,11 +980,21 @@ fn reconcile_event_completion(
         }
         DirectorGoalStatus::Active
     } else {
-        demand.add(&region.region);
-        blocker = Some(format!(
+        let reason = format!(
             "{} has active events but no idle regional Replicant",
             region.region
-        ));
+        );
+        requirements.raise(
+            DirectorRequirement::WorkerCapacity {
+                region: region.region.clone(),
+                count: 1,
+                affinity: Some("events".to_owned()),
+            },
+            &id,
+            reason.clone(),
+            PRIORITY_EVENT_COMPLETION,
+        )?;
+        blocker = Some(reason);
         next_action = Some("Wait for a regional worker or grow the regional workforce".to_owned());
         DirectorGoalStatus::Blocked
     };
@@ -970,7 +1023,7 @@ fn reconcile_enhance_catalogue(
     region: &RegionView,
     workers: &[WorkerView],
     reserved: &mut BTreeSet<String>,
-    demand: &mut ReconcileDemand,
+    requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EnhanceStarCatalogue;
     let enabled = goal_enabled(context.controls, kind);
@@ -1071,11 +1124,21 @@ fn reconcile_enhance_catalogue(
         DirectorGoalStatus::Active
     } else {
         if worker_shortage > 0 && !pending.is_empty() {
-            demand.add_count(&region.region, worker_shortage);
-            blocker = Some(format!(
+            let reason = format!(
                 "{} catalogue backlog can use {desired_parallel} parallel worker(s), but {worker_shortage} slot(s) lack an idle regional Replicant with a racing vessel",
                 region.region
-            ));
+            );
+            requirements.raise(
+                DirectorRequirement::WorkerCapacity {
+                    region: region.region.clone(),
+                    count: worker_shortage,
+                    affinity: Some("catalogue".to_owned()),
+                },
+                &id,
+                reason.clone(),
+                PRIORITY_CATALOGUE,
+            )?;
+            blocker = Some(reason);
         }
 
         if context.automatic && launch_slots > 0 && !pending.is_empty() && !recently_launched {
@@ -1172,7 +1235,7 @@ fn reconcile_expand_mining(
     controls: &BTreeMap<DirectorGoalKind, bool>,
     automatic: bool,
     reserved: &mut BTreeSet<String>,
-    demand: &mut ReconcileDemand,
+    requirements: &mut DirectorRequirementGraph,
     now: i64,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandMiningOps;
@@ -1259,11 +1322,21 @@ fn reconcile_expand_mining(
         }
         DirectorGoalStatus::Active
     } else {
-        demand.add(&region.region);
-        blocker = Some(format!(
+        let reason = format!(
             "{} has unstaffed known belts but no idle regional Replicant",
             region.region
-        ));
+        );
+        requirements.raise(
+            DirectorRequirement::WorkerCapacity {
+                region: region.region.clone(),
+                count: 1,
+                affinity: Some("mining".to_owned()),
+            },
+            &id,
+            reason.clone(),
+            PRIORITY_MINING,
+        )?;
+        blocker = Some(reason);
         next_action = Some("Free a regional worker or grow the regional workforce".to_owned());
         DirectorGoalStatus::Blocked
     };
@@ -1328,13 +1401,13 @@ fn reconcile_workforce(
     workers: &[WorkerView],
     workflows: &[WorkflowInstance],
     reserved: &BTreeSet<String>,
-    demand: &ReconcileDemand,
+    demand: &BTreeMap<String, usize>,
     states: &mut BTreeMap<String, RegionWorkforceState>,
     automatic: bool,
     now: i64,
 ) -> Result<Vec<String>, ApplicationError> {
     let mut recommendations = Vec::new();
-    for (region_name, pending) in &demand.by_region {
+    for (region_name, pending) in demand {
         if *pending == 0 {
             continue;
         }
@@ -1482,7 +1555,7 @@ fn reconcile_workforce(
         }
     }
     for (region, state) in states.iter_mut() {
-        if !demand.by_region.contains_key(region) {
+        if !demand.contains_key(region) {
             state.pressure_since_ms = None;
         }
         repository.put_document(WORKFORCE_NS, region, state)?;

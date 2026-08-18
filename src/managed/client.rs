@@ -871,6 +871,13 @@ impl Client {
         super::gateways::TutorialsGateway::new(self.clone())
     }
 
+    /// Account-wide unlocked blueprint catalogue normalized behind the
+    /// managed client boundary.
+    #[must_use]
+    pub fn blueprints(&self) -> super::gateways::BlueprintsGateway {
+        super::gateways::BlueprintsGateway::new(self.clone())
+    }
+
     /// Managed device observations commit and publish before this gateway returns.
     #[must_use]
     pub fn devices(&self) -> super::gateways::DevicesGateway {
@@ -1269,6 +1276,9 @@ mod tests {
                 stow_capacity: None,
                 stow_used: None,
                 operational_capacity: None,
+                grace_period_remaining: None,
+                upkeep_requirements: Vec::new(),
+                system_status: None,
                 active_directive: None,
                 travel: None,
                 access: AccessScope::Owned,

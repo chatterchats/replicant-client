@@ -65,6 +65,9 @@ pub mod automation;
 /// Empire-level standing-goal reconciliation and regional workforce planning.
 pub mod orchestration;
 
+/// Durable shared prerequisites raised by Automation Director goals.
+pub mod director_requirements;
+
 /// Declarative desired-state evaluation and fulfillment planning.
 pub mod requirements;
 

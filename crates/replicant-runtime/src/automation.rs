@@ -91,6 +91,11 @@ pub fn logistics_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.delivery").expect("static workflow kind is valid")
 }
 
+/// Internal mixed-manifest logistics workflow used by Director coordinators.
+pub fn logistics_manifest_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("logistics.manifest").expect("static workflow kind is valid")
+}
+
 /// Intent-native directed exploration workflow backed by the relay expansion engine.
 pub fn exploration_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("exploration.frontier").expect("static workflow kind is valid")
@@ -136,6 +141,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
+    registry.register(Arc::new(LogisticsManifestWorkflowFactory::new()))?;
     registry.register(Arc::new(ExplorationWorkflowFactory::new()))?;
     registry.register(Arc::new(EventDeliveryWorkflowFactory::new()))?;
     registry.register(Arc::new(EventTourWorkflowFactory::new()))?;
@@ -296,6 +302,33 @@ pub struct LogisticsIntent {
     /// Return transports after delivery.
     #[serde(default)]
     pub return_transports: bool,
+}
+
+/// Internal Director/coordinator intent for one mixed resource/device shipment.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LogisticsManifestIntent {
+    /// Origin location or system scope.
+    pub origin: String,
+    /// Exact destination location.
+    pub destination: String,
+    /// Resource quantities to move together.
+    #[serde(default)]
+    pub resources: ResourceMap,
+    /// Device quantities to move together.
+    #[serde(default)]
+    pub devices: Vec<DeviceRequest>,
+    /// Optional tagged device groups to include.
+    #[serde(default)]
+    pub device_tags: Vec<String>,
+    /// Return transports after delivery.
+    #[serde(default)]
+    pub return_transports: bool,
+    /// Optional regional ownership hint for observability/policy.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Human-readable reason this manifest exists.
+    #[serde(default)]
+    pub purpose: String,
 }
 
 /// Restart-safe logistics checkpoint. The concrete plan is persisted before mutation.
@@ -526,6 +559,11 @@ workflow_factory!(
     LogisticsWorkflowFactory,
     LogisticsWorkflow,
     logistics_workflow_kind
+);
+workflow_factory!(
+    LogisticsManifestWorkflowFactory,
+    LogisticsManifestWorkflow,
+    logistics_manifest_workflow_kind
 );
 workflow_factory!(
     ExplorationWorkflowFactory,
@@ -971,6 +1009,60 @@ impl WorkflowExecutor for LogisticsWorkflow {
             let mut checkpoint: LogisticsWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
             let request = delivery_request(&intent);
+            let plan = if let Some(plan) = checkpoint.plan.clone() {
+                plan
+            } else {
+                context
+                    .advance_to("planning", &checkpoint)
+                    .map_err(string_error)?;
+                let plan = plan_delivery(&client, &request)
+                    .await
+                    .map_err(string_error)?;
+                for code in plan
+                    .cargo_transports
+                    .iter()
+                    .chain(plan.device_carriers.iter())
+                    .chain(plan.payload_devices.iter().map(|device| &device.code))
+                {
+                    claim_device(context, code)?;
+                }
+                checkpoint.plan = Some(plan.clone());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                plan
+            };
+            checkpoint.started = true;
+            context
+                .advance_to("delivering", &checkpoint)
+                .map_err(string_error)?;
+            let options = DeliveryOptions {
+                return_transports: intent.return_transports,
+                ..DeliveryOptions::default()
+            };
+            let report = execute_delivery(&client, &plan, options)
+                .await
+                .map_err(string_error)?;
+            context.mark_succeeded(Some(report)).map_err(string_error)
+        })
+    }
+}
+
+struct LogisticsManifestWorkflow;
+impl WorkflowExecutor for LogisticsManifestWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: LogisticsManifestIntent = context.config().map_err(string_error)?;
+            let request = manifest_delivery_request(&intent);
+            if request.resources.is_empty()
+                && request.devices.is_empty()
+                && request.device_tags.is_empty()
+            {
+                return Err("logistics manifest must contain at least one payload".to_owned());
+            }
+            let client = managed_client(context)?;
+            let mut checkpoint: LogisticsWorkflowCheckpoint =
+                context.checkpoint().map_err(string_error)?;
             let plan = if let Some(plan) = checkpoint.plan.clone() {
                 plan
             } else {
@@ -1638,6 +1730,17 @@ pub fn new_logistics_workflow(
     )
 }
 
+/// Creates a queued mixed-manifest logistics workflow for Director/coordinator use.
+pub fn new_logistics_manifest_workflow(
+    intent: LogisticsManifestIntent,
+) -> NewWorkflow<LogisticsManifestIntent, LogisticsWorkflowCheckpoint> {
+    queued_workflow(
+        logistics_manifest_workflow_kind(),
+        intent,
+        LogisticsWorkflowCheckpoint::default(),
+    )
+}
+
 /// Creates a queued directed exploration workflow.
 pub fn new_exploration_workflow(
     intent: ExplorationIntent,
@@ -2089,6 +2192,17 @@ fn delivery_request(intent: &LogisticsIntent) -> DeliveryRequest {
     }
 }
 
+fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryRequest {
+    DeliveryRequest {
+        origin: intent.origin.clone(),
+        destination: intent.destination.clone(),
+        resources: intent.resources.clone(),
+        devices: intent.devices.clone(),
+        device_tags: intent.device_tags.clone(),
+        carrier: None,
+    }
+}
+
 async fn resolve_location_system(client: &Client, location: &str) -> Result<String, String> {
     let mut catalogue = client.galaxy().catalogue();
     if catalogue.is_empty() {
@@ -2231,6 +2345,10 @@ mod tests {
         assert_eq!(salvage_workflow_kind().as_str(), "salvage.site");
         assert_eq!(mining_deploy_workflow_kind().as_str(), "mining.deploy");
         assert_eq!(logistics_workflow_kind().as_str(), "logistics.delivery");
+        assert_eq!(
+            logistics_manifest_workflow_kind().as_str(),
+            "logistics.manifest"
+        );
         assert_eq!(exploration_workflow_kind().as_str(), "exploration.frontier");
         assert_eq!(event_delivery_workflow_kind().as_str(), "event.delivery");
         assert_eq!(event_tour_workflow_kind().as_str(), "event.tour");
@@ -2244,5 +2362,25 @@ mod tests {
             region_establish_workflow_kind().as_str(),
             "region.establish"
         );
+    }
+
+    #[test]
+    fn manifest_intent_builds_one_mixed_delivery_request() {
+        let request = manifest_delivery_request(&LogisticsManifestIntent {
+            origin: "SCEPTURUM-BELT-1".to_owned(),
+            destination: "SCEPTURUM-7-L4".to_owned(),
+            resources: [("structural".to_owned(), 400), ("carbon".to_owned(), 80)]
+                .into_iter()
+                .collect(),
+            devices: vec![DeviceRequest {
+                quantity: 1,
+                device_type: "maintenance_drone".to_owned(),
+            }],
+            purpose: "system hub upkeep".to_owned(),
+            ..LogisticsManifestIntent::default()
+        });
+        assert_eq!(request.resources.get("structural"), Some(&400));
+        assert_eq!(request.resources.get("carbon"), Some(&80));
+        assert_eq!(request.devices.len(), 1);
     }
 }

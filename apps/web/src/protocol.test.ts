@@ -7,6 +7,7 @@ import {
   parseCargoResponse,
   parseHealthResponse,
   parseDevicesResponse,
+  parseDirectorResponse,
   parseInventoryResponse,
   parseLeaderboardsResponse,
   parseMiningResponse,
@@ -93,6 +94,63 @@ describe("parseDevicesResponse", () => {
       status: null,
       owner_name: null,
       claim: null,
+    });
+  });
+});
+
+describe("parseDirectorResponse", () => {
+  it("parses durable shared requirements and defaults old snapshots to none", () => {
+    const base = {
+      metadata: { revision: 3, generated_at_ms: 10 },
+      mode: "advisory",
+      regions: [],
+      goals: [],
+      replicants: [],
+      workforce: {
+        total: 0,
+        busy: 0,
+        idle: 0,
+        idle_ratio: 1,
+        pending_worker_demand: 0,
+        scale_up_recommended: false,
+        scale_reason: null,
+      },
+    };
+    const legacy = parseDirectorResponse({
+      protocol_version: 1,
+      payload: base,
+    });
+    expect(legacy.payload.requirements).toEqual([]);
+
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        ...base,
+        requirements: [
+          {
+            id: "worker:beta:catalogue",
+            kind: "worker_capacity",
+            status: "pending",
+            region: "beta",
+            target: "beta: +2 catalogue worker(s)",
+            priority: 500,
+            requesters: [
+              {
+                goal_id: "enhance_star_catalogue:beta",
+                reason: "survey backlog",
+                priority: 500,
+              },
+            ],
+            active_workflows: [],
+          },
+        ],
+      },
+    });
+    expect(parsed.payload.requirements[0]).toMatchObject({
+      id: "worker:beta:catalogue",
+      kind: "worker_capacity",
+      region: "beta",
+      priority: 500,
     });
   });
 });

@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 macro_rules! open_value {
     ($name:ident { $($known:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[non_exhaustive]
         pub enum $name { $($known,)+ Unknown(String) }
         impl $name {

@@ -1,9 +1,9 @@
 //! Read-only player trade-directory reports.
 
-use std::{cmp::Ordering, io};
+use std::{cmp::Ordering, collections::BTreeMap, io};
 
 use replicant_client::{Client, Replicant, SyncDomain};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ReportResult;
@@ -108,6 +108,18 @@ pub struct ShopTrade {
     pub created_at: Option<String>,
 }
 
+/// Typed portion of an open-shaped shop trade exchange bundle.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TradeBundle {
+    #[serde(default)]
+    pub resources: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub devices: BTreeMap<String, i64>,
+    /// Unsupported/unknown exchange fields retained for forward compatibility.
+    #[serde(default)]
+    pub unknown: BTreeMap<String, Value>,
+}
+
 impl ShopTrade {
     /// Returns the trade name or a stable fallback.
     #[must_use]
@@ -137,6 +149,57 @@ impl ShopTrade {
                 .to_ascii_lowercase()
                 .contains(&needle)
     }
+
+    /// Parses the buyer-side requirements without discarding unknown fields.
+    #[must_use]
+    pub fn criteria_bundle(&self) -> TradeBundle {
+        parse_trade_bundle(self.criteria.as_ref())
+    }
+
+    /// Parses the seller-side rewards without discarding unknown fields.
+    #[must_use]
+    pub fn rewards_bundle(&self) -> TradeBundle {
+        parse_trade_bundle(self.rewards.as_ref())
+    }
+}
+
+/// Parses the currently known resource/device trade bundle shape while
+/// preserving anything else for future contract updates.
+#[must_use]
+pub fn parse_trade_bundle(value: Option<&Value>) -> TradeBundle {
+    let Some(Value::Object(root)) = value else {
+        return TradeBundle::default();
+    };
+    let mut bundle = TradeBundle::default();
+    for (kind, value) in root {
+        let target = match kind.as_str() {
+            "resources" => Some(&mut bundle.resources),
+            "devices" => Some(&mut bundle.devices),
+            _ => None,
+        };
+        let Some(target) = target else {
+            bundle.unknown.insert(kind.clone(), value.clone());
+            continue;
+        };
+        let Value::Object(items) = value else {
+            bundle.unknown.insert(kind.clone(), value.clone());
+            continue;
+        };
+        let mut unsupported = serde_json::Map::new();
+        for (item, quantity) in items {
+            if let Some(quantity) = quantity.as_i64() {
+                target.insert(item.clone(), quantity);
+            } else {
+                unsupported.insert(item.clone(), quantity.clone());
+            }
+        }
+        if !unsupported.is_empty() {
+            bundle
+                .unknown
+                .insert(kind.clone(), Value::Object(unsupported));
+        }
+    }
+    bundle
 }
 
 /// Returns owned replicants that can view trade directories.
@@ -316,5 +379,17 @@ mod tests {
             exchange_summary(Some(&serde_json::json!({"IRON": 4, "WATER": 0}))),
             "4 IRON"
         );
+    }
+
+    #[test]
+    fn parses_typed_trade_bundles_and_preserves_unknown_fields() {
+        let bundle = parse_trade_bundle(Some(&serde_json::json!({
+            "resources": {"structural": 200},
+            "devices": {"compute_core": 1},
+            "future": {"standing": 5}
+        })));
+        assert_eq!(bundle.resources.get("structural"), Some(&200));
+        assert_eq!(bundle.devices.get("compute_core"), Some(&1));
+        assert!(bundle.unknown.contains_key("future"));
     }
 }
