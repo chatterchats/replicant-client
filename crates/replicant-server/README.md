@@ -17,11 +17,18 @@ Configuration is environment-based:
 | `REPLICANT_PROFILE` | `default` | Local profile name |
 | `REPLICANT_DB` | `replicant-client.sqlite` | Managed SDK database |
 | `REPLICANT_RUNTIME_DB` | `replicant-runtime.sqlite` | Workflow/runtime database |
+| `REPLICANT_LOG_DIR` | sibling `logs/` directory | Persistent daemon tracing logs |
 | `REPLICANTD_BIND` | `127.0.0.1:8080` | HTTP listen address |
-| `RUST_LOG` | `info` | Tracing filter |
+| `RUST_LOG` | `info` | Tracing filter applied to console and persistent logs |
 
 A non-empty `RS_API_TOKEN` takes precedence over `RS_API_TOKEN_FILE`. Token
 files are trimmed when read and neither source is printed in logs or status.
+
+`replicantd` writes the same tracing stream to stderr and to
+`REPLICANT_LOG_DIR/replicantd.log`. When `REPLICANT_LOG_DIR` is unset, it
+defaults to a `logs/` directory beside `REPLICANT_RUNTIME_DB`. This means a
+native default run writes `./logs/replicantd.log`, while the desktop sidecar
+writes inside the same per-user application-data directory as `runtime.sqlite`.
 
 The default binding is loopback-only. Binding to a non-loopback address is an explicit advanced deployment choice and should only be done behind an authenticated same-origin proxy or on an isolated container network.
 

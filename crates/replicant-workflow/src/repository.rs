@@ -25,7 +25,8 @@ const FINITE_EXECUTION_SCHEMA: &str =
     include_str!("../migrations/0005_finite_execution_history.sql");
 const AUTOMATION_TRIGGER_SCHEMA: &str = include_str!("../migrations/0006_automation_triggers.sql");
 const AUTOMATION_POLICY_SCHEMA: &str = include_str!("../migrations/0007_automation_policy.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 7;
+const RUNTIME_DOCUMENT_SCHEMA: &str = include_str!("../migrations/0008_runtime_documents.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 8;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -238,6 +239,13 @@ impl WorkflowRepository {
             transaction.execute_batch(AUTOMATION_POLICY_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (7)",
+                [],
+            )?;
+        }
+        if found < 8 {
+            transaction.execute_batch(RUNTIME_DOCUMENT_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (8)",
                 [],
             )?;
         }
@@ -474,6 +482,104 @@ impl WorkflowRepository {
             return Err(RepositoryError::TriggerNotFound(id));
         }
         Ok(())
+    }
+
+    /// Reads one application-owned durable JSON document.
+    pub fn read_document(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<(Value, u64)>, RepositoryError> {
+        validate_document_identity(namespace, key)?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT value_json, revision FROM runtime_documents WHERE namespace = ?1 AND key = ?2",
+                params![namespace, key],
+                |row| {
+                    let json: String = row.get(0)?;
+                    let revision: i64 = row.get(1)?;
+                    let value = serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    let revision = u64::try_from(revision).map_err(|_| {
+                        to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
+                    })?;
+                    Ok((value, revision))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Lists application-owned durable JSON documents in stable key order.
+    pub fn list_documents(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, Value, u64)>, RepositoryError> {
+        validate_document_identity(namespace, "_")?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT key, value_json, revision FROM runtime_documents WHERE namespace = ?1 ORDER BY key",
+        )?;
+        let rows = statement.query_map([namespace], |row| {
+            let key: String = row.get(0)?;
+            let json: String = row.get(1)?;
+            let revision: i64 = row.get(2)?;
+            let value = serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let revision = u64::try_from(revision).map_err(|_| {
+                to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
+            })?;
+            Ok((key, value, revision))
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Inserts or replaces one application-owned durable JSON document.
+    pub fn put_document<T: Serialize>(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<u64, RepositoryError> {
+        validate_document_identity(namespace, key)?;
+        let json = serde_json::to_string(value)?;
+        let now = now_millis()?;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO runtime_documents (namespace, key, value_json, revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4)
+             ON CONFLICT(namespace, key) DO UPDATE SET
+                value_json = excluded.value_json,
+                revision = runtime_documents.revision + 1,
+                updated_at = excluded.updated_at",
+            params![namespace, key, json, now],
+        )?;
+        let revision: i64 = connection.query_row(
+            "SELECT revision FROM runtime_documents WHERE namespace = ?1 AND key = ?2",
+            params![namespace, key],
+            |row| row.get(0),
+        )?;
+        u64::try_from(revision).map_err(|_| RepositoryError::InvalidStoredRevision(revision))
+    }
+
+    /// Deletes one application-owned durable JSON document.
+    pub fn delete_document(&self, namespace: &str, key: &str) -> Result<bool, RepositoryError> {
+        validate_document_identity(namespace, key)?;
+        Ok(self.connection()?.execute(
+            "DELETE FROM runtime_documents WHERE namespace = ?1 AND key = ?2",
+            params![namespace, key],
+        )? != 0)
     }
 
     /// Creates and returns a queued workflow atomically.
@@ -1107,6 +1213,18 @@ fn invalid_stored_execution(value: &str) -> rusqlite::Error {
         rusqlite::types::Type::Text,
         format!("invalid persisted finite execution value {value:?}").into(),
     )
+}
+
+fn validate_document_identity(namespace: &str, key: &str) -> Result<(), RepositoryError> {
+    let valid_namespace = !namespace.is_empty()
+        && namespace.len() <= 128
+        && namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        });
+    if !valid_namespace || key.is_empty() || key.len() > 256 {
+        return Err(RepositoryError::InvalidKind(format!("{namespace}:{key}")));
+    }
+    Ok(())
 }
 
 fn now_millis() -> Result<i64, RepositoryError> {

@@ -165,11 +165,13 @@ describe("Intelligence pages", () => {
     expect(playersOnly).not.toContain("Signal received");
     expect(playersOnly).toContain("Include NPC / system chatter");
     expect(normalizeBobnetChannel("general")).toBe("#general");
+    const [firstMessage] = data.messages;
+    if (!firstMessage) throw new Error("expected BobNet fixture message");
     expect(
       channelMessages(
         [
-          { ...data.messages[0]!, id: 2, created_at: "2026-08-16T12:02:00Z" },
-          { ...data.messages[0]!, id: 1, created_at: "2026-08-16T12:01:00Z" },
+          { ...firstMessage, id: 2, created_at: "2026-08-16T12:02:00Z" },
+          { ...firstMessage, id: 1, created_at: "2026-08-16T12:01:00Z" },
         ],
         "general",
       ).map((message) => message.id),

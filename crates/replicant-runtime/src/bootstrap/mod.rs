@@ -224,6 +224,54 @@ fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
 }
 
+/// Goal-level inputs for creating a regional bootstrap plan without exposing CLI plumbing.
+#[derive(Clone, Debug)]
+pub struct BootstrapPlanningRequest {
+    /// Known star in the target region used as the ark rendezvous.
+    pub landing_star: String,
+    /// Existing manufacturing location from which the ark is built.
+    pub source_hub: String,
+    /// Replicant that becomes the regional capital operator.
+    pub operator: String,
+    /// Replicant that performs regional scouting and survey work.
+    pub explorer: String,
+    /// Workflow-owned compatibility mission path.
+    pub mission_file: PathBuf,
+    /// Whether an abandoned scratch plan may be replaced.
+    pub replace_plan: bool,
+}
+
+/// Creates a bootstrap mission from goal-level inputs and returns the durable plan.
+pub async fn plan_bootstrap(
+    client: &Client,
+    request: &BootstrapPlanningRequest,
+) -> AnyResult<BootstrapMission> {
+    let config = Config {
+        command: Command::Plan,
+        region: None,
+        landing_star: Some(request.landing_star.trim().to_ascii_uppercase()),
+        source_hub: request.source_hub.trim().to_ascii_uppercase(),
+        operator: request.operator.clone(),
+        explorer: request.explorer.clone(),
+        mission_file: request.mission_file.clone(),
+        database: PathBuf::new(),
+        profile: BootstrapProfile::default(),
+        seed_quantity: 500,
+        quick_scout_radius_ly: 7.499,
+        survey_radius_ly: 30.0,
+        minimum_sites: 5,
+        maximum_sites: 9,
+        max_concurrency: 8,
+        wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
+        replace_plan: request.replace_plan,
+        verbose: false,
+        log_file: None,
+        json: false,
+    };
+    create_plan(client, &config).await?;
+    load_mission(&request.mission_file)
+}
+
 /// Inputs shared by the reusable bootstrap stage, deliver, and run operations.
 #[derive(Clone, Debug)]
 pub struct BootstrapExecutionRequest {

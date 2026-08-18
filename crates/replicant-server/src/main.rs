@@ -1,21 +1,73 @@
 //! `replicantd` process entry point.
 
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use replicant_runtime::{config::ManagedClientConfig, config::RuntimeConfig, start_managed_client};
-use replicant_server::{AppState, DaemonConfig, router, run_supervisor, run_trigger_engine};
+use replicant_server::{
+    AppState, DaemonConfig, router, run_director, run_supervisor, run_trigger_engine,
+};
 use replicant_workflow::WorkflowRepository;
 use tokio::{net::TcpListener, sync::watch};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::MakeWriter, prelude::*};
+
+#[derive(Clone)]
+struct PersistentLogWriter {
+    file: Arc<Mutex<File>>,
+}
+
+impl PersistentLogWriter {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+}
+
+impl Write for PersistentLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file
+            .lock()
+            .map_err(|_| io::Error::other("persistent log writer lock poisoned"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| io::Error::other("persistent log writer lock poisoned"))?
+            .flush()
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for PersistentLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_filter = replicant_runtime::config::log_filter_directive();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_new(&log_filter).unwrap_or_else(|_| EnvFilter::new("info")))
-        .try_init()?;
-
     let config = DaemonConfig::from_env()?;
+    let log_filter = replicant_runtime::config::log_filter_directive();
+    init_logging(&config, &log_filter)?;
+
+    tracing::info!(
+        managed_database = %config.managed_database.display(),
+        runtime_database = %config.runtime_database.display(),
+        log_directory = %config.log_directory.display(),
+        log_filter = %log_filter,
+        "replicantd startup configuration resolved"
+    );
+
     let client =
         start_managed_client(ManagedClientConfig::from_env(&config.managed_database)?).await?;
     let repository = Arc::new(WorkflowRepository::open(&config.runtime_database)?);
@@ -41,6 +93,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let supervisor = tokio::spawn(run_supervisor(state.clone(), shutdown_rx.clone()));
     let triggers = tokio::spawn(run_trigger_engine(state.clone(), shutdown_rx.clone()));
+    let director = tokio::spawn(run_director(state.clone(), shutdown_rx.clone()));
     let signal = tokio::spawn(shutdown_signal(shutdown_tx.clone()));
     let server_result = axum::serve(listener, router(state))
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
@@ -48,9 +101,49 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let _ = shutdown_tx.send(true);
     supervisor.await?;
     triggers.await?;
+    director.await?;
     signal.abort();
     client.close().await?;
     server_result?;
+    tracing::info!("replicantd shutdown complete");
+    Ok(())
+}
+
+fn init_logging(
+    config: &DaemonConfig,
+    log_filter: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fs::create_dir_all(&config.log_directory)?;
+    let log_path = config.log_directory.join("replicantd.log");
+    let file_writer = PersistentLogWriter::open(&log_path)?;
+    let (filter, filter_error) = match EnvFilter::try_new(log_filter) {
+        Ok(filter) => (filter, None),
+        Err(error) => (EnvFilter::new("info"), Some(error.to_string())),
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_writer(io::stderr),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(file_writer),
+        )
+        .try_init()?;
+
+    if let Some(error) = filter_error {
+        tracing::warn!(
+            requested = %log_filter,
+            error = %error,
+            "invalid RUST_LOG directive; falling back to info"
+        );
+    }
+    tracing::info!(path = %log_path.display(), "persistent daemon logging initialized");
     Ok(())
 }
 

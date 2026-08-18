@@ -2,8 +2,12 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { daemonApi } from "./api";
+import { useDomainQuery } from "./domainQuery";
 import type {
   AutomationTrigger,
+  DirectorGoalKind,
+  DirectorGoalSummary,
+  DirectorSnapshot,
   EntityKind,
   OperationDescriptor,
   ParameterDescriptor,
@@ -16,7 +20,13 @@ import type {
   WorkflowSummary,
 } from "./protocol";
 
-const tabs = ["Active", "Templates", "Schedules", "History"] as const;
+const tabs = [
+  "Director",
+  "Active",
+  "Templates",
+  "Schedules",
+  "History",
+] as const;
 type Tab = (typeof tabs)[number];
 type Values = Record<string, unknown>;
 
@@ -842,6 +852,259 @@ function WorkflowInspector({
   );
 }
 
+const goalLabels: Record<DirectorGoalKind, string> = {
+  establish_regions: "Establish Regions",
+  expand_star_catalogue: "Expand Star Catalogue",
+  enhance_star_catalogue: "Enhance Star Catalogue",
+  expand_mining_ops: "Expand Mining Ops",
+  event_completion: "Event Completion",
+  expand_ftl_network: "Expand FTL Network",
+  establish_beacons: "Establish Beacons",
+};
+
+function goalProgress(goal: DirectorGoalSummary) {
+  if (goal.progress_total === 0) return null;
+  return `${String(goal.progress_current)} / ${String(goal.progress_total)}`;
+}
+
+function DirectorView() {
+  const query = useDomainQuery({
+    slice: "director",
+    fetcher: (signal) => daemonApi.director(signal),
+    isEmpty: () => false,
+  });
+  const [mutating, setMutating] = useState(false);
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const data = query.data;
+
+  const mutate = async (operation: () => Promise<DirectorSnapshot>) => {
+    setMutating(true);
+    setMutationError(null);
+    try {
+      await operation();
+      await query.refresh();
+    } catch (reason) {
+      setMutationError(String(reason));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  if (!data) {
+    return (
+      <p className="empty-state">
+        {query.error ?? "Loading Automation Director…"}
+      </p>
+    );
+  }
+
+  const globalGoals = data.goals.filter((goal) => goal.region === null);
+  const regionalGoals = data.goals.filter((goal) => goal.region !== null);
+  const grouped = regionalGoals.reduce<Record<string, DirectorGoalSummary[]>>(
+    (items, goal) => {
+      const region = goal.region ?? "unknown";
+      (items[region] ??= []).push(goal);
+      return items;
+    },
+    {},
+  );
+  const goalPolicies = Array.from(
+    new Map(data.goals.map((goal) => [goal.kind, goal.enabled])).entries(),
+  );
+
+  return (
+    <section className="director-view">
+      <div className="director-toolbar">
+        <div>
+          <span className="eyebrow">Empire control plane</span>
+          <h2>Automation Director</h2>
+          <p>
+            Standing goals create regional batch campaigns. Replicants keep
+            their regional assignment, and workforce scaling is grow-only: the
+            Director can add workers but never deletes or retires them.
+          </p>
+        </div>
+        <div className="director-mode" aria-label="Director mode">
+          {(["off", "advisory", "automatic"] as const).map((mode) => (
+            <button
+              key={mode}
+              className={data.mode === mode ? "active" : ""}
+              disabled={mutating}
+              onClick={() => void mutate(() => daemonApi.setDirectorMode(mode))}
+            >
+              {mode}
+            </button>
+          ))}
+          <button
+            disabled={mutating}
+            onClick={() => void mutate(() => daemonApi.reconcileDirector())}
+          >
+            Reconcile now
+          </button>
+        </div>
+      </div>
+
+      {mutationError || query.error ? (
+        <p className="form-error">{mutationError ?? query.error}</p>
+      ) : null}
+
+      <div className="director-metrics">
+        <div>
+          <span>Replicants</span>
+          <strong>{data.workforce.total}</strong>
+        </div>
+        <div>
+          <span>Busy</span>
+          <strong>{data.workforce.busy}</strong>
+        </div>
+        <div>
+          <span>Idle reserve</span>
+          <strong>{Math.round(data.workforce.idle_ratio * 100)}%</strong>
+        </div>
+        <div>
+          <span>Worker-blocked</span>
+          <strong>{data.workforce.pending_worker_demand}</strong>
+        </div>
+      </div>
+      {data.workforce.scale_reason ? (
+        <p
+          className={
+            data.workforce.scale_up_recommended
+              ? "director-callout warning"
+              : "director-callout"
+          }
+        >
+          {data.workforce.scale_reason}
+        </p>
+      ) : null}
+
+      <section className="director-policy">
+        <h3>Standing goal policy</h3>
+        <div className="director-policy-grid">
+          {goalPolicies.map(([kind, enabled]) => (
+            <label key={kind} className="director-toggle">
+              <input
+                type="checkbox"
+                checked={enabled}
+                disabled={mutating}
+                onChange={(event) =>
+                  void mutate(() =>
+                    daemonApi.setDirectorGoal(kind, event.target.checked),
+                  )
+                }
+              />
+              {goalLabels[kind]}
+            </label>
+          ))}
+        </div>
+      </section>
+
+      <div className="director-goal-grid">
+        {globalGoals.map((goal) => (
+          <article className={`director-goal ${goal.status}`} key={goal.id}>
+            <header>
+              <div>
+                <span>Global goal</span>
+                <h3>{goalLabels[goal.kind]}</h3>
+              </div>
+              <span>{goal.enabled ? "enabled" : "disabled"}</span>
+            </header>
+            <p>{goal.objective}</p>
+            {goalProgress(goal) ? <strong>{goalProgress(goal)}</strong> : null}
+            {goal.blocker ? (
+              <p>
+                <b>Blocked:</b> {goal.blocker}
+              </p>
+            ) : null}
+            {goal.next_action ? (
+              <p>
+                <b>Next:</b> {goal.next_action}
+              </p>
+            ) : null}
+          </article>
+        ))}
+      </div>
+
+      <section className="director-regions">
+        <h3>Regional campaigns</h3>
+        {data.regions.map((region) => (
+          <article className="director-region" key={region.region}>
+            <header>
+              <div>
+                <span>{region.status}</span>
+                <h4>{region.region}</h4>
+                <small>
+                  {region.hub_system ?? "No foothold"} · {region.known_systems}{" "}
+                  known systems
+                </small>
+              </div>
+              <div className="director-region-workers">
+                {region.replicants.length
+                  ? region.replicants.join(", ")
+                  : "No assigned workers"}
+              </div>
+            </header>
+            <div className="director-regional-goals">
+              {(grouped[region.region] ?? []).map((goal) => {
+                const progress = goalProgress(goal);
+                return (
+                  <div
+                    className={`director-regional-goal ${goal.status}`}
+                    key={goal.id}
+                  >
+                    <div>
+                      <strong>{goalLabels[goal.kind]}</strong>
+                      <span>
+                        {goal.status}
+                        {progress ? ` · ${progress}` : ""}
+                      </span>
+                    </div>
+                    <p>{goal.blocker ?? goal.next_action ?? goal.objective}</p>
+                  </div>
+                );
+              })}
+            </div>
+          </article>
+        ))}
+      </section>
+
+      <section className="director-roster">
+        <h3>Regional Replicant assignments</h3>
+        <div className="director-roster-grid">
+          {data.replicants.map((replicant) => (
+            <label key={replicant.code}>
+              <span>
+                <strong>{replicant.name ?? replicant.code}</strong>
+                <small>{replicant.busy ? "busy" : "idle"}</small>
+              </span>
+              <select
+                value={replicant.region ?? ""}
+                disabled={mutating}
+                onChange={(event) =>
+                  void mutate(() =>
+                    daemonApi.assignDirectorReplicant(
+                      replicant.code,
+                      event.target.value || null,
+                      replicant.role_affinity,
+                    ),
+                  )
+                }
+              >
+                <option value="">Unassigned</option>
+                {data.regions.map((region) => (
+                  <option key={region.region} value={region.region}>
+                    {region.region}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ))}
+        </div>
+      </section>
+    </section>
+  );
+}
+
 export function AutomationsPage({
   workflows,
   entities,
@@ -851,7 +1114,7 @@ export function AutomationsPage({
   entities: Record<string, unknown>;
   selectedWorkflowId?: string;
 }) {
-  const [tab, setTab] = useState<Tab>("Active");
+  const [tab, setTab] = useState<Tab>("Director");
   const [descriptors, setDescriptors] = useState<WorkflowDescriptor[]>([]);
   const [triggerDescriptors, setTriggerDescriptors] = useState<
     OperationDescriptor[]
@@ -890,10 +1153,7 @@ export function AutomationsPage({
           (descriptor) => descriptor.category !== "compatibility",
         );
         setDescriptors(visibleWorkflows);
-        setTriggerDescriptors([
-          ...catalog.actions,
-          ...visibleWorkflows,
-        ]);
+        setTriggerDescriptors([...catalog.actions, ...visibleWorkflows]);
       })
       .catch((reason: unknown) => {
         setError(String(reason));
@@ -1011,7 +1271,9 @@ export function AutomationsPage({
         </p>
       ) : null}
 
-      {tab === "Templates" ? (
+      {tab === "Director" ? (
+        <DirectorView />
+      ) : tab === "Templates" ? (
         <div className="templates-layout">
           <div className="template-list">
             {descriptors.map((descriptor) => (

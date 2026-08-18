@@ -521,6 +521,125 @@ pub async fn plan_event_mission(
     Ok(mission_state(&plan))
 }
 
+/// Returns active discovered event designations in one catalogue region.
+pub async fn active_event_designations_in_region(
+    client: &Client,
+    region: &str,
+) -> AnyResult<Vec<String>> {
+    let scope = EventScope::Region {
+        region: region.trim().to_ascii_lowercase(),
+    };
+    let mut designations = fetch_active_events_in_scope(client, &scope)
+        .await?
+        .into_iter()
+        .filter_map(|event| event.designation)
+        .collect::<Vec<_>>();
+    designations.sort();
+    designations.dedup();
+    Ok(designations)
+}
+
+/// Inputs for creating a restart-safe regional all-events campaign.
+#[derive(Clone, Debug)]
+pub struct EventCampaignPlanningRequest {
+    /// Catalogue region to include.
+    pub region: String,
+    /// Replicant assigned to the campaign.
+    pub replicant: String,
+    /// Manufacturing and staging home.
+    pub home: String,
+    /// Destination for the durable campaign adapter.
+    pub plan_file: PathBuf,
+    /// Whether an existing terminal or abandoned adapter may be replaced.
+    pub replace_plan: bool,
+}
+
+/// Serialized compatibility files required to reconstruct an event campaign.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EventCampaignArchive {
+    /// Serialized campaign document.
+    pub campaign_json: String,
+    /// Serialized child mission documents keyed by their adapter path.
+    pub mission_json: BTreeMap<String, String>,
+}
+
+/// Creates a regional all-events campaign using the existing batch planner.
+pub async fn plan_event_campaign(
+    client: &Client,
+    request: &EventCampaignPlanningRequest,
+) -> AnyResult<EventExecutionState> {
+    client.ready().await?;
+    client.sync().domain(SyncDomain::Replicants).await?;
+    let config = Config {
+        command: Command::Plan,
+        event: None,
+        criterion: None,
+        replicant: Some(request.replicant.clone()),
+        home: request.home.to_uppercase(),
+        database: PathBuf::new(),
+        plan_path: request.plan_file.clone(),
+        replace_plan: request.replace_plan,
+        all_events: true,
+        region: Some(request.region.trim().to_ascii_lowercase()),
+        center: None,
+        radius_ly: None,
+        wait_timeout: Duration::from_secs(21_600),
+        verbose: false,
+        log_file: None,
+        json: true,
+    };
+    let scope = config.event_scope();
+    let events = fetch_active_events_in_scope(client, &scope).await?;
+    let earned = fetch_earned_achievements(client).await?;
+    let definitions = events
+        .iter()
+        .map(normalize_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    campaign::create_campaign(client, &config, definitions, &earned).await?;
+    let campaign = campaign::load_campaign(&request.plan_file)?;
+    campaign::execution_state(&campaign)
+}
+
+/// Captures every compatibility file used by a campaign so workflow state can remain authoritative.
+pub fn archive_event_campaign(plan_file: &Path) -> AnyResult<EventCampaignArchive> {
+    let campaign = campaign::load_campaign(plan_file)?;
+    let mut mission_json = BTreeMap::new();
+    for path in campaign::mission_paths(&campaign) {
+        if path.exists() {
+            mission_json.insert(
+                path.to_string_lossy().into_owned(),
+                fs::read_to_string(path)?,
+            );
+        }
+    }
+    Ok(EventCampaignArchive {
+        campaign_json: fs::read_to_string(plan_file)?,
+        mission_json,
+    })
+}
+
+/// Restores a campaign's compatibility files from a durable workflow checkpoint.
+pub fn restore_event_campaign(plan_file: &Path, archive: &EventCampaignArchive) -> AnyResult<()> {
+    if let Some(parent) = plan_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(plan_file, &archive.campaign_json)?;
+    for (path, contents) in &archive.mission_json {
+        let path = PathBuf::from(path);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 /// Inputs for resuming a persisted event mission or campaign.
 #[derive(Clone, Debug)]
 pub struct EventExecutionRequest {
@@ -903,8 +1022,15 @@ pub async fn discovered_events(
     fetch_events(client, None).await
 }
 
-async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::LocationEvent>> {
+/// Returns every currently active location event discovered by the account.
+pub async fn active_events(
+    client: &Client,
+) -> crate::ReportResult<Vec<raw::events::LocationEvent>> {
     fetch_events(client, Some("active")).await
+}
+
+async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::LocationEvent>> {
+    Ok(active_events(client).await?)
 }
 
 async fn fetch_events(

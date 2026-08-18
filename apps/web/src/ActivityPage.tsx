@@ -55,7 +55,9 @@ export function ActivityPage({
           Device
           <input
             value={device}
-            onChange={(event) => setDevice(event.target.value)}
+            onChange={(event) => {
+              setDevice(event.target.value);
+            }}
             placeholder="Device code"
           />
         </label>
@@ -63,7 +65,9 @@ export function ActivityPage({
           Event name
           <input
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              setName(event.target.value);
+            }}
             placeholder="ami.survey.digest"
           />
         </label>
@@ -71,7 +75,9 @@ export function ActivityPage({
           <input
             type="checkbox"
             checked={amiOnly}
-            onChange={(event) => setAmiOnly(event.target.checked)}
+            onChange={(event) => {
+              setAmiOnly(event.target.checked);
+            }}
           />{" "}
           AMI digests only
         </label>
@@ -92,37 +98,40 @@ export function ActivityPage({
               </tr>
             </thead>
             <tbody>
-              {data.events.map((event) => (
-                <tr key={event.id}>
-                  <td>{new Date(event.occurred_at).toLocaleString()}</td>
-                  <td>
-                    <strong>{event.name}</strong>
-                    {event.ami_digest && <small>AMI digest</small>}
-                  </td>
-                  <td>
-                    {event.device ? (
-                      <button onClick={() => onSelectEntity(event.device!)}>
-                        {event.device.id}
-                      </button>
-                    ) : event.replicant ? (
-                      <button onClick={() => onSelectEntity(event.replicant!)}>
-                        {event.replicant.id}
-                      </button>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td>{event.location ?? event.system ?? "—"}</td>
-                  <td className="activity-details-cell">
-                    <details>
-                      <summary>
-                        {event.ami_digest ? "View report" : "View payload"}
-                      </summary>
-                      <ActivityEventDetails event={event} />
-                    </details>
-                  </td>
-                </tr>
-              ))}
+              {data.events.map((event) => {
+                const subject = event.device ?? event.replicant;
+                return (
+                  <tr key={event.id}>
+                    <td>{new Date(event.occurred_at).toLocaleString()}</td>
+                    <td>
+                      <strong>{event.name}</strong>
+                      {event.ami_digest && <small>AMI digest</small>}
+                    </td>
+                    <td>
+                      {subject ? (
+                        <button
+                          onClick={() => {
+                            onSelectEntity(subject);
+                          }}
+                        >
+                          {subject.id}
+                        </button>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td>{event.location ?? event.system ?? "—"}</td>
+                    <td className="activity-details-cell">
+                      <details>
+                        <summary>
+                          {event.ami_digest ? "View report" : "View payload"}
+                        </summary>
+                        <ActivityEventDetails event={event} />
+                      </details>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

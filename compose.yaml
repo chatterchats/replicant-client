@@ -12,9 +12,10 @@ services:
       REPLICANTD_TOKEN: ${REPLICANTD_TOKEN:?set REPLICANTD_TOKEN; the daemon can start workflows and run actions}
       REPLICANT_DB: /var/lib/replicant/replicant-client.sqlite
       REPLICANT_RUNTIME_DB: /var/lib/replicant/replicant-runtime.sqlite
+      REPLICANT_LOG_DIR: /var/lib/replicant/logs
       REPLICANT_PROFILE: ${REPLICANT_PROFILE:-default}
       RS_API_TOKEN: ${RS_API_TOKEN:-}
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: ${RUST_LOG:-info,replicant_runtime::orchestration=debug,replicant_workflow::supervisor=info,replicant_server=info,replicant_client::raw::http=warn}
     user: "${REPLICANT_UID:-1000}:${REPLICANT_GID:-1000}"
     expose:
       - "8080"
@@ -28,6 +29,11 @@ services:
       - app
     restart: unless-stopped
     stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
       interval: 30s

@@ -1050,7 +1050,9 @@ export function App() {
                   setGalaxyCommand(command);
                   dispatch({ type: "set_palette", open: true });
                 }}
-                onOpenLeaderboards={() => navigate("Leaderboards")}
+                onOpenLeaderboards={() => {
+                  navigate("Leaderboards");
+                }}
               />
             ) : shell.page === "Settings" ? (
               <SettingsPage />
@@ -1125,14 +1127,18 @@ export function App() {
                 <button
                   role="tab"
                   aria-selected={activityTab === "workflow"}
-                  onClick={() => setActivityTab("workflow")}
+                  onClick={() => {
+                    setActivityTab("workflow");
+                  }}
                 >
                   Workflow activity
                 </button>
                 <button
                   role="tab"
                   aria-selected={activityTab === "ami"}
-                  onClick={() => setActivityTab("ami")}
+                  onClick={() => {
+                    setActivityTab("ami");
+                  }}
                 >
                   AMI reports
                 </button>

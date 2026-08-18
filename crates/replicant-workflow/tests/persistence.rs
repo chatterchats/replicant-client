@@ -79,6 +79,50 @@ fn creates_reads_and_lists_typed_workflows() {
 }
 
 #[test]
+fn persists_namespaced_runtime_documents_with_revisions() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let first = serde_json::json!({"mode": "advisory", "enabled": true});
+    let second = serde_json::json!({"mode": "automatic", "enabled": true});
+
+    assert_eq!(
+        repository
+            .put_document("director.settings", "singleton", &first)
+            .expect("insert document"),
+        0
+    );
+    let (stored, revision) = repository
+        .read_document("director.settings", "singleton")
+        .expect("read document")
+        .expect("document exists");
+    assert_eq!(stored, first);
+    assert_eq!(revision, 0);
+
+    assert_eq!(
+        repository
+            .put_document("director.settings", "singleton", &second)
+            .expect("update document"),
+        1
+    );
+    assert_eq!(
+        repository
+            .list_documents("director.settings")
+            .expect("list documents"),
+        vec![("singleton".to_owned(), second, 1)]
+    );
+    assert!(
+        repository
+            .delete_document("director.settings", "singleton")
+            .expect("delete document")
+    );
+    assert!(
+        repository
+            .read_document("director.settings", "singleton")
+            .expect("read deleted document")
+            .is_none()
+    );
+}
+
+#[test]
 fn updates_state_and_rejects_invalid_or_stale_transitions() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
     let queued = create(&repository, None);
@@ -434,7 +478,7 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         WorkflowRepository::open(&path),
         Err(RepositoryError::UnsupportedDatabaseSchema {
             found: 99,
-            supported: 7
+            supported: 8
         })
     ));
     fs::remove_file(path).expect("remove test database");

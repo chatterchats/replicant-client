@@ -15,8 +15,9 @@ COPY --from=builder /src/target/release/replicantd /usr/local/bin/replicantd
 USER replicant
 ENV REPLICANT_DB=/var/lib/replicant/replicant-client.sqlite \
     REPLICANT_RUNTIME_DB=/var/lib/replicant/replicant-runtime.sqlite \
+    REPLICANT_LOG_DIR=/var/lib/replicant/logs \
     REPLICANTD_BIND=127.0.0.1:8080 \
-    RUST_LOG=info
+    RUST_LOG=info,replicant_runtime::orchestration=debug,replicant_workflow::supervisor=info,replicant_server=info,replicant_client::raw::http=warn
 VOLUME ["/var/lib/replicant"]
 EXPOSE 8080
 STOPSIGNAL SIGTERM

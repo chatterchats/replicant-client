@@ -15,22 +15,31 @@ use replicant_client::{
     Client, DeviceType, MiningDirective, Operation, OperationStatus, SurveyDirective,
     domain::AccessScope,
 };
+use replicant_printing::{
+    PrintRequest,
+    managed::{QueueOptions, printing_status_in_system, queue_prints_with_components},
+};
 use replicant_transport::{
     DeliveryOptions, DeliveryPlan, DeliveryRequest, DeviceRequest, ResourceMap, execute_delivery,
     plan_delivery,
 };
 use replicant_workflow::{
-    BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError, ResourceKey,
-    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry,
-    WorkflowStatus,
+    BoxWorkflowFuture, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowContext,
+    WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bootstrap::{
+    BootstrapExecutionRequest, BootstrapPlanningRequest, plan_bootstrap, run_bootstrap,
+};
+
 use crate::{
     event::{
-        EventExecutionRequest, EventPlanningRequest, execute_event_mission, plan_event_mission,
-        prestage_event_mission,
+        EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest,
+        EventPlanningRequest, archive_event_campaign, execute_event_campaign,
+        execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
+        restore_event_campaign,
     },
     mining::{MiningExpansionRequest, execute_expansion},
     observatory::auto_prospect,
@@ -72,6 +81,11 @@ pub fn mining_deploy_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("mining.deploy").expect("static workflow kind is valid")
 }
 
+/// Intent-native batch mining expansion workflow.
+pub fn mining_campaign_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("mining.campaign").expect("static workflow kind is valid")
+}
+
 /// Intent-native point-to-point logistics workflow.
 pub fn logistics_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.delivery").expect("static workflow kind is valid")
@@ -92,9 +106,25 @@ pub fn event_tour_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("event.tour").expect("static workflow kind is valid")
 }
 
+/// Regional batch event campaign workflow.
+pub fn event_campaign_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("event.campaign").expect("static workflow kind is valid")
+}
+
 /// Intent-native bounded observatory prospect workflow.
 pub fn observatory_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("observatory.search").expect("static workflow kind is valid")
+}
+
+/// Grow-only workforce provisioning workflow.
+pub fn replicant_provision_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("replicant.provision").expect("static workflow kind is valid")
+}
+
+/// Stable kind for autonomous regional bootstrap.
+#[must_use]
+pub fn region_establish_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("region.establish").expect("valid workflow kind")
 }
 
 /// Registers intent-native application workflows.
@@ -104,11 +134,15 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(ScanTourWorkflowFactory::new()))?;
     registry.register(Arc::new(SalvageWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
+    registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
     registry.register(Arc::new(ExplorationWorkflowFactory::new()))?;
     registry.register(Arc::new(EventDeliveryWorkflowFactory::new()))?;
     registry.register(Arc::new(EventTourWorkflowFactory::new()))?;
-    registry.register(Arc::new(ObservatoryWorkflowFactory::new()))
+    registry.register(Arc::new(EventCampaignWorkflowFactory::new()))?;
+    registry.register(Arc::new(ObservatoryWorkflowFactory::new()))?;
+    registry.register(Arc::new(ReplicantProvisionWorkflowFactory::new()))?;
+    registry.register(Arc::new(RegionEstablishWorkflowFactory::new()))
 }
 
 /// Shared player intent for system/belt survey automation.
@@ -135,6 +169,9 @@ pub struct ScanTourIntent {
     /// Maximum systems to include in one route.
     #[serde(default = "default_tour_limit")]
     pub system_limit: usize,
+    /// Optional exact system allowlist. When present, the route is constrained to these systems.
+    #[serde(default)]
+    pub target_systems: Option<Vec<String>>,
     /// Optional replicant to pin.
     #[serde(default)]
     pub replicant: Option<String>,
@@ -199,6 +236,22 @@ pub struct MiningDeployIntent {
     /// Optional manufacturing hub.
     #[serde(default)]
     pub hub: Option<String>,
+}
+
+/// Goal-level input for a batch mining expansion.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiningCampaignIntent {
+    /// Target systems selected by the regional campaign planner.
+    pub systems: Vec<String>,
+    /// Optional regional Replicant to pin.
+    #[serde(default)]
+    pub replicant: Option<String>,
+    /// Optional regional manufacturing hub.
+    #[serde(default)]
+    pub hub: Option<String>,
+    /// Maximum concurrently dispatched site workers.
+    #[serde(default = "default_mining_concurrency")]
+    pub max_concurrency: usize,
 }
 
 /// Restart-safe mining deployment checkpoint.
@@ -318,6 +371,84 @@ pub struct EventTourCheckpoint {
     pub plan_json: Option<String>,
 }
 
+/// Regional event-completion campaign intent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventCampaignIntent {
+    /// Catalogue region whose active events should be planned as one campaign.
+    pub region: String,
+    /// Optional regional replicant to pin.
+    #[serde(default)]
+    pub replicant: Option<String>,
+    /// Optional regional manufacturing/staging home.
+    #[serde(default)]
+    pub home: Option<String>,
+}
+
+/// Durable regional event campaign checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EventCampaignCheckpoint {
+    /// Resolved regional replicant.
+    pub replicant: Option<String>,
+    /// Resolved regional home.
+    pub home: Option<String>,
+    /// Authoritative archive of campaign and child mission compatibility files.
+    pub archive: Option<EventCampaignArchive>,
+}
+
+/// Intent for creating one additional regional Replicant.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicantProvisionIntent {
+    /// Region that will permanently own the new worker.
+    pub region: String,
+    /// Manufacturing/staging location shared with the source Replicant.
+    pub home: String,
+    /// Existing Replicant used as the replication source.
+    pub source_replicant: String,
+    /// Cradle vessel type to manufacture for the new worker.
+    #[serde(default = "default_worker_cradle")]
+    pub cradle_type: String,
+    /// Optional explicit display name for the new Replicant.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Restart-safe workforce provisioning checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReplicantProvisionCheckpoint {
+    /// Unique manufacturing tag for this provisioning request.
+    pub tag: Option<String>,
+    /// Printed empty matrix code.
+    pub matrix: Option<String>,
+    /// Printed cradle vessel code.
+    pub cradle: Option<String>,
+    /// Whether the target matrix has been stowed into its cradle.
+    pub stowed: bool,
+    /// New Replicant code after successful replication.
+    pub new_replicant: Option<String>,
+}
+
+/// Goal-level intent for establishing one newly discovered region.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RegionEstablishIntent {
+    /// Canonical target region.
+    pub region: String,
+    /// Known landing star in that region.
+    pub landing_star: String,
+    /// Existing source manufacturing hub.
+    pub source_hub: String,
+    /// Replicant assigned as regional operator.
+    pub operator: String,
+    /// Replicant assigned as regional explorer.
+    pub explorer: String,
+}
+
+/// Durable regional bootstrap adapter checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RegionEstablishCheckpoint {
+    /// Latest serialized parent bootstrap mission.
+    pub mission_json: Option<String>,
+}
+
 /// Optional observatory pin for automatic prospecting.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ObservatoryIntent {
@@ -361,16 +492,76 @@ macro_rules! workflow_factory {
     };
 }
 
-workflow_factory!(ScanSystemWorkflowFactory, ScanSystemWorkflow, scan_system_workflow_kind);
-workflow_factory!(ScanBeltWorkflowFactory, ScanBeltWorkflow, scan_belt_workflow_kind);
-workflow_factory!(ScanTourWorkflowFactory, ScanTourWorkflow, scan_tour_workflow_kind);
-workflow_factory!(SalvageWorkflowFactory, SalvageWorkflow, salvage_workflow_kind);
-workflow_factory!(MiningDeployWorkflowFactory, MiningDeployWorkflow, mining_deploy_workflow_kind);
-workflow_factory!(LogisticsWorkflowFactory, LogisticsWorkflow, logistics_workflow_kind);
-workflow_factory!(ExplorationWorkflowFactory, ExplorationWorkflow, exploration_workflow_kind);
-workflow_factory!(EventDeliveryWorkflowFactory, EventDeliveryWorkflow, event_delivery_workflow_kind);
-workflow_factory!(EventTourWorkflowFactory, EventTourWorkflow, event_tour_workflow_kind);
-workflow_factory!(ObservatoryWorkflowFactory, ObservatoryWorkflow, observatory_workflow_kind);
+workflow_factory!(
+    ScanSystemWorkflowFactory,
+    ScanSystemWorkflow,
+    scan_system_workflow_kind
+);
+workflow_factory!(
+    ScanBeltWorkflowFactory,
+    ScanBeltWorkflow,
+    scan_belt_workflow_kind
+);
+workflow_factory!(
+    ScanTourWorkflowFactory,
+    ScanTourWorkflow,
+    scan_tour_workflow_kind
+);
+workflow_factory!(
+    SalvageWorkflowFactory,
+    SalvageWorkflow,
+    salvage_workflow_kind
+);
+workflow_factory!(
+    MiningDeployWorkflowFactory,
+    MiningDeployWorkflow,
+    mining_deploy_workflow_kind
+);
+workflow_factory!(
+    MiningCampaignWorkflowFactory,
+    MiningCampaignWorkflow,
+    mining_campaign_workflow_kind
+);
+workflow_factory!(
+    LogisticsWorkflowFactory,
+    LogisticsWorkflow,
+    logistics_workflow_kind
+);
+workflow_factory!(
+    ExplorationWorkflowFactory,
+    ExplorationWorkflow,
+    exploration_workflow_kind
+);
+workflow_factory!(
+    EventDeliveryWorkflowFactory,
+    EventDeliveryWorkflow,
+    event_delivery_workflow_kind
+);
+workflow_factory!(
+    EventTourWorkflowFactory,
+    EventTourWorkflow,
+    event_tour_workflow_kind
+);
+workflow_factory!(
+    EventCampaignWorkflowFactory,
+    EventCampaignWorkflow,
+    event_campaign_workflow_kind
+);
+workflow_factory!(
+    ObservatoryWorkflowFactory,
+    ObservatoryWorkflow,
+    observatory_workflow_kind
+);
+workflow_factory!(
+    ReplicantProvisionWorkflowFactory,
+    ReplicantProvisionWorkflow,
+    replicant_provision_workflow_kind
+);
+workflow_factory!(
+    RegionEstablishWorkflowFactory,
+    RegionEstablishWorkflow,
+    region_establish_workflow_kind
+);
 
 struct ScanSystemWorkflow;
 impl WorkflowExecutor for ScanSystemWorkflow {
@@ -404,10 +595,14 @@ async fn run_survey_controller(
     mode: SurveyModeIntent,
 ) -> Result<(), String> {
     let client = managed_client(context)?;
-    let mut checkpoint: ControllerWorkflowCheckpoint = context.checkpoint().map_err(string_error)?;
+    let mut checkpoint: ControllerWorkflowCheckpoint =
+        context.checkpoint().map_err(string_error)?;
     let controller = resolve_controller(
         &client,
-        checkpoint.controller.as_deref().or(intent.controller.as_deref()),
+        checkpoint
+            .controller
+            .as_deref()
+            .or(intent.controller.as_deref()),
         DeviceType::SurveyController,
         Some(&intent.system),
     )
@@ -415,7 +610,9 @@ async fn run_survey_controller(
     checkpoint.controller = Some(controller.clone());
     claim_device(context, &controller)?;
     claim_target(context, "survey-system", &intent.system)?;
-    context.advance_to("configuring", &checkpoint).map_err(string_error)?;
+    context
+        .advance_to("configuring", &checkpoint)
+        .map_err(string_error)?;
 
     let survey = client
         .devices()
@@ -440,14 +637,20 @@ async fn run_survey_controller(
         .map_err(string_error)?;
         await_success(&operation).await?;
         checkpoint.directive_set = true;
-        context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+        context
+            .persist_checkpoint(&checkpoint)
+            .map_err(string_error)?;
     }
     if !checkpoint.launched {
-        context.advance_to("launching", &checkpoint).map_err(string_error)?;
+        context
+            .advance_to("launching", &checkpoint)
+            .map_err(string_error)?;
         let operation = survey.launch().await.map_err(string_error)?;
         await_success(&operation).await?;
         checkpoint.launched = true;
-        context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+        context
+            .persist_checkpoint(&checkpoint)
+            .map_err(string_error)?;
     }
     if !wait_controller_completion(context, &client, &controller, &mut checkpoint).await? {
         return Ok(());
@@ -504,6 +707,7 @@ impl WorkflowExecutor for ScanTourWorkflow {
                 center: intent.center,
                 radius_ly: intent.radius_ly,
                 system_limit: intent.system_limit.max(1),
+                target_systems: intent.target_systems,
                 star_detail_concurrency: 8,
                 mission_file: plan_file,
                 controller: None,
@@ -550,7 +754,10 @@ impl WorkflowExecutor for SalvageWorkflow {
             let system = resolve_location_system(&client, &intent.location).await?;
             let controller = resolve_controller(
                 &client,
-                checkpoint.controller.as_deref().or(intent.controller.as_deref()),
+                checkpoint
+                    .controller
+                    .as_deref()
+                    .or(intent.controller.as_deref()),
                 DeviceType::MiningController,
                 Some(&system),
             )
@@ -558,7 +765,9 @@ impl WorkflowExecutor for SalvageWorkflow {
             checkpoint.controller = Some(controller.clone());
             claim_device(context, &controller)?;
             claim_target(context, "salvage-site", &intent.location)?;
-            context.advance_to("configuring", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("configuring", &checkpoint)
+                .map_err(string_error)?;
 
             let mining = client
                 .devices()
@@ -577,14 +786,20 @@ impl WorkflowExecutor for SalvageWorkflow {
                     .map_err(string_error)?;
                 await_success(&operation).await?;
                 checkpoint.directive_set = true;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
             }
             if !checkpoint.launched {
-                context.advance_to("launching", &checkpoint).map_err(string_error)?;
+                context
+                    .advance_to("launching", &checkpoint)
+                    .map_err(string_error)?;
                 let operation = mining.launch().await.map_err(string_error)?;
                 await_success(&operation).await?;
                 checkpoint.launched = true;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
             }
             if !wait_controller_completion(context, &client, &controller, &mut checkpoint).await? {
                 return Ok(());
@@ -606,7 +821,8 @@ impl WorkflowExecutor for MiningDeployWorkflow {
         Box::pin(async move {
             let intent: MiningDeployIntent = context.config().map_err(string_error)?;
             let client = managed_client(context)?;
-            let mut checkpoint: MiningDeployCheckpoint = context.checkpoint().map_err(string_error)?;
+            let mut checkpoint: MiningDeployCheckpoint =
+                context.checkpoint().map_err(string_error)?;
             let replicant = match checkpoint.replicant.clone() {
                 Some(value) => value,
                 None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
@@ -624,7 +840,9 @@ impl WorkflowExecutor for MiningDeployWorkflow {
             let plan_file = scratch_file(context.id(), "mining-plan.json")?;
             materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
             checkpoint.started = true;
-            context.advance_to("deploying", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("deploying", &checkpoint)
+                .map_err(string_error)?;
             let request = MiningExpansionRequest {
                 systems: vec![intent.system],
                 replicant,
@@ -654,7 +872,84 @@ impl WorkflowExecutor for MiningDeployWorkflow {
             };
             if plan_file.exists() {
                 checkpoint.plan_json = Some(read_json(&plan_file)?);
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            match result {
+                Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    }
+}
+
+struct MiningCampaignWorkflow;
+impl WorkflowExecutor for MiningCampaignWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: MiningCampaignIntent = context.config().map_err(string_error)?;
+            if intent.systems.is_empty() {
+                return context
+                    .mark_succeeded(Some(serde_json::json!({"systems": []})))
+                    .map_err(string_error);
+            }
+            let client = managed_client(context)?;
+            let mut checkpoint: MiningDeployCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            let replicant = match checkpoint.replicant.clone() {
+                Some(value) => value,
+                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            };
+            let hub = match checkpoint.hub.clone() {
+                Some(value) => value,
+                None => resolve_home(&client, intent.hub.as_deref()).await?,
+            };
+            checkpoint.replicant = Some(replicant.clone());
+            checkpoint.hub = Some(hub.clone());
+            claim(context, ResourceKey::Replicant(replicant.clone()))?;
+            for system in &intent.systems {
+                claim_target(context, "mining-target", system)?;
+            }
+            claim_target(context, "location", &hub)?;
+            let plan_file = scratch_file(context.id(), "mining-campaign.json")?;
+            materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
+            checkpoint.started = true;
+            context
+                .advance_to("expanding", &checkpoint)
+                .map_err(string_error)?;
+            let request = MiningExpansionRequest {
+                systems: intent.systems,
+                replicant,
+                hub,
+                mission_file: plan_file.clone(),
+                wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                max_concurrency: intent.max_concurrency.max(1),
+            };
+            let execution = execute_expansion(&client, &request);
+            tokio::pin!(execution);
+            let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
+            let result = loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = checkpoint_interval.tick() => {
+                        match context.control_request().map_err(string_error)? {
+                            replicant_workflow::ControlRequest::Continue => {}
+                            replicant_workflow::ControlRequest::Pause
+                            | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                        }
+                        if plan_file.exists() {
+                            checkpoint.plan_json = Some(read_json(&plan_file)?);
+                            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                        }
+                    }
+                }
+            };
+            if plan_file.exists() {
+                checkpoint.plan_json = Some(read_json(&plan_file)?);
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
             }
             match result {
                 Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
@@ -679,8 +974,12 @@ impl WorkflowExecutor for LogisticsWorkflow {
             let plan = if let Some(plan) = checkpoint.plan.clone() {
                 plan
             } else {
-                context.advance_to("planning", &checkpoint).map_err(string_error)?;
-                let plan = plan_delivery(&client, &request).await.map_err(string_error)?;
+                context
+                    .advance_to("planning", &checkpoint)
+                    .map_err(string_error)?;
+                let plan = plan_delivery(&client, &request)
+                    .await
+                    .map_err(string_error)?;
                 for code in plan
                     .cargo_transports
                     .iter()
@@ -690,11 +989,15 @@ impl WorkflowExecutor for LogisticsWorkflow {
                     claim_device(context, code)?;
                 }
                 checkpoint.plan = Some(plan.clone());
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
                 plan
             };
             checkpoint.started = true;
-            context.advance_to("delivering", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("delivering", &checkpoint)
+                .map_err(string_error)?;
             let options = DeliveryOptions {
                 return_transports: intent.return_transports,
                 ..DeliveryOptions::default()
@@ -735,7 +1038,9 @@ impl WorkflowExecutor for ExplorationWorkflow {
             } else {
                 clear_scratch_file(&plan_file)?;
             }
-            context.advance_to("exploring", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("exploring", &checkpoint)
+                .map_err(string_error)?;
             let request = RelayExpansionRequest {
                 replicant,
                 hub,
@@ -789,7 +1094,9 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
             let plan_file = scratch_file(context.id(), "event-plan.json")?;
             materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
             if checkpoint.plan_json.is_none() {
-                context.advance_to("planning", &checkpoint).map_err(string_error)?;
+                context
+                    .advance_to("planning", &checkpoint)
+                    .map_err(string_error)?;
                 plan_event_mission(
                     &client,
                     &EventPlanningRequest {
@@ -804,12 +1111,16 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
                 .await
                 .map_err(string_error)?;
                 checkpoint.plan_json = Some(read_json(&plan_file)?);
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
             }
 
             loop {
                 materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
-                context.advance_to("staging", &checkpoint).map_err(string_error)?;
+                context
+                    .advance_to("staging", &checkpoint)
+                    .map_err(string_error)?;
                 let result = prestage_event_mission(
                     &client,
                     &EventExecutionRequest::new(
@@ -821,7 +1132,9 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
                 .map_err(string_error)?;
                 checkpoint.plan_json = Some(read_json(&plan_file)?);
                 checkpoint.ready = result.ready;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
                 if result.ready {
                     return context
                         .mark_succeeded(Some(serde_json::json!({
@@ -862,7 +1175,9 @@ impl WorkflowExecutor for EventTourWorkflow {
                             .map_err(string_error)?,
                     };
                     checkpoint.delivery_child = Some(child.id);
-                    context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
                     child.id
                 }
             };
@@ -894,9 +1209,9 @@ impl WorkflowExecutor for EventTourWorkflow {
                 }
             };
             let delivery: EventDeliveryCheckpoint = child.checkpoint().map_err(string_error)?;
-            let plan_json = delivery
-                .plan_json
-                .ok_or_else(|| "completed event delivery child has no plan checkpoint".to_owned())?;
+            let plan_json = delivery.plan_json.ok_or_else(|| {
+                "completed event delivery child has no plan checkpoint".to_owned()
+            })?;
             let replicant = delivery
                 .replicant
                 .or(intent.replicant.clone())
@@ -904,7 +1219,9 @@ impl WorkflowExecutor for EventTourWorkflow {
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.plan_json = Some(plan_json.clone());
             claim(context, ResourceKey::Replicant(replicant))?;
-            context.advance_to("resolving", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("resolving", &checkpoint)
+                .map_err(string_error)?;
             let plan_file = scratch_file(context.id(), "event-plan.json")?;
             materialize_json(&plan_file, Some(&plan_json))?;
             let state = execute_event_mission(
@@ -917,8 +1234,157 @@ impl WorkflowExecutor for EventTourWorkflow {
             .await
             .map_err(string_error)?;
             checkpoint.plan_json = Some(read_json(&plan_file)?);
-            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
             context.mark_succeeded(Some(state)).map_err(string_error)
+        })
+    }
+}
+
+struct EventCampaignWorkflow;
+impl WorkflowExecutor for EventCampaignWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: EventCampaignIntent = context.config().map_err(string_error)?;
+            let client = managed_client(context)?;
+            let mut checkpoint: EventCampaignCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            claim_target(context, "event-campaign", &intent.region)?;
+            let replicant = match checkpoint.replicant.clone() {
+                Some(value) => value,
+                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            };
+            let home = match checkpoint.home.clone() {
+                Some(value) => value,
+                None => resolve_home(&client, intent.home.as_deref()).await?,
+            };
+            checkpoint.replicant = Some(replicant.clone());
+            checkpoint.home = Some(home.clone());
+            claim(context, ResourceKey::Replicant(replicant.clone()))?;
+            let plan_file = scratch_file(context.id(), "event-campaign.json")?;
+            if let Some(archive) = checkpoint.archive.as_ref() {
+                restore_event_campaign(&plan_file, archive).map_err(string_error)?;
+            } else {
+                clear_scratch_file(&plan_file)?;
+                context
+                    .advance_to("planning", &checkpoint)
+                    .map_err(string_error)?;
+                plan_event_campaign(
+                    &client,
+                    &EventCampaignPlanningRequest {
+                        region: intent.region.clone(),
+                        replicant,
+                        home,
+                        plan_file: plan_file.clone(),
+                        replace_plan: true,
+                    },
+                )
+                .await
+                .map_err(string_error)?;
+                checkpoint.archive =
+                    Some(archive_event_campaign(&plan_file).map_err(string_error)?);
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            context
+                .advance_to("executing", &checkpoint)
+                .map_err(string_error)?;
+            let execution_request = EventExecutionRequest::new(
+                plan_file.clone(),
+                Duration::from_secs(DEFAULT_WAIT_SECONDS),
+            );
+            let execution = execute_event_campaign(&client, &execution_request);
+            tokio::pin!(execution);
+            let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
+            let state = loop {
+                tokio::select! {
+                    result = &mut execution => break result.map_err(string_error)?,
+                    _ = checkpoint_interval.tick() => {
+                        match context.control_request().map_err(string_error)? {
+                            replicant_workflow::ControlRequest::Continue => {}
+                            replicant_workflow::ControlRequest::Pause
+                            | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                        }
+                        if let Ok(archive) = archive_event_campaign(&plan_file) {
+                            checkpoint.archive = Some(archive);
+                            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                        }
+                    }
+                }
+            };
+            checkpoint.archive = Some(archive_event_campaign(&plan_file).map_err(string_error)?);
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            context.mark_succeeded(Some(state)).map_err(string_error)
+        })
+    }
+}
+
+struct RegionEstablishWorkflow;
+impl WorkflowExecutor for RegionEstablishWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: RegionEstablishIntent = context.config().map_err(string_error)?;
+            let client = managed_client(context)?;
+            let mut checkpoint: RegionEstablishCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            claim(context, ResourceKey::Replicant(intent.operator.clone()))?;
+            claim(context, ResourceKey::Replicant(intent.explorer.clone()))?;
+            claim_target(context, "region-establish", &intent.region)?;
+            claim_target(context, "bootstrap-source", &intent.source_hub)?;
+            let plan_file = scratch_file(context.id(), "regional-bootstrap.json")?;
+            if let Some(json) = checkpoint.mission_json.as_deref() {
+                std::fs::write(&plan_file, json).map_err(string_error)?;
+            } else {
+                clear_scratch_file(&plan_file)?;
+                context
+                    .advance_to("planning", &checkpoint)
+                    .map_err(string_error)?;
+                let mission = plan_bootstrap(
+                    &client,
+                    &BootstrapPlanningRequest {
+                        landing_star: intent.landing_star.clone(),
+                        source_hub: intent.source_hub.clone(),
+                        operator: intent.operator.clone(),
+                        explorer: intent.explorer.clone(),
+                        mission_file: plan_file.clone(),
+                        replace_plan: true,
+                    },
+                )
+                .await
+                .map_err(string_error)?;
+                checkpoint.mission_json =
+                    Some(serde_json::to_string(&mission).map_err(string_error)?);
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            context
+                .advance_to("bootstrapping", &checkpoint)
+                .map_err(string_error)?;
+            let mission = run_bootstrap(
+                &client,
+                &BootstrapExecutionRequest::new(
+                    plan_file,
+                    Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                ),
+            )
+            .await
+            .map_err(string_error)?;
+            checkpoint.mission_json = Some(serde_json::to_string(&mission).map_err(string_error)?);
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            context
+                .mark_succeeded(Some(serde_json::json!({
+                    "region": mission.region,
+                    "capital_system": mission.capital_system,
+                    "capital_belt": mission.capital_belt,
+                })))
+                .map_err(string_error)
         })
     }
 }
@@ -932,7 +1398,9 @@ impl WorkflowExecutor for ObservatoryWorkflow {
             if let Some(observatory) = intent.observatory.as_deref() {
                 claim_device(context, observatory)?;
             }
-            context.advance_to("prospecting", &Value::Null).map_err(string_error)?;
+            context
+                .advance_to("prospecting", &Value::Null)
+                .map_err(string_error)?;
             let report = auto_prospect(&client, intent.observatory.as_deref())
                 .await
                 .map_err(string_error)?;
@@ -941,54 +1409,317 @@ impl WorkflowExecutor for ObservatoryWorkflow {
     }
 }
 
+struct ReplicantProvisionWorkflow;
+impl WorkflowExecutor for ReplicantProvisionWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: ReplicantProvisionIntent = context.config().map_err(string_error)?;
+            let client = managed_client(context)?;
+            let mut checkpoint: ReplicantProvisionCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            claim_target(context, "regional-workforce", &intent.region)?;
+            claim(
+                context,
+                ResourceKey::Replicant(intent.source_replicant.clone()),
+            )?;
+            let tag = checkpoint
+                .tag
+                .get_or_insert_with(|| format!("dir-p:{}", &context.id().to_string()[..8]))
+                .clone();
+            let requests = [
+                PrintRequest::new("empty_replicant_matrix", 1),
+                PrintRequest::new(intent.cradle_type.clone(), 1),
+            ];
+            if checkpoint.matrix.is_none() || checkpoint.cradle.is_none() {
+                context
+                    .advance_to("manufacturing", &checkpoint)
+                    .map_err(string_error)?;
+                let mut options = QueueOptions::at(intent.home.clone());
+                options.tags = vec![tag.clone()];
+                options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+                queue_prints_with_components(&client, &requests, &options)
+                    .await
+                    .map_err(string_error)?;
+                loop {
+                    let status = printing_status_in_system(
+                        &client,
+                        &intent.home,
+                        &requests,
+                        std::slice::from_ref(&tag),
+                    )
+                    .await
+                    .map_err(string_error)?;
+                    if status
+                        .requested
+                        .iter()
+                        .all(|line| line.available >= line.required)
+                    {
+                        break;
+                    }
+                    match context.control_request().map_err(string_error)? {
+                        replicant_workflow::ControlRequest::Continue => {}
+                        replicant_workflow::ControlRequest::Pause
+                        | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                let devices = tagged_devices(&client, &tag).await?;
+                checkpoint.matrix = devices
+                    .iter()
+                    .find(|(_, kind)| kind == "empty_replicant_matrix")
+                    .map(|(code, _)| code.clone());
+                checkpoint.cradle = devices
+                    .iter()
+                    .find(|(_, kind)| kind == &intent.cradle_type)
+                    .map(|(code, _)| code.clone());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            let matrix = checkpoint
+                .matrix
+                .clone()
+                .ok_or_else(|| "provisioned empty Replicant matrix was not found".to_owned())?;
+            let cradle = checkpoint
+                .cradle
+                .clone()
+                .ok_or_else(|| "provisioned cradle vessel was not found".to_owned())?;
+            claim_device(context, &matrix)?;
+            claim_device(context, &cradle)?;
+            if !checkpoint.stowed {
+                context
+                    .advance_to("stowing_matrix", &checkpoint)
+                    .map_err(string_error)?;
+                let operation = client
+                    .devices()
+                    .get(&matrix)
+                    .await
+                    .map_err(string_error)?
+                    .command(replicant_client::raw::devices::DeviceCommand::Stow {
+                        target: Some(cradle.clone()),
+                    })
+                    .await
+                    .map_err(string_error)?;
+                await_success(&operation).await?;
+                checkpoint.stowed = true;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            if checkpoint.new_replicant.is_none() {
+                context
+                    .advance_to("replicating", &checkpoint)
+                    .map_err(string_error)?;
+                let source_matrix =
+                    source_matrix_for_replicant(&client, &intent.source_replicant).await?;
+                claim_device(context, &source_matrix)?;
+                let operation = client
+                    .devices()
+                    .get(&source_matrix)
+                    .await
+                    .map_err(string_error)?
+                    .command(replicant_client::raw::devices::DeviceCommand::Replicate {
+                        target: matrix.clone(),
+                        name: intent.name.clone(),
+                    })
+                    .await
+                    .map_err(string_error)?;
+                await_success(&operation).await?;
+                client
+                    .sync()
+                    .domain(replicant_client::SyncDomain::Replicants)
+                    .await
+                    .map_err(string_error)?;
+                let cradle_snapshot = client
+                    .devices()
+                    .get(&cradle)
+                    .await
+                    .map_err(string_error)?
+                    .snapshot()
+                    .await
+                    .map_err(string_error)?;
+                checkpoint.new_replicant = cradle_snapshot
+                    .relationships
+                    .hosting_replicant
+                    .as_ref()
+                    .map(|replicant| replicant.id.as_str().to_owned());
+                if checkpoint.new_replicant.is_none() {
+                    return Err("replication completed but the new Replicant is not yet visible in managed state".to_owned());
+                }
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            context
+                .mark_succeeded(Some(serde_json::json!({
+                    "region": intent.region,
+                    "replicant": checkpoint.new_replicant,
+                    "cradle": cradle,
+                })))
+                .map_err(string_error)
+        })
+    }
+}
+
 /// Creates a queued system-scan workflow.
-pub fn new_scan_system_workflow(intent: ScanIntent) -> NewWorkflow<ScanIntent, ControllerWorkflowCheckpoint> {
-    NewWorkflow::new(scan_system_workflow_kind(), SCHEMA_VERSION, intent, ControllerWorkflowCheckpoint::default())
+pub fn new_scan_system_workflow(
+    intent: ScanIntent,
+) -> NewWorkflow<ScanIntent, ControllerWorkflowCheckpoint> {
+    queued_workflow(
+        scan_system_workflow_kind(),
+        intent,
+        ControllerWorkflowCheckpoint::default(),
+    )
 }
 
 /// Creates a queued belt-search workflow.
-pub fn new_scan_belt_workflow(intent: ScanIntent) -> NewWorkflow<ScanIntent, ControllerWorkflowCheckpoint> {
-    NewWorkflow::new(scan_belt_workflow_kind(), SCHEMA_VERSION, intent, ControllerWorkflowCheckpoint::default())
+pub fn new_scan_belt_workflow(
+    intent: ScanIntent,
+) -> NewWorkflow<ScanIntent, ControllerWorkflowCheckpoint> {
+    queued_workflow(
+        scan_belt_workflow_kind(),
+        intent,
+        ControllerWorkflowCheckpoint::default(),
+    )
 }
 
 /// Creates a queued bounded survey-tour workflow.
-pub fn new_scan_tour_workflow(intent: ScanTourIntent) -> NewWorkflow<ScanTourIntent, ScanTourCheckpoint> {
-    NewWorkflow::new(scan_tour_workflow_kind(), SCHEMA_VERSION, intent, ScanTourCheckpoint::default())
+pub fn new_scan_tour_workflow(
+    intent: ScanTourIntent,
+) -> NewWorkflow<ScanTourIntent, ScanTourCheckpoint> {
+    queued_workflow(
+        scan_tour_workflow_kind(),
+        intent,
+        ScanTourCheckpoint::default(),
+    )
 }
 
 /// Creates a queued salvage workflow.
-pub fn new_salvage_workflow(intent: SalvageIntent) -> NewWorkflow<SalvageIntent, ControllerWorkflowCheckpoint> {
-    NewWorkflow::new(salvage_workflow_kind(), SCHEMA_VERSION, intent, ControllerWorkflowCheckpoint::default())
+pub fn new_salvage_workflow(
+    intent: SalvageIntent,
+) -> NewWorkflow<SalvageIntent, ControllerWorkflowCheckpoint> {
+    queued_workflow(
+        salvage_workflow_kind(),
+        intent,
+        ControllerWorkflowCheckpoint::default(),
+    )
 }
 
 /// Creates a queued one-system mining deployment workflow.
-pub fn new_mining_deploy_workflow(intent: MiningDeployIntent) -> NewWorkflow<MiningDeployIntent, MiningDeployCheckpoint> {
-    NewWorkflow::new(mining_deploy_workflow_kind(), SCHEMA_VERSION, intent, MiningDeployCheckpoint::default())
+pub fn new_mining_deploy_workflow(
+    intent: MiningDeployIntent,
+) -> NewWorkflow<MiningDeployIntent, MiningDeployCheckpoint> {
+    queued_workflow(
+        mining_deploy_workflow_kind(),
+        intent,
+        MiningDeployCheckpoint::default(),
+    )
+}
+
+/// Creates a queued batch mining expansion workflow.
+pub fn new_mining_campaign_workflow(
+    intent: MiningCampaignIntent,
+) -> NewWorkflow<MiningCampaignIntent, MiningDeployCheckpoint> {
+    queued_workflow(
+        mining_campaign_workflow_kind(),
+        intent,
+        MiningDeployCheckpoint::default(),
+    )
 }
 
 /// Creates a queued logistics workflow.
-pub fn new_logistics_workflow(intent: LogisticsIntent) -> NewWorkflow<LogisticsIntent, LogisticsWorkflowCheckpoint> {
-    NewWorkflow::new(logistics_workflow_kind(), SCHEMA_VERSION, intent, LogisticsWorkflowCheckpoint::default())
+pub fn new_logistics_workflow(
+    intent: LogisticsIntent,
+) -> NewWorkflow<LogisticsIntent, LogisticsWorkflowCheckpoint> {
+    queued_workflow(
+        logistics_workflow_kind(),
+        intent,
+        LogisticsWorkflowCheckpoint::default(),
+    )
 }
 
 /// Creates a queued directed exploration workflow.
-pub fn new_exploration_workflow(intent: ExplorationIntent) -> NewWorkflow<ExplorationIntent, ExplorationWorkflowCheckpoint> {
-    NewWorkflow::new(exploration_workflow_kind(), SCHEMA_VERSION, intent, ExplorationWorkflowCheckpoint::default())
+pub fn new_exploration_workflow(
+    intent: ExplorationIntent,
+) -> NewWorkflow<ExplorationIntent, ExplorationWorkflowCheckpoint> {
+    queued_workflow(
+        exploration_workflow_kind(),
+        intent,
+        ExplorationWorkflowCheckpoint::default(),
+    )
 }
 
 /// Creates a queued event-delivery workflow.
-pub fn new_event_delivery_workflow(intent: EventIntent) -> NewWorkflow<EventIntent, EventDeliveryCheckpoint> {
-    NewWorkflow::new(event_delivery_workflow_kind(), SCHEMA_VERSION, intent, EventDeliveryCheckpoint::default())
+pub fn new_event_delivery_workflow(
+    intent: EventIntent,
+) -> NewWorkflow<EventIntent, EventDeliveryCheckpoint> {
+    queued_workflow(
+        event_delivery_workflow_kind(),
+        intent,
+        EventDeliveryCheckpoint::default(),
+    )
 }
 
 /// Creates a queued event-tour workflow.
-pub fn new_event_tour_workflow(intent: EventIntent) -> NewWorkflow<EventIntent, EventTourCheckpoint> {
-    NewWorkflow::new(event_tour_workflow_kind(), SCHEMA_VERSION, intent, EventTourCheckpoint::default())
+pub fn new_event_tour_workflow(
+    intent: EventIntent,
+) -> NewWorkflow<EventIntent, EventTourCheckpoint> {
+    queued_workflow(
+        event_tour_workflow_kind(),
+        intent,
+        EventTourCheckpoint::default(),
+    )
+}
+
+/// Creates a queued grow-only Replicant provisioning workflow.
+pub fn new_replicant_provision_workflow(
+    intent: ReplicantProvisionIntent,
+) -> NewWorkflow<ReplicantProvisionIntent, ReplicantProvisionCheckpoint> {
+    queued_workflow(
+        replicant_provision_workflow_kind(),
+        intent,
+        ReplicantProvisionCheckpoint::default(),
+    )
+}
+
+/// Creates a queued regional event campaign workflow.
+pub fn new_event_campaign_workflow(
+    intent: EventCampaignIntent,
+) -> NewWorkflow<EventCampaignIntent, EventCampaignCheckpoint> {
+    queued_workflow(
+        event_campaign_workflow_kind(),
+        intent,
+        EventCampaignCheckpoint::default(),
+    )
+}
+
+/// Creates a queued autonomous regional bootstrap workflow.
+pub fn new_region_establish_workflow(
+    intent: RegionEstablishIntent,
+) -> NewWorkflow<RegionEstablishIntent, RegionEstablishCheckpoint> {
+    queued_workflow(
+        region_establish_workflow_kind(),
+        intent,
+        RegionEstablishCheckpoint::default(),
+    )
 }
 
 /// Creates a queued observatory prospect workflow.
-pub fn new_observatory_workflow(intent: ObservatoryIntent) -> NewWorkflow<ObservatoryIntent, Value> {
-    NewWorkflow::new(observatory_workflow_kind(), SCHEMA_VERSION, intent, Value::Null)
+pub fn new_observatory_workflow(
+    intent: ObservatoryIntent,
+) -> NewWorkflow<ObservatoryIntent, Value> {
+    queued_workflow(observatory_workflow_kind(), intent, Value::Null)
+}
+
+fn queued_workflow<C, P>(kind: WorkflowKind, config: C, checkpoint: P) -> NewWorkflow<C, P> {
+    NewWorkflow {
+        kind,
+        schema_version: SCHEMA_VERSION,
+        config,
+        checkpoint,
+        current_step: Some("queued".to_owned()),
+        parent_id: None,
+    }
 }
 
 fn default_tour_radius() -> f64 {
@@ -1063,9 +1794,12 @@ fn string_error(error: impl std::fmt::Display) -> String {
 }
 
 fn claim(context: &WorkflowContext, key: ResourceKey) -> Result<(), String> {
-    match context.acquire_claim(key).map_err(string_error)? {
-        ClaimAcquireOutcome::Acquired | ClaimAcquireOutcome::AlreadyOwned => Ok(()),
-        ClaimAcquireOutcome::Busy { owner } => Err(format!("resource is already claimed by {owner}")),
+    match context.acquire_claim(key) {
+        Ok(_) => Ok(()),
+        Err(RepositoryError::ClaimConflict { owner, .. }) => {
+            Err(format!("resource is already claimed by workflow {owner}"))
+        }
+        Err(error) => Err(string_error(error)),
     }
 }
 
@@ -1089,7 +1823,11 @@ async fn resolve_survey_assignment(
     pinned_vessel: Option<&str>,
 ) -> Result<(String, String), String> {
     if let Some(vessel_code) = pinned_vessel.filter(|value| !value.trim().is_empty()) {
-        let handle = client.devices().get(vessel_code).await.map_err(string_error)?;
+        let handle = client
+            .devices()
+            .get(vessel_code)
+            .await
+            .map_err(string_error)?;
         let snapshot = handle.snapshot().await.map_err(string_error)?;
         if snapshot.access != AccessScope::Owned {
             return Err(format!("racing vessel {vessel_code} is not account-owned"));
@@ -1114,7 +1852,11 @@ async fn resolve_survey_assignment(
                 "racing vessel {vessel_code} hosts {hosted}, not requested replicant {expected}"
             ));
         }
-        client.replicants().get_owned(&hosted).await.map_err(string_error)?;
+        client
+            .replicants()
+            .get_owned(&hosted)
+            .await
+            .map_err(string_error)?;
         return Ok((hosted, vessel_code.to_owned()));
     }
 
@@ -1211,7 +1953,11 @@ async fn resolve_controller(
 
 async fn resolve_replicant(client: &Client, pinned: Option<&str>) -> Result<String, String> {
     if let Some(code) = pinned.filter(|value| !value.trim().is_empty()) {
-        client.replicants().get_owned(code).await.map_err(string_error)?;
+        client
+            .replicants()
+            .get_owned(code)
+            .await
+            .map_err(string_error)?;
         return Ok(code.to_owned());
     }
     client
@@ -1253,7 +1999,9 @@ async fn wait_controller_completion(
     controller: &str,
     checkpoint: &mut ControllerWorkflowCheckpoint,
 ) -> Result<bool, String> {
-    context.advance_to("running", checkpoint).map_err(string_error)?;
+    context
+        .advance_to("running", checkpoint)
+        .map_err(string_error)?;
     loop {
         match context.control_request().map_err(string_error)? {
             replicant_workflow::ControlRequest::Continue => {}
@@ -1279,11 +2027,15 @@ async fn wait_controller_completion(
             if !checkpoint.observed_active || checkpoint.idle_observations != 0 {
                 checkpoint.observed_active = true;
                 checkpoint.idle_observations = 0;
-                context.persist_checkpoint(checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(checkpoint)
+                    .map_err(string_error)?;
             }
         } else {
             checkpoint.idle_observations = checkpoint.idle_observations.saturating_add(1);
-            context.persist_checkpoint(checkpoint).map_err(string_error)?;
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
             if checkpoint.observed_active || checkpoint.idle_observations >= 6 {
                 return Ok(true);
             }
@@ -1360,6 +2112,68 @@ fn designation_in_system(location: &str, system: &str) -> bool {
     location == system || location.starts_with(&format!("{system}-"))
 }
 
+async fn tagged_devices(client: &Client, tag: &str) -> Result<Vec<(String, String)>, String> {
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .with_tag(tag.to_owned())
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut devices = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if let Some(kind) = snapshot.device_type.as_ref() {
+            devices.push((handle.id().as_str().to_owned(), kind.as_str().to_owned()));
+        }
+    }
+    devices.sort();
+    Ok(devices)
+}
+
+async fn source_matrix_for_replicant(client: &Client, replicant: &str) -> Result<String, String> {
+    let snapshot = client
+        .replicants()
+        .get_owned(replicant)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let host = snapshot
+        .hosted_device
+        .as_ref()
+        .ok_or_else(|| format!("Replicant {replicant} has no hosted cradle device"))?;
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    for handle in handles {
+        let device = handle.snapshot().await.map_err(string_error)?;
+        if device
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str() == "replicant_matrix")
+            && device.relationships.stowed_in.as_ref() == Some(host)
+        {
+            return Ok(handle.id().as_str().to_owned());
+        }
+    }
+    Err(format!("could not locate Replicant matrix for {replicant}"))
+}
+
+fn default_worker_cradle() -> String {
+    "racing_vessel".to_owned()
+}
+
+fn default_mining_concurrency() -> usize {
+    4
+}
+
 fn scratch_file(workflow_id: WorkflowId, name: &str) -> Result<PathBuf, String> {
     let directory = std::env::temp_dir()
         .join("replicant-client-automation")
@@ -1420,5 +2234,15 @@ mod tests {
         assert_eq!(exploration_workflow_kind().as_str(), "exploration.frontier");
         assert_eq!(event_delivery_workflow_kind().as_str(), "event.delivery");
         assert_eq!(event_tour_workflow_kind().as_str(), "event.tour");
+        assert_eq!(event_campaign_workflow_kind().as_str(), "event.campaign");
+        assert_eq!(mining_campaign_workflow_kind().as_str(), "mining.campaign");
+        assert_eq!(
+            replicant_provision_workflow_kind().as_str(),
+            "replicant.provision"
+        );
+        assert_eq!(
+            region_establish_workflow_kind().as_str(),
+            "region.establish"
+        );
     }
 }

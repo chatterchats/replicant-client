@@ -45,7 +45,8 @@ export type DomainSlice =
   | "standing"
   | "leaderboards"
   | "workflows"
-  | "operations";
+  | "operations"
+  | "director";
 
 export interface DaemonHealth {
   status: HealthStatus;
@@ -75,6 +76,70 @@ export type AutomationControlAction =
 export interface AutomationControlResponse {
   automation: AutomationStatus;
   affected_workflows: number;
+}
+
+export type DirectorMode = "off" | "advisory" | "automatic";
+export type DirectorGoalKind =
+  | "establish_regions"
+  | "expand_star_catalogue"
+  | "enhance_star_catalogue"
+  | "expand_mining_ops"
+  | "event_completion"
+  | "expand_ftl_network"
+  | "establish_beacons";
+export type DirectorGoalStatus = "satisfied" | "active" | "blocked" | "waiting";
+export type DirectorRegionStatus =
+  "discovered" | "establishing" | "established";
+
+export interface DirectorReplicantAssignment {
+  code: string;
+  name: string | null;
+  region: string | null;
+  busy: boolean;
+  workflow_id: string | null;
+  role_affinity: string | null;
+}
+
+export interface DirectorRegionSummary {
+  region: string;
+  status: DirectorRegionStatus;
+  hub_system: string | null;
+  hub_location: string | null;
+  replicants: string[];
+  known_systems: number;
+}
+
+export interface DirectorGoalSummary {
+  id: string;
+  kind: DirectorGoalKind;
+  region: string | null;
+  status: DirectorGoalStatus;
+  objective: string;
+  blocker: string | null;
+  next_action: string | null;
+  progress_current: number;
+  progress_total: number;
+  active_workflows: string[];
+  enabled: boolean;
+}
+
+export interface DirectorWorkforceSummary {
+  total: number;
+  busy: number;
+  idle: number;
+  idle_ratio: number;
+  pending_worker_demand: number;
+  scale_up_recommended: boolean;
+  scale_reason: string | null;
+}
+
+export interface DirectorSnapshot {
+  metadata: SnapshotMetadata;
+  mode: DirectorMode;
+  regions: DirectorRegionSummary[];
+  goals: DirectorGoalSummary[];
+  replicants: DirectorReplicantAssignment[];
+  workforce: DirectorWorkforceSummary;
 }
 
 export interface SnapshotMetadata {
@@ -1072,6 +1137,11 @@ function nullableString(value: unknown, name: string): string | null {
   return value;
 }
 
+function requiredString(value: unknown, name: string): string {
+  if (typeof value !== "string") throw new Error(`Invalid ${name}`);
+  return value;
+}
+
 function number(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value))
     throw new Error(`Invalid ${name}`);
@@ -1161,6 +1231,7 @@ const domainSlices = [
   "leaderboards",
   "workflows",
   "operations",
+  "director",
 ] as const;
 const inventoryOwnerKinds = ["account", "replicant", "location"] as const;
 const apiTokenSources = ["environment", "secret_file", "unset"] as const;
@@ -3388,6 +3459,109 @@ export function parseLiveMessage(value: unknown): LiveMessage {
       throw new Error(`Unsupported live delta: ${type}`);
   }
   return { protocol_version: PROTOCOL_VERSION, revision, delta };
+}
+
+const directorModes = ["off", "advisory", "automatic"] as const;
+const directorGoalKinds = [
+  "establish_regions",
+  "expand_star_catalogue",
+  "enhance_star_catalogue",
+  "expand_mining_ops",
+  "event_completion",
+  "expand_ftl_network",
+  "establish_beacons",
+] as const;
+const directorGoalStatuses = [
+  "satisfied",
+  "active",
+  "blocked",
+  "waiting",
+] as const;
+const directorRegionStatuses = [
+  "discovered",
+  "establishing",
+  "established",
+] as const;
+
+export function parseDirectorResponse(
+  value: unknown,
+): Versioned<DirectorSnapshot> {
+  return envelope(value, (payload) => {
+    const item = record(payload, "Director snapshot");
+    if (
+      !Array.isArray(item.regions) ||
+      !Array.isArray(item.goals) ||
+      !Array.isArray(item.replicants)
+    )
+      throw new Error("Invalid Director collections");
+    const workforce = record(item.workforce, "Director workforce");
+    return {
+      metadata: metadata(item.metadata),
+      mode: oneOf(item.mode, directorModes, "Director mode"),
+      regions: item.regions.map((value) => {
+        const region = record(value, "Director region");
+        return {
+          region: requiredString(region.region, "region"),
+          status: oneOf(region.status, directorRegionStatuses, "region status"),
+          hub_system: nullableString(region.hub_system, "hub system"),
+          hub_location: nullableString(region.hub_location, "hub location"),
+          replicants: stringArray(region.replicants, "regional replicants"),
+          known_systems: number(region.known_systems, "known systems"),
+        };
+      }),
+      goals: item.goals.map((value) => {
+        const goal = record(value, "Director goal");
+        return {
+          id: requiredString(goal.id, "goal id"),
+          kind: oneOf(goal.kind, directorGoalKinds, "goal kind"),
+          region: nullableString(goal.region, "goal region"),
+          status: oneOf(goal.status, directorGoalStatuses, "goal status"),
+          objective: requiredString(goal.objective, "goal objective"),
+          blocker: nullableString(goal.blocker, "goal blocker"),
+          next_action: nullableString(goal.next_action, "goal next action"),
+          progress_current: number(goal.progress_current, "goal progress"),
+          progress_total: number(goal.progress_total, "goal total"),
+          active_workflows: stringArray(
+            goal.active_workflows,
+            "goal workflows",
+          ),
+          enabled: boolean(goal.enabled, "goal enabled"),
+        };
+      }),
+      replicants: item.replicants.map((value) => {
+        const replicant = record(value, "Director Replicant");
+        return {
+          code: requiredString(replicant.code, "Replicant code"),
+          name: nullableString(replicant.name, "Replicant name"),
+          region: nullableString(replicant.region, "Replicant region"),
+          busy: boolean(replicant.busy, "Replicant busy"),
+          workflow_id: nullableString(
+            replicant.workflow_id,
+            "Replicant workflow",
+          ),
+          role_affinity: nullableString(
+            replicant.role_affinity,
+            "role affinity",
+          ),
+        };
+      }),
+      workforce: {
+        total: number(workforce.total, "workforce total"),
+        busy: number(workforce.busy, "workforce busy"),
+        idle: number(workforce.idle, "workforce idle"),
+        idle_ratio: finiteNumber(workforce.idle_ratio, "workforce idle ratio"),
+        pending_worker_demand: number(
+          workforce.pending_worker_demand,
+          "worker demand",
+        ),
+        scale_up_recommended: boolean(
+          workforce.scale_up_recommended,
+          "scale recommendation",
+        ),
+        scale_reason: nullableString(workforce.scale_reason, "scale reason"),
+      },
+    };
+  });
 }
 
 export function parseAutomationControlResponse(

@@ -49,22 +49,23 @@ use replicant_protocol::{
     BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot,
     CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
     DescriptorCatalog, DeviceClaim, DeviceLogSummary, DeviceLogsSnapshot, DeviceSummary,
-    DevicesSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
-    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
-    EntityKind, EntityRef, EntitySummary, ErrorResponse, EventCriterionSummary,
-    EventRequirementKind, EventRequirementSummary, EventRewardItem, EventRewardsSummary,
-    EventSummary, EventsSnapshot, FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution,
-    FiniteExecutionHistoryResponse, FiniteExecutionStatus as ProtocolFiniteExecutionStatus,
-    GalaxySceneSnapshot, HealthStatus, InboxMessageSummary, InventoryDistribution,
-    InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity, InventoryResourceSummary,
-    InventorySnapshot, LeaderboardBoardSummary, LeaderboardEntrySummary, LeaderboardsSnapshot,
-    LiveDelta, LiveMessage, MessagesSnapshot, MiningInstallationStatus, MiningInstallationSummary,
-    MiningSnapshot, NetworkRelaySummary, NetworkSnapshot, Notification, NotificationLevel,
-    OperationClass, OperationKind, OperationStatus, OperationUpdate, OverviewReplicant,
-    OverviewSnapshot, OverviewTravel, RelayExpansionSummary, RelaySnapshot, ReportsSnapshot,
-    ReputationSummary, RequirementSummary, ResultSummary, RunOperationRequest,
-    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SettingsSnapshot,
-    SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
+    DevicesSnapshot, DirectorGoalControlRequest, DirectorModeRequest,
+    DirectorReplicantRegionRequest, DirectorSnapshot, DirectoryReplicantDetail,
+    DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary, DirectorySnapshot, DomainSlice,
+    EntityId, EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
+    EventCriterionSummary, EventRequirementKind, EventRequirementSummary, EventRewardItem,
+    EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
+    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
+    InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
+    InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
+    LeaderboardEntrySummary, LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot,
+    MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
+    NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
+    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
+    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
+    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SettingsSnapshot, SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
     SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartWorkflowRequest,
     StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
     TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
@@ -78,8 +79,8 @@ use replicant_protocol::{
 use replicant_runtime::{
     ApplicationContext,
     automation::{
-        ControllerWorkflowCheckpoint, ExplorationIntent, ExplorationWorkflowCheckpoint,
-        ScanIntent, ScanTourCheckpoint, ScanTourIntent,
+        ControllerWorkflowCheckpoint, ExplorationIntent, ExplorationWorkflowCheckpoint, ScanIntent,
+        ScanTourCheckpoint, ScanTourIntent,
     },
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
@@ -87,6 +88,10 @@ use replicant_runtime::{
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     intelligence::{account_profile, inbox, leaderboard, leaderboard_index, standing},
+    orchestration::{
+        assign_replicant_region, cached_director_snapshot, parse_goal_kind, reconcile_director,
+        set_director_mode, set_goal_enabled,
+    },
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
@@ -106,13 +111,15 @@ use replicant_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 use tower_http::cors::CorsLayer;
 
 /// Live broadcast capacity. Deltas are coalesced per supervisor tick, so this
 /// holds many seconds of updates even during heavy fleet activity; lagging
 /// subscribers recover by revision comparison rather than by reconnecting.
 const LIVE_BUFFER: usize = 1024;
+const DIRECTOR_RECONCILE_TIMEOUT: Duration = Duration::from_secs(45);
+static DIRECTOR_RECONCILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -135,6 +142,8 @@ pub struct DaemonConfig {
     pub managed_database: PathBuf,
     /// Workflow/runtime SQLite database.
     pub runtime_database: PathBuf,
+    /// Directory containing persistent daemon log files.
+    pub log_directory: PathBuf,
     /// Local HTTP listen address.
     pub bind: SocketAddr,
     /// Shared secret required on every request when present.
@@ -155,6 +164,9 @@ impl DaemonConfig {
         let runtime_database = env::var_os("REPLICANT_RUNTIME_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("replicant-runtime.sqlite"));
+        let log_directory = env::var_os("REPLICANT_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_log_directory(&runtime_database));
         let bind = env::var("REPLICANTD_BIND")
             .unwrap_or_else(|_| DEFAULT_BIND.to_owned())
             .parse()
@@ -167,6 +179,7 @@ impl DaemonConfig {
             profile,
             managed_database,
             runtime_database,
+            log_directory,
             bind,
             token,
         };
@@ -193,6 +206,14 @@ impl DaemonConfig {
         };
         presented.is_some_and(|presented| constant_time_eq(presented, expected))
     }
+}
+
+fn default_log_directory(runtime_database: &std::path::Path) -> PathBuf {
+    runtime_database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("logs")
 }
 
 /// Compares two secrets without leaking their common prefix length through
@@ -241,6 +262,8 @@ pub struct AppState {
     /// from. `/api/devices`, `/api/autofactories`, and the relay projection all
     /// rebuild the identical row set, previously once per request.
     device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
+    director_reconcile: Mutex<()>,
+    director_wake: Notify,
     daemon: DaemonConfig,
 }
 
@@ -270,6 +293,8 @@ impl AppState {
             pending_slices: StdMutex::new(BTreeSet::new()),
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
+            director_reconcile: Mutex::new(()),
+            director_wake: Notify::new(),
             daemon,
         }))
     }
@@ -380,6 +405,42 @@ async fn authenticate(
     }
 }
 
+async fn trace_http_request(request: Request<axum::body::Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    tracing::debug!(method = %method, path = %path, "daemon HTTP request started");
+    let response = next.run(request).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    if status.is_server_error() {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "daemon HTTP request failed"
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "daemon HTTP request rejected"
+        );
+    } else {
+        tracing::debug!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "daemon HTTP request completed"
+        );
+    }
+    response
+}
+
 /// Builds the local HTTP router.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -425,6 +486,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/triggers/{id}/fire", post(fire_trigger))
         .route("/api/automation/control", post(control_automation))
+        .route("/api/director", get(director_snapshot))
+        .route("/api/director/reconcile", post(reconcile_director_now))
+        .route("/api/director/mode", put(update_director_mode))
+        .route("/api/director/goals/{kind}", put(update_director_goal))
+        .route(
+            "/api/director/replicants/{code}/region",
+            put(update_director_replicant_region),
+        )
         .route("/api/workflows", get(list_workflows).post(start_workflow))
         .route("/api/workflows/{id}", get(workflow_detail))
         .route("/api/workflows/{id}/activity", get(workflow_activity))
@@ -432,6 +501,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/workflows/{id}/resume", post(resume_workflow))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .layer(middleware::from_fn(trace_http_request))
         .layer(
             CorsLayer::new()
                 .allow_origin([
@@ -537,6 +607,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                             DomainSlice::Network,
                             DomainSlice::Standing,
                             DomainSlice::Leaderboards,
+                            DomainSlice::Director,
                         ] {
                             state.invalidate(slice);
                         }
@@ -1875,15 +1946,12 @@ fn relay_snapshot(
         .filter(|device| !deployed_codes.contains(device.entity.id.0.as_str()))
         .filter(|device| {
             device.tags.iter().any(|tag| tag.starts_with("relay-m:"))
-                || device
-                    .claim
-                    .as_ref()
-                    .is_some_and(|claim| {
-                        matches!(
-                            claim.workflow_kind.0.as_str(),
-                            "relay.expansion" | "exploration.frontier"
-                        )
-                    })
+                || device.claim.as_ref().is_some_and(|claim| {
+                    matches!(
+                        claim.workflow_kind.0.as_str(),
+                        "relay.expansion" | "exploration.frontier"
+                    )
+                })
         })
         .cloned()
         .collect();
@@ -4639,6 +4707,174 @@ async fn start_workflow(
     ))
 }
 
+async fn director_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let snapshot =
+        cached_director_snapshot(&state.repository, state.revision.load(Ordering::Relaxed))
+            .map_err(ApiError::runtime)?;
+    Ok(Json(Versioned::current(snapshot)))
+}
+
+async fn reconcile_director_now(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    tracing::info!("manual Automation Director reconciliation requested");
+    let snapshot = reconcile_and_invalidate_director(&state, "manual").await?;
+    state.flush_invalidations();
+    Ok(Json(Versioned::current(snapshot)))
+}
+
+async fn update_director_mode(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<DirectorModeRequest>, JsonRejection>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid Director mode request"))?;
+    tracing::info!(mode = ?request.mode, "Automation Director mode changed");
+    set_director_mode(&state.repository, request.mode).map_err(ApiError::runtime)?;
+    director_control_changed(&state)
+}
+
+async fn update_director_goal(
+    State(state): State<Arc<AppState>>,
+    Path(kind): Path<String>,
+    payload: Result<Json<DirectorGoalControlRequest>, JsonRejection>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let Some(kind) = parse_goal_kind(&kind) else {
+        return Err(ApiError::invalid("unknown Director goal kind"));
+    };
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid Director goal request"))?;
+    tracing::info!(goal = ?kind, enabled = request.enabled, "Automation Director goal changed");
+    set_goal_enabled(&state.repository, kind, request.enabled).map_err(ApiError::runtime)?;
+    director_control_changed(&state)
+}
+
+async fn update_director_replicant_region(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+    payload: Result<Json<DirectorReplicantRegionRequest>, JsonRejection>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let Json(request) =
+        payload.map_err(|_| ApiError::invalid("invalid regional assignment request"))?;
+    tracing::info!(
+        replicant = %code,
+        region = ?request.region,
+        role_affinity = ?request.role_affinity,
+        "Automation Director regional assignment changed"
+    );
+    assign_replicant_region(
+        &state.repository,
+        &code,
+        request.region.as_deref(),
+        request.role_affinity.as_deref(),
+    )
+    .map_err(ApiError::runtime)?;
+    director_control_changed(&state)
+}
+
+fn director_control_changed(
+    state: &Arc<AppState>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let snapshot =
+        cached_director_snapshot(&state.repository, state.revision.load(Ordering::Relaxed))
+            .map_err(ApiError::runtime)?;
+    state.invalidate(DomainSlice::Director);
+    state.flush_invalidations();
+    state.director_wake.notify_one();
+    Ok(Json(Versioned::current(snapshot)))
+}
+
+async fn reconcile_and_invalidate_director(
+    state: &Arc<AppState>,
+    trigger: &'static str,
+) -> Result<DirectorSnapshot, ApiError> {
+    let attempt = DIRECTOR_RECONCILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    tracing::info!(attempt, trigger, "Automation Director reconciliation queued");
+    let reconciliation = async {
+        let lock_started = Instant::now();
+        let _guard = state.director_reconcile.lock().await;
+        tracing::info!(
+            attempt,
+            trigger,
+            wait_ms = lock_started.elapsed().as_millis(),
+            "Automation Director reconciliation lock acquired"
+        );
+        reconcile_director(
+            state.client(),
+            state.repository.clone(),
+            state.revision.load(Ordering::Relaxed),
+            true,
+        )
+        .await
+    };
+    let snapshot = match tokio::time::timeout(DIRECTOR_RECONCILE_TIMEOUT, reconciliation).await {
+        Ok(result) => result.map_err(ApiError::runtime)?,
+        Err(_) => {
+            tracing::warn!(
+                attempt,
+                trigger,
+                elapsed_ms = started.elapsed().as_millis(),
+                timeout_ms = DIRECTOR_RECONCILE_TIMEOUT.as_millis(),
+                "Automation Director reconciliation timed out"
+            );
+            return Err(ApiError::director_timeout());
+        }
+    };
+    tracing::info!(
+        attempt,
+        trigger,
+        elapsed_ms = started.elapsed().as_millis(),
+        regions = snapshot.regions.len(),
+        goals = snapshot.goals.len(),
+        replicants = snapshot.replicants.len(),
+        "Automation Director reconciliation completed"
+    );
+    state.invalidate(DomainSlice::Director);
+    state.invalidate(DomainSlice::Workflows);
+    Ok(snapshot)
+}
+
+async fn reconcile_director_background(state: &Arc<AppState>, trigger: &'static str) {
+    match reconcile_and_invalidate_director(state, trigger).await {
+        Ok(_) => state.flush_invalidations(),
+        Err(error) => tracing::warn!(
+            status = error.status.as_u16(),
+            code = error.code,
+            message = error.message,
+            "Automation Director reconciliation failed"
+        ),
+    }
+}
+
+/// Periodically reconciles standing empire goals against managed world state.
+pub async fn run_director(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tracing::info!(
+        interval_seconds = 30,
+        "Automation Director background loop started"
+    );
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                tracing::debug!(trigger = "interval", "Automation Director reconciliation triggered");
+                reconcile_director_background(&state, "interval").await;
+            },
+            _ = state.director_wake.notified() => {
+                tracing::debug!(trigger = "control_change", "Automation Director reconciliation triggered");
+                reconcile_director_background(&state, "control_change").await;
+            },
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    tracing::info!("Automation Director background loop stopped");
+}
+
 async fn control_automation(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<AutomationControlRequest>, JsonRejection>,
@@ -5213,6 +5449,19 @@ impl ApiError {
         }
     }
 
+    fn director_timeout() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "director_reconcile_timeout",
+            message: "Automation Director reconciliation timed out; the last successful snapshot remains available",
+        }
+    }
+
+    fn runtime(error: replicant_runtime::ApplicationError) -> Self {
+        tracing::error!(error = %error, "runtime Director request failed");
+        Self::internal()
+    }
+
     fn repository(error: RepositoryError) -> Self {
         match error {
             RepositoryError::NotFound(_) => Self::not_found(),
@@ -5292,11 +5541,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn log_directory_defaults_next_to_runtime_database() {
+        assert_eq!(
+            default_log_directory(std::path::Path::new(
+                "/var/lib/replicant/replicant-runtime.sqlite",
+            )),
+            PathBuf::from("/var/lib/replicant/logs"),
+        );
+        assert_eq!(
+            default_log_directory(std::path::Path::new("replicant-runtime.sqlite")),
+            PathBuf::from("logs"),
+        );
+    }
+
     fn test_daemon_config() -> DaemonConfig {
         DaemonConfig {
             profile: "test".to_owned(),
             managed_database: PathBuf::from("replicant-client.sqlite"),
             runtime_database: PathBuf::from("replicant-runtime.sqlite"),
+            log_directory: PathBuf::from("logs"),
             bind: DEFAULT_BIND.parse().expect("default bind address"),
             token: None,
         }
@@ -6033,6 +6297,7 @@ mod tests {
                     center: "SOL".to_owned(),
                     radius_ly: 10.0,
                     system_limit: 5,
+                    target_systems: None,
                     star_detail_concurrency: 1,
                     mission_file: PathBuf::from("survey.json"),
                     controller: Some("SC-1".to_owned()),

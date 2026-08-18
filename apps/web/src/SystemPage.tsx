@@ -295,7 +295,7 @@ function ClaimsPanel({
 }) {
   const { data, error } = useDomainQuery({
     slice: "devices",
-    fetcher: daemonApi.devices,
+    fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) =>
       !snapshot.devices.some(
         (device) =>
@@ -350,40 +350,74 @@ function ClaimsPanel({
         const lifecycle = command("device.lifecycle", device.entity.id);
         return (
           <div className="asset-operations" key={device.entity.id}>
-            <button onClick={() => onSelectEntity(device.entity)}>
+            <button
+              onClick={() => {
+                onSelectEntity(device.entity);
+              }}
+            >
               <strong>{device.device_type}</strong> · {device.entity.id} ·{" "}
               {device.status ?? "unknown"}
             </button>
             {isHub && rename && (
-              <button onClick={() => onRunCommand(rename)}>
+              <button
+                onClick={() => {
+                  onRunCommand(rename);
+                }}
+              >
                 Naming rights
               </button>
             )}
             {isHub && entry && (
-              <button onClick={() => onRunCommand(entry)}>
+              <button
+                onClick={() => {
+                  onRunCommand(entry);
+                }}
+              >
                 Set entry point
               </button>
             )}
             {isHub && welcome && (
-              <button onClick={() => onRunCommand(welcome)}>
+              <button
+                onClick={() => {
+                  onRunCommand(welcome);
+                }}
+              >
                 Welcome message
               </button>
             )}
             {isWard && deploy && (
-              <button onClick={() => onRunCommand(deploy)}>Deploy ward</button>
+              <button
+                onClick={() => {
+                  onRunCommand(deploy);
+                }}
+              >
+                Deploy ward
+              </button>
             )}
             {isWard && activate && (
-              <button onClick={() => onRunCommand(activate)}>
+              <button
+                onClick={() => {
+                  onRunCommand(activate);
+                }}
+              >
                 Activate / evict miners
               </button>
             )}
             {isWard && deactivate && (
-              <button onClick={() => onRunCommand(deactivate)}>
+              <button
+                onClick={() => {
+                  onRunCommand(deactivate);
+                }}
+              >
                 Deactivate ward
               </button>
             )}
             {lifecycle && (
-              <button onClick={() => onRunCommand(lifecycle)}>
+              <button
+                onClick={() => {
+                  onRunCommand(lifecycle);
+                }}
+              >
                 More controls
               </button>
             )}

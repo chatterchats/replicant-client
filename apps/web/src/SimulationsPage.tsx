@@ -29,9 +29,13 @@ function outcome(run: SimulationRunSummary) {
 
 function score(run: SimulationRunSummary) {
   const details = [
-    run.score_seconds !== null ? `${run.score_seconds}s score` : null,
-    run.resources_mined !== null ? `${run.resources_mined} mined` : null,
-    run.devices_printed !== null ? `${run.devices_printed} printed` : null,
+    run.score_seconds !== null ? `${String(run.score_seconds)}s score` : null,
+    run.resources_mined !== null
+      ? `${String(run.resources_mined)} mined`
+      : null,
+    run.devices_printed !== null
+      ? `${String(run.devices_printed)} printed`
+      : null,
   ].filter((value): value is string => value !== null);
   return details.join(" · ") || "—";
 }
@@ -49,7 +53,7 @@ export function SimulationsPage({
 }) {
   const { data, status, error, refreshing, refresh } = useDomainQuery({
     slice: "simulations",
-    fetcher: daemonApi.simulations,
+    fetcher: (signal) => daemonApi.simulations(signal),
     isEmpty: (snapshot) =>
       snapshot.interfaces.length === 0 && snapshot.account_history.length === 0,
   });
@@ -113,7 +117,11 @@ export function SimulationsPage({
                     "Unknown datacentre"}
                 </p>
               </div>
-              <button onClick={() => onSelectEntity(item.device.entity)}>
+              <button
+                onClick={() => {
+                  onSelectEntity(item.device.entity);
+                }}
+              >
                 Inspect
               </button>
             </header>
@@ -139,31 +147,34 @@ export function SimulationsPage({
                       <td>
                         {scenario.objective_type ?? "—"}
                         {scenario.objective_target !== null
-                          ? ` · ${scenario.objective_target}`
+                          ? ` · ${String(scenario.objective_target)}`
                           : ""}
                       </td>
                       <td>
                         {scenario.timeout_hours !== null
-                          ? `${scenario.timeout_hours} h`
+                          ? `${String(scenario.timeout_hours)} h`
                           : "—"}
                       </td>
                       <td>
                         {scenario.entry_cost
-                          .map((cost) => `${cost.quantity} ${cost.resource}`)
+                          .map(
+                            (cost) =>
+                              `${String(cost.quantity)} ${cost.resource}`,
+                          )
                           .join(" + ") || "None"}
                       </td>
                       <td>
                         {start && (
                           <button
-                            onClick={() =>
+                            onClick={() => {
                               onRunCommand({
                                 ...start,
                                 initialParameters: {
                                   interface: item.device.entity.id,
                                   scenario: scenario.code,
                                 },
-                              })
-                            }
+                              });
+                            }}
                           >
                             Start
                           </button>
@@ -189,7 +200,11 @@ export function SimulationsPage({
                     {run.started_at ?? "Unknown start"}
                   </p>
                   {run.is_mine && abandon && (
-                    <button onClick={() => onRunCommand(abandon)}>
+                    <button
+                      onClick={() => {
+                        onRunCommand(abandon);
+                      }}
+                    >
                       Abandon
                     </button>
                   )}

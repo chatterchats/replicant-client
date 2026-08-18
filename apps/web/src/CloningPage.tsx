@@ -10,9 +10,9 @@ export function effectiveDeviceLocation(
   device: DeviceSummary,
   devicesByCode: Map<string, DeviceSummary>,
 ): string | null {
-  let current: DeviceSummary | undefined = device;
+  let current = device;
   const visited = new Set<string>();
-  while (current && !visited.has(current.entity.id)) {
+  while (!visited.has(current.entity.id)) {
     visited.add(current.entity.id);
     const parentCode: string | null = current.stowed_in ?? current.attached_to;
     const parent: DeviceSummary | undefined =
@@ -49,7 +49,7 @@ export function CloningPage({
 }) {
   const query = useDomainQuery({
     slice: "devices",
-    fetcher: daemonApi.devices,
+    fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) =>
       !snapshot.devices.some(
         (device) => device.device_type === "empty_replicant_matrix",
@@ -65,7 +65,8 @@ export function CloningPage({
   const replicate = commands.find(
     (command) => command.descriptor.kind === "clone.replicate",
   );
-  const devices = query.data?.devices ?? [];
+  const snapshotDevices = query.data?.devices;
+  const devices = useMemo(() => snapshotDevices ?? [], [snapshotDevices]);
   const devicesByCode = useMemo(
     () => new Map(devices.map((device) => [device.entity.id, device])),
     [devices],
@@ -127,7 +128,9 @@ export function CloningPage({
                     <td>
                       <button
                         className="link-button"
-                        onClick={() => onSelectEntity(matrix.entity)}
+                        onClick={() => {
+                          onSelectEntity(matrix.entity);
+                        }}
                       >
                         {matrix.entity.id}
                       </button>
@@ -139,12 +142,12 @@ export function CloningPage({
                       <div className="asset-operations">
                         {!matrix.stowed_in && stowTarget && (
                           <button
-                            onClick={() =>
+                            onClick={() => {
                               onRunCommand({
                                 ...stowTarget,
                                 initialParameters: { matrix: matrix.entity.id },
-                              })
-                            }
+                              });
+                            }}
                           >
                             Stow in cradle
                           </button>
@@ -155,15 +158,15 @@ export function CloningPage({
                           ? localSources.map((source) => (
                               <button
                                 key={source.entity.id}
-                                onClick={() =>
+                                onClick={() => {
                                   onRunCommand({
                                     ...replicate,
                                     initialParameters: {
                                       source: source.entity.id,
                                       target: matrix.entity.id,
                                     },
-                                  })
-                                }
+                                  });
+                                }}
                               >
                                 Clone from{" "}
                                 {source.owner_name ?? source.entity.id}
@@ -172,14 +175,14 @@ export function CloningPage({
                           : matrix.stowed_in &&
                             replicate && (
                               <button
-                                onClick={() =>
+                                onClick={() => {
                                   onRunCommand({
                                     ...replicate,
                                     initialParameters: {
                                       target: matrix.entity.id,
                                     },
-                                  })
-                                }
+                                  });
+                                }}
                               >
                                 Choose source matrix
                               </button>
@@ -204,7 +207,9 @@ export function CloningPage({
             {sourceMatrices.map((source) => (
               <button
                 key={source.entity.id}
-                onClick={() => onSelectEntity(source.entity)}
+                onClick={() => {
+                  onSelectEntity(source.entity);
+                }}
               >
                 {source.owner_name ?? source.owner ?? source.entity.id} ·{" "}
                 {effectiveDeviceLocation(source, devicesByCode) ??

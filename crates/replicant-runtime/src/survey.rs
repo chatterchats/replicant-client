@@ -262,6 +262,7 @@ struct Config {
     center: String,
     radius_ly: f64,
     system_limit: usize,
+    target_systems: Option<BTreeSet<String>>,
     star_detail_concurrency: usize,
     plan_path: PathBuf,
     controller_override: Option<String>,
@@ -1032,6 +1033,13 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
             let position = star.position?;
             let star_code = star.key.id.as_str().to_owned();
             if star_code == config.center {
+                return None;
+            }
+            if config
+                .target_systems
+                .as_ref()
+                .is_some_and(|targets| !targets.contains(&star_code))
+            {
                 return None;
             }
             let distance = position_distance(center_position, position);
@@ -4569,6 +4577,9 @@ pub struct SurveyOptions {
     pub center: String,
     pub radius_ly: f64,
     pub system_limit: usize,
+    /// Optional exact star-system allowlist for batch/fleet survey partitioning.
+    #[serde(default)]
+    pub target_systems: Option<Vec<String>>,
     pub star_detail_concurrency: usize,
     pub mission_file: PathBuf,
     pub controller: Option<String>,
@@ -4658,6 +4669,13 @@ pub async fn execute_survey_route(
         center: options.center.to_ascii_uppercase(),
         radius_ly: options.radius_ly,
         system_limit: options.system_limit.max(1),
+        target_systems: options.target_systems.as_ref().map(|systems| {
+            systems
+                .iter()
+                .map(|system| system.trim().to_ascii_uppercase())
+                .filter(|system| !system.is_empty())
+                .collect::<BTreeSet<_>>()
+        }),
         star_detail_concurrency: options.star_detail_concurrency.clamp(1, 16),
         plan_path: options.mission_file.clone(),
         controller_override: options.controller.clone(),
@@ -4761,6 +4779,7 @@ pub async fn execute_survey(client: &Client, request: &SurveyRequest) -> AnyResu
             center: request.center.to_ascii_uppercase(),
             radius_ly: request.radius_ly,
             system_limit: request.system_limit.max(1),
+            target_systems: None,
             star_detail_concurrency: request.star_detail_concurrency.clamp(1, 16),
             mission_file: request.mission_file.clone(),
             controller: request.controller.clone(),

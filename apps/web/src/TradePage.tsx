@@ -165,161 +165,158 @@ export function TradeContent({
       ) : !controllers.length ? (
         <section className="empty-state">No trades match the search.</section>
       ) : (
-        controllers.map((controller) => (
-          <section
-            key={controller.entity.id}
-            className="connection-card trade-controller"
-          >
-            <header className="page-heading">
-              <div>
-                <h2>{controller.shop_name ?? controller.entity.id}</h2>
-                <p>
-                  {controller.owner_name ??
-                    controller.owner_replicant ??
-                    "Unknown owner"}
-                  {" · "}
-                  {controller.location ??
-                    controller.system ??
-                    "Hidden location"}
-                </p>
-              </div>
-              <span className="status-chip">
-                {controller.is_local ? "local" : "network"}
-              </span>
-            </header>
-            <div className="asset-operations">
-              <button
-                onClick={() => {
-                  onSelectEntity(controller.entity);
-                }}
-              >
-                Inspect
-              </button>
-              {controller.is_local &&
-                withParameters(operations, "trade.create", {
-                  controller: controller.entity.id,
-                }) && (
+        controllers.map((controller) => {
+          const createTrade = controller.is_local
+            ? withParameters(operations, "trade.create", {
+                controller: controller.entity.id,
+              })
+            : undefined;
+          const configureShop = controller.is_local
+            ? withParameters(operations, "trade.configure_shop", {
+                controller: controller.entity.id,
+              })
+            : undefined;
+          return (
+            <section
+              key={controller.entity.id}
+              className="connection-card trade-controller"
+            >
+              <header className="page-heading">
+                <div>
+                  <h2>{controller.shop_name ?? controller.entity.id}</h2>
+                  <p>
+                    {controller.owner_name ??
+                      controller.owner_replicant ??
+                      "Unknown owner"}
+                    {" · "}
+                    {controller.location ??
+                      controller.system ??
+                      "Hidden location"}
+                  </p>
+                </div>
+                <span className="status-chip">
+                  {controller.is_local ? "local" : "network"}
+                </span>
+              </header>
+              <div className="asset-operations">
+                <button
+                  onClick={() => {
+                    onSelectEntity(controller.entity);
+                  }}
+                >
+                  Inspect
+                </button>
+                {createTrade && (
                   <button
-                    onClick={() =>
-                      onRunCommand(
-                        withParameters(operations, "trade.create", {
-                          controller: controller.entity.id,
-                        })!,
-                      )
-                    }
+                    onClick={() => {
+                      onRunCommand(createTrade);
+                    }}
                   >
                     Create trade
                   </button>
                 )}
-              {controller.is_local &&
-                withParameters(operations, "trade.configure_shop", {
-                  controller: controller.entity.id,
-                }) && (
+                {configureShop && (
                   <button
-                    onClick={() =>
-                      onRunCommand(
-                        withParameters(operations, "trade.configure_shop", {
-                          controller: controller.entity.id,
-                        })!,
-                      )
-                    }
+                    onClick={() => {
+                      onRunCommand(configureShop);
+                    }}
                   >
                     Configure shop
                   </button>
                 )}
-              {controller.system && (
-                <button
-                  onClick={() => {
-                    if (controller.system) onOpenSystem(controller.system);
-                  }}
-                >
-                  Open System
-                </button>
-              )}
-              {controller.workflow && (
-                <button
-                  onClick={() => {
-                    if (controller.workflow)
-                      onSelectWorkflow(controller.workflow.id);
-                  }}
-                >
-                  Workflow · {controller.workflow.status}
-                </button>
-              )}
-            </div>
-            {!controller.trades.length ? (
-              <p className="empty-state">No current trades.</p>
-            ) : (
-              <div className="inventory-table-wrap">
-                <table className="inventory-table">
-                  <thead>
-                    <tr>
-                      <th>Trade</th>
-                      <th>Buyer gives</th>
-                      <th>Buyer receives</th>
-                      <th>Stock</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {controller.trades.map((trade) => (
-                      <tr key={trade.trade_code}>
-                        <td>
-                          <strong>{trade.name ?? trade.trade_code}</strong>
-                          <small>{trade.trade_code}</small>
-                        </td>
-                        <td>{exchange(trade.requested)}</td>
-                        <td>{exchange(trade.offered)}</td>
-                        <td>
-                          {trade.current_stock ?? "?"}
-                          {trade.initial_stock !== null &&
-                            " / " + String(trade.initial_stock)}
-                        </td>
-                        <td>
-                          {withParameters(operations, "trade.execute", {
+                {controller.system && (
+                  <button
+                    onClick={() => {
+                      if (controller.system) onOpenSystem(controller.system);
+                    }}
+                  >
+                    Open System
+                  </button>
+                )}
+                {controller.workflow && (
+                  <button
+                    onClick={() => {
+                      if (controller.workflow)
+                        onSelectWorkflow(controller.workflow.id);
+                    }}
+                  >
+                    Workflow · {controller.workflow.status}
+                  </button>
+                )}
+              </div>
+              {!controller.trades.length ? (
+                <p className="empty-state">No current trades.</p>
+              ) : (
+                <div className="inventory-table-wrap">
+                  <table className="inventory-table">
+                    <thead>
+                      <tr>
+                        <th>Trade</th>
+                        <th>Buyer gives</th>
+                        <th>Buyer receives</th>
+                        <th>Stock</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {controller.trades.map((trade) => {
+                        const executeTrade = withParameters(
+                          operations,
+                          "trade.execute",
+                          {
                             controller: controller.entity.id,
                             trade_code: trade.trade_code,
-                          }) && (
-                            <button
-                              onClick={() =>
-                                onRunCommand(
-                                  withParameters(operations, "trade.execute", {
-                                    controller: controller.entity.id,
-                                    trade_code: trade.trade_code,
-                                  })!,
-                                )
-                              }
-                            >
-                              Buy
-                            </button>
-                          )}
-                          {controller.is_local &&
-                            withParameters(operations, "trade.delete", {
+                          },
+                        );
+                        const deleteTrade = controller.is_local
+                          ? withParameters(operations, "trade.delete", {
                               controller: controller.entity.id,
                               trade_code: trade.trade_code,
-                            }) && (
-                              <button
-                                onClick={() =>
-                                  onRunCommand(
-                                    withParameters(operations, "trade.delete", {
-                                      controller: controller.entity.id,
-                                      trade_code: trade.trade_code,
-                                    })!,
-                                  )
-                                }
-                              >
-                                Delete
-                              </button>
-                            )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-        ))
+                            })
+                          : undefined;
+                        return (
+                          <tr key={trade.trade_code}>
+                            <td>
+                              <strong>{trade.name ?? trade.trade_code}</strong>
+                              <small>{trade.trade_code}</small>
+                            </td>
+                            <td>{exchange(trade.requested)}</td>
+                            <td>{exchange(trade.offered)}</td>
+                            <td>
+                              {trade.current_stock ?? "?"}
+                              {trade.initial_stock !== null &&
+                                " / " + String(trade.initial_stock)}
+                            </td>
+                            <td>
+                              {executeTrade && (
+                                <button
+                                  onClick={() => {
+                                    onRunCommand(executeTrade);
+                                  }}
+                                >
+                                  Buy
+                                </button>
+                              )}
+                              {deleteTrade && (
+                                <button
+                                  onClick={() => {
+                                    onRunCommand(deleteTrade);
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          );
+        })
       )}
       <p className="table-summary">
         Viewer {data?.viewer?.id ?? "—"} · revision{" "}

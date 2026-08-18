@@ -17,7 +17,17 @@ function primitiveText(value: unknown): string {
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") return value.toLocaleString();
   if (typeof value === "string") return value || "—";
-  return String(value);
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "symbol") return value.description ?? value.toString();
+  if (typeof value === "function") return value.name || "Function";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value) || "—";
+    } catch {
+      return "—";
+    }
+  }
+  return "—";
 }
 
 function StructuredValue({
@@ -32,10 +42,11 @@ function StructuredValue({
   }
 
   if (Array.isArray(value)) {
-    if (!value.length) return <span>None</span>;
+    const items: unknown[] = value;
+    if (!items.length) return <span>None</span>;
     return (
       <div className="activity-payload-list">
-        {value.map((item, index) => (
+        {items.map((item, index) => (
           <div className="activity-payload-list-item" key={index}>
             <StructuredValue value={item} depth={depth + 1} />
           </div>
@@ -121,11 +132,12 @@ function DeviceSummaries({ devices }: { devices: unknown[] }) {
           const extra = Object.fromEntries(
             Object.entries(device).filter(([key]) => !known.has(key)),
           );
+          const deviceCode =
+            typeof device.device_code === "string"
+              ? device.device_code
+              : String(index);
           return (
-            <div
-              className="activity-device-card"
-              key={String(device.device_code ?? index)}
-            >
+            <div className="activity-device-card" key={deviceCode}>
               <strong>{primitiveText(device.device_code)}</strong>
               <span>{primitiveText(device.status)}</span>
               {device.events !== undefined && (
@@ -159,7 +171,7 @@ export function ActivityEventDetails({
   event: AccountEventSummary;
   compact?: boolean;
 }) {
-  const payload = event.payload ?? {};
+  const payload = event.payload;
   const directive = payload.directive;
   const activity = asRecord(payload.activity);
   const report = asRecord(payload.report);

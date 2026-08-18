@@ -16,6 +16,7 @@ import type {
   DaemonHealth,
   DescriptorCatalog,
   DevicesSnapshot,
+  DirectorSnapshot,
   DirectorySnapshot,
   EntityIndexSnapshot,
   EventsSnapshot,
@@ -200,6 +201,22 @@ const automationControlResponse: AutomationControlResponse = {
   automation,
   affected_workflows: 0,
 };
+const director: DirectorSnapshot = {
+  metadata,
+  mode: "advisory",
+  regions: [],
+  goals: [],
+  replicants: [],
+  workforce: {
+    total: 0,
+    busy: 0,
+    idle: 0,
+    idle_ratio: 0,
+    pending_worker_demand: 0,
+    scale_up_recommended: false,
+    scale_reason: null,
+  },
+};
 
 function systemScene(system: string): SystemSceneSnapshot {
   return {
@@ -247,6 +264,11 @@ vi.mock("./api", async (importOriginal) => {
       galaxyScene: () => Promise.resolve(galaxyScene),
       systemScene: (system: string) => Promise.resolve(systemScene(system)),
       history: () => Promise.resolve([]),
+      director: () => Promise.resolve(director),
+      reconcileDirector: () => Promise.resolve(director),
+      setDirectorMode: () => Promise.resolve(director),
+      setDirectorGoal: () => Promise.resolve(director),
+      assignDirectorReplicant: () => Promise.resolve(director),
       controlAutomation: () => Promise.resolve(automationControlResponse),
     } satisfies Partial<typeof actual.daemonApi>,
   };

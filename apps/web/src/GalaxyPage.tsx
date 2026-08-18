@@ -87,7 +87,7 @@ export function GalaxyPage({
   const galaxyRevision = useGalaxyRevision();
   const deviceQuery = useDomainQuery({
     slice: "devices",
-    fetcher: daemonApi.devices,
+    fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) => snapshot.devices.length === 0,
   });
   const [scene, setScene] = useState<GalaxySceneSnapshot>();

@@ -148,3 +148,89 @@ before a crash. For example, `event.tour` reuses an existing matching `event.del
 (or creates one as a child), waits until staging succeeds, and only then claims the Replicant and
 resolves the event. This keeps manufacturing/logistics independent from Replicant dispatch while
 making both phases visible to the workflow UI.
+
+## Automation Director
+
+Intent-native workflows are the execution layer, not the strategic control plane. The
+Automation Director continuously reconciles standing empire goals against managed game state and
+creates or reuses durable **batch/campaign workflows** when work is required.
+
+```text
+standing empire goals
+        |
+        v
+Automation Director
+  +-- discovered / established regions
+  +-- permanent regional Replicant assignments
+  +-- objective / blocker / next action
+  +-- regional workforce pressure
+        |
+        v
+regional goal instances / campaign planners
+        |
+        v
+durable intent-native workflows
+        |
+        v
+managed operations
+```
+
+The Director never issues game commands directly. Mechanical work remains inside registered
+workflows and managed client operations. Director state (settings, goal controls, regional
+assignments, goal runtime, and workforce pressure) is persisted in the workflow database through
+the generic `runtime_documents` store.
+
+The Director has three operating modes:
+
+- `off`: preserve configuration and report state without planning new work;
+- `advisory`: reconcile goals and report blockers / next actions without launching work;
+- `automatic`: reconcile goals and create the required campaign workflows.
+
+The initial standing goals are intentionally batch-oriented rather than one-goal-per-object:
+
+- **Establish Regions** discovers regions without an owned foothold, grows a two-Replicant
+  bootstrap pool when required, and runs one regional bootstrap campaign at a time. This serial
+  establishment policy prevents newly discovered regions from causing a burst of simultaneous
+  cloning/ark construction. Newly established regions automatically become eligible for regional
+  goals.
+- **Expand Star Catalogue** uses owned galactic observatories to prospect for undiscovered stars.
+- **Enhance Star Catalogue** runs regional survey tours over known systems that still need survey
+  coverage. Large regional backlogs are partitioned into disjoint exact-system shards across up to
+  four idle region-assigned Replicants/racing vessels. The shard backlog contributes real regional
+  worker pressure, so the grow-only workforce policy can add catalogue capacity when useful survey
+  work is persistently waiting rather than cloning merely because utilization is high.
+- **Expand Mining Ops** batches uncovered known belt systems into regional mining campaigns.
+- **Event Completion** batches active regional events into campaign planning, staging, routing,
+  and completion.
+- **Expand FTL Network** and **Establish Beacons** are persisted goal kinds but remain disabled by
+  default until their autonomous placement/scoring policies are implemented. Explicit frontier,
+  relay, event, and bootstrap workflows remain available in the meantime.
+
+### Regions and worker ownership
+
+A Replicant may be permanently assigned to an operating region. The Director automatically makes
+an initial assignment from live location when a Replicant has no saved assignment, but it never
+automatically moves or clears an existing assignment. Regional campaign planners only consume
+workers assigned to that region, preventing normal automation from sending an Alpha worker across
+the galaxy to service Beta work merely because it is momentarily idle.
+
+Cross-region movement remains an explicit workflow/operator concern. Region aliases are
+canonicalized at the Director boundary, while previously unknown future region names remain valid
+without code changes. A region may contain multiple system hubs; the Director deterministically
+chooses the hub system with the strongest manufacturing footprint as the regional capital, then
+prefers an owned Autofactory in that system as the campaign home. This avoids letting an arbitrary
+relay/expansion hub become the operating centre merely because it appeared first in device state.
+
+### Grow-only Replicant workforce
+
+Automated workforce management is deliberately **grow-only**. There is no Director operation,
+workflow, or policy that deletes, retires, decommissions, or otherwise scales down Replicants.
+Idle Replicants are retained permanently.
+
+Scale-up is based on regional useful-work pressure rather than utilization alone. Ordinary
+established regions must have campaign work blocked on a missing worker, remain below the idle
+reserve threshold for a sustained hold period, and respect a scale-up cooldown. Establishing a new
+region is the exception: it may explicitly request the two-worker bootstrap pool even before that
+region has a local hub. The resulting `replicant.provision` workflow prints an empty Replicant
+matrix and cradle vessel at an established manufacturing home, performs replication, and records
+the new Replicant as permanently assigned to the target region.

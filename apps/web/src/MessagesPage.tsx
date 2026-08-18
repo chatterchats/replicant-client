@@ -114,14 +114,18 @@ export function MessagesContent({
               type="search"
               placeholder="Title or message body"
               value={search}
-              onChange={(event) => setSearch(event.target.value)}
+              onChange={(event) => {
+                setSearch(event.target.value);
+              }}
             />
           </label>
           <label>
             <span>Message type</span>
             <select
               value={messageType}
-              onChange={(event) => setMessageType(event.target.value)}
+              onChange={(event) => {
+                setMessageType(event.target.value);
+              }}
             >
               <option value="">All types</option>
               {messageTypes.map((type) => (
@@ -135,7 +139,9 @@ export function MessagesContent({
             <input
               type="checkbox"
               checked={unreadOnly}
-              onChange={(event) => setUnreadOnly(event.target.checked)}
+              onChange={(event) => {
+                setUnreadOnly(event.target.checked);
+              }}
             />
             Unread only
           </label>
@@ -143,7 +149,7 @@ export function MessagesContent({
         <p className="table-summary">
           {filteredInbox.length} shown
           {typeof data?.unread_count === "number" &&
-            ` · ${data.unread_count} unread`}
+            ` · ${String(data.unread_count)} unread`}
         </p>
         {filteredInbox.length ? (
           <div className="message-list">

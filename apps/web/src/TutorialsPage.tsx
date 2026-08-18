@@ -37,7 +37,12 @@ export function TutorialsPage() {
       {error && <p className="inline-warning">{error}</p>}
       <section className="asset-jobs">
         {data?.tutorials.map((tutorial) => (
-          <button key={tutorial.slug} onClick={() => setSlug(tutorial.slug)}>
+          <button
+            key={tutorial.slug}
+            onClick={() => {
+              setSlug(tutorial.slug);
+            }}
+          >
             <strong>{tutorial.name ?? tutorial.slug}</strong> ·{" "}
             {tutorial.completed
               ? "complete"

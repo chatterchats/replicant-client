@@ -53,7 +53,9 @@ export function DirectoryPage() {
         Name
         <input
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value);
+          }}
           placeholder="Partial name"
         />
       </label>
@@ -93,7 +95,13 @@ export function DirectoryPage() {
               <h2>{profile.name ?? profile.entity.id}</h2>
               <p>{profile.entity.id}</p>
             </div>
-            <button onClick={() => setProfile(undefined)}>Close</button>
+            <button
+              onClick={() => {
+                setProfile(undefined);
+              }}
+            >
+              Close
+            </button>
           </header>
           <dl className="detail-list">
             <div>

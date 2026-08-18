@@ -33,6 +33,7 @@ fn survey_and_relay_checkpoints_resume_without_repeating_completed_steps() {
                 center: "ROOT".to_owned(),
                 radius_ly: 1.0,
                 system_limit: 1,
+                target_systems: None,
                 star_detail_concurrency: 1,
                 mission_file: path.with_extension("survey.json"),
                 controller: None,

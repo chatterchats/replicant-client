@@ -4,6 +4,7 @@ import {
   parseBlueprintsResponse,
   parseBobnetResponse,
   parseAutomationControlResponse,
+  parseDirectorResponse,
   parseBootstrapResponse,
   parseCargoResponse,
   parseDescriptorsResponse,
@@ -39,7 +40,12 @@ import {
   parseWorkflowDetailResponse,
   parseWorkflowResponse,
 } from "./protocol";
-import type { AutomationControlAction, TriggerRequest } from "./protocol";
+import type {
+  AutomationControlAction,
+  DirectorGoalKind,
+  DirectorMode,
+  TriggerRequest,
+} from "./protocol";
 
 export function daemonUrl(path: string, origin?: string): string {
   const configuredOrigin = (
@@ -167,6 +173,39 @@ async function send(
 }
 
 export const daemonApi = {
+  async director(signal?: AbortSignal) {
+    return parseDirectorResponse(await get("/api/director", signal)).payload;
+  },
+  async reconcileDirector() {
+    return parseDirectorResponse(
+      await post("/api/director/reconcile", undefined, 60_000),
+    ).payload;
+  },
+  async setDirectorMode(mode: DirectorMode) {
+    return parseDirectorResponse(
+      await send("PUT", "/api/director/mode", { mode }),
+    ).payload;
+  },
+  async setDirectorGoal(kind: DirectorGoalKind, enabled: boolean) {
+    return parseDirectorResponse(
+      await send("PUT", `/api/director/goals/${encodeURIComponent(kind)}`, {
+        enabled,
+      }),
+    ).payload;
+  },
+  async assignDirectorReplicant(
+    code: string,
+    region: string | null,
+    roleAffinity: string | null = null,
+  ) {
+    return parseDirectorResponse(
+      await send(
+        "PUT",
+        `/api/director/replicants/${encodeURIComponent(code)}/region`,
+        { region, role_affinity: roleAffinity },
+      ),
+    ).payload;
+  },
   async controlAutomation(
     action: AutomationControlAction,
     workflowIds: string[] = [],

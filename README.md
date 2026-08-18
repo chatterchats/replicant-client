@@ -249,7 +249,8 @@ Docker deployment paths. See [`apps/desktop/README.md`](apps/desktop/README.md).
 The production Docker and Docker Compose deployment is documented in
 [`docs/docker.md`](docs/docker.md). It runs the web UI and reverse proxy as the
 only host-published service; `replicantd` remains on the private Compose
-network with its SQLite state in `${HOME}/.local/share/replicant` by default.
+network with its SQLite state and persistent `logs/replicantd.log` in
+`${HOME}/.local/share/replicant` by default.
 
 ## License
 

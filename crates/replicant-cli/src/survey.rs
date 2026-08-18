@@ -256,6 +256,7 @@ fn parse(arguments: Vec<String>) -> crate::AnyResult<Config> {
             center,
             radius_ly,
             system_limit,
+            target_systems: None,
             star_detail_concurrency,
             mission_file,
             controller,

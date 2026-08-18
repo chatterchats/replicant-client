@@ -37,10 +37,22 @@ Both services have container health checks. The daemon checks
 daemon before starting. The proxy preserves same-origin `/api` requests and
 WebSocket upgrades at `/ws`, with a one-day idle timeout for live connections.
 
-Logs go to stdout/stderr and are available through `docker compose logs`.
-Docker logging-driver retention should be configured at the host level if
-persistent logs are wanted; no application log is written to the container
-layer.
+`replicantd` writes each tracing event to both stdout/stderr and a persistent
+application log at `/var/lib/replicant/logs/replicantd.log`. Because
+`/var/lib/replicant` is the same bind-mounted data root as the SQLite
+databases, the host can read the file directly at
+`${REPLICANT_DATA_DIR:-$HOME/.local/share/replicant}/logs/replicantd.log`
+without using Docker commands. Set `REPLICANT_LOG_DIR` to override the daemon
+log directory for native/custom deployments.
+
+Compose also keeps stdout/stderr through Docker's `local` logging driver with
+10 MiB / 3-file rotation, so `docker compose logs` remains useful without
+becoming the only copy of runtime diagnostics. `RUST_LOG` controls both sinks.
+The supplied default keeps normal application events at `info`, enables
+Director decision tracing at `debug`, and suppresses noisy raw-HTTP internals
+to `warn`. HTTP request timing is emitted by `replicant_server` at `debug`
+(with failures promoted to `warn`/`error`). For deeper investigation,
+temporarily use the debug profile shown in `.env.example`.
 
 ## Secrets
 
@@ -66,8 +78,7 @@ The host directory `${HOME}/.local/share/replicant` is mounted at
   history, and managed operations;
 - `replicant-runtime.sqlite` plus SQLite WAL files: workflows, checkpoints,
   claims, triggers, schedules, and activity;
-- future intentionally persistent profile configuration or file logs placed
-  below the same data root.
+- `logs/replicantd.log`: persistent structured daemon/runtime/workflow logs.
 
 Override the host path with `REPLICANT_DATA_DIR`. It must exist and be writable
 by `REPLICANT_UID:REPLICANT_GID`; these default to `1000:1000`. Prove the

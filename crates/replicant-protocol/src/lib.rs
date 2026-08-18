@@ -198,6 +198,185 @@ pub struct AutomationStatus {
     pub workflows_paused: bool,
 }
 
+/// Automation Director execution mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorMode {
+    /// Persist and evaluate goals without planning work.
+    Off,
+    /// Evaluate and explain plans without launching new work.
+    Advisory,
+    /// Reconcile standing goals and launch eligible work automatically.
+    Automatic,
+}
+
+/// Standing empire-level goals understood by the Automation Director.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorGoalKind {
+    /// Establish a durable foothold in every discovered region.
+    EstablishRegions,
+    /// Discover previously unknown stars with observatories.
+    ExpandStarCatalogue,
+    /// Survey known systems so the catalogue contains richer knowledge.
+    EnhanceStarCatalogue,
+    /// Continually extend mining coverage to useful known belts.
+    ExpandMiningOps,
+    /// Batch-plan and complete active location events in each region.
+    EventCompletion,
+    /// Extend relay reach where regional work requires it.
+    ExpandFtlNetwork,
+    /// Ensure useful known systems receive monitoring beacons.
+    EstablishBeacons,
+}
+
+/// Current health of one Director goal instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorGoalStatus {
+    /// Desired state currently holds.
+    Satisfied,
+    /// Useful work is active or ready to launch.
+    Active,
+    /// Work is waiting on a concrete dependency.
+    Blocked,
+    /// Nothing can or should be done until new world state arrives.
+    Waiting,
+}
+
+/// Establishment state for one discovered catalogue region.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorRegionStatus {
+    /// Region is known but has no operational foothold.
+    Discovered,
+    /// Establishment work has started but no durable hub exists yet.
+    Establishing,
+    /// An owned hub provides a persistent regional foothold.
+    Established,
+}
+
+/// One regional Replicant assignment managed by the Director.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorReplicantAssignment {
+    /// Replicant code.
+    pub code: String,
+    /// Display name when known.
+    pub name: Option<String>,
+    /// Permanently assigned operating region, when set.
+    pub region: Option<String>,
+    /// Whether a non-terminal workflow currently claims this Replicant.
+    pub busy: bool,
+    /// Current claiming workflow, when busy.
+    pub workflow_id: Option<WorkflowId>,
+    /// Optional soft role preference such as catalogue or events.
+    pub role_affinity: Option<String>,
+}
+
+/// Director view of one discovered region.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorRegionSummary {
+    /// Canonical region name.
+    pub region: String,
+    /// Current establishment state.
+    pub status: DirectorRegionStatus,
+    /// Regional hub star, when established.
+    pub hub_system: Option<String>,
+    /// Regional manufacturing/home location, when known.
+    pub hub_location: Option<String>,
+    /// Replicants permanently assigned to this region.
+    pub replicants: Vec<String>,
+    /// Number of known catalogue systems in the region.
+    pub known_systems: usize,
+}
+
+/// One instantiated standing Director goal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorGoalSummary {
+    /// Stable instance identifier.
+    pub id: String,
+    /// Standing goal type.
+    pub kind: DirectorGoalKind,
+    /// Region for regional goals; absent for global goals.
+    pub region: Option<String>,
+    /// Current health.
+    pub status: DirectorGoalStatus,
+    /// Plain-language objective.
+    pub objective: String,
+    /// Primary concrete blocker, when one exists.
+    pub blocker: Option<String>,
+    /// Next planned action.
+    pub next_action: Option<String>,
+    /// Current progress numerator when quantifiable.
+    pub progress_current: u64,
+    /// Progress denominator when quantifiable.
+    pub progress_total: u64,
+    /// Non-terminal workflows owned by this goal instance.
+    pub active_workflows: Vec<WorkflowId>,
+    /// Whether this standing goal type is enabled.
+    pub enabled: bool,
+}
+
+/// Grow-only workforce pressure summary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorWorkforceSummary {
+    /// Total owned Replicants.
+    pub total: usize,
+    /// Replicants claimed by active workflows.
+    pub busy: usize,
+    /// Replicants currently unclaimed by automation.
+    pub idle: usize,
+    /// `idle / total`, or `1.0` for an empty account.
+    pub idle_ratio: f64,
+    /// Regional assignments currently blocked specifically on worker capacity.
+    pub pending_worker_demand: usize,
+    /// Whether sustained demand meets the current scale-up policy.
+    pub scale_up_recommended: bool,
+    /// Human-readable reason for or against scaling.
+    pub scale_reason: Option<String>,
+}
+
+/// Complete Automation Director projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorSnapshot {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Current Director mode.
+    pub mode: DirectorMode,
+    /// Discovered regions and permanent worker pools.
+    pub regions: Vec<DirectorRegionSummary>,
+    /// Standing goal instances.
+    pub goals: Vec<DirectorGoalSummary>,
+    /// Replicant assignments and utilization.
+    pub replicants: Vec<DirectorReplicantAssignment>,
+    /// Empire-wide workforce pressure.
+    pub workforce: DirectorWorkforceSummary,
+}
+
+/// Updates the Director operating mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorModeRequest {
+    /// New operating mode.
+    pub mode: DirectorMode,
+}
+
+/// Enables or disables one standing goal type globally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorGoalControlRequest {
+    /// Whether this standing goal should be instantiated and reconciled.
+    pub enabled: bool,
+}
+
+/// Permanently assigns a Replicant to a region.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorReplicantRegionRequest {
+    /// Canonical or user-supplied region name; empty clears the assignment.
+    pub region: Option<String>,
+    /// Optional soft role preference.
+    #[serde(default)]
+    pub role_affinity: Option<String>,
+}
+
 /// Metadata describing an application snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -2336,6 +2515,8 @@ pub enum DomainSlice {
     Workflows,
     /// Managed operation state.
     Operations,
+    /// Automation Director goals, regions, and workforce state.
+    Director,
 }
 
 /// Managed operation lifecycle presented by the application.

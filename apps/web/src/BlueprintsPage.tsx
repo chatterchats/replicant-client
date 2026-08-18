@@ -6,7 +6,7 @@ export function BlueprintsPage() {
   const [search, setSearch] = useState("");
   const { data, status, error, refreshing, refresh } = useDomainQuery({
     slice: "blueprints",
-    fetcher: daemonApi.blueprints,
+    fetcher: (signal) => daemonApi.blueprints(signal),
     isEmpty: (snapshot) => snapshot.blueprints.length === 0,
   });
   if (!data && status === "loading")
@@ -39,7 +39,9 @@ export function BlueprintsPage() {
         <input
           type="search"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value);
+          }}
         />
       </label>
       <div className="inventory-table-wrap">
@@ -62,17 +64,17 @@ export function BlueprintsPage() {
                 </td>
                 <td>
                   {row.print_time_seconds !== null
-                    ? `${row.print_time_seconds}s`
+                    ? `${String(row.print_time_seconds)}s`
                     : "—"}
                 </td>
                 <td>
                   {row.resources
-                    .map((item) => `${item.quantity} ${item.resource}`)
+                    .map((item) => `${String(item.quantity)} ${item.resource}`)
                     .join(", ") || "—"}
                 </td>
                 <td>
                   {row.components
-                    .map((item) => `${item.quantity} ${item.resource}`)
+                    .map((item) => `${String(item.quantity)} ${item.resource}`)
                     .join(", ") || "—"}
                 </td>
                 <td>

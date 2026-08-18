@@ -62,6 +62,9 @@ pub mod workflows;
 /// Intent-driven workflow layer for web and Tauri automation.
 pub mod automation;
 
+/// Empire-level standing-goal reconciliation and regional workforce planning.
+pub mod orchestration;
+
 /// Declarative desired-state evaluation and fulfillment planning.
 pub mod requirements;
 

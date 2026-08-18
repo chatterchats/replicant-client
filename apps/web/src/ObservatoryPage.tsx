@@ -16,7 +16,7 @@ export function ObservatoryPage({
 }) {
   const query = useDomainQuery({
     slice: "devices",
-    fetcher: daemonApi.devices,
+    fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) =>
       !snapshot.devices.some((device) =>
         device.device_type?.includes("observatory"),
@@ -50,7 +50,11 @@ export function ObservatoryPage({
         </div>
         <div className="asset-operations">
           {autoProspect && (
-            <button onClick={() => onRunCommand(autoProspect)}>
+            <button
+              onClick={() => {
+                onRunCommand(autoProspect);
+              }}
+            >
               Auto-select &amp; prospect
             </button>
           )}
@@ -76,18 +80,22 @@ export function ObservatoryPage({
               {device.location ?? device.system ?? "Unknown location"}
             </p>
             <div className="asset-operations">
-              <button onClick={() => onSelectEntity(device.entity)}>
+              <button
+                onClick={() => {
+                  onSelectEntity(device.entity);
+                }}
+              >
                 Inspect
               </button>
               {operations.map((operation) => (
                 <button
                   key={operation.descriptor.kind}
-                  onClick={() =>
+                  onClick={() => {
                     onRunCommand({
                       ...operation,
                       initialParameters: { device: device.entity.id },
-                    })
-                  }
+                    });
+                  }}
                 >
                   {operation.descriptor.display_name}
                 </button>

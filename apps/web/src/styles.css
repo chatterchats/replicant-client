@@ -2813,3 +2813,202 @@ h1 {
     grid-template-columns: 1fr;
   }
 }
+
+.director-view {
+  display: grid;
+  gap: 1rem;
+}
+.director-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+}
+.director-toolbar h2 {
+  margin: 0.2rem 0;
+}
+.director-toolbar p {
+  max-width: 70ch;
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+}
+.director-mode {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  justify-content: end;
+}
+.director-mode button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.director-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+.director-metrics div {
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  display: grid;
+  gap: 0.2rem;
+}
+.director-metrics span,
+.director-goal header span,
+.director-region header span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.director-metrics strong {
+  font-size: 1.35rem;
+}
+.director-callout {
+  margin: 0;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.director-callout.warning {
+  border-color: color-mix(in srgb, var(--warning, #d99a00) 55%, var(--border));
+}
+.director-policy {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.director-policy h3 {
+  margin: 0;
+}
+.director-policy-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+.director-goal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 0.75rem;
+}
+.director-goal,
+.director-region {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+}
+.director-goal.blocked,
+.director-regional-goal.blocked {
+  border-left: 3px solid var(--warning, #d99a00);
+}
+.director-goal.active,
+.director-regional-goal.active {
+  border-left: 3px solid var(--accent);
+}
+.director-goal.satisfied,
+.director-regional-goal.satisfied {
+  border-left: 3px solid var(--success, #4ca86b);
+}
+.director-goal header,
+.director-region > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: start;
+}
+.director-goal h3,
+.director-region h4 {
+  margin: 0.15rem 0;
+}
+.director-goal p {
+  margin: 0.5rem 0 0;
+}
+.director-toggle {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.82rem;
+}
+.director-regions {
+  display: grid;
+  gap: 0.75rem;
+}
+.director-regions > h3,
+.director-roster h3 {
+  margin-bottom: 0;
+}
+.director-region-workers {
+  color: var(--muted);
+  text-align: right;
+  max-width: 45%;
+}
+.director-regional-goals {
+  margin-top: 0.8rem;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+.director-regional-goal {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.director-regional-goal > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+.director-regional-goal span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.director-regional-goal p {
+  margin: 0.35rem 0 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+.director-roster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.55rem;
+}
+.director-roster-grid label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel);
+}
+.director-roster-grid label > span {
+  display: grid;
+}
+.director-roster-grid small {
+  color: var(--muted);
+}
+@media (max-width: 800px) {
+  .director-toolbar {
+    flex-direction: column;
+  }
+  .director-mode {
+    justify-content: start;
+  }
+  .director-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .director-region-workers {
+    max-width: none;
+  }
+}

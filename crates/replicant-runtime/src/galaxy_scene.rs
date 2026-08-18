@@ -40,16 +40,27 @@ pub async fn galaxy_scene(
     }
     let locations = client.locations().find().collect().await?;
 
-    Ok(build_scene(
+    Ok(build_scene(SceneInputs {
         stars,
         knowledge,
         locations,
         devices,
         replicants,
-        workflow_targets(workflows),
+        targets: workflow_targets(workflows),
         revision,
         generated_at_ms,
-    ))
+    }))
+}
+
+struct SceneInputs {
+    stars: Vec<Star>,
+    knowledge: Vec<StarKnowledge>,
+    locations: Vec<Location>,
+    devices: Vec<Device>,
+    replicants: Vec<Replicant>,
+    targets: Vec<Target>,
+    revision: u64,
+    generated_at_ms: i64,
 }
 
 #[derive(Clone)]
@@ -90,16 +101,17 @@ fn workflow_targets(workflows: &[WorkflowInstance]) -> Vec<Target> {
         .collect()
 }
 
-fn build_scene(
-    stars: Vec<Star>,
-    knowledge: Vec<StarKnowledge>,
-    locations: Vec<Location>,
-    devices: Vec<Device>,
-    replicants: Vec<Replicant>,
-    targets: Vec<Target>,
-    revision: u64,
-    generated_at_ms: i64,
-) -> GalaxySceneSnapshot {
+fn build_scene(inputs: SceneInputs) -> GalaxySceneSnapshot {
+    let SceneInputs {
+        stars,
+        knowledge,
+        locations,
+        devices,
+        replicants,
+        targets,
+        revision,
+        generated_at_ms,
+    } = inputs;
     let positions = stars
         .iter()
         .filter_map(|star| {
@@ -438,16 +450,16 @@ mod tests {
             anchor: "SOL-HUB".to_owned(),
             systems: vec!["ALPHA".to_owned()],
         };
-        let scene = build_scene(
-            vec![star("SOL", 0.0), star("ALPHA", 7.0)],
-            Vec::new(),
-            Vec::new(),
-            vec![relay("R1", "SOL-1"), relay("R2", "ALPHA-1")],
-            Vec::new(),
-            vec![target],
-            9,
-            10,
-        );
+        let scene = build_scene(SceneInputs {
+            stars: vec![star("SOL", 0.0), star("ALPHA", 7.0)],
+            knowledge: Vec::new(),
+            locations: Vec::new(),
+            devices: vec![relay("R1", "SOL-1"), relay("R2", "ALPHA-1")],
+            replicants: Vec::new(),
+            targets: vec![target],
+            revision: 9,
+            generated_at_ms: 10,
+        });
 
         assert_eq!(scene.revision, 9);
         assert_eq!(

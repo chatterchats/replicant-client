@@ -58,7 +58,10 @@ started by this desktop process; it never kills a separately launched daemon.
 
 The sidecar uses `client.sqlite` and `runtime.sqlite` in Tauri's per-user local
 application data directory unless `REPLICANT_DB` or `REPLICANT_RUNTIME_DB` is
-already configured. No API token, database contents, or shell/process command is
+already configured. The daemon automatically writes persistent tracing output to
+a sibling `logs/replicantd.log` directory (or `REPLICANT_LOG_DIR` when explicitly
+configured), so desktop runtime diagnostics survive sidecar restarts alongside
+the databases. No API token, database contents, or shell/process command is
 exposed through the frontend capability set.
 
 ## Validation and release packaging

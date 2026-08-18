@@ -226,7 +226,9 @@ export function BobNetContent({
               aria-label="Open BobNet channel"
               placeholder="#channel"
               value={channelEntry}
-              onChange={(event) => setChannelEntry(event.target.value)}
+              onChange={(event) => {
+                setChannelEntry(event.target.value);
+              }}
             />
             <button type="submit">Open</button>
           </form>
@@ -240,7 +242,9 @@ export function BobNetContent({
                     : ""
                 }
                 key={channel}
-                onClick={() => setSelectedChannel(channel)}
+                onClick={() => {
+                  setSelectedChannel(channel);
+                }}
               >
                 <span>{channel}</span>
                 <small>
@@ -265,7 +269,7 @@ export function BobNetContent({
               <small>
                 {visibleMessages.length} loaded
                 {typeof data?.total_messages === "number"
-                  ? ` · ${data.total_messages} available in recent history`
+                  ? ` · ${String(data.total_messages)} available in recent history`
                   : ""}
               </small>
             </div>
@@ -278,27 +282,30 @@ export function BobNetContent({
             aria-live="polite"
           >
             {visibleMessages.map((message, index) => {
+              const sender = message.sender;
+              const currentSystem = message.current_system;
               const senderLabel =
-                message.sender_name ?? message.sender ?? "NPC / system";
+                message.sender_name ?? sender ?? "NPC / system";
               return (
                 <div
                   className={`bobnet-line${message.is_npc_or_system ? " system" : ""}`}
                   key={
-                    message.id ?? `${message.created_at ?? "message"}:${index}`
+                    message.id ??
+                    `${message.created_at ?? "message"}:${String(index)}`
                   }
                 >
                   <time dateTime={message.created_at ?? undefined}>
                     {clockTime(message.created_at)}
                   </time>
-                  {message.sender ? (
+                  {sender ? (
                     <button
                       className="bobnet-nick"
-                      onClick={() =>
+                      onClick={() => {
                         onSelectEntity({
                           kind: "replicant",
-                          id: message.sender ?? "",
-                        })
-                      }
+                          id: sender,
+                        });
+                      }}
                     >
                       &lt;{senderLabel}&gt;
                     </button>
@@ -308,18 +315,18 @@ export function BobNetContent({
                     </strong>
                   )}
                   <span className="bobnet-line-body">{message.body ?? ""}</span>
-                  {message.current_system && (
+                  {currentSystem && (
                     <button
                       className="bobnet-system-link"
-                      title={`Sent from ${message.current_system}`}
-                      onClick={() =>
+                      title={`Sent from ${currentSystem}`}
+                      onClick={() => {
                         onSelectEntity({
                           kind: "system",
-                          id: message.current_system ?? "",
-                        })
-                      }
+                          id: currentSystem,
+                        });
+                      }}
                     >
-                      {message.current_system}
+                      {currentSystem}
                     </button>
                   )}
                 </div>
@@ -354,7 +361,9 @@ export function BobNetContent({
               }
               value={draft}
               disabled={!activeSender || !data?.selected_source}
-              onChange={(event) => setDraft(event.target.value)}
+              onChange={(event) => {
+                setDraft(event.target.value);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -396,7 +405,9 @@ export function BobNetContent({
               <button
                 className={replicant.entity.id === activeSender ? "active" : ""}
                 key={replicant.entity.id}
-                onClick={() => setSender(replicant.entity.id)}
+                onClick={() => {
+                  setSender(replicant.entity.id);
+                }}
               >
                 <span>{replicant.name ?? replicant.entity.id}</span>
                 <small>
@@ -416,7 +427,9 @@ export function BobNetContent({
             <input
               type="checkbox"
               checked={includeNpcs}
-              onChange={(event) => onIncludeNpcsChange(event.target.checked)}
+              onChange={(event) => {
+                onIncludeNpcsChange(event.target.checked);
+              }}
             />
             Include NPC / system chatter
           </label>

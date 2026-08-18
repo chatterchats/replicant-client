@@ -143,6 +143,14 @@ impl Drop for CampaignWorker {
     }
 }
 
+pub(super) fn mission_paths(campaign: &EventCampaignPlan) -> Vec<PathBuf> {
+    campaign
+        .missions
+        .iter()
+        .map(|mission| mission.mission_path.clone())
+        .collect()
+}
+
 pub(crate) fn is_campaign_file(path: &Path) -> AnyResult<bool> {
     if !path.exists() {
         return Ok(false);

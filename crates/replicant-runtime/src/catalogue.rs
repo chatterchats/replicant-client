@@ -15,6 +15,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
+    actions::{
+        ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
+        tag_devices,
+    },
     automation::{
         EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
         SalvageIntent, ScanIntent, ScanTourIntent, event_delivery_workflow_kind,
@@ -25,10 +29,6 @@ use crate::{
         new_scan_system_workflow, new_scan_tour_workflow, observatory_workflow_kind,
         salvage_workflow_kind, scan_belt_workflow_kind, scan_system_workflow_kind,
         scan_tour_workflow_kind,
-    },
-    actions::{
-        ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
-        tag_devices,
     },
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
     observatory::auto_prospect,
@@ -604,8 +604,7 @@ impl OperationCatalogue {
                 Ok(repository.create(workflow)?)
             }
             "logistics.delivery" => {
-                let mut workflow =
-                    new_logistics_workflow(decode::<LogisticsIntent>(parameters)?);
+                let mut workflow = new_logistics_workflow(decode::<LogisticsIntent>(parameters)?);
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
@@ -2118,6 +2117,7 @@ impl SurveyStart {
             center: self.center,
             radius_ly: self.radius_ly,
             system_limit: self.system_limit,
+            target_systems: None,
             star_detail_concurrency: self.star_detail_concurrency,
             mission_file: self.mission_file,
             controller: self.controller,

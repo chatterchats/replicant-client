@@ -515,6 +515,11 @@ impl WorkflowSupervisor {
     /// Durably requests a cooperative pause while retaining resource claims.
     pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
+        tracing::info!(
+            workflow_id = %id,
+            kind = %instance.kind,
+            "workflow pause requested"
+        );
         self.transition(instance, WorkflowStatus::Paused)?;
         if let Some(control) = self.controls.get(&id) {
             control.send_replace(ControlRequest::Pause);
@@ -525,6 +530,11 @@ impl WorkflowSupervisor {
     /// Durably resumes a paused workflow through reconciliation.
     pub fn resume(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
+        tracing::info!(
+            workflow_id = %id,
+            kind = %instance.kind,
+            "workflow resume requested"
+        );
         self.transition(instance, WorkflowStatus::Reconciling)?;
         Ok(())
     }
@@ -535,6 +545,11 @@ impl WorkflowSupervisor {
     /// a workflow without an executor releases them immediately.
     pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         let instance = self.read(id)?;
+        tracing::info!(
+            workflow_id = %id,
+            kind = %instance.kind,
+            "workflow cancellation requested"
+        );
         self.transition(instance, WorkflowStatus::Cancelled)?;
         if let Some(control) = self.controls.get(&id) {
             control.send_replace(ControlRequest::Cancel);
@@ -668,17 +683,32 @@ impl WorkflowSupervisor {
             }
         };
         let id = instance.id;
+        let kind = instance.kind.clone();
+        tracing::info!(workflow_id = %id, kind = %kind, "workflow executor starting");
         let repository = self.repository.clone();
         let client = self.client.clone();
         let (control_sender, control) = watch::channel(ControlRequest::Continue);
         let task = tokio::spawn(async move {
             let mut context = WorkflowContext::new(repository, instance, client, control);
             if let Err(error) = executor.execute(&mut context).await {
+                tracing::error!(
+                    workflow_id = %id,
+                    kind = %kind,
+                    error = %error,
+                    "workflow executor failed"
+                );
                 if let Err(record_error) = context.mark_failed(error) {
                     tracing::error!(workflow_id = %id, error = %record_error, "failed to record workflow executor error");
                 }
             } else if let Err(error) = fail_if_still_running(&mut context) {
-                tracing::error!(workflow_id = %id, error = %error, "failed to finalize workflow executor");
+                tracing::error!(
+                    workflow_id = %id,
+                    kind = %kind,
+                    error = %error,
+                    "failed to finalize workflow executor"
+                );
+            } else {
+                tracing::info!(workflow_id = %id, kind = %kind, "workflow executor finished");
             }
         });
         self.tasks.insert(id, task);

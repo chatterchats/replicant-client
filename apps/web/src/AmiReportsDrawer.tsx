@@ -35,7 +35,9 @@ export function AmiReportsDrawer({
           Report type
           <select
             value={eventType}
-            onChange={(event) => setEventType(event.target.value)}
+            onChange={(event) => {
+              setEventType(event.target.value);
+            }}
           >
             <option value="">All AMI reports</option>
             {eventTypes.map((name) => (
@@ -59,35 +61,40 @@ export function AmiReportsDrawer({
         <p className="empty-state">No AMI reports match this view.</p>
       ) : (
         <div className="ami-report-list">
-          {events.map((event) => (
-            <details className="ami-report-card" key={event.id}>
-              <summary>
-                <span>
-                  <strong>{event.name}</strong>
-                  <small>
-                    {event.device?.id ??
-                      event.location ??
-                      event.system ??
-                      "fleet"}
-                  </small>
-                </span>
-                <time dateTime={event.occurred_at}>
-                  {new Date(event.occurred_at).toLocaleString()}
-                </time>
-              </summary>
-              <div className="ami-report-card-body">
-                {event.device && (
-                  <button
-                    className="subtle-link"
-                    onClick={() => onSelectEntity(event.device!)}
-                  >
-                    Inspect {event.device.id}
-                  </button>
-                )}
-                <ActivityEventDetails event={event} compact />
-              </div>
-            </details>
-          ))}
+          {events.map((event) => {
+            const device = event.device;
+            return (
+              <details className="ami-report-card" key={event.id}>
+                <summary>
+                  <span>
+                    <strong>{event.name}</strong>
+                    <small>
+                      {event.device?.id ??
+                        event.location ??
+                        event.system ??
+                        "fleet"}
+                    </small>
+                  </span>
+                  <time dateTime={event.occurred_at}>
+                    {new Date(event.occurred_at).toLocaleString()}
+                  </time>
+                </summary>
+                <div className="ami-report-card-body">
+                  {device && (
+                    <button
+                      className="subtle-link"
+                      onClick={() => {
+                        onSelectEntity(device);
+                      }}
+                    >
+                      Inspect {device.id}
+                    </button>
+                  )}
+                  <ActivityEventDetails event={event} compact />
+                </div>
+              </details>
+            );
+          })}
         </div>
       )}
     </div>
