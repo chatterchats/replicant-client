@@ -69,7 +69,8 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(RequirementWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningWorkflowFactory::new()))?;
     registry.register(Arc::new(EventWorkflowFactory::new()))?;
-    registry.register(Arc::new(RequirementActionFactory::new()))
+    registry.register(Arc::new(RequirementActionFactory::new()))?;
+    crate::automation::register(registry)
 }
 
 /// Persisted survey workflow configuration.

@@ -160,7 +160,7 @@ export function SurveyContent({
                       <small className="status-chip">{mission.phase}</small>
                     </td>
                     <td>
-                      <strong>{mission.vessel}</strong>
+                      <strong>{mission.vessel || "Controller-only"}</strong>
                       <small>
                         {mission.controller ?? "No controller"} ·{" "}
                         {mission.drones.length} drones

@@ -12,8 +12,8 @@ use serde_json::Value;
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    ClaimAcquireOutcome, RepositoryError, ResourceClaim, ResourceKey, WaitIntent, WaitOutcome,
-    WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository, WorkflowState,
+    ClaimAcquireOutcome, NewWorkflow, RepositoryError, ResourceClaim, ResourceKey, WaitIntent,
+    WaitOutcome, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository, WorkflowState,
     WorkflowStatus,
 };
 
@@ -86,6 +86,32 @@ impl WorkflowContext {
     #[must_use]
     pub fn repository(&self) -> &WorkflowRepository {
         &self.repository
+    }
+
+    /// Persists a child workflow owned by this orchestration.
+    ///
+    /// The parent link is always derived from the current workflow so callers
+    /// cannot accidentally create an unparented task while composing durable
+    /// child work.
+    pub fn create_child<C: Serialize, P: Serialize>(
+        &self,
+        mut workflow: NewWorkflow<C, P>,
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        workflow.parent_id = Some(self.instance.id);
+        self.repository.create(workflow)
+    }
+
+    /// Lists durable child workflows owned by this orchestration.
+    ///
+    /// This lets restart reconciliation reattach to child work that was
+    /// created immediately before a parent checkpoint write was interrupted.
+    pub fn child_workflows(&self) -> Result<Vec<WorkflowInstance>, RepositoryError> {
+        Ok(self
+            .repository
+            .list()?
+            .into_iter()
+            .filter(|workflow| workflow.parent_id == Some(self.instance.id))
+            .collect())
     }
 
     /// Atomically advances to a named logical step and persists its checkpoint.

@@ -6,7 +6,8 @@
 //! client. Frontends call the runtime and remain responsible only for
 //! presentation and user interaction.
 //!
-//! Workflow execution is intentionally outside this initial boundary.
+//! Durable workflow execution is coordinated by `replicant-workflow`; this
+//! crate supplies the application-specific workflow implementations and intents.
 
 use replicant_client::Client;
 use std::error::Error;
@@ -55,8 +56,11 @@ pub mod survey;
 /// Relay-network planning and restart-safe execution.
 pub mod relay;
 
-/// Durable survey and relay workflow registrations.
+/// Durable compatibility workflow registrations and shared orchestration glue.
 pub mod workflows;
+
+/// Intent-driven workflow layer for web and Tauri automation.
+pub mod automation;
 
 /// Declarative desired-state evaluation and fulfillment planning.
 pub mod requirements;

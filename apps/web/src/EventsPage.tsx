@@ -59,8 +59,11 @@ export function EventsContent({
 }) {
   const [search, setSearch] = useState("");
   const operations = useMemo(() => eventCommands(descriptors), [descriptors]);
+  const preparation = operations.find(
+    (command) => command.descriptor.kind === "event.delivery",
+  );
   const fulfillment = operations.find(
-    (command) => command.descriptor.kind === "event.fulfillment",
+    (command) => command.descriptor.kind === "event.tour",
   );
   const events = (data?.events ?? []).filter((event) =>
     [
@@ -229,6 +232,20 @@ export function EventsContent({
                     >
                       System
                     </button>
+                    {preparation && (
+                      <button
+                        onClick={() => {
+                          onRunCommand({
+                            ...preparation,
+                            initialParameters: {
+                              event: event.designation,
+                            },
+                          });
+                        }}
+                      >
+                        Prepare
+                      </button>
+                    )}
                     {fulfillment && (
                       <button
                         onClick={() => {
@@ -236,7 +253,6 @@ export function EventsContent({
                             ...fulfillment,
                             initialParameters: {
                               event: event.designation,
-                              plan_file: `plans/events/${event.designation}.json`,
                             },
                           });
                         }}

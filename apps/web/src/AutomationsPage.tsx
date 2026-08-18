@@ -719,10 +719,15 @@ function WorkflowRow({
 }) {
   const active = activeStatuses.includes(workflow.status);
   return (
-    <article className={`workflow-row ${selected ? "selected" : ""}`}>
+    <article
+      className={`workflow-row ${selected ? "selected" : ""} ${detail?.parent_id ? "child" : ""}`.trim()}
+    >
       <button className="workflow-row-main" onClick={onSelect}>
         <span>
-          <small>{workflow.kind}</small>
+          <small>
+            {workflow.kind}
+            {detail?.parent_id ? " · child workflow" : ""}
+          </small>
           <strong>{descriptor?.display_name ?? workflow.kind}</strong>
         </span>
         <span className={`workflow-status ${workflow.status}`}>
@@ -797,6 +802,14 @@ function WorkflowInspector({
           ×
         </button>
       </header>
+      {detail.parent_id ? (
+        <section>
+          <h3>Orchestration</h3>
+          <p>
+            <small>Parent workflow</small> {detail.parent_id}
+          </p>
+        </section>
+      ) : null}
       <section>
         <h3>Claimed resources</h3>
         {detail.claims.length ? (
@@ -873,8 +886,14 @@ export function AutomationsPage({
     void daemonApi
       .descriptors(controller.signal)
       .then((catalog) => {
-        setDescriptors(catalog.workflows);
-        setTriggerDescriptors([...catalog.actions, ...catalog.workflows]);
+        const visibleWorkflows = catalog.workflows.filter(
+          (descriptor) => descriptor.category !== "compatibility",
+        );
+        setDescriptors(visibleWorkflows);
+        setTriggerDescriptors([
+          ...catalog.actions,
+          ...visibleWorkflows,
+        ]);
       })
       .catch((reason: unknown) => {
         setError(String(reason));

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applicableDescriptorCommands,
+  descriptorCommands,
   resolveContextDefaults,
   searchDescriptors,
 } from "./CommandPalette";
@@ -63,6 +64,20 @@ describe("descriptor command discovery", () => {
       expect(searchDescriptors(catalog, query)).toHaveLength(1);
     },
   );
+
+  it("hides compatibility workflows from normal command discovery", () => {
+    const compatibility: WorkflowDescriptor = {
+      ...descriptor,
+      kind: "event.fulfillment",
+      category: "compatibility",
+    };
+    expect(
+      descriptorCommands({
+        ...catalog,
+        workflows: [descriptor, compatibility],
+      }).map(({ descriptor: item }) => item.kind),
+    ).toEqual(["survey.route"]);
+  });
 
   it("only applies descriptors with matching semantic entity parameters", () => {
     expect(

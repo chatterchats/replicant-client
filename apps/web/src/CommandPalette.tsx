@@ -24,12 +24,12 @@ export interface DescriptorCommand {
 export function descriptorCommands(
   catalog: DescriptorCatalog,
 ): DescriptorCommand[] {
-  return [...catalog.reports, ...catalog.actions, ...catalog.workflows].map(
-    (descriptor) => ({
+  return [...catalog.reports, ...catalog.actions, ...catalog.workflows]
+    .filter((descriptor) => descriptor.category !== "compatibility")
+    .map((descriptor) => ({
       descriptor,
       operationClass: descriptor.operation_class,
-    }),
-  );
+    }));
 }
 
 export function applicableDescriptorCommands(

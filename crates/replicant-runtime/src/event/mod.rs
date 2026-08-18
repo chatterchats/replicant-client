@@ -541,6 +541,47 @@ impl EventExecutionRequest {
     }
 }
 
+/// Result of advancing one event only through manufacturing and logistics staging.
+#[derive(Clone, Debug, Serialize)]
+pub struct EventPrestageResult {
+    /// Current durable event execution state.
+    pub state: EventExecutionState,
+    /// Whether every event requirement is physically staged and ready for a replicant.
+    pub ready: bool,
+}
+
+/// Advances one persisted single-event mission through manufacturing and independent
+/// logistics without dispatching its selected replicant.
+///
+/// This is the reusable boundary used by the intent-driven `event.delivery`
+/// workflow. The caller may keep the serialized plan in its own authoritative
+/// checkpoint and materialize it only while invoking this compatibility adapter.
+pub async fn prestage_event_mission(
+    client: &Client,
+    request: &EventExecutionRequest,
+) -> AnyResult<EventPrestageResult> {
+    if campaign::is_campaign_file(&request.plan_file)? {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            format!("{} is an event campaign", request.plan_file.display()),
+        ));
+    }
+    let _lock = MissionLock::acquire(&request.plan_file)?;
+    let config = execution_config(request);
+    let mut plan = load_plan(&request.plan_file)?;
+    let ready = executor::prestage_campaign_mission(
+        client,
+        &config,
+        &mut plan,
+        &executor::CampaignReplanReservations::default(),
+    )
+    .await?;
+    Ok(EventPrestageResult {
+        state: mission_state(&plan),
+        ready,
+    })
+}
+
 /// Typed progress returned by reusable event executors.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

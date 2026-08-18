@@ -15,6 +15,17 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
+    automation::{
+        EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
+        SalvageIntent, ScanIntent, ScanTourIntent, event_delivery_workflow_kind,
+        event_tour_workflow_kind, exploration_workflow_kind, logistics_workflow_kind,
+        mining_deploy_workflow_kind, new_event_delivery_workflow, new_event_tour_workflow,
+        new_exploration_workflow, new_logistics_workflow, new_mining_deploy_workflow,
+        new_observatory_workflow, new_salvage_workflow, new_scan_belt_workflow,
+        new_scan_system_workflow, new_scan_tour_workflow, observatory_workflow_kind,
+        salvage_workflow_kind, scan_belt_workflow_kind, scan_system_workflow_kind,
+        scan_tour_workflow_kind,
+    },
     actions::{
         ClearTagsAction, ContributeDevicesAction, TagDevicesAction, clear_tags, contribute_devices,
         tag_devices,
@@ -566,6 +577,60 @@ impl OperationCatalogue {
             .ok_or_else(|| unknown(OperationClass::Workflow, kind))?;
         let parameters = self.validate(OperationClass::Workflow, kind, parameters, false)?;
         match kind {
+            "scan.system" => {
+                let mut workflow = new_scan_system_workflow(decode::<ScanIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "scan.belt" => {
+                let mut workflow = new_scan_belt_workflow(decode::<ScanIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "scan.tour" => {
+                let mut workflow = new_scan_tour_workflow(decode::<ScanTourIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "salvage.site" => {
+                let mut workflow = new_salvage_workflow(decode::<SalvageIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "mining.deploy" => {
+                let mut workflow =
+                    new_mining_deploy_workflow(decode::<MiningDeployIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "logistics.delivery" => {
+                let mut workflow =
+                    new_logistics_workflow(decode::<LogisticsIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "exploration.frontier" => {
+                let mut workflow =
+                    new_exploration_workflow(decode::<ExplorationIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "event.delivery" => {
+                let mut workflow = new_event_delivery_workflow(decode::<EventIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "event.tour" => {
+                let mut workflow = new_event_tour_workflow(decode::<EventIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "observatory.search" => {
+                let mut workflow =
+                    new_observatory_workflow(decode::<ObservatoryIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
             "survey.route" => {
                 let parameters: SurveyStart = decode(parameters)?;
                 let mut workflow = new_survey_workflow(SurveyWorkflowConfig {
@@ -1304,11 +1369,187 @@ fn json_object(input: &str) -> Result<raw::JsonObject, CatalogueError> {
 fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
     vec![
         WorkflowDescriptor {
+            kind: operation_kind(scan_system_workflow_kind().as_str()),
+            display_name: "Survey system".to_owned(),
+            aliases: strings(&["system_scanner"]),
+            description: "Survey every planet and moon in a system using an automatically selected AMI survey controller.".to_owned(),
+            category: "survey".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location, EntityKind::Device],
+            parameters: vec![
+                required("system", "System", ParameterKind::System),
+                optional("controller", "Survey controller", ParameterKind::Device),
+                defaulted("recall", "Recall when complete", ParameterKind::Boolean, true),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(scan_belt_workflow_kind().as_str()),
+            display_name: "Search asteroid belt".to_owned(),
+            aliases: strings(&["belt_searcher"]),
+            description: "Search a system's asteroid belt for resource sites with an automatically selected AMI survey controller.".to_owned(),
+            category: "survey".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location, EntityKind::Device],
+            parameters: vec![
+                required("system", "System", ParameterKind::System),
+                optional("controller", "Survey controller", ParameterKind::Device),
+                defaulted("recall", "Recall when complete", ParameterKind::Boolean, true),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(scan_tour_workflow_kind().as_str()),
+            display_name: "Survey area".to_owned(),
+            aliases: strings(&["survey_area"]),
+            description: "Plan and run a bounded survey route with an automatically resolved racing vessel and maintenance home.".to_owned(),
+            category: "survey".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Replicant, EntityKind::Device],
+            parameters: vec![
+                required("center", "Centre system", ParameterKind::System),
+                bounded(
+                    defaulted("radius_ly", "Radius (ly)", ParameterKind::Number, 30.0),
+                    Some(0.0),
+                    None,
+                ),
+                bounded(
+                    defaulted("system_limit", "System limit", ParameterKind::Integer, 80),
+                    Some(1.0),
+                    None,
+                ),
+                optional("replicant", "Replicant", ParameterKind::Replicant),
+                optional("vessel", "Racing vessel", ParameterKind::Device),
+                defaulted("include_explored", "Include explored", ParameterKind::Boolean, false),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(salvage_workflow_kind().as_str()),
+            display_name: "Salvage site".to_owned(),
+            aliases: strings(&["salvage"]),
+            description: "Assign an AMI mining controller to deplete a salvage site.".to_owned(),
+            category: "mining".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::Location, EntityKind::Device],
+            parameters: vec![
+                required("location", "Salvage site", ParameterKind::Location),
+                optional("controller", "Mining controller", ParameterKind::Device),
+                defaulted("recall", "Recall when complete", ParameterKind::Boolean, true),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(mining_deploy_workflow_kind().as_str()),
+            display_name: "Deploy mining operation".to_owned(),
+            aliases: strings(&["mining_deploy"]),
+            description: "Stage and deploy one mining installation while automatically resolving the replicant and manufacturing hub when omitted.".to_owned(),
+            category: "mining".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location, EntityKind::Replicant],
+            parameters: vec![
+                required("system", "Target system", ParameterKind::System),
+                optional("replicant", "Replicant", ParameterKind::Replicant),
+                optional("hub", "Manufacturing hub", ParameterKind::Location),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(logistics_workflow_kind().as_str()),
+            display_name: "Deliver cargo or devices".to_owned(),
+            aliases: strings(&["transport", "cargo", "taxi"]),
+            description: "Move a resource, device type, or tagged devices between two locations without exposing a transport plan file.".to_owned(),
+            category: "logistics".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location, EntityKind::Device],
+            parameters: vec![
+                required("origin", "Origin", ParameterKind::Location),
+                required("destination", "Destination", ParameterKind::Location),
+                enum_parameter("payload_kind", "Payload", &["resource", "device", "tag"], "resource"),
+                required("item", "Resource, device type, or tag", ParameterKind::String),
+                bounded(
+                    defaulted("quantity", "Quantity", ParameterKind::Integer, 1),
+                    Some(1.0),
+                    None,
+                ),
+                defaulted("return_transports", "Return transports", ParameterKind::Boolean, false),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(exploration_workflow_kind().as_str()),
+            display_name: "Explore toward system".to_owned(),
+            aliases: strings(&["explore_system"]),
+            description: "Extend the relay frontier toward one target system, automatically selecting a replicant and manufacturing hub when they are not pinned.".to_owned(),
+            category: "exploration".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Replicant, EntityKind::Location],
+            parameters: vec![
+                required("target", "Target system", ParameterKind::System),
+                optional("replicant", "Replicant", ParameterKind::Replicant),
+                optional("hub", "Manufacturing hub", ParameterKind::Location),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(event_delivery_workflow_kind().as_str()),
+            display_name: "Prepare event".to_owned(),
+            aliases: strings(&["event_delivery"]),
+            description: "Manufacture and stage event requirements while leaving the selected replicant free.".to_owned(),
+            category: "events".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location],
+            parameters: vec![
+                required("event", "Event designation", ParameterKind::String),
+                optional("criterion", "Completion criterion", ParameterKind::String),
+                optional("replicant", "Preferred replicant", ParameterKind::Replicant),
+                optional("home", "Manufacturing home", ParameterKind::Location),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(event_tour_workflow_kind().as_str()),
+            display_name: "Fulfill event".to_owned(),
+            aliases: strings(&["event_tour"]),
+            description: "Ensure event requirements are staged, then dispatch the selected replicant to resolve the event.".to_owned(),
+            category: "events".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::System, EntityKind::Location, EntityKind::Replicant],
+            parameters: vec![
+                required("event", "Event designation", ParameterKind::String),
+                optional("criterion", "Completion criterion", ParameterKind::String),
+                optional("replicant", "Preferred replicant", ParameterKind::Replicant),
+                optional("home", "Manufacturing home", ParameterKind::Location),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(observatory_workflow_kind().as_str()),
+            display_name: "Search with observatory".to_owned(),
+            aliases: strings(&["signal_search"]),
+            description: "Run bounded automatic prospecting with an eligible Galactic Observatory.".to_owned(),
+            category: "observatory".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::Device, EntityKind::System],
+            parameters: vec![optional("observatory", "Galactic Observatory", ParameterKind::Device)],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
             kind: operation_kind(survey_workflow_kind().as_str()),
             display_name: "Survey route".to_owned(),
             aliases: strings(&["survey"]),
             description: "Plan or execute a restart-safe system survey route.".to_owned(),
-            category: "survey".to_owned(),
+            category: "compatibility".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
             applicable_to: vec![
@@ -1433,7 +1674,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             display_name: "Relay expansion".to_owned(),
             aliases: strings(&["relay"]),
             description: "Build and deploy a restart-safe relay expansion.".to_owned(),
-            category: "relay".to_owned(),
+            category: "compatibility".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
             applicable_to: vec![
@@ -1479,7 +1720,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             aliases: strings(&["mining"]),
             description: "Stage and deploy restart-safe mining installations to one or more systems."
                 .to_owned(),
-            category: "mining".to_owned(),
+            category: "compatibility".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
             applicable_to: vec![
@@ -1526,7 +1767,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             description:
                 "Plan and execute a discovered event, or resume an existing event mission/campaign, as a durable workflow."
                     .to_owned(),
-            category: "events".to_owned(),
+            category: "compatibility".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
             applicable_to: vec![EntityKind::System, EntityKind::Location],
@@ -1565,7 +1806,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             display_name: "Fulfill requirement".to_owned(),
             aliases: strings(&["requirement"]),
             description: "Evaluate desired state and expose its lower-level child work.".to_owned(),
-            category: "automation".to_owned(),
+            category: "compatibility".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
             applicable_to: vec![EntityKind::System, EntityKind::Location],
@@ -2049,6 +2290,72 @@ mod tests {
                 .workflow_registry()
                 .contains(&event_workflow_kind())
         );
+    }
+
+    #[test]
+    fn intent_workflows_hide_executor_plumbing_from_frontend_descriptors() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        for kind in [
+            "scan.system",
+            "scan.belt",
+            "scan.tour",
+            "salvage.site",
+            "mining.deploy",
+            "logistics.delivery",
+            "exploration.frontier",
+            "event.delivery",
+            "event.tour",
+            "observatory.search",
+        ] {
+            let descriptor = catalogue
+                .descriptors()
+                .workflows
+                .iter()
+                .find(|descriptor| descriptor.kind.0 == kind)
+                .expect("intent descriptor");
+            assert_ne!(descriptor.category, "compatibility");
+            assert!(descriptor.parameters.iter().all(|parameter| {
+                !parameter.name.ends_with("_file")
+                    && !parameter.name.contains("timeout")
+                    && !parameter.name.contains("concurrency")
+                    && !parameter.name.ends_with("_json")
+            }));
+        }
+
+        for kind in [
+            "survey.route",
+            "relay.expansion",
+            "mining.expansion",
+            "event.fulfillment",
+            "requirement.fulfillment",
+        ] {
+            let descriptor = catalogue
+                .descriptors()
+                .workflows
+                .iter()
+                .find(|descriptor| descriptor.kind.0 == kind)
+                .expect("compatibility descriptor");
+            assert_eq!(descriptor.category, "compatibility");
+        }
+    }
+
+    #[test]
+    fn intent_workflow_factories_are_registered() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        for kind in [
+            scan_system_workflow_kind(),
+            scan_belt_workflow_kind(),
+            scan_tour_workflow_kind(),
+            salvage_workflow_kind(),
+            mining_deploy_workflow_kind(),
+            logistics_workflow_kind(),
+            exploration_workflow_kind(),
+            event_delivery_workflow_kind(),
+            event_tour_workflow_kind(),
+            observatory_workflow_kind(),
+        ] {
+            assert!(catalogue.workflow_registry().contains(&kind), "{kind}");
+        }
     }
 
     #[test]

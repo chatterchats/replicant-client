@@ -900,6 +900,10 @@ h1 {
 .workflow-row.selected {
   border-color: rgba(65, 212, 200, 0.58);
 }
+.workflow-row.child {
+  margin-left: 24px;
+  border-left-color: rgba(65, 212, 200, 0.42);
+}
 .workflow-row-main {
   min-width: 0;
   flex: 1;

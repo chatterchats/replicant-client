@@ -77,6 +77,10 @@ use replicant_protocol::{
 };
 use replicant_runtime::{
     ApplicationContext,
+    automation::{
+        ControllerWorkflowCheckpoint, ExplorationIntent, ExplorationWorkflowCheckpoint,
+        ScanIntent, ScanTourCheckpoint, ScanTourIntent,
+    },
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
     config::{self, RuntimeConfig},
@@ -1611,53 +1615,145 @@ async fn survey_missions(
     let mut fleet_codes = std::collections::BTreeSet::new();
     let mut missions = Vec::new();
     for workflow in state.repository.list().map_err(ApiError::repository)? {
-        if workflow.kind.as_str() != "survey.route" || !active_workflow(workflow.status) {
+        if !active_workflow(workflow.status) {
             continue;
         }
-        let config = workflow
-            .config::<SurveyWorkflowConfig>()
-            .map_err(ApiError::repository)?;
-        let checkpoint = workflow
-            .checkpoint::<SurveyWorkflowCheckpoint>()
-            .map_err(ApiError::repository)?;
-        let plan = checkpoint.state.as_ref().map(summarize_plan);
-        let controller = plan
-            .as_ref()
-            .and_then(|plan| plan.controller.clone())
-            .or_else(|| config.options.controller.clone());
-        let drones = plan
-            .as_ref()
-            .map(|plan| plan.drones.clone())
-            .or_else(|| config.options.drones.clone())
-            .unwrap_or_default();
-        fleet_codes.insert(config.options.vessel.clone());
-        fleet_codes.extend(controller.iter().cloned());
-        fleet_codes.extend(drones.iter().cloned());
-        missions.push(SurveyMissionSummary {
-            workflow: summary(&workflow),
-            replicant: plan
-                .as_ref()
-                .map(|plan| plan.replicant.clone())
-                .unwrap_or_else(|| config.options.replicant.clone()),
-            vessel: plan
-                .as_ref()
-                .map(|plan| plan.vessel.clone())
-                .unwrap_or_else(|| config.options.vessel.clone()),
-            center: plan
-                .as_ref()
-                .map(|plan| plan.center.clone())
-                .unwrap_or_else(|| config.options.center.clone()),
-            phase: plan
-                .as_ref()
-                .map(|plan| plan.phase.clone())
-                .or_else(|| workflow.current_step.clone())
-                .unwrap_or_else(|| "queued".to_owned()),
-            completed_systems: plan.as_ref().map_or(0, |plan| plan.completed_stops),
-            total_systems: plan.as_ref().map_or(0, |plan| plan.total_stops),
-            next_system: plan.and_then(|plan| plan.next_system),
-            controller,
-            drones,
-        });
+        match workflow.kind.as_str() {
+            "survey.route" => {
+                let config = workflow
+                    .config::<SurveyWorkflowConfig>()
+                    .map_err(ApiError::repository)?;
+                let checkpoint = workflow
+                    .checkpoint::<SurveyWorkflowCheckpoint>()
+                    .map_err(ApiError::repository)?;
+                let plan = checkpoint.state.as_ref().map(summarize_plan);
+                let controller = plan
+                    .as_ref()
+                    .and_then(|plan| plan.controller.clone())
+                    .or_else(|| config.options.controller.clone());
+                let drones = plan
+                    .as_ref()
+                    .map(|plan| plan.drones.clone())
+                    .or_else(|| config.options.drones.clone())
+                    .unwrap_or_default();
+                fleet_codes.insert(config.options.vessel.clone());
+                fleet_codes.extend(controller.iter().cloned());
+                fleet_codes.extend(drones.iter().cloned());
+                missions.push(SurveyMissionSummary {
+                    workflow: summary(&workflow),
+                    replicant: plan
+                        .as_ref()
+                        .map(|plan| plan.replicant.clone())
+                        .unwrap_or_else(|| config.options.replicant.clone()),
+                    vessel: plan
+                        .as_ref()
+                        .map(|plan| plan.vessel.clone())
+                        .unwrap_or_else(|| config.options.vessel.clone()),
+                    center: plan
+                        .as_ref()
+                        .map(|plan| plan.center.clone())
+                        .unwrap_or_else(|| config.options.center.clone()),
+                    phase: plan
+                        .as_ref()
+                        .map(|plan| plan.phase.clone())
+                        .or_else(|| workflow.current_step.clone())
+                        .unwrap_or_else(|| "queued".to_owned()),
+                    completed_systems: plan.as_ref().map_or(0, |plan| plan.completed_stops),
+                    total_systems: plan.as_ref().map_or(0, |plan| plan.total_stops),
+                    next_system: plan.and_then(|plan| plan.next_system),
+                    controller,
+                    drones,
+                });
+            }
+            "scan.system" | "scan.belt" => {
+                let config = workflow
+                    .config::<ScanIntent>()
+                    .map_err(ApiError::repository)?;
+                let checkpoint = workflow
+                    .checkpoint::<ControllerWorkflowCheckpoint>()
+                    .map_err(ApiError::repository)?;
+                let controller = checkpoint.controller.or(config.controller);
+                let controller_device = controller.as_ref().and_then(|code| {
+                    devices
+                        .iter()
+                        .find(|device| device.entity.id.0.as_str() == code)
+                });
+                let drones = controller_device
+                    .map(|device| device.controlled_devices.clone())
+                    .unwrap_or_default();
+                if let Some(controller) = controller.as_ref() {
+                    fleet_codes.insert(controller.clone());
+                }
+                fleet_codes.extend(drones.iter().cloned());
+                missions.push(SurveyMissionSummary {
+                    workflow: summary(&workflow),
+                    replicant: controller_device
+                        .and_then(|device| device.owner.clone())
+                        .unwrap_or_default(),
+                    vessel: String::new(),
+                    center: config.system.clone(),
+                    phase: workflow
+                        .current_step
+                        .clone()
+                        .unwrap_or_else(|| "queued".to_owned()),
+                    completed_systems: 0,
+                    total_systems: 1,
+                    next_system: Some(config.system),
+                    controller,
+                    drones,
+                });
+            }
+            "scan.tour" => {
+                let config = workflow
+                    .config::<ScanTourIntent>()
+                    .map_err(ApiError::repository)?;
+                let checkpoint = workflow
+                    .checkpoint::<ScanTourCheckpoint>()
+                    .map_err(ApiError::repository)?;
+                let plan = checkpoint.state.as_ref().map(summarize_plan);
+                let controller = plan.as_ref().and_then(|plan| plan.controller.clone());
+                let drones = plan
+                    .as_ref()
+                    .map(|plan| plan.drones.clone())
+                    .unwrap_or_default();
+                let vessel = plan
+                    .as_ref()
+                    .map(|plan| plan.vessel.clone())
+                    .or_else(|| checkpoint.vessel.clone())
+                    .or_else(|| config.vessel.clone())
+                    .unwrap_or_default();
+                if !vessel.is_empty() {
+                    fleet_codes.insert(vessel.clone());
+                }
+                fleet_codes.extend(controller.iter().cloned());
+                fleet_codes.extend(drones.iter().cloned());
+                missions.push(SurveyMissionSummary {
+                    workflow: summary(&workflow),
+                    replicant: plan
+                        .as_ref()
+                        .map(|plan| plan.replicant.clone())
+                        .or_else(|| checkpoint.replicant.clone())
+                        .or_else(|| config.replicant.clone())
+                        .unwrap_or_default(),
+                    vessel,
+                    center: plan
+                        .as_ref()
+                        .map(|plan| plan.center.clone())
+                        .unwrap_or(config.center),
+                    phase: plan
+                        .as_ref()
+                        .map(|plan| plan.phase.clone())
+                        .or_else(|| workflow.current_step.clone())
+                        .unwrap_or_else(|| "queued".to_owned()),
+                    completed_systems: plan.as_ref().map_or(0, |plan| plan.completed_stops),
+                    total_systems: plan.as_ref().map_or(0, |plan| plan.total_stops),
+                    next_system: plan.and_then(|plan| plan.next_system),
+                    controller,
+                    drones,
+                });
+            }
+            _ => {}
+        }
     }
     missions.sort_by(|left, right| left.workflow.id.cmp(&right.workflow.id));
     Ok(Json(Versioned::current(SurveySnapshot {
@@ -1683,6 +1779,7 @@ async fn mining_missions(
         .filter(|workflow| {
             active_workflow(workflow.status)
                 && (workflow.kind.as_str().contains("mining")
+                    || workflow.kind.as_str() == "salvage.site"
                     || workflow
                         .current_step
                         .as_deref()
@@ -1781,39 +1878,85 @@ fn relay_snapshot(
                 || device
                     .claim
                     .as_ref()
-                    .is_some_and(|claim| claim.workflow_kind.0 == "relay.expansion")
+                    .is_some_and(|claim| {
+                        matches!(
+                            claim.workflow_kind.0.as_str(),
+                            "relay.expansion" | "exploration.frontier"
+                        )
+                    })
         })
         .cloned()
         .collect();
     let mut expansions = Vec::new();
-    for workflow in workflows.iter().filter(|workflow| {
-        workflow.kind.as_str() == "relay.expansion" && active_workflow(workflow.status)
-    }) {
-        let config = workflow
-            .config::<RelayWorkflowConfig>()
-            .map_err(ApiError::repository)?;
-        let checkpoint = workflow
-            .checkpoint::<RelayWorkflowCheckpoint>()
-            .map_err(ApiError::repository)?;
-        let status = checkpoint.state.as_ref().map(|state| state.status());
-        expansions.push(RelayExpansionSummary {
-            workflow: summary(workflow),
-            replicant: config.request.replicant,
-            hub: config.request.hub,
-            targets: config.request.targets.clone(),
-            phase: status
-                .as_ref()
-                .and_then(|status| wire_value(Some(&status.phase)))
-                .or_else(|| workflow.current_step.clone())
-                .unwrap_or_else(|| "queued".to_owned()),
-            completed_stops: status.as_ref().map_or(0, |status| status.completed_stops),
-            total_stops: status.as_ref().map(|status| status.total_stops),
-            next_system: status
-                .as_ref()
-                .and_then(|status| status.next_system.clone())
-                .or_else(|| config.request.targets.first().cloned()),
-            pending_relays: status.map(|status| status.pending_relays),
-        });
+    for workflow in workflows
+        .iter()
+        .filter(|workflow| active_workflow(workflow.status))
+    {
+        match workflow.kind.as_str() {
+            "relay.expansion" => {
+                let config = workflow
+                    .config::<RelayWorkflowConfig>()
+                    .map_err(ApiError::repository)?;
+                let checkpoint = workflow
+                    .checkpoint::<RelayWorkflowCheckpoint>()
+                    .map_err(ApiError::repository)?;
+                let status = checkpoint.state.as_ref().map(|state| state.status());
+                expansions.push(RelayExpansionSummary {
+                    workflow: summary(workflow),
+                    replicant: config.request.replicant,
+                    hub: config.request.hub,
+                    targets: config.request.targets.clone(),
+                    phase: status
+                        .as_ref()
+                        .and_then(|status| wire_value(Some(&status.phase)))
+                        .or_else(|| workflow.current_step.clone())
+                        .unwrap_or_else(|| "queued".to_owned()),
+                    completed_stops: status.as_ref().map_or(0, |status| status.completed_stops),
+                    total_stops: status.as_ref().map(|status| status.total_stops),
+                    next_system: status
+                        .as_ref()
+                        .and_then(|status| status.next_system.clone())
+                        .or_else(|| config.request.targets.first().cloned()),
+                    pending_relays: status.map(|status| status.pending_relays),
+                });
+            }
+            "exploration.frontier" => {
+                let config = workflow
+                    .config::<ExplorationIntent>()
+                    .map_err(ApiError::repository)?;
+                let checkpoint = workflow
+                    .checkpoint::<ExplorationWorkflowCheckpoint>()
+                    .map_err(ApiError::repository)?;
+                let status = checkpoint.state.as_ref().map(|state| state.status());
+                expansions.push(RelayExpansionSummary {
+                    workflow: summary(workflow),
+                    replicant: checkpoint
+                        .replicant
+                        .clone()
+                        .or(config.replicant.clone())
+                        .unwrap_or_default(),
+                    hub: checkpoint
+                        .hub
+                        .clone()
+                        .or(config.hub.clone())
+                        .unwrap_or_default(),
+                    targets: vec![config.target.clone()],
+                    phase: status
+                        .as_ref()
+                        .and_then(|status| wire_value(Some(&status.phase)))
+                        .or_else(|| workflow.current_step.clone())
+                        .unwrap_or_else(|| "queued".to_owned()),
+                    completed_stops: status.as_ref().map_or(0, |status| status.completed_stops),
+                    total_stops: status.as_ref().map(|status| status.total_stops),
+                    next_system: status
+                        .as_ref()
+                        .and_then(|status| status.next_system.clone())
+                        .or(Some(config.target.clone())),
+                    pending_relays: status.map(|status| status.pending_relays),
+                });
+            }
+            _ => {}
+        }
     }
     expansions.sort_by(|left, right| left.workflow.id.cmp(&right.workflow.id));
     Ok(RelaySnapshot {
