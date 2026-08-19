@@ -147,9 +147,9 @@ docker-up:
 	$(DOCKER_COMPOSE) up -d
 
 docker-down:
-	$(DOCKER_COMPOSE) down
+	$(DOCKER_COMPOSE) stop
 
-docker-rebuild-deploy: docker-build docker-down docker-up
+docker-rebuild-deploy: docker-build docker-up
 
 docker-restart: docker-down docker-up
 
