@@ -220,6 +220,7 @@ export interface DeviceSummary {
   owner_name: string | null;
   system: string | null;
   location: string | null;
+  available_commands: string[];
   tags: string[];
   attached_to: string | null;
   stowed_in: string | null;
@@ -1825,6 +1826,10 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
         : nullableString(device.owner_name, "device owner name"),
     system: nullableString(device.system, "device system"),
     location: nullableString(device.location, "device location"),
+    available_commands:
+      device.available_commands === undefined
+        ? []
+        : stringArray(device.available_commands, "available device commands"),
     tags: stringArray(device.tags, "device tags"),
     attached_to: nullableString(device.attached_to, "attached device"),
     stowed_in: nullableString(device.stowed_in, "stowed device"),
@@ -2895,7 +2900,7 @@ export function parseAutofactoryResponse(
         available: number(utilization.available, "available factories"),
         unavailable: number(utilization.unavailable, "unavailable factories"),
         queued_units: number(utilization.queued_units, "queued units"),
-        utilization_percent: number(
+        utilization_percent: finiteNumber(
           utilization.utilization_percent,
           "factory utilization",
         ),

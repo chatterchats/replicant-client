@@ -15,7 +15,7 @@ cp .env.example .env
 mkdir -p "$HOME/.local/share/replicant"
 # If your user/group IDs are not 1000, set REPLICANT_UID and REPLICANT_GID
 # in .env to the output of: id -u; id -g
-docker compose build
+make docker-build
 docker compose up -d
 docker compose ps
 docker compose logs -f
@@ -148,7 +148,7 @@ and recreate without removing the volume:
 ```sh
 docker compose stop replicantd
 # Back up as above, then update the checked-out source.
-docker compose build --pull
+make docker-build
 docker compose up -d
 docker compose ps
 docker compose logs -f replicantd
@@ -184,12 +184,21 @@ in the minimal daemon image.
 
 ## Validation and architecture
 
-`make docker-check` resolves Compose configuration and builds both production
-images without requiring an account. With a configured token,
+`make docker-build` now performs the release builds on the host first: Cargo
+builds `target/release/replicantd`, the web build is staged under
+`target/docker/web`, and the Dockerfiles only package those artifacts. The
+daemon image runs `ldd` during assembly so an incompatible host-built binary
+fails the build immediately instead of producing an image that cannot start.
+The runtime image is pinned to Fedora 44; change that base deliberately if the
+local build host/ABI changes.
+
+
+`make docker-check` performs the same local artifact build, resolves Compose
+configuration, and packages both production images without requiring an account. With a configured token,
 `make docker-smoke` starts the stack, waits for health, checks the static web
 health and proxied daemon health, and verifies a WebSocket `101` upgrade.
 Ordinary `make ci` does not require Docker.
 
-The Dockerfiles use standard Debian/Alpine multi-stage images and make no
-architecture-specific downloads, keeping them suitable for BuildKit/buildx on
-`linux/amd64` and `linux/arm64` where the pinned upstream images are available.
+Because the daemon binary is now built on the host, build the release artifacts
+for the same architecture as the target Docker engine. The runtime images use
+standard Fedora/Alpine bases and contain no compiler toolchains.

@@ -97,3 +97,32 @@ it("resolves selected entity context ahead of static defaults", () => {
     replicant: "R-1",
   });
 });
+
+it("uses selected device context only once when an action has two device parameters", () => {
+  const baseParameter = descriptor.parameters[0];
+  if (!baseParameter)
+    throw new Error("test descriptor must define a parameter");
+  const twoDeviceDescriptor: WorkflowDescriptor = {
+    ...descriptor,
+    kind: "device.attach",
+    applicable_to: ["device"],
+    parameters: [
+      {
+        ...baseParameter,
+        name: "device",
+        kind: { type: "device" },
+      },
+      {
+        ...baseParameter,
+        name: "target",
+        kind: { type: "device" },
+      },
+    ],
+  };
+  expect(
+    resolveContextDefaults(twoDeviceDescriptor, { device: "HOST-1" }),
+  ).toEqual({
+    device: "HOST-1",
+    target: "",
+  });
+});

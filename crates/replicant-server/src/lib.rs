@@ -3869,6 +3869,11 @@ fn device_summary(
         .relationships
         .assigned_replicant
         .map(|value| value.id.to_string());
+    let available_commands = device
+        .available_commands
+        .iter()
+        .filter_map(|command| wire_value(Some(command)))
+        .collect();
     DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
@@ -3882,6 +3887,7 @@ fn device_summary(
             .as_ref()
             .and_then(|value| device_system(value, location_systems)),
         location,
+        available_commands,
         tags: device.tags,
         attached_to: device
             .relationships
@@ -5837,6 +5843,7 @@ mod tests {
             owner_name: None,
             system: None,
             location: None,
+            available_commands: Vec::new(),
             tags: Vec::new(),
             attached_to: None,
             stowed_in: None,

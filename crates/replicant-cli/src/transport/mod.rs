@@ -226,6 +226,7 @@ impl Config {
                 device_codes: Vec::new(),
                 device_tags,
                 carrier,
+                allow_transport_staging: false,
             },
             database,
             wait_timeout,

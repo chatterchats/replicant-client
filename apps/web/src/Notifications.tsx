@@ -158,7 +158,9 @@ export function NotificationCenter({
               <button
                 className="notification-dismiss"
                 aria-label={`Clear ${notification.title}`}
-                onClick={() => onDismiss(notification)}
+                onClick={() => {
+                  onDismiss(notification);
+                }}
               >
                 ×
               </button>

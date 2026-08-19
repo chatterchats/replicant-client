@@ -1,7 +1,11 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useMemo, useState } from "react";
 
-import { ParameterField, validateParameters } from "./AutomationsPage";
+import {
+  LogisticsWorkflowForm,
+  ParameterField,
+  validateParameters,
+} from "./AutomationsPage";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -72,19 +76,26 @@ export function resolveContextDefaults(
   descriptor: OperationDescriptor,
   context: CommandContext,
 ): Record<string, unknown> {
+  const usedContext = new Set<ContextKind>();
   return Object.fromEntries(
     descriptor.parameters.map((parameter) => {
       const contextKind =
         parameter.kind.type === "entity"
           ? parameter.kind.entity_kind
           : parameter.kind.type;
+      const canUseContext = (
+        ["system", "location", "device", "replicant"] as ContextKind[]
+      ).includes(contextKind as ContextKind);
+      const typedContextKind = canUseContext
+        ? (contextKind as ContextKind)
+        : undefined;
       const contextual =
-        contextKind === "system" ||
-        contextKind === "location" ||
-        contextKind === "device" ||
-        contextKind === "replicant"
-          ? context[contextKind]
+        typedContextKind && !usedContext.has(typedContextKind)
+          ? context[typedContextKind]
           : undefined;
+      if (contextual !== undefined && typedContextKind) {
+        usedContext.add(typedContextKind);
+      }
       return [parameter.name, contextual ?? parameter.default ?? ""];
     }),
   );
@@ -230,6 +241,27 @@ export function CommandPalette({
                 {submitting ? "Running…" : "Confirm and run"}
               </button>
             </div>
+          </div>
+        ) : selected?.descriptor.operation_class === "workflow" &&
+          selected.descriptor.kind === "logistics.delivery" ? (
+          <div className="palette-logistics-form">
+            <button
+              type="button"
+              onClick={() => {
+                setSelected(null);
+              }}
+            >
+              ← Commands
+            </button>
+            <LogisticsWorkflowForm
+              descriptor={selected.descriptor}
+              entities={entities}
+              initialOrigin={context.location ?? context.system ?? ""}
+              onStarted={(workflow) => {
+                onWorkflowStarted(workflow);
+                onClose();
+              }}
+            />
           </div>
         ) : selected ? (
           <form

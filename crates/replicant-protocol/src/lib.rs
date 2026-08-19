@@ -496,6 +496,9 @@ pub struct DeviceSummary {
     pub system: Option<String>,
     /// Current location, when known.
     pub location: Option<String>,
+    /// Commands currently advertised by the managed device projection.
+    #[serde(default)]
+    pub available_commands: Vec<String>,
     /// User-defined device tags.
     pub tags: Vec<String>,
     /// Parent attachment relationship.
@@ -2807,6 +2810,7 @@ mod tests {
             owner_name: None,
             system: None,
             location: None,
+            available_commands: Vec::new(),
             tags: Vec::new(),
             attached_to: None,
             stowed_in: None,

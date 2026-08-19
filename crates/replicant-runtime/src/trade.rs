@@ -111,8 +111,10 @@ pub struct ShopTrade {
 /// Typed portion of an open-shaped shop trade exchange bundle.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TradeBundle {
+    /// Resource quantities represented by the exchange bundle.
     #[serde(default)]
     pub resources: BTreeMap<String, i64>,
+    /// Device quantities represented by the exchange bundle.
     #[serde(default)]
     pub devices: BTreeMap<String, i64>,
     /// Unsupported/unknown exchange fields retained for forward compatibility.

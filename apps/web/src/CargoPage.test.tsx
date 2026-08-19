@@ -17,6 +17,7 @@ const device: DeviceSummary = {
   owner_name: "Ada",
   system: "SOL",
   location: "SOL-HUB",
+  available_commands: [],
   tags: [],
   attached_to: null,
   stowed_in: null,

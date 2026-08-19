@@ -303,7 +303,7 @@ impl DirectorRequirementGraph {
     /// by device type with their effective requester priority.
     #[must_use]
     pub fn current_blueprint_priorities(&self) -> BTreeMap<String, u32> {
-        let mut priorities = BTreeMap::new();
+        let mut priorities: BTreeMap<String, u32> = BTreeMap::new();
         for record in self.records.values() {
             let requested_now = record.requesters.iter().any(|requester| {
                 self.seen_requesters
@@ -357,7 +357,9 @@ impl DirectorRequirementGraph {
         };
         if !record.active_workflows.contains(&workflow_id) {
             record.active_workflows.push(workflow_id);
-            record.active_workflows.sort();
+            record
+                .active_workflows
+                .sort_by_key(|workflow_id| workflow_id.to_string());
         }
         record.status = DirectorRequirementStatus::Active;
         Ok(())

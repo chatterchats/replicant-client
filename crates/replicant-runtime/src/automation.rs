@@ -293,19 +293,34 @@ pub enum LogisticsPayloadKind {
 }
 
 /// Player intent for point-to-point logistics.
+///
+/// The legacy `payload_kind`/`item`/`quantity` fields remain optional so
+/// persisted one-item workflows continue to deserialize. New callers should
+/// prefer the mixed manifest fields.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LogisticsIntent {
     /// Origin location or system scope.
     pub origin: String,
     /// Exact destination location.
     pub destination: String,
-    /// Whether `item` names a resource type, device type, or tag.
-    pub payload_kind: LogisticsPayloadKind,
-    /// Resource type, device type, or tag.
-    pub item: String,
+    /// Legacy selector describing `item`.
+    #[serde(default)]
+    pub payload_kind: Option<LogisticsPayloadKind>,
+    /// Legacy resource type, device type, or tag.
+    #[serde(default)]
+    pub item: Option<String>,
     /// Requested resource/device quantity. Ignored for tag payloads.
     #[serde(default = "default_quantity")]
     pub quantity: i64,
+    /// Resource quantities to move together.
+    #[serde(default)]
+    pub resources: ResourceMap,
+    /// Device-type quantities to move together.
+    #[serde(default)]
+    pub devices: Vec<DeviceRequest>,
+    /// Every eligible device carrying any supplied tag.
+    #[serde(default)]
+    pub device_tags: Vec<String>,
     /// Return transports after delivery.
     #[serde(default)]
     pub return_transports: bool,
@@ -334,6 +349,10 @@ pub struct LogisticsManifestIntent {
     /// Return transports after delivery.
     #[serde(default)]
     pub return_transports: bool,
+    /// Allow the transport planner to self-stage a free carrier from outside
+    /// the origin system when no suitable local carrier is available.
+    #[serde(default)]
+    pub allow_transport_staging: bool,
     /// Optional regional ownership hint for observability/policy.
     #[serde(default)]
     pub region: Option<String>,
@@ -1058,13 +1077,21 @@ impl WorkflowExecutor for LogisticsWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         Box::pin(async move {
             let intent: LogisticsIntent = context.config().map_err(string_error)?;
-            if intent.quantity <= 0 && !matches!(intent.payload_kind, LogisticsPayloadKind::Tag) {
-                return Err("logistics quantity must be greater than zero".to_owned());
-            }
             let client = managed_client(context)?;
             let mut checkpoint: LogisticsWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
             let request = delivery_request(&intent);
+            if request.resources.is_empty()
+                && request.devices.is_empty()
+                && request.device_tags.is_empty()
+            {
+                return Err("logistics delivery must contain at least one payload".to_owned());
+            }
+            if request.resources.values().any(|quantity| *quantity <= 0)
+                || request.devices.iter().any(|request| request.quantity <= 0)
+            {
+                return Err("logistics quantities must be greater than zero".to_owned());
+            }
             let plan = if let Some(plan) = checkpoint.plan.clone() {
                 plan
             } else {
@@ -1197,12 +1224,12 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 let operation = client
                     .operations()
                     .get(OperationId::new(operation_id.clone()));
-                if let Err(error) = await_success(&operation).await {
-                    if !blueprint_is_known(&client, device_type).await? {
-                        return Err(format!(
-                            "managed decommission operation {operation_id} could not be recovered: {error}"
-                        ));
-                    }
+                if let Err(error) = await_success(&operation).await
+                    && !blueprint_is_known(&client, device_type).await?
+                {
+                    return Err(format!(
+                        "managed decommission operation {operation_id} could not be recovered: {error}"
+                    ));
                 }
                 if wait_for_blueprint(&client, device_type, 24).await? {
                     checkpoint.blueprint_verified = true;
@@ -1317,18 +1344,12 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                             None => {
                                 let child = context
                                     .create_child(new_logistics_manifest_workflow(
-                                        LogisticsManifestIntent {
-                                            origin: source_location.clone(),
-                                            destination: factory_location.clone(),
-                                            device_codes: vec![source_code.clone()],
-                                            return_transports: true,
-                                            purpose: format!(
-                                                "blueprint-acquire:{}:{}",
-                                                device_type.to_ascii_lowercase(),
-                                                source_code
-                                            ),
-                                            ..LogisticsManifestIntent::default()
-                                        },
+                                        blueprint_transport_manifest(
+                                            device_type,
+                                            &source_code,
+                                            &source_location,
+                                            &factory_location,
+                                        ),
                                     ))
                                     .map_err(string_error)?;
                                 context
@@ -2670,19 +2691,44 @@ async fn await_success(operation: &Operation) -> Result<(), String> {
     }
 }
 
+fn blueprint_transport_manifest(
+    device_type: &str,
+    source_code: &str,
+    source_location: &str,
+    factory_location: &str,
+) -> LogisticsManifestIntent {
+    LogisticsManifestIntent {
+        origin: source_location.to_owned(),
+        destination: factory_location.to_owned(),
+        device_codes: vec![source_code.to_owned()],
+        return_transports: true,
+        allow_transport_staging: true,
+        purpose: format!(
+            "blueprint-acquire:{}:{}",
+            device_type.to_ascii_lowercase(),
+            source_code
+        ),
+        ..LogisticsManifestIntent::default()
+    }
+}
+
 fn delivery_request(intent: &LogisticsIntent) -> DeliveryRequest {
-    let mut resources = ResourceMap::new();
-    let mut devices = Vec::new();
-    let mut device_tags = Vec::new();
-    match intent.payload_kind {
-        LogisticsPayloadKind::Resource => {
-            resources.insert(intent.item.clone(), intent.quantity);
+    let mut resources = intent.resources.clone();
+    let mut devices = intent.devices.clone();
+    let mut device_tags = intent.device_tags.clone();
+    if let (Some(payload_kind), Some(item)) = (&intent.payload_kind, intent.item.as_ref())
+        && !item.trim().is_empty()
+    {
+        match payload_kind {
+            LogisticsPayloadKind::Resource => {
+                *resources.entry(item.clone()).or_default() += intent.quantity;
+            }
+            LogisticsPayloadKind::Device => devices.push(DeviceRequest {
+                quantity: intent.quantity,
+                device_type: item.clone(),
+            }),
+            LogisticsPayloadKind::Tag => device_tags.push(item.clone()),
         }
-        LogisticsPayloadKind::Device => devices.push(DeviceRequest {
-            quantity: intent.quantity,
-            device_type: intent.item.clone(),
-        }),
-        LogisticsPayloadKind::Tag => device_tags.push(intent.item.clone()),
     }
     DeliveryRequest {
         origin: intent.origin.clone(),
@@ -2692,6 +2738,7 @@ fn delivery_request(intent: &LogisticsIntent) -> DeliveryRequest {
         device_codes: Vec::new(),
         device_tags,
         carrier: None,
+        allow_transport_staging: false,
     }
 }
 
@@ -2704,6 +2751,7 @@ fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryReques
         device_codes: intent.device_codes.clone(),
         device_tags: intent.device_tags.clone(),
         carrier: None,
+        allow_transport_staging: intent.allow_transport_staging,
     }
 }
 
@@ -2831,14 +2879,43 @@ mod tests {
         let request = delivery_request(&LogisticsIntent {
             origin: "SCEPTURUM".to_owned(),
             destination: "TWAFFY-OBJ-1".to_owned(),
-            payload_kind: LogisticsPayloadKind::Resource,
-            item: "rares".to_owned(),
+            payload_kind: Some(LogisticsPayloadKind::Resource),
+            item: Some("rares".to_owned()),
             quantity: 400,
+            resources: ResourceMap::new(),
+            devices: Vec::new(),
+            device_tags: Vec::new(),
             return_transports: false,
         });
         assert_eq!(request.resources.get("rares"), Some(&400));
         assert!(request.devices.is_empty());
         assert!(request.device_tags.is_empty());
+    }
+
+    #[test]
+    fn logistics_intent_combines_multiple_payload_kinds() {
+        let mut resources = ResourceMap::new();
+        resources.insert("rares".to_owned(), 400);
+        resources.insert("volatiles".to_owned(), 100);
+        let request = delivery_request(&LogisticsIntent {
+            origin: "SCEPTURUM".to_owned(),
+            destination: "TWAFFY-OBJ-1".to_owned(),
+            payload_kind: None,
+            item: None,
+            quantity: 1,
+            resources,
+            devices: vec![DeviceRequest {
+                device_type: "exotic_matter_injector".to_owned(),
+                quantity: 36,
+            }],
+            device_tags: vec!["twaffy-obj-1".to_owned()],
+            return_transports: true,
+        });
+        assert_eq!(request.resources.get("rares"), Some(&400));
+        assert_eq!(request.resources.get("volatiles"), Some(&100));
+        assert_eq!(request.devices.len(), 1);
+        assert_eq!(request.devices[0].quantity, 36);
+        assert_eq!(request.device_tags, vec!["twaffy-obj-1"]);
     }
 
     #[test]
@@ -2932,6 +3009,7 @@ mod tests {
                 device_type: "maintenance_drone".to_owned(),
             }],
             device_codes: vec!["DEVICE-EXACT".to_owned()],
+            allow_transport_staging: true,
             purpose: "system hub upkeep".to_owned(),
             ..LogisticsManifestIntent::default()
         });
@@ -2939,5 +3017,22 @@ mod tests {
         assert_eq!(request.resources.get("carbon"), Some(&80));
         assert_eq!(request.devices.len(), 1);
         assert_eq!(request.device_codes, ["DEVICE-EXACT"]);
+        assert!(request.allow_transport_staging);
+    }
+
+    #[test]
+    fn blueprint_transport_manifest_allows_cross_system_carrier_staging() {
+        let intent = blueprint_transport_manifest(
+            "service_bot",
+            "DEVICE-1",
+            "REMOTE-BELT-1",
+            "SCEPTURUM-BELT-1",
+        );
+
+        assert_eq!(intent.origin, "REMOTE-BELT-1");
+        assert_eq!(intent.destination, "SCEPTURUM-BELT-1");
+        assert_eq!(intent.device_codes, ["DEVICE-1"]);
+        assert!(intent.return_transports);
+        assert!(intent.allow_transport_staging);
     }
 }

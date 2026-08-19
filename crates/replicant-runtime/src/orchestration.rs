@@ -1013,11 +1013,11 @@ fn reconcile_blueprint_acquisition(
     prune_runtime_workflows(&mut runtime, context.workflows);
     let mut active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
-    if active.is_empty() {
-        if let Some(existing) = active_blueprint_acquisition_workflow(context.workflows) {
-            runtime.active_workflows = vec![existing];
-            active = vec![existing];
-        }
+    if active.is_empty()
+        && let Some(existing) = active_blueprint_acquisition_workflow(context.workflows)
+    {
+        runtime.active_workflows = vec![existing];
+        active = vec![existing];
     }
 
     if !enabled {
@@ -1526,6 +1526,7 @@ fn reconcile_maintain_system_hubs(
                     device_codes: Vec::new(),
                     device_tags: Vec::new(),
                     return_transports: true,
+                    allow_transport_staging: false,
                     region: Some(region.region.clone()),
                     purpose,
                 },
@@ -3430,6 +3431,7 @@ mod tests {
                 device_codes: Vec::new(),
                 device_tags: Vec::new(),
                 return_transports: true,
+                allow_transport_staging: false,
                 region: Some("alpha".to_owned()),
                 purpose: hub_supply_purpose("alpha", "HUB1"),
             }))

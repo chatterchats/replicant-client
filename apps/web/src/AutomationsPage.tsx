@@ -30,6 +30,12 @@ const tabs = [
 ] as const;
 type Tab = (typeof tabs)[number];
 type Values = Record<string, unknown>;
+type LogisticsPayloadDraft = {
+  id: number;
+  kind: "resource" | "device" | "tag";
+  item: string;
+  quantity: number;
+};
 
 function stringValue(value: unknown) {
   return typeof value === "string" ||
@@ -295,6 +301,253 @@ function WorkflowForm({
           />
         ))}
       </div>
+      {serverError ? <p className="form-error">{serverError}</p> : null}
+      <button className="primary" disabled={submitting} type="submit">
+        {submitting ? "Starting…" : "Start workflow"}
+      </button>
+    </form>
+  );
+}
+
+export function LogisticsWorkflowForm({
+  descriptor,
+  entities,
+  onStarted,
+  initialOrigin = "",
+}: {
+  descriptor: WorkflowDescriptor;
+  entities: Record<string, unknown>;
+  onStarted: (workflow: WorkflowSummary) => void;
+  initialOrigin?: string;
+}) {
+  const [origin, setOrigin] = useState(initialOrigin);
+  const [destination, setDestination] = useState("");
+  const [returnTransports, setReturnTransports] = useState(false);
+  const [payloads, setPayloads] = useState<LogisticsPayloadDraft[]>([
+    { id: 1, kind: "resource", item: "", quantity: 1 },
+  ]);
+  const [nextId, setNextId] = useState(2);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const locations = entityIds(entities, "location");
+  const systems = entityIds(entities, "system");
+  const deviceTypeOptions = deviceTypes(entities);
+  const locationOptions = [...new Set([...locations, ...systems])].sort();
+
+  const updatePayload = (
+    id: number,
+    update: Partial<Omit<LogisticsPayloadDraft, "id">>,
+  ) => {
+    setPayloads((current) =>
+      current.map((payload) =>
+        payload.id === id ? { ...payload, ...update } : payload,
+      ),
+    );
+  };
+
+  return (
+    <form
+      className="workflow-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        const activePayloads = payloads.filter(
+          (payload) => payload.item.trim().length > 0,
+        );
+        if (!origin.trim() || !destination.trim()) {
+          setServerError("Origin and destination are required.");
+          return;
+        }
+        if (activePayloads.length === 0) {
+          setServerError("Add at least one resource, device, or tag payload.");
+          return;
+        }
+        if (
+          activePayloads.some(
+            (payload) => payload.kind !== "tag" && payload.quantity < 1,
+          )
+        ) {
+          setServerError("Resource and device quantities must be at least 1.");
+          return;
+        }
+
+        const resources: Record<string, number> = {};
+        const devices: { device_type: string; quantity: number }[] = [];
+        const deviceTags: string[] = [];
+        for (const payload of activePayloads) {
+          const item = payload.item.trim();
+          if (payload.kind === "resource") {
+            resources[item] = (resources[item] ?? 0) + payload.quantity;
+          } else if (payload.kind === "device") {
+            devices.push({ device_type: item, quantity: payload.quantity });
+          } else {
+            deviceTags.push(item);
+          }
+        }
+
+        setSubmitting(true);
+        setServerError(null);
+        void daemonApi
+          .startWorkflow(descriptor.kind, {
+            origin: origin.trim(),
+            destination: destination.trim(),
+            resources,
+            devices,
+            device_tags: [...new Set(deviceTags)],
+            return_transports: returnTransports,
+          })
+          .then(onStarted)
+          .catch((error: unknown) => {
+            setServerError(String(error));
+          })
+          .finally(() => {
+            setSubmitting(false);
+          });
+      }}
+    >
+      <header>
+        <span className={`risk ${descriptor.risk}`}>
+          {descriptor.risk} risk
+        </span>
+        <h2>{descriptor.display_name}</h2>
+        <p>
+          Move a mixed manifest of resources, device types, and tagged devices
+          in one durable delivery.
+        </p>
+      </header>
+      <div className="form-grid">
+        <label>
+          Origin
+          <input
+            required
+            list="logistics-origin-options"
+            value={origin}
+            onChange={(event) => {
+              setOrigin(event.target.value);
+            }}
+          />
+        </label>
+        <label>
+          Destination
+          <input
+            required
+            list="logistics-destination-options"
+            value={destination}
+            onChange={(event) => {
+              setDestination(event.target.value);
+            }}
+          />
+        </label>
+        <datalist id="logistics-origin-options">
+          {locationOptions.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+        <datalist id="logistics-destination-options">
+          {locations.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+      </div>
+      <fieldset className="manifest-builder">
+        <legend>Payload manifest</legend>
+        {payloads.map((payload) => (
+          <div className="manifest-row" key={payload.id}>
+            <select
+              aria-label="Payload kind"
+              value={payload.kind}
+              onChange={(event) => {
+                updatePayload(payload.id, {
+                  kind: event.target.value as LogisticsPayloadDraft["kind"],
+                  quantity: 1,
+                });
+              }}
+            >
+              <option value="resource">Resource</option>
+              <option value="device">Device type</option>
+              <option value="tag">Device tag</option>
+            </select>
+            <input
+              aria-label="Payload item"
+              list={
+                payload.kind === "device"
+                  ? `logistics-device-types-${String(payload.id)}`
+                  : undefined
+              }
+              placeholder={
+                payload.kind === "resource"
+                  ? "resource type"
+                  : payload.kind === "device"
+                    ? "device type"
+                    : "tag"
+              }
+              value={payload.item}
+              onChange={(event) => {
+                updatePayload(payload.id, { item: event.target.value });
+              }}
+            />
+            {payload.kind === "device" ? (
+              <datalist id={`logistics-device-types-${String(payload.id)}`}>
+                {deviceTypeOptions.map((option) => (
+                  <option key={option} value={option} />
+                ))}
+              </datalist>
+            ) : null}
+            {payload.kind === "tag" ? (
+              <span className="manifest-tag-quantity">all matching</span>
+            ) : (
+              <input
+                aria-label="Payload quantity"
+                min={1}
+                type="number"
+                value={payload.quantity}
+                onChange={(event) => {
+                  updatePayload(payload.id, {
+                    quantity: Number.isFinite(event.target.valueAsNumber)
+                      ? event.target.valueAsNumber
+                      : 1,
+                  });
+                }}
+              />
+            )}
+            <button
+              disabled={payloads.length === 1}
+              type="button"
+              onClick={() => {
+                setPayloads((current) =>
+                  current.filter((item) => item.id !== payload.id),
+                );
+              }}
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+        <button
+          type="button"
+          onClick={() => {
+            setPayloads((current) => [
+              ...current,
+              { id: nextId, kind: "resource", item: "", quantity: 1 },
+            ]);
+            setNextId((current) => current + 1);
+          }}
+        >
+          + Add payload
+        </button>
+      </fieldset>
+      <label className="boolean-field">
+        <input
+          type="checkbox"
+          checked={returnTransports}
+          onChange={(event) => {
+            setReturnTransports(event.target.checked);
+          }}
+        />
+        <span>
+          <strong>Return transports</strong>
+          <small>Send carriers back to the origin after delivery.</small>
+        </span>
+      </label>
       {serverError ? <p className="form-error">{serverError}</p> : null}
       <button className="primary" disabled={submitting} type="submit">
         {submitting ? "Starting…" : "Start workflow"}
@@ -1331,16 +1584,29 @@ export function AutomationsPage({
             ))}
           </div>
           {selectedDescriptor ? (
-            <WorkflowForm
-              key={selectedDescriptor.kind}
-              descriptor={selectedDescriptor}
-              entities={entities}
-              onStarted={(workflow) => {
-                setCreated((items) => [...items, workflow]);
-                setTab("Active");
-                setSelectedId(workflow.id);
-              }}
-            />
+            selectedDescriptor.kind === "logistics.delivery" ? (
+              <LogisticsWorkflowForm
+                key={selectedDescriptor.kind}
+                descriptor={selectedDescriptor}
+                entities={entities}
+                onStarted={(workflow) => {
+                  setCreated((items) => [...items, workflow]);
+                  setTab("Active");
+                  setSelectedId(workflow.id);
+                }}
+              />
+            ) : (
+              <WorkflowForm
+                key={selectedDescriptor.kind}
+                descriptor={selectedDescriptor}
+                entities={entities}
+                onStarted={(workflow) => {
+                  setCreated((items) => [...items, workflow]);
+                  setTab("Active");
+                  setSelectedId(workflow.id);
+                }}
+              />
+            )
           ) : (
             <p className="empty-state">
               Select a workflow template to configure it.

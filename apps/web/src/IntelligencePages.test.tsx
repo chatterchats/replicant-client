@@ -10,7 +10,7 @@ import { LeaderboardsContent } from "./LeaderboardsPage";
 import { filterInboxMessages, MessagesContent } from "./MessagesPage";
 import { NetworkContent } from "./NetworkPage";
 import { ReportsContent } from "./ReportsPage";
-import { StandingContent } from "./StandingPage";
+import { ReputationContent, StandingContent } from "./StandingPage";
 import type {
   BobnetSnapshot,
   LeaderboardsSnapshot,
@@ -36,6 +36,7 @@ const device = {
   owner_name: null,
   system: "SOL",
   location: "SOL-1",
+  available_commands: [],
   tags: [],
   attached_to: null,
   stowed_in: null,
@@ -266,6 +267,43 @@ describe("Intelligence pages", () => {
     );
     expect(html).toContain("First flight");
     expect(html).toContain("Not exposed");
+  });
+
+  it("sorts the species reputation page highest to lowest", () => {
+    const data: StandingSnapshot = {
+      metadata,
+      experience_points_total: 42,
+      civilisation_points: 3,
+      achievements: [],
+      reputation: [
+        {
+          species: "low",
+          name: "Low",
+          value: 2,
+          trait_name: null,
+          description: null,
+        },
+        {
+          species: "high",
+          name: "High",
+          value: 12,
+          trait_name: null,
+          description: null,
+        },
+        {
+          species: "middle",
+          name: "Middle",
+          value: 7,
+          trait_name: null,
+          description: null,
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <ReputationContent {...common} data={data} />,
+    );
+    expect(html.indexOf("High")).toBeLessThan(html.indexOf("Middle"));
+    expect(html.indexOf("Middle")).toBeLessThan(html.indexOf("Low"));
   });
 
   it("renders leaderboard rows and empty/error/loading states", () => {

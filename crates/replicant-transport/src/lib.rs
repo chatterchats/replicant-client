@@ -74,6 +74,10 @@ pub struct DeliveryRequest {
     /// Optional transport type/count restriction.
     #[serde(default)]
     pub carrier: Option<CarrierPreference>,
+    /// Allow an otherwise-free transport outside the origin system to self-stage
+    /// to the pickup location when no suitable local transport is available.
+    #[serde(default)]
+    pub allow_transport_staging: bool,
 }
 
 /// One concrete resource pickup location.
@@ -238,7 +242,13 @@ pub async fn plan_delivery_with(
         .iter()
         .map(|payload| payload.code.clone())
         .collect::<BTreeSet<_>>();
-    let candidates = transport_candidates(&request.origin, &devices, &blueprints, &payload_codes);
+    let candidates = transport_candidates(
+        &request.origin,
+        &devices,
+        &blueprints,
+        &payload_codes,
+        request.allow_transport_staging,
+    );
 
     let resource_demand = resource_pickups
         .iter()
@@ -775,15 +785,14 @@ fn transport_candidates(
     devices: &[Device],
     blueprints: &BTreeMap<String, (i64, i64)>,
     payload_codes: &BTreeSet<String>,
+    allow_transport_staging: bool,
 ) -> Vec<TransportCandidate> {
     let mut candidates = devices
         .iter()
         .filter(|device| {
-            device
-                .location
-                .as_ref()
-                .is_some_and(|location| transport_scope_matches(origin, location.id.as_str()))
-                && device.travel.is_none()
+            device.location.as_ref().is_some_and(|location| {
+                allow_transport_staging || transport_scope_matches(origin, location.id.as_str())
+            }) && device.travel.is_none()
                 && device.relationships.attached_to.is_none()
                 && device.relationships.stowed_in.is_none()
                 && device.relationships.controller.is_none()
@@ -802,7 +811,7 @@ fn transport_candidates(
             Some(TransportCandidate {
                 code: device.key.id.as_str().to_owned(),
                 device_type,
-                origin_rank: origin_location_rank(origin, &location),
+                origin_rank: transport_origin_rank(origin, &location),
                 cargo_capacity: blueprint_cargo.max(0),
                 attach_capacity,
             })
@@ -856,8 +865,12 @@ async fn select_transports(
         })
         .collect::<Vec<_>>();
     eligible.sort_by(|left, right| {
-        capacity_rank(kind.capacity(left), demand)
-            .cmp(&capacity_rank(kind.capacity(right), demand))
+        (left.origin_rank >= REMOTE_TRANSPORT_RANK)
+            .cmp(&(right.origin_rank >= REMOTE_TRANSPORT_RANK))
+            .then_with(|| {
+                capacity_rank(kind.capacity(left), demand)
+                    .cmp(&capacity_rank(kind.capacity(right), demand))
+            })
             .then_with(|| left.origin_rank.cmp(&right.origin_rank))
             .then_with(|| left.code.cmp(&right.code))
     });
@@ -865,6 +878,15 @@ async fn select_transports(
     let mut selected = Vec::new();
     let mut selected_capacity = 0i64;
     for candidate in eligible {
+        if preference.is_none()
+            && !selected.is_empty()
+            && candidate.origin_rank >= REMOTE_TRANSPORT_RANK
+        {
+            // One usable local transport can make repeated trips. Remote
+            // staging is a fallback for a missing local carrier, not a way to
+            // shorten a delivery by borrowing additional cross-system hulls.
+            break;
+        }
         let enough = match preference {
             // An explicit preference pins the exact transport count.
             Some(preference) => selected.len() >= preference.quantity,
@@ -1783,8 +1805,18 @@ fn scope_matches(origin: &str, location: &str) -> bool {
     }
 }
 
+const REMOTE_TRANSPORT_RANK: u8 = 3;
+
 fn transport_scope_matches(origin: &str, location: &str) -> bool {
     system_designation(location).eq_ignore_ascii_case(system_designation(origin.trim()))
+}
+
+fn transport_origin_rank(origin: &str, location: &str) -> u8 {
+    if transport_scope_matches(origin, location) {
+        origin_location_rank(origin, location)
+    } else {
+        REMOTE_TRANSPORT_RANK
+    }
 }
 
 fn origin_location_rank(origin: &str, location: &str) -> u8 {
@@ -1881,6 +1913,30 @@ mod tests {
         }
     }
 
+    fn attachment_transport(code: &str, location: &str) -> Device {
+        Device {
+            key: replicant_client::DeviceKey::live(code.into()),
+            device_type: Some(replicant_client::DeviceType::from("mobile_fleet")),
+            status: Some(replicant_client::DeviceStatus::from("inactive")),
+            location: Some(replicant_client::LocationKey::live(location.into())),
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: replicant_client::DeviceRelationships::default(),
+            attach_capacity: Some(1),
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: None,
+            access: replicant_client::domain::AccessScope::Owned,
+        }
+    }
+
     #[test]
     fn resource_allocation_never_uses_destination_stock_as_a_pickup() {
         let destination = replicant_client::LocationKey::live("SCEPTURUM-7-L4".into());
@@ -1926,6 +1982,55 @@ mod tests {
     fn exact_origin_matches_only_that_location() {
         assert!(scope_matches("SCEPTURUM-BELT-1", "SCEPTURUM-BELT-1"));
         assert!(!scope_matches("SCEPTURUM-BELT-1", "SCEPTURUM-7-L4"));
+    }
+
+    #[test]
+    fn transport_staging_is_opt_in_and_keeps_remote_carriers_as_fallbacks() {
+        let devices = vec![
+            attachment_transport("LOCAL", "SCEPTURUM-7-L4"),
+            attachment_transport("REMOTE", "TWAFFY-OBJ-1"),
+        ];
+        let blueprints = BTreeMap::new();
+        let payload_codes = BTreeSet::new();
+
+        let local_only = transport_candidates(
+            "SCEPTURUM-BELT-1",
+            &devices,
+            &blueprints,
+            &payload_codes,
+            false,
+        );
+        assert_eq!(local_only.len(), 1);
+        assert_eq!(local_only[0].code, "LOCAL");
+        assert!(local_only[0].origin_rank < REMOTE_TRANSPORT_RANK);
+
+        let with_staging = transport_candidates(
+            "SCEPTURUM-BELT-1",
+            &devices,
+            &blueprints,
+            &payload_codes,
+            true,
+        );
+        assert_eq!(with_staging.len(), 2);
+        assert_eq!(
+            with_staging
+                .iter()
+                .find(|candidate| candidate.code == "REMOTE")
+                .map(|candidate| candidate.origin_rank),
+            Some(REMOTE_TRANSPORT_RANK)
+        );
+    }
+
+    #[test]
+    fn transport_origin_rank_marks_other_systems_as_remote() {
+        assert_eq!(
+            transport_origin_rank("SCEPTURUM-BELT-1", "SCEPTURUM-7-L4"),
+            2
+        );
+        assert_eq!(
+            transport_origin_rank("SCEPTURUM-BELT-1", "TWAFFY-BELT-1"),
+            REMOTE_TRANSPORT_RANK
+        );
     }
 
     #[test]

@@ -64,6 +64,9 @@ export function AutofactoryContent({
       ),
     [descriptors],
   );
+  const printCommand = operations.find(
+    (command) => command.descriptor.kind === "autofactory.print",
+  );
   if (!data && status === "loading")
     return (
       <article className="page loading-state">Loading Autofactories…</article>
@@ -172,6 +175,7 @@ export function AutofactoryContent({
                     <th>Status</th>
                     <th>Queue</th>
                     <th>Workflow</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -228,6 +232,24 @@ export function AutofactoryContent({
                               }}
                             >
                               {device.claim.workflow_kind}
+                            </button>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td>
+                          {printCommand ? (
+                            <button
+                              onClick={() => {
+                                onRunCommand({
+                                  ...printCommand,
+                                  initialParameters: {
+                                    device: device.entity.id,
+                                  },
+                                });
+                              }}
+                            >
+                              Print
                             </button>
                           ) : (
                             "—"

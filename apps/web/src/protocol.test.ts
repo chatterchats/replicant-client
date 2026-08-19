@@ -365,7 +365,7 @@ describe("asset projection parsers", () => {
           available: 0,
           unavailable: 0,
           queued_units: 2,
-          utilization_percent: 100,
+          utilization_percent: 33.333333333333336,
         },
         factories: [
           {
@@ -385,7 +385,7 @@ describe("asset projection parsers", () => {
       },
     });
     expect(parsed.payload.factories[0]?.current_job?.device_type).toBe("relay");
-    expect(parsed.payload.utilization.utilization_percent).toBe(100);
+    expect(parsed.payload.utilization.utilization_percent).toBeCloseTo(33.3333);
   });
 
   it("parses capability-based cargo rows", () => {

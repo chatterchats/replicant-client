@@ -3106,3 +3106,103 @@ h1 {
 .notification-center li.info .notification-open {
   border-left-color: var(--accent);
 }
+
+.manifest-builder {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 18px;
+  padding: 14px;
+  border: 1px solid rgba(159, 188, 193, 0.18);
+  border-radius: 8px;
+}
+.manifest-builder legend {
+  padding: 0 6px;
+  color: #d8e7e4;
+  font-weight: 700;
+}
+.manifest-row {
+  display: grid;
+  grid-template-columns:
+    minmax(110px, 0.75fr) minmax(180px, 1.5fr) minmax(90px, 0.55fr)
+    auto;
+  gap: 8px;
+  align-items: center;
+}
+.manifest-row input,
+.manifest-row select {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid rgba(159, 188, 193, 0.25);
+  border-radius: 6px;
+  outline: 0;
+  background: #12201e;
+  padding: 9px 10px;
+  color: #eff8f6;
+}
+.manifest-tag-quantity {
+  color: #78908c;
+  font-size: 0.78rem;
+  text-align: center;
+}
+.inspector-section {
+  display: grid;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(159, 188, 193, 0.14);
+}
+.inspector-section h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+.inspector-resource-list,
+.inspector-entity-list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.inspector-resource-list li,
+.inspector-entity-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 5px;
+  background: rgba(10, 24, 22, 0.35);
+}
+.inspector-entity-list li > span:first-child {
+  display: grid;
+  gap: 2px;
+}
+.inspector-entity-list small {
+  color: #78908c;
+}
+.inspector-command-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+.inspector-command-grid button {
+  text-align: left;
+}
+.inspector-structured-row {
+  display: contents;
+}
+
+@media (max-width: 720px) {
+  .manifest-row {
+    grid-template-columns: 1fr;
+  }
+  .inspector-command-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.palette-logistics-form {
+  max-height: 75vh;
+  overflow-y: auto;
+  padding: 20px;
+}
+.palette-logistics-form > button:first-child {
+  margin-bottom: 10px;
+}

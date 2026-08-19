@@ -9,7 +9,7 @@ DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip token token-rotate
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip token token-rotate
 
 help:
 	@printf '%s\n' \
@@ -32,7 +32,8 @@ help:
 	  'observability-policy-check 	Verify tracing targets, timing events, and secret guards' \
 	  'policy-checks          		Run all checked-in policy gates' \
 	  'ci                    		Run the full local CI-equivalent suite' \
-	  'docker-build          		Build the production container images' \
+	  'docker-artifacts      		Build release daemon + web artifacts locally' \
+	  'docker-build          		Build locally, then package production images' \
 	  'docker-check          		Validate Compose and build the production images' \
 	  'docker-up             		Start the production Compose stack' \
 	  'docker-down           		Stop the stack without deleting durable data' \
@@ -122,10 +123,19 @@ policy-checks: contract-policy-check
 
 ci: desktop-prepare fmt-check lint test check-all doc policy-checks web-check desktop-check
 
-docker-build:
+docker-artifacts:
+	$(CARGO) build --locked --release -p replicant-server --bin replicantd
+	$(NPM) --prefix $(WEB_DIR) ci
+	$(MAKE) galaxy-wasm
+	$(NPM) --prefix $(WEB_DIR) run build:web
+	rm -rf target/docker/web
+	mkdir -p target/docker/web
+	cp -a $(WEB_DIR)/dist/. target/docker/web/
+
+docker-build: docker-artifacts
 	$(DOCKER_COMPOSE) build
 
-docker-check:
+docker-check: docker-artifacts
 	$(DOCKER_COMPOSE) config --quiet
 	RS_API_TOKEN_FILE_HOST=.env.example $(DOCKER_COMPOSE) -f compose.yaml -f compose.secret.yaml config --quiet
 	$(DOCKER_COMPOSE) -f compose.yaml -f compose.headless.yaml config --quiet

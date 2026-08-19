@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-use replicant_client::{managed::Client, raw};
+use replicant_client::{
+    managed::{AutofactoryPrintOptions, Client},
+    raw,
+};
 use replicant_protocol::{
     ActionDescriptor, DescriptorCatalog, EntityKind, MutationRisk, OperationClass, OperationKind,
     ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
@@ -385,12 +388,19 @@ impl OperationCatalogue {
                         .map_err(runtime_error)?;
                     let command = match input.command.as_str() {
                         "activate" => raw::devices::DeviceCommand::Activate,
+                        "assemble" => raw::devices::DeviceCommand::Assemble,
+                        "cancel" => raw::devices::DeviceCommand::Cancel,
+                        "clear_queue" => raw::devices::DeviceCommand::ClearQueue,
                         "deactivate" => raw::devices::DeviceCommand::Deactivate,
                         "decommission" => raw::devices::DeviceCommand::Decommission,
                         "deploy" => raw::devices::DeviceCommand::Deploy,
                         "compact" => raw::devices::DeviceCommand::Compact,
                         "unfurl" => raw::devices::DeviceCommand::Unfurl,
+                        "launch" => raw::devices::DeviceCommand::Launch,
                         "recall" => raw::devices::DeviceCommand::Recall,
+                        "scan" => raw::devices::DeviceCommand::Scan,
+                        "search" => raw::devices::DeviceCommand::Search,
+                        "system_scan" => raw::devices::DeviceCommand::SystemScan,
                         "withdraw" => raw::devices::DeviceCommand::Withdraw,
                         _ => {
                             return Err(CatalogueError::Invalid(
@@ -402,6 +412,115 @@ impl OperationCatalogue {
                 }
                 .map_err(runtime_error)?;
                 managed_operation_value(operation).await
+            }
+            "device.stow" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .stow(Some(input.target))
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.attach" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .attach(raw::devices::TargetsCommand {
+                            target: Some(input.target),
+                            ..raw::devices::TargetsCommand::default()
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.detach" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Detach(
+                            raw::devices::TargetsCommand {
+                                target: Some(input.target),
+                                ..raw::devices::TargetsCommand::default()
+                            },
+                        ))
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.repair" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(handle.repair(input.target).await.map_err(runtime_error)?)
+                    .await
+            }
+            "device.change_owner" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .change_owner(input.target)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "autofactory.print" => {
+                let input: AutofactoryPrintAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                let mut options = AutofactoryPrintOptions::new(input.quantity);
+                if input.flatpack {
+                    options = options.flatpacked();
+                }
+                let tags = input
+                    .tags
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if !tags.is_empty() {
+                    options = options.tags(tags);
+                }
+                managed_operation_value(
+                    handle
+                        .enqueue_print_configured(input.device_type, options)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
             }
             "observatory.auto_prospect" => {
                 let input: ObservatoryAutoProspectAction = decode(parameters)?;
@@ -782,6 +901,9 @@ impl OperationCatalogue {
         let parameters = self
             .parameters(class, kind)
             .ok_or_else(|| unknown(class, kind))?;
+        if class == OperationClass::Workflow && kind == logistics_workflow_kind().as_str() {
+            return validate_logistics_workflow_parameters(parameters, values, defaults_only);
+        }
         if let Some(name) = values
             .keys()
             .find(|name| !parameters.iter().any(|item| item.name == name.as_str()))
@@ -809,6 +931,116 @@ impl OperationCatalogue {
         }
         Ok(values)
     }
+}
+
+fn validate_logistics_workflow_parameters(
+    parameters: &[ParameterDescriptor],
+    mut values: BTreeMap<String, Value>,
+    defaults_only: bool,
+) -> Result<BTreeMap<String, Value>, CatalogueError> {
+    const MANIFEST_FIELDS: [&str; 3] = ["resources", "devices", "device_tags"];
+    if let Some(name) = values.keys().find(|name| {
+        !parameters.iter().any(|item| item.name == name.as_str())
+            && !MANIFEST_FIELDS.contains(&name.as_str())
+    }) {
+        return Err(CatalogueError::Invalid(format!(
+            "unknown parameter `{name}` for `logistics.delivery`"
+        )));
+    }
+    for parameter in parameters {
+        if !values.contains_key(&parameter.name)
+            && let Some(default) = &parameter.default
+        {
+            values.insert(parameter.name.clone(), default.clone());
+        }
+        let Some(value) = values.get(&parameter.name) else {
+            if parameter.required && !defaults_only {
+                return Err(CatalogueError::Invalid(format!(
+                    "missing required parameter `{}`",
+                    parameter.name
+                )));
+            }
+            continue;
+        };
+        validate_parameter(parameter, value)?;
+    }
+    if let Some(resources) = values.get("resources") {
+        let resources = resources.as_object().ok_or_else(|| {
+            CatalogueError::Invalid("parameter `resources` must be an object".to_owned())
+        })?;
+        if resources.values().any(|quantity| {
+            quantity
+                .as_i64()
+                .or_else(|| {
+                    quantity
+                        .as_u64()
+                        .and_then(|value| i64::try_from(value).ok())
+                })
+                .is_none_or(|quantity| quantity <= 0)
+        }) {
+            return Err(CatalogueError::Invalid(
+                "resource quantities must be positive integers".to_owned(),
+            ));
+        }
+    }
+    if let Some(devices) = values.get("devices") {
+        let devices = devices.as_array().ok_or_else(|| {
+            CatalogueError::Invalid("parameter `devices` must be an array".to_owned())
+        })?;
+        for device in devices {
+            let device = device.as_object().ok_or_else(|| {
+                CatalogueError::Invalid("each device payload must be an object".to_owned())
+            })?;
+            if device
+                .get("device_type")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+                || device
+                    .get("quantity")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|quantity| quantity <= 0)
+            {
+                return Err(CatalogueError::Invalid(
+                    "device payloads require device_type and positive quantity".to_owned(),
+                ));
+            }
+        }
+    }
+    if let Some(tags) = values.get("device_tags") {
+        let tags = tags.as_array().ok_or_else(|| {
+            CatalogueError::Invalid("parameter `device_tags` must be an array".to_owned())
+        })?;
+        if tags
+            .iter()
+            .any(|tag| tag.as_str().is_none_or(str::is_empty))
+        {
+            return Err(CatalogueError::Invalid(
+                "device tags must be non-empty strings".to_owned(),
+            ));
+        }
+    }
+    let has_manifest = values
+        .get("resources")
+        .and_then(Value::as_object)
+        .is_some_and(|items| !items.is_empty())
+        || values
+            .get("devices")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        || values
+            .get("device_tags")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+    let has_legacy = values
+        .get("item")
+        .and_then(Value::as_str)
+        .is_some_and(|item| !item.is_empty());
+    if !defaults_only && !has_manifest && !has_legacy {
+        return Err(CatalogueError::Invalid(
+            "logistics delivery requires at least one payload".to_owned(),
+        ));
+    }
+    Ok(values)
 }
 
 fn unknown(class: OperationClass, kind: &str) -> CatalogueError {
@@ -1184,17 +1416,103 @@ fn descriptors() -> DescriptorCatalog {
                         "Command",
                         &[
                             "activate",
+                            "assemble",
+                            "cancel",
+                            "clear_queue",
                             "deactivate",
                             "decommission",
                             "deploy",
                             "compact",
                             "unfurl",
+                            "launch",
                             "recall",
+                            "scan",
+                            "search",
+                            "system_scan",
                             "withdraw",
                             "retrieve",
                         ],
                         "activate",
                     ),
+                ],
+            ),
+            simple_action(
+                "autofactory.print",
+                "Print devices",
+                "Queue one or more devices on a selected owned Autofactory.",
+                "manufacturing",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Autofactory", ParameterKind::Device),
+                    required("device_type", "Device type", ParameterKind::DeviceType),
+                    bounded(
+                        defaulted("quantity", "Quantity", ParameterKind::Integer, 1),
+                        Some(1.0),
+                        None,
+                    ),
+                    optional("tags", "Tags (comma separated)", ParameterKind::String),
+                    defaulted("flatpack", "Print compacted", ParameterKind::Boolean, false),
+                ],
+            ),
+            simple_action(
+                "device.stow",
+                "Stow device",
+                "Stow the selected device inside another compatible device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("target", "Stow inside", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.attach",
+                "Attach device",
+                "Attach another compatible device to the selected host device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Host device", ParameterKind::Device),
+                    required("target", "Device to attach", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.detach",
+                "Detach device",
+                "Detach one attached device from the selected host device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Host device", ParameterKind::Device),
+                    required("target", "Device to detach", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.repair",
+                "Repair device",
+                "Use the selected maintenance-capable device to repair a target device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Repair device", ParameterKind::Device),
+                    required("target", "Repair target", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.change_owner",
+                "Change device owner",
+                "Transfer the selected device to another account or replicant.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("target", "New owner", ParameterKind::String),
                 ],
             ),
             simple_action(
@@ -1462,7 +1780,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             kind: operation_kind(logistics_workflow_kind().as_str()),
             display_name: "Deliver cargo or devices".to_owned(),
             aliases: strings(&["transport", "cargo", "taxi"]),
-            description: "Move a resource, device type, or tagged devices between two locations without exposing a transport plan file.".to_owned(),
+            description: "Move one or more resources, device types, or tagged device groups between two locations without exposing a transport plan file.".to_owned(),
             category: "logistics".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
@@ -1471,7 +1789,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                 required("origin", "Origin", ParameterKind::Location),
                 required("destination", "Destination", ParameterKind::Location),
                 enum_parameter("payload_kind", "Payload", &["resource", "device", "tag"], "resource"),
-                required("item", "Resource, device type, or tag", ParameterKind::String),
+                optional("item", "Resource, device type, or tag", ParameterKind::String),
                 bounded(
                     defaulted("quantity", "Quantity", ParameterKind::Integer, 1),
                     Some(1.0),
@@ -2021,6 +2339,21 @@ struct DeviceLifecycleAction {
     command: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceTargetAction {
+    device: String,
+    target: String,
+}
+#[derive(Debug, Deserialize)]
+struct AutofactoryPrintAction {
+    device: String,
+    device_type: String,
+    quantity: i64,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    flatpack: bool,
+}
+#[derive(Debug, Deserialize)]
 struct ObservatoryAutoProspectAction {
     device: Option<String>,
 }
@@ -2337,6 +2670,41 @@ mod tests {
                 .expect("compatibility descriptor");
             assert_eq!(descriptor.category, "compatibility");
         }
+    }
+
+    #[test]
+    fn logistics_delivery_accepts_mixed_manifest_parameters() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let parameters = BTreeMap::from([
+            ("origin".to_owned(), Value::String("SCEPTURUM".to_owned())),
+            (
+                "destination".to_owned(),
+                Value::String("TWAFFY-OBJ-1".to_owned()),
+            ),
+            (
+                "resources".to_owned(),
+                serde_json::json!({"rares": 400, "volatiles": 100}),
+            ),
+            (
+                "devices".to_owned(),
+                serde_json::json!([{"device_type": "exotic_matter_injector", "quantity": 36}]),
+            ),
+            (
+                "device_tags".to_owned(),
+                serde_json::json!(["twaffy-obj-1"]),
+            ),
+        ]);
+        let validated = catalogue
+            .validate(
+                OperationClass::Workflow,
+                logistics_workflow_kind().as_str(),
+                parameters,
+                false,
+            )
+            .expect("mixed logistics manifest should validate");
+        assert!(validated.contains_key("resources"));
+        assert!(validated.contains_key("devices"));
+        assert!(validated.contains_key("device_tags"));
     }
 
     #[test]

@@ -27,6 +27,7 @@ const device = (
   owner_name: "Ada",
   system: "SOL",
   location: "SOL-1",
+  available_commands: [],
   tags: [],
   attached_to: null,
   stowed_in: null,

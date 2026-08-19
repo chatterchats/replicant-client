@@ -1030,7 +1030,7 @@ pub async fn active_events(
 }
 
 async fn fetch_active_events(client: &Client) -> AnyResult<Vec<raw::events::LocationEvent>> {
-    Ok(active_events(client).await?)
+    active_events(client).await
 }
 
 async fn fetch_events(

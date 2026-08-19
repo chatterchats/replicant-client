@@ -33,6 +33,7 @@ const relay = {
   system: "SOL",
   location: "SOL-1",
   tags: ["network"],
+  available_commands: [],
   attached_to: null,
   stowed_in: null,
   controller: null,
