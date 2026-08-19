@@ -169,7 +169,8 @@ describe("parseDirectorResponse", () => {
             status: "active",
             objective: "Learn missing blueprints from owned devices",
             blocker: null,
-            next_action: "Sacrifice owned service_bot DEVICE-1 at Autofactory FACTORY-1",
+            next_action:
+              "Sacrifice owned service_bot DEVICE-1 at Autofactory FACTORY-1",
             progress_current: 8,
             progress_total: 9,
             active_workflows: [],

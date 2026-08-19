@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { useNotifications } from "./daemon";
 import type { Notification, NotificationLevel } from "./protocol";
 import { relativeTime } from "./time";
 
 /** How long a toast stays on screen before dismissing itself. */
 const TOAST_TIMEOUT_MS = 8_000;
+const TOAST_LIMIT = 4;
 
 function levelLabel(level: NotificationLevel): string {
   return level === "error" ? "Error" : level === "warning" ? "Warning" : "Info";
@@ -20,17 +20,24 @@ function levelLabel(level: NotificationLevel): string {
  * interrupting.
  */
 export function NotificationToasts({
+  notifications,
+  ready,
   onSelect,
+  onDismiss,
 }: {
+  notifications: Notification[];
+  ready: boolean;
   onSelect: (notification: Notification) => void;
+  onDismiss: (notification: Notification) => void;
 }) {
-  const notifications = useNotifications();
   const seen = useRef<Set<string> | null>(null);
   const [toasts, setToasts] = useState<Notification[]>([]);
 
   useEffect(() => {
-    // Notifications present on first render came with the snapshot and are
-    // history, not news; only announce what arrives afterwards.
+    // The shell mounts before the daemon snapshot arrives. Do not initialize
+    // the seen set from that temporary empty state or the first snapshot will
+    // be mistaken for a burst of brand-new notifications after every reload.
+    if (!ready) return;
     if (seen.current === null) {
       seen.current = new Set(notifications.map((item) => item.id));
       return;
@@ -39,8 +46,9 @@ export function NotificationToasts({
       (item) => item.level !== "info" && !seen.current?.has(item.id),
     );
     for (const item of notifications) seen.current.add(item.id);
-    if (fresh.length > 0) setToasts((current) => [...current, ...fresh]);
-  }, [notifications]);
+    if (fresh.length > 0)
+      setToasts((current) => [...current, ...fresh].slice(-TOAST_LIMIT));
+  }, [notifications, ready]);
 
   useEffect(() => {
     if (toasts.length === 0) return;
@@ -76,6 +84,7 @@ export function NotificationToasts({
               aria-label={`Dismiss ${toast.title}`}
               className="toast-dismiss"
               onClick={() => {
+                onDismiss(toast);
                 setToasts((current) =>
                   current.filter((item) => item.id !== toast.id),
                 );
@@ -92,13 +101,18 @@ export function NotificationToasts({
 
 /** Full list of current notifications, newest first. */
 export function NotificationCenter({
+  notifications,
   onClose,
   onSelect,
+  onDismiss,
+  onClearAll,
 }: {
+  notifications: Notification[];
   onClose: () => void;
   onSelect: (notification: Notification) => void;
+  onDismiss: (notification: Notification) => void;
+  onClearAll: () => void;
 }) {
-  const notifications = useNotifications();
   const ordered = useMemo(
     () => [...notifications].sort((a, b) => b.created_at_ms - a.created_at_ms),
     [notifications],
@@ -107,9 +121,14 @@ export function NotificationCenter({
     <div className="notification-center" aria-label="Notifications">
       <header>
         <h2>Notifications</h2>
-        <button aria-label="Close notifications" onClick={onClose}>
-          ×
-        </button>
+        <div className="notification-center-actions">
+          {ordered.length > 0 && (
+            <button onClick={onClearAll}>Clear all</button>
+          )}
+          <button aria-label="Close notifications" onClick={onClose}>
+            ×
+          </button>
+        </div>
       </header>
       {ordered.length === 0 ? (
         <p className="empty-state">Nothing needs attention.</p>
@@ -118,8 +137,10 @@ export function NotificationCenter({
           {ordered.map((notification) => (
             <li className={notification.level} key={notification.id}>
               <button
+                className="notification-open"
                 onClick={() => {
                   onSelect(notification);
+                  onDismiss(notification);
                   onClose();
                 }}
               >
@@ -133,6 +154,13 @@ export function NotificationCenter({
                 >
                   {relativeTime(notification.created_at_ms)}
                 </time>
+              </button>
+              <button
+                className="notification-dismiss"
+                aria-label={`Clear ${notification.title}`}
+                onClick={() => onDismiss(notification)}
+              >
+                ×
               </button>
             </li>
           ))}

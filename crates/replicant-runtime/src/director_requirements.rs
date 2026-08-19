@@ -576,7 +576,9 @@ mod tests {
             )
             .expect("raise blueprint");
         assert_eq!(
-            graph.current_blueprint_priorities().get("galactic_observatory"),
+            graph
+                .current_blueprint_priorities()
+                .get("galactic_observatory"),
             Some(&400)
         );
         graph.persist(&repository).expect("persist graph");
@@ -591,10 +593,7 @@ mod tests {
             region: Some("alpha".to_owned()),
             origin_scope: "SCEPTURUM".to_owned(),
             destination: "SCEPTURUM-7-L4".to_owned(),
-            resources: BTreeMap::from([
-                ("carbon".to_owned(), 80),
-                ("structural".to_owned(), 400),
-            ]),
+            resources: BTreeMap::from([("carbon".to_owned(), 80), ("structural".to_owned(), 400)]),
             devices: vec![
                 DeviceRequest {
                     quantity: 2,
@@ -712,7 +711,9 @@ mod tests {
 
         let loaded = DirectorRequirementGraph::load(&repository, 200).expect("reload graph");
         assert_eq!(loaded.summaries().len(), 1);
-        loaded.persist(&repository).expect("persist unrefreshed graph");
+        loaded
+            .persist(&repository)
+            .expect("persist unrefreshed graph");
 
         let summaries = load_requirement_summaries(&repository).expect("load summaries");
         assert_eq!(summaries[0].status, DirectorRequirementStatus::Satisfied);

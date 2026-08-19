@@ -467,6 +467,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/trade", get(trade))
         .route("/api/reports", get(reports))
         .route("/api/messages", get(messages))
+        .route("/api/messages/read", post(mark_messages_read))
         .route("/api/bobnet", get(bobnet))
         .route("/api/network", get(network))
         .route("/api/standing", get(standing_snapshot))
@@ -2886,6 +2887,77 @@ async fn messages(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct MarkMessagesReadRequest {
+    #[serde(default)]
+    ids: Vec<i64>,
+    #[serde(default)]
+    mark_all: bool,
+}
+
+async fn mark_messages_read(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MarkMessagesReadRequest>,
+) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
+    if !request.mark_all && request.ids.is_empty() {
+        return Err(ApiError::invalid(
+            "message IDs or mark_all=true are required",
+        ));
+    }
+
+    let _guard = state.message_sync.lock().await;
+    let ids = request.ids.into_iter().collect::<BTreeSet<_>>();
+    let operation = state
+        .client()
+        .messages()
+        .mark_read(replicant_client::raw::messages::MessagesReadRequest {
+            ids: (!request.mark_all).then(|| ids.iter().copied().collect()),
+            mark_all: request.mark_all.then_some(true),
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "marking inbox messages read failed");
+            ApiError::unavailable()
+        })?;
+    let outcome = operation.outcome().await.map_err(|error| {
+        tracing::warn!(error = %error, "reading message read operation outcome failed");
+        ApiError::unavailable()
+    })?;
+    if outcome.status != ManagedOperationStatus::Completed {
+        tracing::warn!(
+            status = ?outcome.status,
+            "message read operation did not complete successfully"
+        );
+        return Err(ApiError::unavailable());
+    }
+
+    let mut cache = load_message_cache(&state.repository)?;
+    let mut newly_read = 0_i64;
+    for message in &mut cache.inbox {
+        if request.mark_all || message.id.is_some_and(|id| ids.contains(&id)) {
+            if message.is_read == Some(false) {
+                newly_read += 1;
+            }
+            message.is_read = Some(true);
+        }
+    }
+    cache.unread_count = if request.mark_all {
+        Some(0)
+    } else {
+        cache
+            .unread_count
+            .map(|count| count.saturating_sub(newly_read))
+    };
+    persist_message_cache(&state.repository, &cache)?;
+    state.invalidate(DomainSlice::Messages);
+
+    Ok(Json(Versioned::current(MessagesSnapshot {
+        metadata: state.snapshot_metadata()?,
+        inbox: cache.inbox,
+        unread_count: cache.unread_count,
+    })))
+}
+
 async fn sync_message_cache(state: &AppState) -> Result<MessageInboxCache, ApiError> {
     let mut cache = load_message_cache(&state.repository)?;
     let mut cursor = cache.last_cursor;
@@ -2929,7 +3001,10 @@ async fn sync_message_cache(state: &AppState) -> Result<MessageInboxCache, ApiEr
             break;
         };
         if cursor == Some(next) {
-            tracing::warn!(cursor = next, "account message pagination cursor did not advance");
+            tracing::warn!(
+                cursor = next,
+                "account message pagination cursor did not advance"
+            );
             break;
         }
         cursor = Some(next);
@@ -2973,10 +3048,7 @@ fn inbox_message_summary(message: replicant_client::raw::messages::Message) -> I
     }
 }
 
-fn merge_inbox_messages(
-    inbox: &mut Vec<InboxMessageSummary>,
-    incoming: Vec<InboxMessageSummary>,
-) {
+fn merge_inbox_messages(inbox: &mut Vec<InboxMessageSummary>, incoming: Vec<InboxMessageSummary>) {
     let mut by_id = BTreeMap::new();
     let mut without_id = Vec::new();
     for message in inbox.drain(..) {
@@ -4906,7 +4978,11 @@ async fn reconcile_and_invalidate_director(
 ) -> Result<DirectorSnapshot, ApiError> {
     let attempt = DIRECTOR_RECONCILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    tracing::info!(attempt, trigger, "Automation Director reconciliation queued");
+    tracing::info!(
+        attempt,
+        trigger,
+        "Automation Director reconciliation queued"
+    );
     let reconciliation = async {
         let lock_started = Instant::now();
         let _guard = state.director_reconcile.lock().await;
@@ -5652,7 +5728,7 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{body_json, method, path},
     };
 
     use super::*;
@@ -6013,6 +6089,65 @@ mod tests {
         assert_eq!(restored.inbox[0].id, Some(3));
         assert_eq!(restored.inbox[1].title.as_deref(), Some("Updated"));
         assert_eq!(restored.inbox[1].is_read, Some(true));
+    }
+
+    #[tokio::test]
+    async fn mark_messages_read_updates_the_persisted_projection() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [
+                    {"id": 1, "title": "One", "is_read": false},
+                    {"id": 2, "title": "Two", "is_read": false}
+                ],
+                "unread_message_count": 2
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/read"))
+            .and(body_json(serde_json::json!({"ids": [1]})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (app, client) = test_app_at(&server.uri()).await;
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/messages")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("initial response");
+        assert_eq!(initial.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/messages/read")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":[1]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("mark-read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(response).await)
+            .expect("typed message response");
+        assert_eq!(response.payload.unread_count, Some(1));
+        assert_eq!(response.payload.inbox[0].id, Some(2));
+        assert_eq!(response.payload.inbox[0].is_read, Some(false));
+        assert_eq!(response.payload.inbox[1].id, Some(1));
+        assert_eq!(response.payload.inbox[1].is_read, Some(true));
+        client.close().await.expect("close client");
     }
 
     #[test]

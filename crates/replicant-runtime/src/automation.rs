@@ -12,8 +12,8 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Device, DeviceType, MiningDirective, Operation, OperationId, OperationStatus, SurveyDirective,
-    domain::AccessScope,
+    Client, Device, DeviceType, MiningDirective, Operation, OperationId, OperationStatus,
+    SurveyDirective, domain::AccessScope,
 };
 use replicant_printing::{
     PrintRequest,
@@ -1171,11 +1171,17 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
             let client = managed_client(context)?;
             let mut checkpoint: BlueprintAcquireCheckpoint =
                 context.checkpoint().map_err(string_error)?;
-            claim_target(context, "blueprint-acquire", &device_type.to_ascii_lowercase())?;
+            claim_target(
+                context,
+                "blueprint-acquire",
+                &device_type.to_ascii_lowercase(),
+            )?;
 
             if blueprint_is_known(&client, device_type).await? {
                 checkpoint.blueprint_verified = true;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
                 return context
                     .mark_succeeded(Some(serde_json::json!({
                         "device_type": device_type,
@@ -1200,7 +1206,9 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 }
                 if wait_for_blueprint(&client, device_type, 24).await? {
                     checkpoint.blueprint_verified = true;
-                    context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
                     return context
                         .mark_succeeded(Some(serde_json::json!({
                             "device_type": device_type,
@@ -1226,7 +1234,9 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 // blueprint until the ambiguity resolves.
                 if wait_for_blueprint(&client, device_type, 24).await? {
                     checkpoint.blueprint_verified = true;
-                    context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
                     return context
                         .mark_succeeded(Some(serde_json::json!({
                             "device_type": device_type,
@@ -1282,7 +1292,9 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
             checkpoint.source_device = Some(source_code.clone());
             checkpoint.autofactory = Some(factory_code.clone());
             checkpoint.autofactory_location = Some(factory_location.clone());
-            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
             claim(context, ResourceKey::Autofactory(factory_code.clone()))?;
 
             if !source_location.eq_ignore_ascii_case(&factory_location) {
@@ -1321,19 +1333,25 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                                     .map_err(string_error)?;
                                 context
                                     .repository()
-                                    .acquire_claim(child.id, ResourceKey::Device(source_code.clone()))
+                                    .acquire_claim(
+                                        child.id,
+                                        ResourceKey::Device(source_code.clone()),
+                                    )
                                     .map_err(string_error)?;
                                 child.id
                             }
                         };
                         checkpoint.logistics_child = Some(id);
-                        context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                        context
+                            .persist_checkpoint(&checkpoint)
+                            .map_err(string_error)?;
                         id
                     }
                 };
 
                 loop {
-                    let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+                    let Some(child) = context.repository().read(child_id).map_err(string_error)?
+                    else {
                         return Err(format!("blueprint logistics child {child_id} disappeared"));
                     };
                     match child.status {
@@ -1346,7 +1364,9 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                             ));
                         }
                         _ => {
-                            context.advance_to("awaiting_transport", &checkpoint).map_err(string_error)?;
+                            context
+                                .advance_to("awaiting_transport", &checkpoint)
+                                .map_err(string_error)?;
                             match context.control_request().map_err(string_error)? {
                                 replicant_workflow::ControlRequest::Continue => {}
                                 replicant_workflow::ControlRequest::Pause
@@ -1360,7 +1380,9 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
 
             if blueprint_is_known(&client, device_type).await? {
                 checkpoint.blueprint_verified = true;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
                 return context
                     .mark_succeeded(Some(serde_json::json!({
                         "device_type": device_type,
@@ -1371,7 +1393,11 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                     .map_err(string_error);
             }
 
-            let source_handle = client.devices().get(&source_code).await.map_err(string_error)?;
+            let source_handle = client
+                .devices()
+                .get(&source_code)
+                .await
+                .map_err(string_error)?;
             let source_now = source_handle.snapshot().await.map_err(string_error)?;
             let current_location = source_now
                 .location
@@ -1386,19 +1412,25 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
             claim_device(context, &source_code)?;
 
             checkpoint.decommission_authorized = true;
-            context.advance_to("decommissioning", &checkpoint).map_err(string_error)?;
+            context
+                .advance_to("decommissioning", &checkpoint)
+                .map_err(string_error)?;
             let operation = source_handle
                 .command(replicant_client::raw::devices::DeviceCommand::Decommission)
                 .await
                 .map_err(string_error)?;
             checkpoint.decommission_submitted = true;
             checkpoint.decommission_operation = Some(operation.id().as_str().to_owned());
-            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
             await_success(&operation).await?;
 
             if wait_for_blueprint(&client, device_type, 24).await? {
                 checkpoint.blueprint_verified = true;
-                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
                 return context
                     .mark_succeeded(Some(serde_json::json!({
                         "device_type": device_type,
@@ -2245,7 +2277,12 @@ fn claim_target(context: &WorkflowContext, namespace: &str, key: &str) -> Result
 }
 
 async fn refresh_owned_devices(client: &Client) -> Result<Vec<Device>, String> {
-    let handles = client.devices().refresh_many().collect().await.map_err(string_error)?;
+    let handles = client
+        .devices()
+        .refresh_many()
+        .collect()
+        .await
+        .map_err(string_error)?;
     let mut devices = Vec::with_capacity(handles.len());
     for handle in handles {
         devices.push(handle.snapshot().await.map_err(string_error)?);
@@ -2295,7 +2332,9 @@ fn resolve_blueprint_source(
             .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
             .ok_or_else(|| format!("selected blueprint source {code} is no longer owned"))?;
         if !blueprint_source_is_releasable(device, &intent.device_type) {
-            return Err(format!("selected blueprint source {code} is no longer releasable"));
+            return Err(format!(
+                "selected blueprint source {code} is no longer releasable"
+            ));
         }
         return Ok(device.clone());
     }
@@ -2304,7 +2343,12 @@ fn resolve_blueprint_source(
         .filter(|device| blueprint_source_is_releasable(device, &intent.device_type))
         .min_by_key(|device| device.key.id.clone())
         .cloned()
-        .ok_or_else(|| format!("no releasable owned {} device is available", intent.device_type))
+        .ok_or_else(|| {
+            format!(
+                "no releasable owned {} device is available",
+                intent.device_type
+            )
+        })
 }
 
 fn resolve_blueprint_factory(
@@ -2313,7 +2357,10 @@ fn resolve_blueprint_factory(
     devices: &[Device],
     source: &Device,
 ) -> Result<Device, String> {
-    let pinned = checkpoint.autofactory.as_deref().or(intent.autofactory.as_deref());
+    let pinned = checkpoint
+        .autofactory
+        .as_deref()
+        .or(intent.autofactory.as_deref());
     if let Some(code) = pinned.filter(|code| !code.trim().is_empty()) {
         return devices
             .iter()
@@ -2327,7 +2374,10 @@ fn resolve_blueprint_factory(
             .cloned()
             .ok_or_else(|| format!("selected Autofactory {code} is not available"));
     }
-    let source_location = source.location.as_ref().map(|location| location.id.as_str());
+    let source_location = source
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str());
     devices
         .iter()
         .filter(|device| {
@@ -2338,10 +2388,9 @@ fn resolve_blueprint_factory(
         })
         .min_by_key(|factory| {
             let same_location = source_location.is_some_and(|source_location| {
-                factory
-                    .location
-                    .as_ref()
-                    .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(source_location))
+                factory.location.as_ref().is_some_and(|location| {
+                    location.id.as_str().eq_ignore_ascii_case(source_location)
+                })
             });
             (!same_location, factory.key.id.clone())
         })
@@ -2804,7 +2853,10 @@ mod tests {
             logistics_manifest_workflow_kind().as_str(),
             "logistics.manifest"
         );
-        assert_eq!(blueprint_acquire_workflow_kind().as_str(), "blueprint.acquire");
+        assert_eq!(
+            blueprint_acquire_workflow_kind().as_str(),
+            "blueprint.acquire"
+        );
         assert_eq!(exploration_workflow_kind().as_str(), "exploration.frontier");
         assert_eq!(event_delivery_workflow_kind().as_str(), "event.delivery");
         assert_eq!(event_tour_workflow_kind().as_str(), "event.tour");

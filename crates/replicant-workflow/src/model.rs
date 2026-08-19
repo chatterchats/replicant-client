@@ -226,7 +226,7 @@ pub struct FiniteExecution {
     pub operation_class: FiniteExecutionClass,
     /// Registered descriptor kind.
     pub kind: String,
-    /// Terminal execution status.
+    /// Current execution status.
     pub status: FiniteExecutionStatus,
     /// Start time in Unix milliseconds.
     pub started_at: i64,

@@ -3012,3 +3012,97 @@ h1 {
     max-width: none;
   }
 }
+
+/* Persistent notification controls and inbox badges/actions. */
+.sidebar nav button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.nav-unread-badge {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #41d4c8;
+  color: #062824;
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 18px;
+  text-align: center;
+}
+.message-bulk-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 6px 0 10px;
+}
+.message-bulk-actions .table-summary {
+  margin: 0;
+}
+.message-bulk-actions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.message-card-header {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+.message-select {
+  grid-column: 1;
+  grid-row: 1;
+  display: grid !important;
+  place-items: center;
+  min-width: 20px;
+}
+.message-card-title {
+  grid-column: 2;
+  grid-row: 1;
+}
+.message-card-badges {
+  grid-column: 3;
+  grid-row: 1;
+}
+.message-card-meta {
+  grid-column: 2 / -1;
+}
+.notification-center-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.notification-center-actions button {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+.notification-center li {
+  position: relative;
+}
+.notification-center li .notification-open {
+  padding-right: 42px;
+}
+.notification-center li .notification-dismiss {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 28px;
+  padding: 3px;
+  border: 0;
+  font-size: 1.05rem;
+  line-height: 1;
+  text-align: center;
+}
+.notification-center li.error .notification-open {
+  border-left-color: var(--danger);
+}
+.notification-center li.warning .notification-open {
+  border-left-color: var(--warning);
+}
+.notification-center li.info .notification-open {
+  border-left-color: var(--accent);
+}

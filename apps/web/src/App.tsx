@@ -58,6 +58,7 @@ import type {
   EventSummary,
   FiniteExecution,
   GalaxyStar,
+  Notification,
   SystemMarker,
   WorkflowStatus,
   WorkflowSummary,
@@ -106,6 +107,36 @@ const navigationCommands = [
   ...navigation.flatMap(([, items]) => items),
   "Settings",
 ];
+
+const NOTIFICATION_DISMISSALS_KEY = "replicant.notifications.dismissed.v1";
+const MESSAGE_BADGE_REFRESH_MS = 60_000;
+
+function loadDismissedNotificationIds(): Set<string> {
+  try {
+    const stored = window.localStorage.getItem(NOTIFICATION_DISMISSALS_KEY);
+    if (!stored) return new Set();
+    const parsed: unknown = JSON.parse(stored);
+    return Array.isArray(parsed)
+      ? new Set(
+          parsed.filter((value): value is string => typeof value === "string"),
+        )
+      : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function persistDismissedNotificationIds(ids: Set<string>) {
+  try {
+    window.localStorage.setItem(
+      NOTIFICATION_DISMISSALS_KEY,
+      JSON.stringify([...ids]),
+    );
+  } catch {
+    // Notification dismissal is a UI convenience; storage failure must never
+    // break the application shell.
+  }
+}
 const activeWorkflowStatuses: WorkflowStatus[] = [
   "queued",
   "running",
@@ -476,6 +507,10 @@ export function App() {
     null,
   );
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [dismissedNotificationIds, setDismissedNotificationIds] = useState(
+    loadDismissedNotificationIds,
+  );
+  const [unreadMessageCount, setUnreadMessageCount] = useState(0);
   const [activityTab, setActivityTab] = useState<"workflow" | "ami">(
     "workflow",
   );
@@ -498,7 +533,14 @@ export function App() {
   const entities = useEntities();
   const workflows = useWorkflows();
   const activity = useActivity();
-  const notifications = useNotifications();
+  const rawNotifications = useNotifications();
+  const notifications = useMemo(
+    () =>
+      rawNotifications.filter(
+        (notification) => !dismissedNotificationIds.has(notification.id),
+      ),
+    [dismissedNotificationIds, rawNotifications],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -510,6 +552,45 @@ export function App() {
       controller.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (revision === null) return;
+    setDismissedNotificationIds((current) => {
+      const activeIds = new Set(rawNotifications.map((item) => item.id));
+      const next = new Set([...current].filter((id) => activeIds.has(id)));
+      if (next.size === current.size) return current;
+      persistDismissedNotificationIds(next);
+      return next;
+    });
+  }, [rawNotifications, revision]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | undefined;
+    const syncUnread = async () => {
+      controller = new AbortController();
+      try {
+        const snapshot = await daemonApi.messages(controller.signal);
+        if (!cancelled && typeof snapshot.unread_count === "number")
+          setUnreadMessageCount(snapshot.unread_count);
+      } catch {
+        // The badge is supplemental. The Messages page will surface an error
+        // if the inbox itself cannot be refreshed.
+      } finally {
+        controller = undefined;
+        if (!cancelled)
+          timer = setTimeout(syncUnread, MESSAGE_BADGE_REFRESH_MS);
+      }
+    };
+    void syncUnread();
+    return () => {
+      cancelled = true;
+      controller?.abort();
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [connection]);
 
   // Page and selection are mirrored into the location hash so a refresh keeps
   // the current view and every page is linkable.
@@ -674,7 +755,15 @@ export function App() {
                     navigate(item);
                   }}
                 >
-                  {item}
+                  <span>{item}</span>
+                  {item === "Messages" && unreadMessageCount > 0 && (
+                    <span
+                      className="nav-unread-badge"
+                      aria-label={`${String(unreadMessageCount)} unread messages`}
+                    >
+                      {unreadMessageCount > 99 ? "99+" : unreadMessageCount}
+                    </span>
+                  )}
                 </button>
               ))}
             </section>
@@ -970,7 +1059,7 @@ export function App() {
             ) : shell.page === "Reports" ? (
               <ReportsPage entities={entities} onSelectEntity={select} />
             ) : shell.page === "Messages" ? (
-              <MessagesPage />
+              <MessagesPage onUnreadCountChange={setUnreadMessageCount} />
             ) : shell.page === "BobNet" ? (
               <BobNetPage onSelectEntity={select} />
             ) : shell.page === "Network" ? (
@@ -1228,8 +1317,18 @@ export function App() {
       ) : null}
 
       <NotificationToasts
+        notifications={notifications}
+        ready={revision !== null}
         onSelect={() => {
           setNotificationsOpen(true);
+        }}
+        onDismiss={(notification) => {
+          setDismissedNotificationIds((current) => {
+            const next = new Set(current);
+            next.add(notification.id);
+            persistDismissedNotificationIds(next);
+            return next;
+          });
         }}
       />
       {commandResult && (
@@ -1262,11 +1361,29 @@ export function App() {
       )}
       {notificationsOpen && (
         <NotificationCenter
+          notifications={notifications}
           onClose={() => {
             setNotificationsOpen(false);
           }}
           onSelect={() => {
             navigate("History");
+          }}
+          onDismiss={(notification: Notification) => {
+            setDismissedNotificationIds((current) => {
+              const next = new Set(current);
+              next.add(notification.id);
+              persistDismissedNotificationIds(next);
+              return next;
+            });
+          }}
+          onClearAll={() => {
+            setDismissedNotificationIds((current) => {
+              const next = new Set(current);
+              for (const notification of notifications)
+                next.add(notification.id);
+              persistDismissedNotificationIds(next);
+              return next;
+            });
           }}
         />
       )}

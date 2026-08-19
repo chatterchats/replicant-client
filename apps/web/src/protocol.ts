@@ -93,16 +93,9 @@ export type DirectorGoalStatus = "satisfied" | "active" | "blocked" | "waiting";
 export type DirectorRegionStatus =
   "discovered" | "establishing" | "established";
 export type DirectorRequirementKind =
-  | "blueprint"
-  | "logistics"
-  | "worker_capacity"
-  | "connectivity";
+  "blueprint" | "logistics" | "worker_capacity" | "connectivity";
 export type DirectorRequirementStatus =
-  | "pending"
-  | "active"
-  | "blocked"
-  | "satisfied"
-  | "unavailable";
+  "pending" | "active" | "blocked" | "satisfied" | "unavailable";
 
 export interface DirectorRequirementRequester {
   goal_id: string;
@@ -3591,43 +3584,42 @@ export function parseDirectorResponse(
           ),
         };
       }),
-      requirements: array(
-        item.requirements ?? [],
-        "Director requirements",
-      ).map((value) => {
-        const requirement = record(value, "Director requirement");
-        return {
-          id: requiredString(requirement.id, "requirement id"),
-          kind: oneOf(
-            requirement.kind,
-            directorRequirementKinds,
-            "requirement kind",
-          ),
-          status: oneOf(
-            requirement.status,
-            directorRequirementStatuses,
-            "requirement status",
-          ),
-          region: nullableString(requirement.region, "requirement region"),
-          target: requiredString(requirement.target, "requirement target"),
-          priority: number(requirement.priority, "requirement priority"),
-          requesters: array(
-            requirement.requesters,
-            "requirement requesters",
-          ).map((value) => {
-            const requester = record(value, "requirement requester");
-            return {
-              goal_id: requiredString(requester.goal_id, "requester goal"),
-              reason: requiredString(requester.reason, "requester reason"),
-              priority: number(requester.priority, "requester priority"),
-            };
-          }),
-          active_workflows: stringArray(
-            requirement.active_workflows ?? [],
-            "requirement workflows",
-          ),
-        };
-      }),
+      requirements: array(item.requirements ?? [], "Director requirements").map(
+        (value) => {
+          const requirement = record(value, "Director requirement");
+          return {
+            id: requiredString(requirement.id, "requirement id"),
+            kind: oneOf(
+              requirement.kind,
+              directorRequirementKinds,
+              "requirement kind",
+            ),
+            status: oneOf(
+              requirement.status,
+              directorRequirementStatuses,
+              "requirement status",
+            ),
+            region: nullableString(requirement.region, "requirement region"),
+            target: requiredString(requirement.target, "requirement target"),
+            priority: number(requirement.priority, "requirement priority"),
+            requesters: array(
+              requirement.requesters,
+              "requirement requesters",
+            ).map((value) => {
+              const requester = record(value, "requirement requester");
+              return {
+                goal_id: requiredString(requester.goal_id, "requester goal"),
+                reason: requiredString(requester.reason, "requester reason"),
+                priority: number(requester.priority, "requester priority"),
+              };
+            }),
+            active_workflows: stringArray(
+              requirement.active_workflows ?? [],
+              "requirement workflows",
+            ),
+          };
+        },
+      ),
       workforce: {
         total: number(workforce.total, "workforce total"),
         busy: number(workforce.busy, "workforce busy"),

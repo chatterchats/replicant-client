@@ -26,7 +26,9 @@ const FINITE_EXECUTION_SCHEMA: &str =
 const AUTOMATION_TRIGGER_SCHEMA: &str = include_str!("../migrations/0006_automation_triggers.sql");
 const AUTOMATION_POLICY_SCHEMA: &str = include_str!("../migrations/0007_automation_policy.sql");
 const RUNTIME_DOCUMENT_SCHEMA: &str = include_str!("../migrations/0008_runtime_documents.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 8;
+const FINITE_EXECUTION_RUNNING_SCHEMA: &str =
+    include_str!("../migrations/0009_finite_execution_running.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 9;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -246,6 +248,13 @@ impl WorkflowRepository {
             transaction.execute_batch(RUNTIME_DOCUMENT_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (8)",
+                [],
+            )?;
+        }
+        if found < 9 {
+            transaction.execute_batch(FINITE_EXECUTION_RUNNING_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (9)",
                 [],
             )?;
         }

@@ -317,6 +317,14 @@ export const daemonApi = {
   async messages(signal?: AbortSignal) {
     return parseMessagesResponse(await get("/api/messages", signal)).payload;
   },
+  async markMessagesRead(options: { ids?: number[]; markAll?: boolean }) {
+    return parseMessagesResponse(
+      await post("/api/messages/read", {
+        ids: options.ids ?? [],
+        mark_all: options.markAll ?? false,
+      }),
+    ).payload;
+  },
   async bobnet(
     options: { source?: string; includeNpcs?: boolean; cursor?: number } = {},
     signal?: AbortSignal,

@@ -2015,9 +2015,14 @@ async fn attempt(client: &Client, id: &OperationId) -> Result<()> {
             notify(client, id, OperationStatus::Rejected);
         }
         Ok(response) => {
-            // A response is not completion until a normalized authoritative
-            // observation satisfies this operation's evidence plan.
-            let next = if expects_evidence {
+            // Most mutations still require normalized target evidence after a
+            // successful HTTP response. The account inbox has no managed target
+            // projection to reconcile, and POST /v1/messages/read returns the
+            // authoritative result of that targetless mutation.
+            let response_completes = matches!(&adapter, MutationAdapter::MessagesMarkRead { .. });
+            let next = if response_completes {
+                OperationStatus::Completed
+            } else if expects_evidence {
                 OperationStatus::AwaitingEvidence
             } else {
                 OperationStatus::ReconciliationRequired
@@ -2414,6 +2419,36 @@ mod tests {
 
         client.close().await.expect("close");
         server.verify().await; // panics if the mock was not hit exactly once
+    }
+
+    #[tokio::test]
+    async fn message_mark_read_completes_from_its_authoritative_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/read"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+
+        let operation = client
+            .messages()
+            .mark_read(raw::messages::MessagesReadRequest {
+                ids: Some(vec![1, 2]),
+                mark_all: None,
+            })
+            .await
+            .expect("message read operation created");
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::Completed
+        );
+
+        client.close().await.expect("close");
+        server.verify().await;
     }
 
     #[tokio::test]

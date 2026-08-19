@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { daemonApi } from "./api";
 import { type DomainQueryStatus, useDomainQuery } from "./domainQuery";
@@ -39,12 +39,22 @@ export function filterInboxMessages(
     );
 }
 
-export function MessagesPage() {
+export function MessagesPage({
+  onUnreadCountChange,
+}: {
+  onUnreadCountChange?: (count: number) => void;
+} = {}) {
   const query = useDomainQuery({
     fetcher: (signal) => daemonApi.messages(signal),
     isEmpty: empty,
   });
-  return <MessagesContent {...query} />;
+  useEffect(() => {
+    if (typeof query.data?.unread_count === "number")
+      onUnreadCountChange?.(query.data.unread_count);
+  }, [onUnreadCountChange, query.data?.unread_count]);
+  return (
+    <MessagesContent {...query} onUnreadCountChange={onUnreadCountChange} />
+  );
 }
 
 export function MessagesContent({
@@ -53,16 +63,21 @@ export function MessagesContent({
   error,
   refreshing,
   refresh,
+  onUnreadCountChange,
 }: {
   data?: MessagesSnapshot;
   status: DomainQueryStatus;
   error: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
+  onUnreadCountChange?: (count: number) => void;
 }) {
   const [search, setSearch] = useState("");
   const [messageType, setMessageType] = useState("");
   const [unreadOnly, setUnreadOnly] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [markingRead, setMarkingRead] = useState(false);
+  const [markReadError, setMarkReadError] = useState<string | null>(null);
   const messageTypes = useMemo(
     () =>
       [
@@ -79,6 +94,41 @@ export function MessagesContent({
       filterInboxMessages(data?.inbox ?? [], search, messageType, unreadOnly),
     [data?.inbox, messageType, search, unreadOnly],
   );
+
+  useEffect(() => {
+    const unreadIds = new Set(
+      (data?.inbox ?? [])
+        .filter((message) => message.is_read === false && message.id !== null)
+        .map((message) => message.id as number),
+    );
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => unreadIds.has(id)));
+      if (
+        next.size === current.size &&
+        [...next].every((id) => current.has(id))
+      )
+        return current;
+      return next;
+    });
+  }, [data?.inbox]);
+
+  const markRead = async (markAll: boolean) => {
+    const ids = markAll ? [] : [...selectedIds];
+    if (!markAll && ids.length === 0) return;
+    setMarkingRead(true);
+    setMarkReadError(null);
+    try {
+      const updated = await daemonApi.markMessagesRead({ ids, markAll });
+      if (typeof updated.unread_count === "number")
+        onUnreadCountChange?.(updated.unread_count);
+      setSelectedIds(new Set());
+      await refresh();
+    } catch (markError: unknown) {
+      setMarkReadError(String(markError));
+    } finally {
+      setMarkingRead(false);
+    }
+  };
 
   if (!data && status === "loading")
     return <article className="page loading-state">Loading Messages…</article>;
@@ -105,6 +155,9 @@ export function MessagesContent({
         </button>
       </header>
       {error && <p className="inline-warning">Refresh failed: {error}</p>}
+      {markReadError && (
+        <p className="inline-warning">Mark read failed: {markReadError}</p>
+      )}
       <section>
         <h2>Account inbox</h2>
         <div className="message-filters">
@@ -146,16 +199,55 @@ export function MessagesContent({
             Unread only
           </label>
         </div>
-        <p className="table-summary">
-          {filteredInbox.length} shown
-          {typeof data?.unread_count === "number" &&
-            ` · ${String(data.unread_count)} unread`}
-        </p>
+        <div className="message-bulk-actions">
+          <p className="table-summary">
+            {filteredInbox.length} shown
+            {typeof data?.unread_count === "number" &&
+              ` · ${String(data.unread_count)} unread`}
+            {selectedIds.size > 0 && ` · ${String(selectedIds.size)} selected`}
+          </p>
+          <div>
+            <button
+              disabled={markingRead || selectedIds.size === 0}
+              onClick={() => void markRead(false)}
+            >
+              Mark selected read
+            </button>
+            <button
+              disabled={
+                markingRead ||
+                (typeof data?.unread_count === "number" &&
+                  data.unread_count === 0)
+              }
+              onClick={() => void markRead(true)}
+            >
+              Mark all as read
+            </button>
+          </div>
+        </div>
         {filteredInbox.length ? (
           <div className="message-list">
             {filteredInbox.map((message, index) => (
               <article key={message.id ?? index}>
                 <header className="message-card-header">
+                  {message.id !== null && message.is_read === false && (
+                    <label className="message-select">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${message.title ?? message.message_type ?? `message ${String(message.id)}`}`}
+                        checked={selectedIds.has(message.id)}
+                        onChange={(event) => {
+                          setSelectedIds((current) => {
+                            const next = new Set(current);
+                            if (event.target.checked)
+                              next.add(message.id as number);
+                            else next.delete(message.id as number);
+                            return next;
+                          });
+                        }}
+                      />
+                    </label>
+                  )}
                   <strong className="message-card-title">
                     {message.title ?? message.message_type ?? "Message"}
                   </strong>

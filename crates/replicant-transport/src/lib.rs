@@ -415,7 +415,11 @@ fn validate_request(request: &DeliveryRequest) -> Result<()> {
             "device quantities must be positive".into(),
         ));
     }
-    if request.device_codes.iter().any(|code| code.trim().is_empty()) {
+    if request
+        .device_codes
+        .iter()
+        .any(|code| code.trim().is_empty())
+    {
         return Err(TransportError::Invalid(
             "device codes cannot be empty".into(),
         ));
@@ -582,7 +586,9 @@ fn select_payload_devices(
             .location
             .as_ref()
             .map(|item| item.id.as_str().to_owned())
-            .ok_or_else(|| TransportError::Invalid(format!("payload device {code} has no location")))?;
+            .ok_or_else(|| {
+                TransportError::Invalid(format!("payload device {code} has no location"))
+            })?;
         if !scope_matches(origin, &location) {
             return Err(TransportError::Invalid(format!(
                 "payload device {code} is at {location}, outside origin scope {origin}"
@@ -1968,8 +1974,9 @@ mod tests {
             payload_device("D", "SCEPTURUM-BELT-1", &["other"]),
         ];
 
-        let selected = select_payload_devices("SCEPTURUM", &[], &[], &["twaffy-obj-1".into()], &devices)
-            .expect("tag selection");
+        let selected =
+            select_payload_devices("SCEPTURUM", &[], &[], &["twaffy-obj-1".into()], &devices)
+                .expect("tag selection");
         let codes = selected
             .iter()
             .map(|device| device.code.as_str())
@@ -1985,14 +1992,9 @@ mod tests {
             payload_device("B", "SCEPTURUM-BELT-1", &[]),
         ];
 
-        let selected = select_payload_devices(
-            "SCEPTURUM-BELT-1",
-            &["B".into()],
-            &[],
-            &[],
-            &devices,
-        )
-        .expect("exact device selection");
+        let selected =
+            select_payload_devices("SCEPTURUM-BELT-1", &["B".into()], &[], &[], &devices)
+                .expect("exact device selection");
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].code, "B");

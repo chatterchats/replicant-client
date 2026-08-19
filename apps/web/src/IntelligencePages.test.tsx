@@ -105,6 +105,9 @@ describe("Intelligence pages", () => {
       <MessagesContent {...common} data={data} />,
     );
     expect(html).toContain("Signal received");
+    expect(html).toContain("Mark selected read");
+    expect(html).toContain("Mark all as read");
+    expect(html).toContain("Select Notice");
     expect(html).not.toContain("Relay history");
   });
 

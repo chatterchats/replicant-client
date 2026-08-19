@@ -292,12 +292,19 @@ fn device(
         upkeep_requirements: raw
             .upkeep_requirements
             .iter()
-            .map(|value| value.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+            .map(|value| {
+                value
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
             .collect(),
-        system_status: raw
-            .system_status
-            .as_ref()
-            .map(|value| value.iter().map(|(key, value)| (key.clone(), value.clone())).collect()),
+        system_status: raw.system_status.as_ref().map(|value| {
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
         active_directive: active_device_directive(raw),
         travel: travel_state(&raw.travel, &realm),
         access,
@@ -311,7 +318,11 @@ fn device(
 /// future API change does not silently discard evidence.
 pub fn blueprint(raw: &raw::blueprints::Blueprint) -> Result<Blueprint, NormalizeError> {
     let device_type = required(raw.device_type.as_ref(), "device_type")?;
-    let mut unknown = raw.extra.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    let mut unknown = raw
+        .extra
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
 
     fn quantities(
         raw: Option<&raw::JsonObject>,
