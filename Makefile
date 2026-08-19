@@ -149,7 +149,7 @@ docker-up:
 docker-down:
 	$(DOCKER_COMPOSE) down
 
-docker-rebuild-deploy: docker-down docker-build docker-up
+docker-rebuild-deploy: docker-build docker-down docker-up
 
 docker-restart: docker-down docker-up
 
