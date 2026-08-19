@@ -347,6 +347,51 @@ pub async fn validate_resource_pickups(client: &Client, plan: &DeliveryPlan) -> 
     Ok(())
 }
 
+
+async fn validate_resource_manifest_at_location(
+    client: &Client,
+    location: &str,
+    manifest: &ResourceMap,
+) -> Result<()> {
+    if manifest.is_empty() {
+        return Ok(());
+    }
+    let (inventories, _) = client
+        .inventory()
+        .list(&raw::inventory::AccountInventoryQuery {
+            location: Some(location.to_owned()),
+            cursor: None,
+            limit: Some(50),
+        })
+        .await?;
+    let mut available = ResourceMap::new();
+    for inventory in inventories {
+        let replicant_client::domain::InventoryOwner::Location(owner) = inventory.owner else {
+            continue;
+        };
+        if !owner.id.as_str().eq_ignore_ascii_case(location) {
+            continue;
+        }
+        for item in inventory.items {
+            *available
+                .entry(item.resource.to_ascii_lowercase())
+                .or_default() += item.quantity.max(0);
+        }
+    }
+    for (resource, required) in manifest {
+        let present = available
+            .get(&resource.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_default();
+        if present < *required {
+            return Err(TransportError::NotFound(format!(
+                "planned resource pickup at {location} is stale: need {required} {resource}, have {present}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Executes a concrete plan and optionally returns the transport devices.
 pub async fn execute_delivery(
     client: &Client,
@@ -1073,7 +1118,7 @@ async fn run_cargo_trips(
             manifest = %format_resources(&manifest),
             "delivering resource manifest"
         );
-        collect_resources(client, code, &manifest, options).await?;
+        collect_resources(client, code, origin, &manifest, options).await?;
         ensure_device_at(client, code, destination, options).await?;
         deposit_resources(client, code, Some(&manifest), options).await?;
         merge_resources(&mut lock(delivered), &manifest);
@@ -1629,12 +1674,14 @@ async fn unfurl_modular_devices(
 async fn collect_resources(
     client: &Client,
     code: &str,
+    location: &str,
     resources: &ResourceMap,
     options: DeliveryOptions,
 ) -> Result<()> {
     if resources.is_empty() {
         return Ok(());
     }
+    validate_resource_manifest_at_location(client, location, resources).await?;
     let before = cargo_map(&client.raw().devices().get(code).await?.value);
     let operation = client
         .devices()
@@ -1644,7 +1691,7 @@ async fn collect_resources(
             resources: resource_json(resources),
         })
         .await?;
-    ensure_operation_accepted(&operation).await?;
+    ensure_resource_collect_accepted(&operation, location).await?;
     wait_for_raw_device(client, code, Some(&operation), options, |device| {
         let cargo = cargo_map(device);
         resources.iter().all(|(resource, quantity)| {
@@ -1735,6 +1782,28 @@ async fn wait_for_raw_device(
 /// command for the full timeout.) Physical effects are verified separately by
 /// the device-state waits, which also abort early if the operation is
 /// rejected after this check.
+async fn ensure_resource_collect_accepted(
+    operation: &Operation,
+    location: &str,
+) -> Result<()> {
+    let outcome = operation.outcome().await?;
+    if !operation_rejected(outcome.status) {
+        return Ok(());
+    }
+    let error = format!(
+        "operation {} ended as {:?}: {:?}",
+        operation.id().as_str(),
+        outcome.status,
+        outcome.response
+    );
+    if error.contains("Insufficient ") && error.contains(" at location: need ") {
+        return Err(TransportError::NotFound(format!(
+            "planned resource pickup at {location} became stale during collection: {error}"
+        )));
+    }
+    Err(TransportError::Operation(error))
+}
+
 async fn ensure_operation_accepted(operation: &Operation) -> Result<()> {
     let outcome = operation.outcome().await?;
     if operation_rejected(outcome.status) {

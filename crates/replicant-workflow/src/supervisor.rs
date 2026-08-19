@@ -17,6 +17,12 @@ use crate::{
     WorkflowStatus,
 };
 
+
+// Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
+// polling/reconciliation waits. Throttle them so the supervisor cannot hot-loop
+// a finished executor several times per second while its prerequisite is unchanged.
+const POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Boxed future returned by a workflow executor.
 pub type BoxWorkflowFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
@@ -494,6 +500,12 @@ impl WorkflowSupervisor {
             if self.tasks.contains_key(&instance.id) {
                 continue;
             }
+            if instance.status == WorkflowStatus::Waiting
+                && instance.wait_intent()?.is_none()
+                && !polling_wait_retry_due(&instance)
+            {
+                continue;
+            }
             let instance = if matches!(
                 instance.status,
                 WorkflowStatus::Running | WorkflowStatus::Waiting
@@ -769,6 +781,14 @@ impl WorkflowSupervisor {
         }
         Ok(())
     }
+}
+
+fn polling_wait_retry_due(instance: &WorkflowInstance) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u128::MAX, |duration| duration.as_millis());
+    let updated_at = u128::try_from(instance.updated_at).unwrap_or_default();
+    now.saturating_sub(updated_at) >= POLLING_WAIT_RETRY_INTERVAL.as_millis()
 }
 
 fn deadline_delay(deadline: Option<i64>) -> Result<Duration, WorkflowWaitError> {

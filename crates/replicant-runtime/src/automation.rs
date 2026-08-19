@@ -26,8 +26,9 @@ use replicant_transport::{
     execute_delivery, plan_delivery, validate_resource_pickups,
 };
 use replicant_workflow::{
-    BoxWorkflowFuture, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowContext,
-    WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry, WorkflowStatus,
+    BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError, RepositoryError,
+    ResourceKey, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
+    WorkflowRegistry, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -866,9 +867,20 @@ impl WorkflowExecutor for ScanTourWorkflow {
             context
                 .persist_checkpoint(&checkpoint)
                 .map_err(string_error)?;
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
-            claim_device(context, &vessel)?;
-            claim_target(context, "survey-tour", &intent.center)?;
+            if let Some(owner) =
+                reserve_scan_tour_scope(context, &intent, &replicant, &vessel)?
+            {
+                context
+                    .advance_to("waiting_for_scan_claims", &checkpoint)
+                    .map_err(string_error)?;
+                context
+                    .emit_activity(format!(
+                        "survey assignment is temporarily reserved by workflow {owner}; waiting to retry"
+                    ))
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
 
             if !ensure_scan_tour_fleet_capacity(
                 context,
@@ -2444,6 +2456,71 @@ fn claim_target(context: &WorkflowContext, namespace: &str, key: &str) -> Result
             key: key.to_owned(),
         },
     )
+}
+
+
+fn scan_tour_target_claims(intent: &ScanTourIntent) -> Vec<ResourceKey> {
+    match intent.target_systems.as_ref().filter(|targets| !targets.is_empty()) {
+        Some(targets) => targets
+            .iter()
+            .map(|system| system.trim().to_ascii_uppercase())
+            .filter(|system| !system.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|system| ResourceKey::Namespaced {
+                namespace: "survey-system".to_owned(),
+                key: system,
+            })
+            .collect(),
+        None => vec![ResourceKey::Namespaced {
+            namespace: "survey-tour".to_owned(),
+            key: intent.center.trim().to_ascii_uppercase(),
+        }],
+    }
+}
+
+
+fn reserve_scan_tour_scope(
+    context: &WorkflowContext,
+    intent: &ScanTourIntent,
+    replicant: &str,
+    vessel: &str,
+) -> Result<Option<WorkflowId>, String> {
+    if intent
+        .target_systems
+        .as_ref()
+        .is_some_and(|targets| !targets.is_empty())
+    {
+        let legacy_center = ResourceKey::Namespaced {
+            namespace: "survey-tour".to_owned(),
+            key: intent.center.trim().to_ascii_uppercase(),
+        };
+        context
+            .release_claim(&legacy_center)
+            .map_err(string_error)?;
+    }
+
+    let mut resources = vec![
+        ResourceKey::Replicant(replicant.to_owned()),
+        ResourceKey::Device(vessel.to_owned()),
+    ];
+    resources.extend(scan_tour_target_claims(intent));
+
+    let mut newly_acquired = Vec::new();
+    for resource in resources {
+        match context.acquire_claim(resource.clone()) {
+            Ok(ClaimAcquireOutcome::Acquired(_)) => newly_acquired.push(resource),
+            Ok(ClaimAcquireOutcome::AlreadyOwned(_)) => {}
+            Err(RepositoryError::ClaimConflict { owner, .. }) => {
+                for acquired in &newly_acquired {
+                    context.release_claim(acquired).map_err(string_error)?;
+                }
+                return Ok(Some(owner));
+            }
+            Err(error) => return Err(string_error(error)),
+        }
+    }
+    Ok(None)
 }
 
 async fn refresh_owned_devices(client: &Client) -> Result<Vec<Device>, String> {
@@ -4165,6 +4242,48 @@ mod tests {
         );
 
         assert!(scan_tour_fleet_print_requests(1, 3).is_empty());
+    }
+
+    #[test]
+    fn scan_tour_claims_exact_targets_for_sharded_routes() {
+        let intent = ScanTourIntent {
+            center: "SCEPTURUM".to_owned(),
+            radius_ly: 20.0,
+            system_limit: 10,
+            target_systems: Some(vec![
+                " beta-two ".to_owned(),
+                "BETA-ONE".to_owned(),
+                "beta-one".to_owned(),
+            ]),
+            replicant: None,
+            vessel: None,
+            include_explored: false,
+        };
+        assert_eq!(
+            scan_tour_target_claims(&intent),
+            vec![
+                ResourceKey::Namespaced {
+                    namespace: "survey-system".to_owned(),
+                    key: "BETA-ONE".to_owned(),
+                },
+                ResourceKey::Namespaced {
+                    namespace: "survey-system".to_owned(),
+                    key: "BETA-TWO".to_owned(),
+                },
+            ]
+        );
+
+        let unbounded = ScanTourIntent {
+            target_systems: None,
+            ..intent
+        };
+        assert_eq!(
+            scan_tour_target_claims(&unbounded),
+            vec![ResourceKey::Namespaced {
+                namespace: "survey-tour".to_owned(),
+                key: "SCEPTURUM".to_owned(),
+            }]
+        );
     }
 
     #[test]

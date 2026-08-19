@@ -475,6 +475,88 @@ async fn records_executor_panics_as_failures() {
     );
 }
 
+struct PollingWaitingFactory {
+    kind: WorkflowKind,
+    executions: Arc<AtomicUsize>,
+}
+
+impl WorkflowFactory for PollingWaitingFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(PollingWaitingWorkflow {
+            executions: self.executions.clone(),
+        }))
+    }
+}
+
+struct PollingWaitingWorkflow {
+    executions: Arc<AtomicUsize>,
+}
+
+impl WorkflowExecutor for PollingWaitingWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            context.mark_waiting().map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[tokio::test]
+async fn polling_wait_is_not_restarted_on_every_supervisor_tick() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.polling-wait").expect("valid kind");
+    let workflow = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: (),
+            checkpoint: (),
+            current_step: Some("waiting".into()),
+            parent_id: None,
+        })
+        .expect("create workflow");
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(PollingWaitingFactory {
+            kind,
+            executions: executions.clone(),
+        }))
+        .expect("register workflow");
+    let mut supervisor =
+        WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+
+    wait_for_status(
+        &mut supervisor,
+        &repository,
+        workflow.id,
+        WorkflowStatus::Waiting,
+    )
+    .await;
+    for _ in 0..5 {
+        supervisor.tick().await.expect("reap or retry waiting workflow");
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repository
+            .read(workflow.id)
+            .expect("read workflow")
+            .unwrap()
+            .status,
+        WorkflowStatus::Waiting
+    );
+}
+
 struct WaitingFactory {
     kind: WorkflowKind,
     satisfied: Arc<std::sync::atomic::AtomicBool>,
