@@ -147,6 +147,8 @@ docker-up:
 docker-down:
 	$(DOCKER_COMPOSE) down
 
+docker-rebuild-deploy: docker-down docker-build docker-up
+
 # Probes go through the web container, which injects the daemon credential,
 # so no token is needed here even though the daemon requires one.
 docker-smoke: docker-check
