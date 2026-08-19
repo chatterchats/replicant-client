@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Location, Replicant, Star,
     domain::{GalacticPosition, Inventory, InventoryOwner},
@@ -34,17 +35,18 @@ use serde_json::Value;
 use crate::{
     ApplicationError,
     automation::{
-        BlueprintAcquireIntent, EventCampaignIntent, LogisticsManifestIntent, MiningCampaignIntent,
-        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
-        blueprint_acquire_workflow_kind, new_blueprint_acquire_workflow,
-        new_event_campaign_workflow, new_logistics_manifest_workflow, new_mining_campaign_workflow,
-        new_observatory_workflow, new_region_establish_workflow, new_replicant_provision_workflow,
-        new_scan_tour_workflow,
+        BlueprintAcquireIntent, BlueprintShopPurchaseIntent, EventCampaignIntent,
+        LogisticsManifestIntent, MiningCampaignIntent, ObservatoryIntent, RegionEstablishIntent,
+        ReplicantProvisionIntent, ScanTourIntent, blueprint_acquire_workflow_kind,
+        new_blueprint_acquire_workflow, new_event_campaign_workflow,
+        new_logistics_manifest_workflow, new_mining_campaign_workflow, new_observatory_workflow,
+        new_region_establish_workflow, new_replicant_provision_workflow, new_scan_tour_workflow,
     },
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
     },
     event::active_events,
+    trade::{TradeBundle, TraderSummary, shop_trades, trader_directory},
 };
 
 const SETTINGS_NS: &str = "director.settings";
@@ -54,6 +56,7 @@ const GOAL_RUNTIME_NS: &str = "director.goal_runtime";
 const REPLICANT_NS: &str = "director.replicant";
 const WORKFORCE_NS: &str = "director.workforce";
 const SNAPSHOT_NS: &str = "director.snapshot";
+const BLUEPRINT_SHOP_NS: &str = "director.blueprint_shop_opportunity";
 const SNAPSHOT_KEY: &str = "latest";
 
 const DEFAULT_HOLD_MS: i64 = 30 * 60 * 1000;
@@ -70,6 +73,8 @@ const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // directly reach at least one known star inside the region.
 const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
 const EVENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
+const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
 
 const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
@@ -166,6 +171,44 @@ struct HubSupplySource {
     description: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BlueprintShopOpportunity {
+    device_type: String,
+    controller_code: String,
+    trade_code: String,
+    current_stock: i64,
+    criteria: TradeBundle,
+    shop_location: String,
+    shop_system: String,
+    shop_name: Option<String>,
+    last_seen_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlueprintShopSnapshot {
+    opportunities: Vec<BlueprintShopOpportunity>,
+    directory_errors: usize,
+    trade_errors: usize,
+    hidden_or_unlocated: usize,
+}
+
+#[derive(Clone, Debug)]
+enum BlueprintAcquisitionSelection {
+    Owned {
+        device_type: DeviceType,
+        source_code: String,
+        factory_code: String,
+        preferred_region: Option<String>,
+    },
+    Shop {
+        device_type: DeviceType,
+        opportunity: Box<BlueprintShopOpportunity>,
+        factory_code: String,
+        replicant_code: String,
+        preferred_region: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct StockLocation {
     location: String,
@@ -181,6 +224,16 @@ struct GoalReconcileContext<'a> {
     controls: &'a BTreeMap<DirectorGoalKind, bool>,
     automatic: bool,
     now: i64,
+}
+
+struct BlueprintReconcileContext<'a> {
+    devices: &'a [Device],
+    workers: &'a [WorkerView],
+    reserved_workers: &'a mut BTreeSet<String>,
+    unlocked_blueprints: Option<&'a BTreeSet<DeviceType>>,
+    shop_snapshot: &'a BlueprintShopSnapshot,
+    location_systems: &'a BTreeMap<String, String>,
+    system_regions: &'a BTreeMap<String, String>,
 }
 
 /// Returns the current Director settings, creating defaults lazily when absent.
@@ -495,6 +548,12 @@ pub async fn reconcile_director(
     let observatory_blueprint_known = unlocked_blueprints
         .as_ref()
         .map(|blueprints| blueprints.contains(&DeviceType::GalacticObservatory));
+    let blueprint_shop_snapshot =
+        if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition) {
+            snapshot_blueprint_shop_opportunities(client, &replicants, &repository, now).await
+        } else {
+            BlueprintShopSnapshot::default()
+        };
     let mut goals = Vec::new();
     let mut reserved_workers = BTreeSet::new();
     let automatic = settings.mode == DirectorMode::Automatic && allow_launch;
@@ -653,12 +712,18 @@ pub async fn reconcile_director(
         ));
     }
 
+    let mut blueprint_context = BlueprintReconcileContext {
+        devices: &devices,
+        workers: &workers,
+        reserved_workers: &mut reserved_workers,
+        unlocked_blueprints: unlocked_blueprints.as_ref(),
+        shop_snapshot: &blueprint_shop_snapshot,
+        location_systems: &location_systems,
+        system_regions: &system_regions,
+    };
     goals.push(reconcile_blueprint_acquisition(
         &goal_context,
-        &devices,
-        unlocked_blueprints.as_ref(),
-        &location_systems,
-        &system_regions,
+        &mut blueprint_context,
         &mut requirements,
     )?);
 
@@ -998,14 +1063,254 @@ fn reconcile_expand_star_catalogue(
     })
 }
 
+async fn snapshot_blueprint_shop_opportunities(
+    client: &Client,
+    replicants: &[Replicant],
+    repository: &WorkflowRepository,
+    now: i64,
+) -> BlueprintShopSnapshot {
+    let started = Instant::now();
+    tracing::info!(
+        event = "director.blueprint.snapshot_started",
+        viewers = replicants.len(),
+        "Director collecting one account-wide blueprint shop snapshot"
+    );
+    let viewer_codes = replicants
+        .iter()
+        .map(|replicant| replicant.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let directory_results = stream::iter(viewer_codes.into_iter().map(|code| {
+        let client = client.clone();
+        async move {
+            let result =
+                tokio::time::timeout(BLUEPRINT_SHOP_TIMEOUT, trader_directory(&client, &code))
+                    .await;
+            (code, result)
+        }
+    }))
+    .buffer_unordered(BLUEPRINT_SHOP_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut snapshot = BlueprintShopSnapshot::default();
+    let mut traders = BTreeMap::<String, TraderSummary>::new();
+    for (viewer, result) in directory_results {
+        let directory = match result {
+            Ok(Ok(directory)) => directory,
+            Ok(Err(error)) => {
+                snapshot.directory_errors += 1;
+                tracing::warn!(
+                    event = "director.blueprint.directory_failed",
+                    viewer = %viewer,
+                    error = %error,
+                    "Director could not inspect one trade directory"
+                );
+                continue;
+            }
+            Err(_) => {
+                snapshot.directory_errors += 1;
+                tracing::warn!(
+                    event = "director.blueprint.directory_failed",
+                    viewer = %viewer,
+                    timeout_ms = BLUEPRINT_SHOP_TIMEOUT.as_millis(),
+                    "Director trade-directory inspection timed out"
+                );
+                continue;
+            }
+        };
+        for trader in directory {
+            traders
+                .entry(trader.controller_code.clone())
+                .and_modify(|existing| {
+                    if existing.location.is_none() && trader.location.is_some() {
+                        *existing = trader.clone();
+                    }
+                })
+                .or_insert(trader);
+        }
+    }
+
+    let inspectable = traders
+        .into_values()
+        .filter_map(|trader| {
+            let Some(location) = trader.location.clone() else {
+                snapshot.hidden_or_unlocated += 1;
+                return None;
+            };
+            let system = trader
+                .star
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| location.split('-').next().map(str::to_owned));
+            let Some(system) = system.filter(|value| !value.trim().is_empty()) else {
+                snapshot.hidden_or_unlocated += 1;
+                return None;
+            };
+            Some((trader, location, system))
+        })
+        .collect::<Vec<_>>();
+
+    let trade_results = stream::iter(inspectable.into_iter().map(|(trader, location, system)| {
+        let client = client.clone();
+        async move {
+            let result = tokio::time::timeout(
+                BLUEPRINT_SHOP_TIMEOUT,
+                shop_trades(&client, &trader.controller_code),
+            )
+            .await;
+            (trader, location, system, result)
+        }
+    }))
+    .buffer_unordered(BLUEPRINT_SHOP_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (trader, location, system, result) in trade_results {
+        let trades = match result {
+            Ok(Ok(trades)) => trades,
+            Ok(Err(error)) => {
+                snapshot.trade_errors += 1;
+                tracing::warn!(
+                    event = "director.blueprint.shop_failed",
+                    controller = %trader.controller_code,
+                    error = %error,
+                    "Director could not inspect one shop's live trades"
+                );
+                continue;
+            }
+            Err(_) => {
+                snapshot.trade_errors += 1;
+                tracing::warn!(
+                    event = "director.blueprint.shop_failed",
+                    controller = %trader.controller_code,
+                    timeout_ms = BLUEPRINT_SHOP_TIMEOUT.as_millis(),
+                    "Director shop inspection timed out"
+                );
+                continue;
+            }
+        };
+        for trade in trades.into_iter().filter(|trade| {
+            !trade.trade_code.is_empty() && trade.current_stock.unwrap_or_default() > 0
+        }) {
+            let rewards = trade.rewards_bundle();
+            let criteria = trade.criteria_bundle();
+            for (device_type, quantity) in rewards.devices {
+                if quantity <= 0 {
+                    continue;
+                }
+                let opportunity = BlueprintShopOpportunity {
+                    device_type: device_type.clone(),
+                    controller_code: trader.controller_code.clone(),
+                    trade_code: trade.trade_code.clone(),
+                    current_stock: trade.current_stock.unwrap_or_default(),
+                    criteria: criteria.clone(),
+                    shop_location: location.clone(),
+                    shop_system: system.clone(),
+                    shop_name: trader.shop_name.clone(),
+                    last_seen_at_ms: now,
+                };
+                let key = format!(
+                    "{}:{}:{}",
+                    opportunity.controller_code, opportunity.trade_code, device_type
+                );
+                if let Err(error) = repository.put_document(BLUEPRINT_SHOP_NS, &key, &opportunity) {
+                    tracing::warn!(
+                        event = "director.blueprint.opportunity_persist_failed",
+                        opportunity = %key,
+                        error = %error,
+                        "Director could not persist blueprint shop opportunity"
+                    );
+                }
+                tracing::debug!(
+                    event = "director.blueprint.opportunity",
+                    device_type = %opportunity.device_type,
+                    controller = %opportunity.controller_code,
+                    trade = %opportunity.trade_code,
+                    stock = opportunity.current_stock,
+                    shop_location = %opportunity.shop_location,
+                    "Director observed a stocked blueprint acquisition opportunity"
+                );
+                snapshot.opportunities.push(opportunity);
+            }
+        }
+    }
+    snapshot.opportunities.sort_by(|left, right| {
+        left.device_type
+            .cmp(&right.device_type)
+            .then_with(|| left.current_stock.cmp(&right.current_stock))
+            .then_with(|| right.last_seen_at_ms.cmp(&left.last_seen_at_ms))
+            .then_with(|| left.controller_code.cmp(&right.controller_code))
+            .then_with(|| left.trade_code.cmp(&right.trade_code))
+    });
+    tracing::info!(
+        event = "director.blueprint.snapshot_completed",
+        opportunities = snapshot.opportunities.len(),
+        directory_errors = snapshot.directory_errors,
+        trade_errors = snapshot.trade_errors,
+        hidden_or_unlocated = snapshot.hidden_or_unlocated,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Director blueprint shop snapshot complete"
+    );
+    snapshot
+}
+
+fn shop_opportunities_for<'a>(
+    snapshot: &'a BlueprintShopSnapshot,
+    device_type: &DeviceType,
+) -> impl Iterator<Item = &'a BlueprintShopOpportunity> {
+    snapshot.opportunities.iter().filter(move |opportunity| {
+        opportunity
+            .device_type
+            .eq_ignore_ascii_case(device_type.as_str())
+            && opportunity.current_stock > 0
+    })
+}
+
+fn blueprint_shop_dependency_cycle(
+    snapshot: &BlueprintShopSnapshot,
+    target: &str,
+    criterion: &str,
+) -> bool {
+    if target.eq_ignore_ascii_case(criterion) {
+        return true;
+    }
+    let mut pending = vec![criterion.to_ascii_lowercase()];
+    let mut visited = BTreeSet::new();
+    let target = target.to_ascii_lowercase();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        for opportunity in snapshot
+            .opportunities
+            .iter()
+            .filter(|opportunity| opportunity.device_type.eq_ignore_ascii_case(&current))
+        {
+            for dependency in opportunity.criteria.devices.keys() {
+                let dependency = dependency.to_ascii_lowercase();
+                if dependency == target {
+                    return true;
+                }
+                if !visited.contains(&dependency) {
+                    pending.push(dependency);
+                }
+            }
+        }
+    }
+    false
+}
+
 fn reconcile_blueprint_acquisition(
     context: &GoalReconcileContext<'_>,
-    devices: &[Device],
-    unlocked_blueprints: Option<&BTreeSet<DeviceType>>,
-    location_systems: &BTreeMap<String, String>,
-    system_regions: &BTreeMap<String, String>,
+    blueprint: &mut BlueprintReconcileContext<'_>,
     requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
+    let devices = blueprint.devices;
+    let workers = blueprint.workers;
+    let unlocked_blueprints = blueprint.unlocked_blueprints;
+    let shop_snapshot = blueprint.shop_snapshot;
+    let location_systems = blueprint.location_systems;
+    let system_regions = blueprint.system_regions;
     let kind = DirectorGoalKind::BlueprintAcquisition;
     let enabled = goal_enabled(context.controls, kind);
     let id = goal_instance_id(kind, None);
@@ -1027,7 +1332,7 @@ fn reconcile_blueprint_acquisition(
             kind,
             region: None,
             status: DirectorGoalStatus::Waiting,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
                 .to_owned(),
             blocker: None,
             next_action: Some("Enable this standing goal to acquire missing blueprints".to_owned()),
@@ -1045,7 +1350,7 @@ fn reconcile_blueprint_acquisition(
             kind,
             region: None,
             status: DirectorGoalStatus::Blocked,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
                 .to_owned(),
             blocker: Some("Managed blueprint catalogue could not be refreshed".to_owned()),
             next_action: Some(
@@ -1070,6 +1375,12 @@ fn reconcile_blueprint_acquisition(
             .keys()
             .map(|device_type| DeviceType::from(device_type.as_str())),
     );
+    tracked_types.extend(
+        shop_snapshot
+            .opportunities
+            .iter()
+            .map(|opportunity| DeviceType::from(opportunity.device_type.as_str())),
+    );
     let known_tracked = tracked_types
         .iter()
         .filter(|device_type| unlocked_blueprints.contains(*device_type))
@@ -1085,8 +1396,44 @@ fn reconcile_blueprint_acquisition(
             .copied()
             .unwrap_or_default()
             .cmp(&priorities.get(left.as_str()).copied().unwrap_or_default())
+            .then_with(|| {
+                let left_stock = shop_opportunities_for(shop_snapshot, left)
+                    .map(|opportunity| opportunity.current_stock)
+                    .min()
+                    .unwrap_or(i64::MAX);
+                let right_stock = shop_opportunities_for(shop_snapshot, right)
+                    .map(|opportunity| opportunity.current_stock)
+                    .min()
+                    .unwrap_or(i64::MAX);
+                left_stock.cmp(&right_stock)
+            })
             .then_with(|| left.cmp(right))
     });
+
+    if missing.is_empty() && (shop_snapshot.directory_errors > 0 || shop_snapshot.trade_errors > 0)
+    {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: None,
+            status: DirectorGoalStatus::Blocked,
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
+                .to_owned(),
+            blocker: Some(format!(
+                "Blueprint shop discovery was incomplete ({} directory errors, {} shop errors)",
+                shop_snapshot.directory_errors, shop_snapshot.trade_errors
+            )),
+            next_action: Some(
+                "Retry the account-wide shop snapshot before declaring all known acquisition opportunities satisfied"
+                    .to_owned(),
+            ),
+            progress_current: known_tracked as u64,
+            progress_total: tracked_types.len() as u64,
+            active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+            enabled,
+        });
+    }
 
     if missing.is_empty() {
         save_goal_runtime(context.repository, &id, &runtime)?;
@@ -1095,11 +1442,12 @@ fn reconcile_blueprint_acquisition(
             kind,
             region: None,
             status: DirectorGoalStatus::Satisfied,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
                 .to_owned(),
             blocker: None,
             next_action: Some(
-                "No owned-copy blueprint opportunities are currently missing".to_owned(),
+                "No known owned-copy or stocked-shop blueprint opportunities are currently missing"
+                    .to_owned(),
             ),
             progress_current: known_tracked as u64,
             progress_total: tracked_types.len() as u64,
@@ -1115,11 +1463,11 @@ fn reconcile_blueprint_acquisition(
             kind,
             region: None,
             status: DirectorGoalStatus::Active,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
                 .to_owned(),
             blocker: None,
             next_action: Some(
-                "Allow the current owned-copy acquisition to finish and verify its blueprint"
+                "Allow the current blueprint acquisition to finish and verify its blueprint"
                     .to_owned(),
             ),
             progress_current: known_tracked as u64,
@@ -1136,11 +1484,11 @@ fn reconcile_blueprint_acquisition(
             kind,
             region: None,
             status: DirectorGoalStatus::Waiting,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
+            objective: "Acquire missing blueprints from owned copies or known stocked shops"
                 .to_owned(),
             blocker: None,
             next_action: Some(
-                "Wait for the owned-copy acquisition retry cooldown before selecting another irreversible device"
+                "Wait for the blueprint acquisition retry cooldown before starting another irreversible acquisition"
                     .to_owned(),
             ),
             progress_current: known_tracked as u64,
@@ -1160,7 +1508,7 @@ fn reconcile_blueprint_acquisition(
                 && !claimed_factories.contains(device.key.id.as_str())
         })
         .collect::<Vec<_>>();
-    let selection = missing.iter().find_map(|device_type| {
+    let owned_selection = missing.iter().find_map(|device_type| {
         let source = devices
             .iter()
             .filter(|device| {
@@ -1194,11 +1542,180 @@ fn reconcile_blueprint_acquisition(
                 };
                 (rank, factory.key.id.clone())
             })?;
-        Some((device_type.clone(), source, factory, source_region.cloned()))
+        Some(BlueprintAcquisitionSelection::Owned {
+            device_type: device_type.clone(),
+            source_code: source.key.id.as_str().to_owned(),
+            factory_code: factory.key.id.as_str().to_owned(),
+            preferred_region: source_region.cloned(),
+        })
     });
 
-    let Some((device_type, source, factory, preferred_region)) = selection else {
-        let requested_without_copy = missing
+    let mut criterion_blockers = Vec::new();
+    let selection = if owned_selection.is_some() {
+        owned_selection
+    } else {
+        let mut selected = None;
+        'device: for device_type in &missing {
+            for opportunity in shop_opportunities_for(shop_snapshot, device_type) {
+                if !opportunity.criteria.unknown.is_empty() {
+                    criterion_blockers.push(format!(
+                        "{} trade {} has unsupported criteria fields",
+                        device_type.as_str(),
+                        opportunity.trade_code
+                    ));
+                    continue;
+                }
+                let target_priority = priorities.get(device_type.as_str()).copied().unwrap_or(100);
+                let mut dependency_blocked = false;
+                for criterion_type in opportunity.criteria.devices.keys() {
+                    let criterion = DeviceType::from(criterion_type.as_str());
+                    if unlocked_blueprints.contains(&criterion) {
+                        continue;
+                    }
+                    let criterion_has_owned_source = devices.iter().any(|device| {
+                        director_blueprint_source_releasable(device, &criterion)
+                            && !claimed.contains(device.key.id.as_str())
+                    });
+                    if !criterion_has_owned_source
+                        && blueprint_shop_dependency_cycle(
+                            shop_snapshot,
+                            device_type.as_str(),
+                            criterion_type,
+                        )
+                    {
+                        criterion_blockers.push(format!(
+                            "blueprint dependency cycle detected while acquiring {} through criterion {}",
+                            device_type.as_str(), criterion_type
+                        ));
+                        dependency_blocked = true;
+                        continue;
+                    }
+                    requirements.raise(
+                        DirectorRequirement::Blueprint {
+                            device_type: criterion_type.clone(),
+                        },
+                        &id,
+                        format!(
+                            "Acquiring {} from shop trade {} requires expendable {} devices",
+                            device_type.as_str(),
+                            opportunity.trade_code,
+                            criterion_type
+                        ),
+                        target_priority.saturating_add(1),
+                    )?;
+                    dependency_blocked = true;
+                }
+                if dependency_blocked {
+                    continue;
+                }
+
+                let shop_region = system_regions.get(&opportunity.shop_system).cloned();
+                let Some(factory) = factories.iter().copied().min_by_key(|factory| {
+                    let factory_location = factory
+                        .location
+                        .as_ref()
+                        .map(|location| location.id.as_str())
+                        .unwrap_or_default();
+                    let factory_system = location_systems.get(factory_location).map(String::as_str);
+                    let factory_region =
+                        factory_system.and_then(|system| system_regions.get(system));
+                    let rank = if factory_location.eq_ignore_ascii_case(&opportunity.shop_location)
+                    {
+                        0
+                    } else if factory_system == Some(opportunity.shop_system.as_str()) {
+                        1
+                    } else if shop_region.as_ref().is_some_and(|region| {
+                        factory_region.is_some_and(|candidate| candidate == region)
+                    }) {
+                        2
+                    } else {
+                        3
+                    };
+                    (rank, factory.key.id.clone())
+                }) else {
+                    criterion_blockers.push(format!(
+                        "{} is stocked at {}, but no unclaimed owned Autofactory is available",
+                        device_type.as_str(),
+                        opportunity.shop_location
+                    ));
+                    continue;
+                };
+
+                let worker = workers
+                    .iter()
+                    .filter(|worker| {
+                        worker.busy_workflow.is_none()
+                            && worker.replicant.travel.is_none()
+                            && !blueprint
+                                .reserved_workers
+                                .contains(worker.replicant.key.id.as_str())
+                    })
+                    .min_by_key(|worker| {
+                        let worker_location = worker
+                            .replicant
+                            .location
+                            .as_ref()
+                            .map(|location| location.id.as_str());
+                        let worker_system = worker_location
+                            .and_then(|location| location_systems.get(location))
+                            .map(String::as_str);
+                        let rank = if worker_location.is_some_and(|location| {
+                            location.eq_ignore_ascii_case(&opportunity.shop_location)
+                        }) {
+                            0
+                        } else if worker_system == Some(opportunity.shop_system.as_str()) {
+                            1
+                        } else if shop_region.as_ref().is_some_and(|region| {
+                            worker
+                                .region
+                                .as_ref()
+                                .is_some_and(|candidate| candidate == region)
+                        }) {
+                            2
+                        } else {
+                            3
+                        };
+                        (rank, worker.replicant.key.id.clone())
+                    });
+                let Some(worker) = worker else {
+                    if let Some(region) = shop_region.as_deref() {
+                        requirements.raise(
+                            DirectorRequirement::WorkerCapacity {
+                                region: region.to_owned(),
+                                count: 1,
+                                affinity: Some("trade".to_owned()),
+                            },
+                            &id,
+                            format!(
+                                "Acquiring {} from {} requires a free Replicant at the shop",
+                                device_type.as_str(),
+                                opportunity.shop_location
+                            ),
+                            target_priority,
+                        )?;
+                    }
+                    criterion_blockers.push(format!(
+                        "{} is stocked at {}, but no free Replicant is available to execute the trade",
+                        device_type.as_str(), opportunity.shop_location
+                    ));
+                    continue;
+                };
+
+                selected = Some(BlueprintAcquisitionSelection::Shop {
+                    device_type: device_type.clone(),
+                    opportunity: Box::new(opportunity.clone()),
+                    factory_code: factory.key.id.as_str().to_owned(),
+                    replicant_code: worker.replicant.key.id.as_str().to_owned(),
+                    preferred_region: shop_region,
+                });
+                break 'device;
+            }
+        }
+        selected
+    };
+
+    let Some(selection) = selection else {
+        let requested_unavailable = missing
             .iter()
             .find(|device_type| {
                 priorities
@@ -1208,21 +1725,31 @@ fn reconcile_blueprint_acquisition(
                     > 0
             })
             .map(|device_type| device_type.as_str().to_owned());
+        let discovery_partial =
+            shop_snapshot.directory_errors > 0 || shop_snapshot.trade_errors > 0;
+        let blocker = criterion_blockers.first().cloned().unwrap_or_else(|| {
+            if let Some(device_type) = requested_unavailable {
+                format!(
+                    "Blueprint {device_type} is required, but there is no releasable owned copy or currently inspectable in-stock shop opportunity"
+                )
+            } else if discovery_partial {
+                "Missing blueprints remain, but the account-wide shop snapshot was incomplete and no safe acquisition was selected".to_owned()
+            } else {
+                "Missing blueprints remain, but no releasable owned copy or safe in-stock shop opportunity is currently available".to_owned()
+            }
+        });
         save_goal_runtime(context.repository, &id, &runtime)?;
         return Ok(DirectorGoalSummary {
             id,
             kind,
             region: None,
             status: DirectorGoalStatus::Blocked,
-            objective: "Learn missing blueprints from owned devices before buying replacements"
-                .to_owned(),
-            blocker: Some(match requested_without_copy {
-                Some(device_type) => format!(
-                    "Blueprint {device_type} is required but no releasable owned copy and Autofactory pair is available; shop acquisition is not enabled in Phase 3"
-                ),
-                None => "Missing blueprints exist, but their owned copies are busy, attached, stowed, active, or no separate owned Autofactory is available".to_owned(),
-            }),
-            next_action: Some("Wait for an owned copy to become releasable or implement the later shop-purchase path".to_owned()),
+            objective: "Acquire missing blueprints from owned copies or known stocked shops".to_owned(),
+            blocker: Some(blocker),
+            next_action: Some(
+                "Wait for an owned copy, criterion dependency, worker, or inspectable shop opportunity to become available"
+                    .to_owned(),
+            ),
             progress_current: known_tracked as u64,
             progress_total: tracked_types.len() as u64,
             active_workflows: protocol_workflow_ids(&runtime.active_workflows),
@@ -1230,32 +1757,104 @@ fn reconcile_blueprint_acquisition(
         });
     };
 
+    let (device_type, preferred_region, next_action, intent, strategy, selected_worker) =
+        match selection {
+            BlueprintAcquisitionSelection::Owned {
+                device_type,
+                source_code,
+                factory_code,
+                preferred_region,
+            } => {
+                let requirement = DirectorRequirement::Blueprint {
+                    device_type: device_type.as_str().to_owned(),
+                };
+                let requirement_id = requirement.identity()?;
+                let is_required = priorities.contains_key(device_type.as_str());
+                let intent = BlueprintAcquireIntent {
+                    device_type: device_type.as_str().to_owned(),
+                    preferred_region: preferred_region.clone(),
+                    requested_by: is_required.then_some(requirement_id).into_iter().collect(),
+                    source_device: Some(source_code.clone()),
+                    autofactory: Some(factory_code.clone()),
+                    acquisition_replicant: None,
+                    shop: None,
+                };
+                (
+                    device_type.clone(),
+                    preferred_region,
+                    format!(
+                        "Sacrifice owned {} {} at Autofactory {} to learn {}",
+                        device_type.as_str(),
+                        source_code,
+                        factory_code,
+                        device_type.as_str()
+                    ),
+                    intent,
+                    "owned",
+                    None,
+                )
+            }
+            BlueprintAcquisitionSelection::Shop {
+                device_type,
+                opportunity,
+                factory_code,
+                replicant_code,
+                preferred_region,
+            } => {
+                let requirement = DirectorRequirement::Blueprint {
+                    device_type: device_type.as_str().to_owned(),
+                };
+                let requirement_id = requirement.identity()?;
+                let is_required = priorities.contains_key(device_type.as_str());
+                let shop_name = opportunity
+                    .shop_name
+                    .clone()
+                    .unwrap_or_else(|| opportunity.controller_code.clone());
+                let intent = BlueprintAcquireIntent {
+                    device_type: device_type.as_str().to_owned(),
+                    preferred_region: preferred_region.clone(),
+                    requested_by: is_required.then_some(requirement_id).into_iter().collect(),
+                    source_device: None,
+                    autofactory: Some(factory_code.clone()),
+                    acquisition_replicant: Some(replicant_code.clone()),
+                    shop: Some(BlueprintShopPurchaseIntent {
+                        controller_code: opportunity.controller_code.clone(),
+                        trade_code: opportunity.trade_code.clone(),
+                        shop_location: opportunity.shop_location.clone(),
+                        shop_system: opportunity.shop_system.clone(),
+                        criteria: opportunity.criteria.clone(),
+                    }),
+                };
+                (
+                    device_type.clone(),
+                    preferred_region,
+                    format!(
+                        "Stage criteria and send Replicant {} to {} for trade {}, then decommission the purchased {} at Autofactory {}",
+                        replicant_code,
+                        shop_name,
+                        opportunity.trade_code,
+                        device_type.as_str(),
+                        factory_code
+                    ),
+                    intent,
+                    "shop",
+                    Some(replicant_code),
+                )
+            }
+        };
+
     let requirement = DirectorRequirement::Blueprint {
         device_type: device_type.as_str().to_owned(),
     };
     let requirement_id = requirement.identity()?;
     let is_required = priorities.contains_key(device_type.as_str());
-    let next_action = format!(
-        "Sacrifice owned {} {} at Autofactory {} to learn {}",
-        device_type.as_str(),
-        source.key.id,
-        factory.key.id,
-        device_type.as_str()
-    );
     if context.automatic {
-        let workflow =
-            context
-                .repository
-                .create(new_blueprint_acquire_workflow(BlueprintAcquireIntent {
-                    device_type: device_type.as_str().to_owned(),
-                    preferred_region,
-                    requested_by: is_required
-                        .then_some(requirement_id.clone())
-                        .into_iter()
-                        .collect(),
-                    source_device: Some(source.key.id.as_str().to_owned()),
-                    autofactory: Some(factory.key.id.as_str().to_owned()),
-                }))?;
+        if let Some(worker) = selected_worker.as_deref() {
+            blueprint.reserved_workers.insert(worker.to_owned());
+        }
+        let workflow = context
+            .repository
+            .create(new_blueprint_acquire_workflow(intent))?;
         if is_required {
             requirements.attach_workflow(&requirement_id, workflow.id)?;
         }
@@ -1263,10 +1862,9 @@ fn reconcile_blueprint_acquisition(
             event = "director.blueprint.strategy_selected",
             workflow_id = %workflow.id,
             device_type = %device_type.as_str(),
-            source_device = %source.key.id,
-            autofactory = %factory.key.id,
-            strategy = "owned",
-            "Director launched owned-copy blueprint acquisition"
+            strategy,
+            region = preferred_region.as_deref().unwrap_or("global"),
+            "Director launched blueprint acquisition"
         );
         runtime.active_workflows = vec![workflow.id];
         runtime.last_launch_at_ms = Some(context.now);
@@ -1277,8 +1875,7 @@ fn reconcile_blueprint_acquisition(
         kind,
         region: None,
         status: DirectorGoalStatus::Active,
-        objective: "Learn missing blueprints from owned devices before buying replacements"
-            .to_owned(),
+        objective: "Acquire missing blueprints from owned copies or known stocked shops".to_owned(),
         blocker: None,
         next_action: Some(next_action),
         progress_current: known_tracked as u64,
@@ -3313,6 +3910,80 @@ mod tests {
             &device,
             &DeviceType::from("service_bot")
         ));
+    }
+
+    #[test]
+    fn blueprint_shop_dependency_cycles_are_detected() {
+        let snapshot = BlueprintShopSnapshot {
+            opportunities: vec![
+                BlueprintShopOpportunity {
+                    device_type: "device_a".to_owned(),
+                    controller_code: "SHOP-A".to_owned(),
+                    trade_code: "TRADE-A".to_owned(),
+                    current_stock: 1,
+                    criteria: TradeBundle {
+                        devices: BTreeMap::from([("device_b".to_owned(), 1)]),
+                        ..TradeBundle::default()
+                    },
+                    shop_location: "SOL-4".to_owned(),
+                    shop_system: "SOL".to_owned(),
+                    shop_name: None,
+                    last_seen_at_ms: 1,
+                },
+                BlueprintShopOpportunity {
+                    device_type: "device_b".to_owned(),
+                    controller_code: "SHOP-B".to_owned(),
+                    trade_code: "TRADE-B".to_owned(),
+                    current_stock: 1,
+                    criteria: TradeBundle {
+                        devices: BTreeMap::from([("device_a".to_owned(), 1)]),
+                        ..TradeBundle::default()
+                    },
+                    shop_location: "SOL-5".to_owned(),
+                    shop_system: "SOL".to_owned(),
+                    shop_name: None,
+                    last_seen_at_ms: 1,
+                },
+            ],
+            ..BlueprintShopSnapshot::default()
+        };
+
+        assert!(blueprint_shop_dependency_cycle(
+            &snapshot, "device_a", "device_b"
+        ));
+        assert!(blueprint_shop_dependency_cycle(
+            &snapshot, "device_b", "device_a"
+        ));
+        assert!(!blueprint_shop_dependency_cycle(
+            &snapshot, "device_a", "device_c"
+        ));
+    }
+
+    #[test]
+    fn shop_opportunities_require_matching_stocked_device_rewards() {
+        let snapshot = BlueprintShopSnapshot {
+            opportunities: vec![BlueprintShopOpportunity {
+                device_type: "service_bot".to_owned(),
+                controller_code: "SHOP-1".to_owned(),
+                trade_code: "TRADE-1".to_owned(),
+                current_stock: 2,
+                criteria: TradeBundle::default(),
+                shop_location: "SOL-4".to_owned(),
+                shop_system: "SOL".to_owned(),
+                shop_name: None,
+                last_seen_at_ms: 1,
+            }],
+            ..BlueprintShopSnapshot::default()
+        };
+
+        assert_eq!(
+            shop_opportunities_for(&snapshot, &DeviceType::from("service_bot")).count(),
+            1
+        );
+        assert_eq!(
+            shop_opportunities_for(&snapshot, &DeviceType::from("system_hub")).count(),
+            0
+        );
     }
 
     #[test]

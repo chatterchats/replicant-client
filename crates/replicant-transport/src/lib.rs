@@ -1798,7 +1798,9 @@ fn eligible_payload(device: &Device) -> bool {
 
 fn scope_matches(origin: &str, location: &str) -> bool {
     let origin = origin.trim();
-    if origin.contains('-') {
+    if origin.eq_ignore_ascii_case("account") {
+        true
+    } else if origin.contains('-') {
         location.eq_ignore_ascii_case(origin)
     } else {
         system_designation(location).eq_ignore_ascii_case(origin)
@@ -1808,7 +1810,9 @@ fn scope_matches(origin: &str, location: &str) -> bool {
 const REMOTE_TRANSPORT_RANK: u8 = 3;
 
 fn transport_scope_matches(origin: &str, location: &str) -> bool {
-    system_designation(location).eq_ignore_ascii_case(system_designation(origin.trim()))
+    let origin = origin.trim();
+    origin.eq_ignore_ascii_case("account")
+        || system_designation(location).eq_ignore_ascii_case(system_designation(origin))
 }
 
 fn transport_origin_rank(origin: &str, location: &str) -> u8 {
@@ -1982,6 +1986,13 @@ mod tests {
     fn exact_origin_matches_only_that_location() {
         assert!(scope_matches("SCEPTURUM-BELT-1", "SCEPTURUM-BELT-1"));
         assert!(!scope_matches("SCEPTURUM-BELT-1", "SCEPTURUM-7-L4"));
+    }
+
+    #[test]
+    fn account_origin_matches_inventory_and_transports_everywhere() {
+        assert!(scope_matches("account", "SCEPTURUM-BELT-1"));
+        assert!(scope_matches("ACCOUNT", "TWAFFY-OBJ-1"));
+        assert!(transport_scope_matches("account", "DELTA-3-L4"));
     }
 
     #[test]

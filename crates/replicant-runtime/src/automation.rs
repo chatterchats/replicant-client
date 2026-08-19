@@ -52,6 +52,7 @@ use crate::{
         SurveyExecutionState, SurveyMode, SurveyOptions, execute_survey_workflow,
         restore_survey_checkpoint,
     },
+    trade::{TradeBundle, shop_trades},
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -205,6 +206,12 @@ pub struct ScanTourCheckpoint {
     pub vessel: Option<String>,
     /// Resolved maintenance home.
     pub maintenance_home: Option<String>,
+    /// Stable tag applied to any survey-fleet devices manufactured for this tour.
+    #[serde(default)]
+    pub fleet_print_tag: Option<String>,
+    /// Child manifest currently staging newly printed survey-fleet devices.
+    #[serde(default)]
+    pub fleet_logistics_child: Option<WorkflowId>,
     /// Last authoritative survey executor state.
     pub state: Option<SurveyExecutionState>,
 }
@@ -370,7 +377,22 @@ pub struct LogisticsWorkflowCheckpoint {
     pub started: bool,
 }
 
-/// Intent for learning one blueprint by sacrificing an already-owned device.
+/// Shop purchase selected for a blueprint acquisition.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlueprintShopPurchaseIntent {
+    /// Trade-controller device code.
+    pub controller_code: String,
+    /// Stable trade code to execute.
+    pub trade_code: String,
+    /// Exact shop location where criteria and a Replicant must be staged.
+    pub shop_location: String,
+    /// Shop system used for observability and affinity.
+    pub shop_system: String,
+    /// Live criteria observed when the Director selected this opportunity.
+    pub criteria: TradeBundle,
+}
+
+/// Intent for learning one blueprint from an owned copy or a known shop.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BlueprintAcquireIntent {
     /// Device type whose blueprint must become unlocked.
@@ -387,10 +409,17 @@ pub struct BlueprintAcquireIntent {
     /// Optional preselected owned Autofactory code.
     #[serde(default)]
     pub autofactory: Option<String>,
+    /// Replicant selected to execute a shop trade.
+    #[serde(default)]
+    pub acquisition_replicant: Option<String>,
+    /// Optional live shop opportunity. When absent, use the owned-copy path.
+    #[serde(default)]
+    pub shop: Option<BlueprintShopPurchaseIntent>,
 }
 
-/// Restart-safe owned-copy blueprint acquisition checkpoint.
+/// Restart-safe blueprint acquisition checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct BlueprintAcquireCheckpoint {
     /// Selected sacrificial device code.
     pub source_device: Option<String>,
@@ -398,8 +427,32 @@ pub struct BlueprintAcquireCheckpoint {
     pub autofactory: Option<String>,
     /// Exact Autofactory location used as the decommission destination.
     pub autofactory_location: Option<String>,
+    /// Child manifest that stages trade criteria at a selected shop.
+    pub criteria_logistics_child: Option<WorkflowId>,
     /// Child manifest that moves the selected physical device when necessary.
     pub logistics_child: Option<WorkflowId>,
+    /// Replicant claimed to execute a shop trade.
+    pub acquisition_replicant: Option<String>,
+    /// Trade controller selected before any shop mutation.
+    pub controller_code: Option<String>,
+    /// Trade code selected before any shop mutation.
+    pub trade_code: Option<String>,
+    /// Exact shop location selected before any shop mutation.
+    pub shop_location: Option<String>,
+    /// Criteria snapshot checkpointed before staging.
+    pub criteria: Option<TradeBundle>,
+    /// Durable tag used for any criterion-device prints.
+    pub criteria_print_tag: Option<String>,
+    /// Target-device codes owned immediately before trade execution.
+    pub pre_purchase_devices: Vec<String>,
+    /// Irreversible purchase intent was durably checkpointed.
+    pub purchase_authorized: bool,
+    /// A managed trade operation was submitted during some invocation.
+    pub purchase_submitted: bool,
+    /// Durable managed operation ID for restart-safe trade recovery.
+    pub purchase_operation: Option<String>,
+    /// The rewarded target device has been observed in managed ownership.
+    pub purchase_observed: bool,
     /// Irreversible decommission intent was durably checkpointed.
     pub decommission_authorized: bool,
     /// A managed decommission operation was submitted during some invocation.
@@ -803,9 +856,24 @@ impl WorkflowExecutor for ScanTourWorkflow {
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.vessel = Some(vessel.clone());
             checkpoint.maintenance_home = Some(maintenance_home.clone());
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
             claim(context, ResourceKey::Replicant(replicant.clone()))?;
             claim_device(context, &vessel)?;
             claim_target(context, "survey-tour", &intent.center)?;
+
+            if !ensure_scan_tour_fleet_capacity(
+                context,
+                &client,
+                &vessel,
+                &maintenance_home,
+                &mut checkpoint,
+            )
+            .await?
+            {
+                return Ok(());
+            }
 
             let plan_file = scratch_file(context.id(), "survey-plan.json")?;
             if let Some(state) = checkpoint.state.as_ref() {
@@ -1239,7 +1307,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                     return context
                         .mark_succeeded(Some(serde_json::json!({
                             "device_type": device_type,
-                            "strategy": "owned",
+                            "strategy": blueprint_acquisition_strategy(&intent),
                             "source_device": checkpoint.source_device,
                             "autofactory": checkpoint.autofactory,
                             "recovered_operation": operation_id,
@@ -1267,7 +1335,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                     return context
                         .mark_succeeded(Some(serde_json::json!({
                             "device_type": device_type,
-                            "strategy": "owned",
+                            "strategy": blueprint_acquisition_strategy(&intent),
                             "source_device": checkpoint.source_device,
                             "autofactory": checkpoint.autofactory,
                             "reconciled_after_authorization": true,
@@ -1301,6 +1369,15 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 context.mark_waiting().map_err(string_error)?;
                 return Ok(());
             }
+
+            if intent.shop.is_some()
+                && checkpoint.source_device.is_none()
+                && !prepare_shop_blueprint_source(context, &client, &intent, &mut checkpoint)
+                    .await?
+            {
+                return Ok(());
+            }
+            let devices = refresh_owned_devices(&client).await?;
             let source = resolve_blueprint_source(&intent, &checkpoint, &devices)?;
             let factory = resolve_blueprint_factory(&intent, &checkpoint, &devices, &source)?;
             let source_location = source
@@ -1407,7 +1484,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 return context
                     .mark_succeeded(Some(serde_json::json!({
                         "device_type": device_type,
-                        "strategy": "owned",
+                        "strategy": blueprint_acquisition_strategy(&intent),
                         "source_device": source_code,
                         "autofactory": factory_code,
                     })))
@@ -1455,7 +1532,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 return context
                     .mark_succeeded(Some(serde_json::json!({
                         "device_type": device_type,
-                        "strategy": "owned",
+                        "strategy": blueprint_acquisition_strategy(&intent),
                         "source_device": source_code,
                         "autofactory": factory_code,
                     })))
@@ -2107,7 +2184,7 @@ pub fn new_logistics_manifest_workflow(
     )
 }
 
-/// Creates a queued owned-copy blueprint acquisition workflow.
+/// Creates a queued owned-copy or shop blueprint acquisition workflow.
 pub fn new_blueprint_acquire_workflow(
     intent: BlueprintAcquireIntent,
 ) -> NewWorkflow<BlueprintAcquireIntent, BlueprintAcquireCheckpoint> {
@@ -2338,6 +2415,675 @@ async fn wait_for_blueprint(
     Ok(false)
 }
 
+fn blueprint_acquisition_strategy(intent: &BlueprintAcquireIntent) -> &'static str {
+    if intent.shop.is_some() {
+        "shop"
+    } else {
+        "owned"
+    }
+}
+
+async fn prepare_shop_blueprint_source(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &BlueprintAcquireIntent,
+    checkpoint: &mut BlueprintAcquireCheckpoint,
+) -> Result<bool, String> {
+    let shop = intent
+        .shop
+        .as_ref()
+        .ok_or_else(|| "shop blueprint acquisition is missing its shop intent".to_owned())?;
+    let replicant = intent
+        .acquisition_replicant
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "shop blueprint acquisition requires an acquisition Replicant".to_owned())?;
+    let factory_code = intent
+        .autofactory
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "shop blueprint acquisition requires an Autofactory".to_owned())?;
+
+    checkpoint.acquisition_replicant = Some(replicant.to_owned());
+    checkpoint.controller_code = Some(shop.controller_code.clone());
+    checkpoint.trade_code = Some(shop.trade_code.clone());
+    checkpoint.shop_location = Some(shop.shop_location.clone());
+    checkpoint.criteria = Some(shop.criteria.clone());
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+
+    claim(context, ResourceKey::Replicant(replicant.to_owned()))?;
+    claim(context, ResourceKey::Autofactory(factory_code.to_owned()))?;
+    claim(
+        context,
+        ResourceKey::Namespaced {
+            namespace: "blueprint-shop-trade".to_owned(),
+            key: format!("{}:{}", shop.controller_code, shop.trade_code),
+        },
+    )?;
+
+    let devices = refresh_owned_devices(client).await?;
+    let factory = devices
+        .iter()
+        .find(|device| {
+            device.key.id.as_str().eq_ignore_ascii_case(factory_code)
+                && device.access == AccessScope::Owned
+                && device.device_type.as_ref() == Some(&DeviceType::Autofactory)
+                && device.location.is_some()
+        })
+        .ok_or_else(|| format!("selected Autofactory {factory_code} is not available"))?;
+    let factory_location = factory
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| format!("Autofactory {factory_code} has no location"))?;
+    checkpoint.autofactory = Some(factory_code.to_owned());
+    checkpoint.autofactory_location = Some(factory_location.clone());
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+
+    if checkpoint.purchase_authorized {
+        if let Some(source) = observe_purchased_blueprint_device(
+            client,
+            &intent.device_type,
+            &checkpoint.pre_purchase_devices,
+            &shop.shop_location,
+            1,
+        )
+        .await?
+        {
+            checkpoint.source_device = Some(source);
+            checkpoint.purchase_observed = true;
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            return Ok(true);
+        }
+
+        if let Some(operation_id) = checkpoint.purchase_operation.as_deref() {
+            let operation = client
+                .operations()
+                .get(OperationId::new(operation_id.to_owned()));
+            let status = operation.status().await.map_err(string_error)?;
+            if matches!(
+                status,
+                OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+            ) {
+                return Err(format!(
+                    "managed trade operation {operation_id} ended as {status:?} before the target device was observed"
+                ));
+            }
+        }
+
+        if let Some(source) = observe_purchased_blueprint_device(
+            client,
+            &intent.device_type,
+            &checkpoint.pre_purchase_devices,
+            &shop.shop_location,
+            12,
+        )
+        .await?
+        {
+            checkpoint.source_device = Some(source);
+            checkpoint.purchase_observed = true;
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            return Ok(true);
+        }
+
+        context
+            .advance_to("reconciling_purchase", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity(
+                "shop trade was already authorized; waiting for managed ownership evidence before any further mutation"
+                    .to_owned(),
+            )
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    if !ensure_shop_trade_criteria(
+        context,
+        client,
+        intent,
+        checkpoint,
+        &factory_location,
+        &shop.shop_location,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+
+    if !ensure_replicant_at_shop(context, client, checkpoint, replicant, &shop.shop_location)
+        .await?
+    {
+        return Ok(false);
+    }
+
+    let live_trade = shop_trades(client, &shop.controller_code)
+        .await
+        .map_err(string_error)?
+        .into_iter()
+        .find(|trade| trade.trade_code.eq_ignore_ascii_case(&shop.trade_code))
+        .ok_or_else(|| {
+            format!(
+                "shop trade {} on controller {} is no longer available",
+                shop.trade_code, shop.controller_code
+            )
+        })?;
+    if live_trade.current_stock.unwrap_or_default() <= 0 {
+        return Err(format!(
+            "shop trade {} on controller {} is out of stock",
+            shop.trade_code, shop.controller_code
+        ));
+    }
+    if live_trade.criteria_bundle() != shop.criteria {
+        return Err(format!(
+            "shop trade {} criteria changed after staging; refusing to execute stale criteria",
+            shop.trade_code
+        ));
+    }
+    if live_trade
+        .rewards_bundle()
+        .devices
+        .get(&intent.device_type)
+        .copied()
+        .unwrap_or_default()
+        <= 0
+    {
+        return Err(format!(
+            "shop trade {} no longer rewards {}",
+            shop.trade_code, intent.device_type
+        ));
+    }
+
+    let devices = refresh_owned_devices(client).await?;
+    checkpoint.pre_purchase_devices = devices
+        .iter()
+        .filter(|device| {
+            device
+                .device_type
+                .as_ref()
+                .is_some_and(|kind| kind.as_str().eq_ignore_ascii_case(&intent.device_type))
+        })
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect();
+    checkpoint.pre_purchase_devices.sort();
+    checkpoint.purchase_authorized = true;
+    context
+        .advance_to("purchasing", checkpoint)
+        .map_err(string_error)?;
+
+    let operation = client
+        .trading()
+        .execute(&shop.controller_code, &shop.trade_code)
+        .await
+        .map_err(string_error)?;
+    checkpoint.purchase_submitted = true;
+    checkpoint.purchase_operation = Some(operation.id().as_str().to_owned());
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+
+    if let Some(source) = observe_purchased_blueprint_device(
+        client,
+        &intent.device_type,
+        &checkpoint.pre_purchase_devices,
+        &shop.shop_location,
+        24,
+    )
+    .await?
+    {
+        checkpoint.source_device = Some(source);
+        checkpoint.purchase_observed = true;
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        return Ok(true);
+    }
+
+    let status = operation.status().await.map_err(string_error)?;
+    if matches!(
+        status,
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
+    ) {
+        return Err(format!(
+            "managed trade operation {} ended as {status:?} and no rewarded {} device was observed",
+            operation.id(),
+            intent.device_type
+        ));
+    }
+    context
+        .advance_to("awaiting_purchase_evidence", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+async fn ensure_shop_trade_criteria(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &BlueprintAcquireIntent,
+    checkpoint: &mut BlueprintAcquireCheckpoint,
+    factory_location: &str,
+    shop_location: &str,
+) -> Result<bool, String> {
+    let criteria = checkpoint
+        .criteria
+        .clone()
+        .or_else(|| intent.shop.as_ref().map(|shop| shop.criteria.clone()))
+        .ok_or_else(|| "shop blueprint acquisition has no criteria snapshot".to_owned())?;
+    if !criteria.unknown.is_empty() {
+        return Err(format!(
+            "shop criteria contain unsupported fields {:?}; refusing automatic purchase",
+            criteria.unknown.keys().collect::<Vec<_>>()
+        ));
+    }
+    if criteria
+        .resources
+        .values()
+        .chain(criteria.devices.values())
+        .any(|quantity| *quantity < 0)
+    {
+        return Err("shop criteria contain a negative quantity".to_owned());
+    }
+
+    let unlocked = client
+        .blueprints()
+        .unlocked_device_types()
+        .await
+        .map_err(string_error)?;
+    for device_type in criteria.devices.keys() {
+        let kind = DeviceType::from(device_type.as_str());
+        if !unlocked.contains(&kind) {
+            context
+                .advance_to("waiting_for_criterion_blueprint", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "trade criterion device {device_type} has no unlocked blueprint; waiting for its Blueprint requirement"
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+    }
+
+    let mut devices = refresh_owned_devices(client).await?;
+    let mut print_requests = Vec::new();
+    for (device_type, required) in &criteria.devices {
+        let available = devices
+            .iter()
+            .filter(|device| trade_payment_device_is_releasable(device, device_type))
+            .count() as i64;
+        if available < *required {
+            print_requests.push(PrintRequest::new(device_type.clone(), required - available));
+        }
+    }
+    if !print_requests.is_empty() {
+        let tag = checkpoint
+            .criteria_print_tag
+            .get_or_insert_with(|| format!("dir-bp-pay:{}", &context.id().to_string()[..8]))
+            .clone();
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        context
+            .advance_to("printing_trade_criteria", checkpoint)
+            .map_err(string_error)?;
+        let mut options = QueueOptions::at(factory_location.to_owned());
+        options.tags = vec![tag];
+        options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+        queue_prints_with_components(client, &print_requests, &options)
+            .await
+            .map_err(string_error)?;
+        devices = refresh_owned_devices(client).await?;
+    }
+
+    let inventories = fetch_account_inventories(client).await?;
+    let resources_at_shop = inventory_at_location(&inventories, shop_location);
+    let mut missing_resources = ResourceMap::new();
+    for (resource, required) in &criteria.resources {
+        let present = resources_at_shop.get(resource).copied().unwrap_or_default();
+        if present < *required {
+            missing_resources.insert(resource.clone(), required - present);
+        }
+    }
+    for (resource, missing) in &missing_resources {
+        let available_elsewhere = inventories
+            .iter()
+            .filter(|inventory| {
+                inventory.location.as_ref().is_some_and(|location| {
+                    !location.id.as_str().eq_ignore_ascii_case(shop_location)
+                })
+            })
+            .flat_map(|inventory| inventory.items.iter())
+            .filter(|item| item.resource.eq_ignore_ascii_case(resource))
+            .map(|item| item.quantity)
+            .sum::<i64>();
+        if available_elsewhere < *missing {
+            context
+                .advance_to("waiting_for_trade_criteria", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "shop trade needs {missing} more {resource}, but only {available_elsewhere} is available elsewhere on the account"
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+    }
+
+    let mut staged_codes = Vec::new();
+    for (device_type, required) in &criteria.devices {
+        let mut at_shop = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        at_shop.sort();
+        let required_count = usize::try_from(*required)
+            .map_err(|_| format!("invalid trade device criterion quantity {required}"))?;
+        let missing = required_count.saturating_sub(at_shop.len());
+        if missing == 0 {
+            continue;
+        }
+        let mut elsewhere = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        !location.id.as_str().eq_ignore_ascii_case(shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        elsewhere.sort();
+        if elsewhere.len() < missing {
+            context
+                .advance_to("waiting_for_trade_criteria", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "trade requires {required} {device_type}, but only {} releasable account copies are available after printing",
+                    at_shop.len() + elsewhere.len()
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        staged_codes.extend(elsewhere.into_iter().take(missing));
+    }
+
+    if !missing_resources.is_empty() || !staged_codes.is_empty() {
+        let child_id = match checkpoint.criteria_logistics_child {
+            Some(id) => id,
+            None => {
+                let shop = intent
+                    .shop
+                    .as_ref()
+                    .ok_or_else(|| "shop blueprint acquisition lost its shop intent".to_owned())?;
+                let child = context
+                    .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                        origin: "account".to_owned(),
+                        destination: shop_location.to_owned(),
+                        resources: missing_resources,
+                        devices: Vec::new(),
+                        device_codes: staged_codes.clone(),
+                        device_tags: Vec::new(),
+                        return_transports: false,
+                        allow_transport_staging: true,
+                        region: intent.preferred_region.clone(),
+                        purpose: format!(
+                            "director:blueprint_shop_criteria:{}:{}:{}",
+                            intent.device_type, shop.controller_code, shop.trade_code
+                        ),
+                    }))
+                    .map_err(string_error)?;
+                for code in &staged_codes {
+                    context
+                        .repository()
+                        .acquire_claim(child.id, ResourceKey::Device(code.clone()))
+                        .map_err(string_error)?;
+                }
+                checkpoint.criteria_logistics_child = Some(child.id);
+                context
+                    .persist_checkpoint(checkpoint)
+                    .map_err(string_error)?;
+                child.id
+            }
+        };
+        if !await_child_workflow(context, child_id, "trade-criteria logistics", checkpoint).await? {
+            return Ok(false);
+        }
+        devices = refresh_owned_devices(client).await?;
+    }
+
+    for (device_type, required) in &criteria.devices {
+        let mut at_shop = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        at_shop.sort();
+        let required_count = usize::try_from(*required)
+            .map_err(|_| format!("invalid trade device criterion quantity {required}"))?;
+        if at_shop.len() < required_count {
+            context
+                .advance_to("waiting_for_trade_criteria", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        for code in at_shop.into_iter().take(required_count) {
+            claim_device(context, &code)?;
+        }
+    }
+    let resources_now =
+        inventory_at_location(&fetch_account_inventories(client).await?, shop_location);
+    if criteria.resources.iter().any(|(resource, required)| {
+        resources_now.get(resource).copied().unwrap_or_default() < *required
+    }) {
+        context
+            .advance_to("waiting_for_trade_criteria", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+async fn await_child_workflow(
+    context: &mut WorkflowContext,
+    child_id: WorkflowId,
+    label: &str,
+    checkpoint: &BlueprintAcquireCheckpoint,
+) -> Result<bool, String> {
+    loop {
+        let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+            return Err(format!("{label} child {child_id} disappeared"));
+        };
+        match child.status {
+            WorkflowStatus::Succeeded => return Ok(true),
+            WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                return Err(format!(
+                    "{label} child {child_id} ended as {:?}: {}",
+                    child.status,
+                    child.last_error.unwrap_or_default()
+                ));
+            }
+            _ => {
+                context
+                    .advance_to("awaiting_trade_criteria", checkpoint)
+                    .map_err(string_error)?;
+                match context.control_request().map_err(string_error)? {
+                    replicant_workflow::ControlRequest::Continue => {}
+                    replicant_workflow::ControlRequest::Pause
+                    | replicant_workflow::ControlRequest::Cancel => return Ok(false),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn ensure_replicant_at_shop(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &BlueprintAcquireCheckpoint,
+    replicant_code: &str,
+    destination: &str,
+) -> Result<bool, String> {
+    let handle = client
+        .replicants()
+        .get_owned(replicant_code)
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        return Ok(true);
+    }
+    if let Some(travel) = &snapshot.travel {
+        let planned = travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str());
+        if planned.is_some_and(|planned| planned.eq_ignore_ascii_case(destination)) {
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        return Err(format!(
+            "acquisition Replicant {replicant_code} is already travelling to {:?}, not {destination}",
+            planned
+        ));
+    }
+    context
+        .advance_to("travelling_to_shop", checkpoint)
+        .map_err(string_error)?;
+    let operation = handle
+        .travel()
+        .to(destination.to_owned())
+        .depart()
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+    let refreshed = handle.refresh().await.map_err(string_error)?;
+    let snapshot = refreshed.snapshot().await.map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        Ok(true)
+    } else {
+        context.mark_waiting().map_err(string_error)?;
+        Ok(false)
+    }
+}
+
+async fn fetch_account_inventories(
+    client: &Client,
+) -> Result<Vec<replicant_client::domain::Inventory>, String> {
+    let mut cursor = None;
+    let mut inventories = Vec::new();
+    for _ in 0..100 {
+        let (mut page, next_cursor) = client
+            .inventory()
+            .list(&replicant_client::raw::inventory::AccountInventoryQuery {
+                location: None,
+                cursor,
+                limit: Some(50),
+            })
+            .await
+            .map_err(string_error)?;
+        inventories.append(&mut page);
+        let Some(next) = next_cursor else {
+            return Ok(inventories);
+        };
+        cursor = Some(next);
+    }
+    Err("account inventory exceeded the 100-page safety bound".to_owned())
+}
+
+fn inventory_at_location(
+    inventories: &[replicant_client::domain::Inventory],
+    location: &str,
+) -> ResourceMap {
+    let mut resources = ResourceMap::new();
+    for inventory in inventories.iter().filter(|inventory| {
+        inventory
+            .location
+            .as_ref()
+            .is_some_and(|key| key.id.as_str().eq_ignore_ascii_case(location))
+    }) {
+        for item in &inventory.items {
+            *resources.entry(item.resource.clone()).or_default() += item.quantity;
+        }
+    }
+    resources
+}
+
+fn trade_payment_device_is_releasable(device: &Device, device_type: &str) -> bool {
+    blueprint_source_is_releasable(device, device_type)
+}
+
+async fn observe_purchased_blueprint_device(
+    client: &Client,
+    device_type: &str,
+    before: &[String],
+    shop_location: &str,
+    attempts: usize,
+) -> Result<Option<String>, String> {
+    let before = before
+        .iter()
+        .map(|code| code.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    for attempt in 0..attempts.max(1) {
+        let mut candidates = refresh_owned_devices(client)
+            .await?
+            .into_iter()
+            .filter(|device| {
+                !before.contains(&device.key.id.as_str().to_ascii_uppercase())
+                    && blueprint_source_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(shop_location)
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|device| device.key.id.clone());
+        if let Some(device) = candidates.first() {
+            return Ok(Some(device.key.id.as_str().to_owned()));
+        }
+        if attempt + 1 < attempts.max(1) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_blueprint_source(
     intent: &BlueprintAcquireIntent,
     checkpoint: &BlueprintAcquireCheckpoint,
@@ -2441,6 +3187,256 @@ fn blueprint_source_is_releasable(device: &Device, device_type: &str) -> bool {
                 "inactive" | "deactivated" | "idle" | "recalled" | "compacted"
             )
         })
+}
+
+const SCAN_TOUR_SURVEY_DRONES: i64 = 3;
+
+fn scan_tour_fleet_print_requests(
+    controller_count: usize,
+    drone_count: usize,
+) -> Vec<PrintRequest> {
+    let mut requests = Vec::new();
+    if controller_count == 0 {
+        requests.push(PrintRequest::new("ami_survey_controller", 1));
+    }
+    let drone_shortfall = SCAN_TOUR_SURVEY_DRONES.saturating_sub(drone_count as i64);
+    if drone_shortfall > 0 {
+        requests.push(PrintRequest::new("survey_drone", drone_shortfall));
+    }
+    requests
+}
+
+async fn ensure_scan_tour_fleet_capacity(
+    context: &mut WorkflowContext,
+    client: &Client,
+    vessel: &str,
+    maintenance_home: &str,
+    checkpoint: &mut ScanTourCheckpoint,
+) -> Result<bool, String> {
+    if checkpoint
+        .state
+        .as_ref()
+        .is_some_and(|state| state.resources().2.len() > SCAN_TOUR_SURVEY_DRONES as usize)
+    {
+        return Ok(true);
+    }
+
+    if let Some(child_id) = checkpoint.fleet_logistics_child {
+        let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+            return Err(format!(
+                "survey-fleet logistics child {child_id} disappeared"
+            ));
+        };
+        match child.status {
+            WorkflowStatus::Succeeded => {
+                checkpoint.fleet_logistics_child = None;
+                context
+                    .persist_checkpoint(checkpoint)
+                    .map_err(string_error)?;
+            }
+            WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                return Err(format!(
+                    "survey-fleet logistics child {child_id} ended as {:?}: {}",
+                    child.status,
+                    child.last_error.unwrap_or_default()
+                ));
+            }
+            _ => {
+                context
+                    .advance_to("staging_survey_fleet", checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(false);
+            }
+        }
+    }
+
+    let vessel_snapshot = client
+        .devices()
+        .get(vessel)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let staging_location = vessel_snapshot
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| format!("survey vessel {vessel} has no current staging location"))?;
+
+    let controllers = client
+        .devices()
+        .controllers(DeviceType::SurveyController)
+        .owned()
+        .idle()
+        .at(&staging_location)
+        .without_adopted_devices()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let drones = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(DeviceType::from("survey_drone"))
+        .idle()
+        .at(&staging_location)
+        .without_controller()
+        .collect()
+        .await
+        .map_err(string_error)?;
+
+    let requests = scan_tour_fleet_print_requests(controllers.len(), drones.len());
+    if requests.is_empty() {
+        return Ok(true);
+    }
+
+    let print_location = maintenance_home.to_owned();
+    let tag = checkpoint
+        .fleet_print_tag
+        .get_or_insert_with(|| format!("scan-fleet:{}", &context.id().to_string()[..8]))
+        .clone();
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .advance_to("manufacturing_survey_fleet", checkpoint)
+        .map_err(string_error)?;
+    context
+        .emit_activity(format!(
+            "survey fleet at {staging_location} is short {}; manufacturing at {print_location}",
+            requests
+                .iter()
+                .map(|request| format!("{} {}", request.quantity, request.device_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .map_err(string_error)?;
+
+    let mut options = QueueOptions::at(print_location.clone());
+    options.tags = vec![tag.clone()];
+    options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+    queue_prints_with_components(client, &requests, &options)
+        .await
+        .map_err(string_error)?;
+
+    loop {
+        let status = printing_status_in_system(
+            client,
+            &print_location,
+            &requests,
+            std::slice::from_ref(&tag),
+        )
+        .await
+        .map_err(string_error)?;
+        if status
+            .requested
+            .iter()
+            .all(|line| line.available >= line.required)
+        {
+            break;
+        }
+        match context.control_request().map_err(string_error)? {
+            replicant_workflow::ControlRequest::Continue => {}
+            replicant_workflow::ControlRequest::Pause
+            | replicant_workflow::ControlRequest::Cancel => return Ok(false),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    if print_location.eq_ignore_ascii_case(&staging_location) {
+        return Ok(true);
+    }
+
+    let printed_codes =
+        tagged_device_codes_for_requests(client, &tag, &print_location, &requests).await?;
+    let child = context
+        .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+            origin: print_location,
+            destination: staging_location,
+            resources: ResourceMap::new(),
+            devices: Vec::new(),
+            device_codes: printed_codes.clone(),
+            device_tags: Vec::new(),
+            return_transports: true,
+            allow_transport_staging: true,
+            region: None,
+            purpose: format!("scan-tour-fleet:{}", context.id()),
+        }))
+        .map_err(string_error)?;
+    for code in &printed_codes {
+        context
+            .repository()
+            .acquire_claim(child.id, ResourceKey::Device(code.clone()))
+            .map_err(string_error)?;
+    }
+    checkpoint.fleet_logistics_child = Some(child.id);
+    context
+        .advance_to("staging_survey_fleet", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(false)
+}
+
+async fn tagged_device_codes_for_requests(
+    client: &Client,
+    tag: &str,
+    location: &str,
+    requests: &[PrintRequest],
+) -> Result<Vec<String>, String> {
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .with_tag(tag.to_owned())
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut candidates = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if snapshot
+            .location
+            .as_ref()
+            .is_none_or(|candidate| !candidate.id.as_str().eq_ignore_ascii_case(location))
+        {
+            continue;
+        }
+        let Some(device_type) = snapshot.device_type.as_ref() else {
+            continue;
+        };
+        candidates.push((
+            device_type.as_str().to_owned(),
+            handle.id().as_str().to_owned(),
+        ));
+    }
+    candidates.sort();
+
+    let mut selected = Vec::new();
+    for request in requests {
+        let required = usize::try_from(request.quantity)
+            .map_err(|_| format!("invalid survey-fleet print quantity {}", request.quantity))?;
+        let matches = candidates
+            .iter()
+            .filter(|(device_type, _)| device_type.eq_ignore_ascii_case(&request.device_type))
+            .map(|(_, code)| code.clone())
+            .take(required)
+            .collect::<Vec<_>>();
+        if matches.len() < required {
+            return Err(format!(
+                "survey-fleet manufacturing completed but only {} of {} tagged {} devices were found at {}",
+                matches.len(),
+                required,
+                request.device_type,
+                location
+            ));
+        }
+        selected.extend(matches);
+    }
+    selected.sort();
+    selected.dedup();
+    Ok(selected)
 }
 
 async fn resolve_survey_assignment(
@@ -2919,6 +3915,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_tour_prints_only_missing_survey_fleet_devices() {
+        let requests = scan_tour_fleet_print_requests(1, 2);
+        assert_eq!(requests, vec![PrintRequest::new("survey_drone", 1)]);
+
+        let requests = scan_tour_fleet_print_requests(0, 1);
+        assert_eq!(
+            requests,
+            vec![
+                PrintRequest::new("ami_survey_controller", 1),
+                PrintRequest::new("survey_drone", 2),
+            ]
+        );
+
+        assert!(scan_tour_fleet_print_requests(1, 3).is_empty());
+    }
+
+    #[test]
     fn intent_workflow_kinds_are_goal_oriented() {
         assert_eq!(scan_system_workflow_kind().as_str(), "scan.system");
         assert_eq!(scan_belt_workflow_kind().as_str(), "scan.belt");
@@ -2965,6 +3978,8 @@ mod tests {
                     requested_by: vec!["blueprint:service_bot".to_owned()],
                     source_device: Some("DEVICE-1".to_owned()),
                     autofactory: Some("FACTORY-1".to_owned()),
+                    acquisition_replicant: None,
+                    shop: None,
                 },
                 BlueprintAcquireCheckpoint {
                     source_device: Some("DEVICE-1".to_owned()),
@@ -2975,6 +3990,7 @@ mod tests {
                     decommission_submitted: true,
                     decommission_operation: Some("OP-1".to_owned()),
                     blueprint_verified: false,
+                    ..BlueprintAcquireCheckpoint::default()
                 },
             ))
             .expect("create blueprint workflow");
@@ -2994,6 +4010,41 @@ mod tests {
 
         drop(repository);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn blueprint_shop_checkpoint_preserves_irreversible_purchase_state() {
+        let checkpoint = BlueprintAcquireCheckpoint {
+            acquisition_replicant: Some("CHAT-2".to_owned()),
+            controller_code: Some("SHOP-1".to_owned()),
+            trade_code: Some("TRADE-1".to_owned()),
+            shop_location: Some("SOL-4".to_owned()),
+            criteria: Some(TradeBundle {
+                resources: std::collections::BTreeMap::from([("structural".to_owned(), 200)]),
+                devices: std::collections::BTreeMap::from([("compute_core".to_owned(), 1)]),
+                unknown: std::collections::BTreeMap::new(),
+            }),
+            pre_purchase_devices: vec!["OLD-1".to_owned()],
+            purchase_authorized: true,
+            purchase_submitted: true,
+            purchase_operation: Some("OP-TRADE".to_owned()),
+            ..BlueprintAcquireCheckpoint::default()
+        };
+
+        let encoded = serde_json::to_value(&checkpoint).expect("serialize checkpoint");
+        let restored: BlueprintAcquireCheckpoint =
+            serde_json::from_value(encoded).expect("restore checkpoint");
+        assert!(restored.purchase_authorized);
+        assert!(restored.purchase_submitted);
+        assert_eq!(restored.purchase_operation.as_deref(), Some("OP-TRADE"));
+        assert_eq!(restored.pre_purchase_devices, vec!["OLD-1"]);
+        assert_eq!(
+            restored
+                .criteria
+                .as_ref()
+                .and_then(|criteria| criteria.devices.get("compute_core")),
+            Some(&1)
+        );
     }
 
     #[test]
