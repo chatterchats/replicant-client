@@ -40,6 +40,7 @@ help:
 	  'docker-smoke          		Start and probe a configured full stack' \
 	  'docker-persistence-smoke		Prove the data directory survives container recreation' \
 	  'docker-rebuild-deploy		Rebuild and redeploy the stack' \
+	  'docker-restart         		Restart the running stack' \
 	  'zip                    		Create a clean working-tree ZIP for handoff' \
 	  'token                  		Generate a new REPLICANTD_TOKEN in .env if not present' \
 	  'token-rotate           		Rotate the REPLICANTD_TOKEN in .env
