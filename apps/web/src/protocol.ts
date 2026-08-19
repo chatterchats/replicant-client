@@ -700,6 +700,7 @@ export interface SettingsSnapshot {
   profile: string;
   bind_address: string;
   managed_database_path: string;
+  history_database_path: string;
   runtime_database_path: string;
   log_filter: string;
   docker: boolean;
@@ -972,6 +973,7 @@ export interface GalaxyStar {
   id: string;
   name: string | null;
   spectral_type: string | null;
+  region?: string | null;
   position: GalaxyPoint;
   exploration: "undiscovered" | "partial" | "explored";
   current: boolean;
@@ -2849,6 +2851,7 @@ export function parseSettingsResponse(
       typeof snapshot.profile !== "string" ||
       typeof snapshot.bind_address !== "string" ||
       typeof snapshot.managed_database_path !== "string" ||
+      typeof snapshot.history_database_path !== "string" ||
       typeof snapshot.runtime_database_path !== "string" ||
       typeof snapshot.log_filter !== "string"
     )
@@ -2858,6 +2861,7 @@ export function parseSettingsResponse(
       profile: snapshot.profile,
       bind_address: snapshot.bind_address,
       managed_database_path: snapshot.managed_database_path,
+      history_database_path: snapshot.history_database_path,
       runtime_database_path: snapshot.runtime_database_path,
       log_filter: snapshot.log_filter,
       docker: boolean(snapshot.docker, "docker environment"),
@@ -3144,6 +3148,10 @@ export function parseGalaxySceneResponse(
             star.spectral_type,
             "galaxy spectral type",
           ),
+          region:
+            star.region === undefined
+              ? null
+              : nullableString(star.region, "galaxy region"),
           position: point(star.position),
           exploration: oneOf(
             star.exploration,

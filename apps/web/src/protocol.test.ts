@@ -614,6 +614,7 @@ describe("parseHealthResponse", () => {
             id: "SOL",
             name: null,
             spectral_type: "G",
+            region: "solzone",
             position: { x: 0, y: 1, z: 2 },
             exploration: "explored",
             current: true,
@@ -632,6 +633,7 @@ describe("parseHealthResponse", () => {
     }).payload;
     expect(scene.stars[0]?.id).toBe("SOL");
     expect(scene.stars[0]?.position.z).toBe(2);
+    expect(scene.stars[0]?.region).toBe("solzone");
   });
 
   it("parses an application-owned system scene", () => {

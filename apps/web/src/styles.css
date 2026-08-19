@@ -10,8 +10,8 @@
   --text: rgba(255, 255, 255, 0.87); /* high emphasis */
   --text-muted: rgba(255, 255, 255, 0.6); /* medium emphasis */
   --text-faint: rgba(255, 255, 255, 0.38); /* disabled/hint tier */
-  --accent: #80cbc4; /* teal 200 */
-  --accent-bright: #b2dfdb; /* teal 100, hover/link text */
+  --accent: #8092cb; /* teal 200 */
+  --accent-bright: #b2c6df; /* teal 100, hover/link text */
   --accent-contrast: #00332e; /* on-accent */
   --danger: #cf6679; /* Material dark error */
   --warning: #ffcc80; /* orange 200 */
@@ -650,8 +650,9 @@ h1 {
   text-transform: uppercase;
 }
 .inspector {
-  width: 340px;
-  min-width: 280px;
+  width: 390px;
+  min-width: 320px;
+  max-width: min(55vw, 680px);
   display: flex;
   flex-direction: column;
   border-left: 1px solid rgba(255, 255, 255, 0.16);
@@ -3213,4 +3214,52 @@ h1 {
 }
 .palette-logistics-form > button:first-child {
   margin-bottom: 10px;
+}
+
+.workflow-inspector-summary dl,
+.workflow-parameters {
+  margin: 0;
+}
+.workflow-inspector-summary dl {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr;
+  gap: 8px 14px;
+}
+.workflow-inspector-summary dt,
+.workflow-parameters dt {
+  color: #78908c;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+.workflow-inspector-summary dd,
+.workflow-parameters dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.workflow-failure,
+.workflow-wait-reason {
+  margin-top: 14px;
+  border: 1px solid rgba(239, 107, 122, 0.42);
+  border-radius: 7px;
+  background: rgba(239, 107, 122, 0.08);
+  padding: 12px;
+}
+.workflow-wait-reason {
+  border-color: rgba(243, 177, 79, 0.38);
+  background: rgba(243, 177, 79, 0.07);
+}
+.workflow-failure p,
+.workflow-wait-reason p {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.workflow-parameters {
+  display: grid;
+  gap: 8px;
+}
+.workflow-parameters > div {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.6fr) minmax(0, 1.4fr);
+  gap: 10px;
 }

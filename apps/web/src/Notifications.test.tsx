@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { formatNotificationsForClipboard } from "./notificationClipboard";
 import { NotificationToasts } from "./Notifications";
 import type { Notification } from "./protocol";
 
@@ -77,5 +78,16 @@ describe("NotificationToasts", () => {
     expect(container.querySelectorAll(".toast")).toHaveLength(1);
     expect(container.textContent).toContain("Fresh failure");
     expect(container.textContent).not.toContain("Historical warning");
+  });
+});
+
+describe("formatNotificationsForClipboard", () => {
+  it("copies all current notifications newest first", () => {
+    expect(formatNotificationsForClipboard([historical, fresh])).toBe(
+      "[1970-01-01T00:00:00.002Z] Error — Fresh failure\n" +
+        "Arrived after the initial snapshot\n\n" +
+        "[1970-01-01T00:00:00.001Z] Warning — Historical warning\n" +
+        "Already present in the daemon snapshot",
+    );
   });
 });

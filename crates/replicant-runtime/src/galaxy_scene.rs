@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use replicant_client::{Client, Device, Location, Replicant, Star, StarKnowledge, TravelState};
+use replicant_client::{Client, Device, Location, Replicant, Star, TravelState};
 use replicant_protocol::{
     EntityId, EntityKind, EntityRef, GalaxyEdge, GalaxyExploration, GalaxyHighlight, GalaxyOverlay,
     GalaxyOverlayKind, GalaxyPoint, GalaxySceneSnapshot, GalaxySignal, GalaxyStar, GalaxyTravel,
@@ -24,13 +24,7 @@ pub async fn galaxy_scene(
     let stars = client.galaxy().catalogue();
     let replicant_handles = client.replicants().find().owned().collect().await?;
     let mut replicants = Vec::with_capacity(replicant_handles.len());
-    let mut knowledge = Vec::new();
     for handle in replicant_handles {
-        knowledge.extend(
-            client
-                .galaxy()
-                .replicant_star_knowledge(handle.id().as_str()),
-        );
         replicants.push(handle.snapshot().await?);
     }
     let device_handles = client.devices().find().owned().collect().await?;
@@ -42,7 +36,6 @@ pub async fn galaxy_scene(
 
     Ok(build_scene(SceneInputs {
         stars,
-        knowledge,
         locations,
         devices,
         replicants,
@@ -54,7 +47,6 @@ pub async fn galaxy_scene(
 
 struct SceneInputs {
     stars: Vec<Star>,
-    knowledge: Vec<StarKnowledge>,
     locations: Vec<Location>,
     devices: Vec<Device>,
     replicants: Vec<Replicant>,
@@ -104,7 +96,6 @@ fn workflow_targets(workflows: &[WorkflowInstance]) -> Vec<Target> {
 fn build_scene(inputs: SceneInputs) -> GalaxySceneSnapshot {
     let SceneInputs {
         stars,
-        knowledge,
         locations,
         devices,
         replicants,
@@ -123,13 +114,15 @@ fn build_scene(inputs: SceneInputs) -> GalaxySceneSnapshot {
     let mut explored = BTreeSet::new();
     let mut partial = BTreeSet::new();
     let mut life = BTreeSet::new();
-    for item in knowledge {
-        let system = item.star.id.to_string();
-        partial.insert(system.clone());
-        if item.explored == Some(true) {
+    for star in &stars {
+        let system = star.key.id.to_string();
+        if star.knowledge_observed {
+            partial.insert(system.clone());
+        }
+        if star.explored == Some(true) {
             explored.insert(system.clone());
         }
-        if item.has_life == Some(true) {
+        if star.has_life == Some(true) {
             life.insert(system);
         }
     }
@@ -199,6 +192,7 @@ fn build_scene(inputs: SceneInputs) -> GalaxySceneSnapshot {
             Some(GalaxyStar {
                 name: star.name,
                 spectral_type: star.spectral_type,
+                region: star.region,
                 position,
                 exploration: if explored.contains(&id) {
                     GalaxyExploration::Explored
@@ -417,6 +411,9 @@ mod tests {
             entry_point: None,
             position: Some(GalacticPosition { x, y: 0.0, z: 0.0 }),
             has_hub: Some(false),
+            knowledge_observed: false,
+            explored: None,
+            has_life: None,
             region: None,
         }
     }
@@ -455,7 +452,6 @@ mod tests {
         };
         let scene = build_scene(SceneInputs {
             stars: vec![star("SOL", 0.0), star("ALPHA", 7.0)],
-            knowledge: Vec::new(),
             locations: Vec::new(),
             devices: vec![relay("R1", "SOL-1"), relay("R2", "ALPHA-1")],
             replicants: Vec::new(),

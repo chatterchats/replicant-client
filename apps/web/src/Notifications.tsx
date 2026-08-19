@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { Notification, NotificationLevel } from "./protocol";
+import { formatNotificationsForClipboard } from "./notificationClipboard";
 import { relativeTime } from "./time";
 
 /** How long a toast stays on screen before dismissing itself. */
@@ -113,6 +114,9 @@ export function NotificationCenter({
   onDismiss: (notification: Notification) => void;
   onClearAll: () => void;
 }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
   const ordered = useMemo(
     () => [...notifications].sort((a, b) => b.created_at_ms - a.created_at_ms),
     [notifications],
@@ -122,9 +126,29 @@ export function NotificationCenter({
       <header>
         <h2>Notifications</h2>
         <div className="notification-center-actions">
-          {ordered.length > 0 && (
-            <button onClick={onClearAll}>Clear all</button>
-          )}
+          {ordered.length > 0 ? (
+            <>
+              <button
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(formatNotificationsForClipboard(ordered))
+                    .then(() => {
+                      setCopyState("copied");
+                    })
+                    .catch(() => {
+                      setCopyState("failed");
+                    });
+                }}
+              >
+                {copyState === "copied"
+                  ? "Copied"
+                  : copyState === "failed"
+                    ? "Copy failed"
+                    : "Copy notifications"}
+              </button>
+              <button onClick={onClearAll}>Clear all</button>
+            </>
+          ) : null}
           <button aria-label="Close notifications" onClick={onClose}>
             ×
           </button>

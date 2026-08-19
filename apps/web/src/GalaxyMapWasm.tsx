@@ -127,6 +127,7 @@ export function GalaxyMapWasm({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | undefined>(undefined);
+  const lastCenteredSystem = useRef<string>("");
   const [rendererReady, setRendererReady] = useState(false);
   const [error, setError] = useState(false);
   const geometry = useMemo(
@@ -197,8 +198,14 @@ export function GalaxyMapWasm({
 
   useEffect(() => {
     const renderer = rendererRef.current;
+    if (!centerSystem) {
+      lastCenteredSystem.current = "";
+      return;
+    }
+    if (!rendererReady || !renderer) return;
+    if (lastCenteredSystem.current === centerSystem) return;
     const star = scene.stars.find((item) => item.id === centerSystem);
-    if (!rendererReady || !renderer || !star) return;
+    if (!star) return;
     renderer.set_camera(
       renderer.camera_theta(),
       renderer.camera_phi(),
@@ -207,6 +214,7 @@ export function GalaxyMapWasm({
       star.position.y,
       star.position.z,
     );
+    lastCenteredSystem.current = centerSystem;
     persistCamera(renderer);
   }, [centerSystem, rendererReady, scene.stars]);
 

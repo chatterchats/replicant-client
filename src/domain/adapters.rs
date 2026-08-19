@@ -789,6 +789,9 @@ pub fn catalogue_star(
             .map(|id| WorldKey::in_realm(realm, LocationId::new(id))),
         position: raw.position.and_then(position),
         has_hub: raw.has_hub,
+        knowledge_observed: false,
+        explored: None,
+        has_life: None,
         region: raw.region.clone(),
     };
     Ok(Observation {
@@ -852,6 +855,48 @@ pub fn replicant_star_knowledge(
             Reachability::Historical,
         ),
     })
+}
+
+/// Collapses one Replicant-scoped star observation into the account-shared star projection.
+pub fn account_star_from_knowledge(knowledge: Observation<StarKnowledge>) -> Observation<Star> {
+    Observation {
+        value: Star {
+            key: knowledge.value.star,
+            name: None,
+            spectral_type: knowledge.value.spectral_type,
+            entry_point: knowledge.value.entry_point,
+            position: knowledge.value.position,
+            has_hub: knowledge.value.has_hub,
+            knowledge_observed: true,
+            explored: knowledge.value.explored,
+            has_life: knowledge.value.has_life,
+            region: knowledge.value.region,
+        },
+        metadata: knowledge.metadata,
+    }
+}
+
+/// Builds the legacy Replicant-scoped compatibility view from account-shared star state.
+pub fn star_knowledge_view(
+    star: Observation<Star>,
+    replicant: ReplicantKey,
+) -> Observation<StarKnowledge> {
+    Observation {
+        value: StarKnowledge {
+            replicant,
+            star: star.value.key,
+            position: star.value.position,
+            spectral_type: star.value.spectral_type,
+            entry_point: star.value.entry_point,
+            explored: star.value.explored,
+            has_hub: star.value.has_hub,
+            has_life: star.value.has_life,
+            region: star.value.region,
+            distance_from_replicant: None,
+            estimated_travel_time: None,
+        },
+        metadata: star.metadata,
+    }
 }
 
 pub fn account_event(

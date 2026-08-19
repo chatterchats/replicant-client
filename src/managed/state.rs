@@ -13,7 +13,7 @@ use tracing::{debug, info};
 use crate::domain::{
     Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location, LocationKey,
     MergeOutcome, Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId, Star,
-    StarKey, StarKnowledge, merge_device, merge_star, merge_star_knowledge,
+    StarKey, StarKnowledge, merge_device, merge_star,
 };
 
 use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
@@ -141,7 +141,6 @@ pub(crate) struct StateSnapshot {
 struct GalaxySnapshot {
     catalogue: BTreeMap<StarKey, Observation<Star>>,
     generated_at: Option<String>,
-    knowledge: BTreeMap<(ReplicantKey, StarKey), Observation<StarKnowledge>>,
 }
 
 impl StateSnapshot {
@@ -176,27 +175,18 @@ impl StateEngine {
 
     pub(crate) fn from_store(store: StoreHandle) -> Result<Self, StoreError> {
         let restore_started = Instant::now();
-        let (
-            devices,
-            account,
-            replicants,
-            locations,
-            inventories,
-            simulations,
-            catalogue,
-            knowledge,
-        ) = store.execute_blocking(|opened| {
-            Ok((
-                opened.restore_devices()?,
-                opened.restore_account()?,
-                opened.restore_replicants()?,
-                opened.restore_locations()?,
-                opened.restore_inventories()?,
-                opened.restore_simulations()?,
-                opened.restore_catalogue()?,
-                opened.restore_star_knowledge()?,
-            ))
-        })?;
+        let (devices, account, replicants, locations, inventories, simulations, catalogue) = store
+            .execute_blocking(|opened| {
+                Ok((
+                    opened.restore_devices()?,
+                    opened.restore_account()?,
+                    opened.restore_replicants()?,
+                    opened.restore_locations()?,
+                    opened.restore_inventories()?,
+                    opened.restore_simulations()?,
+                    opened.restore_catalogue()?,
+                ))
+            })?;
         let snapshot = Arc::new(StateSnapshot {
             revision: 0,
             galaxy_revision: 0,
@@ -219,7 +209,6 @@ impl StateEngine {
             inventories = snapshot.inventories.len(),
             simulations = snapshot.simulations.len(),
             catalogue = catalogue.0.len(),
-            star_knowledge = knowledge.len(),
             "restored durable managed state"
         );
         Ok(Self {
@@ -229,7 +218,6 @@ impl StateEngine {
             galaxy: RwLock::new(Arc::new(GalaxySnapshot {
                 catalogue: catalogue.0,
                 generated_at: catalogue.1,
-                knowledge,
             })),
         })
     }
@@ -291,10 +279,11 @@ impl StateEngine {
         self.galaxy
             .read()
             .expect("galaxy snapshot lock poisoned")
-            .knowledge
-            .iter()
-            .filter(|((known_by, _), _)| known_by == replicant)
-            .map(|(_, value)| value.clone())
+            .catalogue
+            .values()
+            .filter(|star| star.value.knowledge_observed)
+            .cloned()
+            .map(|star| crate::domain::star_knowledge_view(star, replicant.clone()))
             .collect()
     }
 
@@ -370,57 +359,63 @@ impl StateEngine {
             .galaxy
             .read()
             .expect("galaxy snapshot lock poisoned")
-            .knowledge
+            .catalogue
             .clone();
-        let knowledge = knowledge
-            .into_iter()
-            .map(|incoming| {
-                let key = (
-                    incoming.value.replicant.clone(),
-                    incoming.value.star.clone(),
-                );
-                if let Some(current) = existing.get(&key).cloned() {
-                    match merge_star_knowledge(current, incoming) {
-                        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
-                    }
-                } else {
-                    incoming
-                }
-            })
-            .collect::<Vec<_>>();
-        let galaxy_changed = knowledge.iter().any(|observation| {
-            let key = (
-                observation.value.replicant.clone(),
-                observation.value.star.clone(),
-            );
-            existing
+        let mut catalogue = existing.clone();
+        let mut changed = BTreeMap::new();
+        for incoming in knowledge {
+            let incoming = crate::domain::account_star_from_knowledge(incoming);
+            let key = incoming.value.key.clone();
+            let merged = if let Some(current) = catalogue.get(&key).cloned() {
+                let current_knowledge_observed = current.value.knowledge_observed;
+                let current_explored = current.value.explored;
+                let current_has_life = current.value.has_life;
+                let incoming_knowledge_observed = incoming.value.knowledge_observed;
+                let incoming_explored = incoming.value.explored;
+                let incoming_has_life = incoming.value.has_life;
+                let mut merged = match merge_star(current, incoming) {
+                    MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
+                };
+                merged.value.knowledge_observed =
+                    current_knowledge_observed || incoming_knowledge_observed;
+                merged.value.explored =
+                    merge_positive_account_fact(current_explored, incoming_explored);
+                merged.value.has_life =
+                    merge_positive_account_fact(current_has_life, incoming_has_life);
+                merged
+            } else {
+                incoming
+            };
+            if catalogue
                 .get(&key)
-                .is_none_or(|current| current.value != observation.value)
-        });
+                .is_none_or(|current| current.value != merged.value)
+            {
+                catalogue.insert(key.clone(), merged.clone());
+                changed.insert(key, merged);
+            }
+        }
 
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let changed_stars = changed.values().cloned().collect::<Vec<_>>();
         self.store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .persist_star_knowledge_batch(&knowledge)?;
+            .persist_stars(&changed_stars)?;
 
         let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
             .as_ref()
             .clone();
-        for observation in knowledge {
-            galaxy.knowledge.insert(
-                (
-                    observation.value.replicant.clone(),
-                    observation.value.star.clone(),
-                ),
-                observation,
-            );
+        for star in changed.into_values() {
+            galaxy.catalogue.insert(star.value.key.clone(), star);
         }
         *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
 
         let mut snapshot = (*self.snapshot()).clone();
         snapshot.revision += 1;
-        snapshot.galaxy_revision += u64::from(galaxy_changed);
+        snapshot.galaxy_revision += 1;
         self.publish(snapshot);
         Ok(())
     }
@@ -651,7 +646,7 @@ impl StateEngine {
             .event_cursor()
     }
 
-    /// Returns the durable, deduplicated account event journal.
+    /// Returns durable, deduplicated account event history.
     pub(crate) fn events(&self) -> Result<Vec<Event>, StoreError> {
         self.store
             .lock()
@@ -1170,6 +1165,14 @@ impl StateEngine {
     }
 }
 
+fn merge_positive_account_fact(current: Option<bool>, incoming: Option<bool>) -> Option<bool> {
+    match (current, incoming) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1238,6 +1241,9 @@ mod tests {
                 entry_point: None,
                 position: None,
                 has_hub,
+                knowledge_observed: false,
+                explored: None,
+                has_life: None,
                 region: region.map(str::to_owned),
             },
             metadata: device("metadata").metadata,
@@ -1257,12 +1263,12 @@ mod tests {
                 position: None,
                 spectral_type: None,
                 entry_point: None,
-                explored: None,
+                explored: Some(true),
                 has_hub,
-                has_life: None,
+                has_life: Some(true),
                 region: region.map(str::to_owned),
-                distance_from_replicant: None,
-                estimated_travel_time: None,
+                distance_from_replicant: Some(42.0),
+                estimated_travel_time: Some(120),
             },
             metadata: device("metadata").metadata,
         }
@@ -1428,6 +1434,12 @@ mod tests {
         let catalogue = engine.catalogue();
         assert_eq!(catalogue[0].value.has_hub, Some(true));
         assert_eq!(catalogue[0].value.region.as_deref(), Some("solzone"));
+        assert!(
+            engine
+                .star_knowledge(&ReplicantKey::live("R2".into()))
+                .is_empty(),
+            "catalogue membership alone is not account star knowledge"
+        );
 
         engine
             .persist_star_knowledge(star_knowledge("R1", "SOL", Some(false), Some("alpha")))
@@ -1436,9 +1448,14 @@ mod tests {
             .persist_star_knowledge(star_knowledge("R1", "SOL", None, None))
             .expect("persist partial star knowledge");
         assert_eq!(engine.snapshot().galaxy_revision(), 2);
-        let knowledge = engine.star_knowledge(&ReplicantKey::live("R1".into()));
+        let knowledge = engine.star_knowledge(&ReplicantKey::live("R2".into()));
+        assert_eq!(knowledge[0].value.replicant.id.as_str(), "R2");
         assert_eq!(knowledge[0].value.has_hub, Some(false));
         assert_eq!(knowledge[0].value.region.as_deref(), Some("alpha"));
+        assert_eq!(knowledge[0].value.explored, Some(true));
+        assert_eq!(knowledge[0].value.has_life, Some(true));
+        assert_eq!(knowledge[0].value.distance_from_replicant, None);
+        assert_eq!(knowledge[0].value.estimated_travel_time, None);
     }
 
     #[test]

@@ -52,11 +52,43 @@ const activeStatuses: WorkflowStatus[] = [
   "reconciling",
 ];
 
+type SmartOption = { value: string; label: string };
+
 function entityIds(entities: Record<string, unknown>, kind: EntityKind) {
   const prefix = `${kind}:`;
   return Object.keys(entities)
     .filter((key) => key.startsWith(prefix))
     .map((key) => key.slice(prefix.length));
+}
+
+function entityOptions(
+  entities: Record<string, unknown>,
+  kind: EntityKind,
+): SmartOption[] {
+  const prefix = `${kind}:`;
+  return Object.entries(entities)
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([key, value]) => {
+      const id = key.slice(prefix.length);
+      if (typeof value !== "object" || value === null)
+        return { value: id, label: id };
+      const summary = value as Record<string, unknown>;
+      const label = typeof summary.label === "string" ? summary.label : id;
+      const secondary =
+        typeof summary.secondary_label === "string"
+          ? summary.secondary_label
+          : null;
+      return {
+        value: id,
+        label:
+          label === id
+            ? secondary
+              ? `${label} · ${secondary}`
+              : label
+            : `${label} (${id})`,
+      };
+    })
+    .sort((left, right) => left.label.localeCompare(right.label));
 }
 
 function deviceTypes(entities: Record<string, unknown>) {
@@ -74,20 +106,72 @@ function deviceTypes(entities: Record<string, unknown>) {
 function optionsFor(
   parameter: ParameterDescriptor,
   entities: Record<string, unknown>,
-) {
-  switch (parameter.kind.type) {
-    case "system":
-    case "location":
-    case "replicant":
-    case "device":
-      return entityIds(entities, parameter.kind.type);
-    case "device_type":
-      return deviceTypes(entities);
-    case "entity":
-      return entityIds(entities, parameter.kind.entity_kind);
-    default:
-      return [];
+  operationKind?: string,
+  blueprintTypes: string[] = [],
+): SmartOption[] {
+  const entityKind = parameter.kind.type;
+  if (operationKind === "device.change_owner" && parameter.name === "target") {
+    return entityOptions(entities, "replicant");
   }
+  if (entityKind === "replicant") return entityOptions(entities, "replicant");
+  if (entityKind === "device_type") {
+    const values =
+      blueprintTypes.length > 0 ? blueprintTypes : deviceTypes(entities);
+    return values.map((value) => ({ value, label: value }));
+  }
+  if (entityKind === "device") {
+    let options = entityOptions(entities, "device");
+    const deviceType = (id: string) => {
+      const value = entities[`device:${id}`];
+      if (typeof value !== "object" || value === null) return null;
+      const summary = value as Record<string, unknown>;
+      return typeof summary.device_type === "string"
+        ? summary.device_type
+        : typeof summary.entity_type === "string"
+          ? summary.entity_type
+          : null;
+    };
+    if (operationKind === "replicant.teleport" && parameter.name === "target") {
+      options = options.filter(
+        (option) => deviceType(option.value) === "empty_replicant_matrix",
+      );
+    } else if (
+      operationKind === "clone.replicate" &&
+      parameter.name === "target"
+    ) {
+      options = options.filter(
+        (option) => deviceType(option.value) === "empty_replicant_matrix",
+      );
+    } else if (
+      operationKind === "clone.replicate" &&
+      parameter.name === "source"
+    ) {
+      options = options.filter(
+        (option) => deviceType(option.value) === "replicant_matrix",
+      );
+    } else if (
+      operationKind === "clone.stow_target" &&
+      parameter.name === "matrix"
+    ) {
+      options = options.filter(
+        (option) => deviceType(option.value) === "empty_replicant_matrix",
+      );
+    } else if (
+      operationKind === "autofactory.print" &&
+      parameter.name === "device"
+    ) {
+      options = options.filter(
+        (option) => deviceType(option.value) === "autofactory",
+      );
+    }
+    return options;
+  }
+  if (entityKind === "system" || entityKind === "location") {
+    return entityOptions(entities, entityKind);
+  }
+  if (entityKind === "entity")
+    return entityOptions(entities, parameter.kind.entity_kind);
+  return [];
 }
 
 export function validateParameters(
@@ -145,15 +229,24 @@ export function ParameterField({
   entities,
   error,
   onChange,
+  operationKind,
+  blueprintTypes = [],
 }: {
   parameter: ParameterDescriptor;
   value: unknown;
   entities: Record<string, unknown>;
   error?: string;
   onChange: (value: unknown) => void;
+  operationKind?: string;
+  blueprintTypes?: string[];
 }) {
   const id = `workflow-${parameter.name}`;
-  const options = optionsFor(parameter, entities);
+  const options = optionsFor(
+    parameter,
+    entities,
+    operationKind,
+    blueprintTypes,
+  );
   const help = error ?? parameter.description;
   if (parameter.kind.type === "boolean") {
     return (
@@ -200,6 +293,49 @@ export function ParameterField({
   }
   const numeric =
     parameter.kind.type === "integer" || parameter.kind.type === "number";
+  const restrictedDevice =
+    parameter.kind.type === "device" &&
+    ((operationKind === "replicant.teleport" && parameter.name === "target") ||
+      (operationKind === "clone.replicate" &&
+        (parameter.name === "target" || parameter.name === "source")) ||
+      (operationKind === "clone.stow_target" && parameter.name === "matrix") ||
+      (operationKind === "autofactory.print" && parameter.name === "device"));
+  const useSelect =
+    parameter.kind.type === "replicant" ||
+    parameter.kind.type === "device_type" ||
+    restrictedDevice ||
+    (operationKind === "device.change_owner" && parameter.name === "target");
+  const emptyHint =
+    operationKind === "replicant.teleport" && parameter.name === "target"
+      ? "No empty matrices available"
+      : `No ${parameter.label.toLowerCase()} available`;
+  if (useSelect) {
+    return (
+      <label htmlFor={id}>
+        {parameter.label}
+        <select
+          id={id}
+          name={parameter.name}
+          required={parameter.required}
+          disabled={options.length === 0}
+          value={stringValue(value)}
+          onChange={(event) => {
+            onChange(event.target.value);
+          }}
+        >
+          <option value="">{options.length > 0 ? "Select…" : emptyHint}</option>
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <small className={error ? "field-error" : ""}>
+          {options.length === 0 ? emptyHint : help}
+        </small>
+      </label>
+    );
+  }
   const semantic = options.length > 0;
   return (
     <label htmlFor={id}>
@@ -229,7 +365,11 @@ export function ParameterField({
       {semantic ? (
         <datalist id={`${id}-options`}>
           {options.map((option) => (
-            <option key={option} value={option} />
+            <option
+              key={option.value}
+              value={option.value}
+              label={option.label}
+            />
           ))}
         </datalist>
       ) : null}
@@ -294,6 +434,7 @@ function WorkflowForm({
             parameter={parameter}
             value={values[parameter.name]}
             entities={entities}
+            operationKind={descriptor.kind}
             error={errors[parameter.name]}
             onChange={(value) => {
               setValues((current) => ({ ...current, [parameter.name]: value }));
@@ -935,8 +1076,12 @@ function TriggersView({
 function targetSummary(
   detail: WorkflowDetail | undefined,
   descriptor: WorkflowDescriptor | undefined,
+  detailError?: string,
 ) {
-  if (!detail) return "Loading targets…";
+  if (!detail)
+    return detailError
+      ? `Details unavailable: ${detailError}`
+      : "Loading targets…";
   const targetNames = new Set(
     descriptor?.parameters
       .filter((item) =>
@@ -970,6 +1115,7 @@ function WorkflowRow({
   workflow,
   descriptor,
   detail,
+  detailError,
   selected,
   onSelect,
   onControl,
@@ -977,6 +1123,7 @@ function WorkflowRow({
   workflow: WorkflowSummary;
   descriptor?: WorkflowDescriptor;
   detail?: WorkflowDetail;
+  detailError?: string;
   selected: boolean;
   onSelect: () => void;
   onControl: (action: "pause" | "resume" | "cancel") => void;
@@ -1003,7 +1150,7 @@ function WorkflowRow({
         </span>
         <span>
           <small>Targets / resources</small>
-          {targetSummary(detail, descriptor)}
+          {targetSummary(detail, descriptor, detailError)}
         </span>
         <span>
           <small>{detail?.error ? "Error" : "Wait reason"}</small>
@@ -1046,6 +1193,25 @@ function WorkflowRow({
   );
 }
 
+function workflowParameterValue(value: unknown) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") return value;
+  if (
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    typeof value === "symbol"
+  ) {
+    return value.toString();
+  }
+  if (typeof value === "function") return value.name || "function";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "Unserializable value";
+  }
+}
+
 function WorkflowInspector({
   detail,
   activity,
@@ -1055,6 +1221,9 @@ function WorkflowInspector({
   activity: WorkflowActivity[];
   onClose: () => void;
 }) {
+  const orderedActivity = [...activity].sort(
+    (left, right) => right.occurred_at_ms - left.occurred_at_ms,
+  );
   return (
     <aside className="workflow-inspector" aria-label="Workflow details">
       <header className="drawer-header">
@@ -1066,6 +1235,38 @@ function WorkflowInspector({
           ×
         </button>
       </header>
+      <section className="workflow-inspector-summary">
+        <h3>Run status</h3>
+        <dl>
+          <dt>Status</dt>
+          <dd>
+            <span className={`workflow-status ${detail.summary.status}`}>
+              {detail.summary.status}
+            </span>
+          </dd>
+          <dt>Current step</dt>
+          <dd>{detail.summary.current_step ?? "Not started"}</dd>
+          <dt>Created</dt>
+          <dd>{new Date(detail.created_at_ms).toLocaleString()}</dd>
+          {detail.finished_at_ms !== null ? (
+            <>
+              <dt>Finished</dt>
+              <dd>{new Date(detail.finished_at_ms).toLocaleString()}</dd>
+            </>
+          ) : null}
+        </dl>
+        {detail.error ? (
+          <div className="workflow-failure" role="alert">
+            <strong>Failure reason</strong>
+            <p>{detail.error}</p>
+          </div>
+        ) : detail.wait_reason ? (
+          <div className="workflow-wait-reason">
+            <strong>Waiting on</strong>
+            <p>{detail.wait_reason}</p>
+          </div>
+        ) : null}
+      </section>
       {detail.parent_id ? (
         <section>
           <h3>Orchestration</h3>
@@ -1074,6 +1275,21 @@ function WorkflowInspector({
           </p>
         </section>
       ) : null}
+      <section>
+        <h3>Parameters / targets</h3>
+        {Object.keys(detail.parameters).length ? (
+          <dl className="workflow-parameters">
+            {Object.entries(detail.parameters).map(([key, value]) => (
+              <div key={key}>
+                <dt>{key.replaceAll("_", " ")}</dt>
+                <dd>{workflowParameterValue(value)}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : (
+          <p className="empty-state">No configured parameters.</p>
+        )}
+      </section>
       <section>
         <h3>Claimed resources</h3>
         {detail.claims.length ? (
@@ -1089,18 +1305,22 @@ function WorkflowInspector({
         )}
       </section>
       <section>
-        <h3>Activity timeline</h3>
-        <ol className="timeline">
-          {activity.map((item) => (
-            <li className={item.level} key={item.id}>
-              <time dateTime={new Date(item.occurred_at_ms).toISOString()}>
-                {new Date(item.occurred_at_ms).toLocaleString()}
-              </time>
-              <strong>{item.step ?? item.level}</strong>
-              <p>{item.message}</p>
-            </li>
-          ))}
-        </ol>
+        <h3>Recent activity</h3>
+        {orderedActivity.length ? (
+          <ol className="timeline">
+            {orderedActivity.map((item) => (
+              <li className={item.level} key={item.id}>
+                <time dateTime={new Date(item.occurred_at_ms).toISOString()}>
+                  {new Date(item.occurred_at_ms).toLocaleString()}
+                </time>
+                <strong>{item.step ?? item.level}</strong>
+                <p>{item.message}</p>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="empty-state">No workflow activity recorded.</p>
+        )}
       </section>
     </aside>
   );
@@ -1173,6 +1393,12 @@ function DirectorView() {
   );
   const goalPolicies = Array.from(
     new Map(data.goals.map((goal) => [goal.kind, goal.enabled])).entries(),
+  );
+  const replicantLabels = new Map(
+    data.replicants.map((replicant) => [
+      replicant.code,
+      replicant.name ? `${replicant.name} (${replicant.code})` : replicant.code,
+    ]),
   );
   const activeRequirements = data.requirements.filter(
     (requirement) => requirement.status !== "satisfied",
@@ -1334,7 +1560,9 @@ function DirectorView() {
               </div>
               <div className="director-region-workers">
                 {region.replicants.length
-                  ? region.replicants.join(", ")
+                  ? region.replicants
+                      .map((code) => replicantLabels.get(code) ?? code)
+                      .join(", ")
                   : "No assigned workers"}
               </div>
             </header>
@@ -1403,10 +1631,12 @@ export function AutomationsPage({
   workflows,
   entities,
   selectedWorkflowId,
+  onSelectedWorkflowConsumed,
 }: {
   workflows: WorkflowSummary[];
   entities: Record<string, unknown>;
   selectedWorkflowId?: string;
+  onSelectedWorkflowConsumed?: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("Director");
   const [descriptors, setDescriptors] = useState<WorkflowDescriptor[]>([]);
@@ -1417,6 +1647,7 @@ export function AutomationsPage({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [created, setCreated] = useState<WorkflowSummary[]>([]);
   const [details, setDetails] = useState<Record<string, WorkflowDetail>>({});
+  const [detailErrors, setDetailErrors] = useState<Record<string, string>>({});
   const [activity, setActivity] = useState<WorkflowActivity[]>([]);
   const [error, setError] = useState<string | null>(null);
   const currentWorkflows = useMemo(
@@ -1428,15 +1659,30 @@ export function AutomationsPage({
     ],
     [created, workflows],
   );
-  const workflowVersion = currentWorkflows
-    .map(({ id, revision }) => `${id}:${String(revision)}`)
-    .join();
+  const workflowIds = useMemo(
+    () =>
+      currentWorkflows
+        .map((workflow) => workflow.id)
+        .sort((left, right) => left.localeCompare(right))
+        .join("|"),
+    [currentWorkflows],
+  );
+  const selectedWorkflowRevision = currentWorkflows.find(
+    (workflow) => workflow.id === selectedId,
+  )?.revision;
 
   useEffect(() => {
     if (!selectedWorkflowId) return;
-    setTab("Active");
+    const selectedWorkflow = currentWorkflows.find(
+      (workflow) => workflow.id === selectedWorkflowId,
+    );
+    if (!selectedWorkflow) return;
+    setTab(
+      activeStatuses.includes(selectedWorkflow.status) ? "Active" : "History",
+    );
     setSelectedId(selectedWorkflowId);
-  }, [selectedWorkflowId]);
+    onSelectedWorkflowConsumed?.();
+  }, [currentWorkflows, onSelectedWorkflowConsumed, selectedWorkflowId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1458,24 +1704,33 @@ export function AutomationsPage({
   }, []);
 
   useEffect(() => {
+    if (!workflowIds) return;
     const controller = new AbortController();
-    void Promise.all(
-      currentWorkflows.map((workflow) =>
-        daemonApi.workflow(workflow.id, controller.signal),
-      ),
-    )
-      .then((items) => {
-        setDetails(
-          Object.fromEntries(items.map((item) => [item.summary.id, item])),
-        );
-      })
-      .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setError(String(reason));
-      });
+    for (const workflowId of workflowIds.split("|")) {
+      void daemonApi
+        .workflow(workflowId, controller.signal)
+        .then((detail) => {
+          if (controller.signal.aborted) return;
+          setDetails((current) => ({ ...current, [workflowId]: detail }));
+          setDetailErrors((current) => {
+            if (!(workflowId in current)) return current;
+            return Object.fromEntries(
+              Object.entries(current).filter(([key]) => key !== workflowId),
+            );
+          });
+        })
+        .catch((reason: unknown) => {
+          if (controller.signal.aborted) return;
+          setDetailErrors((current) => ({
+            ...current,
+            [workflowId]: String(reason),
+          }));
+        });
+    }
     return () => {
       controller.abort();
     };
-  }, [currentWorkflows]);
+  }, [workflowIds]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -1483,6 +1738,25 @@ export function AutomationsPage({
       return;
     }
     const controller = new AbortController();
+    void daemonApi
+      .workflow(selectedId, controller.signal)
+      .then((detail) => {
+        if (controller.signal.aborted) return;
+        setDetails((current) => ({ ...current, [selectedId]: detail }));
+        setDetailErrors((current) => {
+          if (!(selectedId in current)) return current;
+          return Object.fromEntries(
+            Object.entries(current).filter(([key]) => key !== selectedId),
+          );
+        });
+      })
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted) return;
+        setDetailErrors((current) => ({
+          ...current,
+          [selectedId]: String(reason),
+        }));
+      });
     void daemonApi
       .workflowActivity(selectedId, controller.signal)
       .then(setActivity)
@@ -1492,7 +1766,7 @@ export function AutomationsPage({
     return () => {
       controller.abort();
     };
-  }, [selectedId, workflowVersion]);
+  }, [selectedId, selectedWorkflowRevision]);
 
   const descriptorsByKind = useMemo(
     () => Object.fromEntries(descriptors.map((item) => [item.kind, item])),
@@ -1552,6 +1826,10 @@ export function AutomationsPage({
             className={tab === item ? "active" : ""}
             key={item}
             onClick={() => {
+              if (item !== tab) {
+                setSelectedId(null);
+                setActivity([]);
+              }
               setTab(item);
             }}
           >
@@ -1624,6 +1902,7 @@ export function AutomationsPage({
                 workflow={workflow}
                 descriptor={descriptorsByKind[workflow.kind]}
                 detail={details[workflow.id]}
+                detailError={detailErrors[workflow.id]}
                 selected={selectedId === workflow.id}
                 onSelect={() => {
                   setSelectedId(workflow.id);

@@ -1,16 +1,70 @@
 {
-  "schema_version": 1,
+  "schema_version": 4,
   "migration": "migrations/0001_initial.sql",
   "observation_time": "unix_milliseconds (INTEGER)",
-  "sqlite_durability": "foreign_keys=ON; WAL for file databases; busy_timeout=5000ms; synchronous=FULL",
-  "durable_managed_projections": ["accounts", "devices", "replicants", "locations", "inventories", "simulations", "stars", "replicant_star_knowledge"],
-  "required_tables": [
-    "schema_metadata", "account_binding", "source_documents", "accounts", "replicants",
-    "public_directory_profiles", "devices", "device_relationships", "locations", "inventories",
-    "discovery_data", "stars", "catalogue_metadata", "replicant_star_knowledge", "resource_sites", "location_events", "messages", "bobnet_messages",
-    "blueprints", "achievements", "reputation", "species", "trades", "simulations", "event_journal",
-    "event_cursors", "operation_journal", "reconciliation_queue", "reconciliation_runs",
-    "freshness", "tombstones"
+  "sqlite_durability": "primary/history: WAL for file databases; busy_timeout=15000ms; synchronous=NORMAL; history uses incremental auto-vacuum",
+  "durable_managed_projections": [
+    "accounts",
+    "devices",
+    "replicants",
+    "locations",
+    "inventories",
+    "simulations",
+    "stars"
   ],
-  "required_indexes": ["devices_realm_type_status", "devices_realm_location", "devices_realm_access"]
+  "required_tables": [
+    "schema_metadata",
+    "account_binding",
+    "source_documents",
+    "accounts",
+    "replicants",
+    "public_directory_profiles",
+    "devices",
+    "device_relationships",
+    "locations",
+    "inventories",
+    "discovery_data",
+    "stars",
+    "catalogue_metadata",
+    "resource_sites",
+    "location_events",
+    "messages",
+    "bobnet_messages",
+    "blueprints",
+    "achievements",
+    "reputation",
+    "species",
+    "trades",
+    "simulations",
+    "event_cursors",
+    "operation_journal",
+    "reconciliation_queue",
+    "reconciliation_runs",
+    "freshness",
+    "tombstones"
+  ],
+  "required_indexes": [
+    "devices_realm_type_status",
+    "devices_realm_location",
+    "devices_realm_access"
+  ],
+  "history_database": "replicant-history.sqlite (derived sibling of the managed database); event_history is long-lived history/telemetry storage",
+  "legacy_migrated_tables": [
+    "event_journal",
+    "replicant_star_knowledge"
+  ],
+  "history_migrations": [
+    "migrations/history/0001_initial.sql",
+    "migrations/history/0002_indexes.sql"
+  ],
+  "history_required_tables": [
+    "history_schema_metadata",
+    "event_history"
+  ],
+  "history_required_indexes": [
+    "event_history_occurred_at",
+    "event_history_name_time",
+    "event_history_device_time",
+    "event_history_staged"
+  ]
 }

@@ -36,11 +36,12 @@ use crate::{
     ApplicationError,
     automation::{
         BlueprintAcquireIntent, BlueprintShopPurchaseIntent, EventCampaignIntent,
-        LogisticsManifestIntent, MiningCampaignIntent, ObservatoryIntent, RegionEstablishIntent,
-        ReplicantProvisionIntent, ScanTourIntent, blueprint_acquire_workflow_kind,
-        new_blueprint_acquire_workflow, new_event_campaign_workflow,
-        new_logistics_manifest_workflow, new_mining_campaign_workflow, new_observatory_workflow,
-        new_region_establish_workflow, new_replicant_provision_workflow, new_scan_tour_workflow,
+        ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent, ObservatoryIntent,
+        RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
+        blueprint_acquire_workflow_kind, exploration_workflow_kind, new_blueprint_acquire_workflow,
+        new_event_campaign_workflow, new_exploration_workflow, new_logistics_manifest_workflow,
+        new_mining_campaign_workflow, new_observatory_workflow, new_region_establish_workflow,
+        new_replicant_provision_workflow, new_scan_tour_workflow,
     },
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
@@ -78,6 +79,7 @@ const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
 
 const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
+const PRIORITY_FTL_EXPANSION: u32 = 650;
 const PRIORITY_CATALOGUE: u32 = 500;
 const PRIORITY_MINING: u32 = 450;
 const PRIORITY_CATALOGUE_BLUEPRINT: u32 = 400;
@@ -509,6 +511,7 @@ pub async fn reconcile_director(
         })
         .collect::<Vec<_>>();
     workers.sort_by(|left, right| left.replicant.key.id.cmp(&right.replicant.key.id));
+    mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
 
     for region in regions.values_mut() {
         if let Some(home) = preferred_home_location(
@@ -586,12 +589,36 @@ pub async fn reconcile_director(
         .filter(|region| region.status == DirectorRegionStatus::Established)
         .cloned()
         .collect::<Vec<_>>();
+    let establishing_regions = regions
+        .values()
+        .filter(|region| region.status == DirectorRegionStatus::Establishing)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // A partially bootstrapped region can use its already-staged Replicants to
+    // improve catalogue coverage while its System Hub is still being printed
+    // or deployed. Do not start hub-dependent event/mining/maintenance goals
+    // until the foothold becomes fully established.
+    for region in &establishing_regions {
+        goals.push(reconcile_enhance_catalogue(
+            client,
+            &goal_context,
+            region,
+            &workers,
+            &mut reserved_workers,
+            &mut requirements,
+        )?);
+    }
 
     let mut event_discovery_error = None;
-    let event_designations_by_region = if goal_enabled(
+    let mut event_systems_by_region = BTreeMap::<String, BTreeSet<String>>::new();
+    let event_designations_by_region = if (goal_enabled(
         &goal_controls,
         DirectorGoalKind::EventCompletion,
-    ) && !established_regions.is_empty()
+    ) || goal_enabled(
+        &goal_controls,
+        DirectorGoalKind::ExpandFtlNetwork,
+    )) && !established_regions.is_empty()
     {
         let event_started = Instant::now();
         tracing::info!(
@@ -601,8 +628,14 @@ pub async fn reconcile_director(
         );
         match tokio::time::timeout(EVENT_DISCOVERY_TIMEOUT, active_events(client)).await {
             Ok(Ok(active_events)) => {
+                event_systems_by_region = group_active_event_systems_by_region(
+                    &active_events,
+                    &location_systems,
+                    &system_regions,
+                    &regions,
+                );
                 let grouped = group_active_events_by_region(
-                    active_events,
+                    &active_events,
                     &location_systems,
                     &system_regions,
                     &regions,
@@ -694,14 +727,21 @@ pub async fn reconcile_director(
             &mut requirements,
             now,
         )?);
-        goals.push(waiting_goal(
-            DirectorGoalKind::ExpandFtlNetwork,
-            Some(&region.region),
-            &goal_controls,
-            "Maintain and extend regional FTL reach",
-            "FTL coverage scoring is not yet enabled in the Director planner",
-            "Existing exploration.frontier workflows remain available for explicit expansion",
-        ));
+        let regional_event_systems = event_systems_by_region
+            .get(&region.region)
+            .cloned()
+            .unwrap_or_default();
+        goals.push(reconcile_expand_ftl_network(
+            &goal_context,
+            region,
+            &workers,
+            &mut reserved_workers,
+            &mut requirements,
+            &devices,
+            &locations,
+            &location_systems,
+            &regional_event_systems,
+        )?);
         goals.push(waiting_goal(
             DirectorGoalKind::EstablishBeacons,
             Some(&region.region),
@@ -880,7 +920,13 @@ fn reconcile_establish_regions(
             .iter()
             .filter(|worker| worker.region.as_deref() == Some(target.region.as_str()))
             .collect::<Vec<_>>();
-        if target_workers.len() < 2 {
+        if target.status == DirectorRegionStatus::Establishing {
+            next_action = Some(format!(
+                "Continue useful {} bootstrap work while the regional System Hub becomes available",
+                target.region
+            ));
+            DirectorGoalStatus::Active
+        } else if target_workers.len() < 2 {
             let needed = 2usize.saturating_sub(target_workers.len());
             let reason = format!(
                 "{} needs {needed} additional permanently assigned bootstrap worker(s)",
@@ -2585,16 +2631,12 @@ fn reconcile_enhance_catalogue(
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
 
-    let regional_codes = workers
-        .iter()
-        .filter(|worker| worker.region.as_deref() == Some(region.region.as_str()))
-        .map(|worker| worker.replicant.key.id.as_str().to_owned())
-        .collect::<Vec<_>>();
-    let explored = regional_codes
-        .iter()
-        .flat_map(|code| client.galaxy().replicant_star_knowledge(code))
-        .filter(|knowledge| knowledge.explored == Some(true))
-        .map(|knowledge| knowledge.star.id.as_str().to_owned())
+    let explored = client
+        .galaxy()
+        .catalogue()
+        .into_iter()
+        .filter(|star| star.explored == Some(true))
+        .map(|star| star.key.id.as_str().to_owned())
         .collect::<BTreeSet<_>>();
     let routable = client
         .galaxy()
@@ -2913,6 +2955,270 @@ fn reconcile_expand_mining(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reconcile_expand_ftl_network(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    workers: &[WorkerView],
+    reserved: &mut BTreeSet<String>,
+    requirements: &mut DirectorRequirementGraph,
+    devices: &[Device],
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+    event_systems: &BTreeSet<String>,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::ExpandFtlNetwork;
+    let enabled = goal_enabled(context.controls, kind);
+    let id = goal_instance_id(kind, Some(&region.region));
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, context.workflows);
+
+    let relay_systems = relay_device_systems(devices, location_systems);
+    let dense_belts = dense_belt_systems(locations, location_systems);
+    let covered = region.known_systems.intersection(&relay_systems).count();
+    let mut uncovered = region
+        .known_systems
+        .iter()
+        .filter(|system| !relay_systems.contains(*system))
+        .map(|system| {
+            let event_priority = event_systems.contains(system);
+            let dense_priority = dense_belts.contains(system);
+            let score = ftl_priority_score(event_priority, dense_priority);
+            (system.clone(), score, event_priority, dense_priority)
+        })
+        .collect::<Vec<_>>();
+    uncovered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut active = nonterminal_ids(&runtime, context.workflows);
+    let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
+    let mut blocker = None;
+    let (status, next_action) = if !enabled {
+        (
+            DirectorGoalStatus::Waiting,
+            Some("Enable this standing goal to extend regional FTL coverage".to_owned()),
+        )
+    } else if uncovered.is_empty() {
+        (
+            DirectorGoalStatus::Satisfied,
+            Some("Wait for newly discovered regional systems or new strategic demand".to_owned()),
+        )
+    } else if !active.is_empty() {
+        (
+            DirectorGoalStatus::Active,
+            Some("Continue the active regional FTL expansion campaign".to_owned()),
+        )
+    } else {
+        let (target, _, event_priority, dense_priority) = &uncovered[0];
+        if let Some(existing) = active_exploration_workflow_for_target(context.workflows, target)? {
+            runtime.active_workflows = vec![existing];
+            active = vec![existing];
+        }
+        if !active.is_empty() {
+            (
+                DirectorGoalStatus::Active,
+                Some(format!(
+                    "Continue the existing FTL expansion toward {target}{}",
+                    ftl_priority_suffix(*event_priority, *dense_priority)
+                )),
+            )
+        } else if recently_launched {
+            (
+                DirectorGoalStatus::Waiting,
+                Some(format!(
+                    "Wait briefly before retrying FTL expansion toward {target}{}",
+                    ftl_priority_suffix(*event_priority, *dense_priority)
+                )),
+            )
+        } else if let Some(worker) =
+            select_idle_ftl_worker(workers, &region.region, reserved, devices)
+        {
+            let Some(hub) = region
+                .hub_location
+                .clone()
+                .or_else(|| region.hub_system.clone())
+            else {
+                blocker = Some(format!(
+                    "{} has no operational manufacturing hub for relay expansion",
+                    region.region
+                ));
+                let next_action =
+                    Some("Establish a regional System Hub before expanding FTL reach".to_owned());
+                save_goal_runtime(context.repository, &id, &runtime)?;
+                return Ok(DirectorGoalSummary {
+                    id,
+                    kind,
+                    region: Some(region.region.clone()),
+                    status: DirectorGoalStatus::Blocked,
+                    objective: format!(
+                        "Connect strategic event and mining systems across {}",
+                        region.region
+                    ),
+                    blocker,
+                    next_action,
+                    progress_current: covered as u64,
+                    progress_total: region.known_systems.len() as u64,
+                    active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+                    enabled,
+                });
+            };
+            let next_action = Some(format!(
+                "Extend FTL coverage toward {target} with {worker}{}",
+                ftl_priority_suffix(*event_priority, *dense_priority)
+            ));
+            if context.automatic {
+                let workflow =
+                    context
+                        .repository
+                        .create(new_exploration_workflow(ExplorationIntent {
+                            target: target.clone(),
+                            replicant: Some(worker.clone()),
+                            hub: Some(hub),
+                        }))?;
+                tracing::info!(
+                    event = "director.ftl.connection_required",
+                    workflow_id = %workflow.id,
+                    region = %region.region,
+                    target = %target,
+                    event_priority = *event_priority,
+                    dense_belt_priority = *dense_priority,
+                    replicant = %worker,
+                    "Director launched prioritized regional FTL expansion"
+                );
+                runtime.active_workflows = vec![workflow.id];
+                runtime.last_launch_at_ms = Some(context.now);
+                reserved.insert(worker);
+            }
+            (DirectorGoalStatus::Active, next_action)
+        } else {
+            let has_idle_racing_worker = workers.iter().any(|worker| {
+                worker.region.as_deref() == Some(region.region.as_str())
+                    && worker.busy_workflow.is_none()
+                    && !reserved.contains(worker.replicant.key.id.as_str())
+                    && worker.racing_vessel.is_some()
+            });
+            let reason = if has_idle_racing_worker {
+                format!(
+                    "{} has an idle FTL-capable regional worker, but its vessel has no free stow slot for a mission relay toward {target}",
+                    region.region
+                )
+            } else {
+                format!(
+                    "{} needs an idle regional Replicant hosted in a racing vessel to extend FTL coverage toward {target}",
+                    region.region
+                )
+            };
+            if !has_idle_racing_worker {
+                requirements.raise(
+                    DirectorRequirement::WorkerCapacity {
+                        region: region.region.clone(),
+                        count: 1,
+                        affinity: Some("ftl".to_owned()),
+                    },
+                    &id,
+                    reason.clone(),
+                    PRIORITY_FTL_EXPANSION,
+                )?;
+            }
+            blocker = Some(reason);
+            (
+                DirectorGoalStatus::Blocked,
+                Some(if has_idle_racing_worker {
+                    "Free at least one stow slot on a regional racing vessel before retrying FTL expansion".to_owned()
+                } else {
+                    "Free a regional worker or grow the regional workforce".to_owned()
+                }),
+            )
+        }
+    };
+    save_goal_runtime(context.repository, &id, &runtime)?;
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: format!(
+            "Connect strategic event and mining systems across {}",
+            region.region
+        ),
+        blocker,
+        next_action,
+        progress_current: covered as u64,
+        progress_total: region.known_systems.len() as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
+}
+
+fn relay_device_systems(
+    devices: &[Device],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    devices
+        .iter()
+        .filter(|device| {
+            device.device_type.as_ref().is_some_and(|device_type| {
+                matches!(device_type, DeviceType::FtlRelay | DeviceType::SystemHub)
+                    || device_type.as_str() == "deep_space_relay_station"
+            })
+        })
+        .filter_map(|device| device_system(device, location_systems))
+        .collect()
+}
+
+fn dense_belt_systems(
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    locations
+        .iter()
+        .filter(|location| {
+            ["belt", "asteroid_belt"].iter().any(|field| {
+                location
+                    .unknown
+                    .get(*field)
+                    .and_then(Value::as_object)
+                    .and_then(|belt| belt.get("density"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|density| density.eq_ignore_ascii_case("dense"))
+            })
+        })
+        .filter_map(|location| {
+            location
+                .system
+                .clone()
+                .or_else(|| location_systems.get(location.key.id.as_str()).cloned())
+        })
+        .collect()
+}
+
+fn ftl_priority_score(event_priority: bool, dense_priority: bool) -> u32 {
+    (if event_priority { 200 } else { 0 }) + (if dense_priority { 160 } else { 0 })
+}
+
+fn ftl_priority_suffix(event_priority: bool, dense_priority: bool) -> &'static str {
+    match (event_priority, dense_priority) {
+        (true, true) => " (active events + dense belt)",
+        (true, false) => " (active events)",
+        (false, true) => " (dense belt)",
+        (false, false) => "",
+    }
+}
+
+fn active_exploration_workflow_for_target(
+    workflows: &[WorkflowInstance],
+    target: &str,
+) -> Result<Option<WorkflowId>, ApplicationError> {
+    for workflow in workflows.iter().filter(|workflow| {
+        workflow.kind == exploration_workflow_kind() && !workflow.status.is_terminal()
+    }) {
+        let intent = workflow.config::<ExplorationIntent>()?;
+        if intent.target == target {
+            return Ok(Some(workflow.id));
+        }
+    }
+    Ok(None)
+}
+
 fn bootstrap_assignment(
     regions: &BTreeMap<String, RegionView>,
     target_workers: &[&WorkerView],
@@ -3118,23 +3424,23 @@ fn reconcile_workforce(
 }
 
 fn group_active_events_by_region(
-    events: Vec<replicant_client::raw::events::LocationEvent>,
+    events: &[replicant_client::raw::events::LocationEvent],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
     regions: &BTreeMap<String, RegionView>,
 ) -> BTreeMap<String, Vec<String>> {
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
     for event in events {
-        let Some(designation) = event.designation else {
+        let Some(designation) = event.designation.as_deref() else {
             continue;
         };
-        let Some(location) = event.location else {
+        let Some(location) = event.location.as_deref() else {
             continue;
         };
         let system = location_systems
-            .get(&location)
+            .get(location)
             .cloned()
-            .unwrap_or_else(|| system_prefix(&location).to_owned());
+            .unwrap_or_else(|| system_prefix(location).to_owned());
         let region = system_regions
             .get(&system)
             .cloned()
@@ -3142,11 +3448,41 @@ fn group_active_events_by_region(
         let Some(region) = region else {
             continue;
         };
-        grouped.entry(region).or_default().push(designation);
+        grouped
+            .entry(region)
+            .or_default()
+            .push(designation.to_owned());
     }
     for designations in grouped.values_mut() {
         designations.sort();
         designations.dedup();
+    }
+    grouped
+}
+
+fn group_active_event_systems_by_region(
+    events: &[replicant_client::raw::events::LocationEvent],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    regions: &BTreeMap<String, RegionView>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut grouped = BTreeMap::<String, BTreeSet<String>>::new();
+    for event in events {
+        let Some(location) = event.location.as_deref() else {
+            continue;
+        };
+        let system = location_systems
+            .get(location)
+            .cloned()
+            .unwrap_or_else(|| system_prefix(location).to_owned());
+        let region = system_regions
+            .get(&system)
+            .cloned()
+            .or_else(|| operational_region_for_system(&system, regions));
+        let Some(region) = region else {
+            continue;
+        };
+        grouped.entry(region).or_default().insert(system);
     }
     grouped
 }
@@ -3314,6 +3650,44 @@ fn mark_establishing_regions(
     Ok(())
 }
 
+fn mark_partial_region_footholds(
+    regions: &mut BTreeMap<String, RegionView>,
+    workers: &[WorkerView],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+) {
+    for region in regions
+        .values_mut()
+        .filter(|region| region.status == DirectorRegionStatus::Discovered)
+    {
+        let staged_workers = workers
+            .iter()
+            .filter(|worker| worker.region.as_deref() == Some(region.region.as_str()))
+            .filter(|worker| {
+                worker.replicant.location.as_ref().is_some_and(|location| {
+                    let location = location.id.as_str();
+                    let system = location_systems
+                        .get(location)
+                        .map(String::as_str)
+                        .unwrap_or_else(|| system_prefix(location));
+                    system_regions
+                        .get(system)
+                        .is_some_and(|candidate| candidate == &region.region)
+                })
+            })
+            .count();
+        if staged_workers >= 2 {
+            tracing::info!(
+                event = "director.region.partial_foothold_observed",
+                region = %region.region,
+                staged_workers,
+                "Director recognized a partially established regional foothold"
+            );
+            region.status = DirectorRegionStatus::Establishing;
+        }
+    }
+}
+
 fn preferred_home_location(
     region: &str,
     hub_system: Option<&str>,
@@ -3435,6 +3809,18 @@ fn busy_replicants(
         .iter()
         .filter(|workflow| !workflow.status.is_terminal())
     {
+        // A newly queued workflow has not executed yet, so it may not have
+        // acquired its durable Replicant claim. Honor an explicit configured
+        // assignment immediately so the next Director reconcile cannot hand
+        // the same worker to another workflow during that scheduler gap.
+        let config = workflow.config::<Value>()?;
+        if let Some(code) = config
+            .get("replicant")
+            .and_then(Value::as_str)
+            .filter(|code| !code.trim().is_empty())
+        {
+            busy.entry(code.to_owned()).or_insert(workflow.id);
+        }
         for claim in repository.claims(workflow.id)? {
             if let ResourceKey::Replicant(code) = claim.resource {
                 busy.entry(code).or_insert(workflow.id);
@@ -3646,6 +4032,37 @@ fn partition_systems(systems: &[String], workers: usize) -> Vec<Vec<String>> {
     shards
 }
 
+fn select_idle_ftl_worker(
+    workers: &[WorkerView],
+    region: &str,
+    reserved: &BTreeSet<String>,
+    devices: &[Device],
+) -> Option<String> {
+    workers
+        .iter()
+        .filter(|worker| worker.region.as_deref() == Some(region))
+        .filter(|worker| worker.busy_workflow.is_none())
+        .filter(|worker| !reserved.contains(worker.replicant.key.id.as_str()))
+        .filter_map(|worker| {
+            let vessel_code = worker.racing_vessel.as_deref()?;
+            let vessel = devices
+                .iter()
+                .find(|device| device.key.id.as_str() == vessel_code)?;
+            let free_stow = vessel
+                .stow_capacity
+                .unwrap_or_default()
+                .saturating_sub(vessel.stow_used.unwrap_or_default());
+            (free_stow > 0).then_some((worker, free_stow))
+        })
+        .min_by(|(left, left_free), (right, right_free)| {
+            (left.role_affinity.as_deref() != Some("ftl"))
+                .cmp(&(right.role_affinity.as_deref() != Some("ftl")))
+                .then_with(|| right_free.cmp(left_free))
+                .then_with(|| left.replicant.key.id.cmp(&right.replicant.key.id))
+        })
+        .map(|(worker, _)| worker.replicant.key.id.as_str().to_owned())
+}
+
 fn select_idle_worker(
     workers: &[WorkerView],
     region: &str,
@@ -3742,10 +4159,7 @@ fn goal_enabled(controls: &BTreeMap<DirectorGoalKind, bool>, kind: DirectorGoalK
 }
 
 fn default_goal_enabled(kind: DirectorGoalKind) -> bool {
-    !matches!(
-        kind,
-        DirectorGoalKind::ExpandFtlNetwork | DirectorGoalKind::EstablishBeacons
-    )
+    !matches!(kind, DirectorGoalKind::EstablishBeacons)
 }
 
 fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
@@ -3838,6 +4252,26 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
 
+    fn test_worker(code: &str, region: &str, location: &str) -> WorkerView {
+        WorkerView {
+            replicant: Replicant {
+                key: replicant_client::ReplicantKey::live(code.into()),
+                name: Some(code.to_owned()),
+                is_npc: Some(false),
+                status: Some(replicant_client::domain::ReplicantStatus::Active),
+                location: Some(replicant_client::LocationKey::live(location.into())),
+                hosted_device: None,
+                travel: None,
+                private: None,
+                access: replicant_client::domain::AccessScope::Owned,
+            },
+            region: Some(region.to_owned()),
+            role_affinity: None,
+            busy_workflow: None,
+            racing_vessel: None,
+        }
+    }
+
     fn test_hub_device() -> Device {
         Device {
             key: replicant_client::DeviceKey::live("HUB1".into()),
@@ -3882,12 +4316,115 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_placement_goals_start_disabled_until_planners_exist() {
-        assert!(!default_goal_enabled(DirectorGoalKind::ExpandFtlNetwork));
+    fn production_ready_ftl_goal_defaults_enabled() {
+        assert!(default_goal_enabled(DirectorGoalKind::ExpandFtlNetwork));
         assert!(!default_goal_enabled(DirectorGoalKind::EstablishBeacons));
         assert!(default_goal_enabled(DirectorGoalKind::EventCompletion));
         assert!(default_goal_enabled(DirectorGoalKind::BlueprintAcquisition));
         assert!(default_goal_enabled(DirectorGoalKind::MaintainSystemHubs));
+    }
+
+    #[test]
+    fn staged_regional_bootstrap_workers_mark_partial_foothold() {
+        let mut regions = BTreeMap::from([(
+            "beta".to_owned(),
+            RegionView {
+                region: "beta".to_owned(),
+                status: DirectorRegionStatus::Discovered,
+                hub_system: None,
+                hub_location: None,
+                known_systems: BTreeSet::from(["BETA-STAR".to_owned()]),
+            },
+        )]);
+        let workers = vec![
+            test_worker("BETA-1", "beta", "BETA-STAR-2"),
+            test_worker("BETA-2", "beta", "BETA-STAR-3"),
+        ];
+        let location_systems = BTreeMap::from([
+            ("BETA-STAR-2".to_owned(), "BETA-STAR".to_owned()),
+            ("BETA-STAR-3".to_owned(), "BETA-STAR".to_owned()),
+        ]);
+        let system_regions = BTreeMap::from([("BETA-STAR".to_owned(), "beta".to_owned())]);
+
+        mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
+
+        assert_eq!(regions["beta"].status, DirectorRegionStatus::Establishing);
+    }
+
+    #[test]
+    fn ftl_worker_requires_free_stow_capacity() {
+        let mut full_worker = test_worker("CHAT-1", "alpha", "SCEPTURUM-BELT-1");
+        full_worker.racing_vessel = Some("VESSEL-FULL".to_owned());
+        let mut free_worker = test_worker("CHAT-2", "alpha", "SCEPTURUM-BELT-1");
+        free_worker.racing_vessel = Some("VESSEL-FREE".to_owned());
+
+        let mut full_vessel = test_hub_device();
+        full_vessel.key = replicant_client::DeviceKey::live("VESSEL-FULL".into());
+        full_vessel.stow_capacity = Some(4);
+        full_vessel.stow_used = Some(4);
+        let mut free_vessel = test_hub_device();
+        free_vessel.key = replicant_client::DeviceKey::live("VESSEL-FREE".into());
+        free_vessel.stow_capacity = Some(4);
+        free_vessel.stow_used = Some(3);
+
+        assert_eq!(
+            select_idle_ftl_worker(
+                &[full_worker, free_worker],
+                "alpha",
+                &BTreeSet::new(),
+                &[full_vessel, free_vessel],
+            ),
+            Some("CHAT-2".to_owned())
+        );
+    }
+
+    #[test]
+    fn queued_explicit_replicant_assignment_is_busy_before_executor_claims() {
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let workflow = repository
+            .create(new_scan_tour_workflow(ScanTourIntent {
+                center: "SCEPTURUM".to_owned(),
+                radius_ly: 30.0,
+                system_limit: 10,
+                target_systems: Some(vec!["TARGET".to_owned()]),
+                replicant: Some("CHAT-1".to_owned()),
+                vessel: Some("VESSEL-1".to_owned()),
+                include_explored: false,
+            }))
+            .expect("create queued survey");
+
+        let workflows = repository.list().expect("list workflows");
+        let busy = busy_replicants(&repository, &workflows).expect("resolve busy replicants");
+
+        assert_eq!(busy.get("CHAT-1"), Some(&workflow.id));
+        assert!(repository.claims(workflow.id).expect("claims").is_empty());
+    }
+
+    #[test]
+    fn dense_belt_priority_uses_managed_location_payload() {
+        let location = Location {
+            key: replicant_client::LocationKey::live("BETA-STAR-BELT-1".into()),
+            location_type: None,
+            scanned: Some(true),
+            system_scanned: Some(true),
+            system_tags: Vec::new(),
+            system: Some("BETA-STAR".to_owned()),
+            parent: None,
+            survey_progress: replicant_client::domain::LocationSurveyProgress::default(),
+            environment: replicant_client::domain::LocationEnvironment::default(),
+            unknown: BTreeMap::from([("belt".to_owned(), serde_json::json!({"density": "dense"}))]),
+        };
+
+        assert_eq!(
+            dense_belt_systems(&[location], &BTreeMap::new()),
+            BTreeSet::from(["BETA-STAR".to_owned()])
+        );
+        assert!(ftl_priority_score(true, false) > ftl_priority_score(false, true));
+        assert!(ftl_priority_score(false, true) > ftl_priority_score(false, false));
+        assert_eq!(
+            ftl_priority_suffix(true, true),
+            " (active events + dense belt)"
+        );
     }
 
     #[test]

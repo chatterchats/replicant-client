@@ -3455,6 +3455,11 @@ async fn settings(
         profile: state.daemon.profile.clone(),
         bind_address: state.daemon.bind.to_string(),
         managed_database_path: state.daemon.managed_database.display().to_string(),
+        history_database_path: replicant_client::default_history_database_path(
+            &state.daemon.managed_database,
+        )
+        .display()
+        .to_string(),
         runtime_database_path: state.daemon.runtime_database.display().to_string(),
         log_filter: config::log_filter_directive(),
         docker: config::docker_environment_detected(),
@@ -4020,10 +4025,12 @@ async fn build_entity_index(
     for handle in state.client().replicants().find().owned().collect().await? {
         let replicant = handle.snapshot().await?;
         let location = replicant.location.map(|location| location.id.to_string());
+        let code = replicant.key.id.to_string();
+        let name = replicant.name.clone();
         entities.push(EntitySummary {
-            entity: summary_ref(EntityKind::Replicant, replicant.key.id.to_string()),
-            label: replicant.key.id.to_string(),
-            secondary_label: replicant.name,
+            entity: summary_ref(EntityKind::Replicant, code.clone()),
+            label: name.clone().unwrap_or_else(|| code.clone()),
+            secondary_label: name.map(|_| code),
             system: location
                 .as_ref()
                 .and_then(|location| location_systems.get(location).cloned().flatten()),
@@ -5339,7 +5346,11 @@ fn detail(
         claims,
         created_at_ms: instance.created_at,
         finished_at_ms: instance.status.is_terminal().then_some(instance.updated_at),
-        error: (instance.status == WorkflowStatus::Failed).then(|| "workflow failed".to_owned()),
+        error: if instance.status == WorkflowStatus::Failed {
+            instance.last_error.clone()
+        } else {
+            None
+        },
     })
 }
 
@@ -5419,19 +5430,39 @@ fn operational_notifications(
     triggers: &[AutomationTrigger],
     status: &ClientStatus,
 ) -> Vec<Notification> {
-    let mut notifications = workflows
-        .iter()
-        .filter_map(workflow_notification)
-        .chain(triggers.iter().filter_map(|trigger| {
-            trigger.last_error.as_ref().map(|_| Notification {
-                id: EntityId(format!("trigger:{}:failed", trigger.id)),
-                level: NotificationLevel::Error,
-                title: "Automatic trigger failed".to_owned(),
-                message: "An automatic trigger failed; inspect local daemon logs".to_owned(),
-                created_at_ms: trigger.updated_at,
-            })
-        }))
-        .collect::<Vec<_>>();
+    // A standing Director goal may retry the same blocked/failed work over time.
+    // Keep the newest actionable notification for an identical condition
+    // instead of accumulating one notification per superseded workflow ID.
+    let mut workflow_notifications = BTreeMap::<(String, String), Notification>::new();
+    for workflow in workflows {
+        let Some(notification) = workflow_notification(workflow) else {
+            continue;
+        };
+        let key = if notification.title == "Blocked resource claim" {
+            // The conflicting owner may change from one scheduler pass to the
+            // next. Treat that as the same actionable condition for a given
+            // workflow kind while keeping the newest owner in the message.
+            (notification.title.clone(), workflow.kind.to_string())
+        } else {
+            (notification.title.clone(), notification.message.clone())
+        };
+        match workflow_notifications.get(&key) {
+            Some(existing) if existing.created_at_ms >= notification.created_at_ms => {}
+            _ => {
+                workflow_notifications.insert(key, notification);
+            }
+        }
+    }
+    let mut notifications = workflow_notifications.into_values().collect::<Vec<_>>();
+    notifications.extend(triggers.iter().filter_map(|trigger| {
+        trigger.last_error.as_ref().map(|_| Notification {
+            id: EntityId(format!("trigger:{}:failed", trigger.id)),
+            level: NotificationLevel::Error,
+            title: "Automatic trigger failed".to_owned(),
+            message: "An automatic trigger failed; inspect local daemon logs".to_owned(),
+            created_at_ms: trigger.updated_at,
+        })
+    }));
     let sync = RuntimeSyncStatus {
         phase: sync_phase(status),
         revision: 0,
@@ -5441,6 +5472,7 @@ fn operational_notifications(
     if matches!(sync.phase, SyncPhase::Degraded | SyncPhase::Offline) {
         notifications.push(sync_notification(&sync));
     }
+    notifications.sort_by_key(|notification| std::cmp::Reverse(notification.created_at_ms));
     notifications
 }
 
@@ -5461,9 +5493,9 @@ fn workflow_notification(workflow: &WorkflowInstance) -> Option<Notification> {
         }
         .to_owned(),
         message: if blocked {
-            "A workflow is blocked by a resource claim".to_owned()
+            format!("{} is blocked: {error}", workflow.kind)
         } else {
-            "A workflow failed; inspect local daemon logs".to_owned()
+            format!("{} failed: {error}", workflow.kind)
         },
         created_at_ms: workflow.updated_at,
     })
@@ -6546,6 +6578,9 @@ mod tests {
                     z: 0.0,
                 }),
                 has_hub: None,
+                knowledge_observed: false,
+                explored: None,
+                has_life: None,
                 region: None,
             }],
             &[workflow],
@@ -6757,6 +6792,7 @@ mod tests {
         let payload = &value["payload"];
         assert_eq!(payload["profile"], "test");
         assert!(payload["managed_database_path"].is_string());
+        assert!(payload["history_database_path"].is_string());
         assert!(payload["runtime_database_path"].is_string());
         assert!(payload["bind_address"].is_string());
         assert!(payload["log_filter"].is_string());
@@ -6797,6 +6833,55 @@ mod tests {
                 .headers()
                 .get("access-control-allow-private-network"),
             Some(&"true".parse().expect("header value"))
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn repeated_blocked_workflows_collapse_to_one_notification_per_kind() {
+        let (_app, client, state) = test_app().await;
+        let mut failed = Vec::new();
+        for owner in ["FIRST", "SECOND"] {
+            let workflow = state
+                .repository
+                .create(NewWorkflow {
+                    kind: WorkflowKind::new("scan.tour").unwrap(),
+                    schema_version: 1,
+                    config: Value::Null,
+                    checkpoint: Value::Null,
+                    current_step: None,
+                    parent_id: None,
+                })
+                .unwrap();
+            let workflow = state
+                .repository
+                .update(
+                    workflow.id,
+                    workflow.revision,
+                    WorkflowState {
+                        status: WorkflowStatus::Failed,
+                        current_step: None,
+                        checkpoint: Value::Null,
+                        last_error: Some(format!(
+                            "resource is already claimed by workflow {owner}"
+                        )),
+                        result: None::<Value>,
+                    },
+                )
+                .unwrap();
+            failed.push(workflow);
+        }
+
+        let notifications = operational_notifications(&failed, &[], &client.status());
+        let blocked = notifications
+            .iter()
+            .filter(|notification| notification.title == "Blocked resource claim")
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0]
+                .message
+                .starts_with("scan.tour is blocked: resource is already claimed by workflow ")
         );
         client.close().await.expect("close client");
     }

@@ -5,6 +5,7 @@
 //! child workflows while keeping workflow checkpoints authoritative.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,8 +22,8 @@ use replicant_printing::{
 };
 use replicant_protocol::workflow_reserved;
 use replicant_transport::{
-    DeliveryOptions, DeliveryPlan, DeliveryRequest, DeviceRequest, ResourceMap, execute_delivery,
-    plan_delivery,
+    DeliveryOptions, DeliveryPlan, DeliveryRequest, DeviceRequest, ResourceMap, TransportError,
+    execute_delivery, plan_delivery, validate_resource_pickups,
 };
 use replicant_workflow::{
     BoxWorkflowFuture, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowContext,
@@ -212,6 +213,12 @@ pub struct ScanTourCheckpoint {
     /// Child manifest currently staging newly printed survey-fleet devices.
     #[serde(default)]
     pub fleet_logistics_child: Option<WorkflowId>,
+    /// Exact survey controller reserved for this tour.
+    #[serde(default)]
+    pub fleet_controller: Option<String>,
+    /// Exact survey drones reserved for this tour.
+    #[serde(default)]
+    pub fleet_drones: Vec<String>,
     /// Last authoritative survey executor state.
     pub state: Option<SurveyExecutionState>,
 }
@@ -891,8 +898,9 @@ impl WorkflowExecutor for ScanTourWorkflow {
                 target_systems: intent.target_systems,
                 star_detail_concurrency: 8,
                 mission_file: plan_file,
-                controller: None,
-                drones: None,
+                controller: checkpoint.fleet_controller.clone(),
+                drones: (!checkpoint.fleet_drones.is_empty())
+                    .then(|| checkpoint.fleet_drones.clone()),
                 replace_plan: false,
                 include_explored: intent.include_explored,
                 travel_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
@@ -1215,15 +1223,79 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             let client = managed_client(context)?;
             let mut checkpoint: LogisticsWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
-            let plan = if let Some(plan) = checkpoint.plan.clone() {
-                plan
+            let plan = if checkpoint.started {
+                checkpoint
+                    .plan
+                    .clone()
+                    .ok_or_else(|| "started logistics manifest lost its durable plan".to_owned())?
             } else {
                 context
                     .advance_to("planning", &checkpoint)
                     .map_err(string_error)?;
-                let plan = plan_delivery(&client, &request)
-                    .await
-                    .map_err(string_error)?;
+                let plan = match checkpoint.plan.clone() {
+                    Some(plan) => plan,
+                    None => plan_delivery(&client, &request)
+                        .await
+                        .map_err(string_error)?,
+                };
+
+                // Resource stock is mutable account state, so reserve each
+                // concrete pickup location before accepting the plan. This is
+                // deliberately coarse-grained: two logistics workflows may
+                // use different locations concurrently, but they cannot race
+                // to consume different snapshots of the same location.
+                let mut source_claims = Vec::new();
+                for pickup in &plan.resource_pickups {
+                    let resource = ResourceKey::Namespaced {
+                        namespace: "logistics-resource-source".to_owned(),
+                        key: pickup.location.to_ascii_uppercase(),
+                    };
+                    match context.acquire_claim(resource.clone()) {
+                        Ok(_) => source_claims.push(resource),
+                        Err(RepositoryError::ClaimConflict { owner, .. }) => {
+                            for resource in &source_claims {
+                                context.release_claim(resource).map_err(string_error)?;
+                            }
+                            checkpoint.plan = None;
+                            checkpoint.started = false;
+                            context
+                                .advance_to("waiting_for_resource_source", &checkpoint)
+                                .map_err(string_error)?;
+                            context
+                                .emit_activity(format!(
+                                    "resource pickup {} is reserved by workflow {owner}; discarding the stale plan and waiting to replan",
+                                    pickup.location
+                                ))
+                                .map_err(string_error)?;
+                            context.mark_waiting().map_err(string_error)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(string_error(error)),
+                    }
+                }
+
+                match validate_resource_pickups(&client, &plan).await {
+                    Ok(()) => {}
+                    Err(TransportError::NotFound(error)) => {
+                        for resource in &source_claims {
+                            context.release_claim(resource).map_err(string_error)?;
+                        }
+                        checkpoint.plan = None;
+                        checkpoint.started = false;
+                        context
+                            .advance_to("replanning_stale_resources", &checkpoint)
+                            .map_err(string_error)?;
+                        context
+                            .emit_activity(format!(
+                                "resource pickup snapshot changed before delivery: {error}; waiting to replan from fresh account inventory"
+                            ))
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(string_error(error)),
+                }
+
                 for code in plan
                     .cargo_transports
                     .iter()
@@ -2915,7 +2987,7 @@ async fn await_child_workflow(
     context: &mut WorkflowContext,
     child_id: WorkflowId,
     label: &str,
-    checkpoint: &BlueprintAcquireCheckpoint,
+    checkpoint: &mut BlueprintAcquireCheckpoint,
 ) -> Result<bool, String> {
     loop {
         let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
@@ -2924,10 +2996,25 @@ async fn await_child_workflow(
         match child.status {
             WorkflowStatus::Succeeded => return Ok(true),
             WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let error = child.last_error.unwrap_or_default();
+                if child.status == WorkflowStatus::Failed
+                    && retryable_trade_criteria_logistics_failure(&error)
+                {
+                    checkpoint.criteria_logistics_child = None;
+                    context
+                        .advance_to("replanning_trade_criteria", checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(format!(
+                            "{label} child {child_id} hit stale source stock ({error}); recomputing the remaining shop criteria"
+                        ))
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(false);
+                }
                 return Err(format!(
-                    "{label} child {child_id} ended as {:?}: {}",
-                    child.status,
-                    child.last_error.unwrap_or_default()
+                    "{label} child {child_id} ended as {:?}: {error}",
+                    child.status
                 ));
             }
             _ => {
@@ -2943,6 +3030,15 @@ async fn await_child_workflow(
             }
         }
     }
+}
+
+fn retryable_trade_criteria_logistics_failure(error: &str) -> bool {
+    let stale_snapshot =
+        error.contains("planned resource pickup at ") && error.contains(" is stale: need ");
+    let insufficient_at_source = error.contains("Insufficient ")
+        && error.contains(" at location: need ")
+        && error.contains(", have ");
+    stale_snapshot || insufficient_at_source
 }
 
 async fn ensure_replicant_at_shop(
@@ -3206,6 +3302,100 @@ fn scan_tour_fleet_print_requests(
     requests
 }
 
+fn claimed_scan_tour_devices(context: &WorkflowContext) -> Result<BTreeSet<String>, String> {
+    Ok(context
+        .repository()
+        .device_claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|claim| claim.workflow_id != context.id())
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Device(code) => Some(code),
+            _ => None,
+        })
+        .collect())
+}
+
+async fn available_scan_tour_fleet(
+    context: &WorkflowContext,
+    client: &Client,
+    staging_location: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let claimed = claimed_scan_tour_devices(context)?;
+    let controller_handles = client
+        .devices()
+        .controllers(DeviceType::SurveyController)
+        .owned()
+        .idle()
+        .at(staging_location)
+        .without_adopted_devices()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let drone_handles = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(DeviceType::from("survey_drone"))
+        .idle()
+        .at(staging_location)
+        .without_controller()
+        .collect()
+        .await
+        .map_err(string_error)?;
+
+    let mut controllers = controller_handles
+        .into_iter()
+        .map(|handle| handle.id().as_str().to_owned())
+        .filter(|code| !claimed.contains(code))
+        .collect::<Vec<_>>();
+    let mut drones = drone_handles
+        .into_iter()
+        .map(|handle| handle.id().as_str().to_owned())
+        .filter(|code| !claimed.contains(code))
+        .collect::<Vec<_>>();
+    controllers.sort();
+    drones.sort();
+    Ok((controllers, drones))
+}
+
+fn reserve_scan_tour_fleet(
+    context: &mut WorkflowContext,
+    checkpoint: &mut ScanTourCheckpoint,
+    controllers: &[String],
+    drones: &[String],
+) -> Result<bool, String> {
+    let required_drones = usize::try_from(SCAN_TOUR_SURVEY_DRONES)
+        .map_err(|_| "invalid survey drone requirement".to_owned())?;
+    let Some(controller) = controllers.first() else {
+        return Ok(false);
+    };
+    if drones.len() < required_drones {
+        return Ok(false);
+    }
+    let selected_drones = drones[..required_drones].to_vec();
+    let mut acquired = Vec::new();
+    for code in std::iter::once(controller).chain(selected_drones.iter()) {
+        let resource = ResourceKey::Device(code.clone());
+        match context.acquire_claim(resource.clone()) {
+            Ok(_) => acquired.push(resource),
+            Err(RepositoryError::ClaimConflict { .. }) => {
+                for resource in &acquired {
+                    context.release_claim(resource).map_err(string_error)?;
+                }
+                return Ok(false);
+            }
+            Err(error) => return Err(string_error(error)),
+        }
+    }
+    checkpoint.fleet_controller = Some(controller.clone());
+    checkpoint.fleet_drones = selected_drones;
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    Ok(true)
+}
+
 async fn ensure_scan_tour_fleet_capacity(
     context: &mut WorkflowContext,
     client: &Client,
@@ -3219,6 +3409,28 @@ async fn ensure_scan_tour_fleet_capacity(
         .is_some_and(|state| state.resources().2.len() > SCAN_TOUR_SURVEY_DRONES as usize)
     {
         return Ok(true);
+    }
+
+    let required_drones = usize::try_from(SCAN_TOUR_SURVEY_DRONES)
+        .map_err(|_| "invalid survey drone requirement".to_owned())?;
+    if let Some(controller) = checkpoint.fleet_controller.clone()
+        && checkpoint.fleet_drones.len() == required_drones
+    {
+        let drones = checkpoint.fleet_drones.clone();
+        if reserve_scan_tour_fleet(context, checkpoint, &[controller], &drones)? {
+            return Ok(true);
+        }
+        checkpoint.fleet_controller = None;
+        checkpoint.fleet_drones.clear();
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    } else if checkpoint.fleet_controller.is_some() || !checkpoint.fleet_drones.is_empty() {
+        checkpoint.fleet_controller = None;
+        checkpoint.fleet_drones.clear();
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
     }
 
     if let Some(child_id) = checkpoint.fleet_logistics_child {
@@ -3265,33 +3477,43 @@ async fn ensure_scan_tour_fleet_capacity(
         .map(|location| location.id.as_str().to_owned())
         .ok_or_else(|| format!("survey vessel {vessel} has no current staging location"))?;
 
-    let controllers = client
-        .devices()
-        .controllers(DeviceType::SurveyController)
-        .owned()
-        .idle()
-        .at(&staging_location)
-        .without_adopted_devices()
-        .collect()
-        .await
-        .map_err(string_error)?;
-    let drones = client
-        .devices()
-        .find()
-        .owned()
-        .of_type(DeviceType::from("survey_drone"))
-        .idle()
-        .at(&staging_location)
-        .without_controller()
-        .collect()
-        .await
-        .map_err(string_error)?;
-
-    let requests = scan_tour_fleet_print_requests(controllers.len(), drones.len());
-    if requests.is_empty() {
+    let (controllers, drones) =
+        available_scan_tour_fleet(context, client, &staging_location).await?;
+    if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+        context
+            .emit_activity(format!(
+                "reserved an exclusive survey fleet at {staging_location}: controller {}, drones {}",
+                checkpoint.fleet_controller.as_deref().unwrap_or_default(),
+                checkpoint.fleet_drones.join(", ")
+            ))
+            .map_err(string_error)?;
         return Ok(true);
     }
 
+    // A parallel shard may have won the claim race between discovery and
+    // reservation. Refresh the claim-aware view before deciding what to print.
+    let (controllers, drones) =
+        available_scan_tour_fleet(context, client, &staging_location).await?;
+    if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+        return Ok(true);
+    }
+
+    // Only unclaimed devices count toward this tour. Parallel catalogue shards
+    // therefore manufacture independent fleets instead of racing to claim the
+    // same idle controller/drones after the preflight succeeds.
+    let requests = scan_tour_fleet_print_requests(controllers.len(), drones.len());
+    if requests.is_empty() {
+        context
+            .advance_to("waiting_for_survey_fleet_claim", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity(
+                "survey fleet changed during reservation; waiting for a fresh claim-aware preflight",
+            )
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
     let print_location = maintenance_home.to_owned();
     let tag = checkpoint
         .fleet_print_tag
@@ -3305,7 +3527,7 @@ async fn ensure_scan_tour_fleet_capacity(
         .map_err(string_error)?;
     context
         .emit_activity(format!(
-            "survey fleet at {staging_location} is short {}; manufacturing at {print_location}",
+            "exclusive survey fleet at {staging_location} is short {}; manufacturing at {print_location}",
             requests
                 .iter()
                 .map(|request| format!("{} {}", request.quantity, request.device_type))
@@ -3346,7 +3568,21 @@ async fn ensure_scan_tour_fleet_capacity(
     }
 
     if print_location.eq_ignore_ascii_case(&staging_location) {
-        return Ok(true);
+        let (controllers, drones) =
+            available_scan_tour_fleet(context, client, &staging_location).await?;
+        if reserve_scan_tour_fleet(context, checkpoint, &controllers, &drones)? {
+            return Ok(true);
+        }
+        context
+            .advance_to("waiting_for_survey_fleet_claim", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity(format!(
+                "survey-fleet manufacturing completed at {staging_location}, but the exclusive controller/{required_drones}-drone reservation changed before it could be claimed; waiting to re-evaluate"
+            ))
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
     }
 
     let printed_codes =
@@ -3929,6 +4165,19 @@ mod tests {
         );
 
         assert!(scan_tour_fleet_print_requests(1, 3).is_empty());
+    }
+
+    #[test]
+    fn stale_trade_criteria_resource_failures_are_retryable() {
+        assert!(retryable_trade_criteria_logistics_failure(
+            "operation rejected: Insufficient structural at location: need 49.0, have 0"
+        ));
+        assert!(retryable_trade_criteria_logistics_failure(
+            "planned resource pickup at SCEPTURUM-BELT-1 is stale: need 17 conductive, have 0"
+        ));
+        assert!(!retryable_trade_criteria_logistics_failure(
+            "transport CARRIER-1 has no usable cargo capacity"
+        ));
     }
 
     #[test]

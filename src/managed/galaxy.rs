@@ -1,4 +1,4 @@
-//! Durable galaxy catalogue and per-replicant star-knowledge reads.
+//! Durable galaxy catalogue and account-shared star-knowledge reads.
 
 use std::{collections::BTreeSet, time::Instant};
 
@@ -92,7 +92,8 @@ impl GalaxyGateway {
         self.client.managed_state().catalogue_generated_at()
     }
 
-    /// Returns one replicant's locally committed star knowledge; no network I/O occurs.
+    /// Returns the account-shared locally committed star knowledge through a
+    /// Replicant-scoped compatibility view; no network I/O occurs.
     #[must_use]
     pub fn replicant_star_knowledge(&self, replicant_code: &str) -> Vec<domain::StarKnowledge> {
         let replicant = ReplicantKey::live(ReplicantId::from(replicant_code));

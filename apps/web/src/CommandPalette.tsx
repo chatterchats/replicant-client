@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   LogisticsWorkflowForm,
@@ -140,6 +140,21 @@ export function CommandPalette({
   const [serverError, setServerError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [active, setActive] = useState(0);
+  const [blueprintTypes, setBlueprintTypes] = useState<string[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void daemonApi
+      .blueprints(controller.signal)
+      .then((snapshot) => {
+        setBlueprintTypes(
+          snapshot.blueprints.map((blueprint) => blueprint.device_type).sort(),
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      controller.abort();
+    };
+  }, []);
   const descriptorMatches = useMemo(
     () => searchDescriptors(catalog, query),
     [catalog, query],
@@ -306,6 +321,8 @@ export function CommandPalette({
                   parameter={parameter}
                   value={values[parameter.name]}
                   entities={entities}
+                  operationKind={selected.descriptor.kind}
+                  blueprintTypes={blueprintTypes}
                   error={errors[parameter.name]}
                   onChange={(value) => {
                     setValues((current) => ({

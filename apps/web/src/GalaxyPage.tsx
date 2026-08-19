@@ -64,7 +64,9 @@ function loadSettings(): GalaxySettings {
         exploration,
       },
       layers,
-      anchor: typeof saved.anchor === "string" ? saved.anchor : "",
+      // Camera targeting is transient. Persisting a selected/jump anchor caused
+      // old selections to keep snapping the map back after the inspector closed.
+      anchor: "",
     };
   } catch {
     return defaults;
@@ -93,6 +95,7 @@ export function GalaxyPage({
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState(loadSettings);
+  const [jumpRegion, setJumpRegion] = useState("");
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -135,7 +138,10 @@ export function GalaxyPage({
 
   useEffect(() => {
     try {
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      localStorage.setItem(
+        SETTINGS_KEY,
+        JSON.stringify({ ...settings, anchor: "" }),
+      );
     } catch {
       // Storage is optional; React state still preserves this session.
     }
@@ -159,9 +165,41 @@ export function GalaxyPage({
   const anchor =
     scene?.stars.some((star) => star.id === settings.anchor) === true
       ? settings.anchor
-      : (scene?.stars.find((star) => star.current)?.id ??
-        scene?.stars[0]?.id ??
-        "");
+      : "";
+  const regionAnchors = useMemo(() => {
+    const byRegion = new Map<string, GalaxyStar[]>();
+    for (const star of scene?.stars ?? []) {
+      if (!star.region) continue;
+      const stars = byRegion.get(star.region) ?? [];
+      stars.push(star);
+      byRegion.set(star.region, stars);
+    }
+    return [...byRegion.entries()]
+      .map(([region, stars]) => {
+        const centroid = stars.reduce(
+          (point, star) => ({
+            x: point.x + star.position.x / stars.length,
+            y: point.y + star.position.y / stars.length,
+            z: point.z + star.position.z / stars.length,
+          }),
+          { x: 0, y: 0, z: 0 },
+        );
+        const anchor = [...stars].sort((left, right) => {
+          const distance = (star: GalaxyStar) =>
+            (star.position.x - centroid.x) ** 2 +
+            (star.position.y - centroid.y) ** 2 +
+            (star.position.z - centroid.z) ** 2;
+          return (
+            distance(left) - distance(right) || left.id.localeCompare(right.id)
+          );
+        })[0];
+        return anchor ? { region, system: anchor.id } : null;
+      })
+      .filter(
+        (value): value is { region: string; system: string } => value !== null,
+      )
+      .sort((left, right) => left.region.localeCompare(right.region));
+  }, [scene?.stars]);
   const operations = descriptorCommands(descriptors);
   const teleport = operations.find(
     (command) => command.descriptor.kind === "replicant.teleport",
@@ -225,6 +263,32 @@ export function GalaxyPage({
           </datalist>
         </label>
         <label>
+          Jump to region
+          <select
+            value={jumpRegion}
+            onChange={(event) => {
+              const region = event.target.value;
+              setJumpRegion(region);
+              const target = regionAnchors.find(
+                (item) => item.region === region,
+              );
+              if (target) {
+                setSettings((current) => ({
+                  ...current,
+                  anchor: target.system,
+                }));
+              }
+            }}
+          >
+            <option value="">Choose region…</option>
+            {regionAnchors.map((item) => (
+              <option key={item.region} value={item.region}>
+                {item.region}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
           Exploration
           <select
             value={settings.filters.exploration}
@@ -277,14 +341,16 @@ export function GalaxyPage({
           layers={settings.layers}
           centerSystem={anchor}
           onSelectStar={(system) => {
-            setSettings((current) => ({ ...current, anchor: system }));
+            setSettings((current) => ({ ...current, anchor: "" }));
+            setJumpRegion("");
             const star = scene.stars.find((item) => item.id === system);
             if (star) onSelectStar(star);
           }}
           onContextStar={(system, x, y) => {
             const star = scene.stars.find((item) => item.id === system);
             if (!star) return;
-            setSettings((current) => ({ ...current, anchor: system }));
+            setSettings((current) => ({ ...current, anchor: "" }));
+            setJumpRegion("");
             onSelectStar(star);
             setMenu({ x, y, star });
           }}

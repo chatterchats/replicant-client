@@ -74,8 +74,10 @@ are never copied into either image or sent to the browser.
 The host directory `${HOME}/.local/share/replicant` is mounted at
 `/var/lib/replicant` and holds:
 
-- `replicant-client.sqlite` plus SQLite WAL files: managed projections, event
-  history, and managed operations;
+- `replicant-client.sqlite` plus SQLite WAL files: managed current projections,
+  applied event cursor, and managed operations;
+- `replicant-history.sqlite` plus SQLite WAL files: long-lived account events and
+  raw AMI telemetry (30-day raw digest retention);
 - `replicant-runtime.sqlite` plus SQLite WAL files: workflows, checkpoints,
   claims, triggers, schedules, and activity;
 - `logs/replicantd.log`: persistent structured daemon/runtime/workflow logs.
@@ -125,7 +127,7 @@ tar -C "${REPLICANT_DATA_DIR:-$HOME/.local/share/replicant}" \
 docker compose start replicantd
 ```
 
-Keep both SQLite databases in the same dated backup. Restore into a new
+Keep all three SQLite databases in the same dated backup. Restore into a new
 directory so the failed data remains recoverable:
 
 ```sh

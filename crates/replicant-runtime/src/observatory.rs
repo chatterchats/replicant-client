@@ -1555,6 +1555,9 @@ mod tests {
                 z: position[2],
             }),
             has_hub: None,
+            knowledge_observed: false,
+            explored: None,
+            has_life: None,
             region: None,
         }
     }

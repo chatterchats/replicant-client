@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import { ActivityEventDetails } from "./ActivityEventDetails";
 import { daemonApi } from "./api";
@@ -20,6 +20,11 @@ export function ActivityPage({
     isEmpty: (snapshot) => snapshot.events.length === 0,
   });
   const { data, status, error, refreshing, refresh } = query;
+  const eventTypes = useMemo(() => {
+    const values = new Set(data?.events.map((event) => event.name) ?? []);
+    if (name) values.add(name);
+    return [...values].sort((left, right) => left.localeCompare(right));
+  }, [data?.events, name]);
   if (!data && status === "loading")
     return (
       <article className="page loading-state">
@@ -62,14 +67,20 @@ export function ActivityPage({
           />
         </label>
         <label>
-          Event name
-          <input
+          Event type
+          <select
             value={name}
             onChange={(event) => {
               setName(event.target.value);
             }}
-            placeholder="ami.survey.digest"
-          />
+          >
+            <option value="">All event types</option>
+            {eventTypes.map((eventType) => (
+              <option key={eventType} value={eventType}>
+                {eventType}
+              </option>
+            ))}
+          </select>
         </label>
         <label>
           <input

@@ -1167,6 +1167,14 @@ export function App() {
     setSelectedAutomationWorkflow(workflowId);
     navigate("Automations");
   };
+  const openNotification = (notification: Notification) => {
+    const workflowMatch = /^workflow:([^:]+):attention$/.exec(notification.id);
+    if (workflowMatch?.[1]) {
+      openWorkflow(workflowMatch[1]);
+      return;
+    }
+    navigate("History");
+  };
 
   return (
     <div className={`app-shell ${navOpen ? "nav-open" : ""}`}>
@@ -1478,6 +1486,9 @@ export function App() {
                 entities={entities}
                 workflows={workflows}
                 selectedWorkflowId={selectedAutomationWorkflow}
+                onSelectedWorkflowConsumed={() => {
+                  setSelectedAutomationWorkflow(undefined);
+                }}
               />
             ) : shell.page === "Requirements" ? (
               <RequirementsPage
@@ -1762,8 +1773,8 @@ export function App() {
       <NotificationToasts
         notifications={notifications}
         ready={revision !== null}
-        onSelect={() => {
-          setNotificationsOpen(true);
+        onSelect={(notification) => {
+          openNotification(notification);
         }}
         onDismiss={(notification) => {
           setDismissedNotificationIds((current) => {
@@ -1808,8 +1819,8 @@ export function App() {
           onClose={() => {
             setNotificationsOpen(false);
           }}
-          onSelect={() => {
-            navigate("History");
+          onSelect={(notification) => {
+            openNotification(notification);
           }}
           onDismiss={(notification: Notification) => {
             setDismissedNotificationIds((current) => {

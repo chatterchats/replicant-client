@@ -806,7 +806,7 @@ pub struct EventsSnapshot {
     pub events: Vec<EventSummary>,
 }
 
-/// One durable account event from the managed event journal.
+/// One durable account event from managed history.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccountEventSummary {
     /// Stable stream/event identifier.
@@ -1621,6 +1621,9 @@ pub struct GalaxyStar {
     pub name: Option<String>,
     /// Known spectral classification.
     pub spectral_type: Option<String>,
+    /// Catalogue region, when assigned by the game.
+    #[serde(default)]
+    pub region: Option<String>,
     /// Absolute galactic coordinates.
     pub position: GalaxyPoint,
     /// Best application-owned exploration state.
@@ -2562,7 +2565,7 @@ pub enum DomainSlice {
     History,
     /// Discovered location events.
     Events,
-    /// Durable account event journal and AMI digests.
+    /// Durable account event history and AMI digests.
     Activity,
     /// Trade controllers, orders, and trades.
     Trade,
@@ -2761,6 +2764,8 @@ pub struct SettingsSnapshot {
     pub bind_address: String,
     /// Managed SDK SQLite database location.
     pub managed_database_path: String,
+    /// Long-lived event and telemetry history SQLite database location.
+    pub history_database_path: String,
     /// Workflow/runtime SQLite database location.
     pub runtime_database_path: String,
     /// Effective `tracing` log filter directive.
@@ -3106,6 +3111,7 @@ mod tests {
             profile: "default".to_owned(),
             bind_address: "127.0.0.1:8080".to_owned(),
             managed_database_path: "replicant-client.sqlite".to_owned(),
+            history_database_path: "replicant-history.sqlite".to_owned(),
             runtime_database_path: "replicant-runtime.sqlite".to_owned(),
             log_filter: "info".to_owned(),
             docker: false,

@@ -303,6 +303,50 @@ pub async fn plan_delivery_with(
     })
 }
 
+/// Revalidates every planned resource pickup against a fresh account inventory
+/// snapshot before any delivery mutation begins.
+///
+/// A durable workflow can hold a plan across scheduler turns while other
+/// automations move stock. Returning [`TransportError::NotFound`] here lets the
+/// coordinator discard that stale plan and replan without partially executing
+/// an obsolete manifest.
+pub async fn validate_resource_pickups(client: &Client, plan: &DeliveryPlan) -> Result<()> {
+    if plan.resource_pickups.is_empty() {
+        return Ok(());
+    }
+    let inventories = fetch_inventories(client).await?;
+    let mut by_location = BTreeMap::<String, ResourceMap>::new();
+    for inventory in inventories {
+        let replicant_client::domain::InventoryOwner::Location(location) = inventory.owner else {
+            continue;
+        };
+        let resources = by_location
+            .entry(location.id.as_str().to_ascii_uppercase())
+            .or_default();
+        for item in inventory.items {
+            *resources
+                .entry(item.resource.to_ascii_lowercase())
+                .or_default() += item.quantity.max(0);
+        }
+    }
+    for pickup in &plan.resource_pickups {
+        let available = by_location.get(&pickup.location.to_ascii_uppercase());
+        for (resource, required) in &pickup.resources {
+            let present = available
+                .and_then(|resources| resources.get(&resource.to_ascii_lowercase()))
+                .copied()
+                .unwrap_or_default();
+            if present < *required {
+                return Err(TransportError::NotFound(format!(
+                    "planned resource pickup at {} is stale: need {} {}, have {}",
+                    pickup.location, required, resource, present
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Executes a concrete plan and optionally returns the transport devices.
 pub async fn execute_delivery(
     client: &Client,

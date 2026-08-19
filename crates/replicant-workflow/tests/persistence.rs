@@ -262,6 +262,32 @@ fn claims_are_typed_idempotent_and_exclusive() {
 }
 
 #[test]
+fn device_claims_bulk_query_excludes_other_resource_kinds() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let first = create(&repository, None);
+    let second = create(&repository, None);
+    repository
+        .acquire_claim(first.id, ResourceKey::Device("SURVEY-1".into()))
+        .expect("claim first device");
+    repository
+        .acquire_claim(second.id, ResourceKey::Device("SURVEY-2".into()))
+        .expect("claim second device");
+    repository
+        .acquire_claim(first.id, ResourceKey::Replicant("ADA".into()))
+        .expect("claim replicant");
+
+    let claims = repository.device_claims().expect("list device claims");
+
+    assert_eq!(claims.len(), 2);
+    assert!(claims.iter().any(|claim| {
+        claim.workflow_id == first.id && claim.resource == ResourceKey::Device("SURVEY-1".into())
+    }));
+    assert!(claims.iter().any(|claim| {
+        claim.workflow_id == second.id && claim.resource == ResourceKey::Device("SURVEY-2".into())
+    }));
+}
+
+#[test]
 fn concurrent_workflows_cannot_claim_the_same_resource() {
     let path = std::env::temp_dir().join(format!(
         "replicant-workflow-claims-{}.sqlite",

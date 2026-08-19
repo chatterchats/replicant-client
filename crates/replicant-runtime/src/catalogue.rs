@@ -593,7 +593,7 @@ impl OperationCatalogue {
                     .get(&input.source)
                     .await
                     .map_err(runtime_error)?;
-                managed_operation_value(
+                let result = managed_operation_value(
                     handle
                         .command(raw::devices::DeviceCommand::Replicate {
                             target: input.target,
@@ -602,7 +602,15 @@ impl OperationCatalogue {
                         .await
                         .map_err(runtime_error)?,
                 )
-                .await
+                .await?;
+                if let Some(code) = find_string_field(&result, "new_replicant_code") {
+                    client
+                        .replicants()
+                        .get_owned(code)
+                        .await
+                        .map_err(runtime_error)?;
+                }
+                Ok(result)
             }
             "hub.set_entry_point" => {
                 let input: HubDeviceAction = decode(parameters)?;
@@ -1665,6 +1673,19 @@ fn simple_action(
 
 fn runtime_error(error: replicant_client::Error) -> CatalogueError {
     CatalogueError::Runtime(error.to_string())
+}
+
+fn find_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    match value {
+        Value::Object(map) => map.get(field).and_then(Value::as_str).or_else(|| {
+            map.values()
+                .find_map(|value| find_string_field(value, field))
+        }),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_field(value, field)),
+        _ => None,
+    }
 }
 
 async fn managed_operation_value(

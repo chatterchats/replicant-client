@@ -1,4 +1,4 @@
-//! Durable event-journal catch-up, filtered SSE, and gap recovery.
+//! Durable event-history catch-up, filtered SSE, and gap recovery.
 //!
 //! Three lanes cooperate here, matching the corrected game semantics:
 //!
@@ -122,7 +122,7 @@ pub struct EventCatchUpReport {
     pub cursor: Option<String>,
 }
 
-/// Local-only query over the durable, deduplicated account event journal.
+/// Local-only query over durable, deduplicated account event history.
 #[derive(Clone, Debug)]
 pub struct EventHistoryQuery {
     client: Client,
@@ -173,7 +173,7 @@ impl EventHistoryQuery {
         self
     }
 
-    /// Collects a stable event-ID-ordered view from the durable local journal.
+    /// Collects a stable event-ID-ordered view from durable local history.
     pub async fn collect(self) -> Result<Vec<Event>> {
         self.client.ensure_open()?;
         let matches = |event: &Event| {
@@ -193,7 +193,7 @@ impl EventHistoryQuery {
         };
         let mut events = if let Some(limit) = self.latest {
             // Read newest rows in bounded pages rather than deserializing the
-            // entire durable event journal for every Activity-page refresh.
+            // entire durable event history for every Activity-page refresh.
             // Filtering is applied per page so device/name queries still
             // return the requested number of matching events when available.
             let page_size = limit.clamp(100, 1_000);
@@ -277,7 +277,7 @@ impl EventsGateway {
         })
     }
 
-    /// Starts a local-only query over the durable event journal.
+    /// Starts a local-only query over durable event history.
     #[must_use]
     pub fn history(&self) -> EventHistoryQuery {
         EventHistoryQuery::new(self.client.clone())

@@ -43,7 +43,7 @@ pub enum StartupPolicy {
     Full,
 }
 
-/// Tuning for the durable event-journal catch-up and filtered SSE engine.
+/// Tuning for durable event-history catch-up and the filtered SSE engine.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventStreamOptions {
@@ -276,6 +276,12 @@ impl Readiness {
 enum Storage {
     File(PathBuf),
     Memory,
+}
+
+/// Returns the sibling SQLite path used for long-lived event/telemetry history.
+#[must_use]
+pub fn default_history_database_path(managed_database: impl AsRef<Path>) -> PathBuf {
+    super::store::history_database_path(managed_database.as_ref())
 }
 
 /// Configures and starts a managed [`Client`].
@@ -896,7 +902,7 @@ impl Client {
         super::gateways::DirectoryGateway::new(self.clone())
     }
 
-    /// Durable global catalogue and per-replicant star-knowledge reads.
+    /// Durable global catalogue and account-shared star-knowledge reads.
     #[must_use]
     pub fn galaxy(&self) -> super::galaxy::GalaxyGateway {
         super::galaxy::GalaxyGateway::new(self.clone())
@@ -1506,6 +1512,18 @@ mod tests {
             .expect_err("different account is rejected");
         assert!(matches!(error, Error::AccountStoreMismatch { .. }));
         std::fs::remove_file(path).expect("remove database");
+    }
+
+    #[test]
+    fn history_database_path_is_a_sibling_of_managed_state() {
+        assert_eq!(
+            default_history_database_path("replicant-client.sqlite"),
+            PathBuf::from("replicant-history.sqlite")
+        );
+        assert_eq!(
+            default_history_database_path("private/state.sqlite"),
+            PathBuf::from("private/state.history.sqlite")
+        );
     }
 
     #[test]

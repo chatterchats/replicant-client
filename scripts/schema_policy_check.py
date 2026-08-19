@@ -11,4 +11,14 @@ if missing:
     raise SystemExit(f"schema policy missing: {', '.join(missing)}")
 if "FOREIGN KEY" not in schema or "PRIMARY KEY (realm," not in schema:
     raise SystemExit("schema policy requires foreign and realm-qualified composite keys")
+
+history_schema = "\n".join(
+    (root / migration).read_text() for migration in policy.get("history_migrations", [])
+)
+history_required = policy.get("history_required_tables", []) + policy.get(
+    "history_required_indexes", []
+)
+history_missing = [name for name in history_required if name not in history_schema]
+if history_missing:
+    raise SystemExit(f"history schema policy missing: {', '.join(history_missing)}")
 print("schema policy ok")

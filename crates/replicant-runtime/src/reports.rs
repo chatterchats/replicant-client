@@ -153,37 +153,28 @@ pub async fn nearby_belt_report(
         return Err(io::Error::other("the account has no owned replicants").into());
     }
 
-    // The daemon continuously persists per-replicant star knowledge. Reuse
-    // that committed view first instead of re-walking every paginated star
-    // list each time somebody opens the report page. Only bootstrap the cache
-    // from upstream when this installation has no explored-star knowledge yet.
-    let mut explored = BTreeSet::new();
-    for replicant in &replicants {
-        explored.extend(
-            client
-                .galaxy()
-                .replicant_star_knowledge(replicant.id().as_str())
-                .into_iter()
-                .filter(|star| star.explored == Some(true))
-                .map(|star| star.star.id.as_str().to_owned()),
-        );
-    }
+    // Star knowledge is account-shared and normalized into the canonical catalogue.
+    // Bootstrap it through one owned Replicant only when no explored knowledge exists.
+    let mut catalogue = client.galaxy().catalogue();
+    let mut explored = catalogue
+        .iter()
+        .filter(|star| star.explored == Some(true))
+        .map(|star| star.key.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     if explored.is_empty() {
-        for replicant in &replicants {
-            let report = client
-                .galaxy()
-                .sync_replicant_stars(replicant.id().as_str())
-                .await?;
-            explored.extend(
-                report
-                    .explored_designations()
-                    .iter()
-                    .map(|designation| designation.as_str().to_owned()),
-            );
-        }
+        let report = client
+            .galaxy()
+            .sync_replicant_stars(replicants[0].id().as_str())
+            .await?;
+        explored.extend(
+            report
+                .explored_designations()
+                .iter()
+                .map(|designation| designation.as_str().to_owned()),
+        );
+        catalogue = client.galaxy().catalogue();
     }
 
-    let mut catalogue = client.galaxy().catalogue();
     if catalogue.is_empty() {
         client.galaxy().refresh_catalogue().await?;
         catalogue = client.galaxy().catalogue();

@@ -184,10 +184,14 @@ notes.
 
 ## Persistence and security
 
-The managed SQLite database stores account binding, normalized projections,
-simulation realms, event cursor/history, reconciliation work, and durable
-operation outcomes. API tokens are never persisted. Use a separate database
-per account and close the client before copying or removing the database.
+The managed SQLite database stores account binding, normalized current projections,
+simulation realms, the applied event cursor, reconciliation work, and durable
+operation outcomes. Long-lived account event/telemetry history is stored in a
+sibling history database (`replicant-history.sqlite` for the default managed
+path). API tokens are never persisted. Treat the managed and history files as
+one backup set per account and close the client before copying or removing them.
+Replicant star-census observations are normalized into the account-shared `stars`
+projection; Replicant-relative distance/travel estimates are not persisted.
 
 Do not log tokens, authorization headers, private message bodies, or databases
 containing user data.

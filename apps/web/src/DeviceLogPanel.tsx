@@ -23,17 +23,28 @@ export function DeviceLogPanel({ device }: { device: string }) {
         <p>No device log entries.</p>
       ) : (
         <div className="activity-list compact">
-          {data.events.slice(0, 20).map((event, index) => (
-            <article className="activity-item" key={event.id ?? index}>
-              <small>
-                {event.created_at
-                  ? new Date(event.created_at).toLocaleString()
-                  : "Unknown time"}
-              </small>
-              <strong>{event.event_type ?? "device event"}</strong>
-              <p>{event.message ?? JSON.stringify(event.payload)}</p>
-            </article>
-          ))}
+          {[...data.events]
+            .sort((left, right) => {
+              const leftTime = left.created_at
+                ? Date.parse(left.created_at)
+                : 0;
+              const rightTime = right.created_at
+                ? Date.parse(right.created_at)
+                : 0;
+              return rightTime - leftTime;
+            })
+            .slice(0, 20)
+            .map((event, index) => (
+              <article className="activity-item" key={event.id ?? index}>
+                <small>
+                  {event.created_at
+                    ? new Date(event.created_at).toLocaleString()
+                    : "Unknown time"}
+                </small>
+                <strong>{event.event_type ?? "device event"}</strong>
+                <p>{event.message ?? JSON.stringify(event.payload)}</p>
+              </article>
+            ))}
         </div>
       )}
     </section>

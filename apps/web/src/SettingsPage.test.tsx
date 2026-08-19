@@ -12,6 +12,7 @@ const data: SettingsSnapshot = {
   profile: "default",
   bind_address: "127.0.0.1:8080",
   managed_database_path: "replicant-client.sqlite",
+  history_database_path: "replicant-history.sqlite",
   runtime_database_path: "replicant-runtime.sqlite",
   log_filter: "info",
   docker: false,

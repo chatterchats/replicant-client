@@ -546,11 +546,22 @@ pub struct Star {
     pub entry_point: Option<LocationKey>,
     pub position: Option<GalacticPosition>,
     pub has_hub: Option<bool>,
+    /// Whether an owned Replicant has supplied account star knowledge for this system.
+    #[serde(default)]
+    pub knowledge_observed: bool,
+    /// Whether the account has explored this system.
+    #[serde(default)]
+    pub explored: Option<bool>,
+    /// Whether account-wide star knowledge has detected life in this system.
+    #[serde(default)]
+    pub has_life: Option<bool>,
     pub region: Option<String>,
 }
 
-/// A star observation from one owned replicant's perspective.  It is not a
-/// catalogue replacement: different replicants can know different facts.
+/// Compatibility view of account-shared star knowledge from one Replicant.
+///
+/// Canonical facts are persisted once on [`Star`]. Replicant-relative distance
+/// and travel estimates are intentionally ephemeral and are not durably stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StarKnowledge {
     pub replicant: ReplicantKey,

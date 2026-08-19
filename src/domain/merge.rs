@@ -129,6 +129,9 @@ pub fn merge_star(
     preserve(&mut incoming.value.entry_point, &existing.value.entry_point);
     preserve(&mut incoming.value.position, &existing.value.position);
     preserve(&mut incoming.value.has_hub, &existing.value.has_hub);
+    incoming.value.knowledge_observed |= existing.value.knowledge_observed;
+    preserve(&mut incoming.value.explored, &existing.value.explored);
+    preserve(&mut incoming.value.has_life, &existing.value.has_life);
     preserve(&mut incoming.value.region, &existing.value.region);
     MergeOutcome::Replaced(incoming)
 }

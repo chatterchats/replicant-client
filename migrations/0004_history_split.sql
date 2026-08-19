@@ -1,0 +1,3 @@
+-- Version 4 is completed by the Rust migrator because it moves event history
+-- into a sibling database and merges per-Replicant star observations into the
+-- canonical stars projection before dropping the legacy tables.

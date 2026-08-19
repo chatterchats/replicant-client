@@ -971,6 +971,41 @@ impl WorkflowRepository {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    /// Lists every persisted device claim across active workflows.
+    ///
+    /// This is intentionally a bulk query so coordinators that need to select
+    /// an unclaimed fleet do not perform one SQLite query per workflow.
+    pub fn device_claims(&self) -> Result<Vec<ResourceClaim>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT resource_key, workflow_id, acquired_at, updated_at
+             FROM workflow_resource_claims
+             WHERE resource_namespace = 'device'
+             ORDER BY resource_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let key = row.get::<_, String>(0)?;
+            let workflow_id = row.get::<_, String>(1)?;
+            Ok((
+                key,
+                workflow_id,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, workflow_id, acquired_at, updated_at) = row?;
+            let workflow_id = parse_id(workflow_id)?;
+            Ok(ResourceClaim {
+                resource: ResourceKey::Device(key),
+                workflow_id,
+                acquired_at,
+                updated_at,
+            })
+        })
+        .collect()
+    }
+
     /// Removes claims whose owner is missing or terminal after a restart.
     pub fn reconcile_claims(&self) -> Result<usize, RepositoryError> {
         let mut connection = self.connection()?;

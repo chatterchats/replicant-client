@@ -797,6 +797,9 @@ mod tests {
             entry_point: None,
             position: None,
             has_hub: None,
+            knowledge_observed: false,
+            explored: None,
+            has_life: None,
             region: region.map(str::to_owned),
         }
     }

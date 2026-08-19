@@ -25,8 +25,8 @@ use tracing::{debug, info, warn};
 
 use crate::domain::{
     Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    LocationKey, Observation, ObservationMetadata, Realm, Replicant, ReplicantKey, Simulation,
-    SimulationId, Star, StarKey, StarKnowledge,
+    LocationId, LocationKey, Observation, ObservationMetadata, Realm, Replicant, ReplicantId,
+    ReplicantKey, Simulation, SimulationId, Star, StarId, StarKey, StarKnowledge,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -34,7 +34,13 @@ const DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA: &str =
     include_str!("../../migrations/0002_device_relationship_semantics.sql");
 const RECONCILIATION_LEADER_SCHEMA: &str =
     include_str!("../../migrations/0003_reconciliation_leader.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const HISTORY_SPLIT_SCHEMA: &str = include_str!("../../migrations/0004_history_split.sql");
+const HISTORY_INITIAL_SCHEMA: &str = include_str!("../../migrations/history/0001_initial.sql");
+const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_indexes.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 1;
+const AMI_RAW_RETENTION_DAYS: i64 = 30;
+const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -61,11 +67,15 @@ pub(crate) enum StoreError {
     InvalidEventId(String),
     #[error("database schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
+    #[error("history database schema version {found} is newer than supported version {supported}")]
+    UnsupportedHistorySchemaVersion { found: i64, supported: i64 },
 }
 
 /// Internal durable store. No database handle crosses the crate boundary.
 pub(crate) struct Store {
     connection: Connection,
+    history: Connection,
+    last_history_maintenance: Instant,
     #[cfg(test)]
     fail_next_commit: bool,
 }
@@ -343,20 +353,9 @@ impl StoreProxy {
         self.0
             .execute_blocking(move |s| s.replace_catalogue(&stars, generated_at.as_deref()))
     }
-    pub(crate) fn persist_star_knowledge(
-        &mut self,
-        value: &Observation<StarKnowledge>,
-    ) -> Result<(), StoreError> {
-        self.persist_star_knowledge_batch(std::slice::from_ref(value))
-    }
-
-    pub(crate) fn persist_star_knowledge_batch(
-        &mut self,
-        values: &[Observation<StarKnowledge>],
-    ) -> Result<(), StoreError> {
+    pub(crate) fn persist_stars(&mut self, values: &[Observation<Star>]) -> Result<(), StoreError> {
         let values = values.to_vec();
-        self.0
-            .execute_blocking(move |s| s.persist_star_knowledge_batch(&values))
+        self.0.execute_blocking(move |s| s.persist_stars(&values))
     }
     pub(crate) fn persist_location(
         &mut self,
@@ -660,17 +659,29 @@ pub(crate) struct ReconciliationWork {
     pub(crate) attempts: u32,
 }
 
+pub(crate) fn history_database_path(path: &Path) -> PathBuf {
+    if path.file_name().and_then(|name| name.to_str()) == Some("replicant-client.sqlite") {
+        return path.with_file_name("replicant-history.sqlite");
+    }
+    path.with_extension("history.sqlite")
+}
+
 impl Store {
     pub(crate) fn open_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
+        let history = Connection::open_in_memory()?;
         Self::configure(&connection, false)?;
-        Self::migrate(connection)
+        Self::configure_history(&history, false)?;
+        Self::migrate(connection, history, false)
     }
 
     pub(crate) fn open_file(path: &Path) -> Result<Self, StoreError> {
+        let history_path = history_database_path(path);
         let connection = Connection::open(path)?;
+        let history = Connection::open(&history_path)?;
         Self::configure(&connection, true)?;
-        Self::migrate(connection)
+        Self::configure_history(&history, true)?;
+        Self::migrate(connection, history, true)
     }
 
     fn configure(connection: &Connection, file_database: bool) -> Result<(), StoreError> {
@@ -683,7 +694,40 @@ impl Store {
         Ok(())
     }
 
-    fn migrate(mut connection: Connection) -> Result<Self, StoreError> {
+    fn configure_history(connection: &Connection, file_database: bool) -> Result<(), StoreError> {
+        connection.busy_timeout(Duration::from_secs(15))?;
+        if file_database {
+            let table_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )?;
+            if table_count == 0 {
+                connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+            }
+            connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+        }
+        connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        Ok(())
+    }
+
+    fn migrate(
+        mut connection: Connection,
+        mut history: Connection,
+        file_database: bool,
+    ) -> Result<Self, StoreError> {
+        history.execute_batch(HISTORY_INITIAL_SCHEMA)?;
+        let history_version: i64 = history.query_row(
+            "SELECT CAST(value AS INTEGER) FROM history_schema_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if history_version > CURRENT_HISTORY_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedHistorySchemaVersion {
+                found: history_version,
+                supported: CURRENT_HISTORY_SCHEMA_VERSION,
+            });
+        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL);",
         )?;
@@ -692,60 +736,358 @@ impl Store {
                 row.get(0)
             })
             .optional()?;
-        if version.is_none() || version == Some(0) {
+
+        let mut version = version.unwrap_or(0);
+        if version == 0 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(INITIAL_SCHEMA)?;
             #[cfg(test)]
             if INTERRUPT_NEXT_MIGRATION.with(|interrupted| interrupted.replace(false)) {
                 return Err(StoreError::InjectedMigrationInterruption);
             }
+            transaction.execute_batch(DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA)?;
+            migrate_device_relationship_observations(&transaction)?;
+            transaction.execute_batch(RECONCILIATION_LEADER_SCHEMA)?;
             transaction.execute(
-                "INSERT INTO schema_migrations(version) VALUES (?1) ON CONFLICT(version) DO NOTHING",
-                [CURRENT_SCHEMA_VERSION],
+                "INSERT INTO schema_migrations(version) VALUES (3) ON CONFLICT(version) DO NOTHING",
+                [],
             )?;
-            transaction.execute("DELETE FROM schema_migrations WHERE version = 0", [])?;
+            transaction.execute("DELETE FROM schema_migrations WHERE version != 3", [])?;
             transaction.execute(
-                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1)",
-                [CURRENT_SCHEMA_VERSION.to_string()],
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
             )?;
             transaction.commit()?;
-        } else if version == Some(1) {
+            version = 3;
+        } else if version == 1 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA)?;
             migrate_device_relationship_observations(&transaction)?;
             transaction.execute_batch(RECONCILIATION_LEADER_SCHEMA)?;
             transaction.execute(
-                "UPDATE schema_migrations SET version = ?1 WHERE version = 1",
-                [CURRENT_SCHEMA_VERSION],
+                "UPDATE schema_migrations SET version = 3 WHERE version = 1",
+                [],
             )?;
             transaction.execute(
-                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [CURRENT_SCHEMA_VERSION.to_string()],
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
             )?;
             transaction.commit()?;
-        } else if version == Some(2) {
+            version = 3;
+        } else if version == 2 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(RECONCILIATION_LEADER_SCHEMA)?;
             transaction.execute(
-                "UPDATE schema_migrations SET version = ?1 WHERE version = 2",
-                [CURRENT_SCHEMA_VERSION],
+                "UPDATE schema_migrations SET version = 3 WHERE version = 2",
+                [],
             )?;
             transaction.execute(
-                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [CURRENT_SCHEMA_VERSION.to_string()],
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
             )?;
             transaction.commit()?;
-        } else if let Some(found) = version.filter(|version| *version != CURRENT_SCHEMA_VERSION) {
+            version = 3;
+        } else if version > CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
-                found,
+                found: version,
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        Ok(Self {
+
+        let migrated_history_split = if version == 3 {
+            Self::migrate_history_split(&mut connection, &mut history)?;
+            version = CURRENT_SCHEMA_VERSION;
+            true
+        } else {
+            false
+        };
+        if version != CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found: version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        history.execute_batch(HISTORY_INDEX_SCHEMA)?;
+
+        if migrated_history_split && file_database {
+            let page_count: i64 =
+                connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            let free_pages: i64 =
+                connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            if page_count > 0 && free_pages * 4 >= page_count {
+                info!(
+                    target: "replicant_client::store",
+                    event = "store.primary_compaction_started",
+                    page_count,
+                    free_pages,
+                    "compacting primary SQLite database after history split"
+                );
+                if let Err(error) = connection.execute_batch("VACUUM;") {
+                    warn!(
+                        target: "replicant_client::store",
+                        event = "store.primary_compaction_failed",
+                        error = %error,
+                        "primary database migration succeeded but VACUUM could not reclaim free pages"
+                    );
+                }
+            }
+        }
+
+        let mut store = Self {
             connection,
+            history,
+            last_history_maintenance: Instant::now() - HISTORY_MAINTENANCE_INTERVAL,
             #[cfg(test)]
             fail_next_commit: false,
-        })
+        };
+        store.reconcile_history_visibility()?;
+        store.maintain_history()?;
+        Ok(store)
+    }
+
+    fn migrate_history_split(
+        connection: &mut Connection,
+        history: &mut Connection,
+    ) -> Result<(), StoreError> {
+        let (legacy_event_cursor, migrated_events) =
+            Self::copy_legacy_events_to_history(connection, history)?;
+
+        let mut stars = {
+            let mut statement = connection.prepare("SELECT payload_json FROM stars")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stars = BTreeMap::new();
+            for row in rows {
+                let observation = serde_json::from_str::<Observation<Star>>(&row?)?;
+                stars.insert(observation.value.key.clone(), observation);
+            }
+            stars
+        };
+        if table_exists(connection, "replicant_star_knowledge")? {
+            let mut statement = connection.prepare(
+                "SELECT observation_json FROM replicant_star_knowledge ORDER BY realm, star_id, replicant_id",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let knowledge = serde_json::from_str::<Observation<StarKnowledge>>(&row?)?;
+                let star = crate::domain::account_star_from_knowledge(knowledge);
+                let key = star.value.key.clone();
+                let merged = if let Some(current) = stars.remove(&key) {
+                    merge_migrated_star_knowledge(current, star)
+                } else {
+                    star
+                };
+                stars.insert(key, merged);
+            }
+        }
+
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(HISTORY_SPLIT_SCHEMA)?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, star_id) DO UPDATE SET payload_json = excluded.payload_json",
+            )?;
+            for star in stars.values() {
+                statement.execute(params![
+                    realm_key(&star.value.key.realm),
+                    star.value.key.id.as_str(),
+                    serde_json::to_string(star)?,
+                ])?;
+            }
+        }
+        if let Some(cursor) = legacy_event_cursor.as_deref() {
+            advance_event_cursor(&transaction, cursor)?;
+        }
+        transaction.execute("DROP INDEX IF EXISTS event_journal_realm", [])?;
+        transaction.execute("DROP TABLE IF EXISTS event_journal", [])?;
+        transaction.execute("DROP INDEX IF EXISTS replicant_star_knowledge_star", [])?;
+        transaction.execute("DROP TABLE IF EXISTS replicant_star_knowledge", [])?;
+        transaction.execute(
+            "UPDATE schema_migrations SET version = 4 WHERE version = 3",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '4') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        transaction.commit()?;
+        history.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        info!(
+            target: "replicant_client::store",
+            event = "store.history_split_completed",
+            events = migrated_events,
+            stars = stars.len(),
+            "migrated event history to the history database and normalized star knowledge"
+        );
+        Ok(())
+    }
+
+    fn copy_legacy_events_to_history(
+        connection: &Connection,
+        history: &mut Connection,
+    ) -> Result<(Option<String>, usize), StoreError> {
+        if !table_exists(connection, "event_journal")? {
+            return Ok((None, 0));
+        }
+        let total: i64 =
+            connection.query_row("SELECT COUNT(*) FROM event_journal", [], |row| row.get(0))?;
+        info!(
+            target: "replicant_client::store",
+            event = "store.history_split_copy_started",
+            total,
+            "copying legacy event journal into the history database"
+        );
+        let mut source = connection.prepare(
+            "SELECT event_json, appended_at FROM event_journal ORDER BY appended_at, event_id",
+        )?;
+        let rows = source.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let transaction = history.transaction()?;
+        let mut max_event_id: Option<String> = None;
+        let mut copied = 0usize;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+            )?;
+            for row in rows {
+                let (serialized, appended_at) = row?;
+                let event = serde_json::from_str::<Event>(&serialized)?;
+                let event_id = event.id.as_str();
+                let is_newer = match max_event_id.as_deref() {
+                    Some(current) => compare_event_ids(event_id, current)?.is_gt(),
+                    None => true,
+                };
+                if is_newer {
+                    max_event_id = Some(event_id.to_owned());
+                }
+                insert_history_event(&mut insert, &event, &appended_at)?;
+                copied += 1;
+                if copied.is_multiple_of(100_000) {
+                    info!(
+                        target: "replicant_client::store",
+                        event = "store.history_split_copy_progress",
+                        copied,
+                        total,
+                        "copying legacy event journal into the history database"
+                    );
+                }
+            }
+        }
+        transaction.commit()?;
+        info!(
+            target: "replicant_client::store",
+            event = "store.history_split_copy_completed",
+            copied,
+            total,
+            "copied legacy event journal into the history database"
+        );
+        Ok((max_event_id, copied))
+    }
+
+    fn maintain_history(&mut self) -> Result<(), StoreError> {
+        if self.last_history_maintenance.elapsed() < HISTORY_MAINTENANCE_INTERVAL {
+            return Ok(());
+        }
+        let modifier = format!("-{AMI_RAW_RETENTION_DAYS} days");
+        let deleted = self.history.execute(
+            "DELETE FROM event_history WHERE applied_at IS NOT NULL AND event_name IN ('ami.mining.digest', 'ami.transport.digest', 'ami.survey.digest') AND datetime(appended_at) < datetime('now', ?1)",
+            [modifier],
+        )?;
+        if deleted > 0 {
+            self.history
+                .execute_batch("PRAGMA incremental_vacuum(8192);")?;
+            info!(
+                target: "replicant_client::store",
+                event = "history.telemetry_pruned",
+                deleted,
+                retention_days = AMI_RAW_RETENTION_DAYS,
+                "pruned expired raw AMI telemetry from history database"
+            );
+        }
+        self.last_history_maintenance = Instant::now();
+        Ok(())
+    }
+
+    fn append_history_event(&mut self, event: &Event) -> Result<(), StoreError> {
+        let payload = serde_json::to_string(&event.payload)?;
+        let transaction = self.history.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), NULL)",
+            params![
+                event.id.as_str(),
+                event.realm.as_ref().map(realm_key),
+                event.name.as_str(),
+                event.category.as_str(),
+                event.device.as_ref().map(|key| key.id.as_str()),
+                event.replicant.as_ref().map(|key| key.id.as_str()),
+                event.star.as_ref().map(|key| key.id.as_str()),
+                event.location.as_ref().map(|key| key.id.as_str()),
+                &event.occurred_at,
+                payload,
+            ],
+        )?;
+        transaction.commit()?;
+        self.maintain_history()
+    }
+
+    fn mark_history_event_applied(&mut self, event_id: &str) -> Result<(), StoreError> {
+        self.history.execute(
+            "UPDATE event_history SET applied_at = COALESCE(applied_at, datetime('now')) WHERE event_id = ?1",
+            [event_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_history_event_applied_best_effort(&mut self, event_id: &str) {
+        if let Err(error) = self.mark_history_event_applied(event_id) {
+            warn!(
+                target: "replicant_client::store",
+                event = "history.event_visibility_deferred",
+                event_id,
+                error = %error,
+                "primary event projection committed; history visibility will be repaired from the applied cursor"
+            );
+        }
+    }
+
+    fn reconcile_history_visibility(&mut self) -> Result<(), StoreError> {
+        let Some(cursor) = self.event_cursor()? else {
+            return Ok(());
+        };
+        let mut statement = self
+            .history
+            .prepare("SELECT event_id FROM event_history WHERE applied_at IS NULL")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut applied = Vec::new();
+        for row in rows {
+            let event_id = row?;
+            if !compare_event_ids(&event_id, &cursor)?.is_gt() {
+                applied.push(event_id);
+            }
+        }
+        drop(statement);
+        if applied.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.history.transaction()?;
+        {
+            let mut update = transaction.prepare(
+                "UPDATE event_history SET applied_at = COALESCE(applied_at, datetime('now')) WHERE event_id = ?1",
+            )?;
+            for event_id in &applied {
+                update.execute([event_id])?;
+            }
+        }
+        transaction.commit()?;
+        info!(
+            target: "replicant_client::store",
+            event = "history.visibility_reconciled",
+            rows = applied.len(),
+            cursor,
+            "reconciled staged history rows against the authoritative applied event cursor"
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -826,6 +1168,8 @@ impl Store {
     /// Forces file-backed SQLite state to durable storage before shutdown.
     pub(crate) fn flush(&mut self) -> Result<(), StoreError> {
         self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.history
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
@@ -918,25 +1262,6 @@ impl Store {
         Ok((stars, generated_at))
     }
 
-    pub(crate) fn restore_star_knowledge(
-        &self,
-    ) -> Result<BTreeMap<(ReplicantKey, StarKey), Observation<StarKnowledge>>, StoreError> {
-        let mut statement = self.connection.prepare("SELECT observation_json FROM replicant_star_knowledge ORDER BY realm, replicant_id, star_id")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut knowledge = BTreeMap::new();
-        for row in rows {
-            let observation = serde_json::from_str::<Observation<StarKnowledge>>(&row?)?;
-            knowledge.insert(
-                (
-                    observation.value.replicant.clone(),
-                    observation.value.star.clone(),
-                ),
-                observation,
-            );
-        }
-        Ok(knowledge)
-    }
-
     pub(crate) fn persist_account(
         &mut self,
         account: &Observation<Account>,
@@ -995,33 +1320,21 @@ impl Store {
         Self::commit(transaction, fail_commit)
     }
 
-    pub(crate) fn persist_star_knowledge(
-        &mut self,
-        knowledge: &Observation<StarKnowledge>,
-    ) -> Result<(), StoreError> {
-        self.persist_star_knowledge_batch(std::slice::from_ref(knowledge))
-    }
-
-    pub(crate) fn persist_star_knowledge_batch(
-        &mut self,
-        knowledge: &[Observation<StarKnowledge>],
-    ) -> Result<(), StoreError> {
-        if knowledge.is_empty() {
+    pub(crate) fn persist_stars(&mut self, stars: &[Observation<Star>]) -> Result<(), StoreError> {
+        if stars.is_empty() {
             return Ok(());
         }
-
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
         {
             let mut statement = transaction.prepare(
-                "INSERT INTO replicant_star_knowledge(realm, replicant_id, star_id, observation_json) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(realm, replicant_id, star_id) DO UPDATE SET observation_json = excluded.observation_json",
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, star_id) DO UPDATE SET payload_json = excluded.payload_json",
             )?;
-            for observation in knowledge {
+            for star in stars {
                 statement.execute(params![
-                    realm_key(&observation.value.star.realm),
-                    observation.value.replicant.id.as_str(),
-                    observation.value.star.id.as_str(),
-                    serde_json::to_string(observation)?,
+                    realm_key(&star.value.key.realm),
+                    star.value.key.id.as_str(),
+                    serde_json::to_string(star)?,
                 ])?;
             }
         }
@@ -1135,16 +1448,13 @@ impl Store {
         locations: &[Observation<Location>],
         reconciliation_targets: &[(Realm, String)],
     ) -> Result<bool, StoreError> {
-        let fail_commit = self.take_commit_failure();
-        let transaction = self.connection.transaction()?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
-            params![event.id.as_str(), event.realm.as_ref().map(realm_key), serde_json::to_string(event)?],
-        )? == 1;
-        if !inserted {
-            Self::commit(transaction, fail_commit)?;
+        if self.has_event(cursor)? {
+            self.mark_history_event_applied_best_effort(event.id.as_str());
             return Ok(false);
         }
+        self.append_history_event(event)?;
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
         for device in devices {
             persist_device(&transaction, device)?;
         }
@@ -1170,10 +1480,11 @@ impl Store {
         }
         advance_event_cursor(&transaction, cursor)?;
         Self::commit(transaction, fail_commit)?;
+        self.mark_history_event_applied_best_effort(event.id.as_str());
         Ok(true)
     }
 
-    /// Same atomic guarantee as [`Store::append_event_and_project`], but also
+    /// Same primary-database atomic guarantee as [`Store::append_event_and_project`], but also
     /// tombstones devices proven decommissioned by this event (an explicit
     /// removal signal, unlike a filtered/visibility-scoped collection page).
     pub(crate) fn append_event_and_decommission(
@@ -1182,16 +1493,13 @@ impl Store {
         cursor: &str,
         decommissioned: &[DeviceKey],
     ) -> Result<bool, StoreError> {
-        let fail_commit = self.take_commit_failure();
-        let transaction = self.connection.transaction()?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, ?2, ?3, datetime('now'))",
-            params![event.id.as_str(), event.realm.as_ref().map(realm_key), serde_json::to_string(event)?],
-        )? == 1;
-        if !inserted {
-            Self::commit(transaction, fail_commit)?;
+        if self.has_event(cursor)? {
+            self.mark_history_event_applied_best_effort(event.id.as_str());
             return Ok(false);
         }
+        self.append_history_event(event)?;
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
         for key in decommissioned {
             let realm = realm_key(&key.realm);
             let device_id = key.id.as_str();
@@ -1210,22 +1518,19 @@ impl Store {
         }
         advance_event_cursor(&transaction, cursor)?;
         Self::commit(transaction, fail_commit)?;
+        self.mark_history_event_applied_best_effort(event.id.as_str());
         Ok(true)
     }
 
-    /// Durable dedup check: reports whether this event ID was already
-    /// journaled, regardless of whether it arrived through the unfiltered log
-    /// or the filtered SSE stream.
+    /// Durable dedup check based on the monotonically advancing applied cursor.
+    ///
+    /// History is intentionally stored in a separate database, so it cannot be
+    /// the atomic source of truth for whether an event projection committed.
     pub(crate) fn has_event(&self, event_id: &str) -> Result<bool, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT 1 FROM event_journal WHERE event_id = ?1",
-                [event_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|found| found.is_some())
-            .map_err(StoreError::from)
+        let Some(cursor) = self.event_cursor()? else {
+            return Ok(false);
+        };
+        Ok(!compare_event_ids(event_id, &cursor)?.is_gt())
     }
 
     /// Persists a baseline watermark cursor with no accompanying event, used
@@ -1455,15 +1760,12 @@ impl Store {
     }
 
     pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT event_json FROM event_journal ORDER BY appended_at, event_id")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(serde_json::from_str(&row?)?);
-        }
-        Ok(events)
+        let mut statement = self.history.prepare(
+            "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
+             FROM event_history WHERE applied_at IS NOT NULL ORDER BY appended_at, event_id",
+        )?;
+        let rows = statement.query_map([], history_event_row)?;
+        rows.map(|row| decode_history_event(row?)).collect()
     }
 
     pub(crate) fn read_events_desc(
@@ -1473,16 +1775,12 @@ impl Store {
     ) -> Result<Vec<Event>, StoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-        let mut statement = self.connection.prepare(
-            "SELECT event_json FROM event_journal \
-             ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+        let mut statement = self.history.prepare(
+            "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
+             FROM event_history WHERE applied_at IS NOT NULL ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = statement.query_map(params![limit, offset], |row| row.get::<_, String>(0))?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(serde_json::from_str(&row?)?);
-        }
-        Ok(events)
+        let rows = statement.query_map(params![limit, offset], history_event_row)?;
+        rows.map(|row| decode_history_event(row?)).collect()
     }
 
     pub(crate) fn read_operation(
@@ -1795,8 +2093,12 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn event_count(&self) -> Result<i64, StoreError> {
-        self.connection
-            .query_row("SELECT COUNT(*) FROM event_journal", [], |row| row.get(0))
+        self.history
+            .query_row(
+                "SELECT COUNT(*) FROM event_history WHERE applied_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
             .map_err(StoreError::from)
     }
 }
@@ -1836,10 +2138,152 @@ fn migrate_device_relationship_observations(
     Ok(())
 }
 
+fn merge_migrated_star_knowledge(
+    mut current: Observation<Star>,
+    incoming: Observation<Star>,
+) -> Observation<Star> {
+    if current.value.spectral_type.is_none() {
+        current.value.spectral_type = incoming.value.spectral_type;
+    }
+    if current.value.entry_point.is_none() {
+        current.value.entry_point = incoming.value.entry_point;
+    }
+    if current.value.position.is_none() {
+        current.value.position = incoming.value.position;
+    }
+    if current.value.has_hub.is_none() {
+        current.value.has_hub = incoming.value.has_hub;
+    }
+    current.value.knowledge_observed |= incoming.value.knowledge_observed;
+    current.value.explored = match (current.value.explored, incoming.value.explored) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    current.value.has_life = match (current.value.has_life, incoming.value.has_life) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    if current.value.region.is_none() {
+        current.value.region = incoming.value.region;
+    }
+    current
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(StoreError::from)
+}
+
+fn insert_history_event(
+    statement: &mut rusqlite::Statement<'_>,
+    event: &Event,
+    appended_at: &str,
+) -> Result<(), StoreError> {
+    statement.execute(params![
+        event.id.as_str(),
+        event.realm.as_ref().map(realm_key),
+        event.name.as_str(),
+        event.category.as_str(),
+        event.device.as_ref().map(|key| key.id.as_str()),
+        event.replicant.as_ref().map(|key| key.id.as_str()),
+        event.star.as_ref().map(|key| key.id.as_str()),
+        event.location.as_ref().map(|key| key.id.as_str()),
+        &event.occurred_at,
+        serde_json::to_string(&event.payload)?,
+        appended_at,
+    ])?;
+    Ok(())
+}
+
+type HistoryEventRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn history_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn decode_history_event(row: HistoryEventRow) -> Result<Event, StoreError> {
+    let (
+        event_id,
+        realm_key_value,
+        event_name,
+        category,
+        device_code,
+        replicant_code,
+        star_id,
+        location_id,
+        occurred_at,
+        payload_json,
+    ) = row;
+    let realm = realm_key_value.as_deref().map(realm_from_key);
+    Ok(Event {
+        id: crate::domain::EventId::new(event_id),
+        name: crate::domain::EventName::from(event_name),
+        category: crate::domain::EventCategory::from(category),
+        device: realm
+            .clone()
+            .zip(device_code)
+            .map(|(realm, code)| DeviceKey::in_realm(realm, DeviceId::new(code))),
+        replicant: realm
+            .clone()
+            .zip(replicant_code)
+            .map(|(realm, code)| ReplicantKey::in_realm(realm, ReplicantId::new(code))),
+        location: realm
+            .clone()
+            .zip(location_id)
+            .map(|(realm, id)| LocationKey::in_realm(realm, LocationId::new(id))),
+        star: realm
+            .clone()
+            .zip(star_id)
+            .map(|(realm, id)| StarKey::in_realm(realm, StarId::new(id))),
+        realm,
+        occurred_at,
+        payload: serde_json::from_str(&payload_json)?,
+    })
+}
+
 /// Redis stream IDs are `<milliseconds>-<sequence>` decimal pairs.  They are
 /// ordered numerically; lexical comparison misorders values such as `10-0`
 /// and `9-999`.
 fn compare_event_ids(left: &str, right: &str) -> Result<Ordering, StoreError> {
+    // Equality is format-independent. This matters for synthetic/test cursors and
+    // also avoids rejecting an already-applied opaque cursor merely because no
+    // ordering comparison is actually required. Distinct values still require
+    // the production Redis stream-ID shape below.
+    if left == right {
+        return Ok(Ordering::Equal);
+    }
+
     fn parse(value: &str) -> Result<(u64, u64), StoreError> {
         let Some((milliseconds, sequence)) = value.split_once('-') else {
             return Err(StoreError::InvalidEventId(value.into()));
@@ -2125,6 +2569,43 @@ mod tests {
         }
     }
 
+    fn star(id: &str) -> Observation<Star> {
+        Observation {
+            value: Star {
+                key: StarKey::live(id.into()),
+                name: None,
+                spectral_type: Some("G".to_owned()),
+                entry_point: None,
+                position: None,
+                has_hub: None,
+                knowledge_observed: false,
+                explored: None,
+                has_life: None,
+                region: None,
+            },
+            metadata: device(Realm::Live, "metadata").metadata,
+        }
+    }
+
+    fn legacy_star_knowledge(replicant: &str, id: &str) -> Observation<StarKnowledge> {
+        Observation {
+            value: StarKnowledge {
+                replicant: ReplicantKey::live(replicant.into()),
+                star: StarKey::live(id.into()),
+                position: None,
+                spectral_type: None,
+                entry_point: None,
+                explored: Some(true),
+                has_hub: None,
+                has_life: Some(true),
+                region: Some("alpha".to_owned()),
+                distance_from_replicant: Some(42.0),
+                estimated_travel_time: Some(123),
+            },
+            metadata: device(Realm::Live, "metadata").metadata,
+        }
+    }
+
     #[test]
     fn fresh_migration_is_idempotent_and_configures_file_database() {
         let path = test_path("migration");
@@ -2192,14 +2673,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (4);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (5);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
         fs::remove_file(path).expect("remove test database");
@@ -2279,6 +2760,104 @@ mod tests {
         );
         drop(store);
         std::fs::remove_file(path).expect("remove migrated database");
+    }
+
+    #[test]
+    fn version_three_migrates_events_to_history_and_normalizes_star_knowledge() {
+        let path = test_path("history-split-v3");
+        let history_path = history_database_path(&path);
+        let connection = Connection::open(&path).expect("create v3 database");
+        Store::configure(&connection, true).expect("configure v3 database");
+        connection
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);")
+            .expect("create migration ledger");
+        connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("create v1 schema");
+        connection
+            .execute_batch(DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA)
+            .expect("apply v2 schema");
+        connection
+            .execute_batch(RECONCILIATION_LEADER_SCHEMA)
+            .expect("apply v3 schema");
+        connection
+            .execute("INSERT INTO schema_migrations(version) VALUES (3)", [])
+            .expect("record v3 schema");
+        connection
+            .execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '3')",
+                [],
+            )
+            .expect("record v3 metadata");
+        let star = star("SOL");
+        connection
+            .execute(
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES ('live', 'SOL', ?1)",
+                [serde_json::to_string(&star).expect("encode star")],
+            )
+            .expect("insert star");
+        for replicant in ["R1", "R2"] {
+            let knowledge = legacy_star_knowledge(replicant, "SOL");
+            connection
+                .execute(
+                    "INSERT INTO replicant_star_knowledge(realm, replicant_id, star_id, observation_json) VALUES ('live', ?1, 'SOL', ?2)",
+                    params![
+                        replicant,
+                        serde_json::to_string(&knowledge).expect("encode knowledge")
+                    ],
+                )
+                .expect("insert legacy knowledge");
+        }
+        let event = event();
+        connection
+            .execute(
+                "INSERT INTO event_journal(event_id, realm, event_json, appended_at) VALUES (?1, 'live', ?2, datetime('now'))",
+                params![
+                    event.id.as_str(),
+                    serde_json::to_string(&event).expect("encode event")
+                ],
+            )
+            .expect("insert legacy event");
+        connection
+            .execute(
+                "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', '1-0', datetime('now'))",
+                [],
+            )
+            .expect("seed applied cursor");
+        drop(connection);
+
+        let store = Store::open_file(&path).expect("migrate v3 store");
+        assert_eq!(store.read_events().expect("history events"), vec![event]);
+        let catalogue = store.restore_catalogue().expect("restore catalogue").0;
+        let sol = catalogue
+            .get(&StarKey::live("SOL".into()))
+            .expect("SOL star");
+        assert!(sol.value.knowledge_observed);
+        assert_eq!(sol.value.explored, Some(true));
+        assert_eq!(sol.value.has_life, Some(true));
+        assert_eq!(sol.value.region.as_deref(), Some("alpha"));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('event_journal', 'replicant_star_knowledge')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy table count"),
+            0
+        );
+        assert_eq!(
+            store
+                .history
+                .query_row("SELECT COUNT(*) FROM event_history", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("history row count"),
+            1
+        );
+        drop(store);
+        fs::remove_file(&path).expect("remove primary database");
+        fs::remove_file(&history_path).expect("remove history database");
     }
 
     #[test]

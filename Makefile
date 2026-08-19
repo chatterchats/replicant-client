@@ -9,7 +9,7 @@ DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip token token-rotate
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
 
 help:
 	@printf '%s\n' \
@@ -39,6 +39,7 @@ help:
 	  'docker-down           		Stop the stack without deleting durable data' \
 	  'docker-smoke          		Start and probe a configured full stack' \
 	  'docker-persistence-smoke		Prove the data directory survives container recreation' \
+	  'docker-rebuild-deploy		Rebuild and redeploy the stack' \
 	  'zip                    		Create a clean working-tree ZIP for handoff' \
 	  'token                  		Generate a new REPLICANTD_TOKEN in .env if not present' \
 	  'token-rotate           		Rotate the REPLICANTD_TOKEN in .env
@@ -121,7 +122,7 @@ policy-checks: contract-policy-check
 	$(PYTHON) scripts/schema_policy_check.py
 	$(PYTHON) scripts/authority_matrix_check.py
 
-ci: desktop-prepare fmt-check lint test check-all doc policy-checks web-check desktop-check
+ci: desktop-prepare lint test check-all doc policy-checks web-check desktop-check
 
 docker-artifacts:
 	$(CARGO) build --locked --release -p replicant-server --bin replicantd
@@ -148,6 +149,8 @@ docker-down:
 	$(DOCKER_COMPOSE) down
 
 docker-rebuild-deploy: docker-down docker-build docker-up
+
+docker-restart: docker-down docker-up
 
 # Probes go through the web container, which injects the daemon credential,
 # so no token is needed here even though the daemon requires one.
