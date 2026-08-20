@@ -284,8 +284,7 @@ describe("device fleet browser", () => {
     expect(selectAll).not.toBeNull();
     act(() => {
       if (!selectAll) return;
-      selectAll.checked = true;
-      selectAll.dispatchEvent(new Event("change", { bubbles: true }));
+      selectAll.click();
     });
     expect(container.textContent).toContain("2 selected");
 
