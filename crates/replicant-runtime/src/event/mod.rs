@@ -640,6 +640,47 @@ pub fn restore_event_campaign(plan_file: &Path, archive: &EventCampaignArchive) 
     Ok(())
 }
 
+/// Returns the star systems that the persisted campaign may actually visit.
+/// This is used by durable orchestration to establish FTL connectivity before
+/// manufacturing or transport work begins.
+pub(crate) fn event_campaign_target_systems(plan_file: &Path) -> AnyResult<BTreeSet<String>> {
+    let campaign = campaign::load_campaign(plan_file)?;
+    campaign::target_systems(&campaign)
+}
+
+/// Returns the star system containing one persisted event mission.
+pub(crate) fn event_mission_target_system(plan_file: &Path) -> AnyResult<String> {
+    let mission = load_plan(plan_file)?;
+    Ok(system_from_location(&mission.event.location))
+}
+
+/// Persisted routing/planning identity needed by durable event preflight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EventMissionPreflight {
+    /// Event designation retained by the persisted mission.
+    pub event: String,
+    /// Selected completion criterion retained by the persisted mission.
+    pub criterion: String,
+    /// Replicant assigned to the persisted mission.
+    pub replicant: String,
+    /// Manufacturing/staging home retained by the persisted mission.
+    pub home: String,
+    /// Star system containing the event destination.
+    pub target_system: String,
+}
+
+/// Loads the routing/planning identity retained by one event mission.
+pub(crate) fn event_mission_preflight(plan_file: &Path) -> AnyResult<EventMissionPreflight> {
+    let mission = load_plan(plan_file)?;
+    Ok(EventMissionPreflight {
+        event: mission.event.designation.clone(),
+        criterion: mission.selected_criterion.criterion_name.clone(),
+        replicant: mission.selected_replicant.clone(),
+        home: mission.home_location.clone(),
+        target_system: system_from_location(&mission.event.location),
+    })
+}
+
 /// Inputs for resuming a persisted event mission or campaign.
 #[derive(Clone, Debug)]
 pub struct EventExecutionRequest {

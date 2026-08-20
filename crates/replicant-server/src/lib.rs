@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -128,6 +128,13 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const UPSTREAM_FANOUT: usize = 8;
+const CARGO_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CargoCacheEntry {
+    refreshed_at: Instant,
+    carriers: Vec<CargoCarrierSummary>,
+}
 
 /// Default loopback address used by the daemon.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -261,6 +268,12 @@ pub struct AppState {
     /// from. `/api/devices`, `/api/autofactories`, and the relay projection all
     /// rebuild the identical row set, previously once per request.
     device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
+    /// Last successful cargo detail projection. Cargo contents require fields
+    /// not yet normalized into the managed Device model, so retain the latest
+    /// successful upstream result and refresh it stale-while-revalidate.
+    cargo_cache: tokio::sync::Mutex<Option<CargoCacheEntry>>,
+    cargo_refresh: Mutex<()>,
+    cargo_refreshing: AtomicBool,
     message_sync: Mutex<()>,
     director_reconcile: Mutex<()>,
     director_wake: Notify,
@@ -293,6 +306,9 @@ impl AppState {
             pending_slices: StdMutex::new(BTreeSet::new()),
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
+            cargo_cache: tokio::sync::Mutex::new(None),
+            cargo_refresh: Mutex::new(()),
+            cargo_refreshing: AtomicBool::new(false),
             message_sync: Mutex::new(()),
             director_reconcile: Mutex::new(()),
             director_wake: Notify::new(),
@@ -1559,7 +1575,73 @@ async fn cargo(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<CargoSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let device_rows = device_rows(&state).await?;
+    if let Some(cache) = state.cargo_cache.lock().await.clone() {
+        let age = cache.refreshed_at.elapsed();
+        if age <= CARGO_CACHE_TTL {
+            return Ok(Json(Versioned::current(cargo_snapshot(
+                metadata,
+                cache.carriers,
+            ))));
+        }
+
+        if state
+            .cargo_refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                match refresh_cargo_cache(&state).await {
+                    Ok(_) => {
+                        state.invalidate(DomainSlice::Cargo);
+                        state.flush_invalidations();
+                    }
+                    Err(error) => tracing::warn!(
+                        status = error.status.as_u16(),
+                        code = error.code,
+                        message = error.message,
+                        "background cargo refresh failed; retaining stale snapshot"
+                    ),
+                }
+                state.cargo_refreshing.store(false, Ordering::Release);
+            });
+        }
+
+        tracing::debug!(
+            age_ms = age.as_millis(),
+            ttl_ms = CARGO_CACHE_TTL.as_millis(),
+            "serving stale cargo snapshot while refreshing in background"
+        );
+        return Ok(Json(Versioned::current(cargo_snapshot(
+            metadata,
+            cache.carriers,
+        ))));
+    }
+
+    let carriers = refresh_cargo_cache(&state).await?;
+    Ok(Json(Versioned::current(cargo_snapshot(metadata, carriers))))
+}
+
+async fn refresh_cargo_cache(state: &Arc<AppState>) -> Result<Vec<CargoCarrierSummary>, ApiError> {
+    let _guard = state.cargo_refresh.lock().await;
+    if let Some(cache) = state.cargo_cache.lock().await.clone()
+        && cache.refreshed_at.elapsed() <= CARGO_CACHE_TTL
+    {
+        return Ok(cache.carriers);
+    }
+
+    let carriers = load_cargo_carriers(state).await?;
+    *state.cargo_cache.lock().await = Some(CargoCacheEntry {
+        refreshed_at: Instant::now(),
+        carriers: carriers.clone(),
+    });
+    Ok(carriers)
+}
+
+async fn load_cargo_carriers(
+    state: &Arc<AppState>,
+) -> Result<Vec<CargoCarrierSummary>, ApiError> {
+    let device_rows = device_rows(state).await?;
     let carrier_devices = device_rows
         .iter()
         .filter(|device| {
@@ -1571,10 +1653,7 @@ async fn cargo(
         .cloned()
         .collect::<Vec<_>>();
     if carrier_devices.is_empty() {
-        return Ok(Json(Versioned::current(cargo_snapshot(
-            metadata,
-            Vec::new(),
-        ))));
+        return Ok(Vec::new());
     }
     // The upstream list endpoint can filter by one device type, but not by a
     // list of device codes. Group the already-known carriers by type and make
@@ -1645,7 +1724,7 @@ async fn cargo(
             resources,
         });
     }
-    Ok(Json(Versioned::current(cargo_snapshot(metadata, carriers))))
+    Ok(carriers)
 }
 
 fn cargo_snapshot(metadata: SnapshotMetadata, carriers: Vec<CargoCarrierSummary>) -> CargoSnapshot {

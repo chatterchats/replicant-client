@@ -1,7 +1,7 @@
 //! Durable workflow adapters for the application's restart-safe runtime services.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     sync::Arc,
     time::Duration,
@@ -16,7 +16,11 @@ use serde_json::Value;
 
 use crate::{
     catalogue::OperationCatalogue,
-    event::{EventExecutionRequest, EventPlanningRequest, execute_event, plan_event_mission},
+    automation::reconcile_event_connectivity,
+    event::{
+        EventExecutionRequest, EventPlanningRequest, event_mission_preflight, execute_event,
+        plan_event_mission,
+    },
     mining::{MiningExpansionRequest, execute_expansion},
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
@@ -174,6 +178,12 @@ pub struct EventWorkflowConfig {
 pub struct EventWorkflowCheckpoint {
     /// Whether execution has entered the existing event executor.
     pub started: bool,
+    /// Relay-expansion workflow satisfying a disconnected event destination.
+    #[serde(default)]
+    pub connectivity_workflows: BTreeMap<String, WorkflowId>,
+    /// Whether the event mission should be replanned after connectivity changes.
+    #[serde(default)]
+    pub replan_after_connectivity: bool,
 }
 
 /// Factory for durable mining expansions backed by the existing restart-safe mission file.
@@ -309,30 +319,76 @@ impl WorkflowExecutor for EventWorkflow {
                     key: config.plan_file.display().to_string(),
                 },
             )?;
-            if !checkpoint.started
-                && let Some(event) = config.event.as_deref()
-                && (!config.plan_file.exists() || config.replace_plan)
-            {
-                let replicant = config
-                    .replicant
-                    .clone()
-                    .ok_or_else(|| "event workflow planning requires a replicant".to_owned())?;
-                let home = config.home.clone().ok_or_else(|| {
-                    "event workflow planning requires a manufacturing home".to_owned()
-                })?;
-                plan_event_mission(
+            if !checkpoint.started {
+                if let Some(event) = config.event.as_deref()
+                    && (!config.plan_file.exists() || config.replace_plan)
+                {
+                    let replicant = config
+                        .replicant
+                        .clone()
+                        .ok_or_else(|| "event workflow planning requires a replicant".to_owned())?;
+                    let home = config.home.clone().ok_or_else(|| {
+                        "event workflow planning requires a manufacturing home".to_owned()
+                    })?;
+                    plan_event_mission(
+                        &client,
+                        &EventPlanningRequest {
+                            event: event.to_owned(),
+                            criterion: config.criterion.clone(),
+                            replicant,
+                            home,
+                            plan_file: config.plan_file.clone(),
+                            replace_plan: config.replace_plan,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+
+                let preflight =
+                    event_mission_preflight(&config.plan_file).map_err(|error| error.to_string())?;
+                let targets = BTreeSet::from([preflight.target_system.clone()]);
+                if !reconcile_event_connectivity(
+                    context,
                     &client,
-                    &EventPlanningRequest {
-                        event: event.to_owned(),
-                        criterion: config.criterion.clone(),
-                        replicant,
-                        home,
-                        plan_file: config.plan_file.clone(),
-                        replace_plan: config.replace_plan,
-                    },
+                    &mut checkpoint.connectivity_workflows,
+                    &mut checkpoint.replan_after_connectivity,
+                    &preflight.replicant,
+                    &preflight.home,
+                    &targets,
                 )
-                .await
-                .map_err(|error| error.to_string())?;
+                .await?
+                {
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(|error| error.to_string())?;
+                    context
+                        .advance_to("awaiting_ftl_connectivity", &checkpoint)
+                        .map_err(|error| error.to_string())?;
+                    context.mark_waiting().map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+
+                if checkpoint.replan_after_connectivity {
+                    plan_event_mission(
+                        &client,
+                        &EventPlanningRequest {
+                            event: preflight.event,
+                            criterion: Some(preflight.criterion),
+                            replicant: preflight.replicant,
+                            home: preflight.home,
+                            plan_file: config.plan_file.clone(),
+                            replace_plan: true,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    checkpoint.connectivity_workflows.clear();
+                    checkpoint.replan_after_connectivity = false;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(|error| error.to_string())?;
+                }
             }
             checkpoint.started = true;
             context
@@ -1028,6 +1084,16 @@ mod tests {
             serde_json::from_str::<WorkflowActivityEvent>(&json).expect("deserialize activity"),
             event
         );
+    }
+
+    #[test]
+    fn legacy_event_checkpoint_accepts_pre_connectivity_state() {
+        let checkpoint: EventWorkflowCheckpoint = serde_json::from_value(serde_json::json!({
+            "started": false
+        }))
+        .expect("restore legacy event checkpoint");
+        assert!(checkpoint.connectivity_workflows.is_empty());
+        assert!(!checkpoint.replan_after_connectivity);
     }
 
     #[test]

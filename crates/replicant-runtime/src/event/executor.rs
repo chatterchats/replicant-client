@@ -16,7 +16,7 @@ use replicant_event_planner::{
 use replicant_printing::{
     PrintRequest,
     managed::{
-        QueueOptions, discover_factories, factory_queue_slots,
+        QueueOptions, discover_factories, factory_queue_slots, invalidate_factory_detail_cache,
         fetch_blueprints as fetch_print_blueprints, queue_print_prerequisites,
         queue_print_prerequisites_ahead,
     },
@@ -1757,6 +1757,7 @@ async fn submit_available_print_batches(
         plan.execution.print_batches[index].submitted = true;
         save_plan(&config.plan_path, plan)?;
         ensure_operation_accepted(&operation).await?;
+        invalidate_factory_detail_cache(&batch.factory_code);
         queue_slots.insert(factory_code, slots - 1);
         submitted += 1;
     }
@@ -2148,6 +2149,18 @@ async fn claim_device(
     code: &str,
     role: &str,
 ) -> AnyResult<()> {
+    let known_owned = client.devices().find().owned().collect().await?;
+    if !known_owned
+        .iter()
+        .any(|handle| handle.id().as_str().eq_ignore_ascii_case(code))
+    {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "event asset {code} is not present in the account-owned device projection; replan required"
+            ),
+        ));
+    }
     let detail = client.raw().devices().get(code).await?.value;
     if role == "cargo" && detail.controller_device_code.is_some() {
         return Err(app_error(
@@ -4173,10 +4186,22 @@ async fn detach_devices(
     if devices.is_empty() {
         return Ok(());
     }
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
+    let handle = client.devices().get(carrier).await?;
+    let snapshot = handle.snapshot().await?;
+    if !snapshot.available_commands.is_empty()
+        && !snapshot
+            .available_commands
+            .iter()
+            .any(|command| command.as_str() == "detach")
+    {
+        return Err(app_error(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "carrier {carrier} cannot currently detach payload; it may be out of control range"
+            ),
+        ));
+    }
+    let operation = handle
         .command(raw::devices::DeviceCommand::Detach(
             raw::devices::TargetsCommand {
                 device: None,

@@ -56,7 +56,10 @@ pub struct EventStreamOptions {
 impl Default for EventStreamOptions {
     fn default() -> Self {
         Self {
-            log_poll_interval: Duration::from_secs(120),
+            // SSE is the primary event path. This periodic unfiltered pass is
+            // only a safety reconciliation for muted events, so keep it slow
+            // enough that it does not compete with normal automation reads.
+            log_poll_interval: Duration::from_secs(300),
             reconnect_min_backoff: Duration::from_secs(1),
             reconnect_max_backoff: Duration::from_secs(60),
             max_catchup_pages: 500,

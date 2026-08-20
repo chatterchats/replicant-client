@@ -5,7 +5,7 @@
 //! child workflows while keeping workflow checkpoints authoritative.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,15 +40,15 @@ use crate::bootstrap::{
 use crate::{
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest,
-        EventPlanningRequest, archive_event_campaign, execute_event_campaign,
-        execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
-        restore_event_campaign,
+        EventPlanningRequest, archive_event_campaign, event_campaign_target_systems,
+        event_mission_target_system, execute_event_campaign, execute_event_mission,
+        plan_event_campaign, plan_event_mission, prestage_event_mission, restore_event_campaign,
     },
     mining::{MiningExpansionRequest, execute_expansion},
     observatory::auto_prospect,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
-        restore_relay_checkpoint,
+        ftl_network_reachable_systems, restore_relay_checkpoint,
     },
     survey::{
         SurveyExecutionState, SurveyMode, SurveyOptions, execute_survey_workflow,
@@ -522,6 +522,12 @@ pub struct EventDeliveryCheckpoint {
     pub plan_json: Option<String>,
     /// Whether all requirements are physically staged at the event.
     pub ready: bool,
+    /// Relay-expansion workflow satisfying this event's disconnected destination.
+    #[serde(default)]
+    pub connectivity_workflows: BTreeMap<String, WorkflowId>,
+    /// Whether the mission must be replanned once prerequisite connectivity lands.
+    #[serde(default)]
+    pub replan_after_connectivity: bool,
 }
 
 /// Parent event-tour checkpoint.
@@ -557,6 +563,13 @@ pub struct EventCampaignCheckpoint {
     pub home: Option<String>,
     /// Authoritative archive of campaign and child mission compatibility files.
     pub archive: Option<EventCampaignArchive>,
+    /// Relay-expansion workflow currently satisfying each disconnected event system.
+    #[serde(default)]
+    pub connectivity_workflows: BTreeMap<String, WorkflowId>,
+    /// A connectivity dependency changed the world after this campaign was planned.
+    /// Replanning prevents hours-old event/inventory assumptions from being executed.
+    #[serde(default)]
+    pub replan_after_connectivity: bool,
 }
 
 /// Intent for creating one additional regional Replicant.
@@ -1739,29 +1752,75 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
             };
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.home = Some(home.clone());
-            let plan_file = scratch_file(context.id(), "event-plan.json")?;
-            materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
-            if checkpoint.plan_json.is_none() {
-                context
-                    .advance_to("planning", &checkpoint)
-                    .map_err(string_error)?;
-                plan_event_mission(
-                    &client,
-                    &EventPlanningRequest {
-                        event: intent.event.clone(),
-                        criterion: intent.criterion.clone(),
-                        replicant,
-                        home,
-                        plan_file: plan_file.clone(),
-                        replace_plan: true,
-                    },
-                )
-                .await
+            context
+                .persist_checkpoint(&checkpoint)
                 .map_err(string_error)?;
-                checkpoint.plan_json = Some(read_json(&plan_file)?);
-                context
-                    .persist_checkpoint(&checkpoint)
+
+            let plan_file = scratch_file(context.id(), "event-plan.json")?;
+            loop {
+                materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
+                if checkpoint.plan_json.is_none() {
+                    context
+                        .advance_to("planning", &checkpoint)
+                        .map_err(string_error)?;
+                    plan_event_mission(
+                        &client,
+                        &EventPlanningRequest {
+                            event: intent.event.clone(),
+                            criterion: intent.criterion.clone(),
+                            replicant: replicant.clone(),
+                            home: home.clone(),
+                            plan_file: plan_file.clone(),
+                            replace_plan: true,
+                        },
+                    )
+                    .await
                     .map_err(string_error)?;
+                    checkpoint.plan_json = Some(read_json(&plan_file)?);
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                }
+
+                let target = event_mission_target_system(&plan_file).map_err(string_error)?;
+                let targets = BTreeSet::from([target]);
+                if !reconcile_event_connectivity(
+                    context,
+                    &client,
+                    &mut checkpoint.connectivity_workflows,
+                    &mut checkpoint.replan_after_connectivity,
+                    &replicant,
+                    &home,
+                    &targets,
+                )
+                .await?
+                {
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .advance_to("awaiting_ftl_connectivity", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+
+                if checkpoint.replan_after_connectivity {
+                    tracing::info!(
+                        workflow_id = %context.id(),
+                        event = %intent.event,
+                        "FTL connectivity is ready; replanning event mission against fresh state"
+                    );
+                    checkpoint.plan_json = None;
+                    checkpoint.connectivity_workflows.clear();
+                    checkpoint.replan_after_connectivity = false;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    clear_scratch_file(&plan_file)?;
+                    continue;
+                }
+                break;
             }
 
             loop {
@@ -1830,30 +1889,29 @@ impl WorkflowExecutor for EventTourWorkflow {
                 }
             };
 
-            let child = loop {
-                match context.control_request().map_err(string_error)? {
-                    replicant_workflow::ControlRequest::Continue => {}
-                    replicant_workflow::ControlRequest::Pause
-                    | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+            match context.control_request().map_err(string_error)? {
+                replicant_workflow::ControlRequest::Continue => {}
+                replicant_workflow::ControlRequest::Pause
+                | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+            }
+            let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+                return Err(format!("event delivery child {child_id} disappeared"));
+            };
+            let child = match child.status {
+                WorkflowStatus::Succeeded => child,
+                WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                    return Err(format!(
+                        "event delivery child {child_id} ended as {:?}: {}",
+                        child.status,
+                        child.last_error.unwrap_or_default()
+                    ));
                 }
-                let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
-                    return Err(format!("event delivery child {child_id} disappeared"));
-                };
-                match child.status {
-                    WorkflowStatus::Succeeded => break child,
-                    WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
-                        return Err(format!(
-                            "event delivery child {child_id} ended as {:?}: {}",
-                            child.status,
-                            child.last_error.unwrap_or_default()
-                        ));
-                    }
-                    _ => {
-                        context
-                            .advance_to("awaiting_delivery", &checkpoint)
-                            .map_err(string_error)?;
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
+                _ => {
+                    context
+                        .advance_to("awaiting_delivery", &checkpoint)
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
                 }
             };
             let delivery: EventDeliveryCheckpoint = child.checkpoint().map_err(string_error)?;
@@ -1909,33 +1967,74 @@ impl WorkflowExecutor for EventCampaignWorkflow {
             };
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.home = Some(home.clone());
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
-            let plan_file = scratch_file(context.id(), "event-campaign.json")?;
-            if let Some(archive) = checkpoint.archive.as_ref() {
-                restore_event_campaign(&plan_file, archive).map_err(string_error)?;
-            } else {
-                clear_scratch_file(&plan_file)?;
-                context
-                    .advance_to("planning", &checkpoint)
-                    .map_err(string_error)?;
-                plan_event_campaign(
-                    &client,
-                    &EventCampaignPlanningRequest {
-                        region: intent.region.clone(),
-                        replicant,
-                        home,
-                        plan_file: plan_file.clone(),
-                        replace_plan: true,
-                    },
-                )
-                .await
+            context
+                .persist_checkpoint(&checkpoint)
                 .map_err(string_error)?;
-                checkpoint.archive =
-                    Some(archive_event_campaign(&plan_file).map_err(string_error)?);
-                context
-                    .persist_checkpoint(&checkpoint)
+
+            let plan_file = scratch_file(context.id(), "event-campaign.json")?;
+            loop {
+                if let Some(archive) = checkpoint.archive.as_ref() {
+                    restore_event_campaign(&plan_file, archive).map_err(string_error)?;
+                } else {
+                    clear_scratch_file(&plan_file)?;
+                    context
+                        .advance_to("planning", &checkpoint)
+                        .map_err(string_error)?;
+                    plan_event_campaign(
+                        &client,
+                        &EventCampaignPlanningRequest {
+                            region: intent.region.clone(),
+                            replicant: replicant.clone(),
+                            home: home.clone(),
+                            plan_file: plan_file.clone(),
+                            replace_plan: true,
+                        },
+                    )
+                    .await
                     .map_err(string_error)?;
+                    checkpoint.archive =
+                        Some(archive_event_campaign(&plan_file).map_err(string_error)?);
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                }
+
+                if !ensure_event_campaign_connectivity(
+                    context,
+                    &client,
+                    &mut checkpoint,
+                    &replicant,
+                    &home,
+                    &plan_file,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+
+                if checkpoint.replan_after_connectivity {
+                    tracing::info!(
+                        workflow_id = %context.id(),
+                        region = %intent.region,
+                        "FTL connectivity is ready; replanning event campaign against fresh state"
+                    );
+                    checkpoint.archive = None;
+                    checkpoint.connectivity_workflows.clear();
+                    checkpoint.replan_after_connectivity = false;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    clear_scratch_file(&plan_file)?;
+                    continue;
+                }
+                break;
             }
+
+            // Connectivity expansion is allowed to use the configured event
+            // worker. Claim it only after relay dependencies are satisfied so
+            // the child workflow does not collide with its parent claim. The
+            // explicit workflow config still keeps the worker Director-busy.
+            claim(context, ResourceKey::Replicant(replicant.clone()))?;
             context
                 .advance_to("executing", &checkpoint)
                 .map_err(string_error)?;
@@ -1948,7 +2047,37 @@ impl WorkflowExecutor for EventCampaignWorkflow {
             let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
             let state = loop {
                 tokio::select! {
-                    result = &mut execution => break result.map_err(string_error)?,
+                    result = &mut execution => match result {
+                        Ok(state) => break state,
+                        Err(error) => {
+                            let message = error.to_string();
+                            if retryable_event_campaign_failure(&message) {
+                                if event_campaign_failure_requires_replan(&message) {
+                                    checkpoint.archive = None;
+                                    clear_scratch_file(&plan_file)?;
+                                    context
+                                        .advance_to("replanning_after_stale_asset", &checkpoint)
+                                        .map_err(string_error)?;
+                                } else {
+                                    if let Ok(archive) = archive_event_campaign(&plan_file) {
+                                        checkpoint.archive = Some(archive);
+                                    }
+                                    context
+                                        .advance_to("waiting_for_control_range", &checkpoint)
+                                        .map_err(string_error)?;
+                                }
+                                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
+                                context
+                                    .emit_activity(format!(
+                                        "event campaign hit a recoverable execution condition ({message}); waiting to retry"
+                                    ))
+                                    .map_err(string_error)?;
+                                context.mark_waiting().map_err(string_error)?;
+                                return Ok(());
+                            }
+                            return Err(string_error(error));
+                        }
+                    },
                     _ = checkpoint_interval.tick() => {
                         match context.control_request().map_err(string_error)? {
                             replicant_workflow::ControlRequest::Continue => {}
@@ -1969,6 +2098,188 @@ impl WorkflowExecutor for EventCampaignWorkflow {
             context.mark_succeeded(Some(state)).map_err(string_error)
         })
     }
+}
+
+fn retryable_event_campaign_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("out of comms range")
+        || message.contains("out of control range")
+        || message.contains("not your device")
+        || message.contains("not present in the account-owned device projection")
+}
+
+fn event_campaign_failure_requires_replan(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not your device")
+        || message.contains("not present in the account-owned device projection")
+}
+
+async fn ensure_event_campaign_connectivity(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut EventCampaignCheckpoint,
+    replicant: &str,
+    home: &str,
+    plan_file: &Path,
+) -> Result<bool, String> {
+    let targets = event_campaign_target_systems(plan_file).map_err(string_error)?;
+    let ready = reconcile_event_connectivity(
+        context,
+        client,
+        &mut checkpoint.connectivity_workflows,
+        &mut checkpoint.replan_after_connectivity,
+        replicant,
+        home,
+        &targets,
+    )
+    .await?;
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    if !ready {
+        context
+            .advance_to("awaiting_ftl_connectivity", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+    }
+    Ok(ready)
+}
+
+pub(crate) async fn reconcile_event_connectivity(
+    context: &mut WorkflowContext,
+    client: &Client,
+    connectivity_workflows: &mut BTreeMap<String, WorkflowId>,
+    replan_after_connectivity: &mut bool,
+    replicant: &str,
+    home: &str,
+    targets: &BTreeSet<String>,
+) -> Result<bool, String> {
+    const EVENT_FTL_RANGE_LY: f64 = 7.499;
+
+    let home_system = system_designation(home);
+    let mut completed_dependencies = BTreeMap::<String, WorkflowId>::new();
+    // A live relay child is authoritative evidence that the dependency is still
+    // being worked. Avoid rebuilding the whole local relay graph every 30
+    // seconds while that child is running; only re-evaluate topology after it
+    // reaches a terminal state.
+    for target in targets {
+        let Some(workflow_id) = connectivity_workflows.get(target).copied() else {
+            continue;
+        };
+        let Some(workflow) = context.repository().read(workflow_id).map_err(string_error)? else {
+            connectivity_workflows.remove(target);
+            continue;
+        };
+        match workflow.status {
+            WorkflowStatus::Succeeded => {
+                completed_dependencies.insert(target.clone(), workflow_id);
+            }
+            WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                return Err(format!(
+                    "FTL connectivity dependency {workflow_id} for {target} ended as {:?}: {}",
+                    workflow.status,
+                    workflow.last_error.as_deref().unwrap_or("no error was recorded")
+                ));
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    let reachable =
+        ftl_network_reachable_systems(client, &home_system, targets, EVENT_FTL_RANGE_LY)
+            .await
+            .map_err(string_error)?;
+    // Expansion children share the event worker, so satisfy disconnected
+    // systems serially. This avoids creating several workflows that would all
+    // contend for the same Replicant claim while still reusing any existing
+    // compatible expansion already in flight.
+    for target in targets {
+        if reachable.contains(target) {
+            connectivity_workflows.remove(target);
+            continue;
+        }
+
+        if let Some(workflow_id) = completed_dependencies.get(target) {
+            tracing::warn!(
+                workflow_id = %context.id(),
+                connectivity_workflow_id = %workflow_id,
+                target = %target,
+                home_system = %home_system,
+                "FTL expansion succeeded but managed relay topology has not observed connectivity yet"
+            );
+            return Ok(false);
+        }
+
+        let workflow_id =
+            if let Some(existing) = active_connectivity_workflow(context, target, &home_system)? {
+                tracing::info!(
+                    workflow_id = %context.id(),
+                    connectivity_workflow_id = %existing,
+                    target = %target,
+                    home_system = %home_system,
+                    "event workflow is reusing active FTL expansion"
+                );
+                existing
+            } else {
+                let child = context
+                    .create_child(new_exploration_workflow(ExplorationIntent {
+                        target: target.clone(),
+                        replicant: Some(replicant.to_owned()),
+                        hub: Some(home.to_owned()),
+                    }))
+                    .map_err(string_error)?;
+                tracing::info!(
+                    event = "event.ftl.connectivity_required",
+                    workflow_id = %context.id(),
+                    connectivity_workflow_id = %child.id,
+                    target = %target,
+                    home_system = %home_system,
+                    replicant = %replicant,
+                    "event workflow launched prerequisite FTL expansion"
+                );
+                child.id
+            };
+        connectivity_workflows.insert(target.clone(), workflow_id);
+        *replan_after_connectivity = true;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn active_connectivity_workflow(
+    context: &WorkflowContext,
+    target: &str,
+    home_system: &str,
+) -> Result<Option<WorkflowId>, String> {
+    for workflow in context
+        .repository()
+        .list()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|workflow| {
+            workflow.kind == exploration_workflow_kind() && !workflow.status.is_terminal()
+        })
+    {
+        let intent = workflow.config::<ExplorationIntent>().map_err(string_error)?;
+        if intent.target == target
+            && intent
+                .hub
+                .as_deref()
+                .is_some_and(|hub| system_designation(hub) == home_system)
+        {
+            return Ok(Some(workflow.id));
+        }
+    }
+    Ok(None)
+}
+
+fn system_designation(location_or_system: &str) -> String {
+    location_or_system
+        .split('-')
+        .next()
+        .filter(|system| !system.is_empty())
+        .unwrap_or(location_or_system)
+        .to_ascii_uppercase()
 }
 
 struct RegionEstablishWorkflow;
@@ -4440,6 +4751,26 @@ mod tests {
     }
 
     #[test]
+    fn event_campaign_runtime_failures_choose_waiting_or_replan() {
+        assert!(retryable_event_campaign_failure(
+            "Device is out of comms range"
+        ));
+        assert!(!event_campaign_failure_requires_replan(
+            "Device is out of comms range"
+        ));
+        assert!(retryable_event_campaign_failure("403 Not your device"));
+        assert!(event_campaign_failure_requires_replan(
+            "403 Not your device"
+        ));
+        assert!(event_campaign_failure_requires_replan(
+            "event asset D-1 is not present in the account-owned device projection; replan required"
+        ));
+        assert!(!retryable_event_campaign_failure(
+            "event criterion is structurally invalid"
+        ));
+    }
+
+    #[test]
     fn mutable_manifest_planning_blockers_wait_for_replan() {
         assert!(retryable_manifest_planning_failure(&TransportError::NotFound(
             "origin SCEPTURUM has only 0 conductive; 30 requested".to_owned(),
@@ -4450,6 +4781,34 @@ mod tests {
         assert!(!retryable_manifest_planning_failure(&TransportError::Invalid(
             "destination must be an exact location".to_owned(),
         )));
+    }
+
+    #[test]
+    fn event_connectivity_checkpoint_fields_are_backward_compatible() {
+        let delivery: EventDeliveryCheckpoint = serde_json::from_value(serde_json::json!({
+            "replicant": "REP-1",
+            "home": "SCEPTURUM-BELT-1",
+            "plan_json": null,
+            "ready": false
+        }))
+        .expect("restore legacy delivery checkpoint");
+        assert!(delivery.connectivity_workflows.is_empty());
+        assert!(!delivery.replan_after_connectivity);
+
+        let campaign: EventCampaignCheckpoint = serde_json::from_value(serde_json::json!({
+            "replicant": "REP-1",
+            "home": "SCEPTURUM-BELT-1",
+            "archive": null
+        }))
+        .expect("restore legacy campaign checkpoint");
+        assert!(campaign.connectivity_workflows.is_empty());
+        assert!(!campaign.replan_after_connectivity);
+    }
+
+    #[test]
+    fn event_connectivity_uses_the_home_star_system() {
+        assert_eq!(system_designation("SCEPTURUM-BELT-1"), "SCEPTURUM");
+        assert_eq!(system_designation("THYFFAWFF"), "THYFFAWFF");
     }
 
     #[test]

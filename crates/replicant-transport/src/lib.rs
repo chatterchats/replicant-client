@@ -1616,6 +1616,7 @@ async fn detach_devices(
     if devices.is_empty() {
         return Ok(());
     }
+    ensure_cached_command_available(client, carrier, "detach").await?;
     let operation = client
         .devices()
         .get(carrier)
@@ -1639,6 +1640,28 @@ async fn detach_devices(
         .await?;
     }
     Ok(())
+}
+
+async fn ensure_cached_command_available(
+    client: &Client,
+    code: &str,
+    command: &str,
+) -> Result<()> {
+    let Some(handle) = client.devices().cached(code) else {
+        return Ok(());
+    };
+    let snapshot = handle.snapshot().await?;
+    if snapshot.available_commands.is_empty()
+        || snapshot
+            .available_commands
+            .iter()
+            .any(|available| available.as_str() == command)
+    {
+        return Ok(());
+    }
+    Err(TransportError::Invalid(format!(
+        "device {code} is not currently commandable for {command}; it may be out of control range"
+    )))
 }
 
 async fn unfurl_modular_devices(

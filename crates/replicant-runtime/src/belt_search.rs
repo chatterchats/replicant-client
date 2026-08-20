@@ -8,7 +8,7 @@
 use std::{cmp::Ordering, collections::BTreeMap, io, time::Duration};
 
 use replicant_client::{
-    Client, Operation, OperationStatus, Replicant, Star, SyncDomain,
+    Client, Operation, OperationStatus, Replicant, Star,
     domain::{GalacticPosition, Location},
 };
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,6 @@ pub async fn execute_belt_search(
 ) -> crate::ActionResult<BeltSearchResult> {
     validate_request(request)?;
     client.ready().await?;
-    client.sync().domain(SyncDomain::Replicants).await?;
     let replicant = resolve_owned_replicant(client, &request.replicant).await?;
     let replicant_code = replicant.key.id.as_str().to_owned();
     let replicant_name = replicant
@@ -159,13 +158,18 @@ pub async fn execute_belt_search(
         .unwrap_or(replicant_code.as_str())
         .to_owned();
 
-    // Populate durable explored-star knowledge once. Individual systems are
-    // still targeted-refreshed before a scan when local knowledge is missing.
-    if let Err(error) = client.galaxy().sync_replicant_stars(&replicant_code).await {
+    // Automatic routes that exclude explored systems need a complete
+    // explored-star set before filtering candidates. Inclusive routes and
+    // explicit system lists do not: they use the managed projection and
+    // targeted checks at each visited system instead of traversing hundreds
+    // of Replicant-star catalogue pages up front.
+    if needs_complete_explored_catalogue(request)
+        && let Err(error) = client.galaxy().sync_replicant_stars(&replicant_code).await
+    {
         warn!(
             replicant = %replicant_code,
             error = %error,
-            "belt-search could not refresh the complete explored-system list; falling back to targeted checks"
+            "belt-search could not refresh the explored-system list required for route filtering; falling back to managed knowledge"
         );
     }
 
@@ -251,6 +255,10 @@ pub async fn execute_belt_search(
         systems,
         stops,
     })
+}
+
+fn needs_complete_explored_catalogue(request: &BeltSearchRequest) -> bool {
+    request.route_start.is_some() && !request.include_explored
 }
 
 fn validate_request(request: &BeltSearchRequest) -> crate::ActionResult<()> {
@@ -897,6 +905,30 @@ mod tests {
         assert!(designation_in_system("SOL", "SOL"));
         assert!(designation_in_system("SOL-5-L4", "SOL"));
         assert!(!designation_in_system("SOLA-1", "SOL"));
+    }
+
+    #[test]
+    fn full_replicant_star_sync_is_only_needed_for_excluding_explored_auto_routes() {
+        let mut request = BeltSearchRequest {
+            replicant: "R-1".to_owned(),
+            systems: Vec::new(),
+            route_start: Some("SOL".to_owned()),
+            radius_ly: Some(30.0),
+            system_limit: 80,
+            include_explored: false,
+            plan_only: false,
+            wait_timeout: Duration::from_secs(60),
+        };
+        assert!(needs_complete_explored_catalogue(&request));
+
+        request.include_explored = true;
+        assert!(!needs_complete_explored_catalogue(&request));
+
+        request.route_start = None;
+        request.radius_ly = None;
+        request.systems = vec!["SOL".to_owned(), "VEGA".to_owned()];
+        request.include_explored = false;
+        assert!(!needs_complete_explored_catalogue(&request));
     }
 
     #[test]

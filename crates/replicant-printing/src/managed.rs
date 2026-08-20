@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -11,7 +12,10 @@ use replicant_client::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::Mutex as TokioMutex,
+    time::{sleep, timeout},
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -20,6 +24,79 @@ use crate::{
 };
 
 const AUTOFACTORY: &str = "autofactory";
+const FACTORY_DETAIL_CACHE_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+struct FactoryDetailCacheEntry {
+    observed_at: Instant,
+    detail: raw::devices::DeviceStatus,
+}
+
+static FACTORY_DETAIL_CACHE: OnceLock<StdMutex<BTreeMap<String, FactoryDetailCacheEntry>>> =
+    OnceLock::new();
+static FACTORY_DETAIL_LOCKS: OnceLock<StdMutex<BTreeMap<String, Arc<TokioMutex<()>>>>> =
+    OnceLock::new();
+
+fn factory_detail_cache() -> &'static StdMutex<BTreeMap<String, FactoryDetailCacheEntry>> {
+    FACTORY_DETAIL_CACHE.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+fn factory_detail_lock(factory_code: &str) -> Arc<TokioMutex<()>> {
+    let mut locks = FACTORY_DETAIL_LOCKS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks
+        .entry(factory_code.to_owned())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
+
+fn cached_factory_detail_if_fresh(factory_code: &str) -> Option<raw::devices::DeviceStatus> {
+    let cache = factory_detail_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.get(factory_code)?;
+    (entry.observed_at.elapsed() <= FACTORY_DETAIL_CACHE_TTL).then(|| entry.detail.clone())
+}
+
+async fn shared_factory_detail(
+    client: &Client,
+    factory_code: &str,
+) -> Result<raw::devices::DeviceStatus, PrintingError> {
+    if let Some(detail) = cached_factory_detail_if_fresh(factory_code) {
+        debug!(factory = %factory_code, "reusing shared live Autofactory snapshot");
+        return Ok(detail);
+    }
+
+    let lock = factory_detail_lock(factory_code);
+    let _guard = lock.lock().await;
+    if let Some(detail) = cached_factory_detail_if_fresh(factory_code) {
+        return Ok(detail);
+    }
+
+    let detail = client.raw().devices().get(factory_code).await?.value;
+    factory_detail_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            factory_code.to_owned(),
+            FactoryDetailCacheEntry {
+                observed_at: Instant::now(),
+                detail: detail.clone(),
+            },
+        );
+    Ok(detail)
+}
+
+/// Invalidates the short-lived shared Autofactory detail cache after a
+/// mutation that can change queue or printing state.
+pub fn invalidate_factory_detail_cache(factory_code: &str) {
+    factory_detail_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(factory_code);
+}
 
 /// One live Autofactory and its current queue capacity.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -455,7 +532,7 @@ async fn factory_states_for_codes<B: PrintTime>(
 ) -> Result<Vec<FactoryState>, PrintingError> {
     let mut factories = Vec::with_capacity(factory_codes.len());
     for code in factory_codes {
-        let detail = client.raw().devices().get(code).await?.value;
+        let detail = shared_factory_detail(client, code).await?;
         if factory_status_blocks_printing(detail.status.as_deref()) {
             debug!(
                 factory = %code,
@@ -479,7 +556,7 @@ pub async fn inspect_factory<B: PrintTime>(
     factory_code: &str,
     blueprints: &BTreeMap<String, B>,
 ) -> Result<FactoryState, PrintingError> {
-    let detail = client.raw().devices().get(factory_code).await?.value;
+    let detail = shared_factory_detail(client, factory_code).await?;
     factory_state_from_detail(factory_code, &detail, blueprints)
 }
 
@@ -555,7 +632,7 @@ pub async fn factory_queue_slots(
     client: &Client,
     factory_code: &str,
 ) -> Result<usize, PrintingError> {
-    let detail = client.raw().devices().get(factory_code).await?.value;
+    let detail = shared_factory_detail(client, factory_code).await?;
     if detail.status.as_deref() == Some("waiting_for_resources")
         || factory_status_blocks_printing(detail.status.as_deref())
     {
@@ -613,6 +690,7 @@ async fn enqueue_print_configured(
         .enqueue_print_configured(device_type, options)
         .await?;
     ensure_submission_accepted(&operation).await?;
+    invalidate_factory_detail_cache(factory_code);
     Ok(operation)
 }
 
@@ -1125,7 +1203,7 @@ async fn waiting_parent_requests(
 
     let mut requests = Vec::new();
     for factory_code in factory_codes {
-        let detail = client.raw().devices().get(&factory_code).await?.value;
+        let detail = shared_factory_detail(client, &factory_code).await?;
         if detail.status.as_deref() != Some("waiting_for_resources") {
             continue;
         }
@@ -1169,7 +1247,7 @@ async fn wait_for_existing_component_work(
         let mut pending_factories = BTreeSet::new();
         let mut pending_types = BTreeSet::new();
         for factory_code in factory_codes {
-            let detail = client.raw().devices().get(&factory_code).await?.value;
+            let detail = shared_factory_detail(client, &factory_code).await?;
             if detail.status.as_deref() == Some("waiting_for_resources") {
                 continue;
             }
@@ -1359,7 +1437,7 @@ pub async fn printing_status_in_system(
     let mut queued_prints = QuantityMap::new();
     let mut factory_statuses = Vec::with_capacity(factories.len());
     for (factory_code, location) in factories {
-        let detail = client.raw().devices().get(&factory_code).await?.value;
+        let detail = shared_factory_detail(client, &factory_code).await?;
         let active = detail.printing.as_ref().map(|printing| {
             let job = FactoryPrintJobStatus {
                 device_type: printing

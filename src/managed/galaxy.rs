@@ -5,7 +5,13 @@ use std::{collections::BTreeSet, time::Instant};
 use crate::domain::{self, Realm, ReplicantId, ReplicantKey, Star};
 use crate::raw;
 use crate::{Client, Error, Result};
+use tokio::sync::Semaphore;
 use tracing::info;
+
+// Replicant-star traversals can run for hundreds of pages. Keep them
+// serialized per process so two background consumers cannot monopolize the
+// shared API budget at the same time.
+static REPLICANT_STAR_SYNC: Semaphore = Semaphore::const_new(1);
 
 fn persistence_error(error: super::store::StoreError) -> Error {
     Error::Persistence {
@@ -209,6 +215,21 @@ impl GalaxyGateway {
         replicant_code: &str,
     ) -> Result<ReplicantStarSyncReport> {
         self.client.ensure_open()?;
+        let queue_started = Instant::now();
+        let _permit = REPLICANT_STAR_SYNC
+            .acquire()
+            .await
+            .expect("replicant-star sync semaphore is never closed");
+        let wait_ms = queue_started.elapsed().as_millis() as u64;
+        if wait_ms > 0 {
+            info!(
+                target: "replicant_client::galaxy",
+                event = "galaxy.replicant_stars_slot_acquired",
+                replicant = replicant_code,
+                wait_ms,
+                "acquired serialized replicant-star sync slot"
+            );
+        }
         let total_started = Instant::now();
         info!(
             target: "replicant_client::galaxy",

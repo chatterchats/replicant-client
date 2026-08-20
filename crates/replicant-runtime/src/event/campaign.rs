@@ -23,7 +23,7 @@ use super::{
     EventMissionPlan, EventScope, MissionPhase, PLAN_VERSION, app_error, build_factory_workloads,
     executor, fetch_active_events_in_scope, fetch_blueprints, fetch_devices,
     fetch_earned_achievements, fetch_inventory, load_plan, normalize_event, save_plan,
-    select_replicant,
+    select_replicant, system_from_location,
 };
 
 pub(super) fn configure_execution(campaign: &EventCampaignPlan, config: &mut Config) {
@@ -148,6 +148,20 @@ pub(super) fn mission_paths(campaign: &EventCampaignPlan) -> Vec<PathBuf> {
         .missions
         .iter()
         .map(|mission| mission.mission_path.clone())
+        .collect()
+}
+
+/// Returns the star systems containing executable campaign missions. Blocked
+/// events are intentionally excluded because no travel will be attempted for
+/// them until a later campaign replan makes them actionable.
+pub(super) fn target_systems(campaign: &EventCampaignPlan) -> AnyResult<BTreeSet<String>> {
+    campaign
+        .missions
+        .iter()
+        .map(|mission| {
+            load_plan(&mission.mission_path)
+                .map(|plan| system_from_location(&plan.event.location))
+        })
         .collect()
 }
 

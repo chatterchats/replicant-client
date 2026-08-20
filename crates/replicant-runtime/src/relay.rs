@@ -4848,6 +4848,7 @@ fn relay_device_active(device: &Device) -> bool {
 fn documented_relay_range_ly(device_type: &str) -> Option<f64> {
     match device_type {
         SYSTEM_HUB => Some(15.0),
+        "deep_space_relay_station" => Some(10.0),
         _ => None,
     }
 }
@@ -4888,6 +4889,156 @@ fn resolve_system(location: &str, systems: &BTreeSet<String>) -> Option<String> 
 
 fn designation_in_system(location: &str, system: &str) -> bool {
     location == system || location.starts_with(&format!("{system}-"))
+}
+
+/// Returns the requested systems currently connected to `start` through the
+/// active account-owned relay mesh. This is a projection-only preflight: it
+/// reads the managed device state and local star catalogue without forcing an
+/// account-wide refresh. Inactive relays intentionally do not count because a
+/// relay expansion may need to activate them before travel is actually usable.
+pub async fn ftl_network_reachable_systems(
+    client: &Client,
+    start: &str,
+    targets: &BTreeSet<String>,
+    conventional_range_ly: f64,
+) -> AnyResult<BTreeSet<String>> {
+    let catalogue = client.galaxy().catalogue();
+    let positions = catalogue
+        .iter()
+        .filter_map(|star| {
+            star.position.map(|position| {
+                (
+                    star.key.id.as_str().to_owned(),
+                    Position {
+                        x: position.x,
+                        y: position.y,
+                        z: position.z,
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !positions.contains_key(start) {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!("FTL connectivity origin {start} is not present in the star catalogue"),
+        ));
+    }
+    if let Some(target) = targets.iter().find(|target| !positions.contains_key(*target)) {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!("FTL connectivity target {target} is not present in the star catalogue"),
+        ));
+    }
+    let systems = positions.keys().cloned().collect::<BTreeSet<_>>();
+    let handles = client.devices().find().owned().collect().await?;
+    let mut relay_ranges = BTreeMap::<String, f64>::new();
+    for handle in handles {
+        let device = handle.snapshot().await?;
+        let kind = device_type(&device);
+        let relay_capable = device_has_feature(&device, "relay")
+            || kind == Some(FTL_RELAY)
+            || kind == Some(SYSTEM_HUB)
+            || kind == Some("deep_space_relay_station");
+        if !relay_capable
+            || !relay_device_active(&device)
+            || device.relationships.stowed_in.is_some()
+            || device.relationships.attached_to.is_some()
+        {
+            continue;
+        }
+        let Some(location) = device_location(&device) else {
+            continue;
+        };
+        let Some(system) = resolve_system(location, &systems) else {
+            continue;
+        };
+        let range = kind
+            .and_then(documented_relay_range_ly)
+            .unwrap_or(conventional_range_ly)
+            .max(conventional_range_ly);
+        relay_ranges
+            .entry(system)
+            .and_modify(|current| *current = current.max(range))
+            .or_insert(range);
+    }
+
+    let mut reachable = relay_mesh_reachable_systems(
+        &positions,
+        &relay_ranges,
+        start,
+        conventional_range_ly,
+    );
+    // Same-system work never needs FTL even if the home system lacks a relay.
+    reachable.insert(start.to_owned());
+    reachable.retain(|system| targets.contains(system));
+    Ok(reachable)
+}
+
+/// Convenience predicate for one target system.
+pub async fn ftl_network_reaches_system(
+    client: &Client,
+    start: &str,
+    target: &str,
+    conventional_range_ly: f64,
+) -> AnyResult<bool> {
+    let targets = BTreeSet::from([target.to_owned()]);
+    Ok(ftl_network_reachable_systems(client, start, &targets, conventional_range_ly)
+        .await?
+        .contains(target))
+}
+
+fn relay_mesh_reachable_systems(
+    positions: &BTreeMap<String, Position>,
+    relay_ranges: &BTreeMap<String, f64>,
+    start: &str,
+    conventional_range_ly: f64,
+) -> BTreeSet<String> {
+    if !relay_ranges.contains_key(start) {
+        return BTreeSet::new();
+    }
+    let mut reachable = BTreeSet::from([start.to_owned()]);
+    let mut pending = std::collections::VecDeque::from([start.to_owned()]);
+    while let Some(current) = pending.pop_front() {
+        let Some(current_position) = positions.get(&current) else {
+            continue;
+        };
+        let current_range = relay_ranges
+            .get(&current)
+            .copied()
+            .unwrap_or(conventional_range_ly);
+        for (candidate, candidate_range) in relay_ranges {
+            if reachable.contains(candidate) {
+                continue;
+            }
+            let Some(candidate_position) = positions.get(candidate) else {
+                continue;
+            };
+            let available_range = current_range
+                .max(*candidate_range)
+                .max(conventional_range_ly);
+            if current_position.distance(*candidate_position)
+                <= available_range + RELAY_DISTANCE_EPSILON
+            {
+                reachable.insert(candidate.clone());
+                pending.push_back(candidate.clone());
+            }
+        }
+    }
+    reachable
+}
+
+#[cfg(test)]
+fn relay_mesh_reaches(
+    positions: &BTreeMap<String, Position>,
+    relay_ranges: &BTreeMap<String, f64>,
+    start: &str,
+    target: &str,
+    conventional_range_ly: f64,
+) -> bool {
+    start == target
+        || relay_mesh_reachable_systems(positions, relay_ranges, start, conventional_range_ly)
+            .contains(target)
 }
 
 /// Inputs for invoking the durable relay-expansion workflow from another automation.
@@ -5072,6 +5223,97 @@ mod tests {
             "returned_to_hub": false
         }))
         .expect("valid relay checkpoint")
+    }
+
+    #[test]
+    fn active_relay_mesh_connectivity_requires_one_connected_component() {
+        let positions = BTreeMap::from([
+            (
+                "ROOT".to_owned(),
+                Position {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "MID".to_owned(),
+                Position {
+                    x: 12.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "TARGET".to_owned(),
+                Position {
+                    x: 19.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "ISLAND".to_owned(),
+                Position {
+                    x: 40.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+        ]);
+        let ranges = BTreeMap::from([
+            ("ROOT".to_owned(), 15.0),
+            ("MID".to_owned(), DEFAULT_MAX_HOP_LY),
+            ("TARGET".to_owned(), DEFAULT_MAX_HOP_LY),
+            ("ISLAND".to_owned(), 10.0),
+        ]);
+
+        assert!(relay_mesh_reaches(
+            &positions,
+            &ranges,
+            "ROOT",
+            "TARGET",
+            DEFAULT_MAX_HOP_LY,
+        ));
+        assert!(!relay_mesh_reaches(
+            &positions,
+            &ranges,
+            "ROOT",
+            "ISLAND",
+            DEFAULT_MAX_HOP_LY,
+        ));
+    }
+
+    #[test]
+    fn target_without_active_relay_is_not_yet_ftl_connected() {
+        let positions = BTreeMap::from([
+            ("ROOT".to_owned(), Position::default()),
+            (
+                "TARGET".to_owned(),
+                Position {
+                    x: 5.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+        ]);
+        let ranges = BTreeMap::from([("ROOT".to_owned(), 15.0)]);
+
+        assert!(!relay_mesh_reaches(
+            &positions,
+            &ranges,
+            "ROOT",
+            "TARGET",
+            DEFAULT_MAX_HOP_LY,
+        ));
+    }
+
+    #[test]
+    fn deep_space_relay_station_has_documented_ten_ly_fallback() {
+        assert_eq!(
+            documented_relay_range_ly("deep_space_relay_station"),
+            Some(10.0)
+        );
     }
 
     #[test]

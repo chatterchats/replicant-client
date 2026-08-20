@@ -17,7 +17,6 @@ use crate::{
     WorkflowStatus,
 };
 
-
 // Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
 // polling/reconciliation waits. Throttle them so the supervisor cannot hot-loop
 // a finished executor several times per second while its prerequisite is unchanged.
@@ -26,6 +25,11 @@ const POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // slower cadence. Re-entering the whole durable executor every five seconds
 // while a tour is merely waiting adds churn without improving responsiveness.
 const SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+// Event workflows can remain blocked on manufacturing, staging, or relay
+// expansion for many minutes. The prerequisite workflow itself reacts to
+// managed evidence; parents only need an occasional reconciliation pass to
+// observe completion.
+const EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Boxed future returned by a workflow executor.
 pub type BoxWorkflowFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -794,6 +798,14 @@ fn polling_wait_retry_due(instance: &WorkflowInstance) -> bool {
     let updated_at = u128::try_from(instance.updated_at).unwrap_or_default();
     let interval = if instance.kind.as_str() == "scan.tour" {
         SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL
+    } else if matches!(
+        (instance.kind.as_str(), instance.current_step.as_deref()),
+        (
+            "event.campaign" | "event.delivery" | "event.fulfillment",
+            Some("awaiting_ftl_connectivity"),
+        ) | ("event.tour", Some("awaiting_delivery"))
+    ) {
+        EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL
     } else {
         POLLING_WAIT_RETRY_INTERVAL
     };

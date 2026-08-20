@@ -60,6 +60,10 @@ const SNAPSHOT_NS: &str = "director.snapshot";
 const BLUEPRINT_SHOP_NS: &str = "director.blueprint_shop_opportunity";
 const BLUEPRINT_SHOP_CACHE_NS: &str = "director.blueprint_shop_snapshot";
 const BLUEPRINT_SHOP_CACHE_KEY: &str = "latest";
+const HUB_REFRESH_CACHE_NS: &str = "director.system_hub_refresh";
+const HUB_REFRESH_CACHE_KEY: &str = "latest";
+const ACTIVE_EVENT_CACHE_NS: &str = "director.active_event_snapshot";
+const ACTIVE_EVENT_CACHE_KEY: &str = "latest";
 const SNAPSHOT_KEY: &str = "latest";
 
 const DEFAULT_HOLD_MS: i64 = 30 * 60 * 1000;
@@ -80,6 +84,9 @@ const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
 const BLUEPRINT_SHOP_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
 const BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
+const HUB_REFRESH_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
+const ACTIVE_EVENT_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
+const ACTIVE_EVENT_STALE_FALLBACK_MS: i64 = 10 * 60 * 1000;
 
 const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
@@ -204,6 +211,25 @@ struct BlueprintShopCache {
     #[serde(default)]
     requested_blueprints: BTreeSet<String>,
     snapshot: BlueprintShopSnapshot,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HubRefreshCache {
+    #[serde(default)]
+    refreshed_at_ms: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ActiveEventCache {
+    refreshed_at_ms: i64,
+    #[serde(default)]
+    events: Vec<CachedActiveEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CachedActiveEvent {
+    designation: Option<String>,
+    location: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -439,12 +465,35 @@ pub async fn reconcile_director(
         "Director managed world phase complete"
     );
     let mut hub_refresh_errors = BTreeMap::new();
+    let mut hub_refresh_cache = repository
+        .read_document(HUB_REFRESH_CACHE_NS, HUB_REFRESH_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value::<HubRefreshCache>(value))
+        .transpose()?
+        .unwrap_or_default();
+    let mut hub_refresh_cache_changed = false;
     let hub_codes = devices
         .iter()
         .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
         .map(|device| device.key.id.as_str().to_owned())
         .collect::<Vec<_>>();
     for code in hub_codes {
+        let age_ms = hub_refresh_cache
+            .refreshed_at_ms
+            .get(&code)
+            .map(|refreshed_at| now.saturating_sub(*refreshed_at));
+        if !force_slow_refresh
+            && let Some(age_ms) = age_ms
+            && age_ms <= HUB_REFRESH_CACHE_TTL_MS
+        {
+            tracing::debug!(
+                device = %code,
+                age_ms,
+                ttl_ms = HUB_REFRESH_CACHE_TTL_MS,
+                phase = "devices",
+                "Director reused SSE-backed System Hub state"
+            );
+            continue;
+        }
         match client.devices().refresh(&code).await {
             Ok(handle) => match handle.snapshot().await {
                 Ok(refreshed) => {
@@ -454,6 +503,8 @@ pub async fn reconcile_director(
                     {
                         *device = refreshed;
                     }
+                    hub_refresh_cache.refreshed_at_ms.insert(code.clone(), now);
+                    hub_refresh_cache_changed = true;
                 }
                 Err(error) => {
                     hub_refresh_errors.insert(code, error.to_string());
@@ -463,6 +514,13 @@ pub async fn reconcile_director(
                 hub_refresh_errors.insert(code, error.to_string());
             }
         }
+    }
+    if hub_refresh_cache_changed {
+        repository.put_document(
+            HUB_REFRESH_CACHE_NS,
+            HUB_REFRESH_CACHE_KEY,
+            &hub_refresh_cache,
+        )?;
     }
     let inventories = client.state().inventories()?;
     tracing::debug!(
@@ -628,56 +686,35 @@ pub async fn reconcile_director(
         DirectorGoalKind::ExpandFtlNetwork,
     )) && !established_regions.is_empty()
     {
-        let event_started = Instant::now();
-        tracing::info!(
-            regions = established_regions.len(),
-            phase = "events",
-            "Director loading one account-wide active-event snapshot"
-        );
-        match tokio::time::timeout(EVENT_DISCOVERY_TIMEOUT, active_events(client)).await {
-            Ok(Ok(active_events)) => {
+        match active_events_for_director(
+            client,
+            repository.as_ref(),
+            now,
+            force_slow_refresh,
+            established_regions.len(),
+        )
+        .await
+        {
+            Ok(active_events) => {
                 event_systems_by_region = group_active_event_systems_by_region(
                     &active_events,
                     &location_systems,
                     &system_regions,
                     &regions,
                 );
-                let grouped = group_active_events_by_region(
+                group_active_events_by_region(
                     &active_events,
                     &location_systems,
                     &system_regions,
                     &regions,
-                );
-                tracing::info!(
-                    events = grouped.values().map(Vec::len).sum::<usize>(),
-                    regions = grouped.len(),
-                    elapsed_ms = event_started.elapsed().as_millis(),
-                    phase = "events",
-                    "Director active-event snapshot complete"
-                );
-                grouped
+                )
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 let message = format!("active-event discovery failed: {error}");
                 tracing::warn!(
                     error = %error,
-                    elapsed_ms = event_started.elapsed().as_millis(),
                     phase = "events",
                     "Director active-event snapshot failed; continuing without event planning"
-                );
-                event_discovery_error = Some(message);
-                BTreeMap::new()
-            }
-            Err(_) => {
-                let message = format!(
-                    "active-event discovery exceeded {} seconds",
-                    EVENT_DISCOVERY_TIMEOUT.as_secs()
-                );
-                tracing::warn!(
-                    timeout_ms = EVENT_DISCOVERY_TIMEOUT.as_millis(),
-                    elapsed_ms = event_started.elapsed().as_millis(),
-                    phase = "events",
-                    "Director active-event snapshot timed out; continuing without event planning"
                 );
                 event_discovery_error = Some(message);
                 BTreeMap::new()
@@ -1200,6 +1237,89 @@ async fn blueprint_shop_snapshot_for_requirements(
         },
     )?;
     Ok(snapshot)
+}
+
+async fn active_events_for_director(
+    client: &Client,
+    repository: &WorkflowRepository,
+    now: i64,
+    force_refresh: bool,
+    region_count: usize,
+) -> Result<Vec<CachedActiveEvent>, ApplicationError> {
+    let cached = repository
+        .read_document(ACTIVE_EVENT_CACHE_NS, ACTIVE_EVENT_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value::<ActiveEventCache>(value))
+        .transpose()?;
+    if let Some(cache) = cached.as_ref() {
+        let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+        if !force_refresh && age_ms <= ACTIVE_EVENT_CACHE_TTL_MS {
+            tracing::debug!(
+                event = "director.events.snapshot_cache_hit",
+                age_ms,
+                ttl_ms = ACTIVE_EVENT_CACHE_TTL_MS,
+                events = cache.events.len(),
+                "Director reused cached active-event snapshot"
+            );
+            return Ok(cache.events.clone());
+        }
+    }
+
+    let started = Instant::now();
+    tracing::info!(
+        regions = region_count,
+        phase = "events",
+        "Director loading one account-wide active-event snapshot"
+    );
+    match tokio::time::timeout(EVENT_DISCOVERY_TIMEOUT, active_events(client)).await {
+        Ok(Ok(events)) => {
+            let events = events
+                .into_iter()
+                .map(|event| CachedActiveEvent {
+                    designation: event.designation,
+                    location: event.location,
+                })
+                .collect::<Vec<_>>();
+            repository.put_document(
+                ACTIVE_EVENT_CACHE_NS,
+                ACTIVE_EVENT_CACHE_KEY,
+                &ActiveEventCache {
+                    refreshed_at_ms: now,
+                    events: events.clone(),
+                },
+            )?;
+            tracing::info!(
+                events = events.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                phase = "events",
+                "Director active-event snapshot complete"
+            );
+            Ok(events)
+        }
+        outcome => {
+            let error = match outcome {
+                Ok(Err(error)) => format!("{error}"),
+                Err(_) => format!(
+                    "active-event discovery exceeded {} seconds",
+                    EVENT_DISCOVERY_TIMEOUT.as_secs()
+                ),
+                Ok(Ok(_)) => unreachable!("successful event discovery handled above"),
+            };
+            if let Some(cache) = cached {
+                let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+                if age_ms <= ACTIVE_EVENT_STALE_FALLBACK_MS {
+                    tracing::warn!(
+                        error = %error,
+                        age_ms,
+                        events = cache.events.len(),
+                        phase = "events",
+                        "Director active-event refresh failed; using recent cached snapshot"
+                    );
+                    return Ok(cache.events);
+                }
+            }
+            Err(std::io::Error::other(error).into())
+        }
+    }
 }
 
 async fn snapshot_blueprint_shop_opportunities(
@@ -3531,7 +3651,7 @@ fn reconcile_workforce(
 }
 
 fn group_active_events_by_region(
-    events: &[replicant_client::raw::events::LocationEvent],
+    events: &[CachedActiveEvent],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
     regions: &BTreeMap<String, RegionView>,
@@ -3568,7 +3688,7 @@ fn group_active_events_by_region(
 }
 
 fn group_active_event_systems_by_region(
-    events: &[replicant_client::raw::events::LocationEvent],
+    events: &[CachedActiveEvent],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
     regions: &BTreeMap<String, RegionView>,
