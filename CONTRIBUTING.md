@@ -3,10 +3,10 @@
 `replicant-client` is a single root package (edition 2024, no workspace).
 Module boundaries are enforced by Cargo features, not by separate crates:
 
-| Feature | Implies | Owns |
-| --- | --- | --- |
-| `raw` | — | HTTP transport, authentication, request/response models, pagination, rate-limit metadata. |
-| `events` | `raw` | SSE framing and raw event streaming. |
+| Feature             | Implies  | Owns                                                                                       |
+| ------------------- | -------- | ------------------------------------------------------------------------------------------ |
+| `raw`               | —        | HTTP transport, authentication, request/response models, pagination, rate-limit metadata.  |
+| `events`            | `raw`    | SSE framing and raw event streaming.                                                       |
 | `managed` (default) | `events` | SQLite store, state engine, synchronization, durable operations, and the managed `Client`. |
 
 Do not add a dependency to a lower tier merely because a higher tier already
@@ -17,6 +17,10 @@ them to the feature that needs them.
 
 The verified Replicant Space 2.5.0 OpenAPI and rendered-document corpus under
 [`reference/replicant-space/`](reference/replicant-space/) is the contract.
+The corpus is byte-for-byte pinned by its manifest and must not be reformatted;
+the repository-level `.prettierignore` excludes it so a manual
+`prettier . --write` does not alter the verified reference material. Refresh
+that directory only through the documented contract/reference update process.
 Rendered documentation deprecation asides override missing OpenAPI
 `deprecated` flags — see `policy/contract-metadata.json`.
 
