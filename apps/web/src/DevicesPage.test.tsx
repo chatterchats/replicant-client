@@ -299,7 +299,7 @@ describe("device fleet browser", () => {
       command.dispatchEvent(new Event("change", { bubbles: true }));
     });
     const run = [...container.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Decommission 2"),
+      button.textContent.includes("Decommission 2"),
     );
     expect(run).toBeDefined();
     act(() => {
