@@ -306,7 +306,7 @@ impl LocationQuery {
             })
             .collect::<Vec<_>>();
 
-        info!(
+        debug!(
             target: "replicant_client::query::locations",
             event = "location_query.evaluated",
             input_locations,
@@ -1670,7 +1670,7 @@ impl DeviceQuery {
         let started = Instant::now();
         let entries = self.matching_entries(self.client.managed_state().devices());
         let handles = self.handles(&entries);
-        info!(
+        debug!(
             target: "replicant_client::query::devices",
             event = "query.devices_collected",
             results = handles.len(),

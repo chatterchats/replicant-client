@@ -109,6 +109,45 @@ async fn refresh_device_snapshot(client: &Client, code: &str) -> AnyResult<Devic
     Ok(handle.snapshot().await?)
 }
 
+async fn wait_for_adoption_projection(
+    client: &Client,
+    drone_code: &str,
+    controller_code: &str,
+) -> AnyResult<bool> {
+    const ATTEMPTS: usize = 6;
+    const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+    for attempt in 0..ATTEMPTS {
+        let refreshed = refresh_device_snapshot(client, drone_code).await?;
+        if device_controller(&refreshed) == Some(controller_code) {
+            if attempt > 0 {
+                debug!(
+                    target: "replicant_client::explore",
+                    event = "fleet.adoption_projection_converged",
+                    drone = drone_code,
+                    controller = controller_code,
+                    attempt = attempt + 1,
+                    "survey drone controller projection converged after adoption"
+                );
+            }
+            return Ok(true);
+        }
+        if attempt + 1 < ATTEMPTS {
+            debug!(
+                target: "replicant_client::explore",
+                event = "fleet.adoption_projection_pending",
+                drone = drone_code,
+                controller = controller_code,
+                attempt = attempt + 1,
+                "waiting for survey drone controller projection after adoption"
+            );
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+
+    Ok(false)
+}
+
 async fn refresh_assigned_device_snapshots(
     client: &Client,
     replicant_code: &str,
@@ -1540,12 +1579,11 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
         let operation = controller.adopt(needs_adoption.clone()).await?;
         wait_immediate_operation("adopt survey drones", &operation).await?;
         for code in &needs_adoption {
-            let refreshed = refresh_device_snapshot(client, code).await?;
-            if device_controller(&refreshed) != Some(controller_code.as_str()) {
+            if !wait_for_adoption_projection(client, code, &controller_code).await? {
                 return Err(app_error(
                     io::ErrorKind::Other,
                     format!(
-                        "drone {code} did not report controller {controller_code} after adoption"
+                        "drone {code} did not report controller {controller_code} after bounded adoption verification"
                     ),
                 ));
             }

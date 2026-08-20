@@ -1,9 +1,15 @@
 //! Unified discovery, validation, and invocation for application operations.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
+use futures::{stream, StreamExt};
 use replicant_client::{
-    managed::{AutofactoryPrintOptions, Client},
+    managed::{AutofactoryPrintOptions, Client, Operation, OperationStatus},
     raw,
 };
 use replicant_protocol::{
@@ -378,40 +384,11 @@ impl OperationCatalogue {
             }
             "device.lifecycle" => {
                 let input: DeviceLifecycleAction = decode(parameters)?;
-                let operation = if input.command == "retrieve" {
-                    client.devices().retrieve(&input.device).await
-                } else {
-                    let handle = client
-                        .devices()
-                        .get(&input.device)
-                        .await
-                        .map_err(runtime_error)?;
-                    let command = match input.command.as_str() {
-                        "activate" => raw::devices::DeviceCommand::Activate,
-                        "assemble" => raw::devices::DeviceCommand::Assemble,
-                        "cancel" => raw::devices::DeviceCommand::Cancel,
-                        "clear_queue" => raw::devices::DeviceCommand::ClearQueue,
-                        "deactivate" => raw::devices::DeviceCommand::Deactivate,
-                        "decommission" => raw::devices::DeviceCommand::Decommission,
-                        "deploy" => raw::devices::DeviceCommand::Deploy,
-                        "compact" => raw::devices::DeviceCommand::Compact,
-                        "unfurl" => raw::devices::DeviceCommand::Unfurl,
-                        "launch" => raw::devices::DeviceCommand::Launch,
-                        "recall" => raw::devices::DeviceCommand::Recall,
-                        "scan" => raw::devices::DeviceCommand::Scan,
-                        "search" => raw::devices::DeviceCommand::Search,
-                        "system_scan" => raw::devices::DeviceCommand::SystemScan,
-                        "withdraw" => raw::devices::DeviceCommand::Withdraw,
-                        _ => {
-                            return Err(CatalogueError::Invalid(
-                                "unsupported device lifecycle command".to_owned(),
-                            ));
-                        }
-                    };
-                    handle.command(command).await
-                }
-                .map_err(runtime_error)?;
-                managed_operation_value(operation).await
+                run_device_lifecycle(client, &input.device, &input.command).await
+            }
+            "device.lifecycle.bulk" => {
+                let input: DeviceBulkLifecycleAction = decode(parameters)?;
+                run_bulk_device_lifecycle(client, input).await
             }
             "device.stow" => {
                 let input: DeviceTargetAction = decode(parameters)?;
@@ -1422,24 +1399,28 @@ fn descriptors() -> DescriptorCatalog {
                     enum_parameter(
                         "command",
                         "Command",
-                        &[
-                            "activate",
-                            "assemble",
-                            "cancel",
-                            "clear_queue",
-                            "deactivate",
-                            "decommission",
-                            "deploy",
-                            "compact",
-                            "unfurl",
-                            "launch",
-                            "recall",
-                            "scan",
-                            "search",
-                            "system_scan",
-                            "withdraw",
-                            "retrieve",
-                        ],
+                        DEVICE_LIFECYCLE_COMMANDS,
+                        "activate",
+                    ),
+                ],
+            ),
+            simple_action(
+                "device.lifecycle.bulk",
+                "Control selected devices",
+                "Run one standard managed lifecycle command across multiple devices with bounded concurrency and per-device results.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![],
+                vec![
+                    required(
+                        "devices",
+                        "Devices (comma separated)",
+                        ParameterKind::String,
+                    ),
+                    enum_parameter(
+                        "command",
+                        "Command",
+                        DEVICE_LIFECYCLE_COMMANDS,
                         "activate",
                     ),
                 ],
@@ -1686,6 +1667,181 @@ fn find_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
             .find_map(|value| find_string_field(value, field)),
         _ => None,
     }
+}
+
+const DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
+    "activate",
+    "assemble",
+    "cancel",
+    "clear_queue",
+    "deactivate",
+    "decommission",
+    "deploy",
+    "compact",
+    "unfurl",
+    "launch",
+    "recall",
+    "scan",
+    "search",
+    "system_scan",
+    "withdraw",
+    "retrieve",
+];
+const BULK_DEVICE_COMMAND_CONCURRENCY: usize = 4;
+
+fn device_lifecycle_command(command: &str) -> Result<raw::devices::DeviceCommand, CatalogueError> {
+    match command {
+        "activate" => Ok(raw::devices::DeviceCommand::Activate),
+        "assemble" => Ok(raw::devices::DeviceCommand::Assemble),
+        "cancel" => Ok(raw::devices::DeviceCommand::Cancel),
+        "clear_queue" => Ok(raw::devices::DeviceCommand::ClearQueue),
+        "deactivate" => Ok(raw::devices::DeviceCommand::Deactivate),
+        "decommission" => Ok(raw::devices::DeviceCommand::Decommission),
+        "deploy" => Ok(raw::devices::DeviceCommand::Deploy),
+        "compact" => Ok(raw::devices::DeviceCommand::Compact),
+        "unfurl" => Ok(raw::devices::DeviceCommand::Unfurl),
+        "launch" => Ok(raw::devices::DeviceCommand::Launch),
+        "recall" => Ok(raw::devices::DeviceCommand::Recall),
+        "scan" => Ok(raw::devices::DeviceCommand::Scan),
+        "search" => Ok(raw::devices::DeviceCommand::Search),
+        "system_scan" => Ok(raw::devices::DeviceCommand::SystemScan),
+        "withdraw" => Ok(raw::devices::DeviceCommand::Withdraw),
+        _ => Err(CatalogueError::Invalid(
+            "unsupported device lifecycle command".to_owned(),
+        )),
+    }
+}
+
+async fn create_device_lifecycle_operation(
+    client: &Client,
+    device: &str,
+    command: &str,
+) -> Result<Operation, CatalogueError> {
+    if command == "retrieve" {
+        client
+            .devices()
+            .retrieve(device)
+            .await
+            .map_err(runtime_error)
+    } else {
+        let handle = client.devices().get(device).await.map_err(runtime_error)?;
+        handle
+            .command(device_lifecycle_command(command)?)
+            .await
+            .map_err(runtime_error)
+    }
+}
+
+async fn run_device_lifecycle(
+    client: &Client,
+    device: &str,
+    command: &str,
+) -> Result<Value, CatalogueError> {
+    managed_operation_value(
+        create_device_lifecycle_operation(client, device, command).await?,
+    )
+    .await
+}
+
+fn bulk_device_codes(value: &str) -> Result<Vec<String>, CatalogueError> {
+    let mut seen = BTreeSet::new();
+    let devices = value
+        .split([',', '\n', '\r', '\t', ' '])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert((*value).to_owned()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if devices.is_empty() {
+        return Err(CatalogueError::Invalid(
+            "bulk device lifecycle requires at least one device".to_owned(),
+        ));
+    }
+    Ok(devices)
+}
+
+async fn run_bulk_device_lifecycle(
+    client: &Client,
+    input: DeviceBulkLifecycleAction,
+) -> Result<Value, CatalogueError> {
+    let devices = bulk_device_codes(&input.devices)?;
+    if input.command != "retrieve" {
+        device_lifecycle_command(&input.command)?;
+    }
+    let command = input.command;
+    let mut results = stream::iter(devices.into_iter().enumerate())
+        .map(|(index, device)| {
+            let command = command.clone();
+            async move {
+                let operation = match create_device_lifecycle_operation(
+                    client,
+                    &device,
+                    &command,
+                )
+                .await
+                {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return (
+                            index,
+                            serde_json::json!({
+                                "kind": "failed",
+                                "device": device,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                };
+                let operation_id = operation.id().as_str().to_owned();
+                let result = match operation.wait_timeout(Duration::from_secs(3)).await {
+                    Ok(outcome) => {
+                        let operation_status =
+                            format!("{:?}", outcome.status).to_ascii_lowercase();
+                        let failed = matches!(
+                            outcome.status,
+                            OperationStatus::Cancelled
+                                | OperationStatus::Rejected
+                                | OperationStatus::Ambiguous
+                                | OperationStatus::Failed
+                        );
+                        if failed {
+                            serde_json::json!({
+                                "kind": "failed",
+                                "device": device,
+                                "operation_id": operation_id,
+                                "operation_status": operation_status,
+                                "error": "managed operation was rejected or requires reconciliation",
+                            })
+                        } else {
+                            serde_json::json!({
+                                "kind": "succeeded",
+                                "device": device,
+                                "operation_id": operation_id,
+                                "operation_status": operation_status,
+                            })
+                        }
+                    }
+                    Err(error) => serde_json::json!({
+                        "kind": "failed",
+                        "device": device,
+                        "operation_id": operation_id,
+                        "error": error.to_string(),
+                    }),
+                };
+                (index, result)
+            }
+        })
+        .buffer_unordered(BULK_DEVICE_COMMAND_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by_key(|(index, _)| *index);
+    Ok(serde_json::json!({
+        "command": command,
+        "results": results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Vec<_>>(),
+    }))
 }
 
 async fn managed_operation_value(
@@ -2360,6 +2516,11 @@ struct DeviceLifecycleAction {
     command: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceBulkLifecycleAction {
+    devices: String,
+    command: String,
+}
+#[derive(Debug, Deserialize)]
 struct DeviceTargetAction {
     device: String,
     target: String,
@@ -2806,6 +2967,38 @@ mod tests {
         ] {
             assert_eq!(catalogue.resolve_kind(class, alias), Some(canonical));
         }
+    }
+
+    #[test]
+    fn bulk_device_lifecycle_validates_selection_without_becoming_a_row_action() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let parameters = BTreeMap::from([
+            (
+                "devices".to_owned(),
+                Value::String("D-1,D-2,D-2".to_owned()),
+            ),
+            (
+                "command".to_owned(),
+                Value::String("decommission".to_owned()),
+            ),
+        ]);
+        catalogue
+            .validate_invocation(
+                OperationClass::Action,
+                "device.lifecycle.bulk",
+                parameters,
+            )
+            .expect("bulk lifecycle action should validate");
+        assert!(!catalogue.is_applicable(
+            OperationClass::Action,
+            "device.lifecycle.bulk",
+            &EntityKind::Device
+        ));
+        assert_eq!(
+            bulk_device_codes(" D-1, D-2\nD-1 ").expect("device codes"),
+            vec!["D-1".to_owned(), "D-2".to_owned()]
+        );
+        assert!(bulk_device_codes(" , \n ").is_err());
     }
 
     #[test]

@@ -51,3 +51,4 @@ apps/web/*.tsbuildinfo
 apps/desktop/node_modules/
 apps/desktop/src-tauri/binaries/replicantd-*
 apps/desktop/src-tauri/icons/
+node_modules/

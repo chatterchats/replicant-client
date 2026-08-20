@@ -7,6 +7,8 @@ export interface ConfirmRequest {
   /** Named items the action will affect, listed so the impact is visible. */
   items?: string[];
   confirmLabel: string;
+  /** Optional neutral label when "Keep running" does not fit the confirmation context. */
+  cancelLabel?: string;
   /** Requires typing the confirmation word; use for irreversible, wide-scope actions. */
   requireTyped?: string;
   destructive?: boolean;
@@ -106,7 +108,9 @@ export function ConfirmDialog({
           </label>
         )}
         <div className="confirm-actions">
-          <button onClick={onClose}>Keep running</button>
+          <button onClick={onClose}>
+            {request.cancelLabel ?? "Keep running"}
+          </button>
           <button
             className={request.destructive ? "danger" : ""}
             disabled={!satisfied}

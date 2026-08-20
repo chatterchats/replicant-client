@@ -225,10 +225,19 @@ pub async fn plan_delivery_with(
     )?;
 
     let blueprints = fetch_transport_capacities(client).await?;
-    let handles = client.devices().refresh_many().collect().await?;
+    // Normal logistics planning consumes the managed projection maintained by
+    // SSE and targeted reads. A previous implementation performed an
+    // unfiltered remote refresh here, turning every delivery plan into a full
+    // account traversal (dozens of pages on large fleets). Exact devices are
+    // still authoritatively checked by the execution path before mutation.
+    let handles = client.devices().find().owned().collect().await?;
     let mut devices = Vec::with_capacity(handles.len());
     for handle in handles {
-        devices.push(handle.snapshot().await?);
+        let device = match handle.snapshot().await {
+            Ok(device) => device,
+            Err(_) => handle.refresh().await?.snapshot().await?,
+        };
+        devices.push(device);
     }
 
     let payload_devices = select_payload_devices(

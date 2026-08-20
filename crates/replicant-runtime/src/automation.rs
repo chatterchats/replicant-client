@@ -1246,9 +1246,24 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     .map_err(string_error)?;
                 let plan = match checkpoint.plan.clone() {
                     Some(plan) => plan,
-                    None => plan_delivery(&client, &request)
-                        .await
-                        .map_err(string_error)?,
+                    None => match plan_delivery(&client, &request).await {
+                        Ok(plan) => plan,
+                        Err(error) if retryable_manifest_planning_failure(&error) => {
+                            checkpoint.plan = None;
+                            checkpoint.started = false;
+                            context
+                                .advance_to("waiting_to_replan", &checkpoint)
+                                .map_err(string_error)?;
+                            context
+                                .emit_activity(format!(
+                                    "logistics manifest cannot currently be planned ({error}); waiting for fresh managed state or hub stock before replanning"
+                                ))
+                                .map_err(string_error)?;
+                            context.mark_waiting().map_err(string_error)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(string_error(error)),
+                    },
                 };
 
                 // Resource stock is mutable account state, so reserve each
@@ -1338,6 +1353,20 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
     }
 }
 
+fn retryable_manifest_planning_failure(error: &TransportError) -> bool {
+    match error {
+        // Missing stock, carriers, or payloads are mutable world-state blockers,
+        // not terminal workflow defects. Director manifests should wait for the
+        // hub/projection to change and then select a fresh plan.
+        TransportError::NotFound(_) => true,
+        TransportError::Invalid(message) => {
+            message.contains("not a free inactive payload")
+                || message.contains("reserved by another workflow")
+        }
+        _ => false,
+    }
+}
+
 struct BlueprintAcquireWorkflow;
 impl WorkflowExecutor for BlueprintAcquireWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
@@ -1403,7 +1432,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 ));
             }
 
-            let devices = refresh_owned_devices(&client).await?;
+            let devices = owned_device_snapshots(&client).await?;
             if checkpoint.decommission_authorized {
                 // There is an intentionally conservative crash window between durably
                 // authorizing this irreversible command and receiving/persisting the
@@ -1461,7 +1490,7 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
             {
                 return Ok(());
             }
-            let devices = refresh_owned_devices(&client).await?;
+            let devices = owned_device_snapshots(&client).await?;
             let source = resolve_blueprint_source(&intent, &checkpoint, &devices)?;
             let factory = resolve_blueprint_factory(&intent, &checkpoint, &devices, &source)?;
             let source_location = source
@@ -2523,16 +2552,30 @@ fn reserve_scan_tour_scope(
     Ok(None)
 }
 
-async fn refresh_owned_devices(client: &Client) -> Result<Vec<Device>, String> {
+async fn owned_device_snapshots(client: &Client) -> Result<Vec<Device>, String> {
+    // Workflow planning normally consumes the managed projection maintained by
+    // SSE, targeted reads, and explicit reconciliation. Do not turn each
+    // checkpoint pass into an unfiltered account-wide device traversal.
     let handles = client
         .devices()
-        .refresh_many()
+        .find()
+        .owned()
         .collect()
         .await
         .map_err(string_error)?;
     let mut devices = Vec::with_capacity(handles.len());
     for handle in handles {
-        devices.push(handle.snapshot().await.map_err(string_error)?);
+        let device = match handle.snapshot().await {
+            Ok(device) => device,
+            Err(_) => handle
+                .refresh()
+                .await
+                .map_err(string_error)?
+                .snapshot()
+                .await
+                .map_err(string_error)?,
+        };
+        devices.push(device);
     }
     devices.sort_by(|left, right| left.key.id.cmp(&right.key.id));
     Ok(devices)
@@ -2612,7 +2655,7 @@ async fn prepare_shop_blueprint_source(
         },
     )?;
 
-    let devices = refresh_owned_devices(client).await?;
+    let devices = owned_device_snapshots(client).await?;
     let factory = devices
         .iter()
         .find(|device| {
@@ -2752,7 +2795,7 @@ async fn prepare_shop_blueprint_source(
         ));
     }
 
-    let devices = refresh_owned_devices(client).await?;
+    let devices = owned_device_snapshots(client).await?;
     checkpoint.pre_purchase_devices = devices
         .iter()
         .filter(|device| {
@@ -2864,7 +2907,22 @@ async fn ensure_shop_trade_criteria(
         }
     }
 
-    let mut devices = refresh_owned_devices(client).await?;
+    // Reattach to previously-created staging work first. Once it succeeds,
+    // re-enter from fresh managed inventory rather than carrying the old
+    // missing-resource/device calculation forward.
+    if let Some(child_id) = checkpoint.criteria_logistics_child {
+        if !await_child_workflow(context, child_id, "trade-criteria logistics", checkpoint).await? {
+            return Ok(false);
+        }
+        checkpoint.criteria_logistics_child = None;
+        context
+            .advance_to("rechecking_trade_criteria", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    let mut devices = owned_device_snapshots(client).await?;
     let mut print_requests = Vec::new();
     for (device_type, required) in &criteria.devices {
         let available = devices
@@ -2887,12 +2945,20 @@ async fn ensure_shop_trade_criteria(
             .advance_to("printing_trade_criteria", checkpoint)
             .map_err(string_error)?;
         let mut options = QueueOptions::at(factory_location.to_owned());
-        options.tags = vec![tag];
+        options.tags = vec![tag.clone()];
         options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
         queue_prints_with_components(client, &print_requests, &options)
             .await
             .map_err(string_error)?;
-        devices = refresh_owned_devices(client).await?;
+        client
+            .devices()
+            .refresh_many()
+            .with_tag(tag)
+            .at(factory_location.to_owned())
+            .collect()
+            .await
+            .map_err(string_error)?;
+        devices = owned_device_snapshots(client).await?;
     }
 
     let inventories = fetch_account_inventories(client).await?;
@@ -2904,25 +2970,24 @@ async fn ensure_shop_trade_criteria(
             missing_resources.insert(resource.clone(), required - present);
         }
     }
+
+    // Director trade resources come from the selected manufacturing home, not
+    // arbitrary account stock. In the current empire layout this resolves to
+    // consolidation hubs such as SCEPTURUM or THYFFAWFF.
+    let resource_origin = resolve_location_system(client, factory_location).await?;
+    let resources_at_home = inventory_in_system(&inventories, &resource_origin);
     for (resource, missing) in &missing_resources {
-        let available_elsewhere = inventories
-            .iter()
-            .filter(|inventory| {
-                inventory.location.as_ref().is_some_and(|location| {
-                    !location.id.as_str().eq_ignore_ascii_case(shop_location)
-                })
-            })
-            .flat_map(|inventory| inventory.items.iter())
-            .filter(|item| item.resource.eq_ignore_ascii_case(resource))
-            .map(|item| item.quantity)
-            .sum::<i64>();
-        if available_elsewhere < *missing {
+        let available = resources_at_home
+            .get(resource)
+            .copied()
+            .unwrap_or_default();
+        if available < *missing {
             context
                 .advance_to("waiting_for_trade_criteria", checkpoint)
                 .map_err(string_error)?;
             context
                 .emit_activity(format!(
-                    "shop trade needs {missing} more {resource}, but only {available_elsewhere} is available elsewhere on the account"
+                    "shop trade needs {missing} more {resource}, but regional consolidation hub {resource_origin} only has {available}"
                 ))
                 .map_err(string_error)?;
             context.mark_waiting().map_err(string_error)?;
@@ -2976,48 +3041,90 @@ async fn ensure_shop_trade_criteria(
         staged_codes.extend(elsewhere.into_iter().take(missing));
     }
 
-    if !missing_resources.is_empty() || !staged_codes.is_empty() {
-        let child_id = match checkpoint.criteria_logistics_child {
-            Some(id) => id,
-            None => {
-                let shop = intent
-                    .shop
-                    .as_ref()
-                    .ok_or_else(|| "shop blueprint acquisition lost its shop intent".to_owned())?;
-                let child = context
-                    .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
-                        origin: "account".to_owned(),
-                        destination: shop_location.to_owned(),
-                        resources: missing_resources,
-                        devices: Vec::new(),
-                        device_codes: staged_codes.clone(),
-                        device_tags: Vec::new(),
-                        return_transports: false,
-                        allow_transport_staging: true,
-                        region: intent.preferred_region.clone(),
-                        purpose: format!(
-                            "director:blueprint_shop_criteria:{}:{}:{}",
-                            intent.device_type, shop.controller_code, shop.trade_code
-                        ),
-                    }))
-                    .map_err(string_error)?;
-                for code in &staged_codes {
-                    context
-                        .repository()
-                        .acquire_claim(child.id, ResourceKey::Device(code.clone()))
-                        .map_err(string_error)?;
-                }
-                checkpoint.criteria_logistics_child = Some(child.id);
-                context
-                    .persist_checkpoint(checkpoint)
-                    .map_err(string_error)?;
-                child.id
-            }
-        };
-        if !await_child_workflow(context, child_id, "trade-criteria logistics", checkpoint).await? {
+    // Stage resource criteria separately so `account`-wide device sourcing can
+    // never cause resource pickups to wander out to arbitrary belts.
+    if !missing_resources.is_empty() {
+        let shop = intent
+            .shop
+            .as_ref()
+            .ok_or_else(|| "shop blueprint acquisition lost its shop intent".to_owned())?;
+        let child = context
+            .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin: resource_origin.clone(),
+                destination: shop_location.to_owned(),
+                resources: missing_resources,
+                devices: Vec::new(),
+                device_codes: Vec::new(),
+                device_tags: Vec::new(),
+                return_transports: false,
+                allow_transport_staging: true,
+                region: intent.preferred_region.clone(),
+                purpose: format!(
+                    "director:blueprint_shop_criteria:{}:{}:{}:resources",
+                    intent.device_type, shop.controller_code, shop.trade_code
+                ),
+            }))
+            .map_err(string_error)?;
+        checkpoint.criteria_logistics_child = Some(child.id);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        if !await_child_workflow(context, child.id, "trade-criteria resource logistics", checkpoint)
+            .await?
+        {
             return Ok(false);
         }
-        devices = refresh_owned_devices(client).await?;
+        checkpoint.criteria_logistics_child = None;
+        context
+            .advance_to("rechecking_trade_criteria", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    if !staged_codes.is_empty() {
+        let shop = intent
+            .shop
+            .as_ref()
+            .ok_or_else(|| "shop blueprint acquisition lost its shop intent".to_owned())?;
+        let child = context
+            .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin: "account".to_owned(),
+                destination: shop_location.to_owned(),
+                resources: ResourceMap::new(),
+                devices: Vec::new(),
+                device_codes: staged_codes.clone(),
+                device_tags: Vec::new(),
+                return_transports: false,
+                allow_transport_staging: true,
+                region: intent.preferred_region.clone(),
+                purpose: format!(
+                    "director:blueprint_shop_criteria:{}:{}:{}:devices",
+                    intent.device_type, shop.controller_code, shop.trade_code
+                ),
+            }))
+            .map_err(string_error)?;
+        for code in &staged_codes {
+            context
+                .repository()
+                .acquire_claim(child.id, ResourceKey::Device(code.clone()))
+                .map_err(string_error)?;
+        }
+        checkpoint.criteria_logistics_child = Some(child.id);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        if !await_child_workflow(context, child.id, "trade-criteria device logistics", checkpoint)
+            .await?
+        {
+            return Ok(false);
+        }
+        checkpoint.criteria_logistics_child = None;
+        context
+            .advance_to("rechecking_trade_criteria", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
     }
 
     for (device_type, required) in &criteria.devices {
@@ -3115,7 +3222,9 @@ fn retryable_trade_criteria_logistics_failure(error: &str) -> bool {
     let insufficient_at_source = error.contains("Insufficient ")
         && error.contains(" at location: need ")
         && error.contains(", have ");
-    stale_snapshot || insufficient_at_source
+    let stale_payload = error.contains("not a free inactive payload")
+        || error.contains("reserved by another workflow");
+    stale_snapshot || insufficient_at_source || stale_payload
 }
 
 async fn ensure_replicant_at_shop(
@@ -3219,6 +3328,23 @@ fn inventory_at_location(
     resources
 }
 
+fn inventory_in_system(
+    inventories: &[replicant_client::domain::Inventory],
+    system: &str,
+) -> ResourceMap {
+    let mut resources = ResourceMap::new();
+    for inventory in inventories.iter().filter(|inventory| {
+        inventory.location.as_ref().is_some_and(|key| {
+            designation_in_system(key.id.as_str(), system)
+        })
+    }) {
+        for item in &inventory.items {
+            *resources.entry(item.resource.clone()).or_default() += item.quantity;
+        }
+    }
+    resources
+}
+
 fn trade_payment_device_is_releasable(device: &Device, device_type: &str) -> bool {
     blueprint_source_is_releasable(device, device_type)
 }
@@ -3235,8 +3361,19 @@ async fn observe_purchased_blueprint_device(
         .map(|code| code.to_ascii_uppercase())
         .collect::<std::collections::BTreeSet<_>>();
     for attempt in 0..attempts.max(1) {
-        let mut candidates = refresh_owned_devices(client)
-            .await?
+        let handles = client
+            .devices()
+            .refresh_many()
+            .of_type(DeviceType::from(device_type))
+            .at(shop_location.to_owned())
+            .collect()
+            .await
+            .map_err(string_error)?;
+        let mut refreshed = Vec::with_capacity(handles.len());
+        for handle in handles {
+            refreshed.push(handle.snapshot().await.map_err(string_error)?);
+        }
+        let mut candidates = refreshed
             .into_iter()
             .filter(|device| {
                 !before.contains(&device.key.id.as_str().to_ascii_uppercase())
@@ -4294,9 +4431,25 @@ mod tests {
         assert!(retryable_trade_criteria_logistics_failure(
             "planned resource pickup at SCEPTURUM-BELT-1 is stale: need 17 conductive, have 0"
         ));
+        assert!(retryable_trade_criteria_logistics_failure(
+            "payload device DEVICE-1 is not a free inactive payload"
+        ));
         assert!(!retryable_trade_criteria_logistics_failure(
             "transport CARRIER-1 has no usable cargo capacity"
         ));
+    }
+
+    #[test]
+    fn mutable_manifest_planning_blockers_wait_for_replan() {
+        assert!(retryable_manifest_planning_failure(&TransportError::NotFound(
+            "origin SCEPTURUM has only 0 conductive; 30 requested".to_owned(),
+        )));
+        assert!(retryable_manifest_planning_failure(&TransportError::Invalid(
+            "payload device DEVICE-1 is not a free inactive payload".to_owned(),
+        )));
+        assert!(!retryable_manifest_planning_failure(&TransportError::Invalid(
+            "destination must be an exact location".to_owned(),
+        )));
     }
 
     #[test]

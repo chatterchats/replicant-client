@@ -58,6 +58,8 @@ const REPLICANT_NS: &str = "director.replicant";
 const WORKFORCE_NS: &str = "director.workforce";
 const SNAPSHOT_NS: &str = "director.snapshot";
 const BLUEPRINT_SHOP_NS: &str = "director.blueprint_shop_opportunity";
+const BLUEPRINT_SHOP_CACHE_NS: &str = "director.blueprint_shop_snapshot";
+const BLUEPRINT_SHOP_CACHE_KEY: &str = "latest";
 const SNAPSHOT_KEY: &str = "latest";
 
 const DEFAULT_HOLD_MS: i64 = 30 * 60 * 1000;
@@ -76,6 +78,8 @@ const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
 const EVENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
+const BLUEPRINT_SHOP_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
+const BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
 
 const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
@@ -186,12 +190,20 @@ struct BlueprintShopOpportunity {
     last_seen_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct BlueprintShopSnapshot {
     opportunities: Vec<BlueprintShopOpportunity>,
     directory_errors: usize,
     trade_errors: usize,
     hidden_or_unlocated: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BlueprintShopCache {
+    refreshed_at_ms: i64,
+    #[serde(default)]
+    requested_blueprints: BTreeSet<String>,
+    snapshot: BlueprintShopSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -394,6 +406,7 @@ pub async fn reconcile_director(
     repository: Arc<WorkflowRepository>,
     revision: u64,
     allow_launch: bool,
+    force_slow_refresh: bool,
 ) -> Result<DirectorSnapshot, ApplicationError> {
     let started = Instant::now();
     let settings = director_settings(&repository)?;
@@ -527,13 +540,13 @@ pub async fn reconcile_director(
 
     let goal_controls = load_goal_controls(&repository)?;
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
-    let blueprint_snapshot_needed =
+    let blueprint_catalogue_needed =
         goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition)
             || (goal_enabled(&goal_controls, DirectorGoalKind::ExpandStarCatalogue)
                 && !devices.iter().any(|device| {
                     device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
                 }));
-    let unlocked_blueprints = if blueprint_snapshot_needed {
+    let unlocked_blueprints = if blueprint_catalogue_needed {
         match client.blueprints().unlocked_device_types().await {
             Ok(blueprints) => Some(blueprints),
             Err(error) => {
@@ -551,12 +564,7 @@ pub async fn reconcile_director(
     let observatory_blueprint_known = unlocked_blueprints
         .as_ref()
         .map(|blueprints| blueprints.contains(&DeviceType::GalacticObservatory));
-    let blueprint_shop_snapshot =
-        if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition) {
-            snapshot_blueprint_shop_opportunities(client, &replicants, &repository, now).await
-        } else {
-            BlueprintShopSnapshot::default()
-        };
+
     let mut goals = Vec::new();
     let mut reserved_workers = BTreeSet::new();
     let automatic = settings.mode == DirectorMode::Automatic && allow_launch;
@@ -751,6 +759,37 @@ pub async fn reconcile_director(
             "Existing event/bootstrap automation may still deploy required beacons",
         ));
     }
+
+    // Shop discovery is intentionally demand-driven and happens only after
+    // the standing goals have raised this pass's Blueprint requirements. Owned
+    // copies can be learned without touching the trade directory, and an active
+    // acquisition already has enough information to finish.
+    let mut shop_requested_blueprints = BTreeSet::new();
+    if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition)
+        && active_blueprint_acquisition_workflow(&workflows).is_none()
+    {
+        for device_type in requirements.current_blueprint_priorities().keys() {
+            let kind = DeviceType::from(device_type.as_str());
+            let already_known = unlocked_blueprints
+                .as_ref()
+                .is_some_and(|known| known.contains(&kind));
+            let owned_source = devices
+                .iter()
+                .any(|device| director_blueprint_source_releasable(device, &kind));
+            if !already_known && !owned_source {
+                shop_requested_blueprints.insert(device_type.to_ascii_lowercase());
+            }
+        }
+    }
+    let blueprint_shop_snapshot = blueprint_shop_snapshot_for_requirements(
+        client,
+        &replicants,
+        &repository,
+        now,
+        &shop_requested_blueprints,
+        force_slow_refresh,
+    )
+    .await?;
 
     let mut blueprint_context = BlueprintReconcileContext {
         devices: &devices,
@@ -1107,6 +1146,60 @@ fn reconcile_expand_star_catalogue(
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
+}
+
+async fn blueprint_shop_snapshot_for_requirements(
+    client: &Client,
+    replicants: &[Replicant],
+    repository: &WorkflowRepository,
+    now: i64,
+    requested_blueprints: &BTreeSet<String>,
+    force_refresh: bool,
+) -> Result<BlueprintShopSnapshot, ApplicationError> {
+    if requested_blueprints.is_empty() {
+        tracing::debug!(
+            event = "director.blueprint.snapshot_skipped",
+            "Director skipped shop discovery because no unresolved Blueprint requirement needs a shop"
+        );
+        return Ok(BlueprintShopSnapshot::default());
+    }
+
+    let cached = repository
+        .read_document(BLUEPRINT_SHOP_CACHE_NS, BLUEPRINT_SHOP_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value::<BlueprintShopCache>(value))
+        .transpose()?;
+    if let Some(cache) = cached.as_ref() {
+        let ttl_ms = if cache.snapshot.directory_errors == 0 && cache.snapshot.trade_errors == 0 {
+            BLUEPRINT_SHOP_CACHE_TTL_MS
+        } else {
+            BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS
+        };
+        let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+        let covers_requirements = requested_blueprints.is_subset(&cache.requested_blueprints);
+        if !force_refresh && age_ms <= ttl_ms && covers_requirements {
+            tracing::debug!(
+                event = "director.blueprint.snapshot_cache_hit",
+                age_ms,
+                ttl_ms,
+                requirements = requested_blueprints.len(),
+                opportunities = cache.snapshot.opportunities.len(),
+                "Director reused cached blueprint shop snapshot"
+            );
+            return Ok(cache.snapshot.clone());
+        }
+    }
+
+    let snapshot = snapshot_blueprint_shop_opportunities(client, replicants, repository, now).await;
+    repository.put_document(
+        BLUEPRINT_SHOP_CACHE_NS,
+        BLUEPRINT_SHOP_CACHE_KEY,
+        &BlueprintShopCache {
+            refreshed_at_ms: now,
+            requested_blueprints: requested_blueprints.clone(),
+            snapshot: snapshot.clone(),
+        },
+    )?;
+    Ok(snapshot)
 }
 
 async fn snapshot_blueprint_shop_opportunities(
@@ -2377,6 +2470,29 @@ fn choose_hub_supply_source(
         .filter(|stock| stock.location != hub.location)
         .collect::<Vec<_>>();
 
+    // Regional hubs are the normal consolidation warehouses. Prefer the exact
+    // manufacturing home first (for example SCEPTURUM-BELT-1), then the hub
+    // system as an aggregate scope. Remote belt stock is only a fallback.
+    if let Some(home_location) = region.hub_location.as_deref()
+        && home_location != hub.location
+        && usable.iter().copied().any(|stock| {
+            stock.location.eq_ignore_ascii_case(home_location)
+                && resources_cover(&stock.resources, &hub.deficits)
+        })
+    {
+        return Some(HubSupplySource {
+            origin: home_location.to_owned(),
+            description: format!("{home_location} regional consolidation hub"),
+        });
+    }
+    if let Some(home_system) = region.hub_system.as_deref()
+        && system_resources_cover(&usable, home_system, &hub.deficits)
+    {
+        return Some(HubSupplySource {
+            origin: home_system.to_owned(),
+            description: format!("{home_system} regional consolidation hub"),
+        });
+    }
     if let Some(stock) = usable.iter().copied().find(|stock| {
         stock.system == hub.system
             && stock.is_belt
@@ -2384,22 +2500,13 @@ fn choose_hub_supply_source(
     }) {
         return Some(HubSupplySource {
             origin: stock.location.clone(),
-            description: stock.location.clone(),
+            description: format!("{} local fallback stock", stock.location),
         });
     }
     if system_resources_cover(&usable, &hub.system, &hub.deficits) {
         return Some(HubSupplySource {
             origin: hub.system.clone(),
-            description: format!("{} system inventory", hub.system),
-        });
-    }
-    if let Some(home) = region.hub_system.as_deref()
-        && home != hub.system
-        && system_resources_cover(&usable, home, &hub.deficits)
-    {
-        return Some(HubSupplySource {
-            origin: home.to_owned(),
-            description: format!("{home} regional home inventory"),
+            description: format!("{} local fallback inventory", hub.system),
         });
     }
 
@@ -4551,7 +4658,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_supply_prefers_same_system_belt_stock() {
+    fn hub_supply_prefers_regional_consolidation_home() {
         let region = RegionView {
             region: "alpha".to_owned(),
             status: DirectorRegionStatus::Established,
@@ -4586,6 +4693,43 @@ mod tests {
                     ("carbon".to_owned(), 80),
                     ("structural".to_owned(), 400),
                 ]),
+            },
+        ];
+
+        let source = choose_hub_supply_source(&hub, &region, &stocks).expect("source");
+        assert_eq!(source.origin, "SCEPTURUM-BELT-1");
+    }
+
+    #[test]
+    fn hub_supply_prefers_regional_home_over_remote_local_belt() {
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("SCEPTURUM".to_owned()),
+            hub_location: Some("SCEPTURUM-BELT-1".to_owned()),
+            known_systems: BTreeSet::new(),
+        };
+        let hub = HubMaintenanceView {
+            system: "ALPHA-EDGE".to_owned(),
+            location: "ALPHA-EDGE-3-L4".to_owned(),
+            deficits: BTreeMap::from([("structural".to_owned(), 400)]),
+            grace_period_remaining: Some(86_400),
+            degraded: false,
+        };
+        let stocks = vec![
+            StockLocation {
+                location: "ALPHA-EDGE-BELT-1".to_owned(),
+                system: "ALPHA-EDGE".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: true,
+                resources: BTreeMap::from([("structural".to_owned(), 1_000)]),
+            },
+            StockLocation {
+                location: "SCEPTURUM-BELT-1".to_owned(),
+                system: "SCEPTURUM".to_owned(),
+                region: Some("alpha".to_owned()),
+                is_belt: true,
+                resources: BTreeMap::from([("structural".to_owned(), 1_000)]),
             },
         ];
 

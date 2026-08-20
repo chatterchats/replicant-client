@@ -13,16 +13,16 @@ the SDK directly or demonstrate a registered reusable API/preset.
 
 ## Inventory
 
-| Example | Decision |
-| --- | --- |
-| `raw_read`, `raw_events` | Keep as raw SDK educational examples. |
-| `fluent_queries`, `game_concepts`, `managed_sync` | Keep as managed SDK educational examples. |
-| `bobnet_messages` | Keep as an SDK example of managed message history and SSE-backed watching. |
-| `initialize_colony_database` | Retire as the preferred application initializer; keep as an SDK hydration example. Normal applications use `replicantd` startup/synchronization. |
-| `nearby_belt_report` | Registered Report alias for `nearby_belts`; keep as a thin reusable-report demonstration. |
-| `clear_tags` | Registered Action `clear_tags`; keep as a thin action demonstration. |
-| `contribute_twaffy_injectors` | Named TWAFFY preset alias for generic Action `contribute_devices`; keep as a thin action demonstration. |
-| `tag_twaffy_ring_injectors` | Named TWAFFY preset alias for generic Action `tag_devices`; keep as a thin action demonstration. |
+| Example                                           | Decision                                                                                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `raw_read`, `raw_events`                          | Keep as raw SDK educational examples.                                                                                                            |
+| `fluent_queries`, `game_concepts`, `managed_sync` | Keep as managed SDK educational examples.                                                                                                        |
+| `bobnet_messages`                                 | Keep as an SDK example of managed message history and SSE-backed watching.                                                                       |
+| `initialize_colony_database`                      | Retire as the preferred application initializer; keep as an SDK hydration example. Normal applications use `replicantd` startup/synchronization. |
+| `nearby_belt_report`                              | Registered Report alias for `nearby_belts`; keep as a thin reusable-report demonstration.                                                        |
+| `clear_tags`                                      | Registered Action `clear_tags`; keep as a thin action demonstration.                                                                             |
+| `contribute_twaffy_injectors`                     | Named TWAFFY preset alias for generic Action `contribute_devices`; keep as a thin action demonstration.                                          |
+| `tag_twaffy_ring_injectors`                       | Named TWAFFY preset alias for generic Action `tag_devices`; keep as a thin action demonstration.                                                 |
 
 The TWAFFY destination, owner, device type, and tag are defaults only in the
 explicitly named preset examples. The generic catalogue actions require those

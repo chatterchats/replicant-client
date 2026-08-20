@@ -22,6 +22,10 @@ use crate::{
 // polling/reconciliation waits. Throttle them so the supervisor cannot hot-loop
 // a finished executor several times per second while its prerequisite is unchanged.
 const POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+// Survey tours already perform authoritative survey-state checks on a much
+// slower cadence. Re-entering the whole durable executor every five seconds
+// while a tour is merely waiting adds churn without improving responsiveness.
+const SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Boxed future returned by a workflow executor.
 pub type BoxWorkflowFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -788,7 +792,12 @@ fn polling_wait_retry_due(instance: &WorkflowInstance) -> bool {
         .duration_since(UNIX_EPOCH)
         .map_or(u128::MAX, |duration| duration.as_millis());
     let updated_at = u128::try_from(instance.updated_at).unwrap_or_default();
-    now.saturating_sub(updated_at) >= POLLING_WAIT_RETRY_INTERVAL.as_millis()
+    let interval = if instance.kind.as_str() == "scan.tour" {
+        SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL
+    } else {
+        POLLING_WAIT_RETRY_INTERVAL
+    };
+    now.saturating_sub(updated_at) >= interval.as_millis()
 }
 
 fn deadline_delay(deadline: Option<i64>) -> Result<Duration, WorkflowWaitError> {

@@ -194,7 +194,6 @@ fails the build immediately instead of producing an image that cannot start.
 The runtime image is pinned to Fedora 44; change that base deliberately if the
 local build host/ABI changes.
 
-
 `make docker-check` performs the same local artifact build, resolves Compose
 configuration, and packages both production images without requiring an account. With a configured token,
 `make docker-smoke` starts the stack, waits for health, checks the static web

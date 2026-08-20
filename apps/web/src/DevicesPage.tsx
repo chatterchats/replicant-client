@@ -1,17 +1,20 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { daemonApi } from "./api";
+import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import {
   applicableDescriptorCommands,
   type DescriptorCommand,
 } from "./CommandPalette";
+import { useDaemonState } from "./daemon";
 import { type DomainQueryStatus, useDomainQuery } from "./domainQuery";
 import type {
   DescriptorCatalog,
   DeviceSummary,
   DevicesSnapshot,
   EntityRef,
+  FiniteExecution,
 } from "./protocol";
 
 export type DeviceSortKey =
@@ -114,6 +117,100 @@ const emptyFilters: DeviceFilters = {
   system: "",
   owner: "",
 };
+
+export const BULK_DEVICE_COMMANDS = [
+  { id: "activate", label: "Activate", destructive: false },
+  { id: "assemble", label: "Assemble", destructive: false },
+  { id: "cancel", label: "Cancel", destructive: false },
+  { id: "clear_queue", label: "Clear queue", destructive: false },
+  { id: "deactivate", label: "Deactivate", destructive: false },
+  { id: "decommission", label: "Decommission", destructive: true },
+  { id: "deploy", label: "Deploy", destructive: false },
+  { id: "compact", label: "Compact", destructive: false },
+  { id: "unfurl", label: "Unfurl", destructive: false },
+  { id: "launch", label: "Launch", destructive: false },
+  { id: "recall", label: "Recall", destructive: false },
+  { id: "scan", label: "Scan", destructive: false },
+  { id: "search", label: "Search", destructive: false },
+  { id: "system_scan", label: "System scan", destructive: false },
+  { id: "withdraw", label: "Withdraw", destructive: false },
+  { id: "retrieve", label: "Retrieve", destructive: false },
+] as const;
+
+export type BulkDeviceCommand = (typeof BULK_DEVICE_COMMANDS)[number]["id"];
+
+export interface BulkDeviceEligibility {
+  eligible: DeviceSummary[];
+  incompatible: DeviceSummary[];
+}
+
+export interface BulkDeviceResultItem {
+  kind: "succeeded" | "failed";
+  device: string;
+  operation_id: string | null;
+  operation_status: string | null;
+  error: string | null;
+}
+
+export function bulkDeviceEligibility(
+  devices: DeviceSummary[],
+  selected: ReadonlySet<string>,
+  command: BulkDeviceCommand | "",
+): BulkDeviceEligibility {
+  const selectedDevices = devices.filter((device) =>
+    selected.has(device.entity.id),
+  );
+  if (!command) return { eligible: [], incompatible: selectedDevices };
+  const eligible = selectedDevices.filter((device) =>
+    device.available_commands.includes(command),
+  );
+  const eligibleCodes = new Set(eligible.map((device) => device.entity.id));
+  return {
+    eligible,
+    incompatible: selectedDevices.filter(
+      (device) => !eligibleCodes.has(device.entity.id),
+    ),
+  };
+}
+
+export function bulkDeviceResultItems(result: unknown): BulkDeviceResultItem[] {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return [];
+  const results = (result as { results?: unknown }).results;
+  if (!Array.isArray(results)) return [];
+  return results.flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const item = value as Record<string, unknown>;
+    if (
+      (item.kind !== "succeeded" && item.kind !== "failed") ||
+      typeof item.device !== "string"
+    )
+      return [];
+    return [
+      {
+        kind: item.kind,
+        device: item.device,
+        operation_id:
+          typeof item.operation_id === "string" ? item.operation_id : null,
+        operation_status:
+          typeof item.operation_status === "string"
+            ? item.operation_status
+            : null,
+        error: typeof item.error === "string" ? item.error : null,
+      },
+    ];
+  });
+}
+
+function bulkCommandInfo(command: BulkDeviceCommand | "") {
+  return BULK_DEVICE_COMMANDS.find((item) => item.id === command);
+}
+
+function confirmationItems(devices: DeviceSummary[]): string[] {
+  const visible = devices.slice(0, 24).map((device) => device.entity.id);
+  if (devices.length > visible.length)
+    visible.push(`… and ${String(devices.length - visible.length)} more`);
+  return visible;
+}
 
 export function deviceCategory(deviceType: string | null): DeviceCategory {
   return deviceType
@@ -411,9 +508,11 @@ export function DevicesPage({
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: devicesEmpty,
   });
+  const historyRevision = useDaemonState().invalidated.history ?? 0;
   return (
     <DevicesContent
       {...query}
+      historyRevision={historyRevision}
       descriptors={descriptors}
       onSelectDevice={onSelectDevice}
       onSelectEntity={onSelectEntity}
@@ -429,6 +528,7 @@ export function DevicesContent({
   error,
   refreshing,
   refresh,
+  historyRevision = 0,
   descriptors,
   onSelectDevice,
   onSelectEntity,
@@ -440,6 +540,7 @@ export function DevicesContent({
   error: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
+  historyRevision?: number;
   descriptors: DescriptorCatalog;
   onSelectDevice: (device: DeviceSummary) => void;
   onSelectEntity: (entity: EntityRef) => void;
@@ -455,6 +556,19 @@ export function DevicesContent({
   const [collapsedDevices, setCollapsedDevices] = useState<Set<string>>(
     () => new Set(),
   );
+  const [selectedDevices, setSelectedDevices] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [bulkCommand, setBulkCommand] = useState<BulkDeviceCommand | "">("");
+  const [bulkRun, setBulkRun] = useState<{
+    command: BulkDeviceCommand;
+    deviceIds: string[];
+    execution: FiniteExecution;
+  } | null>(null);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(
+    null,
+  );
   const allDevices = useMemo(() => data?.devices ?? [], [data?.devices]);
   const rows = useMemo(
     () => filterAndSortDevices(allDevices, filters, sort, descending),
@@ -465,6 +579,35 @@ export function DevicesContent({
     () => applicableDescriptorCommands(descriptors, "device"),
     [descriptors],
   );
+  const hasBulkLifecycleAction = useMemo(
+    () =>
+      descriptors.actions.some(
+        (descriptor) => descriptor.kind === "device.lifecycle.bulk",
+      ),
+    [descriptors.actions],
+  );
+  const selectedCount = selectedDevices.size;
+  const { eligible: bulkEligible, incompatible: bulkIncompatible } = useMemo(
+    () => bulkDeviceEligibility(allDevices, selectedDevices, bulkCommand),
+    [allDevices, bulkCommand, selectedDevices],
+  );
+  const bulkCommandOptions = useMemo(
+    () =>
+      BULK_DEVICE_COMMANDS.map((command) => ({
+        ...command,
+        eligible: bulkDeviceEligibility(allDevices, selectedDevices, command.id)
+          .eligible.length,
+      })).filter((command) => command.eligible > 0),
+    [allDevices, selectedDevices],
+  );
+  const bulkInfo = bulkCommandInfo(bulkCommand);
+  const bulkResults = bulkDeviceResultItems(bulkRun?.execution.result);
+  const failedBulkResults = bulkResults.filter(
+    (item) => item.kind === "failed",
+  );
+  const bulkExecutionId = bulkRun?.execution.id;
+  const bulkExecutionStatus = bulkRun?.execution.status;
+  const bulkRunning = bulkExecutionStatus === "running";
   const statuses = useMemo(
     () =>
       uniqueStrings(
@@ -489,6 +632,109 @@ export function DevicesContent({
       ].sort((left, right) => left[1].localeCompare(right[1])),
     [allDevices],
   );
+  useEffect(() => {
+    const present = new Set(allDevices.map((device) => device.entity.id));
+    setSelectedDevices((current) => {
+      if ([...current].every((id) => present.has(id))) return current;
+      return new Set([...current].filter((id) => present.has(id)));
+    });
+  }, [allDevices]);
+
+  useEffect(() => {
+    if (!bulkExecutionId || bulkExecutionStatus !== "running") return;
+    const controller = new AbortController();
+    void daemonApi
+      .history(controller.signal)
+      .then((history) => {
+        const execution = history.find((item) => item.id === bulkExecutionId);
+        if (!execution) return;
+        setBulkRun((current) => {
+          if (!current || current.execution.id !== execution.id) return current;
+          return { ...current, execution };
+        });
+      })
+      .catch((fetchError: unknown) => {
+        if (!controller.signal.aborted) setBulkError(String(fetchError));
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [bulkExecutionId, bulkExecutionStatus, historyRevision]);
+
+  const toggleDeviceSelection = (device: string, checked: boolean) => {
+    setSelectedDevices((current) => {
+      const next = new Set(current);
+      if (checked) next.add(device);
+      else next.delete(device);
+      return next;
+    });
+  };
+  const setFilteredSelection = (checked: boolean) => {
+    setSelectedDevices((current) => {
+      const next = new Set(current);
+      for (const device of rows) {
+        if (checked) next.add(device.entity.id);
+        else next.delete(device.entity.id);
+      }
+      return next;
+    });
+  };
+  const filteredSelected = rows.filter((device) =>
+    selectedDevices.has(device.entity.id),
+  ).length;
+  const allFilteredSelected =
+    rows.length > 0 && filteredSelected === rows.length;
+
+  const submitBulkCommand = async (
+    command: BulkDeviceCommand,
+    targets: DeviceSummary[],
+  ) => {
+    setBulkError(null);
+    try {
+      const execution = await daemonApi.runOperation(
+        "action",
+        "device.lifecycle.bulk",
+        {
+          devices: targets.map((device) => device.entity.id).join(","),
+          command,
+        },
+      );
+      setBulkRun({
+        command,
+        deviceIds: targets.map((device) => device.entity.id),
+        execution,
+      });
+    } catch (runError) {
+      setBulkError(String(runError));
+    }
+  };
+
+  const requestBulkCommand = () => {
+    if (!bulkCommand || bulkEligible.length === 0 || bulkRunning) return;
+    const info = bulkCommandInfo(bulkCommand);
+    if (!info) return;
+    const skipped = bulkIncompatible.length;
+    setConfirmRequest({
+      title: `${info.label} ${String(bulkEligible.length)} ${
+        bulkEligible.length === 1 ? "device" : "devices"
+      }?`,
+      message:
+        skipped > 0
+          ? `${String(skipped)} selected ${
+              skipped === 1 ? "device does" : "devices do"
+            } not currently advertise this command and will be skipped.`
+          : "The command will be submitted through the managed device operation path for every selected compatible device.",
+      items: confirmationItems(bulkEligible),
+      confirmLabel: `${info.label} ${String(bulkEligible.length)}`,
+      cancelLabel: "Cancel",
+      requireTyped: info.destructive ? "DECOMMISSION" : undefined,
+      destructive: info.destructive,
+      onConfirm: () => {
+        void submitBulkCommand(bulkCommand, bulkEligible);
+      },
+    });
+  };
+
   const chooseSort = (next: DeviceSortKey) => {
     setDescending(next === sort ? !descending : false);
     setSort(next);
@@ -615,6 +861,132 @@ export function DevicesContent({
             </label>
           </section>
 
+          <section
+            className="device-bulk-actions"
+            aria-label="Bulk device actions"
+          >
+            <div className="device-bulk-selection">
+              <strong>{selectedCount} selected</strong>
+              <span>{filteredSelected} in the current filtered view</span>
+              <button
+                disabled={rows.length === 0 || bulkRunning}
+                onClick={() => {
+                  setFilteredSelection(!allFilteredSelected);
+                }}
+              >
+                {allFilteredSelected
+                  ? "Deselect filtered"
+                  : "Select all filtered"}
+              </button>
+              <button
+                disabled={selectedCount === 0 || bulkRunning}
+                onClick={() => {
+                  setSelectedDevices(new Set<string>());
+                }}
+              >
+                Clear selection
+              </button>
+            </div>
+            <div className="device-bulk-command">
+              <label>
+                <span>Bulk command</span>
+                <select
+                  aria-label="Bulk device command"
+                  disabled={
+                    selectedCount === 0 ||
+                    !hasBulkLifecycleAction ||
+                    bulkRunning
+                  }
+                  value={bulkCommand}
+                  onChange={(event) => {
+                    setBulkCommand(
+                      event.target.value as BulkDeviceCommand | "",
+                    );
+                  }}
+                >
+                  <option value="">Choose command…</option>
+                  {bulkCommandOptions.map((command) => (
+                    <option key={command.id} value={command.id}>
+                      {command.label} ({command.eligible}/{selectedCount})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className={bulkInfo?.destructive ? "danger" : "primary"}
+                disabled={
+                  !hasBulkLifecycleAction ||
+                  !bulkCommand ||
+                  bulkEligible.length === 0 ||
+                  bulkRunning
+                }
+                onClick={requestBulkCommand}
+              >
+                {bulkRunning
+                  ? "Bulk command running…"
+                  : bulkInfo
+                    ? `${bulkInfo.label} ${String(bulkEligible.length)}`
+                    : "Run command"}
+              </button>
+            </div>
+            {!hasBulkLifecycleAction ? (
+              <p className="inline-warning">
+                Bulk device control is unavailable from this daemon build.
+              </p>
+            ) : bulkCommand && bulkIncompatible.length > 0 ? (
+              <p className="muted">
+                {bulkIncompatible.length} selected{" "}
+                {bulkIncompatible.length === 1 ? "device is" : "devices are"}{" "}
+                incompatible and will be skipped.
+              </p>
+            ) : null}
+          </section>
+
+          {bulkRun ? (
+            <section
+              className={`device-bulk-status ${bulkRun.execution.status}`}
+              aria-live="polite"
+            >
+              <div>
+                <strong>
+                  {bulkCommandInfo(bulkRun.command)?.label ?? bulkRun.command}
+                </strong>
+                <span>
+                  {bulkRun.execution.status === "running"
+                    ? `Running across ${String(bulkRun.deviceIds.length)} devices…`
+                    : `${String(bulkRun.execution.summary.succeeded)} succeeded · ${String(
+                        bulkRun.execution.summary.failed,
+                      )} failed · ${String(bulkRun.execution.summary.skipped)} skipped`}
+                </span>
+              </div>
+              {bulkRun.execution.error ? (
+                <p className="inline-warning">{bulkRun.execution.error}</p>
+              ) : null}
+              {failedBulkResults.length > 0 ? (
+                <details>
+                  <summary>{failedBulkResults.length} failed devices</summary>
+                  <ul>
+                    {failedBulkResults.map((item) => (
+                      <li key={item.device}>
+                        <strong>{item.device}</strong>
+                        <span>
+                          {item.error ??
+                            item.operation_status ??
+                            "managed operation failed"}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+            </section>
+          ) : null}
+          {bulkError ? (
+            <p className="inline-warning">
+              Bulk action update failed: {bulkError}
+            </p>
+          ) : null}
+
           <div className="fleet-summary">
             <p className="table-summary">
               Showing {rows.length} of {allDevices.length} devices · revision{" "}
@@ -646,6 +1018,17 @@ export function DevicesContent({
               <table className="device-table">
                 <thead>
                   <tr>
+                    <th className="device-select-column">
+                      <input
+                        aria-label="Select all filtered devices"
+                        checked={allFilteredSelected}
+                        disabled={rows.length === 0 || bulkRunning}
+                        type="checkbox"
+                        onChange={(event) => {
+                          setFilteredSelection(event.target.checked);
+                        }}
+                      />
+                    </th>
                     <th>{sortButton("Code", "code")}</th>
                     <th>{sortButton("Type / status", "type")}</th>
                     <th>{sortButton("Owner", "owner")}</th>
@@ -671,7 +1054,7 @@ export function DevicesContent({
                   return (
                     <tbody key={group.category}>
                       <tr className="device-group-row">
-                        <th colSpan={6}>
+                        <th colSpan={7}>
                           <div>
                             <button
                               className="group-toggle"
@@ -710,7 +1093,30 @@ export function DevicesContent({
                         ? null
                         : visibleRows.map(
                             ({ device, depth, relationship, hasChildren }) => (
-                              <tr key={device.entity.id}>
+                              <tr
+                                className={
+                                  selectedDevices.has(device.entity.id)
+                                    ? "selected-device-row"
+                                    : undefined
+                                }
+                                key={device.entity.id}
+                              >
+                                <td className="device-select-column">
+                                  <input
+                                    aria-label={`Select device ${device.entity.id}`}
+                                    checked={selectedDevices.has(
+                                      device.entity.id,
+                                    )}
+                                    disabled={bulkRunning}
+                                    type="checkbox"
+                                    onChange={(event) => {
+                                      toggleDeviceSelection(
+                                        device.entity.id,
+                                        event.target.checked,
+                                      );
+                                    }}
+                                  />
+                                </td>
                                 <td>
                                   <div
                                     className="device-tree-cell"
@@ -858,6 +1264,12 @@ export function DevicesContent({
           )}
         </>
       )}
+      <ConfirmDialog
+        request={confirmRequest}
+        onClose={() => {
+          setConfirmRequest(null);
+        }}
+      />
     </article>
   );
 }

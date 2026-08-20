@@ -51,7 +51,6 @@ replicant-cli          React GUI
 - runtime DB = application/workflow truth;
 - frontend store = disposable projection/cache.
 
-
 ## Deployment Targets
 
 The same runtime architecture supports three independent deployment styles:

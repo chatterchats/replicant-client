@@ -5010,6 +5010,7 @@ async fn reconcile_and_invalidate_director(
             state.repository.clone(),
             state.revision.load(Ordering::Relaxed),
             true,
+            trigger == "manual",
         )
         .await
     };
@@ -6770,6 +6771,18 @@ mod tests {
                 assert!(value["payload"]["metadata"]["revision"].is_number());
                 assert!(value["payload"]["locations"].is_array());
                 assert!(value["payload"]["resources"].is_array());
+            }
+            if path == "/api/descriptors" {
+                assert!(
+                    value["payload"]["actions"]
+                        .as_array()
+                        .is_some_and(|actions| actions.iter().any(|action| {
+                            action["kind"] == "device.lifecycle.bulk"
+                                && action["applicable_to"]
+                                    .as_array()
+                                    .is_some_and(Vec::is_empty)
+                        }))
+                );
             }
             assert!(!value.to_string().contains("token"));
         }

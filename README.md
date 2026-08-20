@@ -137,25 +137,25 @@ Safe reads may use bounded retries. Mutations are never automatically retried.
 
 ## Feature tiers
 
-| Feature | Provides |
-| --- | --- |
-| `raw` | HTTP transport, authentication, DTOs, pagination, and rate-limit metadata. |
-| `events` | `raw` plus SSE framing and raw event streaming. |
-| `managed` | `events` plus SQLite, normalized state, synchronization, operations, and `Client`. Enabled by default. |
-| `rustls-tls` | rustls and native root certificates. Enabled by default. |
-| `native-tls` | Platform native TLS. |
+| Feature      | Provides                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------ |
+| `raw`        | HTTP transport, authentication, DTOs, pagination, and rate-limit metadata.                             |
+| `events`     | `raw` plus SSE framing and raw event streaming.                                                        |
+| `managed`    | `events` plus SQLite, normalized state, synchronization, operations, and `Client`. Enabled by default. |
+| `rustls-tls` | rustls and native root certificates. Enabled by default.                                               |
+| `native-tls` | Platform native TLS.                                                                                   |
 
 ## Workspace packages
 
-| Package | Purpose |
-| --- | --- |
-| [`replicant-cli`](crates/replicant-cli) | Unified CLI for printing, transport, survey, relay, mining, regional ownership reassignment, observatory operations, events, bootstrap, and Riker reports. |
-| [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules. |
-| [`replicant-event-planner`](crates/replicant-event-planner) | Pure civilisation-event logistics planning. |
-| [`replicant-mining-planner`](crates/replicant-mining-planner) | Pure mining-network bills of materials and resource expansion. |
-| [`replicant-printing`](crates/replicant-printing) | Pure print scheduling plus optional managed Autofactory workflows. |
-| [`replicant-route-planner`](crates/replicant-route-planner) | Pure survey-route and FTL relay-network algorithms. |
-| [`replicant-transport`](crates/replicant-transport) | Managed point-to-point resource and device delivery. |
+| Package                                                             | Purpose                                                                                                                                                    |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`replicant-cli`](crates/replicant-cli)                             | Unified CLI for printing, transport, survey, relay, mining, regional ownership reassignment, observatory operations, events, bootstrap, and Riker reports. |
+| [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules.                                                                                                   |
+| [`replicant-event-planner`](crates/replicant-event-planner)         | Pure civilisation-event logistics planning.                                                                                                                |
+| [`replicant-mining-planner`](crates/replicant-mining-planner)       | Pure mining-network bills of materials and resource expansion.                                                                                             |
+| [`replicant-printing`](crates/replicant-printing)                   | Pure print scheduling plus optional managed Autofactory workflows.                                                                                         |
+| [`replicant-route-planner`](crates/replicant-route-planner)         | Pure survey-route and FTL relay-network algorithms.                                                                                                        |
+| [`replicant-transport`](crates/replicant-transport)                 | Managed point-to-point resource and device delivery.                                                                                                       |
 
 Run the consolidated CLI locally:
 

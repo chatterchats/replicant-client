@@ -24,22 +24,22 @@ cargo build -p replicant-cli
 
 ## Commands
 
-| Command | Operations | Purpose |
-| --- | --- | --- |
-| `interactive` | — | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup. |
-| `daemon` | — | Show local `replicantd` health. |
-| `operation` | `catalogue`, `help`, `report`, `action` | Discover and run registered capabilities through `replicantd`. |
-| `workflow` | `list`, `inspect`, `start`, `pause`, `resume`, `cancel` | Control durable workflows owned by `replicantd`. |
-| `print` | `queue`, `status`, `clear` | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
-| `transport` | `--plan` or execute | Deliver resources and devices between locations. |
-| `survey` | `plan`, `run`, `status` | Plan and execute durable survey routes. |
-| `relay` | `plan`, `run`, `status` | Expand an account-owned FTL relay network. |
-| `mining` | `plan`, `run`, `status` | Build repeatable mining sites and routes. |
-| `ownership` | `reassign` | Preview or bulk-reassign non-vessel devices by catalogue region. |
-| `observatory` | `status`, `prospect`, `triangulate` | Automate Galactic Observatory fringe prospecting and spectral triangulation. |
-| `event` | `list`, `plan`, `run`, `status` | Plan one or all civilisation events and execute logistics. |
-| `bootstrap` | `plan`, `stage`, `deliver`, `run`, `status` | Stage, deliver, or fully deploy a regional bootstrap mission. |
-| `rikers` | — | Produce a read-only local colony-candidate report. |
+| Command       | Operations                                              | Purpose                                                                      |
+| ------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `interactive` | —                                                       | Guided builder for every CLI workflow, with smart SYSTEM/LOCATION lookup.    |
+| `daemon`      | —                                                       | Show local `replicantd` health.                                              |
+| `operation`   | `catalogue`, `help`, `report`, `action`                 | Discover and run registered capabilities through `replicantd`.               |
+| `workflow`    | `list`, `inspect`, `start`, `pause`, `resume`, `cancel` | Control durable workflows owned by `replicantd`.                             |
+| `print`       | `queue`, `status`, `clear`                              | Distribute Autofactory work, inspect manufacturing, or clear factory queues. |
+| `transport`   | `--plan` or execute                                     | Deliver resources and devices between locations.                             |
+| `survey`      | `plan`, `run`, `status`                                 | Plan and execute durable survey routes.                                      |
+| `relay`       | `plan`, `run`, `status`                                 | Expand an account-owned FTL relay network.                                   |
+| `mining`      | `plan`, `run`, `status`                                 | Build repeatable mining sites and routes.                                    |
+| `ownership`   | `reassign`                                              | Preview or bulk-reassign non-vessel devices by catalogue region.             |
+| `observatory` | `status`, `prospect`, `triangulate`                     | Automate Galactic Observatory fringe prospecting and spectral triangulation. |
+| `event`       | `list`, `plan`, `run`, `status`                         | Plan one or all civilisation events and execute logistics.                   |
+| `bootstrap`   | `plan`, `stage`, `deliver`, `run`, `status`             | Stage, deliver, or fully deploy a regional bootstrap mission.                |
+| `rikers`      | —                                                       | Produce a read-only local colony-candidate report.                           |
 
 Stateful commands accept an operation word or its flag form. For example,
 `survey plan` and `survey --plan` are equivalent.
