@@ -306,7 +306,9 @@ describe("device fleet browser", () => {
     });
     expect(container.textContent).toContain("Decommission 2 devices?");
     expect(container.textContent).toContain("Type DECOMMISSION to continue");
-    const confirm = [...container.querySelectorAll("button")].find(
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    const confirm = [...(dialog?.querySelectorAll("button") ?? [])].find(
       (button) => button.textContent === "Decommission 2",
     );
     expect(confirm?.disabled).toBe(true);

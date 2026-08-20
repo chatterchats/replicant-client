@@ -4271,6 +4271,13 @@ fn invalidate_action_slices(state: &AppState, kind: &str) {
             DomainSlice::Inventory,
             DomainSlice::Cargo,
         ]
+    } else if kind.starts_with("survey.") {
+        &[
+            DomainSlice::Overview,
+            DomainSlice::Entities,
+            DomainSlice::Universe,
+            DomainSlice::Activity,
+        ]
     } else if kind.starts_with("observatory.") {
         &[
             DomainSlice::Devices,

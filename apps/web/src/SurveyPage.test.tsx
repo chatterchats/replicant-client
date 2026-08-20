@@ -6,7 +6,19 @@ import type { DescriptorCatalog, SurveySnapshot } from "./protocol";
 
 const descriptors: DescriptorCatalog = {
   reports: [],
-  actions: [],
+  actions: [
+    {
+      kind: "survey.belt_search",
+      display_name: "Fast belt search",
+      aliases: ["belt_search", "belt-search"],
+      description: "Search systems for asteroid belts",
+      category: "survey",
+      operation_class: "action",
+      risk: "elevated",
+      applicable_to: ["system", "replicant"],
+      parameters: [],
+    },
+  ],
   workflows: [
     {
       kind: "survey.route",
@@ -71,9 +83,17 @@ describe("SurveyContent", () => {
     expect(html).toContain("2 / 5");
     expect(html).toContain("VEGA");
     expect(html).toContain("Survey route");
+    expect(html).toContain("Fast belt search");
     expect(html).toContain("Open workflow");
-    const command = surveyCommands(descriptors)[0];
-    expect(command?.operationClass).toBe("workflow");
+    const commands = surveyCommands(descriptors);
+    expect(commands.map((command) => command.descriptor.kind)).toEqual([
+      "survey.belt_search",
+      "survey.route",
+    ]);
+    const command = commands.find(
+      (candidate) => candidate.descriptor.kind === "survey.belt_search",
+    );
+    expect(command?.operationClass).toBe("action");
     if (command) run(command);
     expect(run).toHaveBeenCalledWith(command);
   });

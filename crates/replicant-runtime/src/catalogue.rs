@@ -39,6 +39,7 @@ use crate::{
         salvage_workflow_kind, scan_belt_workflow_kind, scan_system_workflow_kind,
         scan_tour_workflow_kind,
     },
+    belt_search::{BeltSearchRequest, execute_belt_search},
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
     observatory::auto_prospect,
     relay::RelayExpansionRequest,
@@ -199,6 +200,14 @@ impl OperationCatalogue {
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
+            "survey.belt_search" => {
+                let input: BeltSearchAction = decode(parameters)?;
+                serialize(
+                    execute_belt_search(client, &input.into_request())
+                        .await
+                        .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
+                )
+            }
             "bobnet.send" => {
                 let input: BobnetSendAction = decode(parameters)?;
                 let channel = normalize_bobnet_channel(&input.channel)?;
@@ -914,8 +923,60 @@ impl OperationCatalogue {
             };
             validate_parameter(parameter, value)?;
         }
+        if class == OperationClass::Action && kind == "survey.belt_search" {
+            validate_belt_search_parameters(&values, defaults_only)?;
+        }
         Ok(values)
     }
+}
+
+fn validate_belt_search_parameters(
+    values: &BTreeMap<String, Value>,
+    defaults_only: bool,
+) -> Result<(), CatalogueError> {
+    if defaults_only {
+        return Ok(());
+    }
+    let systems = values
+        .get("systems")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if split_systems(systems)
+        .iter()
+        .any(|system| system.chars().any(char::is_whitespace))
+    {
+        return Err(CatalogueError::Invalid(
+            "system designations must not contain whitespace".to_owned(),
+        ));
+    }
+    let start = values
+        .get("start")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if start.is_some_and(|value| value.chars().any(char::is_whitespace)) {
+        return Err(CatalogueError::Invalid(
+            "belt-search start must be a system or location designation".to_owned(),
+        ));
+    }
+    let radius = values.get("radius_ly").and_then(Value::as_f64);
+    if !systems.is_empty() && (start.is_some() || radius.is_some()) {
+        return Err(CatalogueError::Invalid(
+            "explicit systems cannot be combined with automatic belt-search routing".to_owned(),
+        ));
+    }
+    if start.is_some() != radius.is_some() {
+        return Err(CatalogueError::Invalid(
+            "automatic belt-search routing requires both start and radius".to_owned(),
+        ));
+    }
+    if systems.is_empty() && start.is_none() {
+        return Err(CatalogueError::Invalid(
+            "belt search requires explicit systems or an automatic start and radius".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_logistics_workflow_parameters(
@@ -1211,6 +1272,57 @@ fn descriptors() -> DescriptorCatalog {
                     required("device_type", "Device type", ParameterKind::DeviceType),
                     required("tag", "Tag", ParameterKind::Tag),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
+                ],
+            },
+            ActionDescriptor {
+                kind: operation_kind("survey.belt_search"),
+                display_name: "Fast belt search".to_owned(),
+                aliases: strings(&["belt_search", "belt-search"]),
+                description: "Use a Replicant to rapidly search explicit systems or an automatically planned radius for asteroid belts and resource sites."
+                    .to_owned(),
+                category: "survey".to_owned(),
+                operation_class: OperationClass::Action,
+                risk: MutationRisk::Elevated,
+                applicable_to: vec![EntityKind::System, EntityKind::Replicant],
+                parameters: vec![
+                    required("replicant", "Replicant", ParameterKind::Replicant),
+                    optional(
+                        "systems",
+                        "Explicit systems (comma separated)",
+                        ParameterKind::String,
+                    ),
+                    optional("start", "Automatic route start", ParameterKind::System),
+                    bounded(
+                        optional(
+                            "radius_ly",
+                            "Automatic route radius (ly)",
+                            ParameterKind::Number,
+                        ),
+                        Some(0.000_001),
+                        None,
+                    ),
+                    bounded(
+                        defaulted("system_limit", "System limit", ParameterKind::Integer, 80),
+                        Some(1.0),
+                        None,
+                    ),
+                    defaulted(
+                        "include_explored",
+                        "Include explored systems",
+                        ParameterKind::Boolean,
+                        false,
+                    ),
+                    defaulted("plan_only", "Plan route only", ParameterKind::Boolean, false),
+                    bounded(
+                        defaulted(
+                            "wait_timeout_seconds",
+                            "Per-leg wait timeout (seconds)",
+                            ParameterKind::Integer,
+                            21_600,
+                        ),
+                        Some(1.0),
+                        None,
+                    ),
                 ],
             },
             simple_action(
@@ -2446,6 +2558,37 @@ fn normalize_bobnet_channel(channel: &str) -> Result<String, CatalogueError> {
 }
 
 #[derive(Debug, Deserialize)]
+struct BeltSearchAction {
+    replicant: String,
+    #[serde(default)]
+    systems: String,
+    start: Option<String>,
+    radius_ly: Option<f64>,
+    system_limit: usize,
+    include_explored: bool,
+    plan_only: bool,
+    wait_timeout_seconds: u64,
+}
+
+impl BeltSearchAction {
+    fn into_request(self) -> BeltSearchRequest {
+        BeltSearchRequest {
+            replicant: self.replicant,
+            systems: split_systems(&self.systems),
+            route_start: self
+                .start
+                .map(|value| value.trim().to_ascii_uppercase())
+                .filter(|value| !value.is_empty()),
+            radius_ly: self.radius_ly,
+            system_limit: self.system_limit,
+            include_explored: self.include_explored,
+            plan_only: self.plan_only,
+            wait_timeout: Duration::from_secs(self.wait_timeout_seconds),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct BobnetSendAction {
     replicant: String,
     channel: String,
@@ -2725,6 +2868,17 @@ impl RelayStart {
     }
 }
 
+fn split_systems(value: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    value
+        .split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
 fn csv(value: String) -> Vec<String> {
     value
         .split(',')
@@ -2999,6 +3153,73 @@ mod tests {
             vec!["D-1".to_owned(), "D-2".to_owned()]
         );
         assert!(bulk_device_codes(" , \n ").is_err());
+    }
+
+    #[test]
+    fn fast_belt_search_is_registered_for_survey_ui_and_validates_route_modes() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let descriptor = catalogue
+            .descriptors()
+            .actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "survey.belt_search")
+            .expect("fast belt search descriptor");
+        assert_eq!(descriptor.category, "survey");
+        assert!(descriptor.applicable_to.contains(&EntityKind::System));
+        assert_eq!(
+            catalogue.resolve_kind(OperationClass::Action, "belt_search"),
+            Some("survey.belt_search")
+        );
+
+        catalogue
+            .validate_action(
+                "survey.belt_search",
+                &BTreeMap::from([
+                    (
+                        "replicant".to_owned(),
+                        Value::String("Chats-4".to_owned()),
+                    ),
+                    (
+                        "systems".to_owned(),
+                        Value::String("SOL, VEGA".to_owned()),
+                    ),
+                ]),
+            )
+            .expect("explicit systems should validate");
+        catalogue
+            .validate_action(
+                "survey.belt_search",
+                &BTreeMap::from([
+                    (
+                        "replicant".to_owned(),
+                        Value::String("Chats-4".to_owned()),
+                    ),
+                    (
+                        "start".to_owned(),
+                        Value::String("SCEPTURUM".to_owned()),
+                    ),
+                    ("radius_ly".to_owned(), Value::from(10.0)),
+                ]),
+            )
+            .expect("automatic route should validate");
+        assert!(
+            catalogue
+                .validate_action(
+                    "survey.belt_search",
+                    &BTreeMap::from([
+                        (
+                            "replicant".to_owned(),
+                            Value::String("Chats-4".to_owned()),
+                        ),
+                        ("start".to_owned(), Value::String("SCEPTURUM".to_owned())),
+                    ]),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            split_systems(" sol,VEGA\nsol "),
+            vec!["SOL".to_owned(), "VEGA".to_owned()]
+        );
     }
 
     #[test]
