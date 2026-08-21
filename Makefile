@@ -9,7 +9,7 @@ DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down observability-up observability-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
 
 help:
 	@printf '%s\n' \
@@ -37,6 +37,8 @@ help:
 	  'docker-check          		Validate Compose and build the production images' \
 	  'docker-up             		Start the production Compose stack' \
 	  'docker-down           		Stop the stack without deleting durable data' \
+	  'observability-up      		Start Grafana with the provisioned Replicant telemetry dashboard' \
+	  'observability-down    		Stop the optional Grafana companion service' \
 	  'docker-smoke          		Start and probe a configured full stack' \
 	  'docker-persistence-smoke		Prove the data directory survives container recreation' \
 	  'docker-rebuild-deploy		Rebuild and redeploy the stack' \
@@ -148,6 +150,13 @@ docker-up:
 
 docker-down:
 	$(DOCKER_COMPOSE) stop
+
+observability-up:
+	mkdir -p "$${REPLICANT_DATA_DIR:-$${HOME}/.local/share/replicant}/telemetry" "$${REPLICANT_DATA_DIR:-$${HOME}/.local/share/replicant}/grafana"
+	$(DOCKER_COMPOSE) --profile observability up -d replicantd grafana
+
+observability-down:
+	$(DOCKER_COMPOSE) --profile observability stop grafana
 
 docker-rebuild-deploy: docker-build docker-up
 

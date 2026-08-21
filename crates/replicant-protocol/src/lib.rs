@@ -2764,8 +2764,10 @@ pub struct SettingsSnapshot {
     pub bind_address: String,
     /// Managed SDK SQLite database location.
     pub managed_database_path: String,
-    /// Long-lived event and telemetry history SQLite database location.
+    /// Long-lived game/event history SQLite database location.
     pub history_database_path: String,
+    /// Isolated observability/telemetry SQLite database location.
+    pub telemetry_database_path: String,
     /// Workflow/runtime SQLite database location.
     pub runtime_database_path: String,
     /// Effective `tracing` log filter directive.
@@ -3112,6 +3114,7 @@ mod tests {
             bind_address: "127.0.0.1:8080".to_owned(),
             managed_database_path: "replicant-client.sqlite".to_owned(),
             history_database_path: "replicant-history.sqlite".to_owned(),
+            telemetry_database_path: "replicant-telemetry.sqlite".to_owned(),
             runtime_database_path: "replicant-runtime.sqlite".to_owned(),
             log_filter: "info".to_owned(),
             docker: false,

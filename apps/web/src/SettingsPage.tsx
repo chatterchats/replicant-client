@@ -98,6 +98,8 @@ export function SettingsContent({
             <dd>{data?.managed_database_path ?? "—"}</dd>
             <dt>History database</dt>
             <dd>{data?.history_database_path ?? "—"}</dd>
+            <dt>Telemetry database</dt>
+            <dd>{data?.telemetry_database_path ?? "—"}</dd>
             <dt>Runtime database</dt>
             <dd>{data?.runtime_database_path ?? "—"}</dd>
             <dt>Log filter</dt>

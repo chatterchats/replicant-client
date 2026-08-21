@@ -28,6 +28,10 @@ use crate::raw::rate_limit::{
     RateLimitBucket, RateLimitCoordinator, RateLimitReset, RateLimitSnapshot, RetryAfter,
     bucket_for,
 };
+use crate::raw::telemetry::{
+    ApiAttemptOutcome, ApiAttemptTelemetry, ApiAttemptTimings, ApiRateLimitTelemetry,
+    ApiTelemetrySink, duration_millis, normalize_route_key, now_unix_millis,
+};
 
 /// Opaque local request correlation identifier.
 ///
@@ -103,6 +107,7 @@ struct RequestAttempt<'a> {
     attempt: u32,
     body: Option<Vec<u8>>,
     response_body_limit: usize,
+    rate_limit_wait: Duration,
 }
 
 /// Bounded-backoff retry policy applied to safe reads.
@@ -244,6 +249,7 @@ pub struct ClientBuilder {
     config: ClientConfig,
     tokens: Arc<dyn TokenProvider>,
     http_client: Option<reqwest::Client>,
+    telemetry: Option<Arc<dyn ApiTelemetrySink>>,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -263,6 +269,7 @@ impl ClientBuilder {
             config: ClientConfig::default(),
             tokens: Arc::new(MutableTokenProvider::default()),
             http_client: None,
+            telemetry: None,
         }
     }
 
@@ -363,6 +370,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Installs a best-effort sink for per-attempt HTTP telemetry.
+    ///
+    /// The sink is called inline after an attempt has enough information to
+    /// classify its outcome. Implementations should enqueue without blocking;
+    /// transport success and failure never depend on telemetry persistence.
+    #[must_use]
+    pub fn api_telemetry_sink(mut self, sink: Arc<dyn ApiTelemetrySink>) -> Self {
+        self.telemetry = Some(sink);
+        self
+    }
+
     /// Builds the client.
     ///
     /// # Errors
@@ -408,6 +426,7 @@ impl ClientBuilder {
                 tokens: self.tokens,
                 rate_limits: RateLimitCoordinator::new(),
                 config: self.config,
+                telemetry: self.telemetry,
             }),
         })
     }
@@ -443,6 +462,31 @@ pub(crate) struct ClientInner {
     pub(crate) tokens: Arc<dyn TokenProvider>,
     pub(crate) rate_limits: RateLimitCoordinator,
     pub(crate) config: ClientConfig,
+    pub(crate) telemetry: Option<Arc<dyn ApiTelemetrySink>>,
+}
+
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AttemptProgress {
+    request_prepare_ms: Option<u64>,
+    time_to_headers_ms: Option<u64>,
+    metadata_ms: Option<u64>,
+    body_read_ms: Option<u64>,
+    decode_ms: Option<u64>,
+}
+
+impl AttemptProgress {
+    fn with_elapsed(self, rate_limit_wait: Duration, elapsed: Duration) -> ApiAttemptTimings {
+        ApiAttemptTimings {
+            rate_limit_wait_ms: duration_millis(rate_limit_wait),
+            request_prepare_ms: self.request_prepare_ms,
+            time_to_headers_ms: self.time_to_headers_ms,
+            metadata_ms: self.metadata_ms,
+            body_read_ms: self.body_read_ms,
+            decode_ms: self.decode_ms,
+            elapsed_ms: duration_millis(rate_limit_wait).saturating_add(duration_millis(elapsed)),
+        }
+    }
 }
 
 impl fmt::Debug for Client {
@@ -554,22 +598,65 @@ impl Client {
             "v1/events/stream",
             &[("cursor", cursor.map(ToOwned::to_owned))],
         );
+        let method = Method::GET;
         let request_id = RequestId::new();
         let overall_started = Instant::now();
         let permit_started = Instant::now();
         self.inner.rate_limits.acquire(RateLimitBucket::Sse).await;
         let permit_wait = permit_started.elapsed();
+        let attempt_started = Instant::now();
+        let mut timings = AttemptProgress::default();
+        let request = RequestAttempt {
+            method: &method,
+            path: &path,
+            authenticated: true,
+            request_id: &request_id,
+            bucket: RateLimitBucket::Sse,
+            attempt: 1,
+            body: None,
+            response_body_limit: self.inner.config.max_response_body_bytes,
+            rate_limit_wait: permit_wait,
+        };
+
+        let prepare_started = Instant::now();
+        let prepared = match self.prepare_request(method.clone(), &path, true, &request_id) {
+            Ok(prepared) => prepared.header(reqwest::header::ACCEPT, "text/event-stream"),
+            Err(error) => {
+                timings.request_prepare_ms = Some(duration_millis(prepare_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    None,
+                    ApiAttemptOutcome::PrepareError,
+                    None,
+                    timings.with_elapsed(permit_wait, attempt_started.elapsed()),
+                );
+                return Err(error);
+            }
+        };
+        timings.request_prepare_ms = Some(duration_millis(prepare_started.elapsed()));
+
         let connect_started = Instant::now();
-        let response = self
-            .prepare_request(Method::GET, &path, true, &request_id)?
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+        let response = match prepared.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                timings.time_to_headers_ms = Some(duration_millis(connect_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    None,
+                    ApiAttemptOutcome::TransportError,
+                    None,
+                    timings.with_elapsed(permit_wait, attempt_started.elapsed()),
+                );
+                return Err(map_reqwest_error(error));
+            }
+        };
         let time_to_headers = connect_started.elapsed();
+        timings.time_to_headers_ms = Some(duration_millis(time_to_headers));
+        let metadata_started = Instant::now();
         let metadata = self
             .observe_response(RateLimitBucket::Sse, &response, request_id.clone())
             .await;
+        timings.metadata_ms = Some(duration_millis(metadata_started.elapsed()));
         if self.inner.config.emit_tracing {
             debug!(
                 target: "replicant_client::raw::http",
@@ -585,10 +672,33 @@ impl Client {
             );
         }
         if response.status().is_success() {
+            self.record_api_attempt(
+                &request,
+                Some(&metadata),
+                ApiAttemptOutcome::Success,
+                None,
+                timings.with_elapsed(permit_wait, attempt_started.elapsed()),
+            );
             return Ok(response);
         }
+
         let body_started = Instant::now();
-        let bytes = read_bounded(response, self.inner.config.max_response_body_bytes).await?;
+        let bytes = match read_bounded(response, self.inner.config.max_response_body_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                timings.body_read_ms = Some(duration_millis(body_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    Some(&metadata),
+                    ApiAttemptOutcome::BodyError,
+                    None,
+                    timings.with_elapsed(permit_wait, attempt_started.elapsed()),
+                );
+                return Err(error);
+            }
+        };
+        let body_elapsed = body_started.elapsed();
+        timings.body_read_ms = Some(duration_millis(body_elapsed));
         if self.inner.config.emit_tracing {
             warn!(
                 target: "replicant_client::raw::http",
@@ -598,11 +708,18 @@ impl Client {
                 local_request_id = %request_id,
                 status = metadata.status.as_u16(),
                 response_bytes = bytes.len(),
-                body_read_ms = body_started.elapsed().as_millis() as u64,
+                body_read_ms = body_elapsed.as_millis() as u64,
                 elapsed_ms = overall_started.elapsed().as_millis() as u64,
                 "SSE request was rejected"
             );
         }
+        self.record_api_attempt(
+            &request,
+            Some(&metadata),
+            ApiAttemptOutcome::HttpError,
+            Some(bytes.len()),
+            timings.with_elapsed(permit_wait, attempt_started.elapsed()),
+        );
         Err(map_status(metadata.status, &bytes, &metadata))
     }
 
@@ -651,6 +768,7 @@ impl Client {
                     attempt: attempts,
                     body: body.clone(),
                     response_body_limit,
+                    rate_limit_wait: permit_wait,
                 })
                 .await;
             let attempt_elapsed = attempt_started.elapsed();
@@ -727,51 +845,91 @@ impl Client {
         &self,
         request: RequestAttempt<'_>,
     ) -> Result<RawResponse<T>, Error> {
-        let RequestAttempt {
-            method,
-            path,
-            authenticated,
-            request_id,
-            bucket,
-            attempt,
-            body,
-            response_body_limit,
-        } = request;
         let total_started = Instant::now();
+        let mut timings = AttemptProgress::default();
+
         let prepare_started = Instant::now();
-        let mut request = self.prepare_request(method.clone(), path, authenticated, request_id)?;
-        if let Some(body) = body {
-            request = request
+        let mut prepared = match self.prepare_request(
+            request.method.clone(),
+            request.path,
+            request.authenticated,
+            request.request_id,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                timings.request_prepare_ms = Some(duration_millis(prepare_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    None,
+                    ApiAttemptOutcome::PrepareError,
+                    None,
+                    timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+                );
+                return Err(error);
+            }
+        };
+        if let Some(body) = request.body.as_ref() {
+            prepared = prepared
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
+                .body(body.clone());
         }
         let prepare_elapsed = prepare_started.elapsed();
+        timings.request_prepare_ms = Some(duration_millis(prepare_elapsed));
 
         let send_started = Instant::now();
-        let response = request.send().await.map_err(map_reqwest_error)?;
+        let response = match prepared.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                timings.time_to_headers_ms = Some(duration_millis(send_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    None,
+                    ApiAttemptOutcome::TransportError,
+                    None,
+                    timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+                );
+                return Err(map_reqwest_error(error));
+            }
+        };
         let time_to_headers = send_started.elapsed();
+        timings.time_to_headers_ms = Some(duration_millis(time_to_headers));
         let status = response.status();
         let metadata_started = Instant::now();
         let metadata = self
-            .observe_response(bucket, &response, request_id.clone())
+            .observe_response(request.bucket, &response, request.request_id.clone())
             .await;
         let metadata_elapsed = metadata_started.elapsed();
+        timings.metadata_ms = Some(duration_millis(metadata_elapsed));
 
         let body_started = Instant::now();
-        let bytes = read_bounded(response, response_body_limit).await?;
+        let bytes = match read_bounded(response, request.response_body_limit).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                timings.body_read_ms = Some(duration_millis(body_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    Some(&metadata),
+                    ApiAttemptOutcome::BodyError,
+                    None,
+                    timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+                );
+                return Err(error);
+            }
+        };
         let body_elapsed = body_started.elapsed();
+        timings.body_read_ms = Some(duration_millis(body_elapsed));
         if !metadata.status.is_success() {
             if self.inner.config.emit_tracing {
                 debug!(
                     target: "replicant_client::raw::http",
                     event = "http.response_received",
-                    method = %method,
-                    path,
-                    local_request_id = %request_id,
-                    attempt,
+                    method = %request.method,
+                    path = request.path,
+                    local_request_id = %request.request_id,
+                    attempt = request.attempt,
                     status = status.as_u16(),
                     response_bytes = bytes.len(),
-                    response_body_limit_bytes = response_body_limit,
+                    response_body_limit_bytes = request.response_body_limit,
                     request_prepare_ms = prepare_elapsed.as_millis() as u64,
                     time_to_headers_ms = time_to_headers.as_millis() as u64,
                     metadata_ms = metadata_elapsed.as_millis() as u64,
@@ -780,28 +938,48 @@ impl Client {
                     "received non-success HTTP response"
                 );
             }
+            self.record_api_attempt(
+                &request,
+                Some(&metadata),
+                ApiAttemptOutcome::HttpError,
+                Some(bytes.len()),
+                timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+            );
             return Err(map_status(metadata.status, &bytes, &metadata));
         }
 
         let decode_started = Instant::now();
-        let value = serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes })
-            .map_err(|error| Error::Decode {
-                message: error.to_string(),
-                status: Some(metadata.status.as_u16()),
-                source: Some(Box::new(error)),
-            })?;
+        let value = match serde_json::from_slice(if bytes.is_empty() { b"null" } else { &bytes }) {
+            Ok(value) => value,
+            Err(error) => {
+                timings.decode_ms = Some(duration_millis(decode_started.elapsed()));
+                self.record_api_attempt(
+                    &request,
+                    Some(&metadata),
+                    ApiAttemptOutcome::DecodeError,
+                    Some(bytes.len()),
+                    timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+                );
+                return Err(Error::Decode {
+                    message: error.to_string(),
+                    status: Some(metadata.status.as_u16()),
+                    source: Some(Box::new(error)),
+                });
+            }
+        };
         let decode_elapsed = decode_started.elapsed();
+        timings.decode_ms = Some(duration_millis(decode_elapsed));
         if self.inner.config.emit_tracing {
             debug!(
                 target: "replicant_client::raw::http",
                 event = "http.response_decoded",
-                method = %method,
-                path,
-                local_request_id = %request_id,
-                attempt,
+                method = %request.method,
+                path = request.path,
+                local_request_id = %request.request_id,
+                attempt = request.attempt,
                 status = status.as_u16(),
                 response_bytes = bytes.len(),
-                response_body_limit_bytes = response_body_limit,
+                response_body_limit_bytes = request.response_body_limit,
                 request_prepare_ms = prepare_elapsed.as_millis() as u64,
                 time_to_headers_ms = time_to_headers.as_millis() as u64,
                 metadata_ms = metadata_elapsed.as_millis() as u64,
@@ -811,7 +989,52 @@ impl Client {
                 "decoded successful HTTP response"
             );
         }
+        self.record_api_attempt(
+            &request,
+            Some(&metadata),
+            ApiAttemptOutcome::Success,
+            Some(bytes.len()),
+            timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
+        );
         Ok(RawResponse { value, metadata })
+    }
+
+    fn record_api_attempt(
+        &self,
+        request: &RequestAttempt<'_>,
+        metadata: Option<&ResponseMetadata>,
+        outcome: ApiAttemptOutcome,
+        response_bytes: Option<usize>,
+        timings: ApiAttemptTimings,
+    ) {
+        let Some(sink) = self.inner.telemetry.as_ref() else {
+            return;
+        };
+        let route_key = normalize_route_key(request.path);
+        let concrete_path = request.path.split('?').next().unwrap_or(request.path);
+        let stored_path = if route_key.contains("{token}") {
+            route_key.as_str()
+        } else {
+            concrete_path
+        };
+        let rate_limit = metadata
+            .and_then(|metadata| metadata.rate_limit.as_ref())
+            .map_or_else(ApiRateLimitTelemetry::default, rate_limit_telemetry);
+        sink.record(ApiAttemptTelemetry {
+            observed_at_ms: now_unix_millis(),
+            local_request_id: request.request_id.to_string(),
+            server_request_id: metadata.and_then(|metadata| metadata.request_id.clone()),
+            method: request.method.as_str().to_owned(),
+            path: stored_path.to_owned(),
+            route_key,
+            rate_limit_bucket: rate_limit_bucket_label(request.bucket).to_owned(),
+            attempt: request.attempt,
+            status_code: metadata.map(|metadata| metadata.status.as_u16()),
+            outcome,
+            response_bytes: response_bytes.map(|bytes| bytes.try_into().unwrap_or(u64::MAX)),
+            timings,
+            rate_limit,
+        });
     }
 
     fn prepare_request(
@@ -883,6 +1106,30 @@ impl Client {
             local_request_id,
             rate_limit,
         }
+    }
+}
+
+fn rate_limit_bucket_label(bucket: RateLimitBucket) -> &'static str {
+    match bucket {
+        RateLimitBucket::Read => "read",
+        RateLimitBucket::Action => "action",
+        RateLimitBucket::Registration => "registration",
+        RateLimitBucket::Verification => "verification",
+        RateLimitBucket::Feedback => "feedback",
+        RateLimitBucket::StarCatalogue => "star_catalogue",
+        RateLimitBucket::Sse => "sse",
+    }
+}
+
+fn rate_limit_telemetry(snapshot: &RateLimitSnapshot) -> ApiRateLimitTelemetry {
+    ApiRateLimitTelemetry {
+        limit: snapshot.limit,
+        remaining: snapshot.remaining,
+        reset_epoch_seconds: snapshot.reset.map(RateLimitReset::epoch_seconds),
+        retry_after_ms: snapshot
+            .retry_after
+            .map(RetryAfter::delay)
+            .map(duration_millis),
     }
 }
 
@@ -1250,6 +1497,51 @@ mod tests {
         let mut malformed = HeaderMap::new();
         malformed.insert("x-ratelimit-reset", "not-an-epoch".parse().unwrap());
         assert!(parse_rate_limit(&malformed, observed_at).is_none());
+    }
+
+
+    #[tokio::test]
+    async fn telemetry_sink_receives_physical_http_attempts() {
+        use std::sync::Mutex as StdMutex;
+
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
+
+        #[derive(Default)]
+        struct Capture(StdMutex<Vec<ApiAttemptTelemetry>>);
+
+        impl ApiTelemetrySink for Capture {
+            fn record(&self, sample: ApiAttemptTelemetry) {
+                self.0.lock().expect("capture lock").push(sample);
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": "maintenance"
+            })))
+            .mount(&server)
+            .await;
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client");
+
+        let error = client.health().await.expect_err("503 should fail");
+        assert_eq!(error.status(), Some(503));
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].status_code, Some(503));
+        assert_eq!(samples[0].route_key, "v1/health");
+        assert_eq!(samples[0].outcome, ApiAttemptOutcome::HttpError);
+        assert_eq!(samples[0].attempt, 1);
     }
 
     #[test]

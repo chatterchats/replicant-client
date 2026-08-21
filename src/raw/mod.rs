@@ -41,6 +41,7 @@ mod client;
 pub mod common;
 pub mod pagination;
 pub mod rate_limit;
+pub mod telemetry;
 pub mod vocab;
 
 pub mod accounts;
@@ -68,6 +69,10 @@ pub use client::{
     Client, ClientBuilder, ClientConfig, MutableTokenProvider, RawResponse, RequestId,
     RequestSafety, ResponseMetadata, RetryPolicy, SecretString, StatusCode, TlsBackend,
     TokenProvider, Url,
+};
+pub use telemetry::{
+    ApiAttemptOutcome, ApiAttemptTelemetry, ApiAttemptTimings, ApiRateLimitTelemetry,
+    ApiTelemetrySink, normalize_route_key,
 };
 pub use common::{JsonObject, Position};
 

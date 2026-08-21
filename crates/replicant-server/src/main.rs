@@ -8,7 +8,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use replicant_runtime::{config::ManagedClientConfig, config::RuntimeConfig, start_managed_client};
+use replicant_runtime::{
+    config::ManagedClientConfig, config::RuntimeConfig, start_managed_client,
+    telemetry::TelemetryService,
+};
 use replicant_server::{
     AppState, DaemonConfig, router, run_director, run_supervisor, run_trigger_engine,
 };
@@ -63,13 +66,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing::info!(
         managed_database = %config.managed_database.display(),
         runtime_database = %config.runtime_database.display(),
+        telemetry_database = %config.telemetry_database.display(),
         log_directory = %config.log_directory.display(),
         log_filter = %log_filter,
         "replicantd startup configuration resolved"
     );
 
-    let client =
-        start_managed_client(ManagedClientConfig::from_env(&config.managed_database)?).await?;
+    let telemetry = TelemetryService::start(&config.telemetry_database)?;
+    let client = start_managed_client(
+        ManagedClientConfig::from_env(&config.managed_database)?
+            .with_api_telemetry_sink(telemetry.api_sink()),
+    )
+    .await?;
     let repository = Arc::new(WorkflowRepository::open(&config.runtime_database)?);
     let state = AppState::new(
         client.clone(),
@@ -104,6 +112,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     director.await?;
     signal.abort();
     client.close().await?;
+    telemetry.shutdown()?;
     server_result?;
     tracing::info!("replicantd shutdown complete");
     Ok(())

@@ -701,6 +701,7 @@ export interface SettingsSnapshot {
   bind_address: string;
   managed_database_path: string;
   history_database_path: string;
+  telemetry_database_path: string;
   runtime_database_path: string;
   log_filter: string;
   docker: boolean;
@@ -2852,6 +2853,7 @@ export function parseSettingsResponse(
       typeof snapshot.bind_address !== "string" ||
       typeof snapshot.managed_database_path !== "string" ||
       typeof snapshot.history_database_path !== "string" ||
+      typeof snapshot.telemetry_database_path !== "string" ||
       typeof snapshot.runtime_database_path !== "string" ||
       typeof snapshot.log_filter !== "string"
     )
@@ -2862,6 +2864,7 @@ export function parseSettingsResponse(
       bind_address: snapshot.bind_address,
       managed_database_path: snapshot.managed_database_path,
       history_database_path: snapshot.history_database_path,
+      telemetry_database_path: snapshot.telemetry_database_path,
       runtime_database_path: snapshot.runtime_database_path,
       log_filter: snapshot.log_filter,
       docker: boolean(snapshot.docker, "docker environment"),

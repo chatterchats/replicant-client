@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Replicant Telemetry
+    uid: replicant-telemetry
+    type: frser-sqlite-datasource
+    access: proxy
+    isDefault: true
+    editable: false
+    jsonData:
+      path: /var/lib/replicant-telemetry/replicant-telemetry.sqlite

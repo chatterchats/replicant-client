@@ -68,6 +68,9 @@ pub mod orchestration;
 /// Durable shared prerequisites raised by Automation Director goals.
 pub mod director_requirements;
 
+/// Durable application telemetry and Grafana-oriented rollups.
+pub mod telemetry;
+
 /// Declarative desired-state evaluation and fulfillment planning.
 pub mod requirements;
 
@@ -97,13 +100,16 @@ pub mod galaxy_scene;
 pub async fn start_managed_client(
     config: config::ManagedClientConfig,
 ) -> replicant_client::Result<Client> {
-    let (authentication_token, database, startup_policy) = config.into_parts();
-    Client::builder()
+    let (authentication_token, database, startup_policy, api_telemetry_sink) =
+        config.into_parts();
+    let mut builder = Client::builder()
         .authentication_token(authentication_token)
         .sqlite(database)
-        .startup_policy(startup_policy)
-        .start()
-        .await
+        .startup_policy(startup_policy);
+    if let Some(sink) = api_telemetry_sink {
+        builder = builder.api_telemetry_sink(sink);
+    }
+    builder.start().await
 }
 
 /// Shared state owned by the application layer.

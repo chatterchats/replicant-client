@@ -12,6 +12,7 @@ services:
       REPLICANTD_TOKEN: ${REPLICANTD_TOKEN:?set REPLICANTD_TOKEN; the daemon can start workflows and run actions}
       REPLICANT_DB: /var/lib/replicant/replicant-client.sqlite
       REPLICANT_RUNTIME_DB: /var/lib/replicant/replicant-runtime.sqlite
+      REPLICANT_TELEMETRY_DB: /var/lib/replicant/telemetry/replicant-telemetry.sqlite
       REPLICANT_LOG_DIR: /var/lib/replicant/logs
       REPLICANT_PROFILE: ${REPLICANT_PROFILE:-default}
       RS_API_TOKEN: ${RS_API_TOKEN:-}
@@ -77,6 +78,50 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    profiles: ["observability"]
+    environment:
+      GF_PATHS_DATA: /var/lib/grafana
+      GF_PLUGINS_PREINSTALL: frser-sqlite-datasource@4.0.6
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/api-observability.json
+    # Match the daemon's host UID/GID so SQLite WAL shared-memory bookkeeping
+    # can use the live telemetry database without granting Grafana access to
+    # the managed/runtime/history database directory.
+    user: "${REPLICANT_UID:-1000}:${REPLICANT_GID:-1000}"
+    depends_on:
+      replicantd:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${REPLICANT_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - type: bind
+        source: ${REPLICANT_DATA_DIR:-${HOME}/.local/share/replicant}/grafana
+        target: /var/lib/grafana
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPLICANT_DATA_DIR:-${HOME}/.local/share/replicant}/telemetry
+        target: /var/lib/replicant-telemetry
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./deploy/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+      - type: bind
+        source: ./deploy/grafana/dashboards
+        target: /etc/grafana/dashboards
+        read_only: true
+    networks:
+      - app
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
 

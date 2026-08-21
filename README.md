@@ -186,10 +186,12 @@ notes.
 
 The managed SQLite database stores account binding, normalized current projections,
 simulation realms, the applied event cursor, reconciliation work, and durable
-operation outcomes. Long-lived account event/telemetry history is stored in a
-sibling history database (`replicant-history.sqlite` for the default managed
-path). API tokens are never persisted. Treat the managed and history files as
-one backup set per account and close the client before copying or removing them.
+operation outcomes. Long-lived account event history is stored in a sibling
+history database (`replicant-history.sqlite` for the default managed path), while
+API observability samples and time-series rollups are isolated in
+`replicant-telemetry.sqlite`. API tokens are never persisted. Treat managed,
+history, runtime, and telemetry state as one dated backup set when operating the
+full application, and close the client/daemon before copying or removing them.
 Replicant star-census observations are normalized into the account-shared `stars`
 projection; Replicant-relative distance/travel estimates are not persisted.
 

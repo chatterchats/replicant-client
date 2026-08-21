@@ -1,8 +1,9 @@
 # Docker deployment
 
 The production Compose stack runs a non-root `replicantd` container and a
-non-root nginx container serving the React application. Only the web port is
-published. The daemon reaches Replicant Space over outbound HTTPS/SSE; no
+non-root nginx container serving the React application. An optional Grafana
+profile provides local observability dashboards. Only the web port is
+published by the default profile. The daemon reaches Replicant Space over outbound HTTPS/SSE; no
 inbound webhook or SSE port is required.
 
 ## Prerequisites and first start
@@ -54,6 +55,65 @@ to `warn`. HTTP request timing is emitted by `replicant_server` at `debug`
 (with failures promoted to `warn`/`error`). For deeper investigation,
 temporarily use the debug profile shown in `.env.example`.
 
+
+## Optional Grafana observability
+
+`replicantd` records one best-effort telemetry sample for every physical
+Replicant Space HTTP attempt, including retries and failed responses. Samples
+include the exact HTTP status, normalized route, request attempt number,
+response size, total latency, time to response headers, local rate-limit wait,
+server rate-limit metadata, and local/server request IDs when available. The
+writer uses a bounded in-process queue; telemetry pressure can drop samples but
+cannot block or fail a game API operation.
+
+Telemetry is stored separately from managed and workflow state. High-resolution
+rows are retained on this schedule:
+
+| Age / tier | Retained resolution |
+| ---------- | ------------------- |
+| 0–7 days   | raw attempts + 1 minute |
+| 8–30 days  | 10 minute |
+| 31–90 days | 1 hour |
+| >90 days   | 1 day |
+
+All rollup tiers are maintained continuously, so aging is deletion rather than
+a large compaction job. Rollups preserve exact response codes and cumulative
+latency histogram buckets, allowing long-range response-code timelines and
+approximate p50/p95/p99 latency without retaining individual requests forever.
+Maintenance runs every six hours. `REPLICANT_TELEMETRY_DB` overrides the native
+telemetry database path; otherwise it is a sibling of the managed database.
+
+Start the optional Grafana profile with:
+
+```sh
+make observability-up
+```
+
+Then open `http://127.0.0.1:3000` (or `REPLICANT_GRAFANA_PORT`). Grafana starts
+with the SQLite datasource plugin and a provisioned **Replicant Space / API
+Observability** dashboard. It includes request volume, stacked response classes,
+an exact HTTP-response-code timeline, retries, 429s, p50/p95/p99 latency,
+rate-limit wait versus upstream header latency, top routes, and recent failed
+raw requests.
+
+Grafana is intentionally only given the `telemetry/` directory plus its own
+`grafana/` data directory. It cannot see the managed, runtime, or history
+SQLite files. The telemetry datasource is configured query-only with SQLite
+`ATTACH` disabled. Grafana runs with the same configured host UID/GID as the
+daemon so SQLite can create/read WAL shared-memory files in the live telemetry
+directory. The Grafana port is bound to loopback only.
+
+The checked-in dashboard is provisioned and reproducible. Grafana's own data
+directory is persistent as well, so separately created dashboards/settings can
+survive container recreation. Stop only the companion UI with:
+
+```sh
+make observability-down
+```
+
+Stopping Grafana does not stop telemetry collection; the daemon continues
+building the database and rollups for later inspection.
+
 ## Secrets
 
 The simple setup reads `RS_API_TOKEN` from the ignored `.env` file. For a
@@ -80,6 +140,10 @@ The host directory `${HOME}/.local/share/replicant` is mounted at
   raw AMI telemetry (30-day raw digest retention);
 - `replicant-runtime.sqlite` plus SQLite WAL files: workflows, checkpoints,
   claims, triggers, schedules, and activity;
+- `telemetry/replicant-telemetry.sqlite` plus SQLite WAL files: per-attempt API
+  observability and mergeable time-series rollups;
+- `grafana/`: Grafana's own persistent state when the optional observability
+  profile is used;
 - `logs/replicantd.log`: persistent structured daemon/runtime/workflow logs.
 
 Override the host path with `REPLICANT_DATA_DIR`. It must exist and be writable
@@ -127,7 +191,7 @@ tar -C "${REPLICANT_DATA_DIR:-$HOME/.local/share/replicant}" \
 docker compose start replicantd
 ```
 
-Keep all three SQLite databases in the same dated backup. Restore into a new
+Keep all four SQLite databases in the same dated backup. Grafana state is optional but can be backed up alongside them. Restore into a new
 directory so the failed data remains recoverable:
 
 ```sh

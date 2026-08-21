@@ -18,6 +18,7 @@ replicant-printing = { version = "0.1.0", path = "../replicant-printing", featur
 replicant-route-planner = { version = "0.1.0", path = "../replicant-route-planner" }
 replicant-transport = { version = "0.1.0", path = "../replicant-transport" }
 replicant-workflow = { version = "0.1.0", path = "../replicant-workflow" }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

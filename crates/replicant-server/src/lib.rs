@@ -148,6 +148,8 @@ pub struct DaemonConfig {
     pub managed_database: PathBuf,
     /// Workflow/runtime SQLite database.
     pub runtime_database: PathBuf,
+    /// Isolated API/runtime telemetry SQLite database.
+    pub telemetry_database: PathBuf,
     /// Directory containing persistent daemon log files.
     pub log_directory: PathBuf,
     /// Local HTTP listen address.
@@ -170,6 +172,11 @@ impl DaemonConfig {
         let runtime_database = env::var_os("REPLICANT_RUNTIME_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("replicant-runtime.sqlite"));
+        let telemetry_database = env::var_os("REPLICANT_TELEMETRY_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                replicant_runtime::telemetry::default_telemetry_database_path(&managed_database)
+            });
         let log_directory = env::var_os("REPLICANT_LOG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| default_log_directory(&runtime_database));
@@ -185,6 +192,7 @@ impl DaemonConfig {
             profile,
             managed_database,
             runtime_database,
+            telemetry_database,
             log_directory,
             bind,
             token,
@@ -3546,6 +3554,7 @@ async fn settings(
         )
         .display()
         .to_string(),
+        telemetry_database_path: state.daemon.telemetry_database.display().to_string(),
         runtime_database_path: state.daemon.runtime_database.display().to_string(),
         log_filter: config::log_filter_directive(),
         docker: config::docker_environment_detected(),
@@ -5900,6 +5909,7 @@ mod tests {
             profile: "test".to_owned(),
             managed_database: PathBuf::from("replicant-client.sqlite"),
             runtime_database: PathBuf::from("replicant-runtime.sqlite"),
+            telemetry_database: PathBuf::from("replicant-telemetry.sqlite"),
             log_directory: PathBuf::from("logs"),
             bind: DEFAULT_BIND.parse().expect("default bind address"),
             token: None,
@@ -6915,6 +6925,7 @@ mod tests {
         assert_eq!(payload["profile"], "test");
         assert!(payload["managed_database_path"].is_string());
         assert!(payload["history_database_path"].is_string());
+        assert!(payload["telemetry_database_path"].is_string());
         assert!(payload["runtime_database_path"].is_string());
         assert!(payload["bind_address"].is_string());
         assert!(payload["log_filter"].is_string());

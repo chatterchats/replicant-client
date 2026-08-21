@@ -5,9 +5,10 @@ use std::{
     error::Error as StdError,
     fmt, fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use replicant_client::{SecretString, StartupPolicy};
+use replicant_client::{SecretString, StartupPolicy, raw::ApiTelemetrySink};
 use replicant_protocol::ApiTokenSource;
 
 /// Environment variable containing the Replicant Space API token.
@@ -65,6 +66,7 @@ pub struct ManagedClientConfig {
     authentication_token: SecretString,
     database: PathBuf,
     startup_policy: StartupPolicy,
+    api_telemetry_sink: Option<Arc<dyn ApiTelemetrySink>>,
 }
 
 impl ManagedClientConfig {
@@ -105,6 +107,7 @@ impl ManagedClientConfig {
             authentication_token: SecretString::from(authentication_token),
             database: database.into(),
             startup_policy: StartupPolicy::Essential,
+            api_telemetry_sink: None,
         })
     }
 
@@ -112,6 +115,13 @@ impl ManagedClientConfig {
     #[must_use]
     pub fn with_startup_policy(mut self, startup_policy: StartupPolicy) -> Self {
         self.startup_policy = startup_policy;
+        self
+    }
+
+    /// Installs a non-blocking destination for per-attempt API telemetry.
+    #[must_use]
+    pub fn with_api_telemetry_sink(mut self, sink: Arc<dyn ApiTelemetrySink>) -> Self {
+        self.api_telemetry_sink = Some(sink);
         self
     }
 
@@ -127,11 +137,19 @@ impl ManagedClientConfig {
         self.startup_policy
     }
 
-    pub(crate) fn into_parts(self) -> (SecretString, PathBuf, StartupPolicy) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SecretString,
+        PathBuf,
+        StartupPolicy,
+        Option<Arc<dyn ApiTelemetrySink>>,
+    ) {
         (
             self.authentication_token,
             self.database,
             self.startup_policy,
+            self.api_telemetry_sink,
         )
     }
 }
@@ -143,6 +161,7 @@ impl fmt::Debug for ManagedClientConfig {
             .field("authentication_token", &"<redacted>")
             .field("database", &self.database)
             .field("startup_policy", &self.startup_policy)
+            .field("api_telemetry", &self.api_telemetry_sink.is_some())
             .finish()
     }
 }

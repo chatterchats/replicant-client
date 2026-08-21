@@ -22,7 +22,10 @@ use tracing::{debug, info, warn};
 use crate::raw::rate_limit::{RateLimitBucket, RateLimitCoordinator, RateLimitPolicy};
 use crate::{
     AccountId, Error, Result,
-    raw::{Client as RawClient, ClientBuilder as RawClientBuilder, SecretString, TlsBackend, Url},
+    raw::{
+        ApiTelemetrySink, Client as RawClient, ClientBuilder as RawClientBuilder, SecretString,
+        TlsBackend, Url,
+    },
 };
 
 use super::{
@@ -430,6 +433,13 @@ impl ClientBuilder {
     #[must_use]
     pub fn tracing(mut self, enabled: bool) -> Self {
         self.raw = self.raw.emit_tracing(enabled);
+        self
+    }
+
+    /// Installs a best-effort per-attempt HTTP telemetry sink.
+    #[must_use]
+    pub fn api_telemetry_sink(mut self, sink: Arc<dyn ApiTelemetrySink>) -> Self {
+        self.raw = self.raw.api_telemetry_sink(sink);
         self
     }
 
