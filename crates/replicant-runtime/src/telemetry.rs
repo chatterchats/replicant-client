@@ -158,7 +158,7 @@ struct ChannelApiTelemetrySink {
 
 impl ApiTelemetrySink for ChannelApiTelemetrySink {
     fn record(&self, sample: ApiAttemptTelemetry) {
-        match self.sender.try_send(TelemetryMessage::Api(sample)) {
+        match self.sender.try_send(TelemetryMessage::Api(Box::new(sample))) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -168,7 +168,7 @@ impl ApiTelemetrySink for ChannelApiTelemetrySink {
 }
 
 enum TelemetryMessage {
-    Api(ApiAttemptTelemetry),
+    Api(Box<ApiAttemptTelemetry>),
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -200,11 +200,13 @@ impl TelemetryService {
             std::fs::create_dir_all(parent)?;
         }
         let connection = open_database(&path)?;
-        let initial_dropped = connection.query_row(
-            "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key = 'dropped_samples'), 0)",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
+        let initial_dropped = connection
+            .query_row(
+                "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key = 'dropped_samples'), 0)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| u64::try_from(value).unwrap_or_default())?;
         drop(connection);
 
         let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -286,7 +288,7 @@ fn writer_main(path: &Path, receiver: Receiver<TelemetryMessage>, dropped: Arc<A
 
     loop {
         match receiver.recv_timeout(BATCH_WAIT) {
-            Ok(TelemetryMessage::Api(sample)) => pending.push(sample),
+            Ok(TelemetryMessage::Api(sample)) => pending.push(*sample),
             Ok(TelemetryMessage::Shutdown(ack)) => {
                 flush_batch(&mut connection, &mut pending, dropped.load(Ordering::Relaxed));
                 run_maintenance(&connection, now_millis(), dropped.load(Ordering::Relaxed));
@@ -323,7 +325,7 @@ fn drain_pending(
 ) -> Option<mpsc::Sender<()>> {
     while pending.len() < BATCH_LIMIT {
         match receiver.try_recv() {
-            Ok(TelemetryMessage::Api(sample)) => pending.push(sample),
+            Ok(TelemetryMessage::Api(sample)) => pending.push(*sample),
             Ok(TelemetryMessage::Shutdown(ack)) => return Some(ack),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
@@ -389,18 +391,18 @@ fn insert_api_sample(transaction: &Transaction<'_>, sample: &ApiAttemptTelemetry
             sample.attempt,
             sample.status_code,
             sample.outcome.as_str(),
-            sample.response_bytes,
-            sample.timings.rate_limit_wait_ms,
-            sample.timings.request_prepare_ms,
-            sample.timings.time_to_headers_ms,
-            sample.timings.metadata_ms,
-            sample.timings.body_read_ms,
-            sample.timings.decode_ms,
-            sample.timings.elapsed_ms,
+            sqlite_optional_u64(sample.response_bytes),
+            sqlite_u64(sample.timings.rate_limit_wait_ms),
+            sqlite_optional_u64(sample.timings.request_prepare_ms),
+            sqlite_optional_u64(sample.timings.time_to_headers_ms),
+            sqlite_optional_u64(sample.timings.metadata_ms),
+            sqlite_optional_u64(sample.timings.body_read_ms),
+            sqlite_optional_u64(sample.timings.decode_ms),
+            sqlite_u64(sample.timings.elapsed_ms),
             sample.rate_limit.limit,
             sample.rate_limit.remaining,
-            sample.rate_limit.reset_epoch_seconds,
-            sample.rate_limit.retry_after_ms,
+            sqlite_optional_u64(sample.rate_limit.reset_epoch_seconds),
+            sqlite_optional_u64(sample.rate_limit.retry_after_ms),
         ],
     )?;
 
@@ -417,9 +419,10 @@ fn upsert_rollup(
 ) -> rusqlite::Result<()> {
     let resolution_ms = resolution_seconds.saturating_mul(1_000);
     let bucket_start_ms = sample.observed_at_ms.div_euclid(resolution_ms) * resolution_ms;
-    let elapsed = sample.timings.elapsed_ms;
-    let headers = sample.timings.time_to_headers_ms.unwrap_or_default();
-    let response_bytes = sample.response_bytes.unwrap_or_default();
+    let elapsed = sqlite_u64(sample.timings.elapsed_ms);
+    let headers = sqlite_u64(sample.timings.time_to_headers_ms.unwrap_or_default());
+    let response_bytes = sqlite_u64(sample.response_bytes.unwrap_or_default());
+    let rate_limit_wait = sqlite_u64(sample.timings.rate_limit_wait_ms);
     let status_code = sample.status_code.map(i64::from).unwrap_or(-1);
     transaction.execute(
         "INSERT INTO api_request_rollup(\
@@ -471,7 +474,7 @@ fn upsert_rollup(
             elapsed,
             headers,
             if sample.timings.time_to_headers_ms.is_some() { 1_i64 } else { 0_i64 },
-            sample.timings.rate_limit_wait_ms,
+            rate_limit_wait,
             response_bytes,
             if sample.response_bytes.is_some() { 1_i64 } else { 0_i64 },
             if elapsed <= 25 { 1_i64 } else { 0_i64 },
@@ -536,6 +539,14 @@ fn update_health(connection: &Connection, dropped: u64) {
     ) {
         tracing::warn!(error = %error, "telemetry health update failed");
     }
+}
+
+fn sqlite_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn sqlite_optional_u64(value: Option<u64>) -> Option<i64> {
+    value.map(sqlite_u64)
 }
 
 fn now_millis() -> i64 {
