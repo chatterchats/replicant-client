@@ -463,6 +463,11 @@ pub struct RelayExecutionState {
     planned_transport_capacity: i64,
     #[serde(default)]
     supply: Option<RelaySupplyPlan>,
+    /// Dedicated attachment carrier used for modular Deep Space Relay Stations.
+    /// DSRs cannot be stowed in the deployment vessel; they remain attached to
+    /// this carrier until the carrier and deployment replicant reach the target.
+    #[serde(default)]
+    dsr_carrier_code: Option<String>,
     returned_to_hub: bool,
 }
 
@@ -554,6 +559,7 @@ impl RelayExecutionState {
                     .iter()
                     .flat_map(|supply| supply.carriers.iter().map(|carrier| carrier.code.as_str())),
             )
+            .chain(self.dsr_carrier_code.iter().map(String::as_str))
             .collect();
         let factories = self
             .print_jobs
@@ -1218,6 +1224,33 @@ async fn create_plan(
         }
     }
 
+    let dsr_required = stops.iter().any(stop_requires_attachment_carrier);
+    let dsr_carrier_code = if dsr_required {
+        Some(
+            census
+                .supply_carriers
+                .first()
+                .map(|carrier| carrier.code.clone())
+                .ok_or_else(|| {
+                    app_error(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "Deep Space Relay Station deployment from {} requires an idle attachment carrier in system {}",
+                            config.hub, start_system
+                        ),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let ordinary_supply_carriers = census
+        .supply_carriers
+        .iter()
+        .filter(|carrier| dsr_carrier_code.as_deref() != Some(carrier.code.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
     let vessel = client.devices().get(vessel_code).await?.snapshot().await?;
     let free_slots = vessel
         .stow_capacity
@@ -1227,26 +1260,22 @@ async fn create_plan(
         .iter()
         .filter(|code| {
             census.devices.get(*code).is_some_and(|device| {
-                device
-                    .relationships
-                    .stowed_in
-                    .as_ref()
-                    .is_some_and(|container| container.id.as_str() == vessel_code)
+                device_type(device) != Some(DEEP_SPACE_RELAY)
+                    && device
+                        .relationships
+                        .stowed_in
+                        .as_ref()
+                        .is_some_and(|container| container.id.as_str() == vessel_code)
             })
         })
         .count();
     let transport_capacity = free_slots.saturating_add(i64::try_from(already_stowed)?);
-    let transport_required = i64::try_from(
-        stops
-            .iter()
-            .filter(|stop| stop.action == StopAction::DeployAndActivate)
-            .count(),
-    )?;
+    let transport_required = i64::try_from(stops.iter().filter(|stop| stop_uses_vessel_stow(stop)).count())?;
     if transport_required > 0 && transport_capacity <= 0 {
         return Err(app_error(
             io::ErrorKind::Other,
             format!(
-                "vessel {vessel_code} has no usable stow capacity for the {transport_required} mission relay(s)"
+                "vessel {vessel_code} has no usable stow capacity for the {transport_required} ordinary mission relay(s)"
             ),
         ));
     }
@@ -1256,7 +1285,7 @@ async fn create_plan(
             config.supply_strategy,
             &stops,
             usize::try_from(transport_capacity)?,
-            &census.supply_carriers,
+            &ordinary_supply_carriers,
         )?;
         if let Some(supply) = &supply {
             info!(
@@ -1307,6 +1336,7 @@ async fn create_plan(
         print_jobs,
         planned_transport_capacity: transport_capacity,
         supply,
+        dsr_carrier_code,
         returned_to_hub: false,
     })
 }
@@ -1504,6 +1534,14 @@ fn validate_ignored_printers(
     ))
 }
 
+fn stop_requires_attachment_carrier(stop: &RelayStop) -> bool {
+    stop.action == StopAction::DeployAndActivate && stop.device_type == DEEP_SPACE_RELAY
+}
+
+fn stop_uses_vessel_stow(stop: &RelayStop) -> bool {
+    stop.action == StopAction::DeployAndActivate && !stop_requires_attachment_carrier(stop)
+}
+
 fn deployment_batches(
     stops: &[RelayStop],
     transport_capacity: usize,
@@ -1514,7 +1552,7 @@ fn deployment_batches(
     let deploy_indices = stops
         .iter()
         .enumerate()
-        .filter_map(|(index, stop)| (stop.action == StopAction::DeployAndActivate).then_some(index))
+        .filter_map(|(index, stop)| stop_uses_vessel_stow(stop).then_some(index))
         .collect::<Vec<_>>();
     let initial = deploy_indices
         .iter()
@@ -1861,7 +1899,9 @@ async fn refresh_device_census(
                 && (device.relationships.stowed_in.is_none() || stowed_in_transport)
                 && device.relationships.attached_to.is_none()
                 && !relay_device_active(device)
-                && (stowed_in_transport || device_has_command(device, "stow"))
+                && (kind == Some(DEEP_SPACE_RELAY)
+                    || stowed_in_transport
+                    || device_has_command(device, "stow"))
             {
                 if kind == Some(DEEP_SPACE_RELAY) {
                     hub_stock_dsr.push(code.clone());
@@ -2772,8 +2812,12 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         }
         if device_status(&snapshot) == Some(RELAYING) && correctly_placed {
             let network = handle.network().await?;
+            let upstream = expected_upstream_systems(plan, index);
             plan.stops[index].completed = network.connections.iter().any(|connection| {
-                connection.star.as_deref() == Some(plan.stops[index].parent_system.as_str())
+                connection
+                    .star
+                    .as_deref()
+                    .is_some_and(|system| upstream.contains(system))
             });
         }
     }
@@ -2790,13 +2834,25 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         .supply
         .as_ref()
         .is_none_or(|supply| supply.carriers.iter().all(|carrier| carrier.returned_home));
+    let dsr_carrier_home = if let Some(code) = plan.dsr_carrier_code.as_deref() {
+        match client.devices().get(code).await {
+            Ok(handle) => match handle.snapshot().await {
+                Ok(carrier) => device_at(&carrier, &plan.hub_location),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    } else {
+        true
+    };
     plan.returned_to_hub = plan.stops.iter().all(|stop| stop.completed)
         && replicant.travel.is_none()
         && replicant
             .location
             .as_ref()
             .is_some_and(|location| location.id.as_str() == plan.hub_location.as_str())
-        && supply_home;
+        && supply_home
+        && dsr_carrier_home;
     Ok(())
 }
 
@@ -2808,7 +2864,7 @@ fn next_trip_stop_indices(stops: &[RelayStop], transport_capacity: usize) -> Vec
         if stop.completed {
             continue;
         }
-        if stop.action == StopAction::DeployAndActivate {
+        if stop_uses_vessel_stow(stop) {
             if deploy_count >= transport_capacity {
                 break;
             }
@@ -2850,7 +2906,7 @@ async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyR
     let mission_codes = plan
         .stops
         .iter()
-        .filter(|stop| stop.action == StopAction::DeployAndActivate && !stop.completed)
+        .filter(|stop| stop_uses_vessel_stow(stop) && !stop.completed)
         .filter_map(|stop| stop.relay_code.as_deref())
         .collect::<BTreeSet<_>>();
     for code in mission_codes {
@@ -3036,6 +3092,318 @@ async fn release_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) 
         ensure_operation_accepted(&operation).await?;
     }
     Ok(())
+}
+
+
+fn plan_has_pending_dsr(plan: &MissionPlan) -> bool {
+    plan.stops
+        .iter()
+        .any(|stop| stop_requires_attachment_carrier(stop) && !stop.completed)
+}
+
+async fn ensure_dsr_carrier_assignment(
+    client: &Client,
+    config: &Config,
+    plan: &mut MissionPlan,
+) -> AnyResult<()> {
+    if !plan_has_pending_dsr(plan) {
+        return Ok(());
+    }
+    if let Some(code) = plan.dsr_carrier_code.clone() {
+        ensure_carrier_claim(client, plan, &code).await?;
+        return Ok(());
+    }
+
+    let mission_tag = relay_mission_tag(&plan.mission_id);
+    let supply_codes = plan
+        .supply
+        .iter()
+        .flat_map(|supply| supply.carriers.iter().map(|carrier| carrier.code.clone()))
+        .collect::<BTreeSet<_>>();
+    let handles = client.devices().find().owned().collect().await?;
+    let mut candidates = Vec::<(i64, String)>::new();
+    for handle in handles {
+        let code = handle.id().as_str();
+        if code == plan.vessel_code.as_str() || supply_codes.contains(code) {
+            continue;
+        }
+        let snapshot = handle.snapshot().await?;
+        let conflicting = snapshot.tags.iter().any(|tag| {
+            tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str())
+        });
+        if conflicting
+            || snapshot.attach_capacity.unwrap_or(0) <= 0
+            || snapshot.travel.is_some()
+            || snapshot.relationships.attached_to.is_some()
+            || snapshot.relationships.stowed_in.is_some()
+            || snapshot.relationships.controller.is_some()
+            || snapshot.relationships.hosting_replicant.is_some()
+            || !snapshot.relationships.attached_devices.is_empty()
+            || !device_has_command(&snapshot, "attach")
+            || !device_has_command(&snapshot, "travel")
+            || !device_location(&snapshot)
+                .is_some_and(|location| designation_in_system(location, &plan.start_system))
+        {
+            continue;
+        }
+        candidates.push((snapshot.attach_capacity.unwrap_or(0), code.to_owned()));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let Some((capacity, code)) = candidates.into_iter().next() else {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "Deep Space Relay Station deployment from {} requires an idle attachment carrier in system {}",
+                plan.hub_location, plan.start_system
+            ),
+        ));
+    };
+
+    plan.dsr_carrier_code = Some(code.clone());
+    ensure_carrier_claim(client, plan, &code).await?;
+    save_plan(&config.plan_path, plan)?;
+    info!(
+        carrier = %code,
+        attach_capacity = capacity,
+        hub = %plan.hub_location,
+        "assigned dedicated attachment carrier for Deep Space Relay Station deployment"
+    );
+    Ok(())
+}
+
+async fn ensure_dsr_carrier_at_hub(
+    client: &Client,
+    config: &Config,
+    plan: &MissionPlan,
+    carrier_code: &str,
+) -> AnyResult<()> {
+    let carrier = client.devices().get(carrier_code).await?.snapshot().await?;
+    if device_at(&carrier, &plan.hub_location) {
+        return Ok(());
+    }
+    if carrier.travel.is_some()
+        && travel_destination(&carrier) != Some(plan.hub_location.as_str())
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "DSR carrier {carrier_code} is travelling to {:?}, not hub {}",
+                travel_destination(&carrier),
+                plan.hub_location
+            ),
+        ));
+    }
+    start_device_travel(client, carrier_code, &plan.hub_location).await?;
+    wait_device_at_location(client, config, carrier_code, &plan.hub_location).await
+}
+
+async fn ensure_dsr_carrier_dispatched(
+    client: &Client,
+    config: &Config,
+    plan: &mut MissionPlan,
+    index: usize,
+) -> AnyResult<String> {
+    ensure_dsr_carrier_assignment(client, config, plan).await?;
+    let carrier_code = plan.dsr_carrier_code.clone().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            "Deep Space Relay Station stop has no assigned attachment carrier",
+        )
+    })?;
+    let stop = plan.stops[index].clone();
+    let relay_code = stop.relay_code.as_deref().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("stop {} has no assigned Deep Space Relay Station", stop.system),
+        )
+    })?;
+
+    transfer_trip_relays(client, config, plan, &[index]).await?;
+    ensure_carrier_claim(client, plan, &carrier_code).await?;
+
+    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    if relay.relationships.attached_to.is_none()
+        && relay.relationships.stowed_in.is_none()
+        && device_location(&relay)
+            .is_some_and(|location| designation_in_system(location, &stop.system))
+    {
+        return Ok(carrier_code);
+    }
+    if let Some(container) = relay.relationships.stowed_in.as_ref() {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Deep Space Relay Station {relay_code} is stowed in {}; DSRs must be transported attached to carrier {carrier_code}",
+                container.id.as_str()
+            ),
+        ));
+    }
+    if let Some(attached_to) = relay.relationships.attached_to.as_ref() {
+        if attached_to.id.as_str() != carrier_code {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Deep Space Relay Station {relay_code} is attached to {}, not planned carrier {carrier_code}",
+                    attached_to.id.as_str()
+                ),
+            ));
+        }
+        let carrier = client.devices().get(&carrier_code).await?.snapshot().await?;
+        if device_at(&carrier, &stop.location)
+            || (carrier.travel.is_some()
+                && travel_destination(&carrier) == Some(stop.location.as_str()))
+        {
+            return Ok(carrier_code);
+        }
+        if !device_at(&carrier, &plan.hub_location) {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DSR carrier {carrier_code} is at {:?} with {relay_code} attached; expected hub {} or destination {}",
+                    device_location(&carrier),
+                    plan.hub_location,
+                    stop.location
+                ),
+            ));
+        }
+        start_device_travel(client, &carrier_code, &stop.location).await?;
+        return Ok(carrier_code);
+    }
+
+    if device_location(&relay) != Some(plan.hub_location.as_str()) {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Deep Space Relay Station {relay_code} is at {:?}; expected hub {} before carrier loading",
+                device_location(&relay),
+                plan.hub_location
+            ),
+        ));
+    }
+
+    ensure_dsr_carrier_at_hub(client, config, plan, &carrier_code).await?;
+    ensure_relay_attachable(client, config, relay_code).await?;
+    let carrier = client.devices().get(&carrier_code).await?;
+    let snapshot = carrier.snapshot().await?;
+    if snapshot.attach_capacity.unwrap_or(0) <= 0 {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("DSR carrier {carrier_code} has no attachment capacity"),
+        ));
+    }
+    let operation = carrier
+        .attach(raw::devices::TargetsCommand {
+            device: Some(relay_code.to_owned()),
+            devices: None,
+            target: None,
+            targets: None,
+        })
+        .await?;
+    ensure_operation_accepted(&operation).await?;
+    wait_for_device(client, config, relay_code, |device| {
+        device
+            .relationships
+            .attached_to
+            .as_ref()
+            .is_some_and(|attached_to| attached_to.id.as_str() == carrier_code)
+    })
+    .await?;
+    info!(
+        relay = %relay_code,
+        carrier = %carrier_code,
+        destination = %stop.location,
+        "loaded Deep Space Relay Station onto attachment carrier"
+    );
+    start_device_travel(client, &carrier_code, &stop.location).await?;
+    Ok(carrier_code)
+}
+
+async fn detach_dsr_at_stop(
+    client: &Client,
+    config: &Config,
+    stop: &RelayStop,
+    relay_code: &str,
+    carrier_code: &str,
+) -> AnyResult<()> {
+    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    if relay.relationships.attached_to.is_none()
+        && relay.relationships.stowed_in.is_none()
+        && device_location(&relay)
+            .is_some_and(|location| designation_in_system(location, &stop.system))
+    {
+        return Ok(());
+    }
+    wait_device_at_location(client, config, carrier_code, &stop.location).await?;
+    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    if relay
+        .relationships
+        .attached_to
+        .as_ref()
+        .is_none_or(|carrier| carrier.id.as_str() != carrier_code)
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Deep Space Relay Station {relay_code} is not attached to carrier {carrier_code} at {}",
+                stop.location
+            ),
+        ));
+    }
+    let operation = client
+        .devices()
+        .get(carrier_code)
+        .await?
+        .command(raw::devices::DeviceCommand::Detach(
+            raw::devices::TargetsCommand {
+                device: Some(relay_code.to_owned()),
+                devices: None,
+                target: None,
+                targets: None,
+            },
+        ))
+        .await?;
+    ensure_operation_accepted(&operation).await?;
+    wait_for_device(client, config, relay_code, |device| {
+        device.relationships.attached_to.is_none()
+            && device.relationships.stowed_in.is_none()
+            && device_location(device)
+                .is_some_and(|location| designation_in_system(location, &stop.system))
+    })
+    .await?;
+    Ok(())
+}
+
+async fn send_dsr_carrier_home(
+    client: &Client,
+    plan: &MissionPlan,
+    carrier_code: &str,
+) -> AnyResult<()> {
+    match start_device_travel(client, carrier_code, &plan.hub_location).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_out_of_comms_error(&error) => {
+            warn!(
+                carrier = %carrier_code,
+                hub = %plan.hub_location,
+                error = %error,
+                "DSR carrier return command is temporarily out of comms; final reconciliation will retry"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn finish_dsr_carrier(
+    client: &Client,
+    config: &Config,
+    plan: &MissionPlan,
+) -> AnyResult<()> {
+    let Some(carrier_code) = plan.dsr_carrier_code.as_deref() else {
+        return Ok(());
+    };
+    start_device_travel(client, carrier_code, &plan.hub_location).await?;
+    wait_device_at_location(client, config, carrier_code, &plan.hub_location).await?;
+    release_carrier_claim(client, plan, carrier_code).await
 }
 
 fn device_at(device: &Device, destination: &str) -> bool {
@@ -3681,7 +4049,7 @@ async fn stow_restock_payload(
     let mut to_stow = Vec::new();
     let mut already_stowed = 0usize;
     for index in &restock.relay_stop_indices {
-        if plan.stops[*index].completed {
+        if plan.stops[*index].completed || stop_requires_attachment_carrier(&plan.stops[*index]) {
             continue;
         }
         let code = plan.stops[*index].relay_code.as_deref().ok_or_else(|| {
@@ -3957,6 +4325,7 @@ async fn execute_carrier_supply_plan(
 
     travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
     finish_supply_carriers(client, config, plan).await?;
+    finish_dsr_carrier(client, config, plan).await?;
     plan.returned_to_hub = true;
     save_plan(&config.plan_path, plan)?;
     info!(
@@ -3968,6 +4337,7 @@ async fn execute_carrier_supply_plan(
 }
 
 async fn execute_plan(client: &Client, config: &Config, plan: &mut MissionPlan) -> AnyResult<()> {
+    ensure_dsr_carrier_assignment(client, config, plan).await?;
     if plan.supply.is_some() {
         execute_carrier_supply_plan(client, config, plan).await
     } else {
@@ -4006,7 +4376,7 @@ async fn execute_hub_return_plan(
         let pending_deploys = plan
             .stops
             .iter()
-            .filter(|stop| stop.action == StopAction::DeployAndActivate && !stop.completed)
+            .filter(|stop| stop_uses_vessel_stow(stop) && !stop.completed)
             .count();
         if pending_deploys > 0 && transport_capacity == 0 {
             return Err(app_error(
@@ -4069,6 +4439,7 @@ async fn execute_hub_return_plan(
     }
 
     travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
+    finish_dsr_carrier(client, config, plan).await?;
     plan.returned_to_hub = true;
     save_plan(&config.plan_path, plan)?;
     info!(
@@ -4350,7 +4721,7 @@ async fn stow_trip_relays(
     let mut to_stow = Vec::new();
     for index in indices {
         let stop = &plan.stops[*index];
-        if stop.completed || stop.action != StopAction::DeployAndActivate {
+        if stop.completed || !stop_uses_vessel_stow(stop) {
             continue;
         }
         let code = stop.relay_code.as_deref().ok_or_else(|| {
@@ -4464,24 +4835,34 @@ async fn execute_stop(
             format!("stop {} has no assigned relay", stop.system),
         )
     })?;
+    let dsr_carrier = if stop_requires_attachment_carrier(&stop) {
+        Some(ensure_dsr_carrier_dispatched(client, config, plan, index).await?)
+    } else {
+        None
+    };
+
     travel_to(client, config, &plan.replicant_code, &stop.location).await?;
-    let relay = client.devices().get(relay_code).await?;
-    let snapshot = relay.snapshot().await?;
-    if stop.action == StopAction::DeployAndActivate && snapshot.relationships.stowed_in.is_some() {
-        if !device_has_command(&snapshot, "deploy") {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!("relay {relay_code} does not currently advertise deploy"),
-            ));
+    if let Some(carrier_code) = dsr_carrier.as_deref() {
+        detach_dsr_at_stop(client, config, &stop, relay_code, carrier_code).await?;
+    } else {
+        let relay = client.devices().get(relay_code).await?;
+        let snapshot = relay.snapshot().await?;
+        if stop.action == StopAction::DeployAndActivate && snapshot.relationships.stowed_in.is_some() {
+            if !device_has_command(&snapshot, "deploy") {
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    format!("relay {relay_code} does not currently advertise deploy"),
+                ));
+            }
+            let operation = relay.deploy().await?;
+            ensure_operation_accepted(&operation).await?;
+            wait_for_device(client, config, relay_code, |device| {
+                device.relationships.stowed_in.is_none()
+                    && device_location(device)
+                        .is_some_and(|location| designation_in_system(location, &stop.system))
+            })
+            .await?;
         }
-        let operation = relay.deploy().await?;
-        ensure_operation_accepted(&operation).await?;
-        wait_for_device(client, config, relay_code, |device| {
-            device.relationships.stowed_in.is_none()
-                && device_location(device)
-                    .is_some_and(|location| designation_in_system(location, &stop.system))
-        })
-        .await?;
     }
 
     ensure_relay_unfurled(client, config, relay_code).await?;
@@ -4500,8 +4881,11 @@ async fn execute_stop(
         })
         .await?;
     }
-    wait_for_parent_connection(client, config, relay_code, &stop.parent_system).await?;
+    wait_for_parent_connection(client, config, plan, index, relay_code).await?;
     plan.stops[index].completed = true;
+    if let Some(carrier_code) = dsr_carrier.as_deref() {
+        send_dsr_carrier_home(client, plan, carrier_code).await?;
+    }
     info!(system = %stop.system, relay = relay_code, "relay stop verified");
     Ok(())
 }
@@ -4683,30 +5067,70 @@ async fn wait_for_device_event(
     }
 }
 
+fn expected_upstream_systems(plan: &MissionPlan, index: usize) -> BTreeSet<String> {
+    let mut upstream = plan
+        .network
+        .active_relay_systems
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    upstream.insert(plan.start_system.clone());
+    upstream.insert(plan.stops[index].parent_system.clone());
+    upstream.extend(
+        plan.stops
+            .iter()
+            .enumerate()
+            .filter(|(stop_index, stop)| *stop_index != index && stop.completed)
+            .map(|(_, stop)| stop.system.clone()),
+    );
+    upstream
+}
+
 async fn wait_for_parent_connection(
     client: &Client,
     config: &Config,
+    plan: &MissionPlan,
+    index: usize,
     relay_code: &str,
-    parent_system: &str,
 ) -> AnyResult<()> {
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
+    let upstream = expected_upstream_systems(plan, index);
+    let expected_parent = plan.stops[index].parent_system.as_str();
     // Each pass costs a remote `/network` read, so wake on events naming this
-    // relay rather than on any account event.
+    // relay rather than on any account event. The optimized relay tree names a
+    // preferred parent, but the live network can legitimately connect through
+    // another already-reachable relay-capable system. Either proves the new
+    // relay has joined the expanding mesh.
     loop {
         let network = client.devices().get(relay_code).await?.network().await?;
-        if network
-            .connections
-            .iter()
-            .any(|connection| connection.star.as_deref() == Some(parent_system))
-        {
+        if let Some(connected_via) = network.connections.iter().find_map(|connection| {
+            connection
+                .star
+                .as_deref()
+                .filter(|system| upstream.contains(*system))
+        }) {
+            if connected_via != expected_parent {
+                info!(
+                    relay = %relay_code,
+                    expected_parent = %expected_parent,
+                    connected_via = %connected_via,
+                    "relay joined the reachable mesh through an alternate upstream system"
+                );
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
+            let observed = network
+                .connections
+                .iter()
+                .filter_map(|connection| connection.star.as_deref())
+                .collect::<Vec<_>>();
             return Err(app_error(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "relay {relay_code} never connected to expected parent system {parent_system}"
+                    "relay {relay_code} never joined the reachable mesh (preferred parent {expected_parent}; observed connections: {})",
+                    if observed.is_empty() { "none".to_owned() } else { observed.join(", ") }
                 ),
             ));
         }
@@ -4897,6 +5321,9 @@ fn print_plan(plan: &MissionPlan) {
     println!("  Start/hub: {}", plan.hub_location);
     println!("  Replicant: {}", plan.replicant_code);
     println!("  Vessel: {}", plan.vessel_code);
+    if let Some(carrier) = plan.dsr_carrier_code.as_deref() {
+        println!("  DSR attachment carrier: {carrier}");
+    }
     println!("  Targets: {}", plan.targets.join(", "));
     println!("  Conventional/new-relay hop: {:.3} ly", plan.max_hop_ly);
     println!(
@@ -5730,6 +6157,12 @@ mod tests {
         }
     }
 
+    fn dsr_stop(system: &str, completed: bool) -> RelayStop {
+        let mut stop = relay_stop(system, StopAction::DeployAndActivate, completed);
+        stop.device_type = DEEP_SPACE_RELAY.to_owned();
+        stop
+    }
+
     fn factory_state(code: &str, queued_units: usize, printing: bool) -> FactoryState {
         FactoryState {
             code: code.to_owned(),
@@ -6012,6 +6445,21 @@ mod tests {
         ];
 
         assert_eq!(next_trip_stop_indices(&stops, 2), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn dsr_stops_use_attachment_transport_without_consuming_vessel_stow_slots() {
+        let stops = vec![
+            dsr_stop("DSR-A", false),
+            relay_stop("A", StopAction::DeployAndActivate, false),
+            dsr_stop("DSR-B", false),
+            relay_stop("B", StopAction::DeployAndActivate, false),
+        ];
+
+        assert_eq!(next_trip_stop_indices(&stops, 1), vec![0, 1, 2]);
+        let (initial, restocks) = deployment_batches(&stops, 1);
+        assert_eq!(initial, vec![1]);
+        assert_eq!(restocks, vec![(1, vec![3])]);
     }
 
     #[test]

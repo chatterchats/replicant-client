@@ -2320,6 +2320,7 @@ fn retryable_connectivity_dependency_failure(message: &str) -> bool {
         || message.contains("blueprint is not unlocked")
         || message.contains("missing blueprint")
         || message.contains("insufficient manufacturing inventory")
+        || message.contains("requires an idle attachment carrier")
         || message.contains("no eligible autofactory")
         || message.contains("internal server error")
         || message.contains("unexpected http status 500")
@@ -4887,6 +4888,9 @@ mod tests {
         ));
         assert!(retryable_connectivity_dependency_failure(
             "insufficient manufacturing inventory at SCEPTURUM-BELT-1"
+        ));
+        assert!(retryable_connectivity_dependency_failure(
+            "Deep Space Relay Station deployment from SCEPTURUM-BELT-1 requires an idle attachment carrier in system SCEPTURUM"
         ));
         assert!(!retryable_connectivity_dependency_failure(
             "relay checkpoint is malformed"
