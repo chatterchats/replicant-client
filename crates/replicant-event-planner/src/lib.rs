@@ -267,11 +267,15 @@ impl DeviceStock {
     /// AMI-controlled, nested, travelling, and workflow-reserved transports
     /// are deliberately ineligible.
     #[must_use]
-    pub fn is_transport_eligible(&self, mission_tag_prefix: &str) -> bool {
+    pub fn is_transport_eligible(
+        &self,
+        mission_tag_prefix: &str,
+        allowed_event_mission: Option<&str>,
+    ) -> bool {
         !self.controlled_by_ami
             && !self.travelling
             && self.is_free_standing()
-            && !self.is_reserved_for_workflow(mission_tag_prefix, None)
+            && !self.is_reserved_for_workflow(mission_tag_prefix, allowed_event_mission)
     }
 }
 
@@ -515,6 +519,12 @@ pub struct PlanningContext {
     pub home_location: String,
     /// Prefix used by event-mission claim tags.
     pub mission_tag_prefix: String,
+    /// Stable tag reserved for the event currently being planned.
+    ///
+    /// Devices carrying this exact tag belong to the same game event and are
+    /// therefore reusable after a workflow/campaign restart. Other event
+    /// mission tags remain exclusive reservations.
+    pub event_mission_tag: Option<String>,
 }
 
 /// Planning failure.
@@ -640,10 +650,55 @@ pub fn schedule_print_units(
     })
 }
 
-/// Produces a bounded deterministic mission tag.
+/// Produces a bounded deterministic mission tag from an event designation.
+///
+/// Normal event designations remain human-readable. When the normalized
+/// designation would exceed the API's 32-character tag limit, only the leading
+/// system portion is shortened and a deterministic hash of the full normalized
+/// designation is inserted before the preserved location/event suffix.
 #[must_use]
-pub fn mission_tag(mission_id: &str) -> String {
-    format!("evt-m:{}", short_hash(mission_id))
+pub fn mission_tag(event_designation: &str) -> String {
+    const PREFIX: &str = "evt-m:";
+    const HASH_CHARS: usize = 6;
+
+    let normalized = normalize_tag_component(event_designation)
+        .trim_matches('-')
+        .to_owned();
+    let direct = format!("{PREFIX}{normalized}");
+    if direct.chars().count() <= MAX_TAG_CHARACTERS {
+        return direct;
+    }
+
+    let suffix = preserved_event_suffix(&normalized);
+    let identity_head = normalized
+        .strip_suffix(&suffix)
+        .unwrap_or(normalized.as_str())
+        .trim_end_matches('-');
+    let hash = short_hash(identity_head);
+    let hash = &hash[..HASH_CHARS];
+    let fixed = PREFIX.chars().count() + 1 + HASH_CHARS + suffix.chars().count();
+    let head_budget = MAX_TAG_CHARACTERS.saturating_sub(fixed).max(1);
+    let mut head = normalized
+        .strip_suffix(&suffix)
+        .unwrap_or(normalized.as_str())
+        .trim_end_matches('-')
+        .chars()
+        .take(head_budget)
+        .collect::<String>();
+    head = head.trim_end_matches('-').to_owned();
+    if head.is_empty() {
+        head.push('e');
+    }
+    format!("{PREFIX}{head}-{hash}{suffix}")
+}
+
+fn preserved_event_suffix(normalized: &str) -> String {
+    let Some(evt_index) = normalized.rfind("-evt-") else {
+        return String::new();
+    };
+    let before_evt = &normalized[..evt_index];
+    let location_start = before_evt.rfind('-').unwrap_or(0);
+    normalized[location_start..].to_owned()
 }
 
 /// Produces a bounded role tag.
@@ -674,6 +729,7 @@ fn assess_criterion(
         &context.devices,
         &event.location,
         &context.mission_tag_prefix,
+        context.event_mission_tag.as_deref(),
     );
     let mut remaining_devices = subtract_device_requirements(
         &criterion.devices,
@@ -693,7 +749,10 @@ fn assess_criterion(
                 // event body: devices already standing there were counted as
                 // event stock above and must not be double-claimed here.
                 && device.location.as_deref() != Some(&event.location)
-                && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
+                && !device.is_reserved_for_workflow(
+                    &context.mission_tag_prefix,
+                    context.event_mission_tag.as_deref(),
+                )
         })
         .collect::<Vec<_>>();
     reusable_pool.sort_by(|left, right| {
@@ -715,10 +774,10 @@ fn assess_criterion(
             }
             if device.device_type != requirement.device_type
                 || reused_codes.contains(device.code.as_str())
-                || device
-                    .tags
-                    .iter()
-                    .any(|tag| tag.starts_with(&context.mission_tag_prefix))
+                || device.tags.iter().any(|tag| {
+                    tag.starts_with(&context.mission_tag_prefix)
+                        && context.event_mission_tag.as_deref() != Some(tag.as_str())
+                })
             {
                 continue;
             }
@@ -891,6 +950,7 @@ fn blocked_assessment(
         &context.devices,
         &event.location,
         &context.mission_tag_prefix,
+        context.event_mission_tag.as_deref(),
     );
     let remaining_devices = subtract_device_requirements(
         &criterion.devices,
@@ -937,7 +997,10 @@ fn plan_cargo_transport(
             device.device_type == CARGO_FREIGHTER
                 && device.cargo_capacity > 0
                 && device.is_in_same_system_as(&context.home_location)
-                && device.is_transport_eligible(&context.mission_tag_prefix)
+                && device.is_transport_eligible(
+                    &context.mission_tag_prefix,
+                    context.event_mission_tag.as_deref(),
+                )
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -1010,7 +1073,10 @@ fn plan_device_transport(
             device.attach_capacity > 0
                 && device.attach_used == 0
                 && device.is_in_same_system_as(&context.home_location)
-                && device.is_transport_eligible(&context.mission_tag_prefix)
+                && device.is_transport_eligible(
+                    &context.mission_tag_prefix,
+                    context.event_mission_tag.as_deref(),
+                )
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -1097,7 +1163,10 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
         device.location.as_deref() == Some(event_location)
             && device.is_inactive()
             && device.is_free_standing()
-            && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
+            && !device.is_reserved_for_workflow(
+                &context.mission_tag_prefix,
+                context.event_mission_tag.as_deref(),
+            )
     }) {
         return BeaconPlan {
             action: BeaconAction::DeployExisting,
@@ -1110,7 +1179,10 @@ fn plan_beacon(event_location: &str, context: &PlanningContext) -> BeaconPlan {
         device.is_inactive()
             && device.is_free_standing()
             && device.location.as_deref() == Some(context.home_location.as_str())
-            && !device.is_reserved_for_workflow(&context.mission_tag_prefix, None)
+            && !device.is_reserved_for_workflow(
+                &context.mission_tag_prefix,
+                context.event_mission_tag.as_deref(),
+            )
     }) {
         return BeaconPlan {
             action: BeaconAction::TransportExisting,
@@ -1464,13 +1536,14 @@ fn inactive_devices_at(
     devices: &[DeviceStock],
     location: &str,
     mission_tag_prefix: &str,
+    allowed_event_mission: Option<&str>,
 ) -> BTreeMap<String, i64> {
     let mut counts = BTreeMap::new();
     for device in devices.iter().filter(|device| {
         device.location.as_deref() == Some(location)
             && device.is_inactive()
             && device.is_free_standing()
-            && !device.is_reserved_for_workflow(mission_tag_prefix, None)
+            && !device.is_reserved_for_workflow(mission_tag_prefix, allowed_event_mission)
     }) {
         *counts.entry(device.device_type.clone()).or_default() += 1;
     }
@@ -1863,6 +1936,7 @@ mod tests {
             earned_achievements: BTreeSet::new(),
             home_location: "SCEPTURUM-BELT-1".into(),
             mission_tag_prefix: "evt-m:".into(),
+            event_mission_tag: None,
         }
     }
 
@@ -2057,6 +2131,40 @@ mod tests {
     }
 
     #[test]
+    fn same_event_reservation_is_reusable_after_workflow_recreation() {
+        let mut context = context();
+        let event = event();
+        let tag = mission_tag(&event.designation);
+        context.event_mission_tag = Some(tag.clone());
+        context.devices.push(DeviceStock {
+            code: "SENSOR-OLD-MISSION".into(),
+            device_type: "sensor_array".into(),
+            status: Some("inactive".into()),
+            location: Some("SCEPTURUM-BELT-1".into()),
+            assigned_replicant: Some("Chats-1".into()),
+            tags: [tag].into_iter().collect(),
+            cargo_capacity: 0,
+            attach_capacity: 0,
+            attach_used: 0,
+            attached_to_device_code: None,
+            stowed_in_device_code: None,
+            controlled_by_ami: false,
+            travelling: false,
+        });
+
+        let plan = plan_event(event, &context).expect("plan");
+        let criterion = plan
+            .criteria
+            .iter()
+            .find(|criterion| criterion.criterion_name == "sensor_shield_containment")
+            .expect("criterion");
+        assert_eq!(
+            criterion.reused_devices,
+            vec!["SENSOR-OLD-MISSION".to_owned()]
+        );
+    }
+
+    #[test]
     fn remote_transports_and_bootstrap_carriers_are_not_selected() {
         let mut context = context();
         context.devices.push(DeviceStock {
@@ -2243,5 +2351,20 @@ mod tests {
             role_tag("a very long role name that would otherwise overflow").len()
                 <= MAX_TAG_CHARACTERS
         );
+    }
+
+    #[test]
+    fn event_mission_tags_are_readable_stable_and_bounded() {
+        assert_eq!(
+            mission_tag("KHUXKRIXX-3-EVT-008"),
+            "evt-m:khuxkrixx-3-evt-008"
+        );
+        let long = mission_tag("REALLYLONGSYSTEMNAMEHERE-3-EVT-002");
+        assert_eq!(long, mission_tag("reallylongsystemnamehere-3-evt-002"));
+        assert_eq!(long, "evt-m:reallylon-70faea-3-evt-002");
+        assert!(long.len() <= MAX_TAG_CHARACTERS);
+        assert!(long.ends_with("-3-evt-002"));
+        let sibling = mission_tag("REALLYLONGSYSTEMNAMEHERE-4-EVT-099");
+        assert!(sibling.contains("-70faea-"));
     }
 }

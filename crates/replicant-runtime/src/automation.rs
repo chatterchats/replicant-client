@@ -9,7 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use replicant_client::{
@@ -40,9 +40,10 @@ use crate::bootstrap::{
 use crate::{
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest,
-        EventPlanningRequest, archive_event_campaign, event_campaign_target_systems,
-        event_mission_target_system, execute_event_campaign, execute_event_mission,
-        plan_event_campaign, plan_event_mission, prestage_event_mission, restore_event_campaign,
+        EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
+        event_campaign_target_systems, event_mission_target_system, execute_event_campaign,
+        execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
+        reconcile_event_stock, restore_event_campaign,
     },
     mining::{MiningExpansionRequest, execute_expansion},
     observatory::auto_prospect,
@@ -1727,7 +1728,23 @@ impl WorkflowExecutor for ExplorationWorkflow {
             .await;
             match result {
                 Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
-                Err(error) => Err(error.to_string()),
+                Err(error) => {
+                    let message = error.to_string();
+                    if retryable_connectivity_dependency_failure(&message) {
+                        tracing::warn!(
+                            workflow_id = %context.id(),
+                            target = %intent.target,
+                            error = %message,
+                            "relay expansion is blocked on a recoverable prerequisite; waiting to retry"
+                        );
+                        context
+                            .advance_to("awaiting_relay_prerequisites", &checkpoint)
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)
+                    } else {
+                        Err(message)
+                    }
+                }
             }
         })
     }
@@ -1763,6 +1780,14 @@ impl WorkflowExecutor for EventDeliveryWorkflow {
                     context
                         .advance_to("planning", &checkpoint)
                         .map_err(string_error)?;
+                    let reclaimed = reconcile_terminal_event_stock(context, &client).await?;
+                    if reclaimed > 0 {
+                        context
+                            .emit_activity(format!(
+                                "reclaimed {reclaimed} legacy event-stock device(s) before event planning"
+                            ))
+                            .map_err(string_error)?;
+                    }
                     plan_event_mission(
                         &client,
                         &EventPlanningRequest {
@@ -1980,6 +2005,14 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                     context
                         .advance_to("planning", &checkpoint)
                         .map_err(string_error)?;
+                    let reclaimed = reconcile_terminal_event_stock(context, &client).await?;
+                    if reclaimed > 0 {
+                        context
+                            .emit_activity(format!(
+                                "reclaimed {reclaimed} legacy event-stock device(s) before campaign planning"
+                            ))
+                            .map_err(string_error)?;
+                    }
                     plan_event_campaign(
                         &client,
                         &EventCampaignPlanningRequest {
@@ -2106,6 +2139,9 @@ fn retryable_event_campaign_failure(message: &str) -> bool {
         || message.contains("out of control range")
         || message.contains("not your device")
         || message.contains("not present in the account-owned device projection")
+        || message.contains("unexpected http status 500")
+        || message.contains("internal server error")
+        || message.contains("client is closed")
 }
 
 fn event_campaign_failure_requires_replan(message: &str) -> bool {
@@ -2175,10 +2211,42 @@ pub(crate) async fn reconcile_event_connectivity(
                 completed_dependencies.insert(target.clone(), workflow_id);
             }
             WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let error = workflow
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("no error was recorded");
+                if workflow.status == WorkflowStatus::Failed
+                    && retryable_connectivity_dependency_failure(error)
+                {
+                    const CONNECTIVITY_RETRY_COOLDOWN_MS: i64 = 30 * 60 * 1_000;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+                        .unwrap_or_default();
+                    if now.saturating_sub(workflow.updated_at)
+                        < CONNECTIVITY_RETRY_COOLDOWN_MS
+                    {
+                        tracing::debug!(
+                            workflow_id = %context.id(),
+                            connectivity_workflow_id = %workflow_id,
+                            target = %target,
+                            error = %error,
+                            "FTL connectivity dependency is blocked; retaining failed child during retry cooldown"
+                        );
+                        return Ok(false);
+                    }
+                    tracing::info!(
+                        workflow_id = %context.id(),
+                        connectivity_workflow_id = %workflow_id,
+                        target = %target,
+                        "FTL connectivity blocker cooldown elapsed; retrying expansion"
+                    );
+                    connectivity_workflows.remove(target);
+                    continue;
+                }
                 return Err(format!(
-                    "FTL connectivity dependency {workflow_id} for {target} ended as {:?}: {}",
-                    workflow.status,
-                    workflow.last_error.as_deref().unwrap_or("no error was recorded")
+                    "FTL connectivity dependency {workflow_id} for {target} ended as {:?}: {error}",
+                    workflow.status
                 ));
             }
             _ => return Ok(false),
@@ -2244,6 +2312,17 @@ pub(crate) async fn reconcile_event_connectivity(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn retryable_connectivity_dependency_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no relay network connects")
+        || message.contains("blueprint is not unlocked")
+        || message.contains("missing blueprint")
+        || message.contains("insufficient manufacturing inventory")
+        || message.contains("no eligible autofactory")
+        || message.contains("internal server error")
+        || message.contains("unexpected http status 500")
 }
 
 fn active_connectivity_workflow(
@@ -2768,6 +2847,23 @@ fn managed_client(context: &WorkflowContext) -> Result<Client, String> {
         .managed_client()
         .cloned()
         .ok_or_else(|| "automation workflow requires a managed client".to_owned())
+}
+
+async fn reconcile_terminal_event_stock(
+    context: &WorkflowContext,
+    client: &Client,
+) -> Result<usize, String> {
+    let report = reconcile_event_stock(
+        client,
+        context.repository(),
+        EventStockReconcileOptions {
+            execute: true,
+            reclaim_unknown_orphans: false,
+        },
+    )
+    .await
+    .map_err(string_error)?;
+    Ok(report.event_reclaims + report.regional_stock_reclaims)
 }
 
 fn string_error(error: impl std::fmt::Display) -> String {
@@ -4765,8 +4861,35 @@ mod tests {
         assert!(event_campaign_failure_requires_replan(
             "event asset D-1 is not present in the account-owned device projection; replan required"
         ));
+        assert!(retryable_event_campaign_failure(
+            "unexpected HTTP status 500: Internal server error"
+        ));
+        assert!(!event_campaign_failure_requires_replan(
+            "unexpected HTTP status 500: Internal server error"
+        ));
+        assert!(retryable_event_campaign_failure("client is closed"));
+        assert!(!event_campaign_failure_requires_replan("client is closed"));
         assert!(!retryable_event_campaign_failure(
             "event criterion is structurally invalid"
+        ));
+    }
+
+    #[test]
+    fn relay_connectivity_capacity_blockers_are_retryable_without_campaign_failure() {
+        assert!(retryable_connectivity_dependency_failure(
+            "no relay network connects SCEPTURUM to ALIPHERATZ; closest gap is ANTAR -> ALIPHERATZ at 8.403 ly"
+        ));
+        assert!(retryable_connectivity_dependency_failure(
+            "deep_space_relay_station blueprint is not unlocked"
+        ));
+        assert!(retryable_connectivity_dependency_failure(
+            "missing blueprint for requested device type `comm_satellite`"
+        ));
+        assert!(retryable_connectivity_dependency_failure(
+            "insufficient manufacturing inventory at SCEPTURUM-BELT-1"
+        ));
+        assert!(!retryable_connectivity_dependency_failure(
+            "relay checkpoint is malformed"
         ));
     }
 

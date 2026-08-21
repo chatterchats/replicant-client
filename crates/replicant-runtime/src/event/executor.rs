@@ -67,6 +67,8 @@ pub(crate) struct ExecutionState {
     #[serde(default)]
     pub(crate) printer_lanes: Vec<String>,
     #[serde(default)]
+    pub(crate) queue_adoption_checked: bool,
+    #[serde(default)]
     pub(crate) event_resolved: bool,
     #[serde(default)]
     pub(crate) beacon_completed: bool,
@@ -774,7 +776,7 @@ async fn replan_nonlocal_assets_with_reservations(
     let previous_mission_id = plan.mission_id.clone();
     let replanned_mission_id = uuid::Uuid::new_v4().simple().to_string();
     plan.mission_id = replanned_mission_id.clone();
-    plan.mission_tag = mission_tag(&replanned_mission_id);
+    plan.mission_tag = mission_tag(&event_plan.event.designation);
     plan.event = event_plan.event;
     plan.selected_criterion = selected_criterion;
     plan.grants_unearned_achievement = event_plan.grants_unearned_achievement;
@@ -1072,32 +1074,28 @@ fn set_phase(config: &Config, plan: &mut EventMissionPlan, phase: MissionPhase) 
 
 fn initialize_execution(plan: &mut EventMissionPlan) {
     if plan.execution.print_batches.is_empty() {
-        plan.execution.print_batches = plan
-            .selected_criterion
-            .print_schedule
-            .batches
-            .iter()
-            .map(|batch| {
+        let mut device_ordinals = BTreeMap::<String, usize>::new();
+        let mut execution_batches = Vec::new();
+        for batch in &plan.selected_criterion.print_schedule.batches {
+            let ordinal = device_ordinals.entry(batch.device_type.clone()).or_default();
+            for _ in 0..batch.quantity.max(0) {
                 let role = role_for_device_type(&batch.device_type).to_owned();
-                ExecutionPrintBatch {
+                execution_batches.push(ExecutionPrintBatch {
                     factory_code: batch.factory_code.clone(),
                     device_type: batch.device_type.clone(),
-                    quantity: batch.quantity,
+                    quantity: 1,
                     role,
-                    batch_tag: print_batch_tag(
-                        &plan.mission_id,
-                        &batch.factory_code,
-                        batch.sequence,
-                        &batch.device_type,
-                    ),
+                    batch_tag: print_batch_tag(&plan.mission_tag, &batch.device_type, *ordinal),
                     prerequisites_queued: false,
                     submission_started: false,
                     submitted: false,
                     operation_id: None,
                     produced_codes: Vec::new(),
-                }
-            })
-            .collect();
+                });
+                *ordinal += 1;
+            }
+        }
+        plan.execution.print_batches = execution_batches;
     }
     plan.version = plan.version.max(2);
 }
@@ -1142,17 +1140,10 @@ fn role_for_device_type(device_type: &str) -> &'static str {
     }
 }
 
-fn print_batch_tag(
-    mission_id: &str,
-    factory_code: &str,
-    sequence: usize,
-    device_type: &str,
-) -> String {
+fn print_batch_tag(mission_tag: &str, device_type: &str, ordinal: usize) -> String {
     format!(
         "evt-b:{:016x}",
-        stable_hash(&format!(
-            "{mission_id}:{factory_code}:{sequence}:{device_type}"
-        ))
+        stable_hash(&format!("{mission_tag}:{device_type}:{ordinal}"))
     )
 }
 
@@ -1223,12 +1214,14 @@ async fn reconcile_print_batches(
         }
     }
 
-    // Queue inspection is only needed for the tiny crash window where a
+    // A freshly recreated mission uses deterministic event/batch tags. Inspect
+    // the home Autofactories once so queued work from a failed predecessor can
+    // be adopted instead of submitted again. After that one adoption pass,
+    // queue inspection is only needed for the tiny crash window where a
     // submission began but no durable operation ID/submitted checkpoint made
-    // it to disk. Normal submitted batches are tracked by persisted operation
-    // state and local tagged outputs, so do not GET every Autofactory on every
-    // scheduler pass.
-    let factory_codes = plan
+    // it to disk.
+    let adopt_predecessor_queue = !plan.execution.queue_adoption_checked;
+    let mut factory_codes = plan
         .execution
         .print_batches
         .iter()
@@ -1240,6 +1233,15 @@ async fn reconcile_print_batches(
         })
         .map(|batch| batch.factory_code.clone())
         .collect::<BTreeSet<_>>();
+    if adopt_predecessor_queue && !plan.execution.print_batches.is_empty() {
+        let blueprints = fetch_print_blueprints(client).await?;
+        factory_codes.extend(
+            discover_factories(client, &plan.home_location, &blueprints)
+                .await?
+                .into_iter()
+                .map(|factory| factory.code),
+        );
+    }
     let mut factory_jobs = BTreeMap::<String, Vec<BTreeSet<String>>>::new();
     for code in factory_codes {
         factory_jobs.insert(code.clone(), factory_job_tags(client, &code).await?);
@@ -1261,10 +1263,15 @@ async fn reconcile_print_batches(
             ));
         }
         batch.produced_codes = codes;
-        let queued = factory_jobs.get(&batch.factory_code).is_some_and(|jobs| {
+        let queued_factory = factory_jobs.iter().find_map(|(factory_code, jobs)| {
             jobs.iter()
                 .any(|tags| tags.contains(&plan.mission_tag) && tags.contains(&batch.batch_tag))
+                .then(|| factory_code.clone())
         });
+        let queued = queued_factory.is_some();
+        if let Some(factory_code) = queued_factory {
+            batch.factory_code = factory_code;
+        }
         let produced = i64::try_from(batch.produced_codes.len())? == batch.quantity;
         if queued || produced {
             if produced {
@@ -1290,6 +1297,9 @@ async fn reconcile_print_batches(
                 batch.submitted = true;
             }
         }
+    }
+    if adopt_predecessor_queue {
+        plan.execution.queue_adoption_checked = true;
     }
 
     if let Some(batch) = plan.execution.print_batches.iter().find(|batch| {
@@ -4639,8 +4649,25 @@ mod tests {
     use super::{
         ReplicantTravelDecision, ResourceMap, allocate_manifests, command_available,
         is_modular_device, legacy_recovered_rewards, merge_recovered_rewards, merge_resources,
-        replicant_travel_decision, resources_available_from, status_is,
+        print_batch_tag, replicant_travel_decision, resources_available_from, status_is,
     };
+
+    #[test]
+    fn event_print_batch_tags_survive_workflow_recreation() {
+        let mission_tag = "evt-m:khuxkrixx-3-evt-008";
+        assert_eq!(
+            print_batch_tag(mission_tag, "sensor_array", 0),
+            print_batch_tag(mission_tag, "sensor_array", 0)
+        );
+        assert_ne!(
+            print_batch_tag(mission_tag, "sensor_array", 0),
+            print_batch_tag(mission_tag, "sensor_array", 1)
+        );
+        assert_ne!(
+            print_batch_tag(mission_tag, "sensor_array", 0),
+            print_batch_tag(mission_tag, "ftl_beacon", 0)
+        );
+    }
 
     #[test]
     fn recognizes_modular_transport_states_and_commands() {

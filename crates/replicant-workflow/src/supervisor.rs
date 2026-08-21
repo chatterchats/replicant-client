@@ -30,6 +30,12 @@ const SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 // managed evidence; parents only need an occasional reconciliation pass to
 // observe completion.
 const EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+// Frontier expansion can be blocked for minutes or hours on a blueprint,
+// prerequisite manufacturing, or temporary upstream availability. Re-running
+// the full relay planner every five seconds only burns API budget while the
+// prerequisite is unchanged.
+const EXPLORATION_PREREQUISITE_POLLING_WAIT_RETRY_INTERVAL: Duration =
+    Duration::from_secs(300);
 
 /// Boxed future returned by a workflow executor.
 pub type BoxWorkflowFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -798,6 +804,10 @@ fn polling_wait_retry_due(instance: &WorkflowInstance) -> bool {
     let updated_at = u128::try_from(instance.updated_at).unwrap_or_default();
     let interval = if instance.kind.as_str() == "scan.tour" {
         SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL
+    } else if instance.kind.as_str() == "exploration.frontier"
+        && instance.current_step.as_deref() == Some("awaiting_relay_prerequisites")
+    {
+        EXPLORATION_PREREQUISITE_POLLING_WAIT_RETRY_INTERVAL
     } else if matches!(
         (instance.kind.as_str(), instance.current_step.as_deref()),
         (

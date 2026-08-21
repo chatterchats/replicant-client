@@ -43,7 +43,9 @@ pub(super) fn execution_state(campaign: &EventCampaignPlan) -> AnyResult<EventEx
     Ok(EventExecutionState::Campaign {
         campaign_id: campaign.campaign_id.clone(),
         completed,
-        total: campaign.missions.len() + campaign.blocked_events.len(),
+        total: campaign.missions.len()
+            + campaign.deferred_events.len()
+            + campaign.blocked_events.len(),
         blocked: campaign.blocked_events.len(),
         warnings: campaign.warnings.clone(),
     })
@@ -52,6 +54,11 @@ pub(super) fn execution_state(campaign: &EventCampaignPlan) -> AnyResult<EventEx
 const CAMPAIGN_VERSION: u32 = 1;
 const CAMPAIGN_KIND: &str = "all_events_campaign";
 const CAMPAIGN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_PLANNING_WINDOW: usize = 4;
+
+const fn default_planning_window() -> usize {
+    DEFAULT_PLANNING_WINDOW
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct EventCampaignPlan {
@@ -62,7 +69,11 @@ pub(crate) struct EventCampaignPlan {
     home_location: String,
     #[serde(default)]
     event_scope: EventScope,
+    #[serde(default = "default_planning_window")]
+    planning_window: usize,
     missions: Vec<CampaignMission>,
+    #[serde(default)]
+    deferred_events: Vec<DeferredEvent>,
     blocked_events: Vec<BlockedEvent>,
     #[serde(default)]
     warnings: Vec<String>,
@@ -73,6 +84,12 @@ struct CampaignMission {
     event_designation: String,
     event_title: String,
     mission_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DeferredEvent {
+    event_designation: String,
+    target_system: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +107,8 @@ struct CampaignStatusReport {
     event_scope: EventScope,
     completed: usize,
     total: usize,
+    planning_window: usize,
+    deferred: usize,
     missions: Vec<CampaignMissionStatus>,
     blocked_events: Vec<BlockedEvent>,
     warnings: Vec<String>,
@@ -155,14 +174,28 @@ pub(super) fn mission_paths(campaign: &EventCampaignPlan) -> Vec<PathBuf> {
 /// events are intentionally excluded because no travel will be attempted for
 /// them until a later campaign replan makes them actionable.
 pub(super) fn target_systems(campaign: &EventCampaignPlan) -> AnyResult<BTreeSet<String>> {
-    campaign
+    let mut systems = campaign
         .missions
         .iter()
         .map(|mission| {
             load_plan(&mission.mission_path)
                 .map(|plan| system_from_location(&plan.event.location))
         })
-        .collect()
+        .collect::<AnyResult<BTreeSet<_>>>()?;
+    systems.extend(
+        campaign
+            .deferred_events
+            .iter()
+            .map(|event| event.target_system.clone()),
+    );
+    Ok(systems)
+}
+
+fn deferred_event(event: &EventDefinition) -> DeferredEvent {
+    DeferredEvent {
+        event_designation: event.designation.clone(),
+        target_system: system_from_location(&event.location),
+    }
 }
 
 pub(crate) fn is_campaign_file(path: &Path) -> AnyResult<bool> {
@@ -187,7 +220,7 @@ pub(crate) fn load_campaign(path: &Path) -> AnyResult<EventCampaignPlan> {
     Ok(campaign)
 }
 
-fn save_campaign(path: &Path, campaign: &EventCampaignPlan) -> AnyResult<()> {
+pub(super) fn save_campaign(path: &Path, campaign: &EventCampaignPlan) -> AnyResult<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -222,13 +255,19 @@ pub(crate) async fn create_campaign(
         selected_replicant: replicant_code,
         home_location: config.home.clone(),
         event_scope: config.event_scope(),
+        planning_window: DEFAULT_PLANNING_WINDOW,
         missions: Vec::new(),
+        deferred_events: Vec::new(),
         blocked_events: Vec::new(),
         warnings: Vec::new(),
     };
     let mut pool = build_planning_pool(client, &campaign.home_location, earned).await?;
     sort_campaign_events(&mut events, earned);
     for event in events {
+        if campaign.missions.len() >= campaign.planning_window {
+            campaign.deferred_events.push(deferred_event(&event));
+            continue;
+        }
         match plan_campaign_event(client, config, &campaign, event, &mut pool).await? {
             PlannedEvent::Mission(mission) => campaign.missions.push(mission),
             PlannedEvent::Blocked(blocked) => campaign.blocked_events.push(blocked),
@@ -319,6 +358,7 @@ async fn plan_campaign_event(
     event: EventDefinition,
     pool: &mut PlanningPool,
 ) -> AnyResult<PlannedEvent> {
+    let stable_mission_tag = mission_tag(&event.designation);
     let context = PlanningContext {
         home_inventory: pool.home_inventory.clone(),
         event_inventory: fetch_inventory(client, &event.location).await?,
@@ -328,6 +368,7 @@ async fn plan_campaign_event(
         earned_achievements: pool.earned_achievements.clone(),
         home_location: pool.home_location.clone(),
         mission_tag_prefix: EVENT_MISSION_TAG_PREFIX.into(),
+        event_mission_tag: Some(stable_mission_tag.clone()),
     };
     let event_plan = plan_event(event, &context)?;
     let Some(selected_criterion) = best_criterion(&event_plan.criteria).cloned() else {
@@ -358,7 +399,7 @@ async fn plan_campaign_event(
     let mission = EventMissionPlan {
         version: PLAN_VERSION,
         mission_id: mission_id.clone(),
-        mission_tag: mission_tag(&mission_id),
+        mission_tag: stable_mission_tag,
         phase: MissionPhase::Planned,
         selected_replicant: campaign.selected_replicant.clone(),
         home_location: campaign.home_location.clone(),
@@ -455,6 +496,19 @@ fn reserve_mission(pool: &mut PlanningPool, mission: &EventMissionPlan) {
     }
 }
 
+fn reserve_incomplete_missions(
+    campaign: &EventCampaignPlan,
+    pool: &mut PlanningPool,
+) -> AnyResult<()> {
+    for record in &campaign.missions {
+        let mission = load_plan(&record.mission_path)?;
+        if !mission.phase.is_terminal() {
+            reserve_mission(pool, &mission);
+        }
+    }
+    Ok(())
+}
+
 fn merge_resources(target: &mut ResourceMap, source: &ResourceMap) {
     for (resource, quantity) in source {
         *target.entry(resource.clone()).or_default() += quantity;
@@ -521,10 +575,21 @@ pub(crate) async fn execute_campaign(
     config: &Config,
     campaign: &mut EventCampaignPlan,
 ) -> AnyResult<()> {
+    let deferred = compact_planning_window(campaign)?;
+    if deferred > 0 {
+        save_campaign(&config.plan_path, campaign)?;
+        info!(
+            campaign = %campaign.campaign_id,
+            deferred,
+            window = campaign.planning_window,
+            "deferred untouched legacy campaign missions into bounded planning window"
+        );
+    }
     let mut workers = BTreeMap::<PathBuf, CampaignWorker>::new();
 
     loop {
         reap_finished_campaign_workers(client, config, &mut workers).await?;
+        refill_planning_window(client, config, campaign).await?;
         let busy_paths = worker_paths(&workers);
         prefill_print_queues(client, config, campaign, &busy_paths).await?;
         reap_finished_campaign_workers(client, config, &mut workers).await?;
@@ -617,6 +682,118 @@ pub(crate) async fn execute_campaign(
             ));
         }
     }
+}
+
+pub(super) fn compact_planning_window(campaign: &mut EventCampaignPlan) -> AnyResult<usize> {
+    let mut active_kept = 0usize;
+    let mut kept = Vec::with_capacity(campaign.missions.len());
+    let mut deferred_count = 0usize;
+    for record in std::mem::take(&mut campaign.missions) {
+        let mission = load_plan(&record.mission_path)?;
+        if mission.phase.is_terminal() {
+            kept.push(record);
+            continue;
+        }
+        if active_kept < campaign.planning_window || mission_has_started(&mission) {
+            active_kept += 1;
+            kept.push(record);
+            continue;
+        }
+        campaign.deferred_events.push(DeferredEvent {
+            event_designation: record.event_designation,
+            target_system: system_from_location(&mission.event.location),
+        });
+        deferred_count += 1;
+    }
+    campaign.missions = kept;
+    Ok(deferred_count)
+}
+
+fn mission_has_started(mission: &EventMissionPlan) -> bool {
+    mission.phase != MissionPhase::Planned
+        || !mission.claimed_devices.is_empty()
+        || !mission.execution.print_batches.is_empty()
+        || !mission.execution.payload_devices.is_empty()
+        || mission.execution.resources_staged
+        || mission.execution.devices_staged
+        || mission.execution.prestage_complete
+        || mission.execution.event_resolved
+}
+
+async fn refill_planning_window(
+    client: &Client,
+    config: &Config,
+    campaign: &mut EventCampaignPlan,
+) -> AnyResult<usize> {
+    if campaign.deferred_events.is_empty() {
+        return Ok(0);
+    }
+    let active_count = active_mission_count(campaign)?;
+    if active_count >= campaign.planning_window {
+        return Ok(0);
+    }
+
+    let active = fetch_active_events_in_scope(client, &campaign.event_scope)
+        .await?
+        .iter()
+        .map(normalize_event)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|event| (event.designation.clone(), event))
+        .collect::<BTreeMap<_, _>>();
+    let earned = fetch_earned_achievements(client).await?;
+    let mut pool = build_planning_pool(client, &campaign.home_location, &earned).await?;
+    reserve_incomplete_missions(campaign, &mut pool)?;
+
+    let mut available = campaign.planning_window.saturating_sub(active_count);
+    let mut remaining = Vec::new();
+    let mut added = 0usize;
+    for deferred in std::mem::take(&mut campaign.deferred_events) {
+        if available == 0 {
+            remaining.push(deferred);
+            continue;
+        }
+        let Some(event) = active.get(&deferred.event_designation).cloned() else {
+            let warning = format!(
+                "event {} expired before entering the campaign planning window",
+                deferred.event_designation
+            );
+            warn!(warning = %warning);
+            campaign.warnings.push(warning);
+            continue;
+        };
+        match plan_campaign_event(client, config, campaign, event, &mut pool).await? {
+            PlannedEvent::Mission(mission) => {
+                campaign.missions.push(mission);
+                available -= 1;
+                added += 1;
+            }
+            PlannedEvent::Blocked(blocked) => campaign.blocked_events.push(blocked),
+        }
+    }
+    campaign.deferred_events = remaining;
+    save_campaign(&config.plan_path, campaign)?;
+    if added > 0 {
+        info!(
+            campaign = %campaign.campaign_id,
+            added,
+            active = active_mission_count(campaign)?,
+            deferred = campaign.deferred_events.len(),
+            window = campaign.planning_window,
+            "refilled bounded event campaign planning window"
+        );
+    }
+    Ok(added)
+}
+
+fn active_mission_count(campaign: &EventCampaignPlan) -> AnyResult<usize> {
+    let mut active = 0usize;
+    for record in &campaign.missions {
+        if !load_plan(&record.mission_path)?.phase.is_terminal() {
+            active += 1;
+        }
+    }
+    Ok(active)
 }
 
 async fn spawn_campaign_workers(
@@ -1193,9 +1370,14 @@ async fn retry_blocked_events(
         .collect::<BTreeMap<_, _>>();
     let earned = fetch_earned_achievements(client).await?;
     let mut pool = build_planning_pool(client, &campaign.home_location, &earned).await?;
+    reserve_incomplete_missions(campaign, &mut pool)?;
     let previous = std::mem::take(&mut campaign.blocked_events);
     let mut added = 0usize;
     for blocked in previous {
+        if active_mission_count(campaign)? >= campaign.planning_window {
+            campaign.blocked_events.push(blocked);
+            continue;
+        }
         let Some(event) = active.get(&blocked.event_designation).cloned() else {
             let warning = format!(
                 "event {} is no longer active and was removed from the campaign blocker list",
@@ -1217,7 +1399,9 @@ async fn retry_blocked_events(
 }
 
 fn campaign_is_terminal(campaign: &EventCampaignPlan) -> AnyResult<bool> {
-    Ok(campaign.blocked_events.is_empty() && !campaign_has_incomplete_missions(campaign)?)
+    Ok(campaign.deferred_events.is_empty()
+        && campaign.blocked_events.is_empty()
+        && !campaign_has_incomplete_missions(campaign)?)
 }
 
 fn campaign_has_incomplete_missions(campaign: &EventCampaignPlan) -> AnyResult<bool> {
@@ -1266,7 +1450,9 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
         home_location: campaign.home_location.clone(),
         event_scope: campaign.event_scope.clone(),
         completed,
-        total: statuses.len() + campaign.blocked_events.len(),
+        total: statuses.len() + campaign.deferred_events.len() + campaign.blocked_events.len(),
+        planning_window: campaign.planning_window,
+        deferred: campaign.deferred_events.len(),
         missions: statuses,
         blocked_events: campaign.blocked_events.clone(),
         warnings: campaign.warnings.clone(),
@@ -1281,6 +1467,10 @@ pub(crate) fn show_campaign_status(config: &Config, campaign: &EventCampaignPlan
     println!("Home:       {}", report.home_location);
     println!("Scope:      {}", report.event_scope.description());
     println!("Completed:  {}/{}", report.completed, report.total);
+    println!(
+        "Window:     {} active max · {} deferred",
+        report.planning_window, report.deferred
+    );
     for mission in report.missions {
         let phase = format!("{:?}", mission.phase);
         println!(
@@ -1344,6 +1534,11 @@ mod tests {
             recommendations: badges.iter().copied().collect(),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn campaign_planning_window_defaults_to_four() {
+        assert_eq!(default_planning_window(), 4);
     }
 
     #[test]

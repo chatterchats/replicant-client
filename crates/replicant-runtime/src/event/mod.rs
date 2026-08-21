@@ -15,6 +15,7 @@ use replicant_event_planner::{
     OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
     role_tag,
 };
+use replicant_workflow::WorkflowRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -22,6 +23,9 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 mod campaign;
 mod executor;
+mod stock;
+
+pub use stock::{EventStockReconcileOptions, EventStockReconcileReport, reconcile_event_stock};
 
 const PLAN_VERSION: u32 = 2;
 const DEFAULT_REPLICANT: &str = "Chats-1";
@@ -44,6 +48,7 @@ enum Command {
     Plan,
     Run,
     Status,
+    ReconcileStock,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +59,7 @@ struct Config {
     replicant: Option<String>,
     home: String,
     database: PathBuf,
+    runtime_database: PathBuf,
     plan_path: PathBuf,
     replace_plan: bool,
     all_events: bool,
@@ -64,6 +70,7 @@ struct Config {
     verbose: bool,
     log_file: Option<PathBuf>,
     json: bool,
+    reconcile_execute: bool,
 }
 
 impl Config {
@@ -75,6 +82,10 @@ impl Config {
         let mut home = env::var("RS_EVENT_HOME").unwrap_or_else(|_| DEFAULT_HOME.into());
         let mut database = PathBuf::from(
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
+        );
+        let mut runtime_database = PathBuf::from(
+            env::var("REPLICANT_RUNTIME_DB")
+                .unwrap_or_else(|_| "replicant-runtime.sqlite".into()),
         );
         let mut plan_path =
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
@@ -96,6 +107,7 @@ impl Config {
         let mut verbose = env_flag("RS_EVENT_VERBOSE");
         let mut log_file = env::var("RS_EVENT_LOG_FILE").ok().map(PathBuf::from);
         let mut json = false;
+        let mut reconcile_execute = false;
 
         let mut arguments = arguments.into_iter().peekable();
         if let Some(first) = arguments.peek().map(String::as_str) {
@@ -115,6 +127,10 @@ impl Config {
                 "status" => {
                     arguments.next();
                     Command::Status
+                }
+                "reconcile-stock" | "reconcile_stock" => {
+                    arguments.next();
+                    Command::ReconcileStock
                 }
                 "-h" | "--help" => {
                     print_help();
@@ -136,6 +152,12 @@ impl Config {
                 "--home" => home = required_argument(&mut arguments, "--home")?,
                 "--database" => {
                     database = PathBuf::from(required_argument(&mut arguments, "--database")?)
+                }
+                "--runtime-database" => {
+                    runtime_database = PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--runtime-database",
+                    )?)
                 }
                 "--plan-file" => {
                     plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
@@ -191,6 +213,8 @@ impl Config {
                     )?))
                 }
                 "--json" => json = true,
+                "--execute" if command == Command::ReconcileStock => reconcile_execute = true,
+                "--dry-run" if command == Command::ReconcileStock => reconcile_execute = false,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -259,6 +283,7 @@ impl Config {
             replicant,
             home: home.to_uppercase(),
             database,
+            runtime_database,
             plan_path,
             replace_plan,
             all_events,
@@ -269,6 +294,7 @@ impl Config {
             verbose,
             log_file,
             json,
+            reconcile_execute,
         })
     }
 
@@ -340,11 +366,12 @@ fn env_flag(name: &str) -> bool {
 fn print_help() {
     println!(
         "Replicant event logistics\n\n\
-Usage:\n  replicant-cli event\n  replicant-cli event --list [OPTIONS]\n  replicant-cli event --plan [EVENT] [OPTIONS]\n  replicant-cli event --plan --all [OPTIONS]\n  replicant-cli event --run [OPTIONS]\n  replicant-cli event --status [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --region REGION           Limit discovery to a catalogue region\n  --center LOCATION         Radius centre; accepts a star, system, or location\n  --radius LY               Limit discovery to LY around --center or --home\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  -h, --help                Show this help\n\n\
+Usage:\n  replicant-cli event\n  replicant-cli event --list [OPTIONS]\n  replicant-cli event --plan [EVENT] [OPTIONS]\n  replicant-cli event --plan --all [OPTIONS]\n  replicant-cli event --run [OPTIONS]\n  replicant-cli event --status [OPTIONS]\n  replicant-cli event reconcile-stock [--dry-run|--execute] [OPTIONS]\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --region REGION           Limit discovery to a catalogue region\n  --center LOCATION         Radius centre; accepts a star, system, or location\n  --radius LY               Limit discovery to LY around --center or --home\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --runtime-database PATH   Workflow SQLite database (default: replicant-runtime.sqlite)\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  --dry-run                 Report reconcile-stock changes without mutations (default)\n  --execute                 Apply reconcile-stock tag changes\n  -h, --help                Show this help\n\n\
 Planning performs no gameplay mutations. Run always reconciles and continues\n\
 the persisted mission or all-events campaign; there is no separate resume\n\
-command or --execute flag. Campaigns start print queues before completing\n\
+command. `reconcile-stock` is dry-run by default; its --execute flag applies\n\
+only to that maintenance command. Campaigns start print queues before completing\n\
 material-only events while manufacturing continues. Region and radius scopes\n\
 are persisted in mission files; --region is mutually exclusive with\n\
 --center/--radius."
@@ -506,7 +533,7 @@ pub async fn plan_event_mission(
     let plan = EventMissionPlan {
         version: PLAN_VERSION,
         mission_id: mission_id.clone(),
-        mission_tag: mission_tag(&mission_id),
+        mission_tag: mission_tag(&event_plan.event.designation),
         phase: MissionPhase::Planned,
         selected_replicant: replicant.key.id.as_str().to_owned(),
         home_location: request.home.clone(),
@@ -577,6 +604,7 @@ pub async fn plan_event_campaign(
         replicant: Some(request.replicant.clone()),
         home: request.home.to_uppercase(),
         database: PathBuf::new(),
+        runtime_database: PathBuf::new(),
         plan_path: request.plan_file.clone(),
         replace_plan: request.replace_plan,
         all_events: true,
@@ -587,6 +615,7 @@ pub async fn plan_event_campaign(
         verbose: false,
         log_file: None,
         json: true,
+        reconcile_execute: false,
     };
     let scope = config.event_scope();
     let events = fetch_active_events_in_scope(client, &scope).await?;
@@ -636,6 +665,10 @@ pub fn restore_event_campaign(plan_file: &Path, archive: &EventCampaignArchive) 
             fs::create_dir_all(parent)?;
         }
         fs::write(path, contents)?;
+    }
+    let mut campaign = campaign::load_campaign(plan_file)?;
+    if campaign::compact_planning_window(&mut campaign)? > 0 {
+        campaign::save_campaign(plan_file, &campaign)?;
     }
     Ok(())
 }
@@ -853,10 +886,60 @@ pub async fn run_cli(arguments: Vec<String>) -> AnyResult<()> {
         None
     };
     let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
+    if config.command == Command::ReconcileStock {
+        let repository = WorkflowRepository::open(&config.runtime_database)?;
+        let report = reconcile_event_stock(
+            &client,
+            &repository,
+            EventStockReconcileOptions {
+                execute: config.reconcile_execute,
+                reclaim_unknown_orphans: true,
+            },
+        )
+        .await?;
+        render_stock_reconcile_report(&report, config.json)?;
+        client.close().await?;
+        return Ok(());
+    }
     let result = run(&client, &config).await;
     let close_result = client.close().await;
     close_result?;
     result
+}
+
+fn render_stock_reconcile_report(report: &EventStockReconcileReport, json: bool) -> AnyResult<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Event stock reconciliation ({})",
+        if report.executed { "EXECUTE" } else { "DRY RUN" }
+    );
+    println!("  Owned devices scanned:      {}", report.scanned_devices);
+    println!("  Event-tagged devices:       {}", report.event_tagged_devices);
+    println!("  Exact event reclaims:       {}", report.event_reclaims);
+    println!(
+        "  Regional-stock reclaims:   {}",
+        report.regional_stock_reclaims
+    );
+    println!("  Active reservations kept:   {}", report.active_reservations);
+    println!("  Ambiguous/manual review:    {}", report.ambiguous);
+    for device in &report.devices {
+        if device.target_tag.is_some() || device.disposition.contains("manual review") {
+            println!(
+                "  {:<10} {:<28} {}{}",
+                device.device,
+                device.target_tag.as_deref().unwrap_or("-"),
+                device.disposition,
+                if device.changed { " [changed]" } else { "" }
+            );
+        }
+    }
+    if !report.executed {
+        println!("Dry run only. Re-run with --execute after reviewing the assignments.");
+    }
+    Ok(())
 }
 
 fn init_logging(config: &Config) -> AnyResult<()> {
@@ -1021,7 +1104,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
     let plan = EventMissionPlan {
         version: PLAN_VERSION,
         mission_id: mission_id.clone(),
-        mission_tag: mission_tag(&mission_id),
+        mission_tag: mission_tag(&event_plan.event.designation),
         phase: MissionPhase::Planned,
         selected_replicant: replicant_code,
         home_location: config.home.clone(),
@@ -1468,6 +1551,7 @@ async fn build_context(
         earned_achievements: earned.clone(),
         home_location: home.to_owned(),
         mission_tag_prefix: EVENT_MISSION_TAG_PREFIX.into(),
+        event_mission_tag: Some(mission_tag(&event.designation)),
     })
 }
 
@@ -2027,6 +2111,7 @@ fn execution_config(request: &EventExecutionRequest) -> Config {
         replicant: None,
         home: DEFAULT_HOME.into(),
         database: PathBuf::new(),
+        runtime_database: PathBuf::new(),
         plan_path: request.plan_file.clone(),
         replace_plan: false,
         all_events: false,
@@ -2037,6 +2122,7 @@ fn execution_config(request: &EventExecutionRequest) -> Config {
         verbose: false,
         log_file: None,
         json: false,
+        reconcile_execute: false,
     }
 }
 
