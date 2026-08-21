@@ -60,6 +60,8 @@ const SNAPSHOT_NS: &str = "director.snapshot";
 const BLUEPRINT_SHOP_NS: &str = "director.blueprint_shop_opportunity";
 const BLUEPRINT_SHOP_CACHE_NS: &str = "director.blueprint_shop_snapshot";
 const BLUEPRINT_SHOP_CACHE_KEY: &str = "latest";
+const BLUEPRINT_CATALOGUE_CACHE_NS: &str = "director.blueprint_catalogue";
+const BLUEPRINT_CATALOGUE_CACHE_KEY: &str = "latest";
 const HUB_REFRESH_CACHE_NS: &str = "director.system_hub_refresh";
 const HUB_REFRESH_CACHE_KEY: &str = "latest";
 const ACTIVE_EVENT_CACHE_NS: &str = "director.active_event_snapshot";
@@ -84,6 +86,7 @@ const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
 const BLUEPRINT_SHOP_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
 const BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
+const BLUEPRINT_CATALOGUE_CACHE_TTL_MS: i64 = 30 * 60 * 1000;
 const HUB_REFRESH_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 const ACTIVE_EVENT_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
 const ACTIVE_EVENT_STALE_FALLBACK_MS: i64 = 10 * 60 * 1000;
@@ -211,6 +214,15 @@ struct BlueprintShopCache {
     #[serde(default)]
     requested_blueprints: BTreeSet<String>,
     snapshot: BlueprintShopSnapshot,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct BlueprintCatalogueCache {
+    refreshed_at_ms: i64,
+    #[serde(default)]
+    requirement_signature: BTreeSet<String>,
+    #[serde(default)]
+    unlocked_device_types: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -604,17 +616,52 @@ pub async fn reconcile_director(
                 && !devices.iter().any(|device| {
                     device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
                 }));
-    let unlocked_blueprints = if blueprint_catalogue_needed {
-        match client.blueprints().unlocked_device_types().await {
-            Ok(blueprints) => Some(blueprints),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    phase = "requirements",
-                    "Director could not inspect managed blueprint state"
-                );
-                None
+    let mut blueprint_cache = load_blueprint_catalogue_cache(&repository)?;
+    let mut blueprint_refreshed_this_pass = false;
+    let mut unlocked_blueprints = if blueprint_catalogue_needed {
+        let refresh_due = blueprint_catalogue_refresh_due(
+            &repository,
+            blueprint_cache.as_ref(),
+            now,
+            force_slow_refresh,
+            None,
+        )?;
+        if refresh_due {
+            match refresh_blueprint_catalogue(client).await {
+                Ok(blueprints) => {
+                    blueprint_refreshed_this_pass = true;
+                    let cache = store_blueprint_catalogue_cache(
+                        &repository,
+                        now,
+                        blueprint_cache
+                            .as_ref()
+                            .map(|cache| cache.requirement_signature.clone())
+                            .unwrap_or_default(),
+                        &blueprints,
+                    )?;
+                    blueprint_cache = Some(cache);
+                    Some(blueprints)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        phase = "requirements",
+                        "Director could not refresh managed blueprint state; using the last cached catalogue when available"
+                    );
+                    blueprint_cache.as_ref().map(cached_blueprint_types)
+                }
             }
+        } else {
+            if let Some(cache) = blueprint_cache.as_ref() {
+                tracing::debug!(
+                    age_ms = now.saturating_sub(cache.refreshed_at_ms),
+                    ttl_ms = BLUEPRINT_CATALOGUE_CACHE_TTL_MS,
+                    blueprints = cache.unlocked_device_types.len(),
+                    phase = "requirements",
+                    "Director reused cached unlocked blueprint catalogue"
+                );
+            }
+            blueprint_cache.as_ref().map(cached_blueprint_types)
         }
     } else {
         None
@@ -792,6 +839,44 @@ pub async fn reconcile_director(
             "Beacon placement policy is not yet enabled in the Director planner",
             "Existing event/bootstrap automation may still deploy required beacons",
         ));
+    }
+
+    if blueprint_catalogue_needed {
+        let requirement_signature = requirements
+            .current_blueprint_priorities()
+            .keys()
+            .map(|device_type| device_type.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let signature_changed = blueprint_cache
+            .as_ref()
+            .is_none_or(|cache| cache.requirement_signature != requirement_signature);
+        if signature_changed && !blueprint_refreshed_this_pass {
+            match refresh_blueprint_catalogue(client).await {
+                Ok(blueprints) => {
+                    unlocked_blueprints = Some(blueprints.clone());
+                    store_blueprint_catalogue_cache(
+                        &repository,
+                        now,
+                        requirement_signature,
+                        &blueprints,
+                    )?;
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    phase = "requirements",
+                    "Director could not refresh blueprint state after the requirement set changed"
+                ),
+            }
+        } else if signature_changed
+            && let Some(cache) = blueprint_cache.as_mut()
+        {
+            cache.requirement_signature = requirement_signature;
+            repository.put_document(
+                BLUEPRINT_CATALOGUE_CACHE_NS,
+                BLUEPRINT_CATALOGUE_CACHE_KEY,
+                cache,
+            )?;
+        }
     }
 
     // Shop discovery is intentionally demand-driven and happens only after
@@ -1180,6 +1265,74 @@ fn reconcile_expand_star_catalogue(
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
+}
+
+fn load_blueprint_catalogue_cache(
+    repository: &WorkflowRepository,
+) -> Result<Option<BlueprintCatalogueCache>, ApplicationError> {
+    repository
+        .read_document(BLUEPRINT_CATALOGUE_CACHE_NS, BLUEPRINT_CATALOGUE_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value(value).map_err(ApplicationError::from))
+        .transpose()
+}
+
+fn cached_blueprint_types(cache: &BlueprintCatalogueCache) -> BTreeSet<DeviceType> {
+    cache
+        .unlocked_device_types
+        .iter()
+        .map(|device_type| DeviceType::from(device_type.as_str()))
+        .collect()
+}
+
+fn blueprint_catalogue_refresh_due(
+    repository: &WorkflowRepository,
+    cache: Option<&BlueprintCatalogueCache>,
+    now: i64,
+    force_refresh: bool,
+    requirement_signature: Option<&BTreeSet<String>>,
+) -> Result<bool, ApplicationError> {
+    let Some(cache) = cache else {
+        return Ok(true);
+    };
+    if force_refresh
+        || now.saturating_sub(cache.refreshed_at_ms) >= BLUEPRINT_CATALOGUE_CACHE_TTL_MS
+        || requirement_signature.is_some_and(|signature| cache.requirement_signature != *signature)
+    {
+        return Ok(true);
+    }
+    Ok(repository.list()?.iter().any(|workflow| {
+        workflow.kind == blueprint_acquire_workflow_kind()
+            && workflow.status == WorkflowStatus::Succeeded
+            && workflow.updated_at > cache.refreshed_at_ms
+    }))
+}
+
+async fn refresh_blueprint_catalogue(
+    client: &Client,
+) -> Result<BTreeSet<DeviceType>, replicant_client::Error> {
+    client.blueprints().unlocked_device_types().await
+}
+
+fn store_blueprint_catalogue_cache(
+    repository: &WorkflowRepository,
+    now: i64,
+    requirement_signature: BTreeSet<String>,
+    blueprints: &BTreeSet<DeviceType>,
+) -> Result<BlueprintCatalogueCache, ApplicationError> {
+    let cache = BlueprintCatalogueCache {
+        refreshed_at_ms: now,
+        requirement_signature,
+        unlocked_device_types: blueprints
+            .iter()
+            .map(|device_type| device_type.as_str().to_owned())
+            .collect(),
+    };
+    repository.put_document(
+        BLUEPRINT_CATALOGUE_CACHE_NS,
+        BLUEPRINT_CATALOGUE_CACHE_KEY,
+        &cache,
+    )?;
+    Ok(cache)
 }
 
 async fn blueprint_shop_snapshot_for_requirements(
@@ -4518,6 +4671,55 @@ mod tests {
             travel: None,
             access: replicant_client::domain::AccessScope::Owned,
         }
+    }
+
+    #[test]
+    fn blueprint_catalogue_cache_uses_thirty_minute_ttl_and_requirement_invalidation() {
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let now = 10_000_000_i64;
+        let cache = BlueprintCatalogueCache {
+            refreshed_at_ms: now - BLUEPRINT_CATALOGUE_CACHE_TTL_MS + 1,
+            requirement_signature: BTreeSet::from(["comm_satellite".to_owned()]),
+            unlocked_device_types: BTreeSet::from(["ftl_relay".to_owned()]),
+        };
+        let same_requirements = BTreeSet::from(["comm_satellite".to_owned()]);
+        assert!(
+            !blueprint_catalogue_refresh_due(
+                &repository,
+                Some(&cache),
+                now,
+                false,
+                Some(&same_requirements),
+            )
+            .expect("cache decision")
+        );
+
+        let changed_requirements = BTreeSet::from(["signal_booster".to_owned()]);
+        assert!(
+            blueprint_catalogue_refresh_due(
+                &repository,
+                Some(&cache),
+                now,
+                false,
+                Some(&changed_requirements),
+            )
+            .expect("requirement invalidation")
+        );
+
+        let expired = BlueprintCatalogueCache {
+            refreshed_at_ms: now - BLUEPRINT_CATALOGUE_CACHE_TTL_MS,
+            ..cache
+        };
+        assert!(
+            blueprint_catalogue_refresh_due(
+                &repository,
+                Some(&expired),
+                now,
+                false,
+                Some(&same_requirements),
+            )
+            .expect("ttl expiration")
+        );
     }
 
     #[test]

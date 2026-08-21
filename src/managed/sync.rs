@@ -815,22 +815,38 @@ impl SyncClient {
                 "synchronizing location"
             );
             let request_started = Instant::now();
-            let response = self
+            let response = match self
                 .client
                 .managed_raw()
                 .locations()
                 .get(designation, None)
                 .await
-                .map_err(|error| SyncDomainError {
-                    outcome: SyncOutcome {
-                        pages: usize::from(completed > 0),
-                        items: completed,
-                        revisions: completed,
-                        complete: false,
-                        reconciliation_queued: false,
-                    },
-                    error,
-                })?;
+            {
+                Ok(response) => response,
+                Err(error) if location_is_temporarily_unobservable(&error) => {
+                    debug!(
+                        target: "replicant_client::sync",
+                        event = "sync.location_unobservable",
+                        designation = %designation,
+                        index = index + 1,
+                        total = designations.len(),
+                        "skipping location detail that currently requires a replicant in-system"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(SyncDomainError {
+                        outcome: SyncOutcome {
+                            pages: usize::from(completed > 0),
+                            items: completed,
+                            revisions: completed,
+                            complete: false,
+                            reconciliation_queued: false,
+                        },
+                        error,
+                    });
+                }
+            };
             let request_elapsed = request_started.elapsed();
             let normalize_started = Instant::now();
             let observation = domain::location_detail(&response.value, Realm::Live, observed_at())
@@ -1010,6 +1026,18 @@ fn observed_at() -> crate::domain::ObservationTime {
     crate::domain::ObservationTime::now()
 }
 
+fn location_is_temporarily_unobservable(error: &Error) -> bool {
+    error.status() == Some(403)
+        && error
+            .details()
+            .and_then(|details| details.message.as_deref())
+            .is_some_and(|message| {
+                message
+                    .to_ascii_lowercase()
+                    .contains("no replicant in system")
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1051,27 @@ mod tests {
     use crate::raw::{SecretString, Url};
 
     use crate::managed::test_client_at as client_at;
+
+    #[test]
+    fn location_without_in_system_replicant_is_skipped_during_sync() {
+        let error = Error::Contract {
+            status: 403,
+            details: Box::new(crate::ErrorDetails {
+                message: Some("No replicant in system".to_owned()),
+                ..Default::default()
+            }),
+        };
+        assert!(location_is_temporarily_unobservable(&error));
+
+        let other_forbidden = Error::Contract {
+            status: 403,
+            details: Box::new(crate::ErrorDetails {
+                message: Some("Not your location".to_owned()),
+                ..Default::default()
+            }),
+        };
+        assert!(!location_is_temporarily_unobservable(&other_forbidden));
+    }
 
     #[test]
     fn dependency_ordering_is_stable() {

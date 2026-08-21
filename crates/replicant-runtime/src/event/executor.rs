@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::future::{join_all, try_join_all};
@@ -37,6 +37,7 @@ const CARGO_FREIGHTER: &str = "cargo_freighter";
 const FTL_BEACON: &str = "ftl_beacon";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const AUTHORITATIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const BLOCKED_PREREQUISITE_RECHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CampaignReplanReservations {
@@ -68,6 +69,8 @@ pub(crate) struct ExecutionState {
     pub(crate) printer_lanes: Vec<String>,
     #[serde(default)]
     pub(crate) queue_adoption_checked: bool,
+    #[serde(default)]
+    pub(crate) last_blocked_prerequisite_check_at_ms: Option<i64>,
     #[serde(default)]
     pub(crate) event_resolved: bool,
     #[serde(default)]
@@ -1783,6 +1786,20 @@ async fn prepare_print_prerequisites(
     batch_indexes: &[usize],
 ) -> AnyResult<BTreeSet<usize>> {
     if batch_indexes.is_empty() {
+        let now = event_now_millis();
+        if plan
+            .execution
+            .last_blocked_prerequisite_check_at_ms
+            .is_some_and(|last| {
+                now.saturating_sub(last)
+                    < i64::try_from(BLOCKED_PREREQUISITE_RECHECK_INTERVAL.as_millis())
+                        .unwrap_or(i64::MAX)
+            })
+        {
+            return Ok(BTreeSet::new());
+        }
+        plan.execution.last_blocked_prerequisite_check_at_ms = Some(now);
+        save_plan(&config.plan_path, plan)?;
         let mut options = QueueOptions::at(plan.home_location.clone());
         options.tags = vec![plan.mission_tag.clone(), role_tag("component")];
         options.poll_interval = POLL_INTERVAL;
@@ -1926,14 +1943,22 @@ async fn wait_for_print_outputs(
                 ),
             ));
         }
-        let wake = wait_for_relevant_event(
+        let wake = wait_for_mission_print_event(
             &mut watch,
             deadline,
-            &["print.completed", "device.print_completed"],
+            &plan.mission_tag,
         )
         .await?;
+        if wake == WaitWake::Event {
+            // A completed print may satisfy a blocked parent's recursive
+            // prerequisite chain. Recheck immediately on evidence; otherwise
+            // the persisted fallback probe is limited to once every five minutes.
+            plan.execution.last_blocked_prerequisite_check_at_ms = None;
+            let _ = prepare_print_prerequisites(client, config, plan, &[]).await?;
+        }
         if matches!(wake, WaitWake::Poll | WaitWake::Gap) {
             reconcile_print_batches(client, plan, true).await?;
+            let _ = prepare_print_prerequisites(client, config, plan, &[]).await?;
             save_plan(&config.plan_path, plan)?;
         }
     }
@@ -4407,6 +4432,40 @@ enum WaitWake {
     Gap,
 }
 
+async fn wait_for_mission_print_event(
+    watch: &mut replicant_client::EventWatch,
+    deadline: Instant,
+    mission_tag: &str,
+) -> AnyResult<WaitWake> {
+    let poll_deadline = Instant::now() + AUTHORITATIVE_POLL_INTERVAL;
+    loop {
+        let wake_deadline = deadline.min(poll_deadline);
+        let remaining = wake_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(WaitWake::Poll);
+        }
+        match timeout(remaining, watch.next()).await {
+            Ok(Ok(event))
+                if matches!(event.name.as_str(), "print.completed" | "device.print_completed")
+                    && event.payload.get("tags").is_some_and(|tags| {
+                        tags.as_array().is_some_and(|tags| {
+                            tags.iter().any(|tag| tag.as_str() == Some(mission_tag))
+                        })
+                    }) =>
+            {
+                return Ok(WaitWake::Event);
+            }
+            Ok(Ok(_)) => continue,
+            Err(_) => return Ok(WaitWake::Poll),
+            Ok(Err(error)) => {
+                warn!(error = %error, "event watcher gap; falling back to authoritative refresh");
+                sleep(Duration::from_millis(250)).await;
+                return Ok(WaitWake::Gap);
+            }
+        }
+    }
+}
+
 async fn wait_for_relevant_event(
     watch: &mut replicant_client::EventWatch,
     deadline: Instant,
@@ -4444,6 +4503,14 @@ async fn wait_for_relevant_event_with_interval(
             }
         }
     }
+}
+
+fn event_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {

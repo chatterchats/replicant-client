@@ -27,7 +27,7 @@ use axum::{
 use futures_util::StreamExt;
 use replicant_client::{
     ClientDegradation, ClientStatus,
-    domain::{Device, Inventory, InventoryOwner, Realm},
+    domain::{AccessScope, Device, Inventory, InventoryOwner, Realm},
     managed::{Client, OperationStatus as ManagedOperationStatus},
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
@@ -2337,12 +2337,21 @@ async fn device_logs(
     Path(code): Path<String>,
     Query(query): Query<DeviceLogsQueryParams>,
 ) -> Result<Json<Versioned<DeviceLogsSnapshot>>, ApiError> {
+    // Device logs are an account-owned endpoint upstream. Consult the managed
+    // projection first so inspecting a public/foreign device cannot waste an
+    // API request only to turn a predictable 403 into a misleading daemon 503.
     let handle = state
         .client()
         .devices()
-        .get(&code)
+        .cached(&code)
+        .ok_or(ApiError::device_not_found())?;
+    let snapshot = handle
+        .snapshot()
         .await
         .map_err(|_| ApiError::unavailable())?;
+    if snapshot.access != AccessScope::Owned {
+        return Err(ApiError::forbidden_device_logs());
+    }
     let response = handle
         .logs(&replicant_client::raw::devices::DeviceLogsQuery {
             cursor: query.cursor,
@@ -5729,6 +5738,22 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
             message: "a valid daemon token is required",
+        }
+    }
+
+    fn forbidden_device_logs() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "device_logs_forbidden",
+            message: "device logs are only available for account-owned devices",
+        }
+    }
+
+    fn device_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "device_not_found",
+            message: "device is not present in managed state",
         }
     }
 

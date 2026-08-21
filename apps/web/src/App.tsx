@@ -868,7 +868,9 @@ function Inspector({
             </div>
           </section>
         ) : null}
-        {device ? <DeviceLogPanel device={device.entity.id} /> : null}
+        {device?.ownership.toLowerCase() === "owned" ? (
+          <DeviceLogPanel device={device.entity.id} />
+        ) : null}
       </div>
       {targetSystem || entity.kind === "workflow" ? (
         <div className="inspector-actions">

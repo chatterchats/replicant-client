@@ -29,7 +29,7 @@ const SCAN_TOUR_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 // expansion for many minutes. The prerequisite workflow itself reacts to
 // managed evidence; parents only need an occasional reconciliation pass to
 // observe completion.
-const EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 // Frontier expansion can be blocked for minutes or hours on a blueprint,
 // prerequisite manufacturing, or temporary upstream availability. Re-running
 // the full relay planner every five seconds only burns API budget while the

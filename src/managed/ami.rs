@@ -477,8 +477,8 @@ mod tests {
     use super::*;
     use crate::domain::{
         AccessScope, Device, DeviceId, DeviceKey, DeviceRelationships,
-        DeviceStatus as DomainDeviceStatus, Observation, ObservationAuthority, ObservationMetadata,
-        ObservationSource, Reachability, SourceDocument,
+        DeviceStatus as DomainDeviceStatus, LocationId, LocationKey, Observation,
+        ObservationAuthority, ObservationMetadata, ObservationSource, Reachability, SourceDocument,
     };
     use crate::{Client, Error};
 
@@ -495,7 +495,7 @@ mod tests {
                 key: DeviceKey::live(DeviceId::from(code)),
                 device_type: Some(device_type),
                 status: Some(DomainDeviceStatus::from("active")),
-                location: None,
+                location: Some(LocationKey::live(LocationId::from("SOL-3-L4"))),
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives,

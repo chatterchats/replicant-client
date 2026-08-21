@@ -1409,7 +1409,8 @@ impl LocationEventsGateway {
 fn check_device_capability(client: &Client, device_code: &str, command_name: &str) -> Result<()> {
     let key = DeviceKey::live(DeviceId::from(device_code));
     if let Some(observation) = client.managed_state().device(&key) {
-        let known = &observation.value.available_commands;
+        let device = &observation.value;
+        let known = &device.available_commands;
         if !known.is_empty() && !known.iter().any(|command| command.as_str() == command_name) {
             return Err(Error::Operation {
                 message: format!(
@@ -1417,8 +1418,37 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
                 ),
             });
         }
+        if device_command_requires_star_system(command_name)
+            && (device.location.is_none() || device.travel.is_some())
+        {
+            return Err(Error::Operation {
+                message: format!(
+                    "device `{device_code}` is not currently projected as stationary in a star system; refusing `{command_name}` until managed state catches up"
+                ),
+            });
+        }
     }
     Ok(())
+}
+
+fn device_command_requires_star_system(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "activate"
+            | "collect_resources"
+            | "deploy"
+            | "deposit_resources"
+            | "launch"
+            | "prospect"
+            | "scan"
+            | "search"
+            | "set_entry_point"
+            | "start_mining"
+            | "system_scan"
+            | "travel"
+            | "triangulate"
+            | "unfurl"
+    )
 }
 
 /// Device commands whose own response documents a still-running,
@@ -2299,6 +2329,15 @@ mod tests {
     }
 
     use crate::managed::test_client_at as client_at;
+
+    #[test]
+    fn location_bound_device_commands_are_identified_for_stale_state_guard() {
+        assert!(device_command_requires_star_system("deploy"));
+        assert!(device_command_requires_star_system("system_scan"));
+        assert!(device_command_requires_star_system("travel"));
+        assert!(!device_command_requires_star_system("cancel"));
+        assert!(!device_command_requires_star_system("decommission"));
+    }
 
     #[tokio::test]
     async fn replicant_scoped_location_get_commits_aggregate_survey_progress() {

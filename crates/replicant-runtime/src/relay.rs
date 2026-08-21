@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 tokio::task_local! {
@@ -723,9 +723,20 @@ fn init_logging(config: &Config) -> AnyResult<()> {
 }
 
 async fn run(client: &Client, config: &Config) -> AnyResult<MissionPlan> {
-    let sync = client.sync().full().await?;
-    info!(readiness = ?sync.readiness, "full managed synchronization completed");
-    client.galaxy().refresh_catalogue().await?;
+    let resuming_plan = config.plan_path.exists() && !config.replace_plan;
+    if client.galaxy().catalogue().is_empty() {
+        info!(
+            resuming_plan,
+            "relay catalogue projection is empty; performing one targeted catalogue refresh"
+        );
+        client.galaxy().refresh_catalogue().await?;
+    } else {
+        debug!(
+            resuming_plan,
+            catalogue_stars = client.galaxy().catalogue().len(),
+            "relay workflow is using the managed galaxy projection"
+        );
+    }
 
     let requested_replicant = if config.command == Command::Run && config.plan_path.exists() {
         load_plan(&config.plan_path)?.replicant_code
@@ -1836,17 +1847,26 @@ async fn refresh_device_census(
     systems: &BTreeSet<String>,
     printing_blueprints: &BTreeMap<String, PrintingBlueprint>,
 ) -> AnyResult<DeviceCensus> {
-    let handles = client
-        .devices()
-        .refresh_many()
-        .page_size(50)
-        .max_pages(200)
-        .collect()
-        .await?;
+    // Relay planning consumes the daemon's SSE-backed managed projection. A
+    // full account device traversal here was especially expensive when several
+    // durable frontiers resumed together after restart. If one cached handle is
+    // stale/missing, refresh only that device rather than the whole fleet.
+    let handles = client.devices().find().owned().collect().await?;
     let mut devices = BTreeMap::new();
     for handle in handles {
-        let snapshot = handle.snapshot().await?;
-        devices.insert(handle.id().as_str().to_owned(), snapshot);
+        let code = handle.id().as_str().to_owned();
+        let snapshot = match handle.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    device = %code,
+                    error = %error,
+                    "relay census found an incomplete managed device snapshot; refreshing only that device"
+                );
+                client.devices().refresh(&code).await?.snapshot().await?
+            }
+        };
+        devices.insert(code, snapshot);
     }
 
     let mut active_relay_codes = BTreeMap::<String, Vec<String>>::new();
@@ -4857,9 +4877,35 @@ async fn execute_stop(
         None
     };
 
+    info!(
+        system = %stop.system,
+        location = %stop.location,
+        relay = %relay_code,
+        device_type = %stop.device_type,
+        carrier = ?dsr_carrier,
+        "starting relay deployment stop"
+    );
     travel_to(client, config, &plan.replicant_code, &stop.location).await?;
+    info!(
+        system = %stop.system,
+        location = %stop.location,
+        relay = %relay_code,
+        "deployment replicant is in position for relay stop"
+    );
     if let Some(carrier_code) = dsr_carrier.as_deref() {
+        info!(
+            relay = %relay_code,
+            carrier = %carrier_code,
+            location = %stop.location,
+            "waiting for DSR attachment carrier at deployment stop"
+        );
         detach_dsr_at_stop(client, config, &stop, relay_code, carrier_code).await?;
+        info!(
+            relay = %relay_code,
+            carrier = %carrier_code,
+            system = %stop.system,
+            "DSR detached from carrier at deployment stop"
+        );
     } else {
         let relay = client.devices().get(relay_code).await?;
         let snapshot = relay.snapshot().await?;
@@ -4886,6 +4932,11 @@ async fn execute_stop(
     ensure_relay_unfurled(client, config, relay_code).await?;
     let snapshot = client.devices().get(relay_code).await?.snapshot().await?;
     if device_status(&snapshot) != Some(RELAYING) {
+        info!(
+            relay = %relay_code,
+            system = %stop.system,
+            "activating relay at deployment stop"
+        );
         if !device_has_command(&snapshot, "activate") {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
@@ -4899,6 +4950,12 @@ async fn execute_stop(
         })
         .await?;
     }
+    info!(
+        relay = %relay_code,
+        system = %stop.system,
+        preferred_parent = %stop.parent_system,
+        "waiting for relay topology evidence"
+    );
     wait_for_parent_connection(client, config, plan, index, relay_code).await?;
     plan.stops[index].completed = true;
     if let Some(carrier_code) = dsr_carrier.as_deref() {
@@ -5037,19 +5094,61 @@ async fn wait_for_device(
 ) -> AnyResult<()> {
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
+    let mut authoritative_refresh_due = client.devices().cached(code).is_none();
     loop {
-        let device = client.devices().get(code).await?.snapshot().await?;
-        if predicate(&device) {
-            return Ok(());
+        if let Some(handle) = client.devices().cached(code) {
+            match handle.snapshot().await {
+                Ok(device) if predicate(&device) => return Ok(()),
+                Ok(_) => {}
+                Err(error) => {
+                    debug!(
+                        device = %code,
+                        error = %error,
+                        "relay wait could not read the managed device projection"
+                    );
+                    authoritative_refresh_due = true;
+                }
+            }
+        } else {
+            authoritative_refresh_due = true;
         }
+
         if Instant::now() >= deadline {
             return Err(app_error(
                 io::ErrorKind::TimedOut,
                 format!("timed out waiting for device {code}"),
             ));
         }
-        wait_for_device_event(&mut watch, deadline, code).await?;
+
+        if authoritative_refresh_due {
+            debug!(
+                device = %code,
+                "relay wait performing bounded authoritative device refresh"
+            );
+            let device = client.devices().refresh(code).await?.snapshot().await?;
+            if predicate(&device) {
+                return Ok(());
+            }
+            authoritative_refresh_due = false;
+        }
+
+        match wait_for_device_event(&mut watch, deadline, code).await? {
+            DeviceWaitWake::Event => {
+                // The managed event reducer is the primary evidence path. The
+                // next loop reads the committed projection without another GET.
+            }
+            DeviceWaitWake::Poll | DeviceWaitWake::Gap => {
+                authoritative_refresh_due = true;
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceWaitWake {
+    Event,
+    Poll,
+    Gap,
 }
 
 /// Waits for an event naming `code`, bounded by the authoritative poll
@@ -5058,12 +5157,12 @@ async fn wait_for_device_event(
     watch: &mut replicant_client::EventWatch,
     deadline: Instant,
     code: &str,
-) -> AnyResult<()> {
+) -> AnyResult<DeviceWaitWake> {
     let poll_deadline = (Instant::now() + AUTHORITATIVE_POLL_INTERVAL).min(deadline);
     loop {
         let remaining = poll_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(());
+            return Ok(DeviceWaitWake::Poll);
         }
         match timeout(remaining, watch.next()).await {
             Ok(Ok(event))
@@ -5072,14 +5171,14 @@ async fn wait_for_device_event(
                     .as_ref()
                     .is_some_and(|device| device.id.as_str() == code) =>
             {
-                return Ok(());
+                return Ok(DeviceWaitWake::Event);
             }
             Ok(Ok(_)) => continue,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(DeviceWaitWake::Poll),
             Ok(Err(error)) => {
                 warn!(error = %error, "event watcher gap; falling back to authoritative refresh");
                 sleep(Duration::from_millis(250)).await;
-                return Ok(());
+                return Ok(DeviceWaitWake::Gap);
             }
         }
     }
@@ -5156,7 +5255,7 @@ async fn wait_for_parent_connection(
                 ),
             ));
         }
-        wait_for_device_event(&mut watch, deadline, relay_code).await?;
+        let _ = wait_for_device_event(&mut watch, deadline, relay_code).await?;
     }
 }
 
