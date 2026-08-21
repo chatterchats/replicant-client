@@ -34,8 +34,7 @@ const EVENT_DEPENDENCY_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_se
 // prerequisite manufacturing, or temporary upstream availability. Re-running
 // the full relay planner every five seconds only burns API budget while the
 // prerequisite is unchanged.
-const EXPLORATION_PREREQUISITE_POLLING_WAIT_RETRY_INTERVAL: Duration =
-    Duration::from_secs(300);
+const EXPLORATION_PREREQUISITE_POLLING_WAIT_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Boxed future returned by a workflow executor.
 pub type BoxWorkflowFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;

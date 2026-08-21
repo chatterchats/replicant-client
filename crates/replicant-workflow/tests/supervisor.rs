@@ -531,8 +531,7 @@ async fn polling_wait_is_not_restarted_on_every_supervisor_tick() {
             executions: executions.clone(),
         }))
         .expect("register workflow");
-    let mut supervisor =
-        WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
 
     wait_for_status(
         &mut supervisor,
@@ -542,7 +541,10 @@ async fn polling_wait_is_not_restarted_on_every_supervisor_tick() {
     )
     .await;
     for _ in 0..5 {
-        supervisor.tick().await.expect("reap or retry waiting workflow");
+        supervisor
+            .tick()
+            .await
+            .expect("reap or retry waiting workflow");
         tokio::task::yield_now().await;
     }
 

@@ -51,12 +51,12 @@ use replicant_client::{
 use replicant_printing::{
     Blueprint as PrintingBlueprint, FactoryWorkload, PrintRequest, QuantityMap,
     managed::{
-        FactoryState, PrintingError, discover_factories as discover_print_factories,
+        FactoryState, PrintingError, QueueOptions, discover_factories as discover_print_factories,
         discover_factory_codes as discover_print_factory_codes,
         enqueue_print as enqueue_shared_print,
         enqueue_print_flatpacked as enqueue_shared_print_flatpacked,
         fetch_blueprints as fetch_print_blueprints, printing_status_in_system,
-        queue_print_prerequisites_ahead, QueueOptions,
+        queue_print_prerequisites_ahead,
     },
     schedule_prints,
 };
@@ -1001,8 +1001,8 @@ async fn create_plan(
         account_wide = config.reuse_account_relays,
         "selected existing relay reuse scope"
     );
-    let dsr_available = printing_blueprints.contains_key(DEEP_SPACE_RELAY)
-        || !census.hub_stock_dsr.is_empty();
+    let dsr_available =
+        printing_blueprints.contains_key(DEEP_SPACE_RELAY) || !census.hub_stock_dsr.is_empty();
     let (network, dsr_systems) = plan_relay_network_with_dsr_fallback(
         &planning_stars,
         RelayNetworkRequest {
@@ -1070,11 +1070,16 @@ async fn create_plan(
         .map(|(index, system)| (system.as_str(), index))
         .collect::<BTreeMap<_, _>>();
     let mut action_order = network.execution_order.clone();
-    action_order.extend(dsr_systems.iter().filter(|system| {
-        nodes
-            .get(system.as_str())
-            .is_some_and(|node| node.relay == RelayAvailability::Active)
-    }).cloned());
+    action_order.extend(
+        dsr_systems
+            .iter()
+            .filter(|system| {
+                nodes
+                    .get(system.as_str())
+                    .is_some_and(|node| node.relay == RelayAvailability::Active)
+            })
+            .cloned(),
+    );
     action_order.sort_by(|left, right| {
         let left_node = nodes.get(left.as_str()).expect("planned node exists");
         let right_node = nodes.get(right.as_str()).expect("planned node exists");
@@ -1270,7 +1275,12 @@ async fn create_plan(
         })
         .count();
     let transport_capacity = free_slots.saturating_add(i64::try_from(already_stowed)?);
-    let transport_required = i64::try_from(stops.iter().filter(|stop| stop_uses_vessel_stow(stop)).count())?;
+    let transport_required = i64::try_from(
+        stops
+            .iter()
+            .filter(|stop| stop_uses_vessel_stow(stop))
+            .count(),
+    )?;
     if transport_required > 0 && transport_capacity <= 0 {
         return Err(app_error(
             io::ErrorKind::Other,
@@ -1341,7 +1351,6 @@ async fn create_plan(
     })
 }
 
-
 fn plan_relay_network_with_dsr_fallback(
     stars: &[PlannerStar],
     request: RelayNetworkRequest,
@@ -1350,11 +1359,8 @@ fn plan_relay_network_with_dsr_fallback(
 ) -> Result<(RelayNetworkPlan, BTreeSet<String>), PlannerError> {
     let mut planning_ranges = relay_ranges_ly;
     let mut dsr_systems = BTreeSet::new();
-    let mut result = plan_relay_network_with_ranges(
-        stars.to_vec(),
-        request.clone(),
-        planning_ranges.clone(),
-    );
+    let mut result =
+        plan_relay_network_with_ranges(stars.to_vec(), request.clone(), planning_ranges.clone());
     if result.is_ok() || !dsr_available {
         return result.map(|network| (network, dsr_systems));
     }
@@ -1373,7 +1379,10 @@ fn plan_relay_network_with_dsr_fallback(
                 ..
             } if *distance_ly <= DEEP_SPACE_RELAY_RANGE_LY + RELAY_DISTANCE_EPSILON => {
                 [from.as_str(), to.as_str()].into_iter().find_map(|system| {
-                    (planning_ranges.get(system).copied().unwrap_or(request.max_hop_ly)
+                    (planning_ranges
+                        .get(system)
+                        .copied()
+                        .unwrap_or(request.max_hop_ly)
                         + RELAY_DISTANCE_EPSILON
                         < DEEP_SPACE_RELAY_RANGE_LY)
                         .then(|| system.to_owned())
@@ -1394,8 +1403,7 @@ fn plan_relay_network_with_dsr_fallback(
                 .map(|bridge| bridge.from.clone())
                 .or_else(|| {
                     details.bridges.iter().find_map(|bridge| {
-                        (bridge.distance_ly
-                            <= DEEP_SPACE_RELAY_RANGE_LY + RELAY_DISTANCE_EPSILON
+                        (bridge.distance_ly <= DEEP_SPACE_RELAY_RANGE_LY + RELAY_DISTANCE_EPSILON
                             && planning_ranges
                                 .get(&bridge.to)
                                 .copied()
@@ -2180,7 +2188,13 @@ fn assign_unsubmitted_print_jobs(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assign_job_indices_with_shared_scheduler(
-        print_jobs, &indices, factories, ignored, blueprints, reserved_seconds, hub,
+        print_jobs,
+        &indices,
+        factories,
+        ignored,
+        blueprints,
+        reserved_seconds,
+        hub,
     )
 }
 
@@ -2346,9 +2360,7 @@ fn relay_batch_tag(
     let mode = if flatpack { "flatpack" } else { "assembled" };
     format!(
         "{RELAY_BATCH_TAG_PREFIX}{:016x}",
-        stable_tag_hash(&format!(
-            "{mission_id}:{factory_code}:{device_type}:{mode}"
-        ))
+        stable_tag_hash(&format!("{mission_id}:{factory_code}:{device_type}:{mode}"))
     )
 }
 
@@ -2375,7 +2387,12 @@ fn normalize_relay_print_jobs(jobs: &mut [PrintJob]) {
 fn assign_new_plan_print_batches(mission_id: &str, jobs: &mut [PrintJob]) {
     normalize_relay_print_jobs(jobs);
     for job in jobs {
-        job.batch_tag = Some(relay_batch_tag(mission_id, &job.factory_code, &job.device_type, job.flatpack));
+        job.batch_tag = Some(relay_batch_tag(
+            mission_id,
+            &job.factory_code,
+            &job.device_type,
+            job.flatpack,
+        ));
     }
 }
 
@@ -2388,7 +2405,11 @@ fn assign_safe_legacy_print_batches(plan: &mut MissionPlan) {
             && !job.submitted
             && job.relay_code.is_none()
         {
-            groups.insert((job.factory_code.clone(), job.device_type.clone(), job.flatpack));
+            groups.insert((
+                job.factory_code.clone(),
+                job.device_type.clone(),
+                job.flatpack,
+            ));
         }
     }
     for (factory_code, device_type, flatpack) in groups {
@@ -2400,12 +2421,7 @@ fn assign_safe_legacy_print_batches(plan: &mut MissionPlan) {
         }) {
             continue;
         }
-        let batch_tag = relay_batch_tag(
-            &plan.mission_id,
-            &factory_code,
-            &device_type,
-            flatpack,
-        );
+        let batch_tag = relay_batch_tag(&plan.mission_id, &factory_code, &device_type, flatpack);
         for job in &mut plan.print_jobs {
             if job.factory_code == factory_code
                 && job.device_type == device_type
@@ -3094,7 +3110,6 @@ async fn release_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) 
     Ok(())
 }
 
-
 fn plan_has_pending_dsr(plan: &MissionPlan) -> bool {
     plan.stops
         .iter()
@@ -3128,9 +3143,10 @@ async fn ensure_dsr_carrier_assignment(
             continue;
         }
         let snapshot = handle.snapshot().await?;
-        let conflicting = snapshot.tags.iter().any(|tag| {
-            tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str())
-        });
+        let conflicting = snapshot
+            .tags
+            .iter()
+            .any(|tag| tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str()));
         if conflicting
             || snapshot.attach_capacity.unwrap_or(0) <= 0
             || snapshot.travel.is_some()
@@ -3181,8 +3197,7 @@ async fn ensure_dsr_carrier_at_hub(
     if device_at(&carrier, &plan.hub_location) {
         return Ok(());
     }
-    if carrier.travel.is_some()
-        && travel_destination(&carrier) != Some(plan.hub_location.as_str())
+    if carrier.travel.is_some() && travel_destination(&carrier) != Some(plan.hub_location.as_str())
     {
         return Err(app_error(
             io::ErrorKind::InvalidData,
@@ -3214,7 +3229,10 @@ async fn ensure_dsr_carrier_dispatched(
     let relay_code = stop.relay_code.as_deref().ok_or_else(|| {
         app_error(
             io::ErrorKind::NotFound,
-            format!("stop {} has no assigned Deep Space Relay Station", stop.system),
+            format!(
+                "stop {} has no assigned Deep Space Relay Station",
+                stop.system
+            ),
         )
     })?;
 
@@ -3248,7 +3266,12 @@ async fn ensure_dsr_carrier_dispatched(
                 ),
             ));
         }
-        let carrier = client.devices().get(&carrier_code).await?.snapshot().await?;
+        let carrier = client
+            .devices()
+            .get(&carrier_code)
+            .await?
+            .snapshot()
+            .await?;
         if device_at(&carrier, &stop.location)
             || (carrier.travel.is_some()
                 && travel_destination(&carrier) == Some(stop.location.as_str()))
@@ -3393,11 +3416,7 @@ async fn send_dsr_carrier_home(
     }
 }
 
-async fn finish_dsr_carrier(
-    client: &Client,
-    config: &Config,
-    plan: &MissionPlan,
-) -> AnyResult<()> {
+async fn finish_dsr_carrier(client: &Client, config: &Config, plan: &MissionPlan) -> AnyResult<()> {
     let Some(carrier_code) = plan.dsr_carrier_code.as_deref() else {
         return Ok(());
     };
@@ -4520,13 +4539,10 @@ async fn submit_print_jobs(
                     print_job_correlation_tag(&plan.print_jobs[first_index]).to_owned();
                 let device_type = plan.print_jobs[first_index].device_type.clone();
                 let flatpack = plan.print_jobs[first_index].flatpack;
-                if selected
-                    .iter()
-                    .any(|index| {
-                        plan.print_jobs[*index].device_type != device_type
-                            || plan.print_jobs[*index].flatpack != flatpack
-                    })
-                {
+                if selected.iter().any(|index| {
+                    plan.print_jobs[*index].device_type != device_type
+                        || plan.print_jobs[*index].flatpack != flatpack
+                }) {
                     return Err(app_error(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -4847,7 +4863,9 @@ async fn execute_stop(
     } else {
         let relay = client.devices().get(relay_code).await?;
         let snapshot = relay.snapshot().await?;
-        if stop.action == StopAction::DeployAndActivate && snapshot.relationships.stowed_in.is_some() {
+        if stop.action == StopAction::DeployAndActivate
+            && snapshot.relationships.stowed_in.is_some()
+        {
             if !device_has_command(&snapshot, "deploy") {
                 return Err(app_error(
                     io::ErrorKind::InvalidData,
@@ -5130,7 +5148,11 @@ async fn wait_for_parent_connection(
                 io::ErrorKind::TimedOut,
                 format!(
                     "relay {relay_code} never joined the reachable mesh (preferred parent {expected_parent}; observed connections: {})",
-                    if observed.is_empty() { "none".to_owned() } else { observed.join(", ") }
+                    if observed.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        observed.join(", ")
+                    }
                 ),
             ));
         }
@@ -5411,8 +5433,7 @@ fn print_plan(plan: &MissionPlan) {
     );
     if plan.supply.is_none()
         && plan.planned_transport_capacity > 0
-        && i64::try_from(deployment_count).unwrap_or(i64::MAX)
-            > plan.planned_transport_capacity
+        && i64::try_from(deployment_count).unwrap_or(i64::MAX) > plan.planned_transport_capacity
     {
         println!("  Multi-trip execution adds a hub return between vessel loads.");
     }
@@ -5622,7 +5643,10 @@ pub async fn ftl_network_reachable_systems(
             format!("FTL connectivity origin {start} is not present in the star catalogue"),
         ));
     }
-    if let Some(target) = targets.iter().find(|target| !positions.contains_key(*target)) {
+    if let Some(target) = targets
+        .iter()
+        .find(|target| !positions.contains_key(*target))
+    {
         return Err(app_error(
             io::ErrorKind::NotFound,
             format!("FTL connectivity target {target} is not present in the star catalogue"),
@@ -5661,12 +5685,8 @@ pub async fn ftl_network_reachable_systems(
             .or_insert(range);
     }
 
-    let mut reachable = relay_mesh_reachable_systems(
-        &positions,
-        &relay_ranges,
-        start,
-        conventional_range_ly,
-    );
+    let mut reachable =
+        relay_mesh_reachable_systems(&positions, &relay_ranges, start, conventional_range_ly);
     // Same-system work never needs FTL even if the home system lacks a relay.
     reachable.insert(start.to_owned());
     reachable.retain(|system| targets.contains(system));
@@ -5681,9 +5701,11 @@ pub async fn ftl_network_reaches_system(
     conventional_range_ly: f64,
 ) -> AnyResult<bool> {
     let targets = BTreeSet::from([target.to_owned()]);
-    Ok(ftl_network_reachable_systems(client, start, &targets, conventional_range_ly)
-        .await?
-        .contains(target))
+    Ok(
+        ftl_network_reachable_systems(client, start, &targets, conventional_range_ly)
+            .await?
+            .contains(target),
+    )
 }
 
 fn relay_mesh_reachable_systems(
@@ -6049,26 +6071,23 @@ mod tests {
             max_hop_ly: DEFAULT_MAX_HOP_LY,
         };
 
-        let conventional = plan_relay_network_with_dsr_fallback(
-            &stars,
-            request.clone(),
-            BTreeMap::new(),
-            false,
-        );
-        assert!(matches!(conventional, Err(PlannerError::DisconnectedGap { .. })));
+        let conventional =
+            plan_relay_network_with_dsr_fallback(&stars, request.clone(), BTreeMap::new(), false);
+        assert!(matches!(
+            conventional,
+            Err(PlannerError::DisconnectedGap { .. })
+        ));
 
-        let (network, dsr_systems) = plan_relay_network_with_dsr_fallback(
-            &stars,
-            request,
-            BTreeMap::new(),
-            true,
-        )
-        .expect("10 ly DSR should bridge the 8.403 ly catalogue gap");
+        let (network, dsr_systems) =
+            plan_relay_network_with_dsr_fallback(&stars, request, BTreeMap::new(), true)
+                .expect("10 ly DSR should bridge the 8.403 ly catalogue gap");
         assert!(dsr_systems.contains("ANTAR"));
-        assert!(network
-            .edges
-            .iter()
-            .any(|edge| edge.distance_ly > DEFAULT_MAX_HOP_LY));
+        assert!(
+            network
+                .edges
+                .iter()
+                .any(|edge| edge.distance_ly > DEFAULT_MAX_HOP_LY)
+        );
     }
 
     #[test]
@@ -6097,13 +6116,9 @@ mod tests {
             max_hop_ly: DEFAULT_MAX_HOP_LY,
         };
 
-        assert!(plan_relay_network_with_dsr_fallback(
-            &stars,
-            request,
-            BTreeMap::new(),
-            true,
-        )
-        .is_err());
+        assert!(
+            plan_relay_network_with_dsr_fallback(&stars, request, BTreeMap::new(), true,).is_err()
+        );
     }
 
     #[test]
@@ -6267,7 +6282,8 @@ mod tests {
         assert_eq!(jobs.iter().filter(|job| job.factory_code == "A").count(), 2);
         assert_eq!(jobs.iter().filter(|job| job.factory_code == "B").count(), 1);
         assert!(jobs.iter().filter(|job| job.system != "TWO").all(|job| {
-            let expected = relay_batch_tag("mission-test", &job.factory_code, &job.device_type, false);
+            let expected =
+                relay_batch_tag("mission-test", &job.factory_code, &job.device_type, false);
             job.batch_tag.as_deref() == Some(expected.as_str())
         }));
     }

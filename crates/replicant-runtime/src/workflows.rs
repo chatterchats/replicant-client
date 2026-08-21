@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    catalogue::OperationCatalogue,
     automation::reconcile_event_connectivity,
+    catalogue::OperationCatalogue,
     event::{
         EventExecutionRequest, EventPlanningRequest, event_mission_preflight, execute_event,
         plan_event_mission,
@@ -345,8 +345,8 @@ impl WorkflowExecutor for EventWorkflow {
                     .map_err(|error| error.to_string())?;
                 }
 
-                let preflight =
-                    event_mission_preflight(&config.plan_file).map_err(|error| error.to_string())?;
+                let preflight = event_mission_preflight(&config.plan_file)
+                    .map_err(|error| error.to_string())?;
                 let targets = BTreeSet::from([preflight.target_system.clone()]);
                 if !reconcile_event_connectivity(
                     context,

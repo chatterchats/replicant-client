@@ -678,51 +678,48 @@ pub async fn reconcile_director(
 
     let mut event_discovery_error = None;
     let mut event_systems_by_region = BTreeMap::<String, BTreeSet<String>>::new();
-    let event_designations_by_region = if (goal_enabled(
-        &goal_controls,
-        DirectorGoalKind::EventCompletion,
-    ) || goal_enabled(
-        &goal_controls,
-        DirectorGoalKind::ExpandFtlNetwork,
-    )) && !established_regions.is_empty()
-    {
-        match active_events_for_director(
-            client,
-            repository.as_ref(),
-            now,
-            force_slow_refresh,
-            established_regions.len(),
-        )
-        .await
+    let event_designations_by_region =
+        if (goal_enabled(&goal_controls, DirectorGoalKind::EventCompletion)
+            || goal_enabled(&goal_controls, DirectorGoalKind::ExpandFtlNetwork))
+            && !established_regions.is_empty()
         {
-            Ok(active_events) => {
-                event_systems_by_region = group_active_event_systems_by_region(
-                    &active_events,
-                    &location_systems,
-                    &system_regions,
-                    &regions,
-                );
-                group_active_events_by_region(
-                    &active_events,
-                    &location_systems,
-                    &system_regions,
-                    &regions,
-                )
+            match active_events_for_director(
+                client,
+                repository.as_ref(),
+                now,
+                force_slow_refresh,
+                established_regions.len(),
+            )
+            .await
+            {
+                Ok(active_events) => {
+                    event_systems_by_region = group_active_event_systems_by_region(
+                        &active_events,
+                        &location_systems,
+                        &system_regions,
+                        &regions,
+                    );
+                    group_active_events_by_region(
+                        &active_events,
+                        &location_systems,
+                        &system_regions,
+                        &regions,
+                    )
+                }
+                Err(error) => {
+                    let message = format!("active-event discovery failed: {error}");
+                    tracing::warn!(
+                        error = %error,
+                        phase = "events",
+                        "Director active-event snapshot failed; continuing without event planning"
+                    );
+                    event_discovery_error = Some(message);
+                    BTreeMap::new()
+                }
             }
-            Err(error) => {
-                let message = format!("active-event discovery failed: {error}");
-                tracing::warn!(
-                    error = %error,
-                    phase = "events",
-                    "Director active-event snapshot failed; continuing without event planning"
-                );
-                event_discovery_error = Some(message);
-                BTreeMap::new()
-            }
-        }
-    } else {
-        BTreeMap::new()
-    };
+        } else {
+            BTreeMap::new()
+        };
 
     for region in &established_regions {
         goals.push(reconcile_maintain_system_hubs(

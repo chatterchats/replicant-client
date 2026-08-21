@@ -178,8 +178,7 @@ pub(super) fn target_systems(campaign: &EventCampaignPlan) -> AnyResult<BTreeSet
         .missions
         .iter()
         .map(|mission| {
-            load_plan(&mission.mission_path)
-                .map(|plan| system_from_location(&plan.event.location))
+            load_plan(&mission.mission_path).map(|plan| system_from_location(&plan.event.location))
         })
         .collect::<AnyResult<BTreeSet<_>>>()?;
     systems.extend(

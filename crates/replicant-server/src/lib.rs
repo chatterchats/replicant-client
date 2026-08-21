@@ -1638,9 +1638,7 @@ async fn refresh_cargo_cache(state: &Arc<AppState>) -> Result<Vec<CargoCarrierSu
     Ok(carriers)
 }
 
-async fn load_cargo_carriers(
-    state: &Arc<AppState>,
-) -> Result<Vec<CargoCarrierSummary>, ApiError> {
+async fn load_cargo_carriers(state: &Arc<AppState>) -> Result<Vec<CargoCarrierSummary>, ApiError> {
     let device_rows = device_rows(state).await?;
     let carrier_devices = device_rows
         .iter()

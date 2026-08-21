@@ -10,9 +10,7 @@ use replicant_workflow::WorkflowRepository;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use super::{
-    AnyResult, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, app_error,
-};
+use super::{AnyResult, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, app_error};
 
 const EVENT_STOCK_TAG_PREFIX: &str = "evt-stock:";
 
@@ -344,7 +342,6 @@ fn merge_identity(
         });
 }
 
-
 fn terminal_support_asset(tags: &[String]) -> bool {
     tags.iter().any(|tag| {
         matches!(
@@ -356,7 +353,9 @@ fn terminal_support_asset(tags: &[String]) -> bool {
 
 fn is_opaque_legacy_tag(tag: &str) -> bool {
     tag.strip_prefix(EVENT_MISSION_TAG_PREFIX)
-        .is_some_and(|suffix| suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn event_stock_tag(region: &str) -> String {

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use replicant_client::{
     managed::{AutofactoryPrintOptions, Client, Operation, OperationStatus},
     raw,
@@ -1849,10 +1849,7 @@ async fn run_device_lifecycle(
     device: &str,
     command: &str,
 ) -> Result<Value, CatalogueError> {
-    managed_operation_value(
-        create_device_lifecycle_operation(client, device, command).await?,
-    )
-    .await
+    managed_operation_value(create_device_lifecycle_operation(client, device, command).await?).await
 }
 
 fn bulk_device_codes(value: &str) -> Result<Vec<String>, CatalogueError> {
@@ -3137,11 +3134,7 @@ mod tests {
             ),
         ]);
         catalogue
-            .validate_invocation(
-                OperationClass::Action,
-                "device.lifecycle.bulk",
-                parameters,
-            )
+            .validate_invocation(OperationClass::Action, "device.lifecycle.bulk", parameters)
             .expect("bulk lifecycle action should validate");
         assert!(!catalogue.is_applicable(
             OperationClass::Action,
@@ -3175,14 +3168,8 @@ mod tests {
             .validate_action(
                 "survey.belt_search",
                 &BTreeMap::from([
-                    (
-                        "replicant".to_owned(),
-                        Value::String("Chats-4".to_owned()),
-                    ),
-                    (
-                        "systems".to_owned(),
-                        Value::String("SOL, VEGA".to_owned()),
-                    ),
+                    ("replicant".to_owned(), Value::String("Chats-4".to_owned())),
+                    ("systems".to_owned(), Value::String("SOL, VEGA".to_owned())),
                 ]),
             )
             .expect("explicit systems should validate");
@@ -3190,14 +3177,8 @@ mod tests {
             .validate_action(
                 "survey.belt_search",
                 &BTreeMap::from([
-                    (
-                        "replicant".to_owned(),
-                        Value::String("Chats-4".to_owned()),
-                    ),
-                    (
-                        "start".to_owned(),
-                        Value::String("SCEPTURUM".to_owned()),
-                    ),
+                    ("replicant".to_owned(), Value::String("Chats-4".to_owned())),
+                    ("start".to_owned(), Value::String("SCEPTURUM".to_owned())),
                     ("radius_ly".to_owned(), Value::from(10.0)),
                 ]),
             )
@@ -3207,10 +3188,7 @@ mod tests {
                 .validate_action(
                     "survey.belt_search",
                     &BTreeMap::from([
-                        (
-                            "replicant".to_owned(),
-                            Value::String("Chats-4".to_owned()),
-                        ),
+                        ("replicant".to_owned(), Value::String("Chats-4".to_owned()),),
                         ("start".to_owned(), Value::String("SCEPTURUM".to_owned())),
                     ]),
                 )

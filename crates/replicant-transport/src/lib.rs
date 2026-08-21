@@ -356,7 +356,6 @@ pub async fn validate_resource_pickups(client: &Client, plan: &DeliveryPlan) -> 
     Ok(())
 }
 
-
 async fn validate_resource_manifest_at_location(
     client: &Client,
     location: &str,
@@ -1642,11 +1641,7 @@ async fn detach_devices(
     Ok(())
 }
 
-async fn ensure_cached_command_available(
-    client: &Client,
-    code: &str,
-    command: &str,
-) -> Result<()> {
+async fn ensure_cached_command_available(client: &Client, code: &str, command: &str) -> Result<()> {
     let Some(handle) = client.devices().cached(code) else {
         return Ok(());
     };
@@ -1814,10 +1809,7 @@ async fn wait_for_raw_device(
 /// command for the full timeout.) Physical effects are verified separately by
 /// the device-state waits, which also abort early if the operation is
 /// rejected after this check.
-async fn ensure_resource_collect_accepted(
-    operation: &Operation,
-    location: &str,
-) -> Result<()> {
+async fn ensure_resource_collect_accepted(operation: &Operation, location: &str) -> Result<()> {
     let outcome = operation.outcome().await?;
     if !operation_rejected(outcome.status) {
         return Ok(());

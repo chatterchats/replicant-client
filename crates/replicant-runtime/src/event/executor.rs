@@ -16,9 +16,9 @@ use replicant_event_planner::{
 use replicant_printing::{
     PrintRequest,
     managed::{
-        QueueOptions, discover_factories, factory_queue_slots, invalidate_factory_detail_cache,
-        fetch_blueprints as fetch_print_blueprints, queue_print_prerequisites,
-        queue_print_prerequisites_ahead,
+        QueueOptions, discover_factories, factory_queue_slots,
+        fetch_blueprints as fetch_print_blueprints, invalidate_factory_detail_cache,
+        queue_print_prerequisites, queue_print_prerequisites_ahead,
     },
 };
 use replicant_transport::{DeliveryOptions, PayloadDevice as TransportPayloadDevice};
@@ -1077,7 +1077,9 @@ fn initialize_execution(plan: &mut EventMissionPlan) {
         let mut device_ordinals = BTreeMap::<String, usize>::new();
         let mut execution_batches = Vec::new();
         for batch in &plan.selected_criterion.print_schedule.batches {
-            let ordinal = device_ordinals.entry(batch.device_type.clone()).or_default();
+            let ordinal = device_ordinals
+                .entry(batch.device_type.clone())
+                .or_default();
             for _ in 0..batch.quantity.max(0) {
                 let role = role_for_device_type(&batch.device_type).to_owned();
                 execution_batches.push(ExecutionPrintBatch {

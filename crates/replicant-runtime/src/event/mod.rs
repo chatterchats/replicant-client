@@ -84,8 +84,7 @@ impl Config {
             env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
         );
         let mut runtime_database = PathBuf::from(
-            env::var("REPLICANT_RUNTIME_DB")
-                .unwrap_or_else(|_| "replicant-runtime.sqlite".into()),
+            env::var("REPLICANT_RUNTIME_DB").unwrap_or_else(|_| "replicant-runtime.sqlite".into()),
         );
         let mut plan_path =
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
@@ -154,10 +153,8 @@ impl Config {
                     database = PathBuf::from(required_argument(&mut arguments, "--database")?)
                 }
                 "--runtime-database" => {
-                    runtime_database = PathBuf::from(required_argument(
-                        &mut arguments,
-                        "--runtime-database",
-                    )?)
+                    runtime_database =
+                        PathBuf::from(required_argument(&mut arguments, "--runtime-database")?)
                 }
                 "--plan-file" => {
                     plan_path = PathBuf::from(required_argument(&mut arguments, "--plan-file")?)
@@ -914,16 +911,26 @@ fn render_stock_reconcile_report(report: &EventStockReconcileReport, json: bool)
     }
     println!(
         "Event stock reconciliation ({})",
-        if report.executed { "EXECUTE" } else { "DRY RUN" }
+        if report.executed {
+            "EXECUTE"
+        } else {
+            "DRY RUN"
+        }
     );
     println!("  Owned devices scanned:      {}", report.scanned_devices);
-    println!("  Event-tagged devices:       {}", report.event_tagged_devices);
+    println!(
+        "  Event-tagged devices:       {}",
+        report.event_tagged_devices
+    );
     println!("  Exact event reclaims:       {}", report.event_reclaims);
     println!(
         "  Regional-stock reclaims:   {}",
         report.regional_stock_reclaims
     );
-    println!("  Active reservations kept:   {}", report.active_reservations);
+    println!(
+        "  Active reservations kept:   {}",
+        report.active_reservations
+    );
     println!("  Ambiguous/manual review:    {}", report.ambiguous);
     for device in &report.devices {
         if device.target_tag.is_some() || device.disposition.contains("manual review") {

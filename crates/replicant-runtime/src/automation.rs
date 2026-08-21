@@ -881,9 +881,7 @@ impl WorkflowExecutor for ScanTourWorkflow {
             context
                 .persist_checkpoint(&checkpoint)
                 .map_err(string_error)?;
-            if let Some(owner) =
-                reserve_scan_tour_scope(context, &intent, &replicant, &vessel)?
-            {
+            if let Some(owner) = reserve_scan_tour_scope(context, &intent, &replicant, &vessel)? {
                 context
                     .advance_to("waiting_for_scan_claims", &checkpoint)
                     .map_err(string_error)?;
@@ -2202,7 +2200,11 @@ pub(crate) async fn reconcile_event_connectivity(
         let Some(workflow_id) = connectivity_workflows.get(target).copied() else {
             continue;
         };
-        let Some(workflow) = context.repository().read(workflow_id).map_err(string_error)? else {
+        let Some(workflow) = context
+            .repository()
+            .read(workflow_id)
+            .map_err(string_error)?
+        else {
             connectivity_workflows.remove(target);
             continue;
         };
@@ -2223,9 +2225,7 @@ pub(crate) async fn reconcile_event_connectivity(
                         .duration_since(UNIX_EPOCH)
                         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
                         .unwrap_or_default();
-                    if now.saturating_sub(workflow.updated_at)
-                        < CONNECTIVITY_RETRY_COOLDOWN_MS
-                    {
+                    if now.saturating_sub(workflow.updated_at) < CONNECTIVITY_RETRY_COOLDOWN_MS {
                         tracing::debug!(
                             workflow_id = %context.id(),
                             connectivity_workflow_id = %workflow_id,
@@ -2340,7 +2340,9 @@ fn active_connectivity_workflow(
             workflow.kind == exploration_workflow_kind() && !workflow.status.is_terminal()
         })
     {
-        let intent = workflow.config::<ExplorationIntent>().map_err(string_error)?;
+        let intent = workflow
+            .config::<ExplorationIntent>()
+            .map_err(string_error)?;
         if intent.target == target
             && intent
                 .hub
@@ -2895,9 +2897,12 @@ fn claim_target(context: &WorkflowContext, namespace: &str, key: &str) -> Result
     )
 }
 
-
 fn scan_tour_target_claims(intent: &ScanTourIntent) -> Vec<ResourceKey> {
-    match intent.target_systems.as_ref().filter(|targets| !targets.is_empty()) {
+    match intent
+        .target_systems
+        .as_ref()
+        .filter(|targets| !targets.is_empty())
+    {
         Some(targets) => targets
             .iter()
             .map(|system| system.trim().to_ascii_uppercase())
@@ -2915,7 +2920,6 @@ fn scan_tour_target_claims(intent: &ScanTourIntent) -> Vec<ResourceKey> {
         }],
     }
 }
-
 
 fn reserve_scan_tour_scope(
     context: &WorkflowContext,
@@ -3385,10 +3389,7 @@ async fn ensure_shop_trade_criteria(
     let resource_origin = resolve_location_system(client, factory_location).await?;
     let resources_at_home = inventory_in_system(&inventories, &resource_origin);
     for (resource, missing) in &missing_resources {
-        let available = resources_at_home
-            .get(resource)
-            .copied()
-            .unwrap_or_default();
+        let available = resources_at_home.get(resource).copied().unwrap_or_default();
         if available < *missing {
             context
                 .advance_to("waiting_for_trade_criteria", checkpoint)
@@ -3477,8 +3478,13 @@ async fn ensure_shop_trade_criteria(
         context
             .persist_checkpoint(checkpoint)
             .map_err(string_error)?;
-        if !await_child_workflow(context, child.id, "trade-criteria resource logistics", checkpoint)
-            .await?
+        if !await_child_workflow(
+            context,
+            child.id,
+            "trade-criteria resource logistics",
+            checkpoint,
+        )
+        .await?
         {
             return Ok(false);
         }
@@ -3522,8 +3528,13 @@ async fn ensure_shop_trade_criteria(
         context
             .persist_checkpoint(checkpoint)
             .map_err(string_error)?;
-        if !await_child_workflow(context, child.id, "trade-criteria device logistics", checkpoint)
-            .await?
+        if !await_child_workflow(
+            context,
+            child.id,
+            "trade-criteria device logistics",
+            checkpoint,
+        )
+        .await?
         {
             return Ok(false);
         }
@@ -3742,9 +3753,10 @@ fn inventory_in_system(
 ) -> ResourceMap {
     let mut resources = ResourceMap::new();
     for inventory in inventories.iter().filter(|inventory| {
-        inventory.location.as_ref().is_some_and(|key| {
-            designation_in_system(key.id.as_str(), system)
-        })
+        inventory
+            .location
+            .as_ref()
+            .is_some_and(|key| designation_in_system(key.id.as_str(), system))
     }) {
         for item in &inventory.items {
             *resources.entry(item.resource.clone()).or_default() += item.quantity;
@@ -4899,15 +4911,19 @@ mod tests {
 
     #[test]
     fn mutable_manifest_planning_blockers_wait_for_replan() {
-        assert!(retryable_manifest_planning_failure(&TransportError::NotFound(
-            "origin SCEPTURUM has only 0 conductive; 30 requested".to_owned(),
-        )));
-        assert!(retryable_manifest_planning_failure(&TransportError::Invalid(
-            "payload device DEVICE-1 is not a free inactive payload".to_owned(),
-        )));
-        assert!(!retryable_manifest_planning_failure(&TransportError::Invalid(
-            "destination must be an exact location".to_owned(),
-        )));
+        assert!(retryable_manifest_planning_failure(
+            &TransportError::NotFound(
+                "origin SCEPTURUM has only 0 conductive; 30 requested".to_owned(),
+            )
+        ));
+        assert!(retryable_manifest_planning_failure(
+            &TransportError::Invalid(
+                "payload device DEVICE-1 is not a free inactive payload".to_owned(),
+            )
+        ));
+        assert!(!retryable_manifest_planning_failure(
+            &TransportError::Invalid("destination must be an exact location".to_owned(),)
+        ));
     }
 
     #[test]
