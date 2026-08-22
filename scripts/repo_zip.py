@@ -5,8 +5,9 @@ The archive contains tracked files plus untracked files that are not ignored,
 using the files as they exist in the working tree rather than the contents of
 HEAD. Git metadata, Cargo build output, and SQLite databases are excluded.
 Untracked files matched by the repository ignore rules are omitted using normal
-Git semantics, except for the machine-readable JSON artifacts in versioned
-Replicant Space reference snapshots. Tracked repository files remain included.
+Git semantics, except that versioned Replicant Space reference snapshots are
+included as complete contract trees. Crawler-local HTML/cache artifacts remain
+excluded. Tracked repository files remain included.
 """
 
 from __future__ import annotations
@@ -20,13 +21,8 @@ from datetime import datetime
 import zipfile
 
 
-REFERENCE_SNAPSHOT_JSON_FILES = frozenset(
-    {
-        "crawl-errors.json",
-        "manifest.json",
-        "openapi.json",
-    }
-)
+REFERENCE_SNAPSHOT_EXCLUDED_DIRS = frozenset({".source-html"})
+REFERENCE_SNAPSHOT_EXCLUDED_FILES = frozenset({".crawl-cache.json"})
 
 
 SQLITE_SUFFIXES = (
@@ -59,8 +55,8 @@ def nul_paths(data: bytes) -> list[str]:
     return [os.fsdecode(item) for item in data.split(b"\0") if item]
 
 
-def reference_snapshot_jsons(root: Path) -> set[str]:
-    """Return ignored JSON artifacts that belong in versioned reference snapshots."""
+def reference_snapshot_files(root: Path) -> set[str]:
+    """Return complete versioned reference trees, excluding crawler-local caches."""
     reference = root / "reference"
     if not reference.is_dir():
         return set()
@@ -69,16 +65,25 @@ def reference_snapshot_jsons(root: Path) -> set[str]:
     for snapshot in reference.glob("replicant-space-*"):
         if not snapshot.is_dir():
             continue
-        for filename in REFERENCE_SNAPSHOT_JSON_FILES:
-            source = snapshot / filename
-            if source.is_file():
-                paths.add(source.relative_to(root).as_posix())
+        for source in snapshot.rglob("*"):
+            if not source.is_file():
+                continue
+            relative_snapshot = source.relative_to(snapshot)
+            if any(part in REFERENCE_SNAPSHOT_EXCLUDED_DIRS for part in relative_snapshot.parts):
+                continue
+            if source.name in REFERENCE_SNAPSHOT_EXCLUDED_FILES:
+                continue
+            paths.add(source.relative_to(root).as_posix())
     return paths
 
 
 def explicitly_excluded(path: str) -> bool:
     posix = PurePosixPath(path)
     if ".git" in posix.parts or "target" in posix.parts:
+        return True
+    if any(part in REFERENCE_SNAPSHOT_EXCLUDED_DIRS for part in posix.parts):
+        return True
+    if posix.name in REFERENCE_SNAPSHOT_EXCLUDED_FILES:
         return True
     lower = path.lower()
     return lower.endswith(SQLITE_SUFFIXES)
@@ -132,7 +137,7 @@ def main() -> int:
                 git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
             )
         )
-        candidates.update(reference_snapshot_jsons(root))
+        candidates.update(reference_snapshot_files(root))
     except (OSError, RuntimeError) as error:
         print(f"error: unable to enumerate repository files: {error}", file=sys.stderr)
         return 2

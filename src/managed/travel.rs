@@ -2,7 +2,7 @@
 //!
 //! `destination`, `dry_run`, `notify`, and `via` are exactly the fields the
 //! corrected `app_schemas_travel_TravelRequestSchema` OpenAPI schema defines
-//! for `POST /v1/replicants/{code}/travel` (`reference/replicant-space/openapi.json`);
+//! for `POST /v1/replicants/{code}/travel` (`reference/replicant-space-2-5-1/openapi.json`);
 //! `via` accepts `"auto"` (the server default), `"direct"`, or an explicit
 //! waypoint list, so [`TravelVia`] models exactly those three shapes and
 //! nothing invented beyond the schema.

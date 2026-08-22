@@ -546,6 +546,9 @@ pub struct Star {
     pub entry_point: Option<LocationKey>,
     pub position: Option<GalacticPosition>,
     pub has_hub: Option<bool>,
+    /// Whether the catalogue or account star knowledge reports an active system ward.
+    #[serde(default)]
+    pub has_ward: Option<bool>,
     /// Whether an owned Replicant has supplied account star knowledge for this system.
     #[serde(default)]
     pub knowledge_observed: bool,
@@ -571,6 +574,8 @@ pub struct StarKnowledge {
     pub entry_point: Option<LocationKey>,
     pub explored: Option<bool>,
     pub has_hub: Option<bool>,
+    #[serde(default)]
+    pub has_ward: Option<bool>,
     pub has_life: Option<bool>,
     pub region: Option<String>,
     pub distance_from_replicant: Option<f64>,

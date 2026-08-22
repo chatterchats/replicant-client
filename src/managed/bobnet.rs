@@ -1,6 +1,6 @@
 //! BobNet: the galactic channel-based comms layer.
 //!
-//! Per `reference/replicant-space/concepts/bobnet/index.md`, modern BobNet
+//! Per `reference/replicant-space-2-5-1/concepts/bobnet/index.md`, modern BobNet
 //! delivery is the account event stream (`bobnet.new`) plus relay-device
 //! history; webhook delivery is deprecated and deliberately unsupported
 //! here. Channel/network discovery and relay history are volatile

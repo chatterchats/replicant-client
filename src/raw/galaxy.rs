@@ -32,6 +32,8 @@ pub struct StarItem {
     pub explored: Option<bool>,
     /// Whether this star hosts a system hub.
     pub has_hub: Option<bool>,
+    /// Whether this star hosts an active system ward.
+    pub has_ward: Option<bool>,
     /// Whether this star is known to host life.
     pub has_life: Option<bool>,
     /// Catalogue region, e.g. `solzone`, `alpha`, `beta`, or `gamma`.
@@ -86,6 +88,8 @@ pub struct CatalogueStar {
     pub estimated_planets: Option<i64>,
     /// Whether this star hosts a megastructure hub.
     pub has_hub: Option<bool>,
+    /// Whether this star hosts an active system ward.
+    pub has_ward: Option<bool>,
     /// Display name.
     pub name: Option<String>,
     /// Catalogue region, e.g. `solzone`, `alpha`, `beta`, or `gamma`.

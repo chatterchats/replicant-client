@@ -1,5 +1,5 @@
 //! Simulations: isolated virtual worlds entered through a `replicant_interface`
-//! simulator device (`reference/replicant-space/simulations/*`).
+//! simulator device (`reference/replicant-space-2-5-1/simulations/*`).
 //!
 //! Starting a simulation creates `Realm::Simulation(id)` and seeds it with
 //! the server's starting device loadout; ending one (abandonment,

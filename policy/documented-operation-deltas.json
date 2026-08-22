@@ -1,6 +1,6 @@
 {
-  "$schema_note": "Replicant Space 2.5.0 rendered documentation and OpenAPI share the same route surface; rendered docs add response/semantic detail for tutorials, FTL slingshots, and system wards without adding doc-only operations.",
-  "base_openapi_version": "2.5.0",
-  "documentation_version": "2.5.0",
+  "$schema_note": "Replicant Space 2.5.1 rendered documentation and OpenAPI share the same route surface; rendered docs add response/semantic detail for tutorials, FTL slingshots, system wards, hub maintenance, and multiplayer presence events without adding doc-only operations.",
+  "base_openapi_version": "2.5.1",
+  "documentation_version": "2.5.1",
   "operations": []
 }

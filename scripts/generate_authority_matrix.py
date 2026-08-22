@@ -4,7 +4,10 @@
 import json
 from pathlib import Path
 
+from reference_snapshot import latest_reference_snapshot
+
 ROOT = Path(__file__).resolve().parent.parent
+SNAPSHOT = latest_reference_snapshot(ROOT)
 inventory = json.loads((ROOT / "policy/operations.json").read_text())
 documented_deltas = json.loads(
     (ROOT / "policy/documented-operation-deltas.json").read_text()
@@ -60,6 +63,6 @@ operations.sort(key=lambda entry: (entry["path"], entry["method"]))
 (ROOT / "policy/authority-matrix.json").write_text(json.dumps({
     "version": 1,
     "sync_domain_policy": "policy/sync-domains.json",
-    "contract": "Verified Replicant Space 2.5.0 OpenAPI corpus",
+    "contract": f"Verified Replicant Space {SNAPSHOT.version} OpenAPI corpus",
     "operations": operations,
 }, indent=2) + "\n")

@@ -360,6 +360,46 @@ pub struct WardTransitionPayload {
     pub extra: JsonObject,
 }
 
+/// Typed payload for `hub.warning`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct HubWarningPayload {
+    /// Hub capacity when the threshold was crossed.
+    pub capacity: Option<f64>,
+    /// Warning class, currently `wear` or `inactive`.
+    pub warning_type: Option<String>,
+    /// Future warning fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload for `hub.maintained`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct HubMaintainedPayload {
+    /// Resource quantities consumed by the repair.
+    #[serde(default)]
+    pub resources_consumed: JsonObject,
+    /// Hub capacity after maintenance.
+    pub capacity: Option<f64>,
+    /// Future maintenance fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+/// Typed payload shared by multiplayer Replicant presence events.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct MultiplayerReplicantPresencePayload {
+    /// Replicant entering or leaving the locally observed system.
+    pub replicant_code: Option<String>,
+    /// Display name for that Replicant.
+    pub replicant_name: Option<String>,
+    /// Future multiplayer-presence fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
 /// One account-wide game event.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -493,6 +533,34 @@ impl GameEvent {
     /// different event name.
     pub fn ward_deactivated(&self) -> Result<Option<WardTransitionPayload>, Error> {
         self.decode_payload("ward.deactivated")
+    }
+
+    /// Decodes this event as `hub.warning`, returning `None` for a different
+    /// event name.
+    pub fn hub_warning(&self) -> Result<Option<HubWarningPayload>, Error> {
+        self.decode_payload("hub.warning")
+    }
+
+    /// Decodes this event as `hub.maintained`, returning `None` for a
+    /// different event name.
+    pub fn hub_maintained(&self) -> Result<Option<HubMaintainedPayload>, Error> {
+        self.decode_payload("hub.maintained")
+    }
+
+    /// Decodes this event as `multiplayer.replicant_entered`, returning
+    /// `None` for a different event name.
+    pub fn multiplayer_replicant_entered(
+        &self,
+    ) -> Result<Option<MultiplayerReplicantPresencePayload>, Error> {
+        self.decode_payload("multiplayer.replicant_entered")
+    }
+
+    /// Decodes this event as `multiplayer.replicant_left`, returning `None`
+    /// for a different event name.
+    pub fn multiplayer_replicant_left(
+        &self,
+    ) -> Result<Option<MultiplayerReplicantPresencePayload>, Error> {
+        self.decode_payload("multiplayer.replicant_left")
     }
 
     /// Decodes this event as `trade.completed`, returning `None` for a

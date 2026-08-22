@@ -1,6 +1,6 @@
 //! Trade controller gateways and handles.
 //!
-//! `reference/replicant-space/trading/*` and the corrected OpenAPI corpus
+//! `reference/replicant-space-2-5-1/trading/*` and the corrected OpenAPI corpus
 //! document no request or response schema for any trading operation — every
 //! trading response is the shared default-error shape only
 //! (`src/raw/trading.rs` is deliberately untyped for the same reason). This

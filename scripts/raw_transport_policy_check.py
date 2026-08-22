@@ -9,6 +9,10 @@ from pathlib import Path
 from generate_operation_inventory import build_inventory
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from reference_snapshot import latest_reference_snapshot  # noqa: E402
+
+REFERENCE = latest_reference_snapshot(ROOT).path
 
 EXPECTED = {
     "src/raw/client.rs": {"health"},
@@ -64,7 +68,7 @@ for relative, expected in EXPECTED.items():
 
 inventory = json.loads((ROOT / "policy/operations.json").read_text())
 expected_inventory = build_inventory(
-    json.loads((ROOT / "reference/replicant-space/openapi.json").read_text())
+    json.loads((REFERENCE / "openapi.json").read_text())
 )
 for actual, expected in zip(inventory["operations"], expected_inventory["operations"], strict=True):
     descriptor = (

@@ -797,6 +797,7 @@ mod tests {
             entry_point: None,
             position: None,
             has_hub: None,
+            has_ward: None,
             knowledge_observed: false,
             explored: None,
             has_life: None,

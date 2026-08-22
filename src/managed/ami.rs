@@ -3,9 +3,9 @@
 //! Every AMI controller (mining, survey, transport, fleet) shares one common
 //! command set — `adopt`, `release`, `launch`, `withdraw`, `assemble`,
 //! `activate`, `deactivate`, `clear_directive` — documented on
-//! `reference/replicant-space/ami/index.md`. Each controller type then adds
+//! `reference/replicant-space-2-5-1/ami/index.md`. Each controller type then adds
 //! its own `set_directive` catalogue, documented on its own
-//! `reference/replicant-space/ami/<kind>-controller/index.md` page. AMI
+//! `reference/replicant-space-2-5-1/ami/<kind>-controller/index.md` page. AMI
 //! digest events (`ami.*.digest`) are periodic operational reports, not
 //! complete fleet snapshots, so they are exposed only through
 //! [`crate::managed::EventsGateway`] like any other account event, never
@@ -179,7 +179,7 @@ async fn set_directive(
 }
 
 /// Directives available on an AMI mining controller
-/// (`reference/replicant-space/ami/mining-controller/index.md`).
+/// (`reference/replicant-space-2-5-1/ami/mining-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum MiningDirective {
@@ -252,7 +252,7 @@ impl MiningController {
 }
 
 /// Directives available on an AMI survey controller
-/// (`reference/replicant-space/ami/survey-controller/index.md`).
+/// (`reference/replicant-space-2-5-1/ami/survey-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum SurveyDirective {
@@ -315,7 +315,7 @@ impl SurveyController {
 }
 
 /// Directives available on an AMI transport controller
-/// (`reference/replicant-space/ami/transport-controller/index.md`).
+/// (`reference/replicant-space-2-5-1/ami/transport-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum TransportDirective {
@@ -440,7 +440,7 @@ impl TransportController {
 
 /// A typed handle to an AMI fleet controller device. Fleet controllers have
 /// no directives: their only job is relaying `travel` commands to every
-/// adopted device (`reference/replicant-space/ami/fleet-controller/index.md`).
+/// adopted device (`reference/replicant-space-2-5-1/ami/fleet-controller/index.md`).
 #[derive(Clone, Debug)]
 pub struct FleetController {
     device: DeviceHandle,

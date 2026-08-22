@@ -2470,6 +2470,8 @@ async fn list_devices(
                 replicant_code: None,
                 device_type: None,
                 tag: tag.map(str::to_owned),
+                tags: None,
+                exclude_tags: None,
                 untagged: None,
                 location: location.map(str::to_owned),
                 cursor,

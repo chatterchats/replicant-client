@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Contract and deprecation policy gate for replicant-client.
 
-Verifies the checked-in Replicant Space 2.5.0 OpenAPI and rendered-document
+Verifies the newest checked-in Replicant Space OpenAPI and rendered-document
 corpus:
 
 - the OpenAPI and documentation-manifest checksums match recorded provenance;
@@ -29,8 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "scripts"))
 from generate_operation_inventory import build_inventory  # noqa: E402
+from reference_snapshot import latest_reference_snapshot  # noqa: E402
 
-REFERENCE = ROOT / "reference" / "replicant-space"
+SNAPSHOT = latest_reference_snapshot(ROOT)
+REFERENCE = SNAPSHOT.path
 OPENAPI = REFERENCE / "openapi.json"
 MANIFEST = REFERENCE / "manifest.json"
 POLICY = ROOT / "policy"
@@ -121,7 +123,7 @@ def check_operation_inventory(spec: dict) -> None:
     if checked_in["operations"] != fresh["operations"]:
         fail(
             "policy/operations.json is stale relative to "
-            "reference/replicant-space/openapi.json; run "
+            f"{REFERENCE.relative_to(ROOT)}/openapi.json; run "
             "scripts/generate_operation_inventory.py"
         )
 
@@ -316,6 +318,12 @@ def check_package_identity(metadata: dict) -> None:
 
 def main() -> None:
     metadata = json.loads((POLICY / "contract-metadata.json").read_text())
+    if metadata.get("replicant_space_version") != SNAPSHOT.version:
+        fail(
+            "policy/contract-metadata.json targets Replicant Space "
+            f"{metadata.get('replicant_space_version')!r}, but newest reference snapshot "
+            f"is {SNAPSHOT.version!r}"
+        )
     check_package_identity(metadata)
     spec = check_openapi_checksum(metadata)
     check_documentation_manifest(metadata)
@@ -332,11 +340,18 @@ def main() -> None:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
 
-    print("contract policy check passed: Replicant Space 2.5.0 corpus, "
-          "75 paths, 89 OpenAPI operations (82 supported, 5 deprecated, "
-          "2 admin), 160 schemas, 87 rendered documentation pages; "
-          "message_notify excluded; mining aliases recorded; no stray "
-          "replicant-sdk references.")
+    print(
+        f"contract policy check passed: Replicant Space {SNAPSHOT.version} corpus, "
+        f"{metadata['openapi_path_count']} paths, "
+        f"{metadata['openapi_operation_count']} OpenAPI operations "
+        f"({json.loads((POLICY / 'operations.json').read_text())['totals']['supported']} supported, "
+        f"{json.loads((POLICY / 'operations.json').read_text())['totals']['deprecated']} deprecated, "
+        f"{json.loads((POLICY / 'operations.json').read_text())['totals']['admin']} admin), "
+        f"{metadata['openapi_schema_count']} schemas, "
+        f"{metadata['documentation_page_count']} rendered documentation pages; "
+        "message_notify excluded; mining aliases recorded; no stray "
+        "replicant-sdk references."
+    )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 # Verified upstream contract corpus. These files are byte-for-byte pinned by
-# reference/replicant-space/manifest.json and scripts/contract_policy_check.py.
+# reference/replicant-space-*/manifest.json and scripts/contract_policy_check.py.
 # Never run Prettier over them; refresh them only through the documented
 # contract/reference update process.
-reference/replicant-space/
+reference/replicant-space-*/
 
 # Generated/build outputs.
 target/

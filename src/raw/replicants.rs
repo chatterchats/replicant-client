@@ -620,6 +620,8 @@ pub struct RouteLeg {
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct TravelResponse {
+    /// Arrival time reported by the current API, RFC3339.
+    pub arrival_time: Option<String>,
     /// When this leg arrives, RFC3339.
     pub arrives_at: Option<String>,
     /// When travel departed, RFC3339.

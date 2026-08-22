@@ -1824,6 +1824,8 @@ pub struct DeviceRefreshQuery {
     replicant_code: Option<String>,
     device_type: Option<DeviceType>,
     tag: Option<String>,
+    tags: Option<String>,
+    exclude_tags: Option<String>,
     untagged: bool,
     location: Option<String>,
     page_size: i64,
@@ -1837,6 +1839,8 @@ impl DeviceRefreshQuery {
             replicant_code: None,
             device_type: None,
             tag: None,
+            tags: None,
+            exclude_tags: None,
             untagged: false,
             location: None,
             page_size: 50,
@@ -1872,6 +1876,22 @@ impl DeviceRefreshQuery {
         self
     }
 
+    /// Restricts the remote traversal to devices matching any comma-separated
+    /// tag pattern. The upstream API supports `*` wildcards.
+    #[must_use]
+    pub fn with_tag_patterns(mut self, patterns: impl Into<String>) -> Self {
+        self.tags = Some(patterns.into());
+        self
+    }
+
+    /// Excludes devices matching any comma-separated tag pattern. The
+    /// upstream API supports `*` wildcards.
+    #[must_use]
+    pub fn excluding_tag_patterns(mut self, patterns: impl Into<String>) -> Self {
+        self.exclude_tags = Some(patterns.into());
+        self
+    }
+
     /// Restricts the remote traversal to devices with no tags.
     #[must_use]
     pub fn untagged(mut self) -> Self {
@@ -1897,6 +1917,8 @@ impl DeviceRefreshQuery {
         self.replicant_code.is_some()
             || self.device_type.is_some()
             || self.tag.is_some()
+            || self.tags.is_some()
+            || self.exclude_tags.is_some()
             || self.untagged
             || self.location.is_some()
     }
@@ -1905,9 +1927,16 @@ impl DeviceRefreshQuery {
     /// stable key-sorted set of handles.
     pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
         self.client.ensure_open()?;
-        if self.tag.is_some() && self.untagged {
+        if self.tag.is_some() && self.tags.is_some() {
             return Err(Error::Configuration {
-                message: "device refresh cannot combine a tag with `untagged`".into(),
+                message: "device refresh cannot combine `tag` with `tags`".into(),
+            });
+        }
+        if self.untagged
+            && (self.tag.is_some() || self.tags.is_some() || self.exclude_tags.is_some())
+        {
+            return Err(Error::Configuration {
+                message: "device refresh cannot combine `untagged` with tag filters".into(),
             });
         }
 
@@ -1917,6 +1946,8 @@ impl DeviceRefreshQuery {
             replicant_code: self.replicant_code,
             device_type: self.device_type.map(|value| value.as_str().to_owned()),
             tag: self.tag,
+            tags: self.tags,
+            exclude_tags: self.exclude_tags,
             untagged: self.untagged.then_some(true),
             location: self.location,
             cursor: None,
@@ -2131,6 +2162,8 @@ fn query_is_unfiltered(query: &raw::devices::DeviceListQuery) -> bool {
         && query.location.is_none()
         && query.replicant_code.is_none()
         && query.tag.is_none()
+        && query.tags.is_none()
+        && query.exclude_tags.is_none()
         && query.untagged.is_none()
 }
 

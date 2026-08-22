@@ -2948,6 +2948,8 @@ async fn fetch_location_device_stock(
                 replicant_code: None,
                 device_type: None,
                 tag: None,
+                tags: None,
+                exclude_tags: None,
                 untagged: None,
                 location: Some(location.to_owned()),
                 cursor,

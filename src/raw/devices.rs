@@ -206,6 +206,10 @@ pub struct DeviceStatus {
     pub created_at: Option<String>,
     /// Deployment timestamp, RFC3339.
     pub deployed_at: Option<String>,
+    /// Short human-readable device description.
+    pub short_description: Option<String>,
+    /// Human-readable device description.
+    pub description: Option<String>,
     /// Stable device code.
     pub device_code: Option<String>,
     /// Device type.
@@ -310,9 +314,16 @@ pub struct DeviceListQuery {
     pub replicant_code: Option<String>,
     /// Restrict to a single device type.
     pub device_type: Option<String>,
-    /// Restrict to devices carrying this tag.
+    /// Restrict to devices carrying this exact tag. Deprecated upstream in
+    /// favour of [`Self::tags`], but retained for source compatibility.
     pub tag: Option<String>,
-    /// Restrict to devices with no tags. Incompatible with `tag`.
+    /// Comma-separated include patterns. The server supports `*` wildcards and
+    /// matches a device when any pattern matches. Incompatible with `tag`.
+    pub tags: Option<String>,
+    /// Comma-separated exclude patterns. The server supports `*` wildcards.
+    pub exclude_tags: Option<String>,
+    /// Restrict to devices with no tags. Incompatible with `tag`, `tags`, and
+    /// `exclude_tags`.
     pub untagged: Option<bool>,
     /// Restrict to a single location designation.
     pub location: Option<String>,
@@ -904,9 +915,16 @@ impl DevicesClient {
         query: &DeviceListQuery,
     ) -> Result<RawResponse<DeviceListResponse>, Error> {
         validate_device_list_limit(query.limit)?;
-        if query.tag.is_some() && query.untagged.is_some() {
+        if query.tag.is_some() && query.tags.is_some() {
             return Err(Error::Configuration {
-                message: "device list tag and untagged filters are incompatible".into(),
+                message: "device list `tag` and `tags` filters are incompatible".into(),
+            });
+        }
+        if query.untagged.is_some()
+            && (query.tag.is_some() || query.tags.is_some() || query.exclude_tags.is_some())
+        {
+            return Err(Error::Configuration {
+                message: "device list `untagged` cannot be combined with tag filters".into(),
             });
         }
         let path = with_query(
@@ -915,6 +933,8 @@ impl DevicesClient {
                 ("replicant_code", query.replicant_code.clone()),
                 ("device_type", query.device_type.clone()),
                 ("tag", query.tag.clone()),
+                ("tags", query.tags.clone()),
+                ("exclude_tags", query.exclude_tags.clone()),
                 ("untagged", query.untagged.map(|value| value.to_string())),
                 ("location", query.location.clone()),
                 ("cursor", query.cursor.map(|value| value.to_string())),

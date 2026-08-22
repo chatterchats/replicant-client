@@ -15,8 +15,10 @@ them to the feature that needs them.
 
 ## Contract authority
 
-The verified Replicant Space 2.5.0 OpenAPI and rendered-document corpus under
-[`reference/replicant-space/`](reference/replicant-space/) is the contract.
+The highest semantic-version Replicant Space snapshot under
+`reference/replicant-space-*` is the current contract. The contract/policy
+tooling resolves it automatically; older snapshots remain available for
+regression work.
 The corpus is byte-for-byte pinned by its manifest and must not be reformatted;
 the repository-level `.prettierignore` excludes it so a manual
 `prettier . --write` does not alter the verified reference material. Refresh

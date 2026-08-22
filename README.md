@@ -201,15 +201,16 @@ containing user data.
 
 ## Contract boundary
 
-The client follows the checked-in Replicant Space 2.5.0 documentation and
+The client follows the checked-in Replicant Space 2.5.1 documentation and
 OpenAPI corpus. Deprecated and administrative operations are intentionally
 absent, including from the raw client. Unknown fields and open vocabularies
 remain forward compatible.
 
-The 2.5.0 surface includes tutorial progress, one-time equipment-locker
-retrieval, FTL slingshot device linking, and typed System Ward responses/events.
-Slingshot firing intentionally reuses the normal teleport operation rather than
-introducing a parallel transport API:
+The 2.5.1 surface includes tutorial progress, one-time equipment-locker
+retrieval, FTL slingshot device linking, typed System Ward responses/events,
+star `has_ward` visibility, wildcard device-tag filters, travel `arrival_time`,
+and typed hub/multiplayer presence events. Slingshot firing intentionally reuses
+the normal teleport operation rather than introducing a parallel transport API:
 
 ```rust
 let tutorials = client.tutorials().list().await?;

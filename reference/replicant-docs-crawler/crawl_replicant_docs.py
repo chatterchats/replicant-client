@@ -16,8 +16,11 @@ Features:
 
 Usage:
     python crawl_replicant_docs.py
-    python crawl_replicant_docs.py --output docs/reference/replicant-space
+    python crawl_replicant_docs.py --output reference/replicant-space-2-5-1
     python crawl_replicant_docs.py --refresh --download-assets
+
+When --output is omitted, the crawler reads the live changelog and writes to
+reference/replicant-space-X-Y-Z for the newest semantic version it finds.
 """
 
 from __future__ import annotations
@@ -57,6 +60,8 @@ DEFAULT_USER_AGENT = "replicant-rs-docs-mirror/1.0 (+local reference crawler)"
 CACHE_FILE = ".crawl-cache.json"
 MANIFEST_FILE = "manifest.json"
 ERROR_FILE = "crawl-errors.json"
+DEFAULT_REFERENCE_ROOT = Path("reference")
+RELEASE_RE = re.compile(r"\bv(\d+)\.(\d+)\.(\d+)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -137,11 +142,24 @@ def parse_args() -> argparse.Namespace:
         description="Mirror Replicant Space documentation as local Markdown."
     )
     parser.add_argument("--start-url", default=DEFAULT_START_URL)
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
         "--output",
         type=Path,
-        default=Path("replicant-space-docs"),
-        help="Destination directory (default: ./replicant-space-docs)",
+        help=(
+            "Exact destination directory. When omitted, write to "
+            "reference/replicant-space-X-Y-Z using the newest version in the changelog."
+        ),
+    )
+    destination.add_argument(
+        "--version",
+        help="Override automatic changelog version detection (for example 2.5.1).",
+    )
+    parser.add_argument(
+        "--reference-root",
+        type=Path,
+        default=DEFAULT_REFERENCE_ROOT,
+        help="Root for automatic versioned snapshots (default: ./reference)",
     )
     parser.add_argument(
         "--delay",
@@ -176,6 +194,46 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
     return parser.parse_args()
+
+
+
+def normalize_release_version(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip(), re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"invalid release version {value!r}; expected X.Y.Z")
+    return tuple(int(part) for part in match.groups())
+
+
+def versioned_snapshot_path(reference_root: Path, version: tuple[int, int, int]) -> Path:
+    suffix = "-".join(str(part) for part in version)
+    return reference_root / f"replicant-space-{suffix}"
+
+
+def detect_latest_release_version(
+    session: requests.Session,
+    changelog_url: str,
+    timeout: float,
+) -> tuple[int, int, int]:
+    response = session.get(changelog_url, timeout=timeout)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    release_text = [
+        heading.get_text(" ", strip=True)
+        for heading in soup.find_all(re.compile(r"^h[1-6]$"))
+    ]
+    release_text.extend(
+        str(tag.get("id"))
+        for tag in soup.find_all(id=True)
+        if tag.get("id") is not None
+    )
+    versions = {
+        tuple(int(part) for part in match.groups())
+        for text in release_text
+        for match in RELEASE_RE.finditer(text)
+    }
+    if not versions:
+        raise ValueError(f"no vX.Y.Z release heading found in {changelog_url}")
+    return max(versions)
 
 
 def build_session(user_agent: str) -> requests.Session:
@@ -579,17 +637,40 @@ def main() -> int:
         logging.error("Start URL is outside its own documentation scope")
         return 2
 
-    output: Path = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=True)
-
-    cache_path = output / CACHE_FILE
-    cache: dict[str, dict[str, str]] = load_json(cache_path, {})
     session = build_session(DEFAULT_USER_AGENT)
     robots = build_robots(session, normalized_start, DEFAULT_USER_AGENT, args.no_robots)
+    changelog_url = urlunparse((*docs_origin, DEFAULT_CHANGELOG_PATH, "", "", ""))
 
-    changelog_url = urlunparse(
-        (*docs_origin, DEFAULT_CHANGELOG_PATH, "", "", "")
-    )
+    if args.output is not None:
+        output = args.output.resolve()
+    else:
+        try:
+            if args.version is not None:
+                version = normalize_release_version(args.version)
+            else:
+                if robots is not None and not robots.can_fetch(
+                    DEFAULT_USER_AGENT, changelog_url
+                ):
+                    raise ValueError(
+                        "changelog is blocked by robots.txt; pass --version explicitly"
+                    )
+                version = detect_latest_release_version(
+                    session, changelog_url, args.timeout
+                )
+        except (requests.RequestException, ValueError) as exc:
+            logging.error("Unable to determine versioned reference output: %s", exc)
+            return 2
+        output = versioned_snapshot_path(args.reference_root, version).resolve()
+        logging.info(
+            "Using Replicant Space %s snapshot directory: %s",
+            ".".join(str(part) for part in version),
+            output,
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    cache_path = output / CACHE_FILE
+    cache: dict[str, dict[str, str]] = load_json(cache_path, {})
+
     queue: deque[str] = deque([normalized_start, changelog_url])
     queued: set[str] = set(queue)
     found_from: dict[str, str] = {}

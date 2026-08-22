@@ -1,7 +1,7 @@
 //! `replicant-client` is a durable, stateful Rust client for building
 //! Replicant Space applications.
 //!
-//! The crate targets the verified Replicant Space `2.5.0` rendered and
+//! The crate targets the verified Replicant Space `2.5.1` rendered and
 //! OpenAPI contract. Contract provenance, operation classifications, and
 //! release-specific schema decisions are recorded under `policy/` and
 //! `docs/contract/`.

@@ -40,9 +40,9 @@ open_value!(DeviceFeature {
 });
 open_value!(DeviceStatus { Active => "active", Deactivated => "deactivated", Idle => "idle", Offline => "offline" });
 // AMI controller wire values are confirmed against
-// `reference/replicant-space/api/replicants/events/index.md` (`ami_mining_controller`);
+// `reference/replicant-space-2-5-1/api/replicants/events/index.md` (`ami_mining_controller`);
 // the survey/transport/fleet siblings follow the same `ami_<kind>_controller`
-// naming convention documented in `reference/replicant-space/ami/index.md`.
+// naming convention documented in `reference/replicant-space-2-5-1/ami/index.md`.
 open_value!(DeviceType {
     MiningController => "ami_mining_controller",
     SurveyController => "ami_survey_controller",
@@ -107,7 +107,7 @@ open_value!(DeviceType {
     FtlSlingshot => "ftl_slingshot",
     SystemWard => "system_ward",
 });
-// Directive wire values from `reference/replicant-space/ami/*-controller/index.md`.
+// Directive wire values from `reference/replicant-space-2-5-1/ami/*-controller/index.md`.
 open_value!(DeviceDirective {
     GatherResources => "gather_resources", GatherEvenly => "gather_evenly",
     MaintainRatios => "maintain_ratios", DepleteSmallest => "deplete_smallest",

@@ -9,7 +9,7 @@ DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check ci docker-artifacts docker-build docker-check docker-up docker-down observability-up observability-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
+.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check docs-reference-sync ci docker-artifacts docker-build docker-check docker-up docker-down observability-up observability-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
 
 help:
 	@printf '%s\n' \
@@ -28,7 +28,7 @@ help:
 	  'test                   		Run tests with all features enabled' \
 	  'doc                    		Build docs with warnings denied' \
 	  'feature-checks         		cargo check across the supported feature combinations' \
-	  'contract-policy-check  		Verify the Replicant Space 2.5.0 operation inventory and exclusions' \
+	  'contract-policy-check  		Verify the current Replicant Space operation inventory and exclusions' \
 	  'observability-policy-check 	Verify tracing targets, timing events, and secret guards' \
 	  'policy-checks          		Run all checked-in policy gates' \
 	  'ci                    		Run the full local CI-equivalent suite' \
@@ -43,6 +43,7 @@ help:
 	  'docker-persistence-smoke		Prove the data directory survives container recreation' \
 	  'docker-rebuild-deploy		Rebuild and redeploy the stack' \
 	  'docker-restart         		Restart the running stack' \
+	  'docs-reference-sync    		Refresh the newest versioned Replicant Space reference snapshot' \
 	  'zip                    		Create a clean working-tree ZIP for handoff' \
 	  'token                  		Generate a new REPLICANTD_TOKEN in .env if not present' \
 	  'token-rotate           		Rotate the REPLICANTD_TOKEN in .env
@@ -115,6 +116,9 @@ test:
 
 doc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --all-features --no-deps
+
+docs-reference-sync:
+	$(PYTHON) reference/replicant-docs-crawler/crawl_replicant_docs.py --refresh
 
 contract-policy-check:
 	$(PYTHON) scripts/contract_policy_check.py

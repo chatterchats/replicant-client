@@ -411,6 +411,7 @@ mod tests {
             entry_point: None,
             position: Some(GalacticPosition { x, y: 0.0, z: 0.0 }),
             has_hub: Some(false),
+            has_ward: None,
             knowledge_observed: false,
             explored: None,
             has_life: None,

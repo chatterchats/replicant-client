@@ -2154,6 +2154,9 @@ fn merge_migrated_star_knowledge(
     if current.value.has_hub.is_none() {
         current.value.has_hub = incoming.value.has_hub;
     }
+    if current.value.has_ward.is_none() {
+        current.value.has_ward = incoming.value.has_ward;
+    }
     current.value.knowledge_observed |= incoming.value.knowledge_observed;
     current.value.explored = match (current.value.explored, incoming.value.explored) {
         (Some(left), Some(right)) => Some(left || right),
@@ -2578,6 +2581,7 @@ mod tests {
                 entry_point: None,
                 position: None,
                 has_hub: None,
+                has_ward: None,
                 knowledge_observed: false,
                 explored: None,
                 has_life: None,
@@ -2597,6 +2601,7 @@ mod tests {
                 entry_point: None,
                 explored: Some(true),
                 has_hub: None,
+                has_ward: None,
                 has_life: Some(true),
                 region: Some("alpha".to_owned()),
                 distance_from_replicant: Some(42.0),

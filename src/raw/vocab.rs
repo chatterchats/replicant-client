@@ -67,7 +67,7 @@ macro_rules! open_vocab {
 open_vocab! {
     /// The dotted `event` name on an account event envelope (event log or SSE).
     ///
-    /// See `reference/replicant-space/api/events/catalogue/index.md` for the
+    /// See `reference/replicant-space-2-5-1/api/events/catalogue/index.md` for the
     /// full documented catalogue. New event names are added without a
     /// contract version bump, so unrecognized names decode to `Unknown`
     /// rather than failing.
