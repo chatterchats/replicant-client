@@ -264,7 +264,9 @@ pub struct EmpireTelemetryService {
 
 impl std::fmt::Debug for EmpireTelemetryService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("EmpireTelemetryService").finish_non_exhaustive()
+        formatter
+            .debug_struct("EmpireTelemetryService")
+            .finish_non_exhaustive()
     }
 }
 
@@ -692,7 +694,15 @@ fn project_print_started(
             None,
             &format!("no blueprint recipe is known for {device_type}"),
         )?;
-        record_activity(transaction, event, "print_started", &device_type, 1, location.as_deref(), "observed")?;
+        record_activity(
+            transaction,
+            event,
+            "print_started",
+            &device_type,
+            1,
+            location.as_deref(),
+            "observed",
+        )?;
         return Ok(());
     };
     let BlueprintRecipe {
@@ -773,7 +783,8 @@ fn project_print_completed(
             "inferred_blueprint_at_start".to_owned(),
             true,
         )
-    } else if let Some(recipe) = recipe_for_event(transaction, &device_type, event.occurred_at_ms)? {
+    } else if let Some(recipe) = recipe_for_event(transaction, &device_type, event.occurred_at_ms)?
+    {
         let BlueprintRecipe {
             resources,
             components,
@@ -1014,8 +1025,8 @@ fn project_decommission(
         )?;
     }
     let device_code = event.device_code.clone().unwrap_or_default();
-    let device_type = identity_type(transaction, &device_code)?
-        .unwrap_or_else(|| "__unknown__".to_owned());
+    let device_type =
+        identity_type(transaction, &device_code)?.unwrap_or_else(|| "__unknown__".to_owned());
     if device_type == "__unknown__" {
         record_gap(
             transaction,
@@ -1101,8 +1112,8 @@ fn project_ami_mining(
     if stopped <= 0 {
         return Ok(());
     }
-    let location = nested_string(event.payload.get("report"), &["location"])
-        .or_else(|| event_location(event));
+    let location =
+        nested_string(event.payload.get("report"), &["location"]).or_else(|| event_location(event));
     record_activity(
         transaction,
         event,
@@ -1173,8 +1184,11 @@ fn project_ami_transport(
     let report = event.payload.get("report");
     let collect = nested_string(report, &["collect"]);
     let deliver = nested_string(report, &["deliver"]);
-    let departed = nested_i64(event.payload.get("activity"), &["counts", "travel.departed"])
-        .unwrap_or_default();
+    let departed = nested_i64(
+        event.payload.get("activity"),
+        &["counts", "travel.departed"],
+    )
+    .unwrap_or_default();
     if departed > 0 {
         let series = match (collect.as_deref(), deliver.as_deref()) {
             (Some(origin), Some(destination)) => travel_scope(origin, destination),
@@ -1190,10 +1204,16 @@ fn project_ami_transport(
             "ami_digest_route_inferred",
         )?;
     }
-    let collected = nested_i64(event.payload.get("activity"), &["counts", "transport.collected"])
-        .unwrap_or_default();
-    let delivered = nested_i64(event.payload.get("activity"), &["counts", "transport.delivered"])
-        .unwrap_or_default();
+    let collected = nested_i64(
+        event.payload.get("activity"),
+        &["counts", "transport.collected"],
+    )
+    .unwrap_or_default();
+    let delivered = nested_i64(
+        event.payload.get("activity"),
+        &["counts", "transport.delivered"],
+    )
+    .unwrap_or_default();
     if collected > 0 || delivered > 0 {
         record_gap(
             transaction,
@@ -1220,11 +1240,13 @@ fn project_travel_departed(
     let origin_system = system_designation(&origin).to_owned();
     let destination_system = system_designation(&destination).to_owned();
     let inter_system = i64::from(origin_system != destination_system);
-    let travel_type = string_field(&event.payload, "travel_type").unwrap_or_else(|| "unknown".to_owned());
+    let travel_type =
+        string_field(&event.payload, "travel_type").unwrap_or_else(|| "unknown".to_owned());
     let distance_ly = event.payload.get("distance_ly").and_then(Value::as_f64);
     let planned_duration_seconds = i64_field(&event.payload, "travel_time_seconds");
-    let attached_device_count = i64::try_from(string_array(event.payload.get("attached_devices")).len())
-        .unwrap_or(i64::MAX);
+    let attached_device_count =
+        i64::try_from(string_array(event.payload.get("attached_devices")).len())
+            .unwrap_or(i64::MAX);
     transaction.execute(
         "INSERT OR IGNORE INTO empire_travel(\
             departed_event_id, departed_at_ms, device_code, origin, destination, origin_system,\
@@ -1250,7 +1272,11 @@ fn project_travel_departed(
         transaction,
         event,
         "travel_departed",
-        if inter_system == 1 { "inter_system" } else { "intra_system" },
+        if inter_system == 1 {
+            "inter_system"
+        } else {
+            "intra_system"
+        },
         1,
         event.location_id.as_deref(),
         "observed",
@@ -1329,14 +1355,7 @@ fn project_relay_activated(
         )?;
         return Ok(());
     };
-    insert_infrastructure_delta(
-        transaction,
-        event,
-        kind,
-        1,
-        "relay_activated",
-        "observed",
-    )?;
+    insert_infrastructure_delta(transaction, event, kind, 1, "relay_activated", "observed")?;
     record_activity(
         transaction,
         event,
@@ -1460,7 +1479,11 @@ fn project_event_completed(
             },
         )?;
     }
-    if let Some(devices) = event.payload.pointer("/consumed/devices").and_then(Value::as_array) {
+    if let Some(devices) = event
+        .payload
+        .pointer("/consumed/devices")
+        .and_then(Value::as_array)
+    {
         for device in devices {
             let device_code = string_field(device, "device_code").unwrap_or_default();
             let device_type = string_field(device, "device_type")
@@ -1486,7 +1509,11 @@ fn project_event_completed(
             )?;
         }
     }
-    if let Some(devices) = event.payload.pointer("/rewards/devices").and_then(Value::as_array) {
+    if let Some(devices) = event
+        .payload
+        .pointer("/rewards/devices")
+        .and_then(Value::as_array)
+    {
         for device in devices {
             let (device_code, device_type) = if let Some(code) = device.as_str() {
                 (code.to_owned(), "__unknown__".to_owned())
@@ -1545,7 +1572,10 @@ fn project_trade_completed(
         "observed",
     )?;
     let location = event_location(event).unwrap_or_else(|| "unknown".to_owned());
-    for path in ["/rewards_received/resources", "/criteria_received/resources"] {
+    for path in [
+        "/rewards_received/resources",
+        "/criteria_received/resources",
+    ] {
         for (resource, quantity) in resource_map(event.payload.pointer(path)) {
             insert_resource_delta(
                 transaction,
@@ -1569,7 +1599,11 @@ fn project_trade_completed(
         None,
         "trade.completed exposes the resources/devices received by this role but not the complete outgoing side of the exchange; inventory snapshots reconcile the unknown net change",
     )?;
-    for path in ["/rewards_received/devices", "/criteria_received/devices", "/new_device_codes"] {
+    for path in [
+        "/rewards_received/devices",
+        "/criteria_received/devices",
+        "/new_device_codes",
+    ] {
         if let Some(devices) = event.payload.pointer(path).and_then(Value::as_array) {
             for device in devices {
                 let Some(device_code) = device.as_str() else {
@@ -1749,7 +1783,14 @@ fn insert_infrastructure_delta(
         "INSERT OR IGNORE INTO empire_infrastructure_delta(\
             event_id, occurred_at_ms, kind, delta, reason, source\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![event.event_id, event.occurred_at_ms, kind, delta, reason, source],
+        params![
+            event.event_id,
+            event.occurred_at_ms,
+            kind,
+            delta,
+            reason,
+            source
+        ],
     )?;
     Ok(())
 }
@@ -1893,8 +1934,8 @@ fn snapshot_current_state(
             "managed_snapshot",
         )?;
     }
-    let history_start = meta_i64_transaction(&transaction, "history_start_ms")?
-        .unwrap_or(observed_at_ms);
+    let history_start =
+        meta_i64_transaction(&transaction, "history_start_ms")?.unwrap_or(observed_at_ms);
     ensure_resource_baselines(&transaction, &current, history_start)?;
     reanchor_device_baselines(&transaction, &current, history_start, observed_at_ms)?;
     reanchor_infrastructure_baseline(&transaction, &current, history_start, observed_at_ms)?;
@@ -1954,7 +1995,9 @@ fn read_current_state(managed: &Connection) -> Result<CurrentEmpireState, Empire
             .entry((device_type.clone(), status.clone()))
             .or_default() += 1;
         *state.device_totals.entry(device_type.clone()).or_default() += 1;
-        state.device_identities.insert(device_code, device_type.clone());
+        state
+            .device_identities
+            .insert(device_code, device_type.clone());
         let infrastructure_kind = match device_type.as_str() {
             "ftl_relay" if matches!(status.as_str(), "active" | "relaying") => {
                 Some(ACTIVE_FTL_RELAY)
@@ -1966,7 +2009,10 @@ fn read_current_state(managed: &Connection) -> Result<CurrentEmpireState, Empire
             _ => None,
         };
         if let Some(kind) = infrastructure_kind {
-            *state.active_infrastructure.entry(kind.to_owned()).or_default() += 1;
+            *state
+                .active_infrastructure
+                .entry(kind.to_owned())
+                .or_default() += 1;
         }
     }
     Ok(state)
@@ -1977,17 +2023,19 @@ fn ensure_resource_baselines(
     current: &CurrentEmpireState,
     history_start: i64,
 ) -> Result<(), EmpireTelemetryError> {
-    let existing: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM empire_resource_baseline",
-        [],
-        |row| row.get(0),
-    )?;
+    let existing: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM empire_resource_baseline", [], |row| {
+            row.get(0)
+        })?;
     if existing > 0 {
         return Ok(());
     }
     let mut keys = current.resources.keys().cloned().collect::<BTreeSet<_>>();
-    let mut statement = transaction.prepare("SELECT DISTINCT location, resource FROM empire_resource_delta")?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut statement =
+        transaction.prepare("SELECT DISTINCT location, resource FROM empire_resource_delta")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     for row in rows {
         keys.insert(row?);
     }
@@ -2045,8 +2093,13 @@ fn reanchor_device_baselines(
         "DELETE FROM empire_device_delta WHERE source = 'authoritative_snapshot' OR reason = 'reconciliation'",
         [],
     )?;
-    let mut types = current.device_totals.keys().cloned().collect::<BTreeSet<_>>();
-    let mut statement = transaction.prepare("SELECT DISTINCT device_type FROM empire_device_delta")?;
+    let mut types = current
+        .device_totals
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut statement =
+        transaction.prepare("SELECT DISTINCT device_type FROM empire_device_delta")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
         types.insert(row?);
@@ -2059,7 +2112,11 @@ fn reanchor_device_baselines(
             params![device_type, observed_at_ms],
             |row| row.get(0),
         )?;
-        let current_count = current.device_totals.get(&device_type).copied().unwrap_or_default();
+        let current_count = current
+            .device_totals
+            .get(&device_type)
+            .copied()
+            .unwrap_or_default();
         let confidence = if device_type == "__unknown__" {
             "incomplete"
         } else {
@@ -2128,9 +2185,8 @@ fn reconcile_resources(
     observed_at_ms: i64,
 ) -> Result<(), EmpireTelemetryError> {
     let mut baselines = BTreeMap::new();
-    let mut statement = transaction.prepare(
-        "SELECT location, resource, physical_quantity FROM empire_resource_baseline",
-    )?;
+    let mut statement = transaction
+        .prepare("SELECT location, resource, physical_quantity FROM empire_resource_baseline")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -2145,7 +2201,8 @@ fn reconcile_resources(
     drop(statement);
     let mut keys = baselines.keys().cloned().collect::<BTreeSet<_>>();
     keys.extend(current.resources.keys().cloned());
-    let history_start = meta_i64_transaction(transaction, "history_start_ms")?.unwrap_or(observed_at_ms);
+    let history_start =
+        meta_i64_transaction(transaction, "history_start_ms")?.unwrap_or(observed_at_ms);
     for (location, resource) in keys {
         let baseline = if let Some(value) = baselines.get(&(location.clone(), resource.clone())) {
             *value
@@ -2254,7 +2311,9 @@ fn current_reserved_resources(
     let mut statement = connection.prepare(
         "SELECT location, resources_json FROM empire_print_job WHERE completed_event_id IS NULL",
     )?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     for row in rows {
         let (location, resources_json) = row?;
         let resources: BTreeMap<String, i64> = serde_json::from_str(&resources_json)?;
@@ -2280,7 +2339,11 @@ fn resource_confidence(
         params![location, resource],
         |row| row.get(0),
     )?;
-    Ok(if gaps > 0 { "incomplete" } else { "reconstructed" })
+    Ok(if gaps > 0 {
+        "incomplete"
+    } else {
+        "reconstructed"
+    })
 }
 
 fn maintain_snapshots(connection: &Connection, now: i64) -> Result<(), rusqlite::Error> {
@@ -2424,7 +2487,9 @@ fn resource_map(value: Option<&Value>) -> BTreeMap<String, i64> {
             object
                 .iter()
                 .filter_map(|(resource, quantity)| {
-                    quantity.as_i64().map(|quantity| (resource.clone(), quantity))
+                    quantity
+                        .as_i64()
+                        .map(|quantity| (resource.clone(), quantity))
                 })
                 .collect()
         })
@@ -2636,7 +2701,9 @@ mod tests {
                  GROUP BY device_type ORDER BY device_type",
             )
             .expect("statement")
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .expect("rows")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect");
@@ -2930,7 +2997,13 @@ mod tests {
 
     #[test]
     fn inter_system_travel_is_derived_from_designations() {
-        assert_eq!(travel_scope("SCEPTURUM-7-L4", "SCEPTURUM-BELT-1"), "intra_system");
-        assert_eq!(travel_scope("SCEPTURUM-7-L4", "THYFFAWFF-3"), "inter_system");
+        assert_eq!(
+            travel_scope("SCEPTURUM-7-L4", "SCEPTURUM-BELT-1"),
+            "intra_system"
+        );
+        assert_eq!(
+            travel_scope("SCEPTURUM-7-L4", "THYFFAWFF-3"),
+            "inter_system"
+        );
     }
 }

@@ -46,17 +46,16 @@ use replicant_protocol::{
     AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
     BillCandidateSummary, BillDepartureSummary, BillExpansionSummary, BillFinderRequest,
     BillFinderResponse, BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary,
-    BobnetMessageSummary,
-    BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot,
-    CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
-    DescriptorCatalog, DeviceClaim, DeviceLogSummary, DeviceLogsSnapshot, DeviceSummary,
-    DevicesSnapshot, DirectorGoalControlRequest, DirectorModeRequest,
-    DirectorReplicantRegionRequest, DirectorSnapshot, DirectoryReplicantDetail,
-    DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary, DirectorySnapshot, DomainSlice,
-    EntityId, EntityIndexSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
-    EventCriterionSummary, EventRequirementKind, EventRequirementSummary, EventRewardItem,
-    EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
-    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    BobnetMessageSummary, BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary,
+    BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary, CargoSnapshot,
+    CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim, DeviceLogSummary,
+    DeviceLogsSnapshot, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
+    DirectorModeRequest, DirectorReplicantRegionRequest, DirectorSnapshot,
+    DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary,
+    DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind, EntityRef,
+    EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
+    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
+    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
     InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
@@ -3025,9 +3024,12 @@ fn trade_details_status(error: &replicant_runtime::ApplicationError) -> &'static
         return "unavailable";
     };
     if error.status() == Some(403)
-        && error.details().and_then(|details| details.message.as_deref()).is_some_and(|message| {
-            message.contains("No replicant or comms device in this star system")
-        })
+        && error
+            .details()
+            .and_then(|details| details.message.as_deref())
+            .is_some_and(|message| {
+                message.contains("No replicant or comms device in this star system")
+            })
     {
         "out_of_comms"
     } else {
@@ -3108,11 +3110,8 @@ async fn find_bill(
     payload: Result<Json<BillFinderRequest>, JsonRejection>,
 ) -> Result<Json<Versioned<BillFinderResponse>>, ApiError> {
     let Json(request) = payload.map_err(|_| ApiError::invalid("invalid Bill finder request"))?;
-    let tracking_beacon = resolve_bill_tracking_beacon(
-        state.client(),
-        request.tracking_beacon.as_deref(),
-    )
-    .await?;
+    let tracking_beacon =
+        resolve_bill_tracking_beacon(state.client(), request.tracking_beacon.as_deref()).await?;
     let replicant_code = env::var("REPLICANT_BILL_REPLICANT_CODE")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -3211,10 +3210,7 @@ async fn resolve_bill_tracking_beacon(
     client: &Client,
     requested: Option<&str>,
 ) -> Result<String, ApiError> {
-    if let Some(requested) = requested
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(requested.to_ascii_uppercase());
     }
     if let Some(configured) = env::var("REPLICANT_BILL_TRACKING_BEACON")
@@ -3317,10 +3313,8 @@ fn normalize_bill_vector(vector: [f64; 3]) -> Option<[f64; 3]> {
     if !vector.iter().all(|value| value.is_finite()) {
         return None;
     }
-    let norm =
-        (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
-    (norm > f64::EPSILON)
-        .then_some([vector[0] / norm, vector[1] / norm, vector[2] / norm])
+    let norm = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+    (norm > f64::EPSILON).then_some([vector[0] / norm, vector[1] / norm, vector[2] / norm])
 }
 
 fn resolve_catalogue_system(
@@ -3361,13 +3355,11 @@ fn rank_bill_candidates(
                 position.y - origin.y,
                 position.z - origin.z,
             ];
-            let distance =
-                (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             if !distance.is_finite() || distance <= f64::EPSILON {
                 return None;
             }
-            let projected =
-                delta[0] * vector[0] + delta[1] * vector[1] + delta[2] * vector[2];
+            let projected = delta[0] * vector[0] + delta[1] * vector[1] + delta[2] * vector[2];
             if projected <= 0.0 {
                 return None;
             }
@@ -3469,7 +3461,8 @@ fn bill_expansion(
             status: "reused".to_owned(),
             target_system: Some(target),
             workflow: Some(summary(&existing)),
-            message: "An active FTL expansion workflow already targets this system; reusing it.".to_owned(),
+            message: "An active FTL expansion workflow already targets this system; reusing it."
+                .to_owned(),
         });
     }
 
@@ -6758,7 +6751,11 @@ mod tests {
         ];
         let candidates = rank_bill_candidates(&catalogue, "SOL", [0.97, 0.10, -0.20]);
         assert_eq!(candidates[0].system, "BEST");
-        assert!(candidates.iter().all(|candidate| candidate.system != "BEHIND"));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.system != "BEHIND")
+        );
         assert!(candidates[0].angular_error_deg < candidates[1].angular_error_deg);
     }
 

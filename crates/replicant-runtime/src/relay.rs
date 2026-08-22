@@ -2067,8 +2067,8 @@ async fn refresh_device_census(
             let Some(system) = resolve_system(location, systems) else {
                 continue;
             };
-            let recoverable_dsr = kind == Some(DEEP_SPACE_RELAY)
-                && relay_device_recoverable(device);
+            let recoverable_dsr =
+                kind == Some(DEEP_SPACE_RELAY) && relay_device_recoverable(device);
             if recoverable_dsr {
                 recoverable_dsr_codes
                     .entry(system.clone())
@@ -2590,8 +2590,7 @@ fn migrate_relay_mission_tag_metadata(plan: &mut MissionPlan) -> bool {
         }
     }
     let before = plan.legacy_mission_tags.len();
-    plan
-        .legacy_mission_tags
+    plan.legacy_mission_tags
         .retain(|tag| tag.starts_with(RELAY_MISSION_TAG_PREFIX) && tag != &desired);
     plan.legacy_mission_tags.sort();
     plan.legacy_mission_tags.dedup();
@@ -2882,15 +2881,17 @@ async fn reconcile_supply_plan(client: &Client, plan: &mut MissionPlan) -> AnyRe
     Ok(())
 }
 
-async fn migrate_legacy_relay_devices(
-    client: &Client,
-    plan: &MissionPlan,
-) -> AnyResult<usize> {
+async fn migrate_legacy_relay_devices(client: &Client, plan: &MissionPlan) -> AnyResult<usize> {
     if plan.legacy_mission_tags.is_empty() {
         return Ok(0);
     }
     let desired = relay_system_mission_tag(&plan.start_system);
-    let handles = client.devices().refresh_many().page_size(50).collect().await?;
+    let handles = client
+        .devices()
+        .refresh_many()
+        .page_size(50)
+        .collect()
+        .await?;
     let mut migrated = 0usize;
     for handle in handles {
         let snapshot = handle.snapshot().await?;
@@ -5012,7 +5013,10 @@ async fn prepare_relay_print_prerequisites(
 
     let prerequisite_tag = relay_prerequisite_tag(&plan.mission_id);
     let mut options = QueueOptions::at(plan.hub_location.clone());
-    options.tags = vec![relay_system_mission_tag(&plan.start_system), prerequisite_tag];
+    options.tags = vec![
+        relay_system_mission_tag(&plan.start_system),
+        prerequisite_tag,
+    ];
     options.poll_interval = POLL_INTERVAL;
     options.wait_timeout = config.wait_timeout;
     options.factory_codes = Some(factory_codes);
@@ -5295,9 +5299,10 @@ async fn travel_to(
         .as_ref()
         .map(|location| location.id.as_str().to_owned());
     if snapshot.travel.is_none()
-        && snapshot.location.as_ref().is_some_and(|location| {
-            relay_destination_matches(location.id.as_str(), destination)
-        })
+        && snapshot
+            .location
+            .as_ref()
+            .is_some_and(|location| relay_destination_matches(location.id.as_str(), destination))
     {
         return Ok(());
     }

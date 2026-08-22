@@ -1209,7 +1209,8 @@ mod tests {
     #[test]
     fn mining_mission_tags_are_system_scoped_and_bounded() {
         assert_eq!(mining_mission_tag("SCEPTURUM-BELT-1"), "mine-m:scepturum");
-        let long = mining_mission_tag("A-SYSTEM-NAME-THAT-IS-WELL-PAST-THE-DEVICE-TAG-LIMIT-BELT-1");
+        let long =
+            mining_mission_tag("A-SYSTEM-NAME-THAT-IS-WELL-PAST-THE-DEVICE-TAG-LIMIT-BELT-1");
         assert!(long.chars().count() <= MAX_DEVICE_TAG_CHARS);
     }
 

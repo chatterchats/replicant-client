@@ -40,9 +40,9 @@ use crate::{
         RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
         blueprint_acquire_workflow_kind, blueprint_source_is_candidate, blueprint_source_location,
         exploration_workflow_kind, new_blueprint_acquire_workflow, new_event_campaign_workflow,
-        new_exploration_workflow, new_logistics_manifest_workflow,
-        new_mining_campaign_workflow, new_observatory_workflow, new_region_establish_workflow,
-        new_replicant_provision_workflow, new_scan_tour_workflow,
+        new_exploration_workflow, new_logistics_manifest_workflow, new_mining_campaign_workflow,
+        new_observatory_workflow, new_region_establish_workflow, new_replicant_provision_workflow,
+        new_scan_tour_workflow,
     },
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
@@ -4854,9 +4854,7 @@ mod tests {
         let mut vessel = test_hub_device();
         vessel.key = replicant_client::DeviceKey::live("VESSEL-1".into());
         vessel.device_type = Some(DeviceType::from("heaven_vessel"));
-        vessel.location = Some(replicant_client::LocationKey::live(
-            "SCEPTURUM-7-L4".into(),
-        ));
+        vessel.location = Some(replicant_client::LocationKey::live("SCEPTURUM-7-L4".into()));
 
         let mut stowed = idle.clone();
         stowed.key = replicant_client::DeviceKey::live("SLING-1".into());

@@ -525,10 +525,7 @@ mod tests {
     fn generated_tags_fit_the_api_limit() {
         assert_eq!(mission_tag("SCEPTURUM"), "boot-m:scepturum");
         assert!(mission_tag(&"x".repeat(200)).len() <= 32);
-        assert_eq!(
-            mission_tag(&"x".repeat(200)),
-            mission_tag(&"X".repeat(200))
-        );
+        assert_eq!(mission_tag(&"x".repeat(200)), mission_tag(&"X".repeat(200)));
         assert!(role_tag(&"role".repeat(20)).len() <= 32);
     }
 }

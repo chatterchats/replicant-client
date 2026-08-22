@@ -101,7 +101,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Vec::new()
         }
     };
-    let history_database = replicant_client::default_history_database_path(&config.managed_database);
+    let history_database =
+        replicant_client::default_history_database_path(&config.managed_database);
     let empire_telemetry = match EmpireTelemetryService::start(
         &config.managed_database,
         &history_database,

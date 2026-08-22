@@ -574,10 +574,8 @@ fn pending_tagged_prints_from_devices(
                 .get("tags")
                 .and_then(Value::as_array)
                 .is_some_and(|tags| {
-                    tags.iter().any(|tag| {
-                        tag.as_str()
-                            .is_some_and(|tag| mission_tags.contains(&tag))
-                    })
+                    tags.iter()
+                        .any(|tag| tag.as_str().is_some_and(|tag| mission_tags.contains(&tag)))
                 });
             if !tagged {
                 continue;
@@ -714,9 +712,8 @@ async fn wait_for_printed_assets(
                         .and_then(serde_json::Value::as_array)
                         .is_some_and(|tags| {
                             let aliases = mission_tag_aliases(mission);
-                            tags.iter().any(|tag| {
-                                tag.as_str().is_some_and(|tag| aliases.contains(&tag))
-                            })
+                            tags.iter()
+                                .any(|tag| tag.as_str().is_some_and(|tag| aliases.contains(&tag)))
                         })
                     {
                         break;
@@ -2513,12 +2510,12 @@ fn mission_tag_aliases(mission: &BootstrapMission) -> Vec<&str> {
         .collect()
 }
 
-fn device_has_mission_tag(
-    device: &raw::devices::DeviceStatus,
-    mission: &BootstrapMission,
-) -> bool {
+fn device_has_mission_tag(device: &raw::devices::DeviceStatus, mission: &BootstrapMission) -> bool {
     let aliases = mission_tag_aliases(mission);
-    device.tags.iter().any(|tag| aliases.contains(&tag.as_str()))
+    device
+        .tags
+        .iter()
+        .any(|tag| aliases.contains(&tag.as_str()))
 }
 
 async fn migrate_legacy_mission_devices(
