@@ -253,6 +253,10 @@ pub struct MiningMission {
     pub version: u32,
     pub mission_id: String,
     pub mission_tag: String,
+    /// Historical UUID-derived mission tags still recognized while queued
+    /// prints and already-produced stock are migrated to the system tag.
+    #[serde(default)]
+    pub legacy_mission_tags: Vec<String>,
     pub phase: MissionPhase,
     pub selected_replicant: String,
     pub hub_location: String,
@@ -471,7 +475,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
             });
     let route_schedule = schedule_prints(&route_print_requirements, &blueprints, &route_factories)?;
     let mission_id = uuid::Uuid::new_v4().simple().to_string();
-    let mission_tag = format!("mine-m:{:016x}", stable_hash(&mission_id));
+    let mission_tag = mining_mission_tag(&config.hub);
     let mut print_batches =
         execution_batches(&mission_id, PrintPurpose::Site, &site_schedule.batches);
     print_batches.extend(execution_batches(
@@ -494,6 +498,7 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
         version: PLAN_VERSION,
         mission_id,
         mission_tag,
+        legacy_mission_tags: Vec::new(),
         phase: MissionPhase::Planned,
         selected_replicant,
         hub_location: config.hub.clone(),
@@ -541,6 +546,78 @@ fn execution_batches(
             })
         })
         .collect()
+}
+
+const MINING_MISSION_TAG_PREFIX: &str = "mine-m:";
+const MAX_DEVICE_TAG_CHARS: usize = 32;
+
+/// Returns the stable mining reservation tag for a manufacturing hub system.
+pub(crate) fn mining_mission_tag(hub_location: &str) -> String {
+    let system = hub_location
+        .split('-')
+        .next()
+        .filter(|system| !system.is_empty())
+        .unwrap_or(hub_location);
+    bounded_system_tag(MINING_MISSION_TAG_PREFIX, system)
+}
+
+/// Upgrades an in-memory legacy mining checkpoint while retaining old aliases.
+pub(crate) fn migrate_mission_tag_metadata(mission: &mut MiningMission) -> bool {
+    let desired = mining_mission_tag(&mission.hub_location);
+    let mut changed = false;
+    if mission.mission_tag != desired {
+        let previous = std::mem::replace(&mut mission.mission_tag, desired.clone());
+        if previous.starts_with(MINING_MISSION_TAG_PREFIX)
+            && !mission.legacy_mission_tags.contains(&previous)
+        {
+            mission.legacy_mission_tags.push(previous);
+        }
+        changed = true;
+    }
+    let before = mission.legacy_mission_tags.len();
+    mission
+        .legacy_mission_tags
+        .retain(|tag| tag.starts_with(MINING_MISSION_TAG_PREFIX) && tag != &desired);
+    mission.legacy_mission_tags.sort();
+    mission.legacy_mission_tags.dedup();
+    changed || mission.legacy_mission_tags.len() != before
+}
+
+/// Returns whether a mining mission tag uses the old 16-hex hash identity.
+pub(crate) fn is_opaque_mining_mission_tag(tag: &str) -> bool {
+    tag.strip_prefix(MINING_MISSION_TAG_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn bounded_system_tag(prefix: &str, system: &str) -> String {
+    const HASH_CHARS: usize = 12;
+    let normalized = system
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-');
+    let direct = format!("{prefix}{normalized}");
+    if direct.chars().count() <= MAX_DEVICE_TAG_CHARS {
+        return direct;
+    }
+
+    let fixed = prefix.chars().count() + 1 + HASH_CHARS;
+    let head_budget = MAX_DEVICE_TAG_CHARS.saturating_sub(fixed).max(1);
+    let mut head = normalized.chars().take(head_budget).collect::<String>();
+    head = head.trim_end_matches('-').to_owned();
+    if head.is_empty() {
+        head.push('s');
+    }
+    let hash = stable_hash(normalized) & 0x0000_ffff_ffff_ffff;
+    format!("{prefix}{head}-{hash:012x}")
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -992,7 +1069,7 @@ fn save_plan(path: &Path, mission: &MiningMission) -> AnyResult<()> {
 
 /// Loads a durable mining expansion checkpoint from disk.
 pub fn load_expansion(path: &Path) -> AnyResult<MiningMission> {
-    let mission: MiningMission = serde_json::from_slice(&fs::read(path)?)?;
+    let mut mission: MiningMission = serde_json::from_slice(&fs::read(path)?)?;
     if mission.version != PLAN_VERSION {
         return Err(app_error(
             io::ErrorKind::InvalidData,
@@ -1002,6 +1079,7 @@ pub fn load_expansion(path: &Path) -> AnyResult<MiningMission> {
             ),
         ));
     }
+    migrate_mission_tag_metadata(&mut mission);
     Ok(mission)
 }
 
@@ -1127,6 +1205,13 @@ mod tests {
         AccessScope, ActiveDeviceDirective, DeviceDirective, DeviceId, DeviceKey,
         DeviceRelationships, DeviceStatus,
     };
+
+    #[test]
+    fn mining_mission_tags_are_system_scoped_and_bounded() {
+        assert_eq!(mining_mission_tag("SCEPTURUM-BELT-1"), "mine-m:scepturum");
+        let long = mining_mission_tag("A-SYSTEM-NAME-THAT-IS-WELL-PAST-THE-DEVICE-TAG-LIMIT-BELT-1");
+        assert!(long.chars().count() <= MAX_DEVICE_TAG_CHARS);
+    }
 
     fn device(code: &str, device_type_name: &str, location: &str) -> Device {
         Device {

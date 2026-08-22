@@ -1,0 +1,1693 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP attempts",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Physical HTTP attempts, including retries.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(request_count) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(request_count) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(request_count) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Logical API calls",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 3,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "First attempts; excludes retry amplification.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(logical_request_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(logical_request_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(logical_request_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "2xx response rate",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Share of physical attempts that received a 2xx HTTP status.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 95
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          },
+          "unit": "percent",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 100.0 * SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN request_count ELSE 0 END) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 100.0 * SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN request_count ELSE 0 END) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 100.0 * SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN request_count ELSE 0 END) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "429 responses",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Rate-limit responses in the selected range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(CASE WHEN status_code = 429 THEN request_count ELSE 0 END) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(CASE WHEN status_code = 429 THEN request_count ELSE 0 END) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT SUM(CASE WHEN status_code = 429 THEN request_count ELSE 0 END) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Retry attempts",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Physical attempts whose attempt number is greater than one.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 25
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(retry_attempt_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(retry_attempt_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(retry_attempt_count), 0) AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Retry amplification",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 15,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Physical attempts divided by logical API calls. 1.0x means no retries.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.02
+              },
+              {
+                "color": "red",
+                "value": 1.1
+              }
+            ]
+          },
+          "unit": "none",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(logical_request_count) = 0 THEN 1.0\n  ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(logical_request_count) = 0 THEN 1.0\n  ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(logical_request_count) = 0 THEN 1.0\n  ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Average attempt latency",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Average end-to-end latency per physical API attempt.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 2500
+              }
+            ]
+          },
+          "unit": "ms",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 1.0 * SUM(elapsed_sum_ms) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 1.0 * SUM(elapsed_sum_ms) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT CASE WHEN SUM(request_count) = 0 THEN 0 ELSE 1.0 * SUM(elapsed_sum_ms) / SUM(request_count) END AS value\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Dropped telemetry",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 21,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Samples intentionally dropped because the bounded telemetry queue was unavailable.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='dropped_samples'), 0) AS value",
+          "queryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='dropped_samples'), 0) AS value",
+          "rawQueryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='dropped_samples'), 0) AS value",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "API traffic over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Physical request attempts at the automatically selected retained resolution.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS requests\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\nORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS requests\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\nORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS requests\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\nORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "HTTP response classes over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Stacked response-class timeline. 429 is intentionally separated from other 4xx responses.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE\n    WHEN status_code = -1 THEN 'transport/no status'\n    WHEN status_code = 429 THEN '429'\n    WHEN status_code BETWEEN 200 AND 299 THEN '2xx'\n    WHEN status_code BETWEEN 300 AND 399 THEN '3xx'\n    WHEN status_code BETWEEN 400 AND 499 THEN '4xx other'\n    WHEN status_code BETWEEN 500 AND 599 THEN '5xx'\n    ELSE CAST(status_code AS TEXT)\n  END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, series\nORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE\n    WHEN status_code = -1 THEN 'transport/no status'\n    WHEN status_code = 429 THEN '429'\n    WHEN status_code BETWEEN 200 AND 299 THEN '2xx'\n    WHEN status_code BETWEEN 300 AND 399 THEN '3xx'\n    WHEN status_code BETWEEN 400 AND 499 THEN '4xx other'\n    WHEN status_code BETWEEN 500 AND 599 THEN '5xx'\n    ELSE CAST(status_code AS TEXT)\n  END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, series\nORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE\n    WHEN status_code = -1 THEN 'transport/no status'\n    WHEN status_code = 429 THEN '429'\n    WHEN status_code BETWEEN 200 AND 299 THEN '2xx'\n    WHEN status_code BETWEEN 300 AND 399 THEN '3xx'\n    WHEN status_code BETWEEN 400 AND 499 THEN '4xx other'\n    WHEN status_code BETWEEN 500 AND 599 THEN '5xx'\n    ELSE CAST(status_code AS TEXT)\n  END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, series\nORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 75,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "2xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "429"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Exact HTTP response codes over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 9
+      },
+      "description": "Every retained HTTP status code as its own time series, including failed attempts that were later retried successfully.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE WHEN status_code = -1 THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, status_code\nORDER BY bucket_start_ms, status_code",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE WHEN status_code = -1 THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, status_code\nORDER BY bucket_start_ms, status_code",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(request_count) AS value,\n  CASE WHEN status_code = -1 THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, status_code\nORDER BY bucket_start_ms, status_code",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": ["sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Attempt latency percentiles",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Histogram-derived p50/p95/p99. Values remain mergeable across retained rollup tiers.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS n, MAX(elapsed_max_ms) AS max_ms,\n SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\n)\nSELECT time, CASE WHEN le25*100 >= n*50 THEN 25 WHEN le50*100 >= n*50 THEN 50 WHEN le100*100 >= n*50 THEN 100 WHEN le200*100 >= n*50 THEN 200 WHEN le350*100 >= n*50 THEN 350 WHEN le500*100 >= n*50 THEN 500 WHEN le750*100 >= n*50 THEN 750 WHEN le1000*100 >= n*50 THEN 1000 WHEN le1500*100 >= n*50 THEN 1500 WHEN le2500*100 >= n*50 THEN 2500 WHEN le5000*100 >= n*50 THEN 5000 WHEN le10000*100 >= n*50 THEN 10000 WHEN le30000*100 >= n*50 THEN 30000 ELSE max_ms END AS p50, CASE WHEN le25*100 >= n*95 THEN 25 WHEN le50*100 >= n*95 THEN 50 WHEN le100*100 >= n*95 THEN 100 WHEN le200*100 >= n*95 THEN 200 WHEN le350*100 >= n*95 THEN 350 WHEN le500*100 >= n*95 THEN 500 WHEN le750*100 >= n*95 THEN 750 WHEN le1000*100 >= n*95 THEN 1000 WHEN le1500*100 >= n*95 THEN 1500 WHEN le2500*100 >= n*95 THEN 2500 WHEN le5000*100 >= n*95 THEN 5000 WHEN le10000*100 >= n*95 THEN 10000 WHEN le30000*100 >= n*95 THEN 30000 ELSE max_ms END AS p95, CASE WHEN le25*100 >= n*99 THEN 25 WHEN le50*100 >= n*99 THEN 50 WHEN le100*100 >= n*99 THEN 100 WHEN le200*100 >= n*99 THEN 200 WHEN le350*100 >= n*99 THEN 350 WHEN le500*100 >= n*99 THEN 500 WHEN le750*100 >= n*99 THEN 750 WHEN le1000*100 >= n*99 THEN 1000 WHEN le1500*100 >= n*99 THEN 1500 WHEN le2500*100 >= n*99 THEN 2500 WHEN le5000*100 >= n*99 THEN 5000 WHEN le10000*100 >= n*99 THEN 10000 WHEN le30000*100 >= n*99 THEN 30000 ELSE max_ms END AS p99\nFROM agg ORDER BY time",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS n, MAX(elapsed_max_ms) AS max_ms,\n SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\n)\nSELECT time, CASE WHEN le25*100 >= n*50 THEN 25 WHEN le50*100 >= n*50 THEN 50 WHEN le100*100 >= n*50 THEN 100 WHEN le200*100 >= n*50 THEN 200 WHEN le350*100 >= n*50 THEN 350 WHEN le500*100 >= n*50 THEN 500 WHEN le750*100 >= n*50 THEN 750 WHEN le1000*100 >= n*50 THEN 1000 WHEN le1500*100 >= n*50 THEN 1500 WHEN le2500*100 >= n*50 THEN 2500 WHEN le5000*100 >= n*50 THEN 5000 WHEN le10000*100 >= n*50 THEN 10000 WHEN le30000*100 >= n*50 THEN 30000 ELSE max_ms END AS p50, CASE WHEN le25*100 >= n*95 THEN 25 WHEN le50*100 >= n*95 THEN 50 WHEN le100*100 >= n*95 THEN 100 WHEN le200*100 >= n*95 THEN 200 WHEN le350*100 >= n*95 THEN 350 WHEN le500*100 >= n*95 THEN 500 WHEN le750*100 >= n*95 THEN 750 WHEN le1000*100 >= n*95 THEN 1000 WHEN le1500*100 >= n*95 THEN 1500 WHEN le2500*100 >= n*95 THEN 2500 WHEN le5000*100 >= n*95 THEN 5000 WHEN le10000*100 >= n*95 THEN 10000 WHEN le30000*100 >= n*95 THEN 30000 ELSE max_ms END AS p95, CASE WHEN le25*100 >= n*99 THEN 25 WHEN le50*100 >= n*99 THEN 50 WHEN le100*100 >= n*99 THEN 100 WHEN le200*100 >= n*99 THEN 200 WHEN le350*100 >= n*99 THEN 350 WHEN le500*100 >= n*99 THEN 500 WHEN le750*100 >= n*99 THEN 750 WHEN le1000*100 >= n*99 THEN 1000 WHEN le1500*100 >= n*99 THEN 1500 WHEN le2500*100 >= n*99 THEN 2500 WHEN le5000*100 >= n*99 THEN 5000 WHEN le10000*100 >= n*99 THEN 10000 WHEN le30000*100 >= n*99 THEN 30000 ELSE max_ms END AS p99\nFROM agg ORDER BY time",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT (bucket_start_ms / 1000) AS time, SUM(request_count) AS n, MAX(elapsed_max_ms) AS max_ms,\n SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms\n)\nSELECT time, CASE WHEN le25*100 >= n*50 THEN 25 WHEN le50*100 >= n*50 THEN 50 WHEN le100*100 >= n*50 THEN 100 WHEN le200*100 >= n*50 THEN 200 WHEN le350*100 >= n*50 THEN 350 WHEN le500*100 >= n*50 THEN 500 WHEN le750*100 >= n*50 THEN 750 WHEN le1000*100 >= n*50 THEN 1000 WHEN le1500*100 >= n*50 THEN 1500 WHEN le2500*100 >= n*50 THEN 2500 WHEN le5000*100 >= n*50 THEN 5000 WHEN le10000*100 >= n*50 THEN 10000 WHEN le30000*100 >= n*50 THEN 30000 ELSE max_ms END AS p50, CASE WHEN le25*100 >= n*95 THEN 25 WHEN le50*100 >= n*95 THEN 50 WHEN le100*100 >= n*95 THEN 100 WHEN le200*100 >= n*95 THEN 200 WHEN le350*100 >= n*95 THEN 350 WHEN le500*100 >= n*95 THEN 500 WHEN le750*100 >= n*95 THEN 750 WHEN le1000*100 >= n*95 THEN 1000 WHEN le1500*100 >= n*95 THEN 1500 WHEN le2500*100 >= n*95 THEN 2500 WHEN le5000*100 >= n*95 THEN 5000 WHEN le10000*100 >= n*95 THEN 10000 WHEN le30000*100 >= n*95 THEN 30000 ELSE max_ms END AS p95, CASE WHEN le25*100 >= n*99 THEN 25 WHEN le50*100 >= n*99 THEN 50 WHEN le100*100 >= n*99 THEN 100 WHEN le200*100 >= n*99 THEN 200 WHEN le350*100 >= n*99 THEN 350 WHEN le500*100 >= n*99 THEN 500 WHEN le750*100 >= n*99 THEN 750 WHEN le1000*100 >= n*99 THEN 1000 WHEN le1500*100 >= n*99 THEN 1500 WHEN le2500*100 >= n*99 THEN 2500 WHEN le5000*100 >= n*99 THEN 5000 WHEN le10000*100 >= n*99 THEN 10000 WHEN le30000*100 >= n*99 THEN 30000 ELSE max_ms END AS p99\nFROM agg ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["mean", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Request latency breakdown",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Average measured request phases. This separates local throttling, upstream response time, body transfer, and decode work.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count) END AS 'rate-limit wait',\n  CASE WHEN SUM(request_prepare_count)=0 THEN 0 ELSE 1.0 * SUM(request_prepare_sum_ms) / SUM(request_prepare_count) END AS 'request prepare',\n  CASE WHEN SUM(time_to_headers_count)=0 THEN 0 ELSE 1.0 * SUM(time_to_headers_sum_ms) / SUM(time_to_headers_count) END AS 'time to headers',\n  CASE WHEN SUM(metadata_count)=0 THEN 0 ELSE 1.0 * SUM(metadata_sum_ms) / SUM(metadata_count) END AS metadata,\n  CASE WHEN SUM(body_read_count)=0 THEN 0 ELSE 1.0 * SUM(body_read_sum_ms) / SUM(body_read_count) END AS 'body read',\n  CASE WHEN SUM(decode_count)=0 THEN 0 ELSE 1.0 * SUM(decode_sum_ms) / SUM(decode_count) END AS decode\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count) END AS 'rate-limit wait',\n  CASE WHEN SUM(request_prepare_count)=0 THEN 0 ELSE 1.0 * SUM(request_prepare_sum_ms) / SUM(request_prepare_count) END AS 'request prepare',\n  CASE WHEN SUM(time_to_headers_count)=0 THEN 0 ELSE 1.0 * SUM(time_to_headers_sum_ms) / SUM(time_to_headers_count) END AS 'time to headers',\n  CASE WHEN SUM(metadata_count)=0 THEN 0 ELSE 1.0 * SUM(metadata_sum_ms) / SUM(metadata_count) END AS metadata,\n  CASE WHEN SUM(body_read_count)=0 THEN 0 ELSE 1.0 * SUM(body_read_sum_ms) / SUM(body_read_count) END AS 'body read',\n  CASE WHEN SUM(decode_count)=0 THEN 0 ELSE 1.0 * SUM(decode_sum_ms) / SUM(decode_count) END AS decode\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count) END AS 'rate-limit wait',\n  CASE WHEN SUM(request_prepare_count)=0 THEN 0 ELSE 1.0 * SUM(request_prepare_sum_ms) / SUM(request_prepare_count) END AS 'request prepare',\n  CASE WHEN SUM(time_to_headers_count)=0 THEN 0 ELSE 1.0 * SUM(time_to_headers_sum_ms) / SUM(time_to_headers_count) END AS 'time to headers',\n  CASE WHEN SUM(metadata_count)=0 THEN 0 ELSE 1.0 * SUM(metadata_sum_ms) / SUM(metadata_count) END AS metadata,\n  CASE WHEN SUM(body_read_count)=0 THEN 0 ELSE 1.0 * SUM(body_read_sum_ms) / SUM(body_read_count) END AS 'body read',\n  CASE WHEN SUM(decode_count)=0 THEN 0 ELSE 1.0 * SUM(decode_sum_ms) / SUM(decode_count) END AS decode\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Requests and retries over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Logical calls versus actual HTTP attempts. The gap between the two is retry amplification.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(logical_request_count) AS 'logical calls',\n  SUM(request_count) AS 'physical attempts',\n  SUM(retry_attempt_count) AS retries\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(logical_request_count) AS 'logical calls',\n  SUM(request_count) AS 'physical attempts',\n  SUM(retry_attempt_count) AS retries\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(logical_request_count) AS 'logical calls',\n  SUM(request_count) AS 'physical attempts',\n  SUM(retry_attempt_count) AS retries\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Retry amplification over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Attempts per logical call. A sustained value above 1.0 means retries are adding API load.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(logical_request_count)=0 THEN 1.0 ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS amplification\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(logical_request_count)=0 THEN 1.0 ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS amplification\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(logical_request_count)=0 THEN 1.0 ELSE 1.0 * SUM(request_count) / SUM(logical_request_count) END AS amplification\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Rate-limit remaining",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 30,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Lowest last-seen remaining quota per rate-limit bucket in each time bucket.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  MIN(rate_limit_remaining_last) AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND rate_limit_remaining_last IS NOT NULL\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  MIN(rate_limit_remaining_last) AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND rate_limit_remaining_last IS NOT NULL\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  MIN(rate_limit_remaining_last) AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND rate_limit_remaining_last IS NOT NULL\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Attempt latency distribution",
+      "type": "heatmap",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 10
+      },
+      "description": "Pre-bucketed mergeable latency histogram over time. The 60000 bucket represents attempts slower than 30 seconds.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "mode": "scheme",
+          "scheme": "Spectral",
+          "steps": 16,
+          "reverse": false,
+          "scale": "exponential",
+          "exponent": 0.5
+        },
+        "filterValues": {
+          "le": 0
+        },
+        "legend": {
+          "show": true
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        },
+        "tooltip": {
+          "mode": "single",
+          "showColorScale": true,
+          "yHistogram": false
+        },
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": false,
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(elapsed_le_25_count) AS '25',\n  SUM(elapsed_le_50_count - elapsed_le_25_count) AS '50',\n  SUM(elapsed_le_100_count - elapsed_le_50_count) AS '100',\n  SUM(elapsed_le_200_count - elapsed_le_100_count) AS '200',\n  SUM(elapsed_le_350_count - elapsed_le_200_count) AS '350',\n  SUM(elapsed_le_500_count - elapsed_le_350_count) AS '500',\n  SUM(elapsed_le_750_count - elapsed_le_500_count) AS '750',\n  SUM(elapsed_le_1000_count - elapsed_le_750_count) AS '1000',\n  SUM(elapsed_le_1500_count - elapsed_le_1000_count) AS '1500',\n  SUM(elapsed_le_2500_count - elapsed_le_1500_count) AS '2500',\n  SUM(elapsed_le_5000_count - elapsed_le_2500_count) AS '5000',\n  SUM(elapsed_le_10000_count - elapsed_le_5000_count) AS '10000',\n  SUM(elapsed_le_30000_count - elapsed_le_10000_count) AS '30000',\n  SUM(request_count - elapsed_le_30000_count) AS '60000'\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(elapsed_le_25_count) AS '25',\n  SUM(elapsed_le_50_count - elapsed_le_25_count) AS '50',\n  SUM(elapsed_le_100_count - elapsed_le_50_count) AS '100',\n  SUM(elapsed_le_200_count - elapsed_le_100_count) AS '200',\n  SUM(elapsed_le_350_count - elapsed_le_200_count) AS '350',\n  SUM(elapsed_le_500_count - elapsed_le_350_count) AS '500',\n  SUM(elapsed_le_750_count - elapsed_le_500_count) AS '750',\n  SUM(elapsed_le_1000_count - elapsed_le_750_count) AS '1000',\n  SUM(elapsed_le_1500_count - elapsed_le_1000_count) AS '1500',\n  SUM(elapsed_le_2500_count - elapsed_le_1500_count) AS '2500',\n  SUM(elapsed_le_5000_count - elapsed_le_2500_count) AS '5000',\n  SUM(elapsed_le_10000_count - elapsed_le_5000_count) AS '10000',\n  SUM(elapsed_le_30000_count - elapsed_le_10000_count) AS '30000',\n  SUM(request_count - elapsed_le_30000_count) AS '60000'\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(elapsed_le_25_count) AS '25',\n  SUM(elapsed_le_50_count - elapsed_le_25_count) AS '50',\n  SUM(elapsed_le_100_count - elapsed_le_50_count) AS '100',\n  SUM(elapsed_le_200_count - elapsed_le_100_count) AS '200',\n  SUM(elapsed_le_350_count - elapsed_le_200_count) AS '350',\n  SUM(elapsed_le_500_count - elapsed_le_350_count) AS '500',\n  SUM(elapsed_le_750_count - elapsed_le_500_count) AS '750',\n  SUM(elapsed_le_1000_count - elapsed_le_750_count) AS '1000',\n  SUM(elapsed_le_1500_count - elapsed_le_1000_count) AS '1500',\n  SUM(elapsed_le_2500_count - elapsed_le_1500_count) AS '2500',\n  SUM(elapsed_le_5000_count - elapsed_le_2500_count) AS '5000',\n  SUM(elapsed_le_10000_count - elapsed_le_5000_count) AS '10000',\n  SUM(elapsed_le_30000_count - elapsed_le_10000_count) AS '30000',\n  SUM(request_count - elapsed_le_30000_count) AS '60000'\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Route health / slowest endpoints",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 16,
+        "h": 10
+      },
+      "description": "Volume, retry amplification, error rate, and histogram-derived tail latency by normalized API route.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "error_percent"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p95_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p99_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "max_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT route_key AS route,\n  SUM(request_count) AS attempts,\n  SUM(logical_request_count) AS logical_calls,\n  SUM(retry_attempt_count) AS retries,\n  SUM(CASE WHEN status_code >= 400 OR status_code = -1 THEN request_count ELSE 0 END) AS errors,\n  SUM(elapsed_sum_ms) AS elapsed_sum,\n  MAX(elapsed_max_ms) AS max_ms,\n  SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n  SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n  SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n  SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n  SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY route_key\n)\nSELECT route, attempts, logical_calls, retries,\n  ROUND(CASE WHEN logical_calls=0 THEN 1.0 ELSE 1.0*attempts/logical_calls END, 3) AS amplification,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 100.0*errors/attempts END, 2) AS error_percent,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 1.0*elapsed_sum/attempts END, 1) AS avg_ms,\n  CASE WHEN le25*100 >= attempts*95 THEN 25 WHEN le50*100 >= attempts*95 THEN 50 WHEN le100*100 >= attempts*95 THEN 100 WHEN le200*100 >= attempts*95 THEN 200 WHEN le350*100 >= attempts*95 THEN 350 WHEN le500*100 >= attempts*95 THEN 500 WHEN le750*100 >= attempts*95 THEN 750 WHEN le1000*100 >= attempts*95 THEN 1000 WHEN le1500*100 >= attempts*95 THEN 1500 WHEN le2500*100 >= attempts*95 THEN 2500 WHEN le5000*100 >= attempts*95 THEN 5000 WHEN le10000*100 >= attempts*95 THEN 10000 WHEN le30000*100 >= attempts*95 THEN 30000 ELSE max_ms END AS p95_ms,\n  CASE WHEN le25*100 >= attempts*99 THEN 25 WHEN le50*100 >= attempts*99 THEN 50 WHEN le100*100 >= attempts*99 THEN 100 WHEN le200*100 >= attempts*99 THEN 200 WHEN le350*100 >= attempts*99 THEN 350 WHEN le500*100 >= attempts*99 THEN 500 WHEN le750*100 >= attempts*99 THEN 750 WHEN le1000*100 >= attempts*99 THEN 1000 WHEN le1500*100 >= attempts*99 THEN 1500 WHEN le2500*100 >= attempts*99 THEN 2500 WHEN le5000*100 >= attempts*99 THEN 5000 WHEN le10000*100 >= attempts*99 THEN 10000 WHEN le30000*100 >= attempts*99 THEN 30000 ELSE max_ms END AS p99_ms,\n  max_ms\nFROM agg ORDER BY p95_ms DESC, attempts DESC LIMIT 30",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT route_key AS route,\n  SUM(request_count) AS attempts,\n  SUM(logical_request_count) AS logical_calls,\n  SUM(retry_attempt_count) AS retries,\n  SUM(CASE WHEN status_code >= 400 OR status_code = -1 THEN request_count ELSE 0 END) AS errors,\n  SUM(elapsed_sum_ms) AS elapsed_sum,\n  MAX(elapsed_max_ms) AS max_ms,\n  SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n  SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n  SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n  SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n  SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY route_key\n)\nSELECT route, attempts, logical_calls, retries,\n  ROUND(CASE WHEN logical_calls=0 THEN 1.0 ELSE 1.0*attempts/logical_calls END, 3) AS amplification,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 100.0*errors/attempts END, 2) AS error_percent,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 1.0*elapsed_sum/attempts END, 1) AS avg_ms,\n  CASE WHEN le25*100 >= attempts*95 THEN 25 WHEN le50*100 >= attempts*95 THEN 50 WHEN le100*100 >= attempts*95 THEN 100 WHEN le200*100 >= attempts*95 THEN 200 WHEN le350*100 >= attempts*95 THEN 350 WHEN le500*100 >= attempts*95 THEN 500 WHEN le750*100 >= attempts*95 THEN 750 WHEN le1000*100 >= attempts*95 THEN 1000 WHEN le1500*100 >= attempts*95 THEN 1500 WHEN le2500*100 >= attempts*95 THEN 2500 WHEN le5000*100 >= attempts*95 THEN 5000 WHEN le10000*100 >= attempts*95 THEN 10000 WHEN le30000*100 >= attempts*95 THEN 30000 ELSE max_ms END AS p95_ms,\n  CASE WHEN le25*100 >= attempts*99 THEN 25 WHEN le50*100 >= attempts*99 THEN 50 WHEN le100*100 >= attempts*99 THEN 100 WHEN le200*100 >= attempts*99 THEN 200 WHEN le350*100 >= attempts*99 THEN 350 WHEN le500*100 >= attempts*99 THEN 500 WHEN le750*100 >= attempts*99 THEN 750 WHEN le1000*100 >= attempts*99 THEN 1000 WHEN le1500*100 >= attempts*99 THEN 1500 WHEN le2500*100 >= attempts*99 THEN 2500 WHEN le5000*100 >= attempts*99 THEN 5000 WHEN le10000*100 >= attempts*99 THEN 10000 WHEN le30000*100 >= attempts*99 THEN 30000 ELSE max_ms END AS p99_ms,\n  max_ms\nFROM agg ORDER BY p95_ms DESC, attempts DESC LIMIT 30",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n), agg AS (\nSELECT route_key AS route,\n  SUM(request_count) AS attempts,\n  SUM(logical_request_count) AS logical_calls,\n  SUM(retry_attempt_count) AS retries,\n  SUM(CASE WHEN status_code >= 400 OR status_code = -1 THEN request_count ELSE 0 END) AS errors,\n  SUM(elapsed_sum_ms) AS elapsed_sum,\n  MAX(elapsed_max_ms) AS max_ms,\n  SUM(elapsed_le_25_count) AS le25, SUM(elapsed_le_50_count) AS le50, SUM(elapsed_le_100_count) AS le100,\n  SUM(elapsed_le_200_count) AS le200, SUM(elapsed_le_350_count) AS le350, SUM(elapsed_le_500_count) AS le500,\n  SUM(elapsed_le_750_count) AS le750, SUM(elapsed_le_1000_count) AS le1000, SUM(elapsed_le_1500_count) AS le1500,\n  SUM(elapsed_le_2500_count) AS le2500, SUM(elapsed_le_5000_count) AS le5000, SUM(elapsed_le_10000_count) AS le10000,\n  SUM(elapsed_le_30000_count) AS le30000\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY route_key\n)\nSELECT route, attempts, logical_calls, retries,\n  ROUND(CASE WHEN logical_calls=0 THEN 1.0 ELSE 1.0*attempts/logical_calls END, 3) AS amplification,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 100.0*errors/attempts END, 2) AS error_percent,\n  ROUND(CASE WHEN attempts=0 THEN 0 ELSE 1.0*elapsed_sum/attempts END, 1) AS avg_ms,\n  CASE WHEN le25*100 >= attempts*95 THEN 25 WHEN le50*100 >= attempts*95 THEN 50 WHEN le100*100 >= attempts*95 THEN 100 WHEN le200*100 >= attempts*95 THEN 200 WHEN le350*100 >= attempts*95 THEN 350 WHEN le500*100 >= attempts*95 THEN 500 WHEN le750*100 >= attempts*95 THEN 750 WHEN le1000*100 >= attempts*95 THEN 1000 WHEN le1500*100 >= attempts*95 THEN 1500 WHEN le2500*100 >= attempts*95 THEN 2500 WHEN le5000*100 >= attempts*95 THEN 5000 WHEN le10000*100 >= attempts*95 THEN 10000 WHEN le30000*100 >= attempts*95 THEN 30000 ELSE max_ms END AS p95_ms,\n  CASE WHEN le25*100 >= attempts*99 THEN 25 WHEN le50*100 >= attempts*99 THEN 50 WHEN le100*100 >= attempts*99 THEN 100 WHEN le200*100 >= attempts*99 THEN 200 WHEN le350*100 >= attempts*99 THEN 350 WHEN le500*100 >= attempts*99 THEN 500 WHEN le750*100 >= attempts*99 THEN 750 WHEN le1000*100 >= attempts*99 THEN 1000 WHEN le1500*100 >= attempts*99 THEN 1500 WHEN le2500*100 >= attempts*99 THEN 2500 WHEN le5000*100 >= attempts*99 THEN 5000 WHEN le10000*100 >= attempts*99 THEN 10000 WHEN le30000*100 >= attempts*99 THEN 30000 ELSE max_ms END AS p99_ms,\n  max_ms\nFROM agg ORDER BY p95_ms DESC, attempts DESC LIMIT 30",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Recent failed attempts (raw, 7-day retention)",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 48,
+        "w": 8,
+        "h": 10
+      },
+      "description": "Concrete paths and request IDs for drill-down. This panel intentionally expires with raw retention.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT (observed_at_ms / 1000) AS time, method, path,\n  CASE WHEN status_code IS NULL THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS status,\n  outcome, attempt, elapsed_ms, rate_limit_wait_ms, local_request_id, COALESCE(server_request_id, '') AS server_request_id\nFROM api_request_attempt\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(COALESCE(status_code, -1) AS TEXT) IN (${status:sqlstring})\n  AND (status_code IS NULL OR status_code >= 400 OR outcome <> 'success')\nORDER BY observed_at_ms DESC\nLIMIT 200",
+          "queryText": "SELECT (observed_at_ms / 1000) AS time, method, path,\n  CASE WHEN status_code IS NULL THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS status,\n  outcome, attempt, elapsed_ms, rate_limit_wait_ms, local_request_id, COALESCE(server_request_id, '') AS server_request_id\nFROM api_request_attempt\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(COALESCE(status_code, -1) AS TEXT) IN (${status:sqlstring})\n  AND (status_code IS NULL OR status_code >= 400 OR outcome <> 'success')\nORDER BY observed_at_ms DESC\nLIMIT 200",
+          "rawQueryText": "SELECT (observed_at_ms / 1000) AS time, method, path,\n  CASE WHEN status_code IS NULL THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS status,\n  outcome, attempt, elapsed_ms, rate_limit_wait_ms, local_request_id, COALESCE(server_request_id, '') AS server_request_id\nFROM api_request_attempt\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(COALESCE(status_code, -1) AS TEXT) IN (${status:sqlstring})\n  AND (status_code IS NULL OR status_code >= 400 OR outcome <> 'success')\nORDER BY observed_at_ms DESC\nLIMIT 200",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "elapsed_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rate_limit_wait_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 21,
+      "title": "429s by route",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Which normalized routes are actually exhausting rate limits.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_rate_wait_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT route_key AS route, SUM(request_count) AS responses_429,\n  SUM(retry_attempt_count) AS retries,\n  ROUND(1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count), 1) AS avg_rate_wait_ms\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND status_code = 429\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\nGROUP BY route_key ORDER BY responses_429 DESC LIMIT 30",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT route_key AS route, SUM(request_count) AS responses_429,\n  SUM(retry_attempt_count) AS retries,\n  ROUND(1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count), 1) AS avg_rate_wait_ms\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND status_code = 429\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\nGROUP BY route_key ORDER BY responses_429 DESC LIMIT 30",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT route_key AS route, SUM(request_count) AS responses_429,\n  SUM(retry_attempt_count) AS retries,\n  ROUND(1.0 * SUM(rate_limit_wait_sum_ms) / SUM(request_count), 1) AS avg_rate_wait_ms\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND status_code = 429\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\nGROUP BY route_key ORDER BY responses_429 DESC LIMIT 30",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Rate-limit wait by bucket",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 58,
+        "w": 10,
+        "h": 8
+      },
+      "description": "Average local/shared throttling delay, partitioned by API rate-limit bucket.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0*SUM(rate_limit_wait_sum_ms)/SUM(request_count) END AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0*SUM(rate_limit_wait_sum_ms)/SUM(request_count) END AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  CASE WHEN SUM(request_count)=0 THEN 0 ELSE 1.0*SUM(rate_limit_wait_sum_ms)/SUM(request_count) END AS value,\n  rate_limit_bucket AS series\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms, rate_limit_bucket ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Response volume over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 58,
+        "w": 6,
+        "h": 8
+      },
+      "description": "Decoded HTTP response bytes represented in each retained time bucket.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(response_bytes_sum) AS bytes\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(response_bytes_sum) AS bytes\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms / 1000) AS time,\n  SUM(response_bytes_sum) AS bytes\nFROM api_request_rollup, chosen\nWHERE resolution_seconds = chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to\n  AND route_key IN (${route:sqlstring})\n  AND method IN (${method:sqlstring})\n  AND CAST(status_code AS TEXT) IN (${status:sqlstring})\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Telemetry write failures",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "description": "SQLite telemetry writer/maintenance failures. Any nonzero value deserves inspection.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'), 0) AS value",
+          "queryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'), 0) AS value",
+          "rawQueryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'), 0) AS value",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Maintenance age",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 66,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Seconds since the telemetry retention/compaction maintenance pass.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 25200
+              },
+              {
+                "color": "red",
+                "value": 43200
+              }
+            ]
+          },
+          "unit": "s",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COALESCE((unixepoch('now') * 1000 - CAST((SELECT value FROM telemetry_meta WHERE key='last_maintenance_ms') AS INTEGER)) / 1000, 0) AS value",
+          "queryText": "SELECT COALESCE((unixepoch('now') * 1000 - CAST((SELECT value FROM telemetry_meta WHERE key='last_maintenance_ms') AS INTEGER)) / 1000, 0) AS value",
+          "rawQueryText": "SELECT COALESCE((unixepoch('now') * 1000 - CAST((SELECT value FROM telemetry_meta WHERE key='last_maintenance_ms') AS INTEGER)) / 1000, 0) AS value",
+          "timeColumns": []
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": ["api", "latency", "rate-limit", "replicant-space", "telemetry"],
+  "templating": {
+    "list": [
+      {
+        "name": "route",
+        "label": "Route",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT route_key AS __text, route_key AS __value FROM api_request_rollup GROUP BY route_key ORDER BY route_key",
+        "definition": "SELECT route_key AS __text, route_key AS __value FROM api_request_rollup GROUP BY route_key ORDER BY route_key",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      },
+      {
+        "name": "method",
+        "label": "Method",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT method AS __text, method AS __value FROM api_request_rollup GROUP BY method ORDER BY method",
+        "definition": "SELECT method AS __text, method AS __value FROM api_request_rollup GROUP BY method ORDER BY method",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      },
+      {
+        "name": "status",
+        "label": "Status",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT CASE WHEN status_code = -1 THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS __text, CAST(status_code AS TEXT) AS __value FROM api_request_rollup GROUP BY status_code ORDER BY status_code",
+        "definition": "SELECT CASE WHEN status_code = -1 THEN 'transport/no status' ELSE CAST(status_code AS TEXT) END AS __text, CAST(status_code AS TEXT) AS __value FROM api_request_rollup GROUP BY status_code ORDER BY status_code",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
+  "timezone": "browser",
+  "title": "Replicant Space \u00b7 API Observability",
+  "uid": "replicant-api-observability",
+  "version": 5,
+  "weekStart": ""
+}

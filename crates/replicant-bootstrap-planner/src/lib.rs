@@ -356,10 +356,41 @@ pub fn select_dense_belts(
     Ok(selected)
 }
 
-/// Stable mission reservation tag that fits the server's 32-character limit.
+/// Stable, readable mission reservation tag scoped to a landing system.
+///
+/// Normal system names remain readable. Overlong names retain a readable prefix
+/// plus a deterministic hash so the result always fits the server's
+/// 32-character device-tag limit.
 #[must_use]
-pub fn mission_tag(mission_id: &str) -> String {
-    format!("boot-m:{:016x}", stable_hash(mission_id))
+pub fn mission_tag(system: &str) -> String {
+    const PREFIX: &str = "boot-m:";
+    const HASH_CHARS: usize = 12;
+
+    let normalized = system
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-');
+    let direct = format!("{PREFIX}{normalized}");
+    if direct.chars().count() <= 32 {
+        return direct;
+    }
+
+    let fixed = PREFIX.chars().count() + 1 + HASH_CHARS;
+    let head_budget = 32usize.saturating_sub(fixed).max(1);
+    let mut head = normalized.chars().take(head_budget).collect::<String>();
+    head = head.trim_end_matches('-').to_owned();
+    if head.is_empty() {
+        head.push('s');
+    }
+    let hash = stable_hash(normalized) & 0x0000_ffff_ffff_ffff;
+    format!("{PREFIX}{head}-{hash:012x}")
 }
 
 /// Stable role tag that fits the server's 32-character limit.
@@ -492,7 +523,12 @@ mod tests {
 
     #[test]
     fn generated_tags_fit_the_api_limit() {
+        assert_eq!(mission_tag("SCEPTURUM"), "boot-m:scepturum");
         assert!(mission_tag(&"x".repeat(200)).len() <= 32);
+        assert_eq!(
+            mission_tag(&"x".repeat(200)),
+            mission_tag(&"X".repeat(200))
+        );
         assert!(role_tag(&"role".repeat(20)).len() <= 32);
     }
 }

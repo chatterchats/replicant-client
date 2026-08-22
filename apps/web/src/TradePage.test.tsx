@@ -1,6 +1,10 @@
+/** @vitest-environment jsdom */
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import type { DescriptorCommand } from "./CommandPalette";
 import { TradeContent, tradeCommands } from "./TradePage";
 import type { DescriptorCatalog, TradeSnapshot } from "./protocol";
 
@@ -19,7 +23,20 @@ const descriptors: DescriptorCatalog = {
       parameters: [],
     },
   ],
-  workflows: [],
+  workflows: [
+    {
+      kind: "trade.fulfillment",
+      display_name: "Execute provisioned trade",
+      aliases: [],
+      description: "Provision, execute, and return from a trade",
+      category: "trade",
+      operation_class: "workflow",
+      risk: "elevated",
+      applicable_to: ["device", "replicant", "location"],
+      parameters: [],
+      supported_triggers: [],
+    },
+  ],
 };
 
 const snapshot: TradeSnapshot = {
@@ -37,6 +54,7 @@ const snapshot: TradeSnapshot = {
       location: "SOL-1",
       total_stock: 2,
       trade_count: 1,
+      trade_details_status: "available",
       trades: [
         {
           trade_code: "TRD-1",
@@ -72,9 +90,78 @@ describe("TradeContent", () => {
     expect(html).toContain("4 iron");
     expect(html).toContain("1 probe");
     expect(html).toContain("Inspect");
-    expect(tradeCommands(descriptors)[0]?.descriptor.kind).toBe(
-      "trade.execute",
+    expect(html).toContain("Buy");
+    expect(html).toContain("Provision &amp; Buy");
+    expect(
+      tradeCommands(descriptors).some(
+        (command) => command.descriptor.kind === "trade.fulfillment",
+      ),
+    ).toBe(true);
+  });
+
+  it("binds direct and provisioned buys to the selected trade row", () => {
+    const onRunCommand = vi.fn<(command: DescriptorCommand) => void>();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <TradeContent
+          {...props}
+          onRunCommand={onRunCommand}
+          data={snapshot}
+          status="loaded"
+          error={null}
+        />,
+      );
+    });
+
+    const button = (label: string) =>
+      Array.from(container.querySelectorAll("button")).find(
+        (candidate) => candidate.textContent === label,
+      );
+
+    act(() => {
+      button("Buy")?.click();
+    });
+    const directBuy = onRunCommand.mock.calls.at(-1)?.[0];
+    expect(directBuy?.descriptor.kind).toBe("trade.execute");
+    expect(directBuy?.initialParameters).toEqual({
+      controller: "TC-1",
+      trade_code: "TRD-1",
+    });
+
+    act(() => {
+      button("Provision & Buy")?.click();
+    });
+    const provisionedBuy = onRunCommand.mock.calls.at(-1)?.[0];
+    expect(provisionedBuy?.descriptor.kind).toBe("trade.fulfillment");
+    expect(provisionedBuy?.initialParameters).toEqual({
+      controller: "TC-1",
+      trade_code: "TRD-1",
+      shop_location: "SOL-1",
+    });
+
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it("keeps out-of-comms shops visible without failing the page", () => {
+    const data: TradeSnapshot = {
+      ...snapshot,
+      controllers: snapshot.controllers.map((controller) => ({
+        ...controller,
+        trade_details_status: "out_of_comms",
+        trades: [],
+      })),
+    };
+    const html = renderToStaticMarkup(
+      <TradeContent {...props} data={data} status="loaded" error={null} />,
     );
+    expect(html).toContain("Exchange");
+    expect(html).toContain("Trade details are out of comms");
   });
 
   it("distinguishes loading, empty, and error states", () => {

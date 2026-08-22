@@ -1943,12 +1943,7 @@ async fn wait_for_print_outputs(
                 ),
             ));
         }
-        let wake = wait_for_mission_print_event(
-            &mut watch,
-            deadline,
-            &plan.mission_tag,
-        )
-        .await?;
+        let wake = wait_for_mission_print_event(&mut watch, deadline, &plan.mission_tag).await?;
         if wake == WaitWake::Event {
             // A completed print may satisfy a blocked parent's recursive
             // prerequisite chain. Recheck immediately on evidence; otherwise
@@ -3937,13 +3932,12 @@ async fn start_replicant_travel_to(
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
         if planned != Some(destination) {
-            return Err(app_error(
-                io::ErrorKind::Other,
-                format!(
-                    "replicant {replicant_code} is already travelling to {:?}, not {destination}",
-                    planned
-                ),
-            ));
+            info!(
+                replicant = %replicant_code,
+                in_flight_destination = ?planned,
+                requested_destination = %destination,
+                "replicant is already in flight; waiting for that travel to finish before continuing event route"
+            );
         }
         return Ok(origin);
     }
@@ -4446,12 +4440,14 @@ async fn wait_for_mission_print_event(
         }
         match timeout(remaining, watch.next()).await {
             Ok(Ok(event))
-                if matches!(event.name.as_str(), "print.completed" | "device.print_completed")
-                    && event.payload.get("tags").is_some_and(|tags| {
-                        tags.as_array().is_some_and(|tags| {
-                            tags.iter().any(|tag| tag.as_str() == Some(mission_tag))
-                        })
-                    }) =>
+                if matches!(
+                    event.name.as_str(),
+                    "print.completed" | "device.print_completed"
+                ) && event.payload.get("tags").is_some_and(|tags| {
+                    tags.as_array().is_some_and(|tags| {
+                        tags.iter().any(|tag| tag.as_str() == Some(mission_tag))
+                    })
+                }) =>
             {
                 return Ok(WaitWake::Event);
             }

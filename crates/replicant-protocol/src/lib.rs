@@ -927,7 +927,11 @@ pub struct TradeControllerSummary {
     pub total_stock: Option<i64>,
     /// Number of trades reported by the directory.
     pub trade_count: Option<i64>,
-    /// Current normalized trades.
+    /// Availability of detailed trade data for this controller.
+    ///
+    /// Known values are `available`, `out_of_comms`, and `unavailable`.
+    pub trade_details_status: String,
+    /// Current normalized trades. Empty when detailed trade data is unavailable.
     pub trades: Vec<TradeSummary>,
     /// Active workflow claiming this controller, when present.
     pub workflow: Option<WorkflowSummary>,
@@ -942,6 +946,86 @@ pub struct TradeSnapshot {
     pub viewer: Option<EntityRef>,
     /// Visible trade controllers and their current trades.
     pub controllers: Vec<TradeControllerSummary>,
+}
+
+/// Request for the Bill Skunkworks traffic-vector finder.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BillFinderRequest {
+    /// FTL beacon whose audit log should be inspected. Omit to use the configured/default SOL tracker.
+    pub tracking_beacon: Option<String>,
+    /// Whether an unambiguous result should create or reuse a frontier-expansion workflow.
+    #[serde(default)]
+    pub expand: bool,
+    /// Explicit candidate selected for expansion when the departure ray is ambiguous.
+    pub target_system: Option<String>,
+}
+
+/// One observed Bill departure used to infer the Skunkworks destination.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BillDepartureSummary {
+    /// Beacon whose traffic audit produced this observation.
+    pub tracking_beacon: String,
+    /// Bill's public Replicant code used to filter the audit.
+    pub replicant_code: String,
+    /// Vessel seen departing the audited system.
+    pub vessel_code: Option<String>,
+    /// Open vessel/device type reported by the audit.
+    pub vessel_type: Option<String>,
+    /// Exact audited departure location.
+    pub origin_location: String,
+    /// Catalogue system containing the audited departure location.
+    pub origin_system: String,
+    /// Upstream audit timestamp.
+    pub logged_at: Option<String>,
+    /// Normalized departure direction vector `[x, y, z]`.
+    pub vector: [f64; 3],
+}
+
+/// One known star lying near Bill's observed departure ray.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BillCandidateSummary {
+    /// Candidate star system.
+    pub system: String,
+    /// Angular deviation from the observed vector in degrees.
+    pub angular_error_deg: f64,
+    /// Direct catalogue distance from the departure system in light-years.
+    pub distance_ly: f64,
+    /// Distance along the observed ray in light-years.
+    pub projected_distance_ly: f64,
+    /// Perpendicular miss distance from the ray in light-years.
+    pub cross_track_ly: f64,
+}
+
+/// Optional FTL-expansion result produced by a Bill finder request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BillExpansionSummary {
+    /// `not_requested`, `selection_required`, `queued`, or `reused`.
+    pub status: String,
+    /// Candidate system selected for expansion, when any.
+    pub target_system: Option<String>,
+    /// Created or reused durable workflow.
+    pub workflow: Option<WorkflowSummary>,
+    /// Human-readable explanation of the expansion decision.
+    pub message: String,
+}
+
+/// Result of auditing Bill's traffic trail and matching it against the star catalogue.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BillFinderResponse {
+    /// Snapshot identity and creation time.
+    pub metadata: SnapshotMetadata,
+    /// Departure observation used for the calculation.
+    pub departure: BillDepartureSummary,
+    /// Known systems ranked by angular fit to the departure ray.
+    pub candidates: Vec<BillCandidateSummary>,
+    /// Best system when the result is sufficiently unambiguous.
+    pub recommended_system: Option<String>,
+    /// `high`, `medium`, or `low`.
+    pub confidence: String,
+    /// Whether multiple plausible systems are too close to choose automatically.
+    pub ambiguous: bool,
+    /// Optional durable connectivity expansion result.
+    pub expansion: BillExpansionSummary,
 }
 
 /// One simulation scenario offered by a replicant interface.
@@ -3043,6 +3127,7 @@ mod tests {
                 location: Some("SOL-1".to_owned()),
                 total_stock: Some(1),
                 trade_count: Some(1),
+                trade_details_status: "available".to_owned(),
                 trades: vec![TradeSummary {
                     trade_code: "TRD-1".to_owned(),
                     name: None,
@@ -3058,6 +3143,38 @@ mod tests {
                 }],
                 workflow: None,
             }],
+        }));
+        round_trip(&Versioned::current(BillFinderResponse {
+            metadata: SnapshotMetadata {
+                revision: 42,
+                generated_at_ms: 2,
+            },
+            departure: BillDepartureSummary {
+                tracking_beacon: "BEACON-1".to_owned(),
+                replicant_code: "BILL".to_owned(),
+                vessel_code: Some("VESSEL-1".to_owned()),
+                vessel_type: Some("racing_vessel".to_owned()),
+                origin_location: "SOL-5-L4".to_owned(),
+                origin_system: "SOL".to_owned(),
+                logged_at: Some("2026-08-21T10:57:44-04:00".to_owned()),
+                vector: [0.97, 0.10, -0.20],
+            },
+            candidates: vec![BillCandidateSummary {
+                system: "VEGA".to_owned(),
+                angular_error_deg: 0.2,
+                distance_ly: 25.0,
+                projected_distance_ly: 24.9,
+                cross_track_ly: 0.1,
+            }],
+            recommended_system: Some("VEGA".to_owned()),
+            confidence: "high".to_owned(),
+            ambiguous: false,
+            expansion: BillExpansionSummary {
+                status: "not_requested".to_owned(),
+                target_system: None,
+                workflow: None,
+                message: "FTL expansion was not requested.".to_owned(),
+            },
         }));
         let intelligence_metadata = SnapshotMetadata {
             revision: 42,

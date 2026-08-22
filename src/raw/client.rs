@@ -465,7 +465,6 @@ pub(crate) struct ClientInner {
     pub(crate) telemetry: Option<Arc<dyn ApiTelemetrySink>>,
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 struct AttemptProgress {
     request_prepare_ms: Option<u64>,
@@ -1499,12 +1498,14 @@ mod tests {
         assert!(parse_rate_limit(&malformed, observed_at).is_none());
     }
 
-
     #[tokio::test]
     async fn telemetry_sink_receives_physical_http_attempts() {
         use std::sync::Mutex as StdMutex;
 
-        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
 
         #[derive(Default)]
         struct Capture(StdMutex<Vec<ApiAttemptTelemetry>>);

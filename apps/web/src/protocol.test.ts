@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseAutofactoryResponse,
+  parseBillFinderResponse,
   parseBobnetResponse,
   parseBootstrapResponse,
   parseCargoResponse,
@@ -779,7 +780,48 @@ describe("parseHealthResponse", () => {
       },
     }).payload.controllers[0];
     expect(trade?.shop_name).toBeNull();
+    expect(trade?.trade_details_status).toBe("available");
     expect(trade?.trades[0]?.current_stock).toBeNull();
+  });
+
+  it("parses Bill finder candidates and optional expansion workflow", () => {
+    const result = parseBillFinderResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 1, generated_at_ms: 2 },
+        departure: {
+          tracking_beacon: "FEB51E1B",
+          replicant_code: "A8F48B26",
+          vessel_code: "6BE43B4B",
+          vessel_type: "racing_vessel",
+          origin_location: "SOL-5-L4",
+          origin_system: "SOL",
+          logged_at: "2026-08-21T10:57:44-04:00",
+          vector: [0.97, 0.1, -0.2],
+        },
+        candidates: [
+          {
+            system: "VEGA",
+            angular_error_deg: 0.2,
+            distance_ly: 24,
+            projected_distance_ly: 23.9,
+            cross_track_ly: 0.08,
+          },
+        ],
+        recommended_system: "VEGA",
+        confidence: "high",
+        ambiguous: false,
+        expansion: {
+          status: "not_requested",
+          target_system: null,
+          workflow: null,
+          message: "FTL expansion was not requested.",
+        },
+      },
+    }).payload;
+    expect(result.departure.origin_system).toBe("SOL");
+    expect(result.candidates[0]?.system).toBe("VEGA");
+    expect(result.recommended_system).toBe("VEGA");
   });
 
   it("parses typed intelligence snapshots", () => {

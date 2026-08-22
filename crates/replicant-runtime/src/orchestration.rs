@@ -23,7 +23,7 @@ use replicant_client::{
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
     DirectorRegionSummary, DirectorReplicantAssignment, DirectorSnapshot, DirectorWorkforceSummary,
-    SnapshotMetadata, WorkflowId as ProtocolWorkflowId, workflow_reserved,
+    SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::{
@@ -38,8 +38,9 @@ use crate::{
         BlueprintAcquireIntent, BlueprintShopPurchaseIntent, EventCampaignIntent,
         ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent, ObservatoryIntent,
         RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
-        blueprint_acquire_workflow_kind, exploration_workflow_kind, new_blueprint_acquire_workflow,
-        new_event_campaign_workflow, new_exploration_workflow, new_logistics_manifest_workflow,
+        blueprint_acquire_workflow_kind, blueprint_source_is_candidate, blueprint_source_location,
+        exploration_workflow_kind, new_blueprint_acquire_workflow, new_event_campaign_workflow,
+        new_exploration_workflow, new_logistics_manifest_workflow,
         new_mining_campaign_workflow, new_observatory_workflow, new_region_establish_workflow,
         new_replicant_provision_workflow, new_scan_tour_workflow,
     },
@@ -867,9 +868,7 @@ pub async fn reconcile_director(
                     "Director could not refresh blueprint state after the requirement set changed"
                 ),
             }
-        } else if signature_changed
-            && let Some(cache) = blueprint_cache.as_mut()
-        {
+        } else if signature_changed && let Some(cache) = blueprint_cache.as_mut() {
             cache.requirement_signature = requirement_signature;
             repository.put_document(
                 BLUEPRINT_CATALOGUE_CACHE_NS,
@@ -894,7 +893,7 @@ pub async fn reconcile_director(
                 .is_some_and(|known| known.contains(&kind));
             let owned_source = devices
                 .iter()
-                .any(|device| director_blueprint_source_releasable(device, &kind));
+                .any(|device| blueprint_source_is_candidate(device, kind.as_str(), &devices));
             if !already_known && !owned_source {
                 shop_requested_blueprints.insert(device_type.to_ascii_lowercase());
             }
@@ -1921,11 +1920,11 @@ fn reconcile_blueprint_acquisition(
         let source = devices
             .iter()
             .filter(|device| {
-                director_blueprint_source_releasable(device, device_type)
+                blueprint_source_is_candidate(device, device_type.as_str(), devices)
                     && !claimed.contains(device.key.id.as_str())
             })
             .min_by_key(|device| device.key.id.clone())?;
-        let source_location = source.location.as_ref()?.id.as_str();
+        let source_location = blueprint_source_location(source, devices)?;
         let source_system = location_systems.get(source_location).map(String::as_str);
         let source_region = source_system.and_then(|system| system_regions.get(system));
         let factory = factories
@@ -1982,7 +1981,7 @@ fn reconcile_blueprint_acquisition(
                         continue;
                     }
                     let criterion_has_owned_source = devices.iter().any(|device| {
-                        director_blueprint_source_releasable(device, &criterion)
+                        blueprint_source_is_candidate(device, criterion.as_str(), devices)
                             && !claimed.contains(device.key.id.as_str())
                     });
                     if !criterion_has_owned_source
@@ -2136,15 +2135,24 @@ fn reconcile_blueprint_acquisition(
             .map(|device_type| device_type.as_str().to_owned());
         let discovery_partial =
             shop_snapshot.directory_errors > 0 || shop_snapshot.trade_errors > 0;
+        let missing_names = missing
+            .iter()
+            .map(|device_type| device_type.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let blocker = criterion_blockers.first().cloned().unwrap_or_else(|| {
             if let Some(device_type) = requested_unavailable {
                 format!(
-                    "Blueprint {device_type} is required, but there is no releasable owned copy or currently inspectable in-stock shop opportunity"
+                    "Blueprint {device_type} is required, but there is no available owned copy or currently inspectable in-stock shop opportunity"
                 )
             } else if discovery_partial {
-                "Missing blueprints remain, but the account-wide shop snapshot was incomplete and no safe acquisition was selected".to_owned()
+                format!(
+                    "Missing blueprints remain ({missing_names}), but the account-wide shop snapshot was incomplete and no safe acquisition was selected"
+                )
             } else {
-                "Missing blueprints remain, but no releasable owned copy or safe in-stock shop opportunity is currently available".to_owned()
+                format!(
+                    "Missing blueprints remain ({missing_names}), but no available owned copy or safe in-stock shop opportunity is currently usable"
+                )
             }
         });
         save_goal_runtime(context.repository, &id, &runtime)?;
@@ -2302,26 +2310,6 @@ fn active_blueprint_acquisition_workflow(workflows: &[WorkflowInstance]) -> Opti
         })
         .max_by_key(|workflow| workflow.created_at)
         .map(|workflow| workflow.id)
-}
-
-fn director_blueprint_source_releasable(device: &Device, device_type: &DeviceType) -> bool {
-    device.device_type.as_ref() == Some(device_type)
-        && !workflow_reserved(&device.tags)
-        && device.location.is_some()
-        && device.travel.is_none()
-        && device.relationships.attached_to.is_none()
-        && device.relationships.stowed_in.is_none()
-        && device.relationships.controller.is_none()
-        && device.relationships.hosting_replicant.is_none()
-        && device.relationships.attached_devices.is_empty()
-        && device.relationships.stowed_devices.is_empty()
-        && device.relationships.controlled_devices.is_empty()
-        && device.status.as_ref().is_some_and(|status| {
-            matches!(
-                status.as_str().to_ascii_lowercase().as_str(),
-                "inactive" | "deactivated" | "idle" | "recalled" | "compacted"
-            )
-        })
 }
 
 fn active_blueprint_claims(
@@ -4854,24 +4842,65 @@ mod tests {
     }
 
     #[test]
-    fn blueprint_source_must_be_idle_and_releasable() {
-        let mut device = test_hub_device();
-        device.key = replicant_client::DeviceKey::live("DEVICE-1".into());
-        device.device_type = Some(DeviceType::from("service_bot"));
-        device.status = Some(replicant_client::DeviceStatus::Idle);
-        device.location = Some(replicant_client::LocationKey::live(
+    fn blueprint_source_accepts_idle_stowed_and_out_of_range_owned_copies() {
+        let mut idle = test_hub_device();
+        idle.key = replicant_client::DeviceKey::live("DEVICE-1".into());
+        idle.device_type = Some(DeviceType::from("service_bot"));
+        idle.status = Some(replicant_client::DeviceStatus::Idle);
+        idle.location = Some(replicant_client::LocationKey::live(
             "SCEPTURUM-BELT-1".into(),
         ));
-        assert!(director_blueprint_source_releasable(
-            &device,
-            &DeviceType::from("service_bot")
+
+        let mut vessel = test_hub_device();
+        vessel.key = replicant_client::DeviceKey::live("VESSEL-1".into());
+        vessel.device_type = Some(DeviceType::from("heaven_vessel"));
+        vessel.location = Some(replicant_client::LocationKey::live(
+            "SCEPTURUM-7-L4".into(),
         ));
 
-        device.relationships.hosting_replicant =
+        let mut stowed = idle.clone();
+        stowed.key = replicant_client::DeviceKey::live("SLING-1".into());
+        stowed.device_type = Some(DeviceType::FtlSlingshot);
+        stowed.status = Some(replicant_client::DeviceStatus::from("stowed"));
+        stowed.location = None;
+        stowed.relationships.stowed_in = Some(vessel.key.clone());
+        stowed.available_commands = vec![replicant_client::DeviceCommand::Deploy];
+
+        let mut remote = idle.clone();
+        remote.key = replicant_client::DeviceKey::live("WARD-1".into());
+        remote.device_type = Some(DeviceType::SystemWard);
+        remote.status = Some(replicant_client::DeviceStatus::from("out_of_range"));
+        remote.location = Some(replicant_client::LocationKey::live("RHYVENAI".into()));
+        remote.available_commands = vec![replicant_client::DeviceCommand::from("decommission")];
+
+        let devices = vec![idle.clone(), vessel, stowed.clone(), remote.clone()];
+        assert!(blueprint_source_is_candidate(
+            &idle,
+            "service_bot",
+            &devices
+        ));
+        assert!(blueprint_source_is_candidate(
+            &stowed,
+            "ftl_slingshot",
+            &devices
+        ));
+        assert_eq!(
+            blueprint_source_location(&stowed, &devices),
+            Some("SCEPTURUM-7-L4")
+        );
+        assert!(blueprint_source_is_candidate(
+            &remote,
+            "system_ward",
+            &devices
+        ));
+
+        let mut hosted = idle;
+        hosted.relationships.hosting_replicant =
             Some(replicant_client::ReplicantKey::live("CHAT-1".into()));
-        assert!(!director_blueprint_source_releasable(
-            &device,
-            &DeviceType::from("service_bot")
+        assert!(!blueprint_source_is_candidate(
+            &hosted,
+            "service_bot",
+            &devices
         ));
     }
 

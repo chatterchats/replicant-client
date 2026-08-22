@@ -55,26 +55,33 @@ to `warn`. HTTP request timing is emitted by `replicant_server` at `debug`
 (with failures promoted to `warn`/`error`). For deeper investigation,
 temporarily use the debug profile shown in `.env.example`.
 
-
 ## Optional Grafana observability
 
-`replicantd` records one best-effort telemetry sample for every physical
-Replicant Space HTTP attempt, including retries and failed responses. Samples
-include the exact HTTP status, normalized route, request attempt number,
-response size, total latency, time to response headers, local rate-limit wait,
-server rate-limit metadata, and local/server request IDs when available. The
-writer uses a bounded in-process queue; telemetry pressure can drop samples but
-cannot block or fail a game API operation.
+`replicantd` records best-effort observability for the upstream API, managed
+event/SSE pipeline, durable workflow executor, Director, and selected daemon
+health signals. API telemetry is one sample per physical Replicant Space HTTP
+attempt, including retries and failed responses. Samples include the exact HTTP
+status, normalized route, request attempt number, response size, total latency,
+request preparation, time to response headers, metadata/body/decode timing,
+local rate-limit wait, server rate-limit metadata, and local/server request IDs
+when available. Event telemetry records SSE connects/disconnects, durable event
+application and catch-up recovery. Workflow telemetry records executor wakeups,
+completion duration/outcome, and resource-claim conflicts. Runtime telemetry
+records supervisor health, workflow-status/wait-age snapshots, watcher recovery,
+Director reconciliation, and daemon lifecycle markers. The writer uses one
+bounded in-process queue; telemetry pressure can drop samples but cannot block
+or fail gameplay work.
 
 Telemetry is stored separately from managed and workflow state. High-resolution
-rows are retained on this schedule:
+rows are retained on this schedule for API, event, workflow, and runtime
+telemetry:
 
-| Age / tier | Retained resolution |
-| ---------- | ------------------- |
-| 0–7 days   | raw attempts + 1 minute |
-| 8–30 days  | 10 minute |
-| 31–90 days | 1 hour |
-| >90 days   | 1 day |
+| Age / tier | Retained resolution    |
+| ---------- | ---------------------- |
+| 0–7 days   | raw samples + 1 minute |
+| 8–30 days  | 10 minute              |
+| 31–90 days | 1 hour                 |
+| >90 days   | 1 day                  |
 
 All rollup tiers are maintained continuously, so aging is deletion rather than
 a large compaction job. Rollups preserve exact response codes and cumulative
@@ -89,12 +96,61 @@ Start the optional Grafana profile with:
 make observability-up
 ```
 
+The target rebuilds the release `replicantd` binary and then uses Compose
+`--build`, so the daemon image cannot silently lag the telemetry
+schema/instrumentation in the checked-out source.
+
 Then open `http://127.0.0.1:3000` (or `REPLICANT_GRAFANA_PORT`). Grafana starts
-with the SQLite datasource plugin and a provisioned **Replicant Space / API
-Observability** dashboard. It includes request volume, stacked response classes,
-an exact HTTP-response-code timeline, retries, 429s, p50/p95/p99 latency,
-rate-limit wait versus upstream header latency, top routes, and recent failed
-raw requests.
+with the SQLite datasource plugin and three provisioned dashboards:
+
+- **Replicant Space · API Observability** includes physical versus logical
+  request volume, retry amplification, stacked and exact response-code
+  timelines, p50/p95/p99 latency, a latency-distribution heatmap, full request
+  timing decomposition, rate-limit remaining/wait, route tail-latency/error
+  tables, 429 attribution, response volume, and recent failed raw requests.
+- **Replicant Space · Runtime & Automation Observability** includes managed
+  event ingestion, SSE lifecycle/session health, catch-up recovery, workflow
+  executor wakeups/outcomes/duration, resource-claim contention, waiting age,
+  workflow status, supervisor latency, watcher recovery, Director reconcile
+  outcomes/latency, daemon lifecycle markers, and recent raw incidents.
+- **Replicant Space · Empire Overview** derives an in-game historical projection
+  from the retained account event history and anchors it to authoritative
+  managed-state snapshots. It includes current and historical device totals,
+  current and historical resource stockpiles by type/location, active print
+  reservations, active FTL relays, mining output that is explicitly reported by
+  events, manufacturing activity, inter-system travel, route/distance history,
+  and explicit reconstruction gaps/corrections.
+
+The empire projector runs automatically in a background OS thread. On startup it
+walks every retained applied event that it has not projected before, then tails
+new history every 15 seconds. Every 10 minutes it reads the managed SQLite
+projections and records authoritative resource/device snapshots. Ten-minute
+empire snapshots are retained for 30 days, hourly snapshots for 90 days, and
+daily snapshots indefinitely. Resource baselines remain reverse anchored from
+the first retained event to current managed state. Device and active-relay
+history instead treats managed device snapshots as authoritative checkpoints:
+the first checkpoint anchors the retained pre-snapshot event history backwards,
+and later checkpoints are graphed directly. This prevents incomplete lifecycle
+events from accumulating drift while still recovering as much pre-observability
+history as the retained event log supports.
+
+Resource reconstruction deliberately distinguishes observed facts from inferred
+ones. `mining.stopped`, transport collect/deliver, decommission recovery, event
+rewards/consumption, and the received side of trades are projected from event
+payloads. Print reservations use the blueprint resource recipe at
+`print.started`; physical consumption is applied at `print.completed`. The raw
+AMI mining and transport digest formats do not expose per-operation resource
+quantities, and trade completion does not expose the complete outgoing side, so
+those cases create `empire_projection_gap` rows. The next authoritative snapshot
+adds an explicit reconciliation delta rather than fabricating missing historical
+quantities. Grafana therefore exposes both the reconstructed curve and the
+places where its provenance is incomplete.
+
+`Stored resources` means resources in authoritative location inventories. Cargo
+currently carried by devices is not included in that number. `Reserved` is the
+blueprint cost of retained `print.started` jobs that have not yet matched a
+retained `print.completed`; if the game cancels a print without a corresponding
+retained event, historical reservation release cannot be reconstructed exactly.
 
 Grafana is intentionally only given the `telemetry/` directory plus its own
 `grafana/` data directory. It cannot see the managed, runtime, or history
@@ -140,8 +196,8 @@ The host directory `${HOME}/.local/share/replicant` is mounted at
   raw AMI telemetry (30-day raw digest retention);
 - `replicant-runtime.sqlite` plus SQLite WAL files: workflows, checkpoints,
   claims, triggers, schedules, and activity;
-- `telemetry/replicant-telemetry.sqlite` plus SQLite WAL files: per-attempt API
-  observability and mergeable time-series rollups;
+- `telemetry/replicant-telemetry.sqlite` plus SQLite WAL files: API, SSE/event,
+  workflow, Director/runtime observability and mergeable time-series rollups;
 - `grafana/`: Grafana's own persistent state when the optional observability
   profile is used;
 - `logs/replicantd.log`: persistent structured daemon/runtime/workflow logs.

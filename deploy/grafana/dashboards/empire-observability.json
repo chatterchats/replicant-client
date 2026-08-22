@@ -1,0 +1,1579 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current devices",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Authoritative owned-device snapshot, filtered by device type.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(device_count),0) AS value FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring})",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(device_count),0) AS value FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring})",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(device_count),0) AS value FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Stored resources",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Authoritative resource stockpiles at locations. Cargo carried by devices is intentionally not included.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reported_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reported_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reported_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Reserved for active prints",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Blueprint-cost reservations inferred from retained print.started events that have not yet matched print.completed.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reserved_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reserved_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT COALESCE(SUM(reserved_quantity),0) AS value FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Active FTL infrastructure",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Authoritative current active counts for ordinary FTL relays, Deep Space Relay Stations, and monitoring FTL beacons.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (\n  SELECT MAX(observed_at_ms) AS t\n  FROM empire_device_snapshot\n), latest AS (\n  SELECT latest_time.t,\n         MIN(snapshot.resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot AS snapshot, latest_time\n  WHERE snapshot.observed_at_ms = latest_time.t\n  GROUP BY latest_time.t\n)\nSELECT\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_relay' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"FTL relays\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'deep_space_relay_station' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"Deep Space Relay Stations\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_beacon' AND status = 'monitoring'\n    THEN device_count ELSE 0 END), 0) AS \"FTL beacons\"\nFROM empire_device_snapshot AS snapshot, latest\nWHERE snapshot.observed_at_ms = latest.t\n  AND snapshot.resolution_seconds = latest.resolution_seconds",
+          "queryText": "WITH latest_time AS (\n  SELECT MAX(observed_at_ms) AS t\n  FROM empire_device_snapshot\n), latest AS (\n  SELECT latest_time.t,\n         MIN(snapshot.resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot AS snapshot, latest_time\n  WHERE snapshot.observed_at_ms = latest_time.t\n  GROUP BY latest_time.t\n)\nSELECT\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_relay' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"FTL relays\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'deep_space_relay_station' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"Deep Space Relay Stations\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_beacon' AND status = 'monitoring'\n    THEN device_count ELSE 0 END), 0) AS \"FTL beacons\"\nFROM empire_device_snapshot AS snapshot, latest\nWHERE snapshot.observed_at_ms = latest.t\n  AND snapshot.resolution_seconds = latest.resolution_seconds",
+          "rawQueryText": "WITH latest_time AS (\n  SELECT MAX(observed_at_ms) AS t\n  FROM empire_device_snapshot\n), latest AS (\n  SELECT latest_time.t,\n         MIN(snapshot.resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot AS snapshot, latest_time\n  WHERE snapshot.observed_at_ms = latest_time.t\n  GROUP BY latest_time.t\n)\nSELECT\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_relay' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"FTL relays\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'deep_space_relay_station' AND status IN ('active','relaying')\n    THEN device_count ELSE 0 END), 0) AS \"Deep Space Relay Stations\",\n  COALESCE(SUM(CASE\n    WHEN device_type = 'ftl_beacon' AND status = 'monitoring'\n    THEN device_count ELSE 0 END), 0) AS \"FTL beacons\"\nFROM empire_device_snapshot AS snapshot, latest\nWHERE snapshot.observed_at_ms = latest.t\n  AND snapshot.resolution_seconds = latest.resolution_seconds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Inter-system trips",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Inter-system departures in the selected range, including route-scope counts inferred from AMI transport digests.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COALESCE(SUM(value),0) AS value FROM empire_activity WHERE metric='travel_departed' AND series='inter_system' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to",
+          "queryText": "SELECT COALESCE(SUM(value),0) AS value FROM empire_activity WHERE metric='travel_departed' AND series='inter_system' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to",
+          "rawQueryText": "SELECT COALESCE(SUM(value),0) AS value FROM empire_activity WHERE metric='travel_departed' AND series='inter_system' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Projection gaps",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "description": "Retained events whose exact historical effect cannot be reconstructed. Authoritative snapshots correct current state without inventing missing history.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COUNT(*) AS value FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to",
+          "queryText": "SELECT COUNT(*) AS value FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to",
+          "rawQueryText": "SELECT COUNT(*) AS value FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "title": "Device population over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Reconstructed owned-device population, reverse-anchored from current managed state. Reconciliation deltas correct gaps as authoritative snapshots arrive.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT snapshot.observed_at_ms AS time_ms,\n         snapshot.device_type AS series,\n         SUM(snapshot.device_count) AS value\n  FROM empire_device_snapshot AS snapshot\n  JOIN resolutions USING(observed_at_ms, resolution_seconds)\n  WHERE snapshot.device_type IN (${device_type:sqlstring})\n  GROUP BY snapshot.observed_at_ms, snapshot.device_type\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), series_values AS (\n  SELECT series FROM authoritative, anchor_time WHERE time_ms = anchor_ms\n  UNION\n  SELECT delta.device_type AS series\n  FROM empire_device_delta AS delta, anchor_time\n  WHERE delta.device_type IN (${device_type:sqlstring})\n    AND delta.occurred_at_ms < anchor_ms\n), anchors AS (\n  SELECT series_values.series,\n         anchor_time.anchor_ms,\n         MAX($__from, history.start_ms) AS start_ms,\n         COALESCE((\n           SELECT value FROM authoritative\n           WHERE time_ms = anchor_time.anchor_ms AND series = series_values.series\n         ), 0) AS anchor_value\n  FROM series_values, anchor_time, history\n  WHERE anchor_time.anchor_ms IS NOT NULL\n), backfill_initial AS (\n  SELECT anchors.series,\n         anchors.start_ms AS time_ms,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_device_delta AS delta\n           WHERE delta.device_type = anchors.series\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.device_type AS series,\n         SUM(delta.delta) AS delta\n  FROM empire_device_delta AS delta\n  JOIN anchors ON anchors.series = delta.device_type\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.device_type\n), backfill_points AS (\n  SELECT time_ms, series, value FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.series ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms, authoritative.series, authoritative.value\n  FROM authoritative, anchor_time\n  WHERE authoritative.time_ms >= MAX($__from, anchor_time.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time, value, series\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "queryText": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT snapshot.observed_at_ms AS time_ms,\n         snapshot.device_type AS series,\n         SUM(snapshot.device_count) AS value\n  FROM empire_device_snapshot AS snapshot\n  JOIN resolutions USING(observed_at_ms, resolution_seconds)\n  WHERE snapshot.device_type IN (${device_type:sqlstring})\n  GROUP BY snapshot.observed_at_ms, snapshot.device_type\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), series_values AS (\n  SELECT series FROM authoritative, anchor_time WHERE time_ms = anchor_ms\n  UNION\n  SELECT delta.device_type AS series\n  FROM empire_device_delta AS delta, anchor_time\n  WHERE delta.device_type IN (${device_type:sqlstring})\n    AND delta.occurred_at_ms < anchor_ms\n), anchors AS (\n  SELECT series_values.series,\n         anchor_time.anchor_ms,\n         MAX($__from, history.start_ms) AS start_ms,\n         COALESCE((\n           SELECT value FROM authoritative\n           WHERE time_ms = anchor_time.anchor_ms AND series = series_values.series\n         ), 0) AS anchor_value\n  FROM series_values, anchor_time, history\n  WHERE anchor_time.anchor_ms IS NOT NULL\n), backfill_initial AS (\n  SELECT anchors.series,\n         anchors.start_ms AS time_ms,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_device_delta AS delta\n           WHERE delta.device_type = anchors.series\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.device_type AS series,\n         SUM(delta.delta) AS delta\n  FROM empire_device_delta AS delta\n  JOIN anchors ON anchors.series = delta.device_type\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.device_type\n), backfill_points AS (\n  SELECT time_ms, series, value FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.series ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms, authoritative.series, authoritative.value\n  FROM authoritative, anchor_time\n  WHERE authoritative.time_ms >= MAX($__from, anchor_time.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time, value, series\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "rawQueryText": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT snapshot.observed_at_ms AS time_ms,\n         snapshot.device_type AS series,\n         SUM(snapshot.device_count) AS value\n  FROM empire_device_snapshot AS snapshot\n  JOIN resolutions USING(observed_at_ms, resolution_seconds)\n  WHERE snapshot.device_type IN (${device_type:sqlstring})\n  GROUP BY snapshot.observed_at_ms, snapshot.device_type\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), series_values AS (\n  SELECT series FROM authoritative, anchor_time WHERE time_ms = anchor_ms\n  UNION\n  SELECT delta.device_type AS series\n  FROM empire_device_delta AS delta, anchor_time\n  WHERE delta.device_type IN (${device_type:sqlstring})\n    AND delta.occurred_at_ms < anchor_ms\n), anchors AS (\n  SELECT series_values.series,\n         anchor_time.anchor_ms,\n         MAX($__from, history.start_ms) AS start_ms,\n         COALESCE((\n           SELECT value FROM authoritative\n           WHERE time_ms = anchor_time.anchor_ms AND series = series_values.series\n         ), 0) AS anchor_value\n  FROM series_values, anchor_time, history\n  WHERE anchor_time.anchor_ms IS NOT NULL\n), backfill_initial AS (\n  SELECT anchors.series,\n         anchors.start_ms AS time_ms,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_device_delta AS delta\n           WHERE delta.device_type = anchors.series\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.device_type AS series,\n         SUM(delta.delta) AS delta\n  FROM empire_device_delta AS delta\n  JOIN anchors ON anchors.series = delta.device_type\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.device_type\n), backfill_points AS (\n  SELECT time_ms, series, value FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.series ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms, authoritative.series, authoritative.value\n  FROM authoritative, anchor_time\n  WHERE authoritative.time_ms >= MAX($__from, anchor_time.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time, value, series\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Active FTL infrastructure over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Active ordinary relays, Deep Space Relay Stations, and FTL beacons. Retained history is reverse-anchored to authoritative device snapshots; lifecycle events provide the pre-snapshot changes.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), kinds(kind, series, device_type) AS (\n  VALUES\n    ('active_ftl_relay', 'FTL relays', 'ftl_relay'),\n    ('active_deep_space_relay_station', 'Deep Space Relay Stations', 'deep_space_relay_station'),\n    ('active_ftl_beacon', 'FTL beacons', 'ftl_beacon')\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT resolutions.observed_at_ms AS time_ms,\n         kinds.kind,\n         kinds.series,\n         COALESCE(SUM(CASE\n           WHEN snapshot.device_type = kinds.device_type\n            AND (\n              (kinds.kind IN ('active_ftl_relay','active_deep_space_relay_station')\n               AND snapshot.status IN ('active','relaying'))\n              OR\n              (kinds.kind = 'active_ftl_beacon' AND snapshot.status = 'monitoring')\n            )\n           THEN snapshot.device_count ELSE 0 END), 0) AS value\n  FROM resolutions\n  CROSS JOIN kinds\n  LEFT JOIN empire_device_snapshot AS snapshot\n    ON snapshot.observed_at_ms = resolutions.observed_at_ms\n   AND snapshot.resolution_seconds = resolutions.resolution_seconds\n   AND snapshot.device_type = kinds.device_type\n  GROUP BY resolutions.observed_at_ms, kinds.kind, kinds.series\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), anchors AS (\n  SELECT authoritative.kind,\n         authoritative.series,\n         authoritative.time_ms AS anchor_ms,\n         authoritative.value AS anchor_value,\n         MAX($__from, history.start_ms) AS start_ms\n  FROM authoritative, history, anchor_time\n  WHERE authoritative.time_ms = anchor_time.anchor_ms\n), backfill_initial AS (\n  SELECT anchors.start_ms AS time_ms,\n         anchors.kind,\n         anchors.series,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_infrastructure_delta AS delta\n           WHERE delta.kind = anchors.kind\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms\n    AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.kind,\n         anchors.series,\n         SUM(delta.delta) AS delta\n  FROM empire_infrastructure_delta AS delta\n  JOIN anchors ON anchors.kind = delta.kind\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.kind, anchors.series\n), backfill_points AS (\n  SELECT time_ms, kind, series, value\n  FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.kind,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.kind\n           ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(kind, series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms,\n         authoritative.kind,\n         authoritative.series,\n         authoritative.value\n  FROM authoritative\n  JOIN anchors USING(kind, series)\n  WHERE authoritative.time_ms >= MAX($__from, anchors.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time,\n       series,\n       value\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "queryText": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), kinds(kind, series, device_type) AS (\n  VALUES\n    ('active_ftl_relay', 'FTL relays', 'ftl_relay'),\n    ('active_deep_space_relay_station', 'Deep Space Relay Stations', 'deep_space_relay_station'),\n    ('active_ftl_beacon', 'FTL beacons', 'ftl_beacon')\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT resolutions.observed_at_ms AS time_ms,\n         kinds.kind,\n         kinds.series,\n         COALESCE(SUM(CASE\n           WHEN snapshot.device_type = kinds.device_type\n            AND (\n              (kinds.kind IN ('active_ftl_relay','active_deep_space_relay_station')\n               AND snapshot.status IN ('active','relaying'))\n              OR\n              (kinds.kind = 'active_ftl_beacon' AND snapshot.status = 'monitoring')\n            )\n           THEN snapshot.device_count ELSE 0 END), 0) AS value\n  FROM resolutions\n  CROSS JOIN kinds\n  LEFT JOIN empire_device_snapshot AS snapshot\n    ON snapshot.observed_at_ms = resolutions.observed_at_ms\n   AND snapshot.resolution_seconds = resolutions.resolution_seconds\n   AND snapshot.device_type = kinds.device_type\n  GROUP BY resolutions.observed_at_ms, kinds.kind, kinds.series\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), anchors AS (\n  SELECT authoritative.kind,\n         authoritative.series,\n         authoritative.time_ms AS anchor_ms,\n         authoritative.value AS anchor_value,\n         MAX($__from, history.start_ms) AS start_ms\n  FROM authoritative, history, anchor_time\n  WHERE authoritative.time_ms = anchor_time.anchor_ms\n), backfill_initial AS (\n  SELECT anchors.start_ms AS time_ms,\n         anchors.kind,\n         anchors.series,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_infrastructure_delta AS delta\n           WHERE delta.kind = anchors.kind\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms\n    AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.kind,\n         anchors.series,\n         SUM(delta.delta) AS delta\n  FROM empire_infrastructure_delta AS delta\n  JOIN anchors ON anchors.kind = delta.kind\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.kind, anchors.series\n), backfill_points AS (\n  SELECT time_ms, kind, series, value\n  FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.kind,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.kind\n           ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(kind, series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms,\n         authoritative.kind,\n         authoritative.series,\n         authoritative.value\n  FROM authoritative\n  JOIN anchors USING(kind, series)\n  WHERE authoritative.time_ms >= MAX($__from, anchors.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time,\n       series,\n       value\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "rawQueryText": "WITH history AS (\n  SELECT COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    $__from\n  ) AS start_ms\n), kinds(kind, series, device_type) AS (\n  VALUES\n    ('active_ftl_relay', 'FTL relays', 'ftl_relay'),\n    ('active_deep_space_relay_station', 'Deep Space Relay Stations', 'deep_space_relay_station'),\n    ('active_ftl_beacon', 'FTL beacons', 'ftl_beacon')\n), resolutions AS (\n  SELECT observed_at_ms, MIN(resolution_seconds) AS resolution_seconds\n  FROM empire_device_snapshot\n  GROUP BY observed_at_ms\n), authoritative AS (\n  SELECT resolutions.observed_at_ms AS time_ms,\n         kinds.kind,\n         kinds.series,\n         COALESCE(SUM(CASE\n           WHEN snapshot.device_type = kinds.device_type\n            AND (\n              (kinds.kind IN ('active_ftl_relay','active_deep_space_relay_station')\n               AND snapshot.status IN ('active','relaying'))\n              OR\n              (kinds.kind = 'active_ftl_beacon' AND snapshot.status = 'monitoring')\n            )\n           THEN snapshot.device_count ELSE 0 END), 0) AS value\n  FROM resolutions\n  CROSS JOIN kinds\n  LEFT JOIN empire_device_snapshot AS snapshot\n    ON snapshot.observed_at_ms = resolutions.observed_at_ms\n   AND snapshot.resolution_seconds = resolutions.resolution_seconds\n   AND snapshot.device_type = kinds.device_type\n  GROUP BY resolutions.observed_at_ms, kinds.kind, kinds.series\n), anchor_time AS (\n  SELECT MIN(time_ms) AS anchor_ms FROM authoritative\n), anchors AS (\n  SELECT authoritative.kind,\n         authoritative.series,\n         authoritative.time_ms AS anchor_ms,\n         authoritative.value AS anchor_value,\n         MAX($__from, history.start_ms) AS start_ms\n  FROM authoritative, history, anchor_time\n  WHERE authoritative.time_ms = anchor_time.anchor_ms\n), backfill_initial AS (\n  SELECT anchors.start_ms AS time_ms,\n         anchors.kind,\n         anchors.series,\n         anchors.anchor_ms,\n         anchors.anchor_value - COALESCE((\n           SELECT SUM(delta.delta)\n           FROM empire_infrastructure_delta AS delta\n           WHERE delta.kind = anchors.kind\n             AND delta.occurred_at_ms >= anchors.start_ms\n             AND delta.occurred_at_ms < anchors.anchor_ms\n         ), 0) AS value\n  FROM anchors\n  WHERE anchors.start_ms < anchors.anchor_ms\n    AND anchors.start_ms < $__to\n), backfill_changes AS (\n  SELECT delta.occurred_at_ms AS time_ms,\n         delta.kind,\n         anchors.series,\n         SUM(delta.delta) AS delta\n  FROM empire_infrastructure_delta AS delta\n  JOIN anchors ON anchors.kind = delta.kind\n  WHERE delta.occurred_at_ms >= anchors.start_ms\n    AND delta.occurred_at_ms < anchors.anchor_ms\n    AND delta.occurred_at_ms < $__to\n  GROUP BY delta.occurred_at_ms, delta.kind, anchors.series\n), backfill_points AS (\n  SELECT time_ms, kind, series, value\n  FROM backfill_initial\n  UNION ALL\n  SELECT changes.time_ms,\n         changes.kind,\n         changes.series,\n         initial.value + SUM(changes.delta) OVER (\n           PARTITION BY changes.kind\n           ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING\n         ) AS value\n  FROM backfill_changes AS changes\n  JOIN backfill_initial AS initial USING(kind, series)\n), snapshot_points AS (\n  SELECT authoritative.time_ms,\n         authoritative.kind,\n         authoritative.series,\n         authoritative.value\n  FROM authoritative\n  JOIN anchors USING(kind, series)\n  WHERE authoritative.time_ms >= MAX($__from, anchors.anchor_ms)\n    AND authoritative.time_ms < $__to\n)\nSELECT time_ms / 1000 AS time,\n       series,\n       value\nFROM (\n  SELECT * FROM backfill_points\n  UNION ALL\n  SELECT * FROM snapshot_points\n)\nORDER BY time_ms, series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Stored / reserved / available resources",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 9
+      },
+      "description": "Stored stockpile history plus print reservations. Printing reserves blueprint resources at print.started and consumes them at print.completed. Historical reservation release cannot be inferred when a cancellation has no retained event.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), base AS (\n  SELECT COALESCE(SUM(physical_quantity), 0) AS physical,\n         COALESCE(SUM(reserved_quantity), 0) AS reserved\n  FROM empire_resource_baseline\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), pre AS (\n  SELECT COALESCE(SUM(physical_delta), 0) AS physical,\n         COALESCE(SUM(reserved_delta), 0) AS reserved\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms < bounds.start_ms\n), initial AS (\n  SELECT base.physical + pre.physical AS physical,\n         base.reserved + pre.reserved AS reserved,\n         bounds.start_ms\n  FROM base, pre, bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms,\n         SUM(physical_delta) AS physical_delta,\n         SUM(reserved_delta) AS reserved_delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms\n), points AS (\n  SELECT start_ms AS time_ms, initial.physical AS stored,\n         initial.reserved AS reserved\n  FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT changes.time_ms,\n         initial.physical + SUM(changes.physical_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING),\n         initial.reserved + SUM(changes.reserved_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes, initial\n)\nSELECT time_ms / 1000 AS time,\n       stored AS \"Stored\",\n       reserved AS \"Reserved\",\n       stored - reserved AS \"Available\"\nFROM points\nORDER BY time_ms",
+          "queryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), base AS (\n  SELECT COALESCE(SUM(physical_quantity), 0) AS physical,\n         COALESCE(SUM(reserved_quantity), 0) AS reserved\n  FROM empire_resource_baseline\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), pre AS (\n  SELECT COALESCE(SUM(physical_delta), 0) AS physical,\n         COALESCE(SUM(reserved_delta), 0) AS reserved\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms < bounds.start_ms\n), initial AS (\n  SELECT base.physical + pre.physical AS physical,\n         base.reserved + pre.reserved AS reserved,\n         bounds.start_ms\n  FROM base, pre, bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms,\n         SUM(physical_delta) AS physical_delta,\n         SUM(reserved_delta) AS reserved_delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms\n), points AS (\n  SELECT start_ms AS time_ms, initial.physical AS stored,\n         initial.reserved AS reserved\n  FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT changes.time_ms,\n         initial.physical + SUM(changes.physical_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING),\n         initial.reserved + SUM(changes.reserved_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes, initial\n)\nSELECT time_ms / 1000 AS time,\n       stored AS \"Stored\",\n       reserved AS \"Reserved\",\n       stored - reserved AS \"Available\"\nFROM points\nORDER BY time_ms",
+          "rawQueryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), base AS (\n  SELECT COALESCE(SUM(physical_quantity), 0) AS physical,\n         COALESCE(SUM(reserved_quantity), 0) AS reserved\n  FROM empire_resource_baseline\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), pre AS (\n  SELECT COALESCE(SUM(physical_delta), 0) AS physical,\n         COALESCE(SUM(reserved_delta), 0) AS reserved\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms < bounds.start_ms\n), initial AS (\n  SELECT base.physical + pre.physical AS physical,\n         base.reserved + pre.reserved AS reserved,\n         bounds.start_ms\n  FROM base, pre, bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms,\n         SUM(physical_delta) AS physical_delta,\n         SUM(reserved_delta) AS reserved_delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms\n), points AS (\n  SELECT start_ms AS time_ms, initial.physical AS stored,\n         initial.reserved AS reserved\n  FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT changes.time_ms,\n         initial.physical + SUM(changes.physical_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING),\n         initial.reserved + SUM(changes.reserved_delta) OVER (ORDER BY changes.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes, initial\n)\nSELECT time_ms / 1000 AS time,\n       stored AS \"Stored\",\n       reserved AS \"Reserved\",\n       stored - reserved AS \"Available\"\nFROM points\nORDER BY time_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Stored resources by type over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Reconstructed physical stockpile by resource type for the selected locations.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT resource AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT resource AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.resource = s.series AND b.location IN (${location:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.resource = s.series AND d.location IN (${location:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, resource AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, resource\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "queryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT resource AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT resource AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.resource = s.series AND b.location IN (${location:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.resource = s.series AND d.location IN (${location:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, resource AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, resource\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "rawQueryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT resource AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT resource AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.resource = s.series AND b.location IN (${location:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.resource = s.series AND d.location IN (${location:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, resource AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, resource\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Stored resources by location over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Reconstructed stockpile by location for the selected resources. Main manufacturing hubs naturally rise to the top without hardcoding system names.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT location AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT location AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.location = s.series AND b.resource IN (${resource:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.location = s.series AND d.resource IN (${resource:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, location AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, location\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "queryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT location AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT location AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.location = s.series AND b.resource IN (${resource:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.location = s.series AND d.resource IN (${resource:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, location AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, location\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "rawQueryText": "WITH bounds AS (\n  SELECT MAX($__from, COALESCE(\n    (SELECT CAST(value AS INTEGER) FROM empire_meta WHERE key = 'history_start_ms'),\n    (SELECT MIN(as_of_ms) FROM empire_resource_baseline),\n    $__from\n  )) AS start_ms\n), series_values AS (\n  SELECT location AS series FROM empire_resource_baseline WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n  UNION\n  SELECT location AS series FROM empire_resource_delta WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring})\n), initial AS (\n  SELECT s.series,\n         COALESCE((SELECT SUM(physical_quantity) FROM empire_resource_baseline b WHERE b.location = s.series AND b.resource IN (${resource:sqlstring})), 0)\n         + COALESCE((SELECT SUM(physical_delta) FROM empire_resource_delta d WHERE d.location = s.series AND d.resource IN (${resource:sqlstring}) AND d.occurred_at_ms < bounds.start_ms), 0) AS initial_value,\n         bounds.start_ms\n  FROM series_values s CROSS JOIN bounds\n), changes AS (\n  SELECT occurred_at_ms AS time_ms, location AS series, SUM(physical_delta) AS delta\n  FROM empire_resource_delta, bounds\n  WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= bounds.start_ms AND occurred_at_ms < $__to\n  GROUP BY occurred_at_ms, location\n), points AS (\n  SELECT start_ms AS time_ms, series, initial_value AS value FROM initial WHERE start_ms < $__to\n  UNION ALL\n  SELECT c.time_ms, c.series,\n         i.initial_value + SUM(c.delta) OVER (PARTITION BY c.series ORDER BY c.time_ms ROWS UNBOUNDED PRECEDING)\n  FROM changes c JOIN initial i USING(series)\n)\nSELECT time_ms / 1000 AS time, value, series FROM points ORDER BY time_ms, series",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Current resource commitment",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Current authoritative stockpiles with inferred active-print commitments.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT resource AS Resource, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY resource ORDER BY Stored DESC",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT resource AS Resource, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY resource ORDER BY Stored DESC",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT resource AS Resource, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY resource ORDER BY Stored DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Current top stockpile locations",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Top current locations for the selected resources; this automatically surfaces main hubs such as SCEPTURUM/THYFFAWFF when they hold most stock.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT location AS Location, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY location ORDER BY Stored DESC LIMIT 15",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT location AS Location, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY location ORDER BY Stored DESC LIMIT 15",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_resource_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_resource_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT location AS Location, SUM(reported_quantity) AS Stored, SUM(reserved_quantity) AS Reserved, SUM(available_quantity) AS Available FROM empire_resource_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) GROUP BY location ORDER BY Stored DESC LIMIT 15"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Resource flows over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Signed resource deltas grouped by cause. Positive values add to a location stockpile; negative values consume/export from it. Reconciliation shows otherwise-unobservable net changes.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, reason AS series FROM empire_resource_delta, cfg WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, reason AS series FROM empire_resource_delta, cfg WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, reason AS series FROM empire_resource_delta, cfg WHERE resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Observed mining output by resource",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 38,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Only mining.stopped events containing quantity_mined are counted. AMI mining digests omit mined quantities and are represented as projection gaps instead of fabricated output.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='resource_mined' AND series IN (${resource:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='resource_mined' AND series IN (${resource:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='resource_mined' AND series IN (${resource:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Printing activity over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Observed print.started and print.completed counts for selected device types.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, CASE metric WHEN 'print_started' THEN 'Started' ELSE 'Completed' END AS series FROM empire_activity, cfg WHERE metric IN ('print_started','print_completed') AND series IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), metric ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, CASE metric WHEN 'print_started' THEN 'Started' ELSE 'Completed' END AS series FROM empire_activity, cfg WHERE metric IN ('print_started','print_completed') AND series IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), metric ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, CASE metric WHEN 'print_started' THEN 'Started' ELSE 'Completed' END AS series FROM empire_activity, cfg WHERE metric IN ('print_started','print_completed') AND series IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), metric ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Travel departures over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 47,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Direct travel events plus inter/intra-system counts inferred from AMI transport digest routes.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='travel_departed' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='travel_departed' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(value) AS value, series FROM empire_activity, cfg WHERE metric='travel_departed' AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), series ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Known inter-system distance traveled",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Sum of distance_ly from retained direct travel.departed events. AMI digest-only trips are included in trip counts but not distance because their exact distance is not reported.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((departed_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(distance_ly) AS \"Light-years\" FROM empire_travel, cfg WHERE inter_system=1 AND distance_ly IS NOT NULL AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY (departed_at_ms / bucket_ms) ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((departed_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(distance_ly) AS \"Light-years\" FROM empire_travel, cfg WHERE inter_system=1 AND distance_ly IS NOT NULL AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY (departed_at_ms / bucket_ms) ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((departed_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(distance_ly) AS \"Light-years\" FROM empire_travel, cfg WHERE inter_system=1 AND distance_ly IS NOT NULL AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY (departed_at_ms / bucket_ms) ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "lengthly",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "title": "Most traveled inter-system routes",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 55,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Routes are available for direct travel events; AMI transport digests contribute trip counts to the timeline but do not expose individual route records.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT origin_system || ' \u2192 ' || destination_system AS Route, COUNT(*) AS Trips, ROUND(SUM(COALESCE(distance_ly,0)),1) AS \"Known LY\", ROUND(AVG(CASE WHEN actual_duration_ms IS NOT NULL THEN actual_duration_ms / 1000.0 END),1) AS \"Avg actual seconds\" FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY origin_system, destination_system ORDER BY Trips DESC LIMIT 20",
+          "queryText": "SELECT origin_system || ' \u2192 ' || destination_system AS Route, COUNT(*) AS Trips, ROUND(SUM(COALESCE(distance_ly,0)),1) AS \"Known LY\", ROUND(AVG(CASE WHEN actual_duration_ms IS NOT NULL THEN actual_duration_ms / 1000.0 END),1) AS \"Avg actual seconds\" FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY origin_system, destination_system ORDER BY Trips DESC LIMIT 20",
+          "rawQueryText": "SELECT origin_system || ' \u2192 ' || destination_system AS Route, COUNT(*) AS Trips, ROUND(SUM(COALESCE(distance_ly,0)),1) AS \"Known LY\", ROUND(AVG(CASE WHEN actual_duration_ms IS NOT NULL THEN actual_duration_ms / 1000.0 END),1) AS \"Avg actual seconds\" FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to GROUP BY origin_system, destination_system ORDER BY Trips DESC LIMIT 20"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "Current device status by type",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 63,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Authoritative latest owned-device projection.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT device_type AS \"Device type\", status AS Status, SUM(device_count) AS Count FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring}) GROUP BY device_type,status ORDER BY Count DESC, device_type,status",
+          "queryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT device_type AS \"Device type\", status AS Status, SUM(device_count) AS Count FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring}) GROUP BY device_type,status ORDER BY Count DESC, device_type,status",
+          "rawQueryText": "WITH latest_time AS (SELECT MAX(observed_at_ms) AS t FROM empire_device_snapshot), latest AS (SELECT latest_time.t, MIN(snapshot.resolution_seconds) AS resolution_seconds FROM empire_device_snapshot AS snapshot, latest_time WHERE snapshot.observed_at_ms = latest_time.t GROUP BY latest_time.t) SELECT device_type AS \"Device type\", status AS Status, SUM(device_count) AS Count FROM empire_device_snapshot AS snapshot, latest WHERE snapshot.observed_at_ms = latest.t AND snapshot.resolution_seconds = latest.resolution_seconds AND device_type IN (${device_type:sqlstring}) GROUP BY device_type,status ORDER BY Count DESC, device_type,status"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Device lifecycle deltas",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 63,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Signed device-count changes from prints, consumption/decommission, rewards/trades, and authoritative reconciliation.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(delta) AS value, reason AS series FROM empire_device_delta, cfg WHERE device_type IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(delta) AS value, reason AS series FROM empire_device_delta, cfg WHERE device_type IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(delta) AS value, reason AS series FROM empire_device_delta, cfg WHERE device_type IN (${device_type:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), reason ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Resource reconciliation corrections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 71,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Non-zero corrections mean an authoritative inventory snapshot observed a net change that retained events could not explain\u2014commonly AMI mining/transport or incomplete trade history.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, resource AS series FROM empire_resource_delta, cfg WHERE reason='reconciliation' AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), resource ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, resource AS series FROM empire_resource_delta, cfg WHERE reason='reconciliation' AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), resource ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, SUM(physical_delta) AS value, resource AS series FROM empire_resource_delta, cfg WHERE reason='reconciliation' AND resource IN (${resource:sqlstring}) AND location IN (${location:sqlstring}) AND occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), resource ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Projection gaps over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 71,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Explicitly recorded places where the retained event stream does not contain enough information for exact reconstruction.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, COUNT(*) AS value, kind AS series FROM empire_projection_gap, cfg WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), kind ORDER BY time",
+          "queryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, COUNT(*) AS value, kind AS series FROM empire_projection_gap, cfg WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), kind ORDER BY time",
+          "rawQueryText": "WITH cfg(bucket_ms) AS (SELECT CASE\n    WHEN ($__to - $__from) <= 604800000 THEN 600000\n    WHEN ($__to - $__from) <= 7776000000 THEN 3600000\n    ELSE 86400000\n  END) SELECT ((occurred_at_ms / bucket_ms) * bucket_ms) / 1000 AS time, COUNT(*) AS value, kind AS series FROM empire_projection_gap, cfg WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to GROUP BY (occurred_at_ms / bucket_ms), kind ORDER BY time",
+          "timeColumns": ["time"]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "showPoints": "auto"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "sum"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Recent projection gaps",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 79,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Why portions of historical reconstruction are incomplete. These are never silently replaced with guessed quantities.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT datetime(occurred_at_ms / 1000, 'unixepoch', 'localtime') AS Time, kind AS Kind, COALESCE(location,'') AS Location, COALESCE(resource,'') AS Resource, detail AS Detail FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to ORDER BY occurred_at_ms DESC LIMIT 100",
+          "queryText": "SELECT datetime(occurred_at_ms / 1000, 'unixepoch', 'localtime') AS Time, kind AS Kind, COALESCE(location,'') AS Location, COALESCE(resource,'') AS Resource, detail AS Detail FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to ORDER BY occurred_at_ms DESC LIMIT 100",
+          "rawQueryText": "SELECT datetime(occurred_at_ms / 1000, 'unixepoch', 'localtime') AS Time, kind AS Kind, COALESCE(location,'') AS Location, COALESCE(resource,'') AS Resource, detail AS Detail FROM empire_projection_gap WHERE occurred_at_ms >= $__from AND occurred_at_ms < $__to ORDER BY occurred_at_ms DESC LIMIT 100"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 25,
+      "title": "Recent inter-system travel",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 79,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Detailed route records for retained direct travel events.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT datetime(departed_at_ms / 1000, 'unixepoch', 'localtime') AS Departed, origin_system AS Origin, destination_system AS Destination, travel_type AS Type, ROUND(distance_ly,2) AS \"Distance LY\", CASE WHEN actual_duration_ms IS NULL THEN NULL ELSE ROUND(actual_duration_ms/1000.0,1) END AS \"Actual seconds\", source AS Source FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to ORDER BY departed_at_ms DESC LIMIT 100",
+          "queryText": "SELECT datetime(departed_at_ms / 1000, 'unixepoch', 'localtime') AS Departed, origin_system AS Origin, destination_system AS Destination, travel_type AS Type, ROUND(distance_ly,2) AS \"Distance LY\", CASE WHEN actual_duration_ms IS NULL THEN NULL ELSE ROUND(actual_duration_ms/1000.0,1) END AS \"Actual seconds\", source AS Source FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to ORDER BY departed_at_ms DESC LIMIT 100",
+          "rawQueryText": "SELECT datetime(departed_at_ms / 1000, 'unixepoch', 'localtime') AS Departed, origin_system AS Origin, destination_system AS Destination, travel_type AS Type, ROUND(distance_ly,2) AS \"Distance LY\", CASE WHEN actual_duration_ms IS NULL THEN NULL ELSE ROUND(actual_duration_ms/1000.0,1) END AS \"Actual seconds\", source AS Source FROM empire_travel WHERE inter_system=1 AND departed_at_ms >= $__from AND departed_at_ms < $__to ORDER BY departed_at_ms DESC LIMIT 100"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["replicant-space", "empire", "history"],
+  "templating": {
+    "list": [
+      {
+        "name": "resource",
+        "label": "Resource",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT resource AS __text, resource AS __value FROM (SELECT resource FROM empire_resource_baseline UNION SELECT resource FROM empire_resource_snapshot UNION SELECT resource FROM empire_resource_delta) GROUP BY resource ORDER BY resource",
+        "definition": "SELECT resource AS __text, resource AS __value FROM (SELECT resource FROM empire_resource_baseline UNION SELECT resource FROM empire_resource_snapshot UNION SELECT resource FROM empire_resource_delta) GROUP BY resource ORDER BY resource",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      },
+      {
+        "name": "location",
+        "label": "Location",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT location AS __text, location AS __value FROM (SELECT location FROM empire_resource_baseline UNION SELECT location FROM empire_resource_snapshot UNION SELECT location FROM empire_resource_delta) GROUP BY location ORDER BY location",
+        "definition": "SELECT location AS __text, location AS __value FROM (SELECT location FROM empire_resource_baseline UNION SELECT location FROM empire_resource_snapshot UNION SELECT location FROM empire_resource_delta) GROUP BY location ORDER BY location",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      },
+      {
+        "name": "device_type",
+        "label": "Device type",
+        "type": "query",
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "replicant-telemetry"
+        },
+        "query": "SELECT device_type AS __text, device_type AS __value FROM (SELECT device_type FROM empire_device_baseline UNION SELECT device_type FROM empire_device_snapshot UNION SELECT device_type FROM empire_device_delta) WHERE device_type != '__unknown__' GROUP BY device_type ORDER BY device_type",
+        "definition": "SELECT device_type AS __text, device_type AS __value FROM (SELECT device_type FROM empire_device_baseline UNION SELECT device_type FROM empire_device_snapshot UNION SELECT device_type FROM empire_device_delta) WHERE device_type != '__unknown__' GROUP BY device_type ORDER BY device_type",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": null,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ["$__all"]
+        }
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Replicant Space \u00b7 Empire Overview",
+  "uid": "replicant-empire-overview",
+  "version": 3,
+  "weekStart": ""
+}

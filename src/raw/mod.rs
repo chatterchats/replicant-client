@@ -70,11 +70,11 @@ pub use client::{
     RequestSafety, ResponseMetadata, RetryPolicy, SecretString, StatusCode, TlsBackend,
     TokenProvider, Url,
 };
+pub use common::{JsonObject, Position};
 pub use telemetry::{
     ApiAttemptOutcome, ApiAttemptTelemetry, ApiAttemptTimings, ApiRateLimitTelemetry,
     ApiTelemetrySink, normalize_route_key,
 };
-pub use common::{JsonObject, Position};
 
 impl Client {
     /// Account registration, profile, and account-scoped resource operations.

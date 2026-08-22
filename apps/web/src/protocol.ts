@@ -555,6 +555,7 @@ export interface TradeControllerSummary {
   location: string | null;
   total_stock: number | null;
   trade_count: number | null;
+  trade_details_status: string;
   trades: TradeSummary[];
   workflow: WorkflowSummary | null;
 }
@@ -563,6 +564,48 @@ export interface TradeSnapshot {
   metadata: SnapshotMetadata;
   viewer: EntityRef | null;
   controllers: TradeControllerSummary[];
+}
+
+export interface BillFinderRequest {
+  tracking_beacon?: string | null;
+  expand?: boolean;
+  target_system?: string | null;
+}
+
+export interface BillDepartureSummary {
+  tracking_beacon: string;
+  replicant_code: string;
+  vessel_code: string | null;
+  vessel_type: string | null;
+  origin_location: string;
+  origin_system: string;
+  logged_at: string | null;
+  vector: [number, number, number];
+}
+
+export interface BillCandidateSummary {
+  system: string;
+  angular_error_deg: number;
+  distance_ly: number;
+  projected_distance_ly: number;
+  cross_track_ly: number;
+}
+
+export interface BillExpansionSummary {
+  status: string;
+  target_system: string | null;
+  workflow: WorkflowSummary | null;
+  message: string;
+}
+
+export interface BillFinderResponse {
+  metadata: SnapshotMetadata;
+  departure: BillDepartureSummary;
+  candidates: BillCandidateSummary[];
+  recommended_system: string | null;
+  confidence: string;
+  ambiguous: boolean;
+  expansion: BillExpansionSummary;
 }
 
 export interface ReportsSnapshot {
@@ -2554,6 +2597,10 @@ export function parseTradeResponse(value: unknown): Versioned<TradeSnapshot> {
               controller.trade_count,
               "shop trade count",
             ),
+            trade_details_status:
+              typeof controller.trade_details_status === "string"
+                ? controller.trade_details_status
+                : "available",
             trades: array(controller.trades, "trades").map((value) => {
               const trade = record(value, "trade");
               if (typeof trade.trade_code !== "string")
@@ -2615,6 +2662,109 @@ function bobnetMessage(value: unknown): BobnetMessageSummary {
     ),
     created_at: nullableString(message.created_at, "BobNet message time"),
   };
+}
+
+export function parseBillFinderResponse(
+  value: unknown,
+): Versioned<BillFinderResponse> {
+  return envelope(value, (payload) => {
+    const result = record(payload, "Bill finder response");
+    const departure = record(result.departure, "Bill departure");
+    const vector = array(departure.vector, "Bill departure vector").map(
+      (value) => {
+        if (typeof value !== "number" || !Number.isFinite(value))
+          throw new Error("Invalid Bill departure vector");
+        return value;
+      },
+    );
+    const [vectorX, vectorY, vectorZ] = vector;
+    if (
+      vector.length !== 3 ||
+      vectorX === undefined ||
+      vectorY === undefined ||
+      vectorZ === undefined
+    ) {
+      throw new Error("Invalid Bill departure vector");
+    }
+    const expansion = record(result.expansion, "Bill expansion");
+    if (
+      typeof departure.tracking_beacon !== "string" ||
+      typeof departure.replicant_code !== "string" ||
+      typeof departure.origin_location !== "string" ||
+      typeof departure.origin_system !== "string" ||
+      typeof result.confidence !== "string" ||
+      typeof result.ambiguous !== "boolean" ||
+      typeof expansion.status !== "string" ||
+      typeof expansion.message !== "string"
+    ) {
+      throw new Error("Invalid Bill finder response");
+    }
+    return {
+      metadata: metadata(result.metadata),
+      departure: {
+        tracking_beacon: departure.tracking_beacon,
+        replicant_code: departure.replicant_code,
+        vessel_code: nullableString(departure.vessel_code, "Bill vessel code"),
+        vessel_type: nullableString(departure.vessel_type, "Bill vessel type"),
+        origin_location: departure.origin_location,
+        origin_system: departure.origin_system,
+        logged_at: nullableString(departure.logged_at, "Bill audit timestamp"),
+        vector: [vectorX, vectorY, vectorZ],
+      },
+      candidates: array(result.candidates, "Bill candidates").map((value) => {
+        const candidate = record(value, "Bill candidate");
+        if (typeof candidate.system !== "string")
+          throw new Error("Invalid Bill candidate");
+        const angularError = optionalFiniteNumber(
+          candidate.angular_error_deg,
+          "Bill candidate angular error",
+        );
+        const distance = optionalFiniteNumber(
+          candidate.distance_ly,
+          "Bill candidate distance",
+        );
+        const projectedDistance = optionalFiniteNumber(
+          candidate.projected_distance_ly,
+          "Bill candidate projected distance",
+        );
+        const crossTrack = optionalFiniteNumber(
+          candidate.cross_track_ly,
+          "Bill candidate cross-track distance",
+        );
+        if (
+          angularError === null ||
+          distance === null ||
+          projectedDistance === null ||
+          crossTrack === null
+        ) {
+          throw new Error("Invalid Bill candidate");
+        }
+        return {
+          system: candidate.system,
+          angular_error_deg: angularError,
+          distance_ly: distance,
+          projected_distance_ly: projectedDistance,
+          cross_track_ly: crossTrack,
+        };
+      }),
+      recommended_system: nullableString(
+        result.recommended_system,
+        "Bill recommended system",
+      ),
+      confidence: result.confidence,
+      ambiguous: result.ambiguous,
+      expansion: {
+        status: expansion.status,
+        target_system: nullableString(
+          expansion.target_system,
+          "Bill expansion target",
+        ),
+        workflow:
+          expansion.workflow === null ? null : workflow(expansion.workflow),
+        message: expansion.message,
+      },
+    };
+  });
 }
 
 export function parseReportsResponse(

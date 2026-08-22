@@ -1529,6 +1529,17 @@ async fn ensure_attachable_device(
         detail = client.raw().devices().get(code).await?.value;
     }
 
+    if status_is(&detail, "active") && command_available(&detail, "deactivate") {
+        info!(device = %code, "deactivating active payload before transport");
+        let operation = client.devices().get(code).await?.deactivate().await?;
+        ensure_operation_accepted(&operation).await?;
+        wait_for_raw_device(client, code, Some(&operation), options, |device| {
+            !status_is(device, "active")
+        })
+        .await?;
+        detail = client.raw().devices().get(code).await?.value;
+    }
+
     if !is_modular_device(&detail) || status_is(&detail, "compacted") {
         return Ok(());
     }
@@ -1921,7 +1932,13 @@ fn inactive_payload(device: &Device) -> bool {
     device.status.as_ref().is_some_and(|status| {
         matches!(
             status.as_str().to_ascii_lowercase().as_str(),
-            "inactive" | "deactivated" | "idle" | "stowed" | "recalled" | "compacted"
+            "inactive"
+                | "deactivated"
+                | "idle"
+                | "stowed"
+                | "recalled"
+                | "compacted"
+                | "out_of_range"
         )
     }) && device.travel.is_none()
 }
@@ -2052,6 +2069,14 @@ mod tests {
             travel: None,
             access: replicant_client::domain::AccessScope::Owned,
         }
+    }
+
+    #[test]
+    fn out_of_range_device_can_be_selected_as_transport_payload() {
+        let mut device = payload_device("WARD-1", "RHYVENAI", &[]);
+        device.status = Some(replicant_client::DeviceStatus::from("out_of_range"));
+
+        assert!(eligible_payload(&device));
     }
 
     fn attachment_transport(code: &str, location: &str) -> Device {

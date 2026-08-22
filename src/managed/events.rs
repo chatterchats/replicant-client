@@ -48,6 +48,31 @@ const APPLIER_QUEUE_CAPACITY: usize = 256;
 const EVENT_SUBSCRIPTION_CAPACITY: usize = 256;
 static RECONCILIATION_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Best-effort managed event-pipeline observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventTelemetrySample {
+    /// Observation timestamp in Unix epoch milliseconds.
+    pub observed_at_ms: i64,
+    /// Stable metric name such as `sse_connect` or `event_apply`.
+    pub metric: &'static str,
+    /// Stable outcome associated with the metric.
+    pub outcome: String,
+    /// Event name when the observation concerns one account event.
+    pub event_name: Option<String>,
+    /// Number of account events represented by this observation.
+    pub event_count: u64,
+    /// Number of pages represented by a catch-up observation.
+    pub page_count: u64,
+    /// Optional duration associated with the observation.
+    pub duration_ms: Option<u64>,
+}
+
+/// Destination for managed event/SSE telemetry.
+pub trait EventTelemetrySink: Send + Sync + 'static {
+    /// Records one observation without performing slow I/O inline.
+    fn record(&self, sample: EventTelemetrySample);
+}
+
 fn observed_at() -> crate::domain::ObservationTime {
     crate::domain::ObservationTime::now()
 }
@@ -348,6 +373,12 @@ enum CatchUpOutcome {
     BoundHit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyOutcome {
+    Applied,
+    Duplicate,
+}
+
 /// Applies one raw event: deduplicates by ID, reduces known projections,
 /// commits the event and applied cursor atomically, publishes a state
 /// revision, notifies subscribers, and schedules narrow reconciliation for
@@ -418,7 +449,7 @@ fn consumed_print_devices(event: &Event) -> Vec<DeviceKey> {
         .collect()
 }
 
-fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
+fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<ApplyOutcome> {
     let started = Instant::now();
     debug!(
         target: "replicant_client::events",
@@ -461,7 +492,7 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
         // The transaction's insert-if-absent claim was lost to the other
         // lane, so no reducer, publisher, evidence, or reconciliation side
         // effect may run here.
-        return Ok(());
+        return Ok(ApplyOutcome::Duplicate);
     }
     if event.realm.is_some() && event.name != domain::EventName::DeviceDecommissioned {
         // This client does not (yet) reduce every documented event type into
@@ -488,15 +519,30 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<()> {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "account event durably applied and published"
     );
-    Ok(())
+    Ok(ApplyOutcome::Applied)
 }
 
 /// The sole ordered event-applier. Producers wait for this task's reply, so
 /// queue capacity is real backpressure rather than an unbounded memory buffer.
 async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver<ApplyRequest>) {
     while let Some(request) = receiver.recv().await {
+        let apply_started = Instant::now();
         let result = weak.upgrade().ok_or(Error::Closed).and_then(|client| {
             let result = apply_event(&client, &request.event);
+            let outcome = match &result {
+                Ok(ApplyOutcome::Applied) => "applied",
+                Ok(ApplyOutcome::Duplicate) => "duplicate",
+                Err(_) => "failed",
+            };
+            client.record_event_telemetry(EventTelemetrySample {
+                observed_at_ms: telemetry_now_millis(),
+                metric: "event_apply",
+                outcome: outcome.to_owned(),
+                event_name: Some(request.event.event.clone()),
+                event_count: 1,
+                page_count: 0,
+                duration_ms: Some(duration_millis(apply_started.elapsed())),
+            });
             if result.is_err() {
                 warn!(target: "replicant_client::events", "event application failed; marking continuity degraded");
                 mark_event_continuity_degraded(&client);
@@ -504,7 +550,7 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
                     mark_event_continuity_degraded(&client);
                 }
             }
-            result
+            result.map(|_| ())
         });
         if request.completed.send(result).is_err() {
             // The producer stopped awaiting while work was in flight; the
@@ -754,6 +800,7 @@ async fn catch_up_unfiltered(
     let total_started = Instant::now();
     let mut cursor = from_cursor;
     let mut pages = 0usize;
+    let mut total_events = 0u64;
     info!(
         target: "replicant_client::events",
         event = "events.catchup_started",
@@ -777,15 +824,39 @@ async fn catch_up_unfiltered(
             ..Default::default()
         };
         let request_started = Instant::now();
-        let response = client.managed_raw().events().list(&query).await?;
+        let response = match client.managed_raw().events().list(&query).await {
+            Ok(response) => response,
+            Err(error) => {
+                client.record_event_telemetry(EventTelemetrySample {
+                    observed_at_ms: telemetry_now_millis(),
+                    metric: "catchup",
+                    outcome: "failed".to_owned(),
+                    event_name: None,
+                    event_count: total_events,
+                    page_count: pages.try_into().unwrap_or(u64::MAX),
+                    duration_ms: Some(duration_millis(total_started.elapsed())),
+                });
+                return Err(error);
+            }
+        };
         let request_elapsed = request_started.elapsed();
         let events = response.value.events;
         let next_cursor = response.value.next_cursor;
         let event_count = events.len();
+        total_events = total_events.saturating_add(event_count.try_into().unwrap_or(u64::MAX));
         let last_event_id = events.last().map(|event| event.id.clone());
         let apply_started = Instant::now();
         for event in events {
-            client.managed_events().enqueue(event).await?;
+            if let Err(error) = client.managed_events().enqueue(event).await {
+                record_catchup_telemetry(
+                    client,
+                    "failed",
+                    total_events,
+                    pages,
+                    total_started.elapsed(),
+                );
+                return Err(error);
+            }
         }
         let apply_elapsed = apply_started.elapsed();
         pages += 1;
@@ -812,6 +883,13 @@ async fn catch_up_unfiltered(
                         reason = "terminal_cursor",
                         "event-log catch-up completed"
                     );
+                    record_catchup_telemetry(
+                        client,
+                        "complete",
+                        total_events,
+                        pages,
+                        total_started.elapsed(),
+                    );
                     return Ok(CatchUpOutcome::Complete);
                 }
                 cursor = Some(next);
@@ -822,6 +900,13 @@ async fn catch_up_unfiltered(
                         pages,
                         elapsed_ms = total_started.elapsed().as_millis() as u64,
                         "event-log catch-up reached page bound"
+                    );
+                    record_catchup_telemetry(
+                        client,
+                        "bound_hit",
+                        total_events,
+                        pages,
+                        total_started.elapsed(),
                     );
                     return Ok(CatchUpOutcome::BoundHit);
                 }
@@ -835,10 +920,48 @@ async fn catch_up_unfiltered(
                     reason = "no_next_cursor",
                     "event-log catch-up completed"
                 );
+                record_catchup_telemetry(
+                    client,
+                    "complete",
+                    total_events,
+                    pages,
+                    total_started.elapsed(),
+                );
                 return Ok(CatchUpOutcome::Complete);
             }
         }
     }
+}
+
+fn record_catchup_telemetry(
+    client: &Client,
+    outcome: &str,
+    event_count: u64,
+    page_count: usize,
+    elapsed: Duration,
+) {
+    client.record_event_telemetry(EventTelemetrySample {
+        observed_at_ms: telemetry_now_millis(),
+        metric: "catchup",
+        outcome: outcome.to_owned(),
+        event_name: None,
+        event_count,
+        page_count: page_count.try_into().unwrap_or(u64::MAX),
+        duration_ms: Some(duration_millis(elapsed)),
+    });
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn telemetry_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 /// Claims and processes one durable reconciliation work item, if any is due.
@@ -1074,39 +1197,73 @@ async fn run_sse_loop(
                     elapsed_ms = connect_started.elapsed().as_millis() as u64,
                     "filtered event stream connected"
                 );
+                let connect_ms = duration_millis(connect_started.elapsed());
+                client.record_event_telemetry(EventTelemetrySample {
+                    observed_at_ms: telemetry_now_millis(),
+                    metric: "sse_connect",
+                    outcome: "connected".to_owned(),
+                    event_name: None,
+                    event_count: 0,
+                    page_count: 0,
+                    duration_ms: Some(connect_ms),
+                });
                 client.set_readiness(|readiness| {
                     readiness.sse_connectivity = ReadinessComponent::Ready;
                 });
                 drop(client);
-                let mut received_event = false;
-
-                loop {
+                let session_started = Instant::now();
+                let mut received_events = 0u64;
+                let disconnect_outcome = loop {
                     let next = stream.next().await;
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
                     match next {
                         Some(Ok(event)) => {
-                            received_event = true;
+                            received_events = received_events.saturating_add(1);
                             if client.managed_events().enqueue(event).await.is_err() {
                                 mark_event_continuity_degraded(&client);
-                                break;
+                                break "apply_error";
                             }
                         }
-                        _ => break,
+                        Some(Err(_)) => break "stream_error",
+                        None => break "eof",
                     }
+                };
+                if let Some(client) = weak.upgrade() {
+                    client.record_event_telemetry(EventTelemetrySample {
+                        observed_at_ms: telemetry_now_millis(),
+                        metric: "sse_disconnect",
+                        outcome: disconnect_outcome.to_owned(),
+                        event_name: None,
+                        event_count: received_events,
+                        page_count: 0,
+                        duration_ms: Some(duration_millis(session_started.elapsed())),
+                    });
                 }
-                if received_event {
+                if received_events > 0 {
                     backoff = min_backoff;
                 } else {
                     debug!(target: "replicant_client::events", "event stream ended without an event");
                 }
             }
             Err(error) => {
+                let connect_ms = duration_millis(connect_started.elapsed());
+                if let Some(client) = weak.upgrade() {
+                    client.record_event_telemetry(EventTelemetrySample {
+                        observed_at_ms: telemetry_now_millis(),
+                        metric: "sse_connect",
+                        outcome: "failed".to_owned(),
+                        event_name: None,
+                        event_count: 0,
+                        page_count: 0,
+                        duration_ms: Some(connect_ms),
+                    });
+                }
                 warn!(
                     target: "replicant_client::events",
                     event = "events.sse_connect_failed",
-                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    elapsed_ms = connect_ms,
                     error = %error,
                     "filtered event stream connection failed"
                 )

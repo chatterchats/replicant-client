@@ -29,6 +29,7 @@ export type DeviceCategory =
   | "transport"
   | "carrier"
   | "manufacturing"
+  | "system"
   | "other";
 
 export const DEVICE_CATEGORIES: readonly {
@@ -43,6 +44,7 @@ export const DEVICE_CATEGORIES: readonly {
   { id: "transport", label: "Transport" },
   { id: "carrier", label: "Carrier" },
   { id: "manufacturing", label: "Manufacturing" },
+  { id: "system", label: "System" },
   { id: "other", label: "Other" },
 ];
 
@@ -57,7 +59,7 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
   ],
   mining: ["ami_mining_controller", "mining_drone"],
   survey: ["ami_survey_controller", "survey_drone"],
-  ftl_comms: ["ftl_beacon", "ftl_relay"],
+  ftl_comms: ["ftl_beacon", "ftl_relay", "deep_space_relay_station"],
   maintenance: ["maintenance_drone"],
   transport: [
     "ami_transport_controller",
@@ -73,6 +75,7 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
     "fusion_barge",
   ],
   manufacturing: ["autofactory"],
+  system: ["system_hub", "system_ward"],
 };
 
 const categoryByType = new Map(

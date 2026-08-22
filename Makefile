@@ -152,8 +152,9 @@ docker-down:
 	$(DOCKER_COMPOSE) stop
 
 observability-up:
+	$(CARGO) build --locked --release -p replicant-server --bin replicantd
 	mkdir -p "$${REPLICANT_DATA_DIR:-$${HOME}/.local/share/replicant}/telemetry" "$${REPLICANT_DATA_DIR:-$${HOME}/.local/share/replicant}/grafana"
-	$(DOCKER_COMPOSE) --profile observability up -d replicantd grafana
+	$(DOCKER_COMPOSE) --profile observability up -d --build replicantd grafana
 
 observability-down:
 	$(DOCKER_COMPOSE) --profile observability stop grafana

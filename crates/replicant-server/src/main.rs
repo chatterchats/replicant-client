@@ -9,8 +9,12 @@ use std::{
 };
 
 use replicant_runtime::{
-    config::ManagedClientConfig, config::RuntimeConfig, start_managed_client,
-    telemetry::TelemetryService,
+    config::ManagedClientConfig,
+    config::RuntimeConfig,
+    empire_telemetry::EmpireTelemetryService,
+    mission_stock::reconcile_legacy_mission_tags,
+    start_managed_client,
+    telemetry::{RuntimeTelemetrySample, TelemetryService},
 };
 use replicant_server::{
     AppState, DaemonConfig, router, run_director, run_supervisor, run_trigger_engine,
@@ -73,17 +77,72 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     let telemetry = TelemetryService::start(&config.telemetry_database)?;
+    let runtime_telemetry = telemetry.runtime_sink();
+    runtime_telemetry.record(RuntimeTelemetrySample {
+        observed_at_ms: unix_millis(),
+        metric: "daemon_lifecycle",
+        series: "started".to_owned(),
+        value: 1,
+        duration_ms: None,
+    });
     let client = start_managed_client(
         ManagedClientConfig::from_env(&config.managed_database)?
-            .with_api_telemetry_sink(telemetry.api_sink()),
+            .with_api_telemetry_sink(telemetry.api_sink())
+            .with_event_telemetry_sink(telemetry.event_sink()),
     )
     .await?;
+    let empire_blueprints = match client.blueprints().list().await {
+        Ok(blueprints) => blueprints,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "empire telemetry could not snapshot the current blueprint catalogue"
+            );
+            Vec::new()
+        }
+    };
+    let history_database = replicant_client::default_history_database_path(&config.managed_database);
+    let empire_telemetry = match EmpireTelemetryService::start(
+        &config.managed_database,
+        &history_database,
+        &config.telemetry_database,
+        empire_blueprints,
+    ) {
+        Ok(service) => Some(service),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                history_database = %history_database.display(),
+                "empire telemetry is unavailable; continuing without in-game history projection"
+            );
+            None
+        }
+    };
     let repository = Arc::new(WorkflowRepository::open(&config.runtime_database)?);
-    let state = AppState::new(
+    match reconcile_legacy_mission_tags(&client, repository.as_ref()).await {
+        Ok(report) if report.migrated_devices > 0 => {
+            tracing::info!(
+                mapped_legacy_tags = report.mapped_legacy_tags,
+                migrated_devices = report.migrated_devices,
+                ambiguous_devices = report.ambiguous_devices,
+                "reconciled UUID-derived mission tags into reusable system stock"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "legacy mission-tag reconciliation failed; continuing daemon startup"
+            );
+        }
+    }
+    let state = AppState::new_with_telemetry(
         client.clone(),
         RuntimeConfig::new(&config.profile),
         repository,
         config.clone(),
+        Some(telemetry.workflow_sink()),
+        Some(telemetry.runtime_sink()),
     )?;
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(
@@ -111,6 +170,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     triggers.await?;
     director.await?;
     signal.abort();
+    runtime_telemetry.record(RuntimeTelemetrySample {
+        observed_at_ms: unix_millis(),
+        metric: "daemon_lifecycle",
+        series: "stopped".to_owned(),
+        value: 1,
+        duration_ms: None,
+    });
+    if let Some(empire_telemetry) = empire_telemetry {
+        if let Err(error) = empire_telemetry.shutdown() {
+            tracing::warn!(error = %error, "empire telemetry shutdown did not complete cleanly");
+        }
+    }
     client.close().await?;
     telemetry.shutdown()?;
     server_result?;
@@ -154,6 +225,15 @@ fn init_logging(
     }
     tracing::info!(path = %log_path.display(), "persistent daemon logging initialized");
     Ok(())
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {

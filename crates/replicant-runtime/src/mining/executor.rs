@@ -25,7 +25,8 @@ use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
     SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code, device_location,
     device_type, factory_workloads, fetch_blueprints, find_device, format_quantities,
-    has_directive, has_reservation_tag, refresh_device_snapshots, save_plan, stable_hash,
+    has_directive, has_reservation_tag, is_opaque_mining_mission_tag, refresh_device_snapshots,
+    save_plan, stable_hash,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -90,6 +91,8 @@ pub(crate) async fn execute(
 
     let sync = client.sync().full().await?;
     info!(readiness = ?sync.readiness, "full managed synchronization completed");
+    migrate_legacy_mission_devices(client, mission).await?;
+    save_plan(&config.plan_path, mission)?;
     reconcile(client, config, mission).await?;
     tag_existing_automation(client, mission).await?;
 
@@ -275,16 +278,14 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
         .iter()
         .map(|batch| batch.batch_tag.clone())
         .collect::<BTreeSet<_>>();
-    let handles = client
-        .devices()
-        .refresh_many()
-        .with_tag(mission.mission_tag.clone())
-        .page_size(50)
-        .collect()
-        .await?;
+    migrate_legacy_mission_devices(client, mission).await?;
+    let aliases = mission_tag_aliases(mission);
+    let devices = refresh_device_snapshots(client).await?;
     let mut produced = BTreeMap::<String, Vec<String>>::new();
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
+    for snapshot in devices
+        .iter()
+        .filter(|device| device.tags.iter().any(|tag| aliases.contains(tag)))
+    {
         let matching = snapshot
             .tags
             .iter()
@@ -296,7 +297,7 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
                 io::ErrorKind::InvalidData,
                 format!(
                     "mission-tagged device {} matches multiple print batches",
-                    handle.id().as_str()
+                    snapshot.key.id.as_str()
                 ),
             ));
         }
@@ -304,7 +305,7 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
             produced
                 .entry(batch_tag)
                 .or_default()
-                .push(handle.id().as_str().to_owned());
+                .push(snapshot.key.id.as_str().to_owned());
         }
     }
 
@@ -340,7 +341,8 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
                 .get(&batch.factory_code)
                 .is_some_and(|jobs: &Vec<BTreeSet<String>>| {
                     jobs.iter().any(|tags| {
-                        tags.contains(&mission.mission_tag) && tags.contains(&batch.batch_tag)
+                        aliases.iter().any(|tag| tags.contains(tag))
+                            && tags.contains(&batch.batch_tag)
                     })
                 });
         if queued || i64::try_from(batch.produced_codes.len())? == batch.quantity {
@@ -1518,6 +1520,59 @@ async fn return_and_release_carriers(
     }
 }
 
+fn mission_tag_aliases(mission: &MiningMission) -> Vec<String> {
+    std::iter::once(mission.mission_tag.clone())
+        .chain(mission.legacy_mission_tags.iter().cloned())
+        .collect()
+}
+
+async fn migrate_legacy_mission_devices(
+    client: &Client,
+    mission: &MiningMission,
+) -> AnyResult<usize> {
+    if mission.legacy_mission_tags.is_empty() {
+        return Ok(0);
+    }
+    let devices = refresh_device_snapshots(client).await?;
+    let mut migrated = 0usize;
+    for device in devices {
+        let removable = device
+            .tags
+            .iter()
+            .filter(|tag| {
+                mission.legacy_mission_tags.contains(*tag)
+                    && is_opaque_mining_mission_tag(tag)
+                    && *tag != &mission.mission_tag
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            continue;
+        }
+        let handle = client.devices().get(device.key.id.as_str()).await?;
+        let add_tags = (!device.tags.contains(&mission.mission_tag))
+            .then_some(vec![mission.mission_tag.clone()]);
+        ensure_operation_accepted(
+            &handle
+                .configure(api_raw::devices::DeviceConfiguration {
+                    add_tags,
+                    remove_tags: Some(removable.clone()),
+                    ..Default::default()
+                })
+                .await?,
+        )
+        .await?;
+        migrated += 1;
+        info!(
+            device = %device.key.id.as_str(),
+            new_tag = %mission.mission_tag,
+            old_tags = ?removable,
+            "migrated legacy mining mission tag"
+        );
+    }
+    Ok(migrated)
+}
+
 async fn cleanup_transient_tags(client: &Client, mission: &MiningMission) -> AnyResult<()> {
     let batch_tags = mission
         .print_batches
@@ -1737,7 +1792,8 @@ mod tests {
         MiningMission {
             version: 1,
             mission_id: "mission".into(),
-            mission_tag: "mine-m:0000000000000001".into(),
+            mission_tag: "mine-m:hub".into(),
+            legacy_mission_tags: Vec::new(),
             phase: MissionPhase::ManufacturingSites,
             selected_replicant: "replicant".into(),
             hub_location: "HUB-BELT-1".into(),

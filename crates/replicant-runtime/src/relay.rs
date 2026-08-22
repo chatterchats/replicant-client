@@ -449,6 +449,10 @@ struct SupplyCarrierCandidate {
 pub struct RelayExecutionState {
     version: u32,
     mission_id: String,
+    /// Historical UUID-derived mission tags still recognized while an old
+    /// checkpoint or queued print is migrated to the system-scoped tag.
+    #[serde(default)]
+    legacy_mission_tags: Vec<String>,
     replicant_code: String,
     vessel_code: String,
     hub_location: String,
@@ -505,6 +509,21 @@ pub struct RelayExecutionStatus {
 }
 
 impl RelayExecutionState {
+    /// Returns the stable tag plus UUID-derived aliases recorded by this checkpoint.
+    pub(crate) fn mission_tag_migration(&self) -> (String, Vec<String>) {
+        let desired = relay_system_mission_tag(&self.start_system);
+        let mut legacy = self.legacy_mission_tags.clone();
+        legacy.extend(
+            self.print_jobs
+                .iter()
+                .map(|job| job.mission_tag.clone())
+                .filter(|tag| tag != &desired && is_opaque_relay_mission_tag(tag)),
+        );
+        legacy.sort();
+        legacy.dedup();
+        (desired, legacy)
+    }
+
     /// Returns structured progress without consulting live API state.
     #[must_use]
     pub fn status(&self) -> RelayExecutionStatus {
@@ -564,6 +583,7 @@ impl RelayExecutionState {
         let factories = self
             .print_jobs
             .iter()
+            .filter(|job| job.relay_code.is_none())
             .map(|job| job.factory_code.as_str())
             .collect();
         (&self.replicant_code, devices, factories)
@@ -575,6 +595,8 @@ struct DeviceCensus {
     devices: BTreeMap<String, Device>,
     active_relay_codes: BTreeMap<String, Vec<String>>,
     inactive_relay_codes: BTreeMap<String, Vec<String>>,
+    recoverable_dsr_codes: BTreeMap<String, Vec<String>>,
+    compacted_dsr_codes: BTreeMap<String, Vec<String>>,
     relay_ranges_ly: BTreeMap<String, f64>,
     hub_stock: Vec<String>,
     hub_stock_dsr: Vec<String>,
@@ -761,7 +783,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<MissionPlan> {
     let mut plan = if config.plan_path.exists() && !config.replace_plan {
         let mut plan = load_plan(&config.plan_path)?;
         validate_loaded_plan(&plan, config, &replicant_code, &vessel_code)?;
-        if config.command == Command::Plan && !config.ignore_printers.is_empty() {
+        if !config.ignore_printers.is_empty() {
             let all_factory_codes = discover_print_factory_codes(client, &config.hub)
                 .await?
                 .into_iter()
@@ -855,6 +877,35 @@ async fn resolve_owned_replicant(client: &Client, query: &str) -> AnyResult<Repl
             format!("owned replicant name {query:?} is ambiguous; use its code"),
         )),
     }
+}
+
+fn existing_relay_activation_stop(
+    census: &DeviceCensus,
+    system: &str,
+    parent_system: &str,
+    relay_code: String,
+) -> AnyResult<RelayStop> {
+    let relay = census.devices.get(&relay_code).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("selected relay {relay_code} omitted from census"),
+        )
+    })?;
+    let location = device_location(relay).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            format!("inactive relay {relay_code} has no location"),
+        )
+    })?;
+    Ok(RelayStop {
+        system: system.to_owned(),
+        location: location.to_owned(),
+        parent_system: parent_system.to_owned(),
+        action: StopAction::ActivateExisting,
+        device_type: device_type(relay).unwrap_or(FTL_RELAY).to_owned(),
+        relay_code: Some(relay_code),
+        completed: false,
+    })
 }
 
 async fn create_plan(
@@ -1035,6 +1086,7 @@ async fn create_plan(
     }
 
     let mission_id = format!("{}-{}", start_system.to_lowercase(), uuid::Uuid::new_v4());
+    let mission_tag = relay_system_mission_tag(&start_system);
     let mut hub_stock = census.hub_stock.clone();
     let mut hub_stock_dsr = census.hub_stock_dsr.clone();
     // Assign relays that are already aboard the transport to the earliest new
@@ -1091,6 +1143,21 @@ async fn create_plan(
             })
             .cloned(),
     );
+    // A deployed DSR can be compacted or otherwise inactive while an ordinary
+    // relay in the same system keeps the network node classified as Active.
+    // Include those systems explicitly so expansion repairs the DSR instead of
+    // silently leaving reusable 10 ly infrastructure folded up.
+    action_order.extend(
+        census
+            .recoverable_dsr_codes
+            .keys()
+            .filter(|system| {
+                nodes
+                    .get(system.as_str())
+                    .is_some_and(|node| !node.is_start)
+            })
+            .cloned(),
+    );
     action_order.sort_by(|left, right| {
         let left_node = nodes.get(left.as_str()).expect("planned node exists");
         let right_node = nodes.get(right.as_str()).expect("planned node exists");
@@ -1127,20 +1194,39 @@ async fn create_plan(
             )
         })?;
         let requires_dsr = dsr_systems.contains(system);
-        match node.relay {
-            RelayAvailability::Active if requires_dsr => {
+        let recoverable_dsr = census
+            .recoverable_dsr_codes
+            .get(system)
+            .and_then(|codes| codes.first())
+            .cloned();
+        let mut scheduled_existing = BTreeSet::new();
+
+        if requires_dsr {
+            if let Some(relay_code) = recoverable_dsr {
+                info!(
+                    system = %system,
+                    relay = %relay_code,
+                    "reusing deployed Deep Space Relay Station for required 10 ly coverage"
+                );
+                scheduled_existing.insert(relay_code.clone());
+                stops.push(existing_relay_activation_stop(
+                    &census,
+                    system,
+                    &parent_system,
+                    relay_code,
+                )?);
+            } else {
                 let location = choose_l4_location(client, node).await?;
                 let relay_code = hub_stock_dsr.pop().inspect(|code| {
                     used_hub_stock.push(code.clone());
                 });
                 if relay_code.is_none() {
-                    let mission_tag = relay_mission_tag(&mission_id);
                     let site_tag = relay_site_tag(system);
                     print_jobs.push(PrintJob {
                         system: system.clone(),
                         device_type: DEEP_SPACE_RELAY.to_owned(),
                         factory_code: String::new(),
-                        mission_tag,
+                        mission_tag: mission_tag.clone(),
                         site_tag,
                         batch_tag: None,
                         flatpack: true,
@@ -1153,90 +1239,107 @@ async fn create_plan(
                 stops.push(RelayStop {
                     system: system.clone(),
                     location,
-                    parent_system,
+                    parent_system: parent_system.clone(),
                     action: StopAction::DeployAndActivate,
                     device_type: DEEP_SPACE_RELAY.to_owned(),
                     relay_code,
                     completed: false,
                 });
             }
-            RelayAvailability::ActivationRequired if !requires_dsr => {
-                let relay_code = census
-                    .inactive_relay_codes
-                    .get(system)
-                    .and_then(|codes| codes.first())
-                    .cloned()
-                    .ok_or_else(|| {
-                        app_error(
-                            io::ErrorKind::NotFound,
-                            format!("inactive relay selected at {system} but no device was found"),
-                        )
-                    })?;
-                let relay = census.devices.get(&relay_code).ok_or_else(|| {
-                    app_error(
-                        io::ErrorKind::NotFound,
-                        "selected relay omitted from census",
-                    )
-                })?;
-                let location = device_location(relay).ok_or_else(|| {
-                    app_error(
-                        io::ErrorKind::InvalidData,
-                        format!("inactive relay {relay_code} has no location"),
-                    )
-                })?;
-                stops.push(RelayStop {
-                    system: system.clone(),
-                    location: location.to_owned(),
-                    parent_system,
-                    action: StopAction::ActivateExisting,
-                    device_type: device_type(relay).unwrap_or(FTL_RELAY).to_owned(),
-                    relay_code: Some(relay_code),
-                    completed: false,
-                });
-            }
-            RelayAvailability::ActivationRequired | RelayAvailability::New => {
-                let location = choose_l4_location(client, node).await?;
-                let planned_type = if requires_dsr {
-                    DEEP_SPACE_RELAY
-                } else {
-                    FTL_RELAY
-                };
-                let relay_code = match planned_type {
-                    FTL_RELAY => hub_stock.pop(),
-                    DEEP_SPACE_RELAY => hub_stock_dsr.pop(),
-                    _ => None,
+        } else {
+            match node.relay {
+                RelayAvailability::ActivationRequired => {
+                    let relay_code = census
+                        .inactive_relay_codes
+                        .get(system)
+                        .and_then(|codes| codes.first())
+                        .cloned()
+                        .ok_or_else(|| {
+                            app_error(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "inactive relay selected at {system} but no device was found"
+                                ),
+                            )
+                        })?;
+                    scheduled_existing.insert(relay_code.clone());
+                    stops.push(existing_relay_activation_stop(
+                        &census,
+                        system,
+                        &parent_system,
+                        relay_code,
+                    )?);
                 }
-                .inspect(|code| {
-                    used_hub_stock.push(code.clone());
-                });
-                if relay_code.is_none() {
-                    let mission_tag = relay_mission_tag(&mission_id);
-                    let site_tag = relay_site_tag(system);
-                    print_jobs.push(PrintJob {
+                RelayAvailability::New => {
+                    let location = choose_l4_location(client, node).await?;
+                    let relay_code = hub_stock.pop().inspect(|code| {
+                        used_hub_stock.push(code.clone());
+                    });
+                    if relay_code.is_none() {
+                        let site_tag = relay_site_tag(system);
+                        print_jobs.push(PrintJob {
+                            system: system.clone(),
+                            device_type: FTL_RELAY.to_owned(),
+                            factory_code: String::new(),
+                            mission_tag: mission_tag.clone(),
+                            site_tag,
+                            batch_tag: None,
+                            flatpack: false,
+                            submission_started: false,
+                            operation_id: None,
+                            submitted: false,
+                            relay_code: None,
+                        });
+                    }
+                    stops.push(RelayStop {
                         system: system.clone(),
-                        device_type: planned_type.to_owned(),
-                        factory_code: String::new(),
-                        mission_tag,
-                        site_tag,
-                        batch_tag: None,
-                        flatpack: planned_type == DEEP_SPACE_RELAY,
-                        submission_started: false,
-                        operation_id: None,
-                        submitted: false,
-                        relay_code: None,
+                        location,
+                        parent_system: parent_system.clone(),
+                        action: StopAction::DeployAndActivate,
+                        device_type: FTL_RELAY.to_owned(),
+                        relay_code,
+                        completed: false,
                     });
                 }
-                stops.push(RelayStop {
-                    system: system.clone(),
-                    location,
-                    parent_system,
-                    action: StopAction::DeployAndActivate,
-                    device_type: planned_type.to_owned(),
-                    relay_code,
-                    completed: false,
-                });
+                RelayAvailability::Active => {
+                    if let Some(relay_code) = recoverable_dsr {
+                        info!(
+                            system = %system,
+                            relay = %relay_code,
+                            "repairing deployed inactive Deep Space Relay Station during expansion"
+                        );
+                        scheduled_existing.insert(relay_code.clone());
+                        stops.push(existing_relay_activation_stop(
+                            &census,
+                            system,
+                            &parent_system,
+                            relay_code,
+                        )?);
+                    }
+                }
             }
-            RelayAvailability::Active => {}
+        }
+
+        // If several deployed DSRs in one selected network system are folded
+        // up, restore all of them. One may already be the primary relay stop
+        // above; the remainder are explicit repair stops and require no cargo.
+        if let Some(compacted_codes) = census.compacted_dsr_codes.get(system) {
+            for relay_code in compacted_codes {
+                if scheduled_existing.contains(relay_code) {
+                    continue;
+                }
+                info!(
+                    system = %system,
+                    relay = %relay_code,
+                    "adding repair stop for deployed compacted Deep Space Relay Station"
+                );
+                stops.push(existing_relay_activation_stop(
+                    &census,
+                    system,
+                    &parent_system,
+                    relay_code.clone(),
+                )?);
+            }
         }
     }
 
@@ -1345,6 +1448,7 @@ async fn create_plan(
     Ok(MissionPlan {
         version: PLAN_VERSION,
         mission_id,
+        legacy_mission_tags: Vec::new(),
         replicant_code: replicant_code.to_owned(),
         vessel_code: vessel_code.to_owned(),
         hub_location: config.hub.clone(),
@@ -1828,16 +1932,22 @@ async fn choose_l4_location(client: &Client, node: &NetworkNode) -> AnyResult<St
     {
         return Ok(entry_point.to_owned());
     }
-    locations
+    if let Some(location) = locations
         .iter()
         .find(|location| location.key.id.as_str().ends_with("-L5"))
-        .map(|location| location.key.id.as_str().to_owned())
-        .ok_or_else(|| {
-            app_error(
-                io::ErrorKind::NotFound,
-                format!("{} has no known L4 or L5 deployment location", node.system),
-            )
-        })
+    {
+        return Ok(location.key.id.as_str().to_owned());
+    }
+
+    // Newly discovered catalogue stars can legitimately have no projected
+    // locations or entry point yet. Travelling to the system designation lets
+    // the server select its default arrival zone (typically Oort/Kuiper), from
+    // which the relay can be deployed and the system can be explored.
+    warn!(
+        system = %node.system,
+        "relay target has no known L4/L5; using system-level arrival fallback"
+    );
+    Ok(node.system.clone())
 }
 
 async fn refresh_device_census(
@@ -1871,6 +1981,8 @@ async fn refresh_device_census(
 
     let mut active_relay_codes = BTreeMap::<String, Vec<String>>::new();
     let mut inactive_relay_codes = BTreeMap::<String, Vec<String>>::new();
+    let mut recoverable_dsr_codes = BTreeMap::<String, Vec<String>>::new();
+    let mut compacted_dsr_codes = BTreeMap::<String, Vec<String>>::new();
     let mut relay_range_devices = Vec::<(String, String, String)>::new();
     let mut relay_code_ranges_ly = BTreeMap::<String, f64>::new();
     let mut hub_stock = Vec::new();
@@ -1910,26 +2022,35 @@ async fn refresh_device_census(
             || kind == Some(SYSTEM_HUB)
             || kind == Some(DEEP_SPACE_RELAY);
         if relay_capable {
-            let Some(location) = device_location(device) else {
-                continue;
-            };
             let stowed_in_transport = device
                 .relationships
                 .stowed_in
                 .as_ref()
                 .is_some_and(|container| container.id.as_str() == vessel_code);
 
+            // Relays already aboard the selected transport remain usable
+            // mission stock even though a stowed device deliberately has no
+            // direct location. Count them before requiring `device.location`;
+            // otherwise a full vessel carrying exactly the relays it needs is
+            // incorrectly reported as having zero usable stow capacity.
+            if kind == Some(FTL_RELAY) && stowed_in_transport {
+                hub_stock.push(code.clone());
+                continue;
+            }
+
+            let Some(location) = device_location(device) else {
+                continue;
+            };
+
             // Free ordinary relays and DSRs at the manufacturing hub are
             // fungible stock for expansion. System Hubs remain fixed network
             // infrastructure and are never silently repurposed as cargo.
             if (kind == Some(FTL_RELAY) || kind == Some(DEEP_SPACE_RELAY))
                 && location == hub
-                && (device.relationships.stowed_in.is_none() || stowed_in_transport)
+                && device.relationships.stowed_in.is_none()
                 && device.relationships.attached_to.is_none()
                 && !relay_device_active(device)
-                && (kind == Some(DEEP_SPACE_RELAY)
-                    || stowed_in_transport
-                    || device_has_command(device, "stow"))
+                && (kind == Some(DEEP_SPACE_RELAY) || device_has_command(device, "stow"))
             {
                 if kind == Some(DEEP_SPACE_RELAY) {
                     hub_stock_dsr.push(code.clone());
@@ -1946,13 +2067,27 @@ async fn refresh_device_census(
             let Some(system) = resolve_system(location, systems) else {
                 continue;
             };
+            let recoverable_dsr = kind == Some(DEEP_SPACE_RELAY)
+                && relay_device_recoverable(device);
+            if recoverable_dsr {
+                recoverable_dsr_codes
+                    .entry(system.clone())
+                    .or_default()
+                    .push(code.clone());
+                if relay_device_needs_unfurl(device) {
+                    compacted_dsr_codes
+                        .entry(system.clone())
+                        .or_default()
+                        .push(code.clone());
+                }
+            }
             let usable = if relay_device_active(device) {
                 active_relay_codes
                     .entry(system.clone())
                     .or_default()
                     .push(code.clone());
                 true
-            } else if device_has_command(device, "activate") {
+            } else if device_has_command(device, "activate") || recoverable_dsr {
                 inactive_relay_codes
                     .entry(system.clone())
                     .or_default()
@@ -2014,7 +2149,7 @@ async fn refresh_device_census(
     for codes in active_relay_codes.values_mut() {
         codes.sort();
     }
-    for (system, codes) in &mut inactive_relay_codes {
+    for codes in inactive_relay_codes.values_mut() {
         // If activation is required, prefer the device with the greatest known
         // relay range so the executed stop matches the range the planner may
         // rely on. Ordinary FTL relays have no override and therefore sort
@@ -2026,16 +2161,19 @@ async fn refresh_device_census(
                 .total_cmp(&left_range)
                 .then_with(|| left.cmp(right))
         });
-        if active_relay_codes.contains_key(system) {
-            codes.clear();
-        }
     }
-    inactive_relay_codes.retain(|_, codes| !codes.is_empty());
+    for codes in recoverable_dsr_codes.values_mut() {
+        codes.sort();
+    }
+    for codes in compacted_dsr_codes.values_mut() {
+        codes.sort();
+    }
 
-    // A system's extended planning range must be backed by the device that is
-    // actually usable at execution time. If the system already has active
-    // coverage, only active devices contribute. If it has no active coverage,
-    // the longest-range inactive device is the one selected for activation.
+    // A system's extended planning range must be backed by a device that is
+    // actually usable at execution time. A recoverable deployed DSR counts
+    // here even when an ordinary relay is already active in the same system,
+    // because create_plan schedules that DSR for unfurl/activation before its
+    // extended range can be relied upon by downstream stops.
     let mut relay_ranges_ly = BTreeMap::<String, f64>::new();
     for (system, codes) in &active_relay_codes {
         if let Some(range_ly) = codes
@@ -2047,12 +2185,34 @@ async fn refresh_device_census(
         }
     }
     for (system, codes) in &inactive_relay_codes {
+        if active_relay_codes.contains_key(system) {
+            continue;
+        }
         if let Some(range_ly) = codes
             .iter()
             .filter_map(|code| relay_code_ranges_ly.get(code).copied())
             .max_by(f64::total_cmp)
         {
             relay_ranges_ly.insert(system.clone(), range_ly);
+        }
+    }
+    for (system, codes) in &recoverable_dsr_codes {
+        // The starting system must already have live coverage before a mission
+        // can execute. Do not let a folded-up DSR there silently extend the
+        // root range because start-system repair cannot be topology-verified
+        // until another network node exists.
+        if system == &hub_system {
+            continue;
+        }
+        if let Some(range_ly) = codes
+            .iter()
+            .filter_map(|code| relay_code_ranges_ly.get(code).copied())
+            .max_by(f64::total_cmp)
+        {
+            relay_ranges_ly
+                .entry(system.clone())
+                .and_modify(|existing| *existing = existing.max(range_ly))
+                .or_insert(range_ly);
         }
     }
     hub_stock.sort();
@@ -2068,6 +2228,8 @@ async fn refresh_device_census(
         devices,
         active_relay_codes,
         inactive_relay_codes,
+        recoverable_dsr_codes,
+        compacted_dsr_codes,
         relay_ranges_ly,
         hub_stock,
         hub_stock_dsr,
@@ -2350,11 +2512,96 @@ fn stable_tag_hash(value: &str) -> u64 {
         })
 }
 
-fn relay_mission_tag(mission_id: &str) -> String {
+/// Returns the stable relay reservation tag for a start/hub system.
+pub(crate) fn relay_system_mission_tag(system: &str) -> String {
+    bounded_relay_tag(RELAY_MISSION_TAG_PREFIX, system)
+}
+
+fn legacy_relay_mission_tag(mission_id: &str) -> String {
     format!(
         "{RELAY_MISSION_TAG_PREFIX}{:016x}",
         stable_tag_hash(mission_id)
     )
+}
+
+fn bounded_relay_tag(prefix: &str, value: &str) -> String {
+    const HASH_CHARS: usize = 12;
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-');
+    let direct = format!("{prefix}{normalized}");
+    if direct.chars().count() <= MAX_DEVICE_TAG_CHARS {
+        return direct;
+    }
+
+    let fixed = prefix.chars().count() + 1 + HASH_CHARS;
+    let head_budget = MAX_DEVICE_TAG_CHARS.saturating_sub(fixed).max(1);
+    let mut head = normalized.chars().take(head_budget).collect::<String>();
+    head = head.trim_end_matches('-').to_owned();
+    if head.is_empty() {
+        head.push('s');
+    }
+    let hash = stable_tag_hash(normalized) & 0x0000_ffff_ffff_ffff;
+    format!("{prefix}{head}-{hash:012x}")
+}
+
+/// Returns whether a relay mission tag uses the old 16-hex hash identity.
+pub(crate) fn is_opaque_relay_mission_tag(tag: &str) -> bool {
+    tag.strip_prefix(RELAY_MISSION_TAG_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn migrate_relay_mission_tag_metadata(plan: &mut MissionPlan) -> bool {
+    let desired = relay_system_mission_tag(&plan.start_system);
+    let discovered_legacy = plan
+        .print_jobs
+        .iter()
+        .map(|job| job.mission_tag.clone())
+        .filter(|tag| tag != &desired && tag.starts_with(RELAY_MISSION_TAG_PREFIX))
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for tag in discovered_legacy {
+        if !plan.legacy_mission_tags.contains(&tag) {
+            plan.legacy_mission_tags.push(tag);
+            changed = true;
+        }
+    }
+    let historical = legacy_relay_mission_tag(&plan.mission_id);
+    if historical != desired && !plan.legacy_mission_tags.contains(&historical) {
+        // Only retain the computed historical alias when this is a legacy plan.
+        // New plans already create every print job with the readable system tag.
+        if plan
+            .print_jobs
+            .iter()
+            .any(|job| job.mission_tag == historical)
+        {
+            plan.legacy_mission_tags.push(historical);
+            changed = true;
+        }
+    }
+    let before = plan.legacy_mission_tags.len();
+    plan
+        .legacy_mission_tags
+        .retain(|tag| tag.starts_with(RELAY_MISSION_TAG_PREFIX) && tag != &desired);
+    plan.legacy_mission_tags.sort();
+    plan.legacy_mission_tags.dedup();
+    changed || plan.legacy_mission_tags.len() != before
+}
+
+fn relay_mission_tag_aliases(plan: &MissionPlan) -> Vec<String> {
+    std::iter::once(relay_system_mission_tag(&plan.start_system))
+        .chain(plan.legacy_mission_tags.iter().cloned())
+        .collect()
 }
 
 fn relay_site_tag(system: &str) -> String {
@@ -2473,7 +2720,8 @@ fn pending_print_groups(jobs: &[PrintJob], factory_code: &str) -> Vec<Vec<usize>
 
 fn normalize_print_job_tags(plan: &mut MissionPlan) -> AnyResult<()> {
     normalize_relay_print_jobs(&mut plan.print_jobs);
-    let mission_tag = relay_mission_tag(&plan.mission_id);
+    migrate_relay_mission_tag_metadata(plan);
+    let mission_tag = relay_system_mission_tag(&plan.start_system);
     let mut site_tags = BTreeMap::<String, String>::new();
     let mut batch_factories = BTreeMap::<String, String>::new();
     for job in &mut plan.print_jobs {
@@ -2634,10 +2882,58 @@ async fn reconcile_supply_plan(client: &Client, plan: &mut MissionPlan) -> AnyRe
     Ok(())
 }
 
+async fn migrate_legacy_relay_devices(
+    client: &Client,
+    plan: &MissionPlan,
+) -> AnyResult<usize> {
+    if plan.legacy_mission_tags.is_empty() {
+        return Ok(0);
+    }
+    let desired = relay_system_mission_tag(&plan.start_system);
+    let handles = client.devices().refresh_many().page_size(50).collect().await?;
+    let mut migrated = 0usize;
+    for handle in handles {
+        let snapshot = handle.snapshot().await?;
+        let removable = snapshot
+            .tags
+            .iter()
+            .filter(|tag| {
+                plan.legacy_mission_tags.contains(*tag)
+                    && is_opaque_relay_mission_tag(tag)
+                    && *tag != &desired
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            continue;
+        }
+        let add_tags = (!snapshot.tags.contains(&desired)).then_some(vec![desired.clone()]);
+        let operation = handle
+            .configure(raw::devices::DeviceConfiguration {
+                add_tags,
+                remove_tags: Some(removable.clone()),
+                tags: None,
+                ..Default::default()
+            })
+            .await?;
+        ensure_operation_accepted(&operation).await?;
+        migrated += 1;
+        info!(
+            device = %handle.id().as_str(),
+            new_tag = %desired,
+            old_tags = ?removable,
+            "migrated legacy relay mission tag"
+        );
+    }
+    Ok(migrated)
+}
+
 async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()> {
     normalize_print_job_tags(plan)?;
+    migrate_legacy_relay_devices(client, plan).await?;
     ensure_planned_active_coverage(client, plan).await?;
-    let mission_tag = relay_mission_tag(&plan.mission_id);
+    let mission_tag = relay_system_mission_tag(&plan.start_system);
+    let mission_tag_aliases = relay_mission_tag_aliases(plan);
     let site_tag_systems = plan
         .print_jobs
         .iter()
@@ -2773,7 +3069,7 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
             .get(&plan.print_jobs[index].factory_code)
             .is_some_and(|jobs| {
                 jobs.iter().any(|tags| {
-                    tags.contains(&plan.print_jobs[index].mission_tag)
+                    mission_tag_aliases.iter().any(|tag| tags.contains(tag))
                         && tags.contains(correlation_tag)
                 })
             });
@@ -3080,13 +3376,14 @@ fn carrier_all_assigned_relay_codes(plan: &MissionPlan, carrier_code: &str) -> B
 }
 
 async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -> AnyResult<()> {
-    let mission_tag = relay_mission_tag(&plan.mission_id);
+    let mission_tag = relay_system_mission_tag(&plan.start_system);
+    let aliases = relay_mission_tag_aliases(plan);
     let handle = client.devices().get(code).await?;
     let snapshot = handle.snapshot().await?;
     let conflicting = snapshot
         .tags
         .iter()
-        .filter(|tag| tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str()))
+        .filter(|tag| !aliases.contains(*tag) && workflow_tag_reserved(tag.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if !conflicting.is_empty() {
@@ -3113,14 +3410,20 @@ async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -
 }
 
 async fn release_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -> AnyResult<()> {
-    let mission_tag = relay_mission_tag(&plan.mission_id);
+    let aliases = relay_mission_tag_aliases(plan);
     let handle = client.devices().get(code).await?;
     let snapshot = handle.snapshot().await?;
-    if snapshot.tags.iter().any(|tag| tag == &mission_tag) {
+    let removable = snapshot
+        .tags
+        .iter()
+        .filter(|tag| aliases.contains(*tag))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !removable.is_empty() {
         let operation = handle
             .configure(raw::devices::DeviceConfiguration {
                 add_tags: None,
-                remove_tags: Some(vec![mission_tag]),
+                remove_tags: Some(removable),
                 tags: None,
                 ..Default::default()
             })
@@ -3149,7 +3452,7 @@ async fn ensure_dsr_carrier_assignment(
         return Ok(());
     }
 
-    let mission_tag = relay_mission_tag(&plan.mission_id);
+    let mission_tag_aliases = relay_mission_tag_aliases(plan);
     let supply_codes = plan
         .supply
         .iter()
@@ -3166,7 +3469,7 @@ async fn ensure_dsr_carrier_assignment(
         let conflicting = snapshot
             .tags
             .iter()
-            .any(|tag| tag.as_str() != mission_tag.as_str() && workflow_tag_reserved(tag.as_str()));
+            .any(|tag| !mission_tag_aliases.contains(tag) && workflow_tag_reserved(tag.as_str()));
         if conflicting
             || snapshot.attach_capacity.unwrap_or(0) <= 0
             || snapshot.travel.is_some()
@@ -3445,8 +3748,15 @@ async fn finish_dsr_carrier(client: &Client, config: &Config, plan: &MissionPlan
     release_carrier_claim(client, plan, carrier_code).await
 }
 
+fn relay_destination_matches(actual: &str, destination: &str) -> bool {
+    actual.eq_ignore_ascii_case(destination)
+        || (!destination.contains('-') && designation_in_system(actual, destination))
+}
+
 fn device_at(device: &Device, destination: &str) -> bool {
-    device.travel.is_none() && device_location(device) == Some(destination)
+    device.travel.is_none()
+        && device_location(device)
+            .is_some_and(|actual| relay_destination_matches(actual, destination))
 }
 
 fn travel_destination(device: &Device) -> Option<&str> {
@@ -3466,7 +3776,9 @@ async fn start_device_travel(client: &Client, code: &str, destination: &str) -> 
         return Ok(());
     }
     if snapshot.travel.is_some() {
-        if travel_destination(&snapshot) == Some(destination) {
+        if travel_destination(&snapshot)
+            .is_some_and(|planned| relay_destination_matches(planned, destination))
+        {
             return Ok(());
         }
         return Err(app_error(
@@ -3499,7 +3811,10 @@ async fn wait_device_at_location(
     if device_at(&snapshot, destination) {
         return Ok(());
     }
-    if snapshot.travel.is_some() && travel_destination(&snapshot) != Some(destination) {
+    if snapshot.travel.is_some()
+        && !travel_destination(&snapshot)
+            .is_some_and(|planned| relay_destination_matches(planned, destination))
+    {
         return Err(app_error(
             io::ErrorKind::Other,
             format!(
@@ -3521,7 +3836,9 @@ async fn wait_device_at_location(
         match timeout(remaining.min(Duration::from_secs(60)), watch.next()).await {
             Ok(Some(device)) if device_at(&device, destination) => return Ok(()),
             Ok(Some(device))
-                if device.travel.is_some() && travel_destination(&device) != Some(destination) =>
+                if device.travel.is_some()
+                    && !travel_destination(&device)
+                        .is_some_and(|planned| relay_destination_matches(planned, destination)) =>
             {
                 return Err(app_error(
                     io::ErrorKind::Other,
@@ -4695,7 +5012,7 @@ async fn prepare_relay_print_prerequisites(
 
     let prerequisite_tag = relay_prerequisite_tag(&plan.mission_id);
     let mut options = QueueOptions::at(plan.hub_location.clone());
-    options.tags = vec![relay_mission_tag(&plan.mission_id), prerequisite_tag];
+    options.tags = vec![relay_system_mission_tag(&plan.start_system), prerequisite_tag];
     options.poll_interval = POLL_INTERVAL;
     options.wait_timeout = config.wait_timeout;
     options.factory_codes = Some(factory_codes);
@@ -4978,10 +5295,9 @@ async fn travel_to(
         .as_ref()
         .map(|location| location.id.as_str().to_owned());
     if snapshot.travel.is_none()
-        && snapshot
-            .location
-            .as_ref()
-            .is_some_and(|location| location.id.as_str() == destination)
+        && snapshot.location.as_ref().is_some_and(|location| {
+            relay_destination_matches(location.id.as_str(), destination)
+        })
     {
         return Ok(());
     }
@@ -4991,14 +5307,15 @@ async fn travel_to(
             .as_ref()
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
-        if planned_destination != Some(destination) {
-            return Err(app_error(
-                io::ErrorKind::Other,
-                format!(
-                    "replicant {replicant_code} is already traveling to {:?}, not {destination}",
-                    planned_destination
-                ),
-            ));
+        if !planned_destination
+            .is_some_and(|planned| relay_destination_matches(planned, destination))
+        {
+            info!(
+                replicant = %replicant_code,
+                in_flight_destination = ?planned_destination,
+                requested_destination = %destination,
+                "replicant is already in flight; waiting for that travel to finish before continuing relay route"
+            );
         }
     } else {
         info!(
@@ -5018,7 +5335,9 @@ async fn travel_to(
             .location
             .as_ref()
             .map(|location| location.id.as_str());
-        if snapshot.travel.is_none() && location == Some(destination) {
+        if snapshot.travel.is_none()
+            && location.is_some_and(|actual| relay_destination_matches(actual, destination))
+        {
             info!(
                 replicant = %replicant_code,
                 destination = %destination,
@@ -5413,6 +5732,7 @@ fn validate_loaded_plan(
 fn load_plan(path: &Path) -> AnyResult<MissionPlan> {
     let mut plan: MissionPlan = serde_json::from_reader(File::open(path)?)?;
     normalize_relay_print_jobs(&mut plan.print_jobs);
+    migrate_relay_mission_tag_metadata(&mut plan);
     Ok(plan)
 }
 
@@ -5659,8 +5979,28 @@ fn device_has_feature(device: &Device, feature: &str) -> bool {
 }
 
 fn relay_device_active(device: &Device) -> bool {
+    // `deactivate` is advertised by inactive, compacted, travelling, and even
+    // stowed relay-capable devices, so command availability is not evidence of
+    // live network participation. Only an explicitly active status may
+    // contribute coverage.
     device_status(device).is_some_and(|status| status == RELAYING || status == "active")
-        || device_has_command(device, "deactivate")
+}
+
+fn relay_device_needs_unfurl(device: &Device) -> bool {
+    device_type(device) == Some(DEEP_SPACE_RELAY)
+        && device_status(device)
+            .is_some_and(|status| matches!(status, "compacting" | "compacted" | "unfurling"))
+}
+
+fn relay_device_recoverable(device: &Device) -> bool {
+    if device_type(device) != Some(DEEP_SPACE_RELAY) || relay_device_active(device) {
+        return false;
+    }
+    match device_status(device) {
+        Some("compacted") => device_has_command(device, "unfurl"),
+        Some("compacting") | Some("unfurling") => true,
+        _ => device_has_command(device, "activate"),
+    }
 }
 
 fn documented_relay_range_ly(device_type: &str) -> Option<f64> {
@@ -5875,6 +6215,9 @@ pub struct RelayExpansionRequest {
     pub max_hop_ly: f64,
     /// Maximum wait for printing, travel, or activation evidence.
     pub wait_timeout: Duration,
+    /// Autofactories reserved by other workflows and unavailable for new print work.
+    #[serde(default)]
+    pub unavailable_autofactories: BTreeSet<String>,
 }
 
 /// Parses the existing relay CLI contract into a daemon workflow request.
@@ -5893,6 +6236,7 @@ pub fn relay_workflow_request(arguments: Vec<String>) -> AnyResult<RelayExpansio
         mission_file: config.plan_path,
         max_hop_ly: config.max_hop_ly,
         wait_timeout: config.wait_timeout,
+        unavailable_autofactories: BTreeSet::new(),
     })
 }
 
@@ -5937,7 +6281,7 @@ pub async fn execute_expansion(
         max_hop_ly: request.max_hop_ly,
         replace_plan: false,
         reuse_account_relays: false,
-        ignore_printers: BTreeSet::new(),
+        ignore_printers: request.unavailable_autofactories.clone(),
         supply_strategy: RequestedSupplyStrategy::Auto,
         wait_timeout: request.wait_timeout,
         targets: request
@@ -5990,6 +6334,79 @@ pub fn restore_relay_checkpoint(path: &Path, checkpoint: &RelayExecutionState) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_relay_device(device_type_name: &str, status: &str, commands: &[&str]) -> Device {
+        Device {
+            key: replicant_client::domain::DeviceKey::live(
+                replicant_client::domain::DeviceId::from("RELAY-TEST"),
+            ),
+            device_type: Some(DeviceType::from(device_type_name)),
+            status: Some(replicant_client::domain::DeviceStatus::from(status)),
+            location: Some(replicant_client::domain::LocationKey::live(
+                "ANTAR-1-L4".into(),
+            )),
+            features: Vec::new(),
+            available_commands: commands
+                .iter()
+                .map(|command| replicant_client::domain::DeviceCommand::from(*command))
+                .collect(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: replicant_client::domain::DeviceRelationships::default(),
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: None,
+            access: replicant_client::domain::AccessScope::Owned,
+        }
+    }
+
+    #[test]
+    fn system_level_relay_destination_accepts_server_selected_arrival_zone() {
+        assert!(relay_destination_matches("LYRDANIA-OORT", "LYRDANIA"));
+        assert!(relay_destination_matches("LYRDANIA-KUIPER", "LYRDANIA"));
+        assert!(relay_destination_matches("LYRDANIA-2-L4", "LYRDANIA"));
+        assert!(relay_destination_matches("LYRDANIA-2-L4", "LYRDANIA-2-L4"));
+        assert!(!relay_destination_matches("OTHER-2-L4", "LYRDANIA"));
+        assert!(!relay_destination_matches("LYRDANIA-2-L5", "LYRDANIA-2-L4"));
+    }
+
+    #[test]
+    fn compacted_dsr_is_recoverable_when_it_can_unfurl() {
+        let device = test_relay_device(DEEP_SPACE_RELAY, "compacted", &["unfurl"]);
+
+        assert!(relay_device_needs_unfurl(&device));
+        assert!(relay_device_recoverable(&device));
+    }
+
+    #[test]
+    fn compacted_dsr_without_unfurl_is_not_planned_as_recoverable() {
+        let device = test_relay_device(DEEP_SPACE_RELAY, "compacted", &[]);
+
+        assert!(relay_device_needs_unfurl(&device));
+        assert!(!relay_device_recoverable(&device));
+    }
+
+    #[test]
+    fn inactive_deployed_dsr_is_reusable_without_compaction_repair() {
+        let device = test_relay_device(DEEP_SPACE_RELAY, "inactive", &["activate"]);
+
+        assert!(!relay_device_needs_unfurl(&device));
+        assert!(relay_device_recoverable(&device));
+    }
+
+    #[test]
+    fn compacted_ordinary_relay_is_not_mistaken_for_recoverable_dsr() {
+        let device = test_relay_device(FTL_RELAY, "compacted", &["unfurl"]);
+
+        assert!(!relay_device_needs_unfurl(&device));
+        assert!(!relay_device_recoverable(&device));
+    }
 
     fn execution_state() -> RelayExecutionState {
         serde_json::from_value(serde_json::json!({
@@ -6242,6 +6659,15 @@ mod tests {
         assert_eq!(restored.status(), restored.status());
     }
 
+    #[test]
+    fn resource_factories_are_held_only_while_print_work_is_pending() {
+        let mut state = execution_state();
+        assert_eq!(state.resources().2, vec!["FACTORY-1"]);
+
+        state.print_jobs[0].relay_code = Some("RELAY-1".to_owned());
+        assert!(state.resources().2.is_empty());
+    }
+
     fn print_job(system: &str, factory: &str, batch_tag: Option<&str>) -> PrintJob {
         PrintJob {
             system: system.to_owned(),
@@ -6442,7 +6868,7 @@ mod tests {
 
     #[test]
     fn generated_relay_tags_fit_the_api_limit() {
-        let mission = relay_mission_tag("scepturum-12345678-1234-1234-1234-123456789abc");
+        let mission = relay_system_mission_tag("SCEPTURUM");
         let direct_site = relay_site_tag("XHAKKWUKKXHU");
         let shortened_site =
             relay_site_tag("A-SYSTEM-DESIGNATION-THAT-IS-LONGER-THAN-THE-TAG-LIMIT");
@@ -6451,6 +6877,7 @@ mod tests {
         for tag in [&mission, &direct_site, &shortened_site, &batch] {
             assert!(tag.chars().count() <= MAX_DEVICE_TAG_CHARS, "{tag}");
         }
+        assert_eq!(mission, "relay-m:scepturum");
         assert_eq!(direct_site, "relay-s:XHAKKWUKKXHU");
         assert_ne!(
             shortened_site,

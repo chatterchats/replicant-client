@@ -1,6 +1,7 @@
 import {
   parseActivityResponse,
   parseAutofactoryResponse,
+  parseBillFinderResponse,
   parseBlueprintsResponse,
   parseBobnetResponse,
   parseAutomationControlResponse,
@@ -42,6 +43,7 @@ import {
 } from "./protocol";
 import type {
   AutomationControlAction,
+  BillFinderRequest,
   DirectorGoalKind,
   DirectorMode,
   TriggerRequest,
@@ -310,6 +312,10 @@ export const daemonApi = {
   },
   async trade(signal?: AbortSignal) {
     return parseTradeResponse(await get("/api/trade", signal)).payload;
+  },
+  async findBill(request: BillFinderRequest) {
+    return parseBillFinderResponse(await post("/api/trade/bill/find", request))
+      .payload;
   },
   async reports(signal?: AbortSignal) {
     return parseReportsResponse(await get("/api/reports", signal)).payload;

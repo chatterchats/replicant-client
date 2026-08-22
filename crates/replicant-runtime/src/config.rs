@@ -8,7 +8,9 @@ use std::{
     sync::Arc,
 };
 
-use replicant_client::{SecretString, StartupPolicy, raw::ApiTelemetrySink};
+use replicant_client::{
+    SecretString, StartupPolicy, managed::EventTelemetrySink, raw::ApiTelemetrySink,
+};
 use replicant_protocol::ApiTokenSource;
 
 /// Environment variable containing the Replicant Space API token.
@@ -67,6 +69,15 @@ pub struct ManagedClientConfig {
     database: PathBuf,
     startup_policy: StartupPolicy,
     api_telemetry_sink: Option<Arc<dyn ApiTelemetrySink>>,
+    event_telemetry_sink: Option<Arc<dyn EventTelemetrySink>>,
+}
+
+pub(crate) struct ManagedClientParts {
+    pub(crate) authentication_token: SecretString,
+    pub(crate) database: PathBuf,
+    pub(crate) startup_policy: StartupPolicy,
+    pub(crate) api_telemetry_sink: Option<Arc<dyn ApiTelemetrySink>>,
+    pub(crate) event_telemetry_sink: Option<Arc<dyn EventTelemetrySink>>,
 }
 
 impl ManagedClientConfig {
@@ -108,6 +119,7 @@ impl ManagedClientConfig {
             database: database.into(),
             startup_policy: StartupPolicy::Essential,
             api_telemetry_sink: None,
+            event_telemetry_sink: None,
         })
     }
 
@@ -125,6 +137,13 @@ impl ManagedClientConfig {
         self
     }
 
+    /// Installs a non-blocking destination for managed event/SSE telemetry.
+    #[must_use]
+    pub fn with_event_telemetry_sink(mut self, sink: Arc<dyn EventTelemetrySink>) -> Self {
+        self.event_telemetry_sink = Some(sink);
+        self
+    }
+
     /// Returns the managed SQLite database path.
     #[must_use]
     pub fn database(&self) -> &Path {
@@ -137,20 +156,14 @@ impl ManagedClientConfig {
         self.startup_policy
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        SecretString,
-        PathBuf,
-        StartupPolicy,
-        Option<Arc<dyn ApiTelemetrySink>>,
-    ) {
-        (
-            self.authentication_token,
-            self.database,
-            self.startup_policy,
-            self.api_telemetry_sink,
-        )
+    pub(crate) fn into_parts(self) -> ManagedClientParts {
+        ManagedClientParts {
+            authentication_token: self.authentication_token,
+            database: self.database,
+            startup_policy: self.startup_policy,
+            api_telemetry_sink: self.api_telemetry_sink,
+            event_telemetry_sink: self.event_telemetry_sink,
+        }
     }
 }
 
@@ -162,6 +175,7 @@ impl fmt::Debug for ManagedClientConfig {
             .field("database", &self.database)
             .field("startup_policy", &self.startup_policy)
             .field("api_telemetry", &self.api_telemetry_sink.is_some())
+            .field("event_telemetry", &self.event_telemetry_sink.is_some())
             .finish()
     }
 }

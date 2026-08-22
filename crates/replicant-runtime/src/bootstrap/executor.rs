@@ -157,6 +157,8 @@ pub async fn execute(
         return Ok(());
     }
     client.ready().await?;
+    migrate_legacy_mission_devices(client, mission).await?;
+    save_mission(&config.mission_file, mission)?;
     let sync = client.sync().domain(SyncDomain::Replicants).await?;
     info!(readiness=?sync.readiness, phase=?mission.phase, "refreshed owned replicants for bootstrap execution");
     client.galaxy().refresh_catalogue().await?;
@@ -192,6 +194,8 @@ pub async fn deliver(
         return Ok(());
     }
     client.ready().await?;
+    migrate_legacy_mission_devices(client, mission).await?;
+    save_mission(&config.mission_file, mission)?;
     let sync = client.sync().domain(SyncDomain::Replicants).await?;
     info!(readiness=?sync.readiness, phase=?mission.phase, "refreshed owned replicants for landing delivery");
     client.galaxy().refresh_catalogue().await?;
@@ -228,6 +232,8 @@ pub async fn stage(
         ));
     }
     client.ready().await?;
+    migrate_legacy_mission_devices(client, mission).await?;
+    save_mission(&config.mission_file, mission)?;
     info!(readiness=?client.readiness(), phase=?mission.phase, "managed essential startup ready for source staging");
     client.galaxy().refresh_catalogue().await?;
     ensure_source_entry(client, config, mission).await?;
@@ -501,7 +507,7 @@ async fn reconcile_interrupted_print_submission(
     let hub_devices = list_devices(client, Some(&mission.source_hub), None).await?;
     let tagged = hub_devices
         .iter()
-        .filter(|device| device.tags.iter().any(|tag| tag == &mission.mission_tag))
+        .filter(|device| device_has_mission_tag(device, mission))
         .collect::<Vec<_>>();
     let recorded_codes = mission
         .assets
@@ -521,7 +527,7 @@ async fn reconcile_interrupted_print_submission(
             *completed.entry(device_type.clone()).or_default() += 1;
         }
     }
-    let pending = pending_tagged_prints_from_devices(&hub_devices, &mission.mission_tag);
+    let pending = pending_tagged_prints_from_devices(&hub_devices, &mission_tag_aliases(mission));
     let recorded = mission
         .assets
         .iter()
@@ -547,7 +553,7 @@ async fn reconcile_interrupted_print_submission(
 
 fn pending_tagged_prints_from_devices(
     devices: &[raw::devices::DeviceStatus],
-    mission_tag: &str,
+    mission_tags: &[&str],
 ) -> BTreeMap<String, i64> {
     let mut pending = BTreeMap::<String, i64>::new();
     for factory in devices
@@ -555,7 +561,10 @@ fn pending_tagged_prints_from_devices(
         .filter(|device| device.device_type.as_deref() == Some(AUTOFACTORY))
     {
         if let Some(printing) = &factory.printing
-            && printing.tags.iter().any(|tag| tag == mission_tag)
+            && printing
+                .tags
+                .iter()
+                .any(|tag| mission_tags.contains(&tag.as_str()))
             && let Some(device_type) = &printing.device_type
         {
             *pending.entry(device_type.clone()).or_default() += 1;
@@ -564,7 +573,12 @@ fn pending_tagged_prints_from_devices(
             let tagged = job
                 .get("tags")
                 .and_then(Value::as_array)
-                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(mission_tag)));
+                .is_some_and(|tags| {
+                    tags.iter().any(|tag| {
+                        tag.as_str()
+                            .is_some_and(|tag| mission_tags.contains(&tag))
+                    })
+                });
             if !tagged {
                 continue;
             }
@@ -621,12 +635,11 @@ async fn wait_for_printed_assets(
     let deadline = Instant::now() + config.wait_timeout;
     let mut watch = client.events().watch().await?;
     loop {
-        let tagged = list_devices(
-            client,
-            Some(&mission.source_hub),
-            Some(&mission.mission_tag),
-        )
-        .await?;
+        let tagged = list_devices(client, Some(&mission.source_hub), None)
+            .await?
+            .into_iter()
+            .filter(|device| device_has_mission_tag(device, mission))
+            .collect::<Vec<_>>();
         let complete = desired.iter().all(|(device_type, quantity)| {
             let recorded = mission.assets.get(device_type).map_or(0, Vec::len);
             let printed = tagged
@@ -700,8 +713,10 @@ async fn wait_for_printed_assets(
                         .get("tags")
                         .and_then(serde_json::Value::as_array)
                         .is_some_and(|tags| {
-                            tags.iter()
-                                .any(|tag| tag.as_str() == Some(mission.mission_tag.as_str()))
+                            let aliases = mission_tag_aliases(mission);
+                            tags.iter().any(|tag| {
+                                tag.as_str().is_some_and(|tag| aliases.contains(&tag))
+                            })
                         })
                     {
                         break;
@@ -724,12 +739,12 @@ async fn allocate_printed_assets(
     mission: &mut BootstrapMission,
     desired: &BTreeMap<String, i64>,
 ) -> AnyResult<()> {
-    let tagged = list_devices(
-        client,
-        Some(&mission.source_hub),
-        Some(&mission.mission_tag),
-    )
-    .await?;
+    migrate_legacy_mission_devices(client, mission).await?;
+    let tagged = list_devices(client, Some(&mission.source_hub), None)
+        .await?
+        .into_iter()
+        .filter(|device| device_has_mission_tag(device, mission))
+        .collect::<Vec<_>>();
     let mut used = mission
         .assets
         .values()
@@ -901,8 +916,37 @@ async fn load_ark(
 }
 
 fn carrier_replacement_tag(mission_tag: &str) -> String {
+    const PREFIX: &str = "boot-repl:";
+    const MAX_TAG_CHARS: usize = 32;
+    const HASH_CHARS: usize = 12;
+
     let suffix = mission_tag.strip_prefix("boot-m:").unwrap_or(mission_tag);
-    format!("boot-repl:{suffix}")
+    let direct = format!("{PREFIX}{suffix}");
+    if direct.chars().count() <= MAX_TAG_CHARS {
+        return direct;
+    }
+
+    let fixed = PREFIX.chars().count() + 1 + HASH_CHARS;
+    let head_budget = MAX_TAG_CHARS.saturating_sub(fixed).max(1);
+    let mut head = suffix.chars().take(head_budget).collect::<String>();
+    head = head.trim_end_matches('-').to_owned();
+    if head.is_empty() {
+        head.push('s');
+    }
+    let hash = stable_tag_hash(suffix) & 0x0000_ffff_ffff_ffff;
+    format!("{PREFIX}{head}-{hash:012x}")
+}
+
+fn stable_tag_hash(value: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    value
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
 }
 
 async fn queue_borrowed_carrier_replacements(
@@ -921,7 +965,8 @@ async fn queue_borrowed_carrier_replacements(
         .filter(|device| device.device_type.as_deref() == Some(SURGE_CARRIER))
         .filter(|device| device.tags.iter().any(|tag| tag == &replacement_tag))
         .count();
-    let pending = pending_tagged_prints_from_devices(&hub_devices, &replacement_tag)
+    let replacement_tags = [replacement_tag.as_str()];
+    let pending = pending_tagged_prints_from_devices(&hub_devices, &replacement_tags)
         .get(SURGE_CARRIER)
         .copied()
         .unwrap_or(0);
@@ -2315,6 +2360,7 @@ async fn expand_relays(
                 mission_file: mission.children.relays.clone(),
                 max_hop_ly: 7.499,
                 wait_timeout: config.wait_timeout,
+                unavailable_autofactories: Default::default(),
             },
         )
         .await?;
@@ -2459,6 +2505,70 @@ fn eligible_idle(device: &raw::devices::DeviceStatus, mission_tag: &str) -> bool
         && device.status.as_deref().is_none_or(|status| {
             matches!(status, "idle" | "inactive" | "deactivated" | "compacted")
         })
+}
+
+fn mission_tag_aliases(mission: &BootstrapMission) -> Vec<&str> {
+    std::iter::once(mission.mission_tag.as_str())
+        .chain(mission.legacy_mission_tags.iter().map(String::as_str))
+        .collect()
+}
+
+fn device_has_mission_tag(
+    device: &raw::devices::DeviceStatus,
+    mission: &BootstrapMission,
+) -> bool {
+    let aliases = mission_tag_aliases(mission);
+    device.tags.iter().any(|tag| aliases.contains(&tag.as_str()))
+}
+
+async fn migrate_legacy_mission_devices(
+    client: &Client,
+    mission: &BootstrapMission,
+) -> AnyResult<usize> {
+    if mission.legacy_mission_tags.is_empty() {
+        return Ok(0);
+    }
+    let devices = list_devices(client, None, None).await?;
+    let mut migrated = 0usize;
+    for device in devices {
+        let removable = mission
+            .legacy_mission_tags
+            .iter()
+            .filter(|tag| device.tags.contains(*tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            continue;
+        }
+        let Some(code) = device.device_code.as_deref() else {
+            continue;
+        };
+        let add_tags = (!device.tags.contains(&mission.mission_tag))
+            .then_some(vec![mission.mission_tag.clone()]);
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        ensure_operation(
+            &handle
+                .configure(raw::devices::DeviceConfiguration {
+                    add_tags,
+                    remove_tags: Some(removable.clone()),
+                    tags: None,
+                    ..Default::default()
+                })
+                .await?,
+        )
+        .await?;
+        migrated += 1;
+        info!(
+            device = %code,
+            new_tag = %mission.mission_tag,
+            old_tags = ?removable,
+            "migrated legacy bootstrap mission tag"
+        );
+    }
+    Ok(migrated)
 }
 
 async fn ensure_claim(
@@ -3573,6 +3683,18 @@ mod tests {
         assert_eq!(tag, "boot-repl:0123456789abcdef");
         assert!(tag.len() <= 32);
         assert!(!reservation_tag(&tag));
+
+        let long_tag = carrier_replacement_tag(
+            "boot-m:this-is-a-very-long-system-designation-that-needs-bounding",
+        );
+        assert!(long_tag.len() <= 32);
+        assert!(long_tag.starts_with("boot-repl:"));
+        assert_eq!(
+            long_tag,
+            carrier_replacement_tag(
+                "boot-m:this-is-a-very-long-system-designation-that-needs-bounding"
+            )
+        );
     }
 
     #[test]

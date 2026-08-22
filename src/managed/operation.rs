@@ -1419,7 +1419,7 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
             });
         }
         if device_command_requires_star_system(command_name)
-            && (device.location.is_none() || device.travel.is_some())
+            && !device_command_has_stationary_star_system(client, device, command_name)
         {
             return Err(Error::Operation {
                 message: format!(
@@ -1429,6 +1429,33 @@ fn check_device_capability(client: &Client, device_code: &str, command_name: &st
         }
     }
     Ok(())
+}
+
+fn device_command_has_stationary_star_system(
+    client: &Client,
+    device: &domain::Device,
+    command_name: &str,
+) -> bool {
+    if device.location.is_some() && device.travel.is_none() {
+        return true;
+    }
+
+    // A stowed device intentionally has no direct location of its own. Deploy
+    // executes at the stow container's location, so validate the stationary
+    // container instead of rejecting a healthy stowed-device projection.
+    if command_name == "deploy"
+        && let Some(container) = device.relationships.stowed_in.as_ref()
+    {
+        let key = DeviceKey::live(DeviceId::from(container.id.as_str()));
+        return client
+            .managed_state()
+            .device(&key)
+            .is_some_and(|observation| {
+                observation.value.location.is_some() && observation.value.travel.is_none()
+            });
+    }
+
+    false
 }
 
 fn device_command_requires_star_system(command_name: &str) -> bool {

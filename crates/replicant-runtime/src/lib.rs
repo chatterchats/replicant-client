@@ -71,6 +71,9 @@ pub mod director_requirements;
 /// Durable application telemetry and Grafana-oriented rollups.
 pub mod telemetry;
 
+/// Historical empire projections derived from event history and managed snapshots.
+pub mod empire_telemetry;
+
 /// Declarative desired-state evaluation and fulfillment planning.
 pub mod requirements;
 
@@ -79,6 +82,9 @@ pub mod mining;
 
 /// Event fulfillment planning and restart-safe campaign execution.
 pub mod event;
+
+/// Legacy mission-tag reconciliation for reusable manufactured stock.
+pub mod mission_stock;
 
 /// Regional bootstrap planning and restart-safe execution.
 pub mod bootstrap;
@@ -100,14 +106,22 @@ pub mod galaxy_scene;
 pub async fn start_managed_client(
     config: config::ManagedClientConfig,
 ) -> replicant_client::Result<Client> {
-    let (authentication_token, database, startup_policy, api_telemetry_sink) =
-        config.into_parts();
+    let config::ManagedClientParts {
+        authentication_token,
+        database,
+        startup_policy,
+        api_telemetry_sink,
+        event_telemetry_sink,
+    } = config.into_parts();
     let mut builder = Client::builder()
         .authentication_token(authentication_token)
         .sqlite(database)
         .startup_policy(startup_policy);
     if let Some(sink) = api_telemetry_sink {
         builder = builder.api_telemetry_sink(sink);
+    }
+    if let Some(sink) = event_telemetry_sink {
+        builder = builder.event_telemetry_sink(sink);
     }
     builder.start().await
 }

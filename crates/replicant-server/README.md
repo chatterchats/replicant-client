@@ -10,17 +10,17 @@ RS_API_TOKEN=... cargo run -p replicant-server --bin replicantd
 
 Configuration is environment-based:
 
-| Variable               | Default                    | Purpose                                                                                  |
-| ---------------------- | -------------------------- | ---------------------------------------------------------------------------------------- |
-| `RS_API_TOKEN`         | required                   | Replicant Space authentication token                                                     |
-| `RS_API_TOKEN_FILE`    | unset                      | File containing the token when `RS_API_TOKEN` is absent                                  |
-| `REPLICANT_PROFILE`    | `default`                  | Local profile name                                                                       |
-| `REPLICANT_DB`         | `replicant-client.sqlite`  | Managed SDK operational database; history defaults to sibling `replicant-history.sqlite` |
-| `REPLICANT_RUNTIME_DB` | `replicant-runtime.sqlite` | Workflow/runtime database                                                                |
-| `REPLICANT_TELEMETRY_DB` | sibling `replicant-telemetry.sqlite` | API observability database                                                     |
-| `REPLICANT_LOG_DIR`    | sibling `logs/` directory  | Persistent daemon tracing logs                                                           |
-| `REPLICANTD_BIND`      | `127.0.0.1:8080`           | HTTP listen address                                                                      |
-| `RUST_LOG`             | `info`                     | Tracing filter applied to console and persistent logs                                    |
+| Variable                 | Default                              | Purpose                                                                                  |
+| ------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `RS_API_TOKEN`           | required                             | Replicant Space authentication token                                                     |
+| `RS_API_TOKEN_FILE`      | unset                                | File containing the token when `RS_API_TOKEN` is absent                                  |
+| `REPLICANT_PROFILE`      | `default`                            | Local profile name                                                                       |
+| `REPLICANT_DB`           | `replicant-client.sqlite`            | Managed SDK operational database; history defaults to sibling `replicant-history.sqlite` |
+| `REPLICANT_RUNTIME_DB`   | `replicant-runtime.sqlite`           | Workflow/runtime database                                                                |
+| `REPLICANT_TELEMETRY_DB` | sibling `replicant-telemetry.sqlite` | API observability database                                                               |
+| `REPLICANT_LOG_DIR`      | sibling `logs/` directory            | Persistent daemon tracing logs                                                           |
+| `REPLICANTD_BIND`        | `127.0.0.1:8080`                     | HTTP listen address                                                                      |
+| `RUST_LOG`               | `info`                               | Tracing filter applied to console and persistent logs                                    |
 
 A non-empty `RS_API_TOKEN` takes precedence over `RS_API_TOKEN_FILE`. Token
 files are trimmed when read and neither source is printed in logs or status.

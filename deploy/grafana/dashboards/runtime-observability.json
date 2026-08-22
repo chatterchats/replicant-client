@@ -1,0 +1,1689 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": [
+    "replicant-space",
+    "telemetry",
+    "sse",
+    "workflow",
+    "runtime",
+    "director"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
+  "timezone": "browser",
+  "title": "Replicant Space \u00b7 Runtime & Automation Observability",
+  "uid": "replicant-runtime-observability",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Events applied",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Managed events durably applied in the selected range.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='applied'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='applied'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='applied'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Duplicate events",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 3,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Deduplicated events observed from catch-up/SSE overlap.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='duplicate'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='duplicate'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(event_count_sum),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND outcome='duplicate'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "SSE connect failures",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Failed filtered-SSE connection attempts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_connect' AND outcome='failed'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_connect' AND outcome='failed'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_connect' AND outcome='failed'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "SSE disconnects",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 9,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Completed/failed SSE sessions; repeated growth indicates reconnect churn.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Workflow starts",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Durable workflow executor invocations (wakeups), including reconciliation re-entry.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Claim conflicts",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 15,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Exclusive resource-claim conflicts raised by workflows.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(sample_count),0) AS value FROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Watcher lag/stops",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "Managed/runtime watcher lag or stop incidents.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(value_sum),0) AS value FROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(value_sum),0) AS value FROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT COALESCE(SUM(value_sum),0) AS value FROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Telemetry write failures",
+      "type": "stat",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 21,
+        "y": 0,
+        "w": 3,
+        "h": 4
+      },
+      "description": "SQLite telemetry persistence/maintenance failures.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'),0) AS value",
+          "queryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'),0) AS value",
+          "rawQueryText": "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM telemetry_meta WHERE key='write_failures'),0) AS value",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Managed event application over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Applied, duplicate, and failed managed event application counts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS value, outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply'\nGROUP BY bucket_start_ms,outcome ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS value, outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply'\nGROUP BY bucket_start_ms,outcome ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS value, outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply'\nGROUP BY bucket_start_ms,outcome ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "SSE lifecycle over time",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Connection attempts and session endings, split by outcome.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, metric || ':' || outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric IN ('sse_connect','sse_disconnect')\nGROUP BY bucket_start_ms,metric,outcome ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, metric || ':' || outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric IN ('sse_connect','sse_disconnect')\nGROUP BY bucket_start_ms,metric,outcome ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, metric || ':' || outcome AS series\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric IN ('sse_connect','sse_disconnect')\nGROUP BY bucket_start_ms,metric,outcome ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "SSE session duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Duration of completed SSE sessions. Frequent short sessions indicate connection instability.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count)/1000 END AS 'average session',\n MAX(duration_max_ms)/1000.0 AS 'longest session'\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count)/1000 END AS 'average session',\n MAX(duration_max_ms)/1000.0 AS 'longest session'\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count)/1000 END AS 'average session',\n MAX(duration_max_ms)/1000.0 AS 'longest session'\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='sse_disconnect'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Catch-up recovery activity",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Events and API pages traversed by durable event-log catch-up.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS 'events recovered', SUM(page_count_sum) AS pages\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='catchup'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS 'events recovered', SUM(page_count_sum) AS pages\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='catchup'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(event_count_sum) AS 'events recovered', SUM(page_count_sum) AS pages\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='catchup'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Top managed event names",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 12,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Which game event names dominate managed event ingestion.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT event_name, SUM(event_count_sum) AS events\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND event_name <> ''\nGROUP BY event_name ORDER BY events DESC LIMIT 25",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT event_name, SUM(event_count_sum) AS events\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND event_name <> ''\nGROUP BY event_name ORDER BY events DESC LIMIT 25",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT event_name, SUM(event_count_sum) AS events\nFROM event_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='event_apply' AND event_name <> ''\nGROUP BY event_name ORDER BY events DESC LIMIT 25",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Workflow executor starts / wakeups",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Executor invocations by workflow kind. This exposes polling/churn such as a scan.tour waking thousands of times.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'\nGROUP BY bucket_start_ms,workflow_kind ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'\nGROUP BY bucket_start_ms,workflow_kind ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_started'\nGROUP BY bucket_start_ms,workflow_kind ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Workflow executor outcomes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 9
+      },
+      "description": "Executor completion status by workflow kind.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind || ':' || outcome AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY bucket_start_ms,workflow_kind,outcome ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind || ':' || outcome AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY bucket_start_ms,workflow_kind,outcome ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(sample_count) AS value, workflow_kind || ':' || outcome AS series\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY bucket_start_ms,workflow_kind,outcome ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Workflow execution duration",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 10,
+        "h": 9
+      },
+      "description": "Average/max executor invocation duration and failures by workflow kind.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "avg_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "max_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, SUM(sample_count) AS executions,\n ROUND(CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END,1) AS avg_ms,\n MAX(duration_max_ms) AS max_ms,\n SUM(CASE WHEN outcome='failed' THEN sample_count ELSE 0 END) AS failures\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY workflow_kind ORDER BY executions DESC LIMIT 30",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, SUM(sample_count) AS executions,\n ROUND(CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END,1) AS avg_ms,\n MAX(duration_max_ms) AS max_ms,\n SUM(CASE WHEN outcome='failed' THEN sample_count ELSE 0 END) AS failures\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY workflow_kind ORDER BY executions DESC LIMIT 30",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, SUM(sample_count) AS executions,\n ROUND(CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END,1) AS avg_ms,\n MAX(duration_max_ms) AS max_ms,\n SUM(CASE WHEN outcome='failed' THEN sample_count ELSE 0 END) AS failures\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='executor_finished'\nGROUP BY workflow_kind ORDER BY executions DESC LIMIT 30",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Resource claim conflicts",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 29,
+        "w": 7,
+        "h": 9
+      },
+      "description": "Workflow kinds/resources that collide on exclusive claims.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, COALESCE(NULLIF(detail,''),'unknown') AS resource_kind, SUM(sample_count) AS conflicts\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'\nGROUP BY workflow_kind,detail ORDER BY conflicts DESC LIMIT 30",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, COALESCE(NULLIF(detail,''),'unknown') AS resource_kind, SUM(sample_count) AS conflicts\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'\nGROUP BY workflow_kind,detail ORDER BY conflicts DESC LIMIT 30",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT workflow_kind, COALESCE(NULLIF(detail,''),'unknown') AS resource_kind, SUM(sample_count) AS conflicts\nFROM workflow_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='claim_conflict'\nGROUP BY workflow_kind,detail ORDER BY conflicts DESC LIMIT 30",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Longest waiting workflow age",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 17,
+        "y": 29,
+        "w": 7,
+        "h": 9
+      },
+      "description": "Maximum observed waiting age by workflow kind. Sustained growth indicates blocked work.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_wait_age_ms'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_wait_age_ms'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_wait_age_ms'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Workflow status snapshot",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Maximum observed workflow count by durable status in each time bucket.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_status'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_status'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, MAX(value_max) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='workflow_status'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Workflow supervisor tick latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 38,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Five-second sampled average and maximum supervisor reconciliation latency.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'avg tick ms',\n (SELECT MAX(r2.value_max) FROM runtime_telemetry_rollup r2 WHERE r2.metric='supervisor_tick_max_ms' AND r2.resolution_seconds=chosen.resolution AND r2.bucket_start_ms=r.bucket_start_ms) AS 'max tick ms'\nFROM runtime_telemetry_rollup r, chosen\nWHERE r.resolution_seconds=chosen.resolution AND r.bucket_start_ms >= $__from AND r.bucket_start_ms < $__to AND r.metric='supervisor_ticks'\nGROUP BY r.bucket_start_ms ORDER BY r.bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'avg tick ms',\n (SELECT MAX(r2.value_max) FROM runtime_telemetry_rollup r2 WHERE r2.metric='supervisor_tick_max_ms' AND r2.resolution_seconds=chosen.resolution AND r2.bucket_start_ms=r.bucket_start_ms) AS 'max tick ms'\nFROM runtime_telemetry_rollup r, chosen\nWHERE r.resolution_seconds=chosen.resolution AND r.bucket_start_ms >= $__from AND r.bucket_start_ms < $__to AND r.metric='supervisor_ticks'\nGROUP BY r.bucket_start_ms ORDER BY r.bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'avg tick ms',\n (SELECT MAX(r2.value_max) FROM runtime_telemetry_rollup r2 WHERE r2.metric='supervisor_tick_max_ms' AND r2.resolution_seconds=chosen.resolution AND r2.bucket_start_ms=r.bucket_start_ms) AS 'max tick ms'\nFROM runtime_telemetry_rollup r, chosen\nWHERE r.resolution_seconds=chosen.resolution AND r.bucket_start_ms >= $__from AND r.bucket_start_ms < $__to AND r.metric='supervisor_ticks'\nGROUP BY r.bucket_start_ms ORDER BY r.bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "title": "Watcher lag / stop incidents",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 38,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Managed state, operations, BobNet, and trigger watcher recovery incidents.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='watcher_lag'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Director reconciliations",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 10,
+        "h": 8
+      },
+      "description": "Automation Director reconciliation outcomes split by trigger and result.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Director reconciliation latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 46,
+        "w": 7,
+        "h": 8
+      },
+      "description": "Average and maximum Director reconcile duration.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "time_series",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'average ms',\n MAX(duration_max_ms) AS 'max ms'\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'average ms',\n MAX(duration_max_ms) AS 'max ms'\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time,\n CASE WHEN SUM(duration_count)=0 THEN 0 ELSE 1.0*SUM(duration_sum_ms)/SUM(duration_count) END AS 'average ms',\n MAX(duration_max_ms) AS 'max ms'\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='director_reconcile'\nGROUP BY bucket_start_ms ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "title": "Daemon lifecycle",
+      "type": "timeseries",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 17,
+        "y": 46,
+        "w": 7,
+        "h": 8
+      },
+      "description": "Daemon starts/stops. Start spikes act as restart markers on the shared time axis.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 65,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "displayName": "${__field.labels.series}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["sum", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='daemon_lifecycle'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "queryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='daemon_lifecycle'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "rawQueryText": "WITH chosen(resolution) AS (\n  SELECT CASE\n    WHEN $__from >= (unixepoch('now') * 1000 - 604800000) THEN 60\n    WHEN $__from >= (unixepoch('now') * 1000 - 2592000000) THEN 600\n    WHEN $__from >= (unixepoch('now') * 1000 - 7776000000) THEN 3600\n    ELSE 86400\n  END\n)\nSELECT (bucket_start_ms/1000) AS time, SUM(value_sum) AS value, series\nFROM runtime_telemetry_rollup, chosen\nWHERE resolution_seconds=chosen.resolution AND bucket_start_ms >= $__from AND bucket_start_ms < $__to AND metric='daemon_lifecycle'\nGROUP BY bucket_start_ms,series ORDER BY bucket_start_ms",
+          "timeColumns": ["time"]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": ["series"],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "title": "Recent workflow failures (raw, 7-day retention)",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 16,
+        "h": 9
+      },
+      "description": "Concrete workflow IDs and steps for recent failed/cancelled executor invocations.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT (observed_at_ms/1000) AS time, workflow_kind, workflow_id, outcome, COALESCE(detail,'') AS step, duration_ms\nFROM workflow_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND metric='executor_finished' AND outcome IN ('failed','cancelled')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "queryText": "SELECT (observed_at_ms/1000) AS time, workflow_kind, workflow_id, outcome, COALESCE(detail,'') AS step, duration_ms\nFROM workflow_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND metric='executor_finished' AND outcome IN ('failed','cancelled')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "rawQueryText": "SELECT (observed_at_ms/1000) AS time, workflow_kind, workflow_id, outcome, COALESCE(detail,'') AS step, duration_ms\nFROM workflow_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND metric='executor_finished' AND outcome IN ('failed','cancelled')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "timeColumns": []
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "Recent event/SSE incidents (raw, 7-day retention)",
+      "type": "table",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "replicant-telemetry"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 54,
+        "w": 8,
+        "h": 9
+      },
+      "description": "Concrete recent event-pipeline failures, disconnects, and bounded catch-up runs.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "replicant-telemetry"
+          },
+          "refId": "A",
+          "queryType": "table",
+          "format": "table",
+          "query": "SELECT (observed_at_ms/1000) AS time, metric, outcome, COALESCE(event_name,'') AS event_name, event_count, page_count, duration_ms\nFROM event_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND (outcome IN ('failed','stream_error','apply_error','bound_hit') OR metric='sse_disconnect')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "queryText": "SELECT (observed_at_ms/1000) AS time, metric, outcome, COALESCE(event_name,'') AS event_name, event_count, page_count, duration_ms\nFROM event_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND (outcome IN ('failed','stream_error','apply_error','bound_hit') OR metric='sse_disconnect')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "rawQueryText": "SELECT (observed_at_ms/1000) AS time, metric, outcome, COALESCE(event_name,'') AS event_name, event_count, page_count, duration_ms\nFROM event_telemetry_sample\nWHERE observed_at_ms >= $__from AND observed_at_ms < $__to AND (outcome IN ('failed','stream_error','apply_error','bound_hit') OR metric='sse_disconnect')\nORDER BY observed_at_ms DESC LIMIT 200",
+          "timeColumns": []
+        }
+      ]
+    }
+  ]
+}

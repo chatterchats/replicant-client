@@ -30,14 +30,15 @@ use crate::{
     },
     automation::{
         EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
-        SalvageIntent, ScanIntent, ScanTourIntent, event_delivery_workflow_kind,
-        event_tour_workflow_kind, exploration_workflow_kind, logistics_workflow_kind,
-        mining_deploy_workflow_kind, new_event_delivery_workflow, new_event_tour_workflow,
-        new_exploration_workflow, new_logistics_workflow, new_mining_deploy_workflow,
-        new_observatory_workflow, new_salvage_workflow, new_scan_belt_workflow,
-        new_scan_system_workflow, new_scan_tour_workflow, observatory_workflow_kind,
-        salvage_workflow_kind, scan_belt_workflow_kind, scan_system_workflow_kind,
-        scan_tour_workflow_kind,
+        SalvageIntent, ScanIntent, ScanTourIntent, TradeFulfillmentIntent,
+        event_delivery_workflow_kind, event_tour_workflow_kind, exploration_workflow_kind,
+        logistics_workflow_kind, mining_deploy_workflow_kind, new_event_delivery_workflow,
+        new_event_tour_workflow, new_exploration_workflow, new_logistics_workflow,
+        new_mining_deploy_workflow, new_observatory_workflow, new_salvage_workflow,
+        new_scan_belt_workflow, new_scan_system_workflow, new_scan_tour_workflow,
+        new_trade_fulfillment_workflow, observatory_workflow_kind, salvage_workflow_kind,
+        scan_belt_workflow_kind, scan_system_workflow_kind, scan_tour_workflow_kind,
+        trade_fulfillment_workflow_kind,
     },
     belt_search::{BeltSearchRequest, execute_belt_search},
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
@@ -718,6 +719,12 @@ impl OperationCatalogue {
             }
             "logistics.delivery" => {
                 let mut workflow = new_logistics_workflow(decode::<LogisticsIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
+            "trade.fulfillment" => {
+                let mut workflow =
+                    new_trade_fulfillment_workflow(decode::<TradeFulfillmentIntent>(parameters)?);
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
@@ -2086,6 +2093,28 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             supported_triggers: all_trigger_kinds(),
         },
         WorkflowDescriptor {
+            kind: operation_kind(trade_fulfillment_workflow_kind().as_str()),
+            display_name: "Execute provisioned trade".to_owned(),
+            aliases: strings(&["trade_fulfillment", "buy_trade"]),
+            description: "Provision or manufacture trade criteria, stage cargo/carriers and a buyer Replicant at the shop, execute one trade, secure its rewards, and return the buyer, transports, and rewards to the originating hub.".to_owned(),
+            category: "trade".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![
+                EntityKind::Device,
+                EntityKind::Replicant,
+                EntityKind::Location,
+            ],
+            parameters: vec![
+                required("controller", "Trade controller", ParameterKind::Device),
+                required("trade_code", "Trade code", ParameterKind::String),
+                required("shop_location", "Shop location", ParameterKind::Location),
+                required("home", "Return hub", ParameterKind::Location),
+                optional("replicant", "Buyer Replicant", ParameterKind::Replicant),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
             kind: operation_kind(exploration_workflow_kind().as_str()),
             display_name: "Explore toward system".to_owned(),
             aliases: strings(&["explore_system"]),
@@ -2861,6 +2890,7 @@ impl RelayStart {
             mission_file: self.mission_file,
             max_hop_ly: self.max_hop_ly,
             wait_timeout: Duration::from_secs(self.wait_timeout_seconds),
+            unavailable_autofactories: Default::default(),
         }
     }
 }
@@ -2968,6 +2998,7 @@ mod tests {
             "salvage.site",
             "mining.deploy",
             "logistics.delivery",
+            "trade.fulfillment",
             "exploration.frontier",
             "event.delivery",
             "event.tour",

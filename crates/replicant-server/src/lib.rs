@@ -26,13 +26,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use replicant_client::{
-    ClientDegradation, ClientStatus,
+    ClientDegradation, ClientStatus, Error as ClientError,
     domain::{AccessScope, Device, Inventory, InventoryOwner, Realm},
     managed::{Client, OperationStatus as ManagedOperationStatus},
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
         bobnet::DeviceChannelsResponse,
-        devices::{DeviceListQuery, DeviceStatus as RawDeviceStatus},
+        devices::{DeviceAuditQuery, DeviceListQuery, DeviceStatus as RawDeviceStatus},
         events::LocationEvent,
         leaderboards::{LeaderboardIndexResponse, LeaderboardResponse},
         reputation::AccountReputationResponse,
@@ -44,7 +44,9 @@ use replicant_protocol::{
     ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
     AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
     AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
-    BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary, BobnetMessageSummary,
+    BillCandidateSummary, BillDepartureSummary, BillExpansionSummary, BillFinderRequest,
+    BillFinderResponse, BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary,
+    BobnetMessageSummary,
     BobnetReplicantSummary, BobnetSnapshot, BootstrapMissionSummary, BootstrapSnapshot,
     CargoCarrierSummary, CargoResourceSummary, CargoSnapshot, CreateTriggerRequest, DaemonHealth,
     DescriptorCatalog, DeviceClaim, DeviceLogSummary, DeviceLogsSnapshot, DeviceSummary,
@@ -94,6 +96,7 @@ use replicant_runtime::{
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
     system_scene::system_scene as build_system_scene,
+    telemetry::{RuntimeTelemetrySample, RuntimeTelemetrySink},
     trade::{ShopTrade, TraderSummary, shop_trades, trader_directory},
     workflows::{
         RelayWorkflowCheckpoint, RelayWorkflowConfig, RequirementWorkflowCheckpoint,
@@ -106,7 +109,7 @@ use replicant_workflow::{
     FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
     RepositoryError, ResourceKey, SupervisorError, TriggerCondition, TriggerId, TriggerState,
     TriggerTarget, TriggerTargetClass, WorkflowId, WorkflowInstance, WorkflowKind,
-    WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
+    WorkflowRepository, WorkflowStatus, WorkflowSupervisor, WorkflowTelemetrySink,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -129,6 +132,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const UPSTREAM_FANOUT: usize = 8;
 const CARGO_CACHE_TTL: Duration = Duration::from_secs(30);
+const BILL_REPLICANT_CODE: &str = "A8F48B26";
+const BILL_DEFAULT_TRACKING_BEACON: &str = "FEB51E1B";
+const BILL_MAX_CANDIDATES: usize = 12;
+const BILL_HIGH_CONFIDENCE_DEG: f64 = 0.75;
+const BILL_MEDIUM_CONFIDENCE_DEG: f64 = 2.0;
+const BILL_AMBIGUITY_GAP_DEG: f64 = 0.35;
 
 #[derive(Clone)]
 struct CargoCacheEntry {
@@ -285,6 +294,7 @@ pub struct AppState {
     message_sync: Mutex<()>,
     director_reconcile: Mutex<()>,
     director_wake: Notify,
+    runtime_telemetry: Option<Arc<dyn RuntimeTelemetrySink>>,
     daemon: DaemonConfig,
 }
 
@@ -296,12 +306,27 @@ impl AppState {
         repository: Arc<WorkflowRepository>,
         daemon: DaemonConfig,
     ) -> Result<Arc<Self>, CatalogueError> {
+        Self::new_with_telemetry(client, runtime_config, repository, daemon, None, None)
+    }
+
+    /// Builds daemon state with optional workflow/runtime observability sinks.
+    pub fn new_with_telemetry(
+        client: Client,
+        runtime_config: RuntimeConfig,
+        repository: Arc<WorkflowRepository>,
+        daemon: DaemonConfig,
+        workflow_telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
+        runtime_telemetry: Option<Arc<dyn RuntimeTelemetrySink>>,
+    ) -> Result<Arc<Self>, CatalogueError> {
         let catalogue = OperationCatalogue::new()?;
-        let supervisor = WorkflowSupervisor::with_managed_client(
+        let mut supervisor = WorkflowSupervisor::with_managed_client(
             repository.clone(),
             catalogue.workflow_registry(),
             client.clone(),
         );
+        if let Some(sink) = workflow_telemetry {
+            supervisor = supervisor.with_telemetry_sink(sink);
+        }
         let revision = client.state().revision().unwrap_or_default();
         Ok(Arc::new(Self {
             context: ApplicationContext::new(client, runtime_config),
@@ -320,6 +345,7 @@ impl AppState {
             message_sync: Mutex::new(()),
             director_reconcile: Mutex::new(()),
             director_wake: Notify::new(),
+            runtime_telemetry,
             daemon,
         }))
     }
@@ -328,6 +354,25 @@ impl AppState {
     #[must_use]
     pub fn client(&self) -> &Client {
         self.context.client()
+    }
+
+    fn record_runtime_telemetry(
+        &self,
+        metric: &'static str,
+        series: impl Into<String>,
+        value: i64,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(sink) = self.runtime_telemetry.as_ref() else {
+            return;
+        };
+        sink.record(RuntimeTelemetrySample {
+            observed_at_ms: now_millis().unwrap_or_default(),
+            metric,
+            series: series.into(),
+            value,
+            duration_ms,
+        });
     }
 
     /// Publishes a frontend-safe runtime notification.
@@ -489,6 +534,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/directory/{code}", get(directory_replicant))
         .route("/api/tutorials", get(tutorials))
         .route("/api/trade", get(trade))
+        .route("/api/trade/bill/find", post(find_bill))
         .route("/api/reports", get(reports))
         .route("/api/messages", get(messages))
         .route("/api/messages/read", post(mark_messages_read))
@@ -554,6 +600,12 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Runs periodic persisted-workflow reconciliation until shutdown.
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut telemetry_interval = tokio::time::interval(Duration::from_secs(5));
+    telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_count = 0_i64;
+    let mut tick_errors = 0_i64;
+    let mut tick_duration_sum_ms = 0_u64;
+    let mut tick_duration_max_ms = 0_u64;
     let mut revisions = state.client().state().watch().ok();
     let mut operations = state.client().operations().watch().ok();
     let mut bobnet = state.client().bobnet().watch().await.ok();
@@ -569,7 +621,18 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(error) = state.supervisor.lock().await.tick().await {
+                let tick_started = Instant::now();
+                let tick_result = state.supervisor.lock().await.tick().await;
+                let tick_duration_ms = tick_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                tick_count = tick_count.saturating_add(1);
+                tick_duration_sum_ms = tick_duration_sum_ms.saturating_add(tick_duration_ms);
+                tick_duration_max_ms = tick_duration_max_ms.max(tick_duration_ms);
+                if let Err(error) = tick_result {
+                    tick_errors = tick_errors.saturating_add(1);
                     tracing::error!(error = %error, "workflow supervisor tick failed");
                 }
                 publish_workflow_updates(&state, &mut workflows, &mut activity_cursor);
@@ -580,6 +643,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(error = %error, "BobNet event watch stopped");
+                            state.record_runtime_telemetry("watcher_lag", "bobnet", 1, None);
                             stop_bobnet_watch = true;
                         }
                     }
@@ -605,6 +669,31 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                         state.notify(sync_notification(&sync));
                     }
                 }
+            }
+            _ = telemetry_interval.tick() => {
+                let average_tick_ms = if tick_count > 0 {
+                    tick_duration_sum_ms / u64::try_from(tick_count).unwrap_or(1)
+                } else {
+                    0
+                };
+                state.record_runtime_telemetry(
+                    "supervisor_ticks",
+                    "all",
+                    tick_count,
+                    Some(average_tick_ms),
+                );
+                state.record_runtime_telemetry("supervisor_tick_errors", "all", tick_errors, None);
+                state.record_runtime_telemetry(
+                    "supervisor_tick_max_ms",
+                    "all",
+                    i64::try_from(tick_duration_max_ms).unwrap_or(i64::MAX),
+                    None,
+                );
+                record_workflow_snapshot(&state);
+                tick_count = 0;
+                tick_errors = 0;
+                tick_duration_sum_ms = 0;
+                tick_duration_max_ms = 0;
             }
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 match revision {
@@ -640,6 +729,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "managed state watcher stopped");
+                        state.record_runtime_telemetry("watcher_lag", "managed_state", 1, None);
                         revisions = None;
                     }
                 }
@@ -655,6 +745,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                     })),
                     Err(error) => {
                         tracing::warn!(error = %error, "managed operation watcher stopped");
+                        state.record_runtime_telemetry("watcher_lag", "managed_operations", 1, None);
                         operations = None;
                     }
                 }
@@ -665,6 +756,45 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                 }
             }
         }
+    }
+}
+
+fn record_workflow_snapshot(state: &AppState) {
+    let Ok(workflows) = state.repository.list() else {
+        return;
+    };
+    let now = now_millis().unwrap_or_default();
+    let mut status_counts = BTreeMap::<&'static str, i64>::new();
+    let mut waiting_age_by_kind = BTreeMap::<String, i64>::new();
+    for workflow in workflows {
+        let status = workflow_status_name(workflow.status);
+        *status_counts.entry(status).or_default() += 1;
+        if workflow.status == WorkflowStatus::Waiting {
+            let age = now.saturating_sub(workflow.updated_at).max(0);
+            waiting_age_by_kind
+                .entry(workflow.kind.as_str().to_owned())
+                .and_modify(|current| *current = (*current).max(age))
+                .or_insert(age);
+        }
+    }
+    for (status, count) in status_counts {
+        state.record_runtime_telemetry("workflow_status", status, count, None);
+    }
+    for (kind, age_ms) in waiting_age_by_kind {
+        state.record_runtime_telemetry("workflow_wait_age_ms", kind, age_ms, None);
+    }
+}
+
+fn workflow_status_name(status: WorkflowStatus) -> &'static str {
+    match status {
+        WorkflowStatus::Queued => "queued",
+        WorkflowStatus::Running => "running",
+        WorkflowStatus::Waiting => "waiting",
+        WorkflowStatus::Paused => "paused",
+        WorkflowStatus::Reconciling => "reconciling",
+        WorkflowStatus::Succeeded => "succeeded",
+        WorkflowStatus::Failed => "failed",
+        WorkflowStatus::Cancelled => "cancelled",
     }
 }
 
@@ -695,6 +825,7 @@ pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Recei
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "trigger event watcher lagged; recovering from durable history");
+                        state.record_runtime_telemetry("watcher_lag", "trigger_events", 1, None);
                         events = state.client().events().watch().await.ok();
                         evaluate_event_triggers_for(&state, &[]).await;
                     }
@@ -703,6 +834,7 @@ pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Recei
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 if let Err(error) = revision {
                     tracing::warn!(error = %error, "trigger state watcher stopped");
+                    state.record_runtime_telemetry("watcher_lag", "trigger_state", 1, None);
                     revisions = state.client().state().watch().ok();
                 }
                 evaluate_state_triggers(&state).await;
@@ -2840,25 +2972,46 @@ async fn trade(
     let trade_results = futures_util::stream::iter(traders.into_iter().map(|trader| {
         let client = client.clone();
         async move {
-            let trades = shop_trades(&client, &trader.controller_code)
-                .await
-                .map_err(|_| ApiError::unavailable())?;
-            Ok::<_, ApiError>((trader, trades))
+            match shop_trades(&client, &trader.controller_code).await {
+                Ok(trades) => (trader, trades, "available"),
+                Err(error) => {
+                    let status = trade_details_status(&error);
+                    if status == "out_of_comms" {
+                        tracing::debug!(
+                            controller = %trader.controller_code,
+                            system = ?trader.star,
+                            "trade details unavailable from current comms coverage"
+                        );
+                    } else {
+                        tracing::warn!(
+                            controller = %trader.controller_code,
+                            system = ?trader.star,
+                            error = %error,
+                            "trade detail refresh failed; returning partial trade directory"
+                        );
+                    }
+                    (trader, Vec::new(), status)
+                }
+            }
         }
     }))
     .buffered(UPSTREAM_FANOUT)
     .collect::<Vec<_>>()
     .await;
     let mut controllers = Vec::with_capacity(trade_results.len());
-    for result in trade_results {
-        let (trader, trades) = result?;
+    for (trader, trades, trade_details_status) in trade_results {
         let workflow = devices
             .iter()
             .find(|device| device.entity.id.0 == trader.controller_code)
             .and_then(|device| device.claim.as_ref())
             .and_then(|claim| workflows.get(&claim.workflow_id.0))
             .cloned();
-        controllers.push(trade_controller_summary(trader, trades, workflow));
+        controllers.push(trade_controller_summary(
+            trader,
+            trades,
+            trade_details_status,
+            workflow,
+        ));
     }
     Ok(Json(Versioned::current(TradeSnapshot {
         metadata,
@@ -2867,9 +3020,25 @@ async fn trade(
     })))
 }
 
+fn trade_details_status(error: &replicant_runtime::ApplicationError) -> &'static str {
+    let Some(error) = error.downcast_ref::<ClientError>() else {
+        return "unavailable";
+    };
+    if error.status() == Some(403)
+        && error.details().and_then(|details| details.message.as_deref()).is_some_and(|message| {
+            message.contains("No replicant or comms device in this star system")
+        })
+    {
+        "out_of_comms"
+    } else {
+        "unavailable"
+    }
+}
+
 fn trade_controller_summary(
     trader: TraderSummary,
     trades: Vec<ShopTrade>,
+    trade_details_status: &str,
     workflow: Option<WorkflowSummary>,
 ) -> TradeControllerSummary {
     TradeControllerSummary {
@@ -2883,6 +3052,7 @@ fn trade_controller_summary(
         location: trader.location,
         total_stock: trader.total_stock,
         trade_count: trader.trade_count,
+        trade_details_status: trade_details_status.to_owned(),
         trades: trades
             .into_iter()
             .filter(|trade| !trade.trade_code.is_empty())
@@ -2931,6 +3101,411 @@ fn trade_items(value: Option<&Value>) -> Vec<TradeItemSummary> {
             .then_with(|| left.item.cmp(&right.item))
     });
     normalized
+}
+
+async fn find_bill(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<BillFinderRequest>, JsonRejection>,
+) -> Result<Json<Versioned<BillFinderResponse>>, ApiError> {
+    let Json(request) = payload.map_err(|_| ApiError::invalid("invalid Bill finder request"))?;
+    let tracking_beacon = resolve_bill_tracking_beacon(
+        state.client(),
+        request.tracking_beacon.as_deref(),
+    )
+    .await?;
+    let replicant_code = env::var("REPLICANT_BILL_REPLICANT_CODE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| BILL_REPLICANT_CODE.to_owned());
+
+    let beacon = match state.client().devices().cached(&tracking_beacon) {
+        Some(handle) => handle,
+        None => state
+            .client()
+            .devices()
+            .get(&tracking_beacon)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    tracking_beacon = %tracking_beacon,
+                    error = %error,
+                    "Bill tracking beacon could not be loaded"
+                );
+                ApiError::bill_unavailable()
+            })?,
+    };
+    let audit = beacon
+        .audit(&DeviceAuditQuery {
+            replicant_code: Some(replicant_code.clone()),
+            limit: Some(20),
+            latest: Some(true),
+            ..DeviceAuditQuery::default()
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                tracking_beacon = %tracking_beacon,
+                bill_replicant = %replicant_code,
+                error = %error,
+                "Bill tracking audit failed"
+            );
+            ApiError::bill_unavailable()
+        })?;
+    let observed = latest_bill_departure(&audit, &replicant_code)
+        .ok_or_else(ApiError::bill_departure_not_found)?;
+
+    let mut catalogue = state.client().galaxy().catalogue();
+    let mut origin_system = resolve_catalogue_system(&observed.origin_location, &catalogue);
+    if origin_system.is_none() {
+        if let Err(error) = state.client().galaxy().refresh_catalogue().await {
+            tracing::warn!(error = %error, "Bill finder catalogue refresh failed");
+        }
+        catalogue = state.client().galaxy().catalogue();
+        origin_system = resolve_catalogue_system(&observed.origin_location, &catalogue);
+    }
+    let origin_system = origin_system.ok_or_else(ApiError::bill_catalogue_unavailable)?;
+    let departure = BillDepartureSummary {
+        tracking_beacon,
+        replicant_code,
+        vessel_code: observed.vessel_code,
+        vessel_type: observed.vessel_type,
+        origin_location: observed.origin_location,
+        origin_system: origin_system.clone(),
+        logged_at: observed.logged_at,
+        vector: observed.vector,
+    };
+    let candidates = rank_bill_candidates(&catalogue, &origin_system, departure.vector);
+    if candidates.is_empty() {
+        return Err(ApiError::bill_catalogue_unavailable());
+    }
+    let (recommended_system, confidence, ambiguous) = bill_recommendation(&candidates);
+    let expansion = bill_expansion(
+        &state,
+        &request,
+        &candidates,
+        recommended_system.as_deref(),
+        ambiguous,
+    )?;
+
+    Ok(Json(Versioned::current(BillFinderResponse {
+        metadata: state.snapshot_metadata()?,
+        departure,
+        candidates,
+        recommended_system,
+        confidence,
+        ambiguous,
+        expansion,
+    })))
+}
+
+struct ObservedBillDeparture {
+    vessel_code: Option<String>,
+    vessel_type: Option<String>,
+    origin_location: String,
+    logged_at: Option<String>,
+    vector: [f64; 3],
+}
+
+async fn resolve_bill_tracking_beacon(
+    client: &Client,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(requested) = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(requested.to_ascii_uppercase());
+    }
+    if let Some(configured) = env::var("REPLICANT_BILL_TRACKING_BEACON")
+        .ok()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(configured);
+    }
+
+    let monitoring = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(replicant_client::domain::DeviceType::FtlBeacon)
+        .with_status(replicant_client::domain::DeviceStatus::from("monitoring"))
+        .in_system("SOL")
+        .collect()
+        .await
+        .map_err(|_| ApiError::bill_unavailable())?;
+    if let Some(beacon) = monitoring.first() {
+        return Ok(beacon.id().as_str().to_owned());
+    }
+
+    let any_sol_beacon = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(replicant_client::domain::DeviceType::FtlBeacon)
+        .in_system("SOL")
+        .collect()
+        .await
+        .map_err(|_| ApiError::bill_unavailable())?;
+    Ok(any_sol_beacon
+        .first()
+        .map(|beacon| beacon.id().as_str().to_owned())
+        .unwrap_or_else(|| BILL_DEFAULT_TRACKING_BEACON.to_owned()))
+}
+
+fn latest_bill_departure(audit: &Value, replicant_code: &str) -> Option<ObservedBillDeparture> {
+    audit.get("audit")?.as_array()?.iter().find_map(|entry| {
+        let entry = entry.as_object()?;
+        if !entry
+            .get("replicant_code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code.eq_ignore_ascii_case(replicant_code))
+        {
+            return None;
+        }
+        if !entry
+            .get("travel_type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("departure"))
+        {
+            return None;
+        }
+        let vector = parse_bill_vector(entry.get("vector")?)?;
+        let origin_location = entry.get("location")?.as_str()?.to_owned();
+        Some(ObservedBillDeparture {
+            vessel_code: entry
+                .get("device_code")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            vessel_type: entry
+                .get("device_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            origin_location,
+            logged_at: entry
+                .get("logged_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            vector,
+        })
+    })
+}
+
+fn parse_bill_vector(value: &Value) -> Option<[f64; 3]> {
+    let vector = match value {
+        Value::String(value) => {
+            let values = value
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<f64>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            (values.len() == 3).then_some([values[0], values[1], values[2]])?
+        }
+        Value::Array(values) if values.len() == 3 => [
+            values[0].as_f64()?,
+            values[1].as_f64()?,
+            values[2].as_f64()?,
+        ],
+        _ => return None,
+    };
+    normalize_bill_vector(vector)
+}
+
+fn normalize_bill_vector(vector: [f64; 3]) -> Option<[f64; 3]> {
+    if !vector.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let norm =
+        (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+    (norm > f64::EPSILON)
+        .then_some([vector[0] / norm, vector[1] / norm, vector[2] / norm])
+}
+
+fn resolve_catalogue_system(
+    location: &str,
+    catalogue: &[replicant_client::domain::Star],
+) -> Option<String> {
+    catalogue
+        .iter()
+        .map(|star| star.key.id.as_str())
+        .filter(|system| location == *system || location.starts_with(&format!("{system}-")))
+        .max_by_key(|system| system.len())
+        .map(str::to_owned)
+}
+
+fn rank_bill_candidates(
+    catalogue: &[replicant_client::domain::Star],
+    origin_system: &str,
+    vector: [f64; 3],
+) -> Vec<BillCandidateSummary> {
+    let Some(origin) = catalogue
+        .iter()
+        .find(|star| star.key.id.as_str() == origin_system)
+        .and_then(|star| star.position)
+    else {
+        return Vec::new();
+    };
+    let Some(vector) = normalize_bill_vector(vector) else {
+        return Vec::new();
+    };
+
+    let mut candidates = catalogue
+        .iter()
+        .filter(|star| star.key.id.as_str() != origin_system)
+        .filter_map(|star| {
+            let position = star.position?;
+            let delta = [
+                position.x - origin.x,
+                position.y - origin.y,
+                position.z - origin.z,
+            ];
+            let distance =
+                (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            if !distance.is_finite() || distance <= f64::EPSILON {
+                return None;
+            }
+            let projected =
+                delta[0] * vector[0] + delta[1] * vector[1] + delta[2] * vector[2];
+            if projected <= 0.0 {
+                return None;
+            }
+            let cosine = (projected / distance).clamp(-1.0, 1.0);
+            let angular_error_deg = cosine.acos().to_degrees();
+            let cross_track_ly = (distance * distance - projected * projected)
+                .max(0.0)
+                .sqrt();
+            Some(BillCandidateSummary {
+                system: star.key.id.as_str().to_owned(),
+                angular_error_deg,
+                distance_ly: distance,
+                projected_distance_ly: projected,
+                cross_track_ly,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.angular_error_deg
+            .total_cmp(&right.angular_error_deg)
+            .then_with(|| left.cross_track_ly.total_cmp(&right.cross_track_ly))
+            .then_with(|| left.distance_ly.total_cmp(&right.distance_ly))
+            .then_with(|| left.system.cmp(&right.system))
+    });
+    candidates.truncate(BILL_MAX_CANDIDATES);
+    candidates
+}
+
+fn bill_recommendation(candidates: &[BillCandidateSummary]) -> (Option<String>, String, bool) {
+    let Some(best) = candidates.first() else {
+        return (None, "low".to_owned(), true);
+    };
+    let ambiguous = candidates.get(1).is_some_and(|second| {
+        second.angular_error_deg <= BILL_MEDIUM_CONFIDENCE_DEG
+            && second.angular_error_deg - best.angular_error_deg < BILL_AMBIGUITY_GAP_DEG
+    });
+    let confidence = if !ambiguous && best.angular_error_deg <= BILL_HIGH_CONFIDENCE_DEG {
+        "high"
+    } else if !ambiguous && best.angular_error_deg <= BILL_MEDIUM_CONFIDENCE_DEG {
+        "medium"
+    } else {
+        "low"
+    };
+    let recommended = (!ambiguous && confidence != "low").then(|| best.system.clone());
+    (recommended, confidence.to_owned(), ambiguous)
+}
+
+fn bill_expansion(
+    state: &AppState,
+    request: &BillFinderRequest,
+    candidates: &[BillCandidateSummary],
+    recommended_system: Option<&str>,
+    ambiguous: bool,
+) -> Result<BillExpansionSummary, ApiError> {
+    if !request.expand {
+        return Ok(BillExpansionSummary {
+            status: "not_requested".to_owned(),
+            target_system: None,
+            workflow: None,
+            message: "FTL expansion was not requested.".to_owned(),
+        });
+    }
+
+    let explicit_target = request
+        .target_system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target = if let Some(explicit_target) = explicit_target {
+        candidates
+            .iter()
+            .find(|candidate| candidate.system.eq_ignore_ascii_case(explicit_target))
+            .map(|candidate| candidate.system.clone())
+            .ok_or_else(|| {
+                ApiError::invalid("selected Bill candidate is not in the current result")
+            })?
+    } else if !ambiguous {
+        if let Some(recommended_system) = recommended_system {
+            recommended_system.to_owned()
+        } else {
+            return Ok(BillExpansionSummary {
+                status: "selection_required".to_owned(),
+                target_system: None,
+                workflow: None,
+                message: "The departure vector is not precise enough to expand automatically; select a candidate system first.".to_owned(),
+            });
+        }
+    } else {
+        return Ok(BillExpansionSummary {
+            status: "selection_required".to_owned(),
+            target_system: None,
+            workflow: None,
+            message: "Multiple systems fit Bill's departure vector; select a candidate before expanding the FTL network.".to_owned(),
+        });
+    };
+
+    if let Some(existing) = existing_bill_expansion(&state.repository, &target)? {
+        return Ok(BillExpansionSummary {
+            status: "reused".to_owned(),
+            target_system: Some(target),
+            workflow: Some(summary(&existing)),
+            message: "An active FTL expansion workflow already targets this system; reusing it.".to_owned(),
+        });
+    }
+
+    let instance = state
+        .catalogue
+        .create_workflow(
+            &state.repository,
+            "exploration.frontier",
+            BTreeMap::from([("target".to_owned(), Value::String(target.clone()))]),
+        )
+        .map_err(ApiError::catalogue)?;
+    Ok(BillExpansionSummary {
+        status: "queued".to_owned(),
+        target_system: Some(target),
+        workflow: Some(summary(&instance)),
+        message: "Queued an FTL expansion workflow to the selected Bill candidate.".to_owned(),
+    })
+}
+
+fn existing_bill_expansion(
+    repository: &WorkflowRepository,
+    target: &str,
+) -> Result<Option<WorkflowInstance>, ApiError> {
+    let workflows = repository.list().map_err(ApiError::repository)?;
+    for workflow in workflows.into_iter().rev() {
+        if workflow.kind.as_str() != "exploration.frontier" || workflow.status.is_terminal() {
+            continue;
+        }
+        let Ok(intent) = workflow.config::<ExplorationIntent>() else {
+            continue;
+        };
+        if intent.target.eq_ignore_ascii_case(target) {
+            return Ok(Some(workflow));
+        }
+    }
+    Ok(None)
 }
 
 async fn reports(
@@ -5117,7 +5692,16 @@ async fn reconcile_and_invalidate_director(
         .await
     };
     let snapshot = match tokio::time::timeout(DIRECTOR_RECONCILE_TIMEOUT, reconciliation).await {
-        Ok(result) => result.map_err(ApiError::runtime)?,
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            state.record_runtime_telemetry(
+                "director_reconcile",
+                format!("{trigger}:failed"),
+                1,
+                Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            );
+            return Err(ApiError::runtime(error));
+        }
         Err(_) => {
             tracing::warn!(
                 attempt,
@@ -5126,9 +5710,21 @@ async fn reconcile_and_invalidate_director(
                 timeout_ms = DIRECTOR_RECONCILE_TIMEOUT.as_millis(),
                 "Automation Director reconciliation timed out"
             );
+            state.record_runtime_telemetry(
+                "director_reconcile",
+                format!("{trigger}:timeout"),
+                1,
+                Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            );
             return Err(ApiError::director_timeout());
         }
     };
+    state.record_runtime_telemetry(
+        "director_reconcile",
+        format!("{trigger}:success"),
+        1,
+        Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+    );
     tracing::info!(
         attempt,
         trigger,
@@ -5790,6 +6386,30 @@ impl ApiError {
         }
     }
 
+    fn bill_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "bill_tracking_unavailable",
+            message: "Bill's tracking beacon audit is currently unavailable",
+        }
+    }
+
+    fn bill_departure_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "bill_departure_not_found",
+            message: "no Bill departure vector was found in the selected beacon audit",
+        }
+    }
+
+    fn bill_catalogue_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "bill_catalogue_unavailable",
+            message: "the star catalogue cannot currently resolve Bill's departure vector",
+        }
+    }
+
     fn internal() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -6080,6 +6700,114 @@ mod tests {
         assert_eq!(controller.trades[0].requested[0].kind, "resource");
         assert_eq!(controller.trades[0].requested[0].quantity, Some(4.0));
         assert_eq!(controller.trades[0].offered[0].kind, "device");
+    }
+
+    fn bill_test_star(id: &str, x: f64, y: f64, z: f64) -> replicant_client::Star {
+        replicant_client::Star {
+            key: replicant_client::domain::StarKey::live(replicant_client::StarId::from(id)),
+            name: None,
+            spectral_type: None,
+            entry_point: None,
+            position: Some(replicant_client::domain::GalacticPosition { x, y, z }),
+            has_hub: None,
+            knowledge_observed: true,
+            explored: None,
+            has_life: None,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn bill_audit_parser_finds_departure_vector_after_arrival_rows() {
+        let audit = serde_json::json!({
+            "audit": [
+                {
+                    "replicant_code": "A8F48B26",
+                    "travel_type": "arrival",
+                    "location": "SOL-5-L4",
+                    "vector": "0.88,-0.04,-0.48"
+                },
+                {
+                    "device_code": "6BE43B4B",
+                    "device_type": "racing_vessel",
+                    "replicant_code": "A8F48B26",
+                    "travel_type": "departure",
+                    "location": "SOL-5-L4",
+                    "logged_at": "2026-08-21T10:57:44-04:00",
+                    "vector": "0.97,0.10,-0.20"
+                }
+            ]
+        });
+        let departure = latest_bill_departure(&audit, "A8F48B26").expect("departure");
+        assert_eq!(departure.origin_location, "SOL-5-L4");
+        assert_eq!(departure.vessel_code.as_deref(), Some("6BE43B4B"));
+        let norm = (departure.vector[0] * departure.vector[0]
+            + departure.vector[1] * departure.vector[1]
+            + departure.vector[2] * departure.vector[2])
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bill_candidates_rank_stars_by_departure_ray() {
+        let catalogue = vec![
+            bill_test_star("SOL", 0.0, 0.0, 0.0),
+            bill_test_star("BEST", 9.7, 1.0, -2.0),
+            bill_test_star("SECOND", 19.0, 3.0, -4.0),
+            bill_test_star("BEHIND", -9.7, -1.0, 2.0),
+        ];
+        let candidates = rank_bill_candidates(&catalogue, "SOL", [0.97, 0.10, -0.20]);
+        assert_eq!(candidates[0].system, "BEST");
+        assert!(candidates.iter().all(|candidate| candidate.system != "BEHIND"));
+        assert!(candidates[0].angular_error_deg < candidates[1].angular_error_deg);
+    }
+
+    #[test]
+    fn bill_recommendation_requires_angular_separation() {
+        let ambiguous = vec![
+            BillCandidateSummary {
+                system: "ONE".to_owned(),
+                angular_error_deg: 0.10,
+                distance_ly: 10.0,
+                projected_distance_ly: 10.0,
+                cross_track_ly: 0.02,
+            },
+            BillCandidateSummary {
+                system: "TWO".to_owned(),
+                angular_error_deg: 0.20,
+                distance_ly: 20.0,
+                projected_distance_ly: 20.0,
+                cross_track_ly: 0.07,
+            },
+        ];
+        let (recommended, confidence, is_ambiguous) = bill_recommendation(&ambiguous);
+        assert!(recommended.is_none());
+        assert_eq!(confidence, "low");
+        assert!(is_ambiguous);
+
+        let clear = vec![BillCandidateSummary {
+            system: "ONE".to_owned(),
+            angular_error_deg: 0.10,
+            distance_ly: 10.0,
+            projected_distance_ly: 10.0,
+            cross_track_ly: 0.02,
+        }];
+        let (recommended, confidence, is_ambiguous) = bill_recommendation(&clear);
+        assert_eq!(recommended.as_deref(), Some("ONE"));
+        assert_eq!(confidence, "high");
+        assert!(!is_ambiguous);
+    }
+
+    #[test]
+    fn trade_details_classifies_missing_comms_as_partial_availability() {
+        let error: replicant_runtime::ApplicationError = Box::new(ClientError::Contract {
+            status: 403,
+            details: Box::new(replicant_client::ErrorDetails {
+                message: Some("No replicant or comms device in this star system".to_owned()),
+                ..replicant_client::ErrorDetails::default()
+            }),
+        });
+        assert_eq!(trade_details_status(&error), "out_of_comms");
     }
 
     #[tokio::test]
@@ -6671,6 +7399,7 @@ mod tests {
                     mission_file: PathBuf::from("relay.json"),
                     max_hop_ly: 7.499,
                     wait_timeout: Duration::from_secs(1),
+                    unavailable_autofactories: Default::default(),
                 },
             }))
             .expect("relay workflow");

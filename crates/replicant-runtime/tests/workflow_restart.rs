@@ -59,6 +59,7 @@ fn survey_and_relay_checkpoints_resume_without_repeating_completed_steps() {
                 mission_file: path.with_extension("relay.json"),
                 max_hop_ly: 7.499,
                 wait_timeout: std::time::Duration::from_secs(1),
+                unavailable_autofactories: Default::default(),
             },
         }))
         .expect("create relay workflow");

@@ -475,6 +475,32 @@ fn claim(context: &WorkflowContext, resource: ResourceKey) -> Result<(), String>
     Ok(())
 }
 
+fn reconcile_relay_autofactory_claims(
+    context: &WorkflowContext,
+    required: &BTreeSet<String>,
+) -> Result<(), String> {
+    let stale = context
+        .claims()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Autofactory(code) if !required.contains(&code) => {
+                Some(ResourceKey::Autofactory(code))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for resource in stale {
+        context
+            .release_claim(&resource)
+            .map_err(|error| error.to_string())?;
+    }
+    for code in required {
+        claim(context, ResourceKey::Autofactory(code.clone()))?;
+    }
+    Ok(())
+}
+
 /// Factory for durable survey routes.
 pub struct SurveyWorkflowFactory(WorkflowKind);
 
@@ -692,9 +718,11 @@ impl WorkflowExecutor for RelayWorkflow {
                 for device in devices {
                     claim(context, ResourceKey::Device(device.to_owned()))?;
                 }
-                for factory in factories {
-                    claim(context, ResourceKey::Autofactory(factory.to_owned()))?;
-                }
+                let factories = factories
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                reconcile_relay_autofactory_claims(context, &factories)?;
                 emit(
                     context,
                     &WorkflowActivityEvent::ReconciliationDecision {
@@ -730,6 +758,7 @@ impl WorkflowExecutor for RelayWorkflow {
 
             match result {
                 Ok(report) => {
+                    reconcile_relay_autofactory_claims(context, &BTreeSet::new())?;
                     emit(context, &WorkflowActivityEvent::Completion)?;
                     context
                         .mark_succeeded(Some(report))

@@ -101,6 +101,11 @@ pub fn logistics_manifest_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.manifest").expect("static workflow kind is valid")
 }
 
+/// Durable coordinator for provisioning, executing, and returning from one shop trade.
+pub fn trade_fulfillment_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("trade.fulfillment").expect("static workflow kind is valid")
+}
+
 /// Durable coordinator for learning one missing blueprint from an owned device.
 pub fn blueprint_acquire_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("blueprint.acquire").expect("static workflow kind is valid")
@@ -152,6 +157,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsManifestWorkflowFactory::new()))?;
+    registry.register(Arc::new(TradeFulfillmentWorkflowFactory::new()))?;
     registry.register(Arc::new(BlueprintAcquireWorkflowFactory::new()))?;
     registry.register(Arc::new(ExplorationWorkflowFactory::new()))?;
     registry.register(Arc::new(EventDeliveryWorkflowFactory::new()))?;
@@ -386,6 +392,74 @@ pub struct LogisticsWorkflowCheckpoint {
     pub started: bool,
 }
 
+/// Intent for a fully provisioned buyer-side trade run.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TradeFulfillmentIntent {
+    /// Trade-controller device code.
+    pub controller: String,
+    /// Stable trade code to fulfill once.
+    pub trade_code: String,
+    /// Exact shop location where the buyer must arrive.
+    pub shop_location: String,
+    /// Exact home hub where provisioning starts and all assets return.
+    pub home: String,
+    /// Optional Replicant to execute the trade.
+    #[serde(default)]
+    pub replicant: Option<String>,
+    /// Optional regional affinity used only for observability/policy.
+    #[serde(default)]
+    pub preferred_region: Option<String>,
+    /// Optional device reward that must still be present when the trade is executed.
+    #[serde(default)]
+    pub expected_reward_device: Option<String>,
+}
+
+/// Restart-safe checkpoint for a provisioned buyer-side trade run.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TradeFulfillmentCheckpoint {
+    /// Resolved exact home hub.
+    pub home: Option<String>,
+    /// Resolved home system used for local provisioning.
+    pub home_system: Option<String>,
+    /// Replicant claimed for the run.
+    pub replicant: Option<String>,
+    /// Live criteria snapshot persisted before any staging.
+    pub criteria: Option<TradeBundle>,
+    /// Live reward snapshot persisted before any staging.
+    pub rewards: Option<TradeBundle>,
+    /// Durable tag used for criterion-device prints.
+    pub payment_print_tag: Option<String>,
+    /// Exact criterion devices selected for this purchase.
+    pub payment_device_codes: Vec<String>,
+    /// Child workflow that transports the still-missing payment manifest.
+    pub payment_logistics_child: Option<WorkflowId>,
+    /// Concrete outbound logistics plan retained after the child succeeds.
+    pub outbound_plan: Option<DeliveryPlan>,
+    /// Extra attachment/cargo escorts staged only to carry rewards home.
+    pub escort_carriers: Vec<String>,
+    /// Owned reward-device identities observed before purchase, keyed by device type.
+    pub pre_purchase_devices: BTreeMap<String, Vec<String>>,
+    /// Shop stock immediately before the irreversible purchase.
+    pub pre_purchase_stock: Option<i64>,
+    /// Irreversible purchase intent was durably checkpointed.
+    pub purchase_authorized: bool,
+    /// A managed trade operation was submitted during some invocation.
+    pub purchase_submitted: bool,
+    /// Durable managed operation ID for restart-safe trade recovery.
+    pub purchase_operation: Option<String>,
+    /// The purchase has positive evidence of completion and may be reconciled/returned.
+    pub purchase_observed: bool,
+    /// Reward devices acquired by this execution.
+    pub reward_devices: Vec<String>,
+    /// Reward-device transport mode keyed by device code (`stowed` or carrier code).
+    pub reward_storage: BTreeMap<String, String>,
+    /// Reward resources have been loaded into return cargo transports.
+    pub reward_resources_loaded: bool,
+    /// Buyer, transports, and rewards have all returned to the home hub.
+    pub returned_home: bool,
+}
+
 /// Shop purchase selected for a blueprint acquisition.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BlueprintShopPurchaseIntent {
@@ -418,7 +492,7 @@ pub struct BlueprintAcquireIntent {
     /// Optional preselected owned Autofactory code.
     #[serde(default)]
     pub autofactory: Option<String>,
-    /// Replicant selected to execute a shop trade.
+    /// Optional Replicant selected for shop execution or remote-source control.
     #[serde(default)]
     pub acquisition_replicant: Option<String>,
     /// Optional live shop opportunity. When absent, use the owned-copy path.
@@ -436,12 +510,18 @@ pub struct BlueprintAcquireCheckpoint {
     pub autofactory: Option<String>,
     /// Exact Autofactory location used as the decommission destination.
     pub autofactory_location: Option<String>,
-    /// Child manifest that stages trade criteria at a selected shop.
+    /// New reusable trade workflow used by shop-backed blueprint acquisition.
+    pub trade_child: Option<WorkflowId>,
+    /// Legacy child manifest that staged trade criteria before `trade.fulfillment`.
     pub criteria_logistics_child: Option<WorkflowId>,
     /// Child manifest that moves the selected physical device when necessary.
     pub logistics_child: Option<WorkflowId>,
-    /// Replicant claimed to execute a shop trade.
+    /// Replicant claimed to execute a shop trade or provide local control for
+    /// an otherwise out-of-range owned blueprint source.
     pub acquisition_replicant: Option<String>,
+    /// An owned source was selected while out of comms range and needs a
+    /// Replicant escort before logistics can command it.
+    pub control_escort_required: bool,
     /// Trade controller selected before any shop mutation.
     pub controller_code: Option<String>,
     /// Trade code selected before any shop mutation.
@@ -709,6 +789,11 @@ workflow_factory!(
     LogisticsManifestWorkflowFactory,
     LogisticsManifestWorkflow,
     logistics_manifest_workflow_kind
+);
+workflow_factory!(
+    TradeFulfillmentWorkflowFactory,
+    TradeFulfillmentWorkflow,
+    trade_fulfillment_workflow_kind
 );
 workflow_factory!(
     BlueprintAcquireWorkflowFactory,
@@ -1379,6 +1464,312 @@ fn retryable_manifest_planning_failure(error: &TransportError) -> bool {
     }
 }
 
+struct TradeFulfillmentWorkflow;
+impl WorkflowExecutor for TradeFulfillmentWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: TradeFulfillmentIntent = context.config().map_err(string_error)?;
+            validate_trade_fulfillment_intent(&intent)?;
+            let client = managed_client(context)?;
+            let mut checkpoint: TradeFulfillmentCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            claim_target(
+                context,
+                "trade-fulfillment",
+                &format!(
+                    "{}:{}",
+                    intent.controller.to_ascii_uppercase(),
+                    intent.trade_code.to_ascii_uppercase()
+                ),
+            )?;
+
+            let home = checkpoint
+                .home
+                .clone()
+                .unwrap_or_else(|| intent.home.trim().to_ascii_uppercase());
+            let home_system = match checkpoint.home_system.clone() {
+                Some(system) => system,
+                None => resolve_location_system(&client, &home).await?,
+            };
+            checkpoint.home = Some(home.clone());
+            checkpoint.home_system = Some(home_system.clone());
+
+            let replicant = resolve_and_claim_trade_replicant(
+                context,
+                &client,
+                checkpoint.replicant.as_deref().or(intent.replicant.as_deref()),
+                &home,
+                &home_system,
+            )
+            .await?;
+            checkpoint.replicant = Some(replicant.clone());
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+
+            if checkpoint.returned_home {
+                return context
+                    .mark_succeeded(Some(trade_fulfillment_report(&intent, &checkpoint)))
+                    .map_err(string_error);
+            }
+
+            if checkpoint.criteria.is_none() || checkpoint.rewards.is_none() {
+                let live_trade = live_shop_trade(&client, &intent.controller, &intent.trade_code).await?;
+                validate_live_trade_for_fulfillment(&intent, &live_trade)?;
+                checkpoint.criteria = Some(live_trade.criteria_bundle());
+                checkpoint.rewards = Some(live_trade.rewards_bundle());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            let criteria = checkpoint
+                .criteria
+                .clone()
+                .ok_or_else(|| "trade fulfillment has no criteria snapshot".to_owned())?;
+            let rewards = checkpoint
+                .rewards
+                .clone()
+                .ok_or_else(|| "trade fulfillment has no reward snapshot".to_owned())?;
+            validate_trade_bundle(&criteria, "criteria")?;
+            validate_trade_bundle(&rewards, "rewards")?;
+
+            if !checkpoint.purchase_authorized {
+                if !ensure_trade_replicant_at(
+                    context,
+                    &client,
+                    &checkpoint,
+                    &replicant,
+                    &home,
+                    "assembling_at_home",
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+
+                if !ensure_trade_payment_ready(
+                    context,
+                    &client,
+                    &intent,
+                    &mut checkpoint,
+                    &home,
+                    &home_system,
+                    &criteria,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+
+                if !ensure_trade_reward_capacity(
+                    context,
+                    &client,
+                    &mut checkpoint,
+                    &home_system,
+                    &intent.shop_location,
+                    &rewards,
+                    &replicant,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+
+                // The server chooses the most recently arrived Replicant as the
+                // buyer. Stage all logistics/escorts first, then send our claimed
+                // buyer as the final arrival immediately before the mutation.
+                if !ensure_trade_replicant_at(
+                    context,
+                    &client,
+                    &checkpoint,
+                    &replicant,
+                    &intent.shop_location,
+                    "travelling_to_shop",
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+
+                let live_trade = live_shop_trade(&client, &intent.controller, &intent.trade_code).await?;
+                validate_live_trade_for_fulfillment(&intent, &live_trade)?;
+                if live_trade.criteria_bundle() != criteria || live_trade.rewards_bundle() != rewards {
+                    return Err(format!(
+                        "trade {} changed after provisioning; refusing to execute stale criteria/rewards",
+                        intent.trade_code
+                    ));
+                }
+                let stock = live_trade.current_stock.unwrap_or_default();
+                if stock <= 0 {
+                    return Err(format!(
+                        "trade {} on controller {} is out of stock",
+                        intent.trade_code, intent.controller
+                    ));
+                }
+
+                checkpoint.pre_purchase_devices =
+                    snapshot_reward_device_codes(&client, &rewards).await?;
+                checkpoint.pre_purchase_stock = Some(stock);
+                checkpoint.purchase_authorized = true;
+                context
+                    .advance_to("executing_trade", &checkpoint)
+                    .map_err(string_error)?;
+
+                let operation = client
+                    .trading()
+                    .execute(&intent.controller, &intent.trade_code)
+                    .await
+                    .map_err(string_error)?;
+                checkpoint.purchase_submitted = true;
+                checkpoint.purchase_operation = Some(operation.id().as_str().to_owned());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                await_success(&operation).await?;
+                checkpoint.purchase_observed = true;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            } else if let Some(operation_id) = checkpoint.purchase_operation.clone() {
+                context
+                    .advance_to("recovering_trade", &checkpoint)
+                    .map_err(string_error)?;
+                let operation = client
+                    .operations()
+                    .get(OperationId::new(operation_id.clone()));
+                await_success(&operation).await.map_err(|error| {
+                    format!("managed trade operation {operation_id} could not be recovered: {error}")
+                })?;
+                checkpoint.purchase_observed = true;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            } else if !checkpoint.purchase_observed {
+                // Conservative ambiguity handling for the tiny crash window after
+                // authorization but before the managed operation ID is persisted.
+                // Device rewards can still prove success; otherwise do not submit
+                // a second irreversible trade.
+                let observed = observe_trade_reward_devices(
+                    &client,
+                    &rewards,
+                    &checkpoint.pre_purchase_devices,
+                    &intent.shop_location,
+                    1,
+                )
+                .await?;
+                if !observed.is_empty() {
+                    checkpoint.reward_devices = observed;
+                    checkpoint.purchase_observed = true;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                } else if trade_stock_decreased(
+                    &client,
+                    &intent.controller,
+                    &intent.trade_code,
+                    checkpoint.pre_purchase_stock,
+                )
+                .await?
+                {
+                    checkpoint.purchase_observed = true;
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                } else {
+                    context
+                        .advance_to("reconciling_trade", &checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(
+                            "trade was authorized but no managed operation ID was checkpointed; waiting for reward or stock-change evidence rather than resubmitting"
+                                .to_owned(),
+                        )
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+            }
+
+            if checkpoint.reward_devices.is_empty() && !rewards.devices.is_empty() {
+                let observed = observe_trade_reward_devices(
+                    &client,
+                    &rewards,
+                    &checkpoint.pre_purchase_devices,
+                    &intent.shop_location,
+                    24,
+                )
+                .await?;
+                let expected = trade_bundle_device_count(&rewards)?;
+                if observed.len() < expected {
+                    context
+                        .advance_to("awaiting_trade_rewards", &checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(format!(
+                            "trade completed but only {}/{} rewarded devices are visible at {}; waiting for managed ownership reconciliation",
+                            observed.len(), expected, intent.shop_location
+                        ))
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                }
+                checkpoint.reward_devices = observed;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            if !secure_trade_device_rewards(
+                context,
+                &client,
+                &mut checkpoint,
+                &replicant,
+                &intent.shop_location,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+
+            if !checkpoint.reward_resources_loaded && !rewards.resources.is_empty() {
+                load_trade_reward_resources(
+                    context,
+                    &client,
+                    &mut checkpoint,
+                    &intent.shop_location,
+                    &rewards.resources,
+                )
+                .await?;
+                checkpoint.reward_resources_loaded = true;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            if !return_trade_assets_home(
+                context,
+                &client,
+                &mut checkpoint,
+                &replicant,
+                &home,
+                &rewards.resources,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            checkpoint.returned_home = true;
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            context
+                .mark_succeeded(Some(trade_fulfillment_report(&intent, &checkpoint)))
+                .map_err(string_error)
+        })
+    }
+}
+
 struct BlueprintAcquireWorkflow;
 impl WorkflowExecutor for BlueprintAcquireWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
@@ -1495,21 +1886,25 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 return Ok(());
             }
 
-            if intent.shop.is_some()
-                && checkpoint.source_device.is_none()
-                && !prepare_shop_blueprint_source(context, &client, &intent, &mut checkpoint)
+            if intent.shop.is_some() && checkpoint.source_device.is_none() {
+                let ready = if legacy_shop_purchase_in_progress(&checkpoint) {
+                    prepare_shop_blueprint_source(context, &client, &intent, &mut checkpoint).await?
+                } else {
+                    prepare_shop_blueprint_source_via_trade(
+                        context,
+                        &client,
+                        &intent,
+                        &mut checkpoint,
+                    )
                     .await?
-            {
-                return Ok(());
+                };
+                if !ready {
+                    return Ok(());
+                }
             }
             let devices = owned_device_snapshots(&client).await?;
             let source = resolve_blueprint_source(&intent, &checkpoint, &devices)?;
             let factory = resolve_blueprint_factory(&intent, &checkpoint, &devices, &source)?;
-            let source_location = source
-                .location
-                .as_ref()
-                .map(|location| location.id.as_str().to_owned())
-                .ok_or_else(|| format!("blueprint source {} has no location", source.key.id))?;
             let factory_location = factory
                 .location
                 .as_ref()
@@ -1526,7 +1921,96 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                 .map_err(string_error)?;
             claim(context, ResourceKey::Autofactory(factory_code.clone()))?;
 
+            let source_needs_control = checkpoint.control_escort_required
+                || source
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.as_str().eq_ignore_ascii_case("out_of_range"));
+            if source_needs_control {
+                checkpoint.control_escort_required = true;
+                let source_location = blueprint_source_location(&source, &devices)
+                    .ok_or_else(|| {
+                        format!(
+                            "blueprint source {} has no resolvable location for control-range staging",
+                            source.key.id
+                        )
+                    })?
+                    .to_owned();
+                let source_system = resolve_location_system(&client, &source_location).await?;
+                let pinned_replicant = checkpoint
+                    .acquisition_replicant
+                    .as_deref()
+                    .or(intent.acquisition_replicant.as_deref())
+                    .or_else(|| {
+                        source
+                            .relationships
+                            .assigned_replicant
+                            .as_ref()
+                            .map(|replicant| replicant.id.as_str())
+                    });
+                let escort =
+                    resolve_and_claim_replicant(context, &client, pinned_replicant).await?;
+                let Some(escort) = escort else {
+                    context
+                        .advance_to("awaiting_blueprint_control_replicant", &checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(format!(
+                            "blueprint source {source_code} is in {source_system} but no unclaimed Replicant is available to establish local control"
+                        ))
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(());
+                };
+                checkpoint.acquisition_replicant = Some(escort.clone());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                if !ensure_blueprint_replicant_at(
+                    context,
+                    &client,
+                    &checkpoint,
+                    &escort,
+                    &source_system,
+                    true,
+                    "positioning_blueprint_control",
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+
+            let source = client
+                .devices()
+                .refresh(&source_code)
+                .await
+                .map_err(string_error)?
+                .snapshot()
+                .await
+                .map_err(string_error)?;
+            let source = prepare_blueprint_source_for_transport(
+                context,
+                &client,
+                &checkpoint,
+                source,
+            )
+            .await?;
+            let source_location = source
+                .location
+                .as_ref()
+                .map(|location| location.id.as_str().to_owned())
+                .ok_or_else(|| {
+                    format!(
+                        "blueprint source {} has no standing location after preparation",
+                        source.key.id
+                    )
+                })?;
+
             if !source_location.eq_ignore_ascii_case(&factory_location) {
+                context
+                    .release_claim(&ResourceKey::Device(source_code.clone()))
+                    .map_err(string_error)?;
                 let child_id = match checkpoint.logistics_child {
                     Some(id) => id,
                     None => {
@@ -1598,6 +2082,22 @@ impl WorkflowExecutor for BlueprintAcquireWorkflow {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
+                }
+
+                if checkpoint.control_escort_required
+                    && let Some(escort) = checkpoint.acquisition_replicant.as_deref()
+                    && !ensure_blueprint_replicant_at(
+                        context,
+                        &client,
+                        &checkpoint,
+                        escort,
+                        &factory_location,
+                        false,
+                        "returning_blueprint_control",
+                    )
+                    .await?
+                {
+                    return Ok(());
                 }
             }
 
@@ -1678,19 +2178,74 @@ impl WorkflowExecutor for ExplorationWorkflow {
             let client = managed_client(context)?;
             let mut checkpoint: ExplorationWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
-            let replicant = match checkpoint.replicant.clone() {
-                Some(value) => value,
-                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            release_legacy_exploration_location_claims(context)?;
+
+            let requested_hub = checkpoint.hub.as_deref().or(intent.hub.as_deref());
+            let Some(home) = resolve_exploration_home(context, &client, requested_hub).await? else {
+                return wait_for_exploration_capacity(
+                    context,
+                    &checkpoint,
+                    "awaiting_available_autofactory",
+                    "all Autofactories at eligible manufacturing homes are currently claimed by other workflows",
+                );
             };
-            let hub = match checkpoint.hub.clone() {
-                Some(value) => value,
-                None => resolve_home(&client, intent.hub.as_deref()).await?,
+            let ExplorationHomeSelection {
+                location: hub,
+                unavailable_autofactories,
+            } = home;
+
+            let replicant_was_checkpointed = checkpoint.replicant.is_some();
+            let replicant = if let Some(value) = checkpoint.replicant.clone() {
+                if !try_claim_available(context, ResourceKey::Replicant(value.clone()))? {
+                    return wait_for_exploration_capacity(
+                        context,
+                        &checkpoint,
+                        "awaiting_available_replicant",
+                        "selected Replicant is currently claimed by another workflow",
+                    );
+                }
+                value
+            } else {
+                let Some(value) = resolve_and_claim_replicant(
+                    context,
+                    &client,
+                    intent.replicant.as_deref(),
+                )
+                .await?
+                else {
+                    return wait_for_exploration_capacity(
+                        context,
+                        &checkpoint,
+                        "awaiting_available_replicant",
+                        "all eligible Replicants are currently claimed by other workflows",
+                    );
+                };
+                value
             };
+
+            if !try_claim_available(
+                context,
+                ResourceKey::Namespaced {
+                    namespace: "exploration-target".to_owned(),
+                    key: intent.target.clone(),
+                },
+            )? {
+                if !replicant_was_checkpointed {
+                    release_exploration_claim(
+                        context,
+                        &ResourceKey::Replicant(replicant.clone()),
+                    )?;
+                }
+                return wait_for_exploration_capacity(
+                    context,
+                    &checkpoint,
+                    "awaiting_exploration_target",
+                    "the requested exploration target is already being handled by another workflow",
+                );
+            }
+
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.hub = Some(hub.clone());
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
-            claim_target(context, "location", &hub)?;
-            claim_target(context, "exploration-target", &intent.target)?;
 
             let plan_file = scratch_file(context.id(), "relay-plan.json")?;
             if let Some(state) = checkpoint.state.as_ref() {
@@ -1705,9 +2260,10 @@ impl WorkflowExecutor for ExplorationWorkflow {
                 replicant,
                 hub,
                 targets: vec![intent.target.clone()],
-                mission_file: plan_file,
+                mission_file: plan_file.clone(),
                 max_hop_ly: 7.499,
                 wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                unavailable_autofactories,
             };
             let result = execute_relay_workflow(&client, &request, |state| {
                 let (replicant, devices, factories) = state.resources();
@@ -1715,9 +2271,11 @@ impl WorkflowExecutor for ExplorationWorkflow {
                 for device in devices {
                     claim_device(context, device)?;
                 }
-                for factory in factories {
-                    claim(context, ResourceKey::Autofactory(factory.to_owned()))?;
-                }
+                let factories = factories
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                reconcile_exploration_autofactory_claims(context, &factories)?;
                 checkpoint.state = Some(state.clone());
                 context
                     .advance_to(state.step_name(), &checkpoint)
@@ -1725,10 +2283,41 @@ impl WorkflowExecutor for ExplorationWorkflow {
             })
             .await;
             match result {
-                Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
+                Ok(report) => {
+                    release_exploration_autofactory_claims(context)?;
+                    context.mark_succeeded(Some(report)).map_err(string_error)
+                }
                 Err(error) => {
                     let message = error.to_string();
-                    if retryable_connectivity_dependency_failure(&message) {
+                    if stale_relay_plan_failure(&message) {
+                        release_exploration_autofactory_claims(context)?;
+                        tracing::warn!(
+                            workflow_id = %context.id(),
+                            target = %intent.target,
+                            error = %message,
+                            "relay topology changed underneath the saved plan; discarding it and replanning"
+                        );
+                        checkpoint.state = None;
+                        clear_scratch_file(&plan_file)?;
+                        context
+                            .advance_to("replanning_relay_coverage", &checkpoint)
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)
+                    } else if resource_claim_contention(&message) {
+                        release_exploration_autofactory_claims(context)?;
+                        tracing::warn!(
+                            workflow_id = %context.id(),
+                            target = %intent.target,
+                            error = %message,
+                            "relay expansion encountered temporary workflow resource contention; replanning after the owner releases it"
+                        );
+                        checkpoint.state = None;
+                        clear_scratch_file(&plan_file)?;
+                        context
+                            .advance_to("awaiting_available_resources", &checkpoint)
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)
+                    } else if retryable_connectivity_dependency_failure(&message) {
                         tracing::warn!(
                             workflow_id = %context.id(),
                             target = %intent.target,
@@ -2093,8 +2682,14 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                                     if let Ok(archive) = archive_event_campaign(&plan_file) {
                                         checkpoint.archive = Some(archive);
                                     }
+                                    let step = if event_campaign_failure_waits_for_inputs(&message)
+                                    {
+                                        "waiting_for_event_inputs"
+                                    } else {
+                                        "waiting_for_control_range"
+                                    };
                                     context
-                                        .advance_to("waiting_for_control_range", &checkpoint)
+                                        .advance_to(step, &checkpoint)
                                         .map_err(string_error)?;
                                 }
                                 context.persist_checkpoint(&checkpoint).map_err(string_error)?;
@@ -2131,9 +2726,16 @@ impl WorkflowExecutor for EventCampaignWorkflow {
     }
 }
 
+fn event_campaign_failure_waits_for_inputs(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("all currently feasible events completed, but blocked events remain")
+}
+
 fn retryable_event_campaign_failure(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("out of comms range")
+    event_campaign_failure_waits_for_inputs(&message)
+        || message.contains("out of comms range")
         || message.contains("out of control range")
         || message.contains("not your device")
         || message.contains("not present in the account-owned device projection")
@@ -2314,6 +2916,18 @@ pub(crate) async fn reconcile_event_connectivity(
     Ok(true)
 }
 
+fn stale_relay_plan_failure(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("planned account-owned relay coverage is no longer relaying")
+}
+
+fn resource_claim_contention(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("resource is already claimed by workflow")
+}
+
 fn retryable_connectivity_dependency_failure(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no relay network connects")
@@ -2321,6 +2935,10 @@ fn retryable_connectivity_dependency_failure(message: &str) -> bool {
         || message.contains("missing blueprint")
         || message.contains("insufficient manufacturing inventory")
         || message.contains("requires an idle attachment carrier")
+        || message.contains("no usable stow capacity")
+        || message.contains("not currently projected as stationary in a star system")
+        || message.contains("has no known l4 or l5 deployment location")
+        || message.contains("client is closed")
         || message.contains("no eligible autofactory")
         || message.contains("internal server error")
         || message.contains("unexpected http status 500")
@@ -2690,6 +3308,17 @@ pub fn new_logistics_manifest_workflow(
     )
 }
 
+/// Creates a queued provisioned trade-fulfillment workflow.
+pub fn new_trade_fulfillment_workflow(
+    intent: TradeFulfillmentIntent,
+) -> NewWorkflow<TradeFulfillmentIntent, TradeFulfillmentCheckpoint> {
+    queued_workflow(
+        trade_fulfillment_workflow_kind(),
+        intent,
+        TradeFulfillmentCheckpoint::default(),
+    )
+}
+
 /// Creates a queued owned-copy or shop blueprint acquisition workflow.
 pub fn new_blueprint_acquire_workflow(
     intent: BlueprintAcquireIntent,
@@ -2993,6 +3622,1416 @@ async fn owned_device_snapshots(client: &Client) -> Result<Vec<Device>, String> 
     Ok(devices)
 }
 
+
+fn validate_trade_fulfillment_intent(intent: &TradeFulfillmentIntent) -> Result<(), String> {
+    for (label, value) in [
+        ("trade controller", intent.controller.as_str()),
+        ("trade code", intent.trade_code.as_str()),
+        ("shop location", intent.shop_location.as_str()),
+        ("home hub", intent.home.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("trade fulfillment requires a {label}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_trade_bundle(bundle: &TradeBundle, label: &str) -> Result<(), String> {
+    if !bundle.unknown.is_empty() {
+        return Err(format!(
+            "trade {label} contain unsupported fields {:?}; refusing automatic execution",
+            bundle.unknown.keys().collect::<Vec<_>>()
+        ));
+    }
+    if bundle
+        .resources
+        .values()
+        .chain(bundle.devices.values())
+        .any(|quantity| *quantity < 0)
+    {
+        return Err(format!("trade {label} contain a negative quantity"));
+    }
+    Ok(())
+}
+
+async fn live_shop_trade(
+    client: &Client,
+    controller: &str,
+    trade_code: &str,
+) -> Result<crate::trade::ShopTrade, String> {
+    shop_trades(client, controller)
+        .await
+        .map_err(string_error)?
+        .into_iter()
+        .find(|trade| trade.trade_code.eq_ignore_ascii_case(trade_code))
+        .ok_or_else(|| format!("trade {trade_code} on controller {controller} is not available"))
+}
+
+async fn trade_stock_decreased(
+    client: &Client,
+    controller: &str,
+    trade_code: &str,
+    before: Option<i64>,
+) -> Result<bool, String> {
+    let Some(before) = before else {
+        return Ok(false);
+    };
+    let current = shop_trades(client, controller)
+        .await
+        .map_err(string_error)?
+        .into_iter()
+        .find(|trade| trade.trade_code.eq_ignore_ascii_case(trade_code));
+    Ok(match current {
+        Some(trade) => trade.current_stock.is_some_and(|stock| stock < before),
+        None => before > 0,
+    })
+}
+
+fn validate_live_trade_for_fulfillment(
+    intent: &TradeFulfillmentIntent,
+    trade: &crate::trade::ShopTrade,
+) -> Result<(), String> {
+    if trade.current_stock.unwrap_or_default() <= 0 {
+        return Err(format!(
+            "trade {} on controller {} is out of stock",
+            intent.trade_code, intent.controller
+        ));
+    }
+    let criteria = trade.criteria_bundle();
+    let rewards = trade.rewards_bundle();
+    validate_trade_bundle(&criteria, "criteria")?;
+    validate_trade_bundle(&rewards, "rewards")?;
+    if let Some(expected) = intent
+        .expected_reward_device
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && rewards
+            .devices
+            .get(expected)
+            .copied()
+            .unwrap_or_default()
+            <= 0
+    {
+        return Err(format!(
+            "trade {} no longer rewards expected device {}",
+            intent.trade_code, expected
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_and_claim_trade_replicant(
+    context: &WorkflowContext,
+    client: &Client,
+    pinned: Option<&str>,
+    home: &str,
+    home_system: &str,
+) -> Result<String, String> {
+    if let Some(code) = pinned.filter(|value| !value.trim().is_empty()) {
+        client
+            .replicants()
+            .get_owned(code)
+            .await
+            .map_err(string_error)?;
+        if try_claim_available(context, ResourceKey::Replicant(code.to_owned()))? {
+            return Ok(code.to_owned());
+        }
+        return Err(format!(
+            "selected trade Replicant {code} is claimed by another workflow"
+        ));
+    }
+
+    let handles = client
+        .replicants()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut candidates = Vec::new();
+    for handle in handles {
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if snapshot.travel.is_some() {
+            continue;
+        }
+        let location = snapshot
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str())
+            .unwrap_or_default();
+        let rank = if location.eq_ignore_ascii_case(home) {
+            0
+        } else if designation_in_system(location, home_system) {
+            1
+        } else {
+            2
+        };
+        candidates.push((rank, snapshot.key.id.as_str().to_owned()));
+    }
+    candidates.sort();
+    for (_, code) in candidates {
+        if try_claim_available(context, ResourceKey::Replicant(code.clone()))? {
+            return Ok(code);
+        }
+    }
+    Err("no unclaimed owned Replicant is available for trade fulfillment".to_owned())
+}
+
+async fn ensure_trade_replicant_at(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &TradeFulfillmentCheckpoint,
+    replicant_code: &str,
+    destination: &str,
+    step: &str,
+) -> Result<bool, String> {
+    let handle = client
+        .replicants()
+        .get_owned(replicant_code)
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        return Ok(true);
+    }
+    if let Some(travel) = &snapshot.travel {
+        let planned = travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str());
+        if planned.is_some_and(|planned| planned.eq_ignore_ascii_case(destination)) {
+            context.advance_to(step, checkpoint).map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        return Err(format!(
+            "trade Replicant {replicant_code} is already travelling to {:?}, not {destination}",
+            planned
+        ));
+    }
+    context.advance_to(step, checkpoint).map_err(string_error)?;
+    let operation = handle
+        .travel()
+        .to(destination.to_owned())
+        .depart()
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+    let refreshed = handle.refresh().await.map_err(string_error)?;
+    let snapshot = refreshed.snapshot().await.map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        Ok(true)
+    } else {
+        context.mark_waiting().map_err(string_error)?;
+        Ok(false)
+    }
+}
+
+async fn ensure_trade_payment_ready(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &TradeFulfillmentIntent,
+    checkpoint: &mut TradeFulfillmentCheckpoint,
+    home: &str,
+    home_system: &str,
+    criteria: &TradeBundle,
+) -> Result<bool, String> {
+    if let Some(child_id) = checkpoint.payment_logistics_child {
+        let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+            return Err(format!("trade payment logistics child {child_id} disappeared"));
+        };
+        match child.status {
+            WorkflowStatus::Succeeded => {
+                let child_checkpoint: LogisticsWorkflowCheckpoint =
+                    child.checkpoint().map_err(string_error)?;
+                checkpoint.outbound_plan = child_checkpoint.plan;
+                checkpoint.payment_logistics_child = None;
+                context
+                    .persist_checkpoint(checkpoint)
+                    .map_err(string_error)?;
+            }
+            WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let error = child.last_error.unwrap_or_default();
+                if child.status == WorkflowStatus::Failed
+                    && retryable_trade_criteria_logistics_failure(&error)
+                {
+                    checkpoint.payment_logistics_child = None;
+                    checkpoint.outbound_plan = None;
+                    context
+                        .advance_to("replanning_trade_payment", checkpoint)
+                        .map_err(string_error)?;
+                    context
+                        .emit_activity(format!(
+                            "trade payment logistics hit stale source state ({error}); recomputing the remaining manifest"
+                        ))
+                        .map_err(string_error)?;
+                    context.mark_waiting().map_err(string_error)?;
+                    return Ok(false);
+                }
+                return Err(format!(
+                    "trade payment logistics child {child_id} ended as {:?}: {error}",
+                    child.status
+                ));
+            }
+            _ => {
+                context
+                    .advance_to("staging_trade_payment", checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(false);
+            }
+        }
+    }
+
+    let mut devices = owned_device_snapshots(client).await?;
+    let unlocked = client
+        .blueprints()
+        .unlocked_device_types()
+        .await
+        .map_err(string_error)?;
+    let mut print_requests = Vec::new();
+    for (device_type, required) in &criteria.devices {
+        let required = usize::try_from(*required)
+            .map_err(|_| format!("invalid trade device criterion quantity {required}"))?;
+        let available = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(&intent.shop_location)
+                            || designation_in_system(location.id.as_str(), home_system)
+                    })
+            })
+            .count();
+        if available >= required {
+            continue;
+        }
+        let kind = DeviceType::from(device_type.as_str());
+        if !unlocked.contains(&kind) {
+            context
+                .advance_to("waiting_for_trade_payment_blueprint", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "trade requires {required} {device_type}, but only {available} releasable copies are in the home/shop scope and its blueprint is not unlocked"
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        print_requests.push(PrintRequest::new(
+            device_type.clone(),
+            i64::try_from(required - available)
+                .map_err(|_| "trade print quantity exceeded i64".to_owned())?,
+        ));
+    }
+
+    if !print_requests.is_empty() {
+        let tag = checkpoint
+            .payment_print_tag
+            .get_or_insert_with(|| format!("trade-pay:{}", &context.id().to_string()[..8]))
+            .clone();
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        context
+            .advance_to("printing_trade_payment", checkpoint)
+            .map_err(string_error)?;
+        let mut options = QueueOptions::at(home.to_owned());
+        options.tags = vec![tag.clone()];
+        options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+        queue_prints_with_components(client, &print_requests, &options)
+            .await
+            .map_err(string_error)?;
+        loop {
+            let status = printing_status_in_system(
+                client,
+                home,
+                &print_requests,
+                std::slice::from_ref(&tag),
+            )
+            .await
+            .map_err(string_error)?;
+            if status
+                .requested
+                .iter()
+                .all(|line| line.available >= line.required)
+            {
+                break;
+            }
+            match context.control_request().map_err(string_error)? {
+                replicant_workflow::ControlRequest::Continue => {}
+                replicant_workflow::ControlRequest::Pause
+                | replicant_workflow::ControlRequest::Cancel => return Ok(false),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        client
+            .devices()
+            .refresh_many()
+            .with_tag(tag)
+            .at(home.to_owned())
+            .collect()
+            .await
+            .map_err(string_error)?;
+        devices = owned_device_snapshots(client).await?;
+    }
+
+    let inventories = fetch_account_inventories(client).await?;
+    let resources_at_shop = inventory_at_location(&inventories, &intent.shop_location);
+    let mut missing_resources = ResourceMap::new();
+    for (resource, required) in &criteria.resources {
+        let present = resources_at_shop.get(resource).copied().unwrap_or_default();
+        if present < *required {
+            missing_resources.insert(resource.clone(), required - present);
+        }
+    }
+    let resources_at_home = inventory_in_system_excluding(
+        &inventories,
+        home_system,
+        &intent.shop_location,
+    );
+    for (resource, missing) in &missing_resources {
+        let available = resources_at_home.get(resource).copied().unwrap_or_default();
+        if available < *missing {
+            context
+                .advance_to("waiting_for_trade_payment_resources", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "trade needs {missing} more {resource} at {}, but home system {home_system} only has {available} available outside the shop",
+                    intent.shop_location
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+    }
+
+    let mut payment_codes = Vec::new();
+    for (device_type, required) in &criteria.devices {
+        let required = usize::try_from(*required)
+            .map_err(|_| format!("invalid trade device criterion quantity {required}"))?;
+        let mut at_shop = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(&intent.shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        at_shop.sort();
+        if at_shop.len() >= required {
+            continue;
+        }
+        let missing = required - at_shop.len();
+        let mut at_home = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        designation_in_system(location.id.as_str(), home_system)
+                            && !location
+                                .id
+                                .as_str()
+                                .eq_ignore_ascii_case(&intent.shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        at_home.sort();
+        if at_home.len() < missing {
+            context
+                .advance_to("waiting_for_trade_payment_devices", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        payment_codes.extend(at_home.into_iter().take(missing));
+    }
+    payment_codes.sort();
+    payment_codes.dedup();
+    checkpoint.payment_device_codes = payment_codes.clone();
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+
+    if !missing_resources.is_empty() || !payment_codes.is_empty() {
+        let child = context
+            .create_child(new_logistics_manifest_workflow(LogisticsManifestIntent {
+                origin: home_system.to_owned(),
+                destination: intent.shop_location.clone(),
+                resources: missing_resources,
+                devices: Vec::new(),
+                device_codes: payment_codes.clone(),
+                device_tags: Vec::new(),
+                return_transports: false,
+                allow_transport_staging: true,
+                region: intent.preferred_region.clone(),
+                purpose: format!(
+                    "trade-fulfillment:{}:{}:payment",
+                    intent.controller, intent.trade_code
+                ),
+            }))
+            .map_err(string_error)?;
+        for code in &payment_codes {
+            context
+                .repository()
+                .acquire_claim(child.id, ResourceKey::Device(code.clone()))
+                .map_err(string_error)?;
+        }
+        checkpoint.payment_logistics_child = Some(child.id);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        context
+            .advance_to("staging_trade_payment", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    // Reserve the exact shop-side criterion devices through the irreversible
+    // trade so parallel workflows cannot consume them after preflight.
+    for (device_type, required) in &criteria.devices {
+        let required = usize::try_from(*required)
+            .map_err(|_| format!("invalid trade device criterion quantity {required}"))?;
+        let mut at_shop = devices
+            .iter()
+            .filter(|device| {
+                trade_payment_device_is_releasable(device, device_type)
+                    && device.location.as_ref().is_some_and(|location| {
+                        location.id.as_str().eq_ignore_ascii_case(&intent.shop_location)
+                    })
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        at_shop.sort();
+        if at_shop.len() < required {
+            context
+                .advance_to("waiting_for_trade_payment", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        for code in at_shop.into_iter().take(required) {
+            if !try_claim_available(context, ResourceKey::Device(code.clone()))? {
+                context
+                    .advance_to("waiting_for_trade_payment_claim", checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(false);
+            }
+        }
+    }
+    let resources_now =
+        inventory_at_location(&fetch_account_inventories(client).await?, &intent.shop_location);
+    if criteria.resources.iter().any(|(resource, required)| {
+        resources_now.get(resource).copied().unwrap_or_default() < *required
+    }) {
+        context
+            .advance_to("waiting_for_trade_payment", checkpoint)
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn inventory_in_system_excluding(
+    inventories: &[replicant_client::domain::Inventory],
+    system: &str,
+    excluded_location: &str,
+) -> ResourceMap {
+    let mut resources = ResourceMap::new();
+    for inventory in inventories.iter().filter(|inventory| {
+        inventory.location.as_ref().is_some_and(|key| {
+            designation_in_system(key.id.as_str(), system)
+                && !key.id.as_str().eq_ignore_ascii_case(excluded_location)
+        })
+    }) {
+        for item in &inventory.items {
+            *resources.entry(item.resource.clone()).or_default() += item.quantity;
+        }
+    }
+    resources
+}
+
+fn trade_bundle_device_count(bundle: &TradeBundle) -> Result<usize, String> {
+    bundle.devices.values().try_fold(0usize, |total, quantity| {
+        let quantity = usize::try_from(*quantity)
+            .map_err(|_| format!("invalid trade reward device quantity {quantity}"))?;
+        total
+            .checked_add(quantity)
+            .ok_or_else(|| "trade reward device quantity overflowed usize".to_owned())
+    })
+}
+
+fn trade_bundle_resource_count(bundle: &TradeBundle) -> i64 {
+    bundle
+        .resources
+        .values()
+        .copied()
+        .fold(0i64, i64::saturating_add)
+        .max(0)
+}
+
+async fn trade_replicant_stow_free(client: &Client, replicant: &str) -> Result<i64, String> {
+    let snapshot = client
+        .replicants()
+        .get_owned(replicant)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let Some(vessel) = snapshot.hosted_device.as_ref() else {
+        return Ok(0);
+    };
+    let vessel = client
+        .devices()
+        .refresh(vessel.id.as_str())
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    Ok(vessel
+        .stow_capacity
+        .unwrap_or_default()
+        .saturating_sub(vessel.stow_used.unwrap_or_default())
+        .max(0))
+}
+
+fn trade_transport_codes(checkpoint: &TradeFulfillmentCheckpoint) -> Vec<String> {
+    let mut codes = checkpoint
+        .outbound_plan
+        .as_ref()
+        .into_iter()
+        .flat_map(|plan| {
+            plan.cargo_transports
+                .iter()
+                .chain(plan.device_carriers.iter())
+                .cloned()
+        })
+        .chain(checkpoint.escort_carriers.iter().cloned())
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+async fn free_trade_transport_capacity(
+    client: &Client,
+    code: &str,
+) -> Result<(i64, i64), String> {
+    let detail = client.raw().devices().get(code).await.map_err(string_error)?.value;
+    let cargo_used = detail
+        .cargo
+        .iter()
+        .filter_map(|item| item.quantity)
+        .fold(0i64, i64::saturating_add)
+        .max(0);
+    let attached = i64::try_from(detail.attached_devices.len())
+        .map_err(|_| "attachment count exceeded i64".to_owned())?;
+    Ok((
+        detail
+            .cargo_capacity
+            .unwrap_or_default()
+            .saturating_sub(cargo_used)
+            .max(0),
+        detail
+            .attach_capacity
+            .unwrap_or_default()
+            .saturating_sub(attached)
+            .max(0),
+    ))
+}
+
+async fn trade_transport_is_empty(client: &Client, code: &str) -> Result<bool, String> {
+    let detail = client
+        .raw()
+        .devices()
+        .get(code)
+        .await
+        .map_err(string_error)?
+        .value;
+    Ok(raw_cargo_quantity(&detail) == 0
+        && detail.attached_devices.is_empty()
+        && detail.stowed_devices.is_empty()
+        && detail.controller_device_code.is_none()
+        && detail.hosting_replicant.is_none())
+}
+
+async fn ensure_trade_reward_capacity(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut TradeFulfillmentCheckpoint,
+    home_system: &str,
+    shop_location: &str,
+    rewards: &TradeBundle,
+    replicant: &str,
+) -> Result<bool, String> {
+    let stow_free = trade_replicant_stow_free(client, replicant).await?;
+    let device_rewards = i64::try_from(trade_bundle_device_count(rewards)?)
+        .map_err(|_| "trade reward device count exceeded i64".to_owned())?;
+    let attach_needed = device_rewards.saturating_sub(stow_free).max(0);
+    let cargo_needed = trade_bundle_resource_count(rewards);
+
+    let mut transport_codes = trade_transport_codes(checkpoint);
+    for code in &transport_codes {
+        if !try_claim_available(context, ResourceKey::Device(code.clone()))? {
+            context
+                .advance_to("waiting_for_trade_return_transport", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "trade transport {code} was claimed after payment staging; waiting to reserve the return fleet"
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+    }
+
+    let mut cargo_capacity = 0i64;
+    let mut attach_capacity = 0i64;
+    for code in &transport_codes {
+        let (cargo, attach) = free_trade_transport_capacity(client, code).await?;
+        cargo_capacity = cargo_capacity.saturating_add(cargo);
+        attach_capacity = attach_capacity.saturating_add(attach);
+    }
+
+    if cargo_capacity >= cargo_needed && attach_capacity >= attach_needed {
+        return Ok(true);
+    }
+
+    let devices = owned_device_snapshots(client).await?;
+    let excluded = transport_codes
+        .iter()
+        .map(|code| code.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = devices
+        .iter()
+        .filter(|device| {
+            let code = device.key.id.as_str();
+            !excluded.contains(&code.to_ascii_uppercase())
+                && device.access == AccessScope::Owned
+                && !workflow_reserved(&device.tags)
+                && device.travel.is_none()
+                && device.location.as_ref().is_some_and(|location| {
+                    designation_in_system(location.id.as_str(), home_system)
+                })
+                && device.relationships.attached_to.is_none()
+                && device.relationships.stowed_in.is_none()
+                && device.relationships.controller.is_none()
+                && device.relationships.hosting_replicant.is_none()
+                && device.relationships.attached_devices.is_empty()
+                && device.relationships.stowed_devices.is_empty()
+                && device.relationships.controlled_devices.is_empty()
+                && device.available_commands.iter().any(|command| {
+                    command.as_str().eq_ignore_ascii_case("travel")
+                })
+                && (device.attach_capacity.unwrap_or_default() > 0
+                    || device
+                        .available_commands
+                        .iter()
+                        .any(|command| command.as_str().eq_ignore_ascii_case("collect_resources")))
+        })
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    for code in candidates {
+        if cargo_capacity >= cargo_needed && attach_capacity >= attach_needed {
+            break;
+        }
+        if !trade_transport_is_empty(client, &code).await? {
+            continue;
+        }
+        let (cargo, attach) = free_trade_transport_capacity(client, &code).await?;
+        if cargo == 0 && attach == 0 {
+            continue;
+        }
+        if !try_claim_available(context, ResourceKey::Device(code.clone()))? {
+            continue;
+        }
+        checkpoint.escort_carriers.push(code.clone());
+        checkpoint.escort_carriers.sort();
+        checkpoint.escort_carriers.dedup();
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        if !ensure_trade_device_at(
+            context,
+            client,
+            checkpoint,
+            &code,
+            shop_location,
+            "staging_trade_reward_carriers",
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        cargo_capacity = cargo_capacity.saturating_add(cargo);
+        attach_capacity = attach_capacity.saturating_add(attach);
+        transport_codes.push(code);
+    }
+
+    if cargo_capacity < cargo_needed || attach_capacity < attach_needed {
+        context
+            .advance_to("waiting_for_trade_reward_capacity", checkpoint)
+            .map_err(string_error)?;
+        context
+            .emit_activity(format!(
+                "trade rewards need cargo {cargo_needed} and attachment {attach_needed} return capacity after Replicant stow space; reserved capacity is cargo {cargo_capacity}, attachment {attach_capacity}"
+            ))
+            .map_err(string_error)?;
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+async fn ensure_trade_device_at(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &TradeFulfillmentCheckpoint,
+    code: &str,
+    destination: &str,
+    step: &str,
+) -> Result<bool, String> {
+    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        return Ok(true);
+    }
+    if let Some(travel) = &snapshot.travel {
+        let planned = travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str());
+        if planned.is_some_and(|planned| planned.eq_ignore_ascii_case(destination)) {
+            context.advance_to(step, checkpoint).map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        }
+        return Err(format!(
+            "trade transport {code} is already travelling to {:?}, not {destination}",
+            planned
+        ));
+    }
+    context.advance_to(step, checkpoint).map_err(string_error)?;
+    let operation = handle
+        .command(replicant_client::raw::devices::DeviceCommand::Travel {
+            destination: destination.to_owned(),
+            dry_run: None,
+            via: None,
+        })
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+    let snapshot = handle
+        .refresh()
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if snapshot
+        .location
+        .as_ref()
+        .is_some_and(|location| location.id.as_str().eq_ignore_ascii_case(destination))
+    {
+        Ok(true)
+    } else {
+        context.mark_waiting().map_err(string_error)?;
+        Ok(false)
+    }
+}
+
+async fn snapshot_reward_device_codes(
+    client: &Client,
+    rewards: &TradeBundle,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let devices = owned_device_snapshots(client).await?;
+    let mut result = BTreeMap::new();
+    for device_type in rewards.devices.keys() {
+        let mut codes = devices
+            .iter()
+            .filter(|device| {
+                device
+                    .device_type
+                    .as_ref()
+                    .is_some_and(|kind| kind.as_str().eq_ignore_ascii_case(device_type))
+            })
+            .map(|device| device.key.id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        codes.sort();
+        result.insert(device_type.clone(), codes);
+    }
+    Ok(result)
+}
+
+async fn observe_trade_reward_devices(
+    client: &Client,
+    rewards: &TradeBundle,
+    before: &BTreeMap<String, Vec<String>>,
+    shop_location: &str,
+    attempts: usize,
+) -> Result<Vec<String>, String> {
+    for attempt in 0..attempts.max(1) {
+        let mut selected = Vec::new();
+        let mut complete = true;
+        for (device_type, quantity) in &rewards.devices {
+            let required = usize::try_from(*quantity)
+                .map_err(|_| format!("invalid trade reward quantity {quantity}"))?;
+            let before = before
+                .get(device_type)
+                .into_iter()
+                .flatten()
+                .map(|code| code.to_ascii_uppercase())
+                .collect::<BTreeSet<_>>();
+            let handles = client
+                .devices()
+                .refresh_many()
+                .of_type(DeviceType::from(device_type.as_str()))
+                .at(shop_location.to_owned())
+                .collect()
+                .await
+                .map_err(string_error)?;
+            let mut candidates = Vec::new();
+            for handle in handles {
+                let device = handle.snapshot().await.map_err(string_error)?;
+                if device.access != AccessScope::Owned
+                    || before.contains(&device.key.id.as_str().to_ascii_uppercase())
+                    || device.location.as_ref().is_none_or(|location| {
+                        !location.id.as_str().eq_ignore_ascii_case(shop_location)
+                    })
+                {
+                    continue;
+                }
+                candidates.push(device.key.id.as_str().to_owned());
+            }
+            candidates.sort();
+            if candidates.len() < required {
+                complete = false;
+                break;
+            }
+            selected.extend(candidates.into_iter().take(required));
+        }
+        if complete {
+            selected.sort();
+            selected.dedup();
+            return Ok(selected);
+        }
+        if attempt + 1 < attempts.max(1) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn ensure_trade_reward_attachable(client: &Client, code: &str) -> Result<(), String> {
+    let handle = client.devices().get(code).await.map_err(string_error)?;
+    let mut detail = client
+        .raw()
+        .devices()
+        .get(code)
+        .await
+        .map_err(string_error)?
+        .value;
+
+    let status_is = |detail: &replicant_client::raw::devices::DeviceStatus, expected: &str| {
+        detail
+            .status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case(expected))
+    };
+    let command_available =
+        |detail: &replicant_client::raw::devices::DeviceStatus, expected: &str| {
+            detail
+                .available_commands
+                .iter()
+                .chain(detail.commands.iter())
+                .any(|command| command.eq_ignore_ascii_case(expected))
+        };
+
+    if status_is(&detail, "active") {
+        if !command_available(&detail, "deactivate") {
+            return Err(format!(
+                "trade reward {code} is active and cannot currently be deactivated for transport"
+            ));
+        }
+        let operation = handle.deactivate().await.map_err(string_error)?;
+        await_success(&operation).await?;
+        detail = client
+            .raw()
+            .devices()
+            .get(code)
+            .await
+            .map_err(string_error)?
+            .value;
+    }
+
+    let modular = command_available(&detail, "compact")
+        || command_available(&detail, "unfurl")
+        || detail.status.as_deref().is_some_and(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "compacting" | "compacted" | "unfurling"
+            )
+        });
+    if !modular || status_is(&detail, "compacted") {
+        return Ok(());
+    }
+
+    for attempt in 0..24 {
+        if status_is(&detail, "compacted") {
+            return Ok(());
+        }
+        if status_is(&detail, "compacting") || status_is(&detail, "unfurling") {
+            if attempt + 1 < 24 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                detail = client
+                    .raw()
+                    .devices()
+                    .get(code)
+                    .await
+                    .map_err(string_error)?
+                    .value;
+                continue;
+            }
+            break;
+        }
+        if detail.printing.is_some() || !detail.print_queue.is_empty() {
+            return Err(format!(
+                "trade reward {code} must finish its Autofactory work before it can be compacted"
+            ));
+        }
+        if !command_available(&detail, "compact") {
+            return Err(format!(
+                "trade reward {code} is {:?} and cannot currently be compacted for transport",
+                detail.status
+            ));
+        }
+        let operation = handle.compact().await.map_err(string_error)?;
+        await_success(&operation).await?;
+        detail = client
+            .raw()
+            .devices()
+            .get(code)
+            .await
+            .map_err(string_error)?
+            .value;
+    }
+
+    if status_is(&detail, "compacted") {
+        Ok(())
+    } else {
+        Err(format!(
+            "trade reward {code} did not reach compacted state before transport timeout"
+        ))
+    }
+}
+
+async fn secure_trade_device_rewards(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut TradeFulfillmentCheckpoint,
+    replicant: &str,
+    shop_location: &str,
+) -> Result<bool, String> {
+    if checkpoint.reward_devices.is_empty() {
+        return Ok(true);
+    }
+    let replicant_snapshot = client
+        .replicants()
+        .get_owned(replicant)
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    let vessel_code = replicant_snapshot
+        .hosted_device
+        .as_ref()
+        .map(|device| device.id.as_str().to_owned());
+    let mut stow_free = trade_replicant_stow_free(client, replicant).await?;
+    let transports = trade_transport_codes(checkpoint);
+
+    for code in checkpoint.reward_devices.clone() {
+        claim_device(context, &code)?;
+        if checkpoint.reward_storage.contains_key(&code) {
+            continue;
+        }
+        let handle = client.devices().get(&code).await.map_err(string_error)?;
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if let Some(container) = snapshot.relationships.stowed_in.as_ref()
+            && vessel_code
+                .as_deref()
+                .is_some_and(|vessel| container.id.as_str().eq_ignore_ascii_case(vessel))
+        {
+            checkpoint
+                .reward_storage
+                .insert(code.clone(), "stowed".to_owned());
+            continue;
+        }
+        if let Some(carrier) = snapshot.relationships.attached_to.as_ref()
+            && transports
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(carrier.id.as_str()))
+        {
+            checkpoint
+                .reward_storage
+                .insert(code.clone(), carrier.id.as_str().to_owned());
+            continue;
+        }
+        if snapshot.location.as_ref().is_none_or(|location| {
+            !location.id.as_str().eq_ignore_ascii_case(shop_location)
+        }) {
+            return Err(format!(
+                "reward device {code} is no longer free at shop location {shop_location}"
+            ));
+        }
+
+        ensure_trade_reward_attachable(client, &code).await?;
+        let snapshot = handle
+            .refresh()
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if stow_free > 0
+            && snapshot
+                .available_commands
+                .iter()
+                .any(|command| command.as_str().eq_ignore_ascii_case("stow"))
+        {
+            context
+                .advance_to("stowing_trade_reward", checkpoint)
+                .map_err(string_error)?;
+            let operation = handle.stow(None).await.map_err(string_error)?;
+            await_success(&operation).await?;
+            checkpoint
+                .reward_storage
+                .insert(code.clone(), "stowed".to_owned());
+            stow_free = stow_free.saturating_sub(1);
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            continue;
+        }
+
+        let mut carrier_candidates = Vec::new();
+        for carrier in &transports {
+            let carrier_snapshot = client
+                .devices()
+                .get(carrier)
+                .await
+                .map_err(string_error)?
+                .snapshot()
+                .await
+                .map_err(string_error)?;
+            if carrier_snapshot.location.as_ref().is_none_or(|location| {
+                !location.id.as_str().eq_ignore_ascii_case(shop_location)
+            }) {
+                continue;
+            }
+            let (_, attach) = free_trade_transport_capacity(client, carrier).await?;
+            if attach > 0 {
+                carrier_candidates.push((attach, carrier.clone()));
+            }
+        }
+        carrier_candidates.sort_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let Some((_, carrier)) = carrier_candidates.into_iter().next() else {
+            context
+                .advance_to("waiting_for_trade_reward_carrier", checkpoint)
+                .map_err(string_error)?;
+            context
+                .emit_activity(format!(
+                    "reward device {code} cannot be stowed and no reserved attachment carrier currently has free capacity at {shop_location}"
+                ))
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            return Ok(false);
+        };
+        context
+            .advance_to("attaching_trade_reward", checkpoint)
+            .map_err(string_error)?;
+        let operation = client
+            .devices()
+            .get(&carrier)
+            .await
+            .map_err(string_error)?
+            .attach(replicant_client::raw::devices::TargetsCommand {
+                devices: Some(serde_json::json!([code.clone()])),
+                ..replicant_client::raw::devices::TargetsCommand::default()
+            })
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+        checkpoint.reward_storage.insert(code, carrier);
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    Ok(true)
+}
+
+fn resource_command_object(resources: &ResourceMap) -> Result<serde_json::Map<String, Value>, String> {
+    let value = serde_json::to_value(resources).map_err(string_error)?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "resource manifest did not serialize as an object".to_owned())
+}
+
+fn raw_cargo_quantity(detail: &replicant_client::raw::devices::DeviceStatus) -> i64 {
+    detail
+        .cargo
+        .iter()
+        .filter_map(|item| item.quantity)
+        .fold(0i64, i64::saturating_add)
+        .max(0)
+}
+
+async fn wait_for_trade_reward_resources(
+    client: &Client,
+    shop_location: &str,
+    rewards: &ResourceMap,
+    attempts: usize,
+) -> Result<bool, String> {
+    for attempt in 0..attempts.max(1) {
+        let inventory =
+            inventory_at_location(&fetch_account_inventories(client).await?, shop_location);
+        if rewards.iter().all(|(resource, quantity)| {
+            inventory.get(resource).copied().unwrap_or_default() >= *quantity
+        }) {
+            return Ok(true);
+        }
+        if attempt + 1 < attempts.max(1) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    Ok(false)
+}
+
+async fn load_trade_reward_resources(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut TradeFulfillmentCheckpoint,
+    shop_location: &str,
+    rewards: &ResourceMap,
+) -> Result<(), String> {
+    let mut remaining = rewards.clone();
+    remaining.retain(|_, quantity| *quantity > 0);
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    if !wait_for_trade_reward_resources(client, shop_location, &remaining, 24).await? {
+        return Err(format!(
+            "trade completed but reward resources {:?} were not observed at {shop_location}",
+            remaining
+        ));
+    }
+    let mut carriers = Vec::new();
+    for code in trade_transport_codes(checkpoint) {
+        let detail = client.raw().devices().get(&code).await.map_err(string_error)?.value;
+        if detail.location.as_deref().is_some_and(|location| location.eq_ignore_ascii_case(shop_location)) {
+            let free = detail
+                .cargo_capacity
+                .unwrap_or_default()
+                .saturating_sub(raw_cargo_quantity(&detail))
+                .max(0);
+            if free > 0 {
+                carriers.push((free, code));
+            }
+        }
+    }
+    carriers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    for (capacity, code) in carriers {
+        if remaining.is_empty() {
+            break;
+        }
+        let mut capacity = capacity;
+        let mut manifest = ResourceMap::new();
+        for (resource, quantity) in remaining.clone() {
+            if capacity <= 0 {
+                break;
+            }
+            let take = quantity.min(capacity);
+            if take > 0 {
+                manifest.insert(resource.clone(), take);
+                capacity -= take;
+                let left = quantity - take;
+                if left == 0 {
+                    remaining.remove(&resource);
+                } else {
+                    remaining.insert(resource, left);
+                }
+            }
+        }
+        if manifest.is_empty() {
+            continue;
+        }
+        context
+            .advance_to("loading_trade_reward_resources", checkpoint)
+            .map_err(string_error)?;
+        let operation = client
+            .devices()
+            .get(&code)
+            .await
+            .map_err(string_error)?
+            .command(replicant_client::raw::devices::DeviceCommand::CollectResources {
+                resources: resource_command_object(&manifest)?,
+            })
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+    }
+    if !remaining.is_empty() {
+        return Err(format!(
+            "reserved trade return transports could not load reward resources {:?}",
+            remaining
+        ));
+    }
+    Ok(())
+}
+
+async fn return_trade_assets_home(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut TradeFulfillmentCheckpoint,
+    replicant: &str,
+    home: &str,
+    reward_resources: &ResourceMap,
+) -> Result<bool, String> {
+    context
+        .advance_to("returning_trade_assets", checkpoint)
+        .map_err(string_error)?;
+    for code in trade_transport_codes(checkpoint) {
+        if !ensure_trade_device_at(
+            context,
+            client,
+            checkpoint,
+            &code,
+            home,
+            "returning_trade_transports",
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        let detail = client.raw().devices().get(&code).await.map_err(string_error)?.value;
+        if !reward_resources.is_empty() && raw_cargo_quantity(&detail) > 0 {
+            let operation = client
+                .devices()
+                .get(&code)
+                .await
+                .map_err(string_error)?
+                .command(replicant_client::raw::devices::DeviceCommand::DepositResources {
+                    resources: None,
+                })
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+        }
+        let attached_rewards = checkpoint
+            .reward_storage
+            .iter()
+            .filter_map(|(reward, storage)| storage.eq_ignore_ascii_case(&code).then_some(reward.clone()))
+            .collect::<Vec<_>>();
+        if !attached_rewards.is_empty() {
+            let operation = client
+                .devices()
+                .get(&code)
+                .await
+                .map_err(string_error)?
+                .command(replicant_client::raw::devices::DeviceCommand::Detach(
+                    replicant_client::raw::devices::TargetsCommand {
+                        devices: Some(serde_json::json!(attached_rewards)),
+                        ..replicant_client::raw::devices::TargetsCommand::default()
+                    },
+                ))
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+        }
+    }
+
+    if !ensure_trade_replicant_at(
+        context,
+        client,
+        checkpoint,
+        replicant,
+        home,
+        "returning_trade_replicant",
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+
+    for code in checkpoint.reward_devices.clone() {
+        if checkpoint
+            .reward_storage
+            .get(&code)
+            .is_none_or(|storage| storage != "stowed")
+        {
+            continue;
+        }
+        let handle = client.devices().get(&code).await.map_err(string_error)?;
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if snapshot.relationships.stowed_in.is_some() {
+            let operation = handle.deploy().await.map_err(string_error)?;
+            await_success(&operation).await?;
+        }
+    }
+    Ok(true)
+}
+
+fn trade_fulfillment_report(
+    intent: &TradeFulfillmentIntent,
+    checkpoint: &TradeFulfillmentCheckpoint,
+) -> Value {
+    serde_json::json!({
+        "controller": intent.controller,
+        "trade_code": intent.trade_code,
+        "shop_location": intent.shop_location,
+        "home": checkpoint.home,
+        "replicant": checkpoint.replicant,
+        "reward_devices": checkpoint.reward_devices,
+        "transports": trade_transport_codes(checkpoint),
+        "returned_home": checkpoint.returned_home,
+    })
+}
+
 async fn blueprint_is_known(client: &Client, device_type: &str) -> Result<bool, String> {
     Ok(client
         .blueprints()
@@ -3024,6 +5063,152 @@ fn blueprint_acquisition_strategy(intent: &BlueprintAcquireIntent) -> &'static s
         "shop"
     } else {
         "owned"
+    }
+}
+
+fn legacy_shop_purchase_in_progress(checkpoint: &BlueprintAcquireCheckpoint) -> bool {
+    checkpoint.criteria_logistics_child.is_some()
+        || checkpoint.purchase_authorized
+        || checkpoint.purchase_submitted
+        || checkpoint.purchase_operation.is_some()
+        || checkpoint.criteria_print_tag.is_some()
+        || !checkpoint.pre_purchase_devices.is_empty()
+}
+
+async fn prepare_shop_blueprint_source_via_trade(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &BlueprintAcquireIntent,
+    checkpoint: &mut BlueprintAcquireCheckpoint,
+) -> Result<bool, String> {
+    let shop = intent
+        .shop
+        .as_ref()
+        .ok_or_else(|| "shop blueprint acquisition is missing its shop intent".to_owned())?;
+    let factory_code = intent
+        .autofactory
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "shop blueprint acquisition requires an Autofactory".to_owned())?;
+
+    let devices = owned_device_snapshots(client).await?;
+    let factory = devices
+        .iter()
+        .find(|device| {
+            device.key.id.as_str().eq_ignore_ascii_case(factory_code)
+                && device.access == AccessScope::Owned
+                && device.device_type.as_ref() == Some(&DeviceType::Autofactory)
+                && device.location.is_some()
+        })
+        .ok_or_else(|| format!("selected Autofactory {factory_code} is not available"))?;
+    let factory_location = factory
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str().to_owned())
+        .ok_or_else(|| format!("Autofactory {factory_code} has no location"))?;
+    claim(context, ResourceKey::Autofactory(factory_code.to_owned()))?;
+    checkpoint.autofactory = Some(factory_code.to_owned());
+    checkpoint.autofactory_location = Some(factory_location.clone());
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+
+    let child_id = match checkpoint.trade_child {
+        Some(id) => id,
+        None => {
+            let existing = context
+                .child_workflows()
+                .map_err(string_error)?
+                .into_iter()
+                .filter(|workflow| workflow.kind == trade_fulfillment_workflow_kind())
+                .find_map(|workflow| {
+                    let config = workflow.config::<TradeFulfillmentIntent>().ok()?;
+                    (config.controller.eq_ignore_ascii_case(&shop.controller_code)
+                        && config.trade_code.eq_ignore_ascii_case(&shop.trade_code)
+                        && config.home.eq_ignore_ascii_case(&factory_location)
+                        && config.expected_reward_device.as_deref().is_some_and(|device_type| {
+                            device_type.eq_ignore_ascii_case(&intent.device_type)
+                        }))
+                    .then_some(workflow.id)
+                });
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    context
+                        .create_child(new_trade_fulfillment_workflow(TradeFulfillmentIntent {
+                            controller: shop.controller_code.clone(),
+                            trade_code: shop.trade_code.clone(),
+                            shop_location: shop.shop_location.clone(),
+                            home: factory_location.clone(),
+                            replicant: intent.acquisition_replicant.clone(),
+                            preferred_region: intent.preferred_region.clone(),
+                            expected_reward_device: Some(intent.device_type.clone()),
+                        }))
+                        .map_err(string_error)?
+                        .id
+                }
+            };
+            checkpoint.trade_child = Some(id);
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            id
+        }
+    };
+
+    let Some(child) = context.repository().read(child_id).map_err(string_error)? else {
+        return Err(format!("blueprint trade child {child_id} disappeared"));
+    };
+    match child.status {
+        WorkflowStatus::Succeeded => {
+            let trade_checkpoint: TradeFulfillmentCheckpoint =
+                child.checkpoint().map_err(string_error)?;
+            let refreshed = owned_device_snapshots(client).await?;
+            let mut candidates = trade_checkpoint
+                .reward_devices
+                .iter()
+                .filter_map(|code| {
+                    refreshed.iter().find(|device| {
+                        device.key.id.as_str().eq_ignore_ascii_case(code)
+                            && blueprint_source_is_candidate(
+                                device,
+                                &intent.device_type,
+                                &refreshed,
+                            )
+                            && blueprint_source_location(device, &refreshed).is_some_and(|location| {
+                                location.eq_ignore_ascii_case(&factory_location)
+                            })
+                    })
+                })
+                .map(|device| device.key.id.as_str().to_owned())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            let Some(source) = candidates.into_iter().next() else {
+                return Err(format!(
+                    "trade fulfillment {child_id} succeeded but no returned {} reward is available at Autofactory {} ({factory_location})",
+                    intent.device_type, factory_code
+                ));
+            };
+            checkpoint.source_device = Some(source);
+            checkpoint.acquisition_replicant = trade_checkpoint.replicant;
+            checkpoint.purchase_observed = true;
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            Ok(true)
+        }
+        WorkflowStatus::Failed | WorkflowStatus::Cancelled => Err(format!(
+            "blueprint trade child {child_id} ended as {:?}: {}",
+            child.status,
+            child.last_error.unwrap_or_default()
+        )),
+        _ => {
+            context
+                .advance_to("awaiting_trade_fulfillment", checkpoint)
+                .map_err(string_error)?;
+            context.mark_waiting().map_err(string_error)?;
+            Ok(false)
+        }
     }
 }
 
@@ -3064,6 +5249,17 @@ async fn prepare_shop_blueprint_source(
         ResourceKey::Namespaced {
             namespace: "blueprint-shop-trade".to_owned(),
             key: format!("{}:{}", shop.controller_code, shop.trade_code),
+        },
+    )?;
+    claim(
+        context,
+        ResourceKey::Namespaced {
+            namespace: "trade-fulfillment".to_owned(),
+            key: format!(
+                "{}:{}",
+                shop.controller_code.to_ascii_uppercase(),
+                shop.trade_code.to_ascii_uppercase()
+            ),
         },
     )?;
 
@@ -3814,6 +6010,157 @@ async fn observe_purchased_blueprint_device(
     Ok(None)
 }
 
+fn blueprint_replicant_destination_matches(
+    location: &str,
+    destination: &str,
+    accept_system_location: bool,
+) -> bool {
+    location.eq_ignore_ascii_case(destination)
+        || (accept_system_location && designation_in_system(location, destination))
+}
+
+async fn ensure_blueprint_replicant_at(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &BlueprintAcquireCheckpoint,
+    replicant_code: &str,
+    destination: &str,
+    accept_system_location: bool,
+    step: &str,
+) -> Result<bool, String> {
+    let handle = client
+        .replicants()
+        .get_owned(replicant_code)
+        .await
+        .map_err(string_error)?;
+    let snapshot = handle.snapshot().await.map_err(string_error)?;
+    if snapshot.location.as_ref().is_some_and(|location| {
+        snapshot.travel.is_none()
+            && blueprint_replicant_destination_matches(
+                location.id.as_str(),
+                destination,
+                accept_system_location,
+            )
+    }) {
+        return Ok(true);
+    }
+
+    if let Some(travel) = &snapshot.travel {
+        let planned = travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(|location| location.id.as_str());
+        context.advance_to(step, checkpoint).map_err(string_error)?;
+        if !planned.is_some_and(|planned| {
+            blueprint_replicant_destination_matches(
+                planned,
+                destination,
+                accept_system_location,
+            )
+        }) {
+            context
+                .emit_activity(format!(
+                    "blueprint control Replicant {replicant_code} is already travelling to {:?}; waiting to continue toward {destination}",
+                    planned
+                ))
+                .map_err(string_error)?;
+        }
+        context.mark_waiting().map_err(string_error)?;
+        return Ok(false);
+    }
+
+    context.advance_to(step, checkpoint).map_err(string_error)?;
+    context
+        .emit_activity(format!(
+            "dispatching blueprint control Replicant {replicant_code} to {destination}"
+        ))
+        .map_err(string_error)?;
+    let operation = handle
+        .travel()
+        .to(destination.to_owned())
+        .depart()
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+
+    let snapshot = handle
+        .refresh()
+        .await
+        .map_err(string_error)?
+        .snapshot()
+        .await
+        .map_err(string_error)?;
+    if snapshot.location.as_ref().is_some_and(|location| {
+        snapshot.travel.is_none()
+            && blueprint_replicant_destination_matches(
+                location.id.as_str(),
+                destination,
+                accept_system_location,
+            )
+    }) {
+        Ok(true)
+    } else {
+        context.mark_waiting().map_err(string_error)?;
+        Ok(false)
+    }
+}
+
+async fn prepare_blueprint_source_for_transport(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &BlueprintAcquireCheckpoint,
+    source: Device,
+) -> Result<Device, String> {
+    if source.relationships.stowed_in.is_none() {
+        return Ok(source);
+    }
+
+    let code = source.key.id.as_str().to_owned();
+    claim_device(context, &code)?;
+    context
+        .advance_to("deploying_blueprint_source", checkpoint)
+        .map_err(string_error)?;
+    context
+        .emit_activity(format!(
+            "deploying stowed {device_type} {code} before blueprint acquisition",
+            device_type = source
+                .device_type
+                .as_ref()
+                .map_or("device", |kind| kind.as_str())
+        ))
+        .map_err(string_error)?;
+
+    let operation = client
+        .devices()
+        .get(&code)
+        .await
+        .map_err(string_error)?
+        .deploy()
+        .await
+        .map_err(string_error)?;
+    await_success(&operation).await?;
+
+    for attempt in 0..24 {
+        if let Ok(handle) = client.devices().refresh(&code).await {
+            let refreshed = handle.snapshot().await.map_err(string_error)?;
+            if refreshed.relationships.stowed_in.is_none()
+                && refreshed.location.is_some()
+                && refreshed.travel.is_none()
+            {
+                return Ok(refreshed);
+            }
+        }
+        if attempt + 1 < 24 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    Err(format!(
+        "stowed blueprint source {code} did not become a free-standing device after deploy"
+    ))
+}
+
 fn resolve_blueprint_source(
     intent: &BlueprintAcquireIntent,
     checkpoint: &BlueprintAcquireCheckpoint,
@@ -3828,21 +6175,28 @@ fn resolve_blueprint_source(
             .iter()
             .find(|device| device.key.id.as_str().eq_ignore_ascii_case(code))
             .ok_or_else(|| format!("selected blueprint source {code} is no longer owned"))?;
-        if !blueprint_source_is_releasable(device, &intent.device_type) {
+        let is_candidate = blueprint_source_is_candidate(device, &intent.device_type, devices)
+            || (checkpoint.control_escort_required
+                && blueprint_source_is_control_revealed_candidate(
+                    device,
+                    &intent.device_type,
+                    devices,
+                ));
+        if !is_candidate {
             return Err(format!(
-                "selected blueprint source {code} is no longer releasable"
+                "selected blueprint source {code} is no longer available for blueprint acquisition"
             ));
         }
         return Ok(device.clone());
     }
     devices
         .iter()
-        .filter(|device| blueprint_source_is_releasable(device, &intent.device_type))
+        .filter(|device| blueprint_source_is_candidate(device, &intent.device_type, devices))
         .min_by_key(|device| device.key.id.clone())
         .cloned()
         .ok_or_else(|| {
             format!(
-                "no releasable owned {} device is available",
+                "no owned {} device is currently available for blueprint acquisition",
                 intent.device_type
             )
         })
@@ -3871,10 +6225,7 @@ fn resolve_blueprint_factory(
             .cloned()
             .ok_or_else(|| format!("selected Autofactory {code} is not available"));
     }
-    let source_location = source
-        .location
-        .as_ref()
-        .map(|location| location.id.as_str());
+    let source_location = blueprint_source_location(source, devices);
     devices
         .iter()
         .filter(|device| {
@@ -3917,6 +6268,105 @@ fn blueprint_source_is_releasable(device: &Device, device_type: &str) -> bool {
                 "inactive" | "deactivated" | "idle" | "recalled" | "compacted"
             )
         })
+}
+
+/// Returns the physical location that can be used to stage an owned blueprint
+/// source. Stowed devices intentionally have no direct location in managed
+/// state, so use their stationary container's location until they are deployed.
+pub(crate) fn blueprint_source_location<'a>(
+    device: &'a Device,
+    devices: &'a [Device],
+) -> Option<&'a str> {
+    if device.travel.is_none()
+        && let Some(location) = device.location.as_ref()
+    {
+        return Some(location.id.as_str());
+    }
+
+    let container = device.relationships.stowed_in.as_ref()?;
+    let container = devices.iter().find(|candidate| candidate.key == *container)?;
+    if container.travel.is_some() {
+        return None;
+    }
+    container
+        .location
+        .as_ref()
+        .map(|location| location.id.as_str())
+}
+
+/// Whether an owned device can safely become the sacrificial source for a
+/// missing blueprint. This is deliberately broader than
+/// `blueprint_source_is_releasable`: starter equipment may be stowed, while
+/// devices in disconnected systems are represented as `out_of_range`. Both
+/// are preparable states and should not make the Director pretend no owned
+/// source exists.
+fn blueprint_source_is_structurally_safe(
+    device: &Device,
+    device_type: &str,
+    devices: &[Device],
+) -> bool {
+    device.access == AccessScope::Owned
+        && !workflow_reserved(&device.tags)
+        && device
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str().eq_ignore_ascii_case(device_type))
+        && device.travel.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.controller.is_none()
+        && device.relationships.hosting_replicant.is_none()
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+        && blueprint_source_location(device, devices).is_some()
+}
+
+fn blueprint_source_is_control_revealed_candidate(
+    device: &Device,
+    device_type: &str,
+    devices: &[Device],
+) -> bool {
+    blueprint_source_is_structurally_safe(device, device_type, devices)
+        && device
+            .available_commands
+            .iter()
+            .any(|command| command.as_str().eq_ignore_ascii_case("deactivate"))
+}
+
+pub(crate) fn blueprint_source_is_candidate(
+    device: &Device,
+    device_type: &str,
+    devices: &[Device],
+) -> bool {
+    if !blueprint_source_is_structurally_safe(device, device_type, devices) {
+        return false;
+    }
+
+    let status = device
+        .status
+        .as_ref()
+        .map(|status| status.as_str().to_ascii_lowercase())
+        .unwrap_or_default();
+    match status.as_str() {
+        "inactive" | "deactivated" | "idle" | "recalled" | "compacted" => {
+            device.relationships.stowed_in.is_none()
+        }
+        "stowed" => {
+            device.relationships.stowed_in.is_some()
+                && device
+                    .available_commands
+                    .iter()
+                    .any(|command| command.as_str().eq_ignore_ascii_case("deploy"))
+        }
+        "out_of_range" => {
+            device.relationships.stowed_in.is_none()
+                && device.available_commands.iter().any(|command| {
+                    command.as_str().eq_ignore_ascii_case("decommission")
+                        || command.as_str().eq_ignore_ascii_case("travel")
+                })
+        }
+        _ => false,
+    }
 }
 
 const SCAN_TOUR_SURVEY_DRONES: i64 = 3;
@@ -4443,6 +6893,237 @@ async fn resolve_controller(
     Err("no eligible idle owned controller with an adopted fleet is available in scope".to_owned())
 }
 
+fn try_claim_available(context: &WorkflowContext, key: ResourceKey) -> Result<bool, String> {
+    match context.acquire_claim(key) {
+        Ok(ClaimAcquireOutcome::Acquired(_) | ClaimAcquireOutcome::AlreadyOwned(_)) => Ok(true),
+        Err(RepositoryError::ClaimConflict { owner, .. }) => {
+            tracing::debug!(
+                workflow_id = %context.id(),
+                claim_owner = %owner,
+                "workflow resource candidate is already claimed"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(string_error(error)),
+    }
+}
+
+fn release_exploration_claim(
+    context: &WorkflowContext,
+    key: &ResourceKey,
+) -> Result<(), String> {
+    context.release_claim(key).map_err(string_error)?;
+    Ok(())
+}
+
+fn wait_for_exploration_capacity(
+    context: &mut WorkflowContext,
+    checkpoint: &ExplorationWorkflowCheckpoint,
+    step: &str,
+    reason: &str,
+) -> Result<(), String> {
+    tracing::info!(
+        workflow_id = %context.id(),
+        reason = %reason,
+        "exploration frontier is waiting for workflow capacity"
+    );
+    context
+        .advance_to(step, checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)
+}
+
+async fn resolve_and_claim_replicant(
+    context: &WorkflowContext,
+    client: &Client,
+    pinned: Option<&str>,
+) -> Result<Option<String>, String> {
+    let pinned = pinned.filter(|value| !value.trim().is_empty());
+    if pinned.is_none()
+        && let Some(code) = context
+            .claims()
+            .map_err(string_error)?
+            .into_iter()
+            .find_map(|claim| match claim.resource {
+                ResourceKey::Replicant(code) => Some(code),
+                _ => None,
+            })
+    {
+        return Ok(Some(code));
+    }
+
+    if let Some(code) = pinned {
+        client
+            .replicants()
+            .get_owned(code)
+            .await
+            .map_err(string_error)?;
+        return try_claim_available(context, ResourceKey::Replicant(code.to_owned()))
+            .map(|available| available.then_some(code.to_owned()));
+    }
+
+    let handles = client
+        .replicants()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    for handle in handles {
+        let code = handle.id().as_str().to_owned();
+        if try_claim_available(context, ResourceKey::Replicant(code.clone()))? {
+            return Ok(Some(code));
+        }
+    }
+    Ok(None)
+}
+
+struct ExplorationHomeSelection {
+    location: String,
+    unavailable_autofactories: BTreeSet<String>,
+}
+
+fn exploration_claimed_autofactories(
+    context: &WorkflowContext,
+) -> Result<BTreeSet<String>, String> {
+    context
+        .repository()
+        .autofactory_claims()
+        .map_err(string_error)
+        .map(|claims| {
+            claims
+                .into_iter()
+                .filter(|claim| claim.workflow_id != context.id())
+                .filter_map(|claim| match claim.resource {
+                    ResourceKey::Autofactory(code) => Some(code),
+                    _ => None,
+                })
+                .collect()
+        })
+}
+
+async fn resolve_exploration_home(
+    context: &WorkflowContext,
+    client: &Client,
+    pinned: Option<&str>,
+) -> Result<Option<ExplorationHomeSelection>, String> {
+    let claimed = exploration_claimed_autofactories(context)?;
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .of_type(DeviceType::Autofactory)
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut factories_by_location = BTreeMap::<String, Vec<String>>::new();
+    for handle in handles {
+        let code = handle.id().as_str().to_owned();
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        if let Some(location) = snapshot.location.as_ref() {
+            factories_by_location
+                .entry(location.id.as_str().to_owned())
+                .or_default()
+                .push(code);
+        }
+    }
+    if factories_by_location.is_empty() {
+        return Err("no owned autofactory location is available for staging".to_owned());
+    }
+
+    let select = |location: &str, factories: &[String]| {
+        let unavailable_autofactories = factories
+            .iter()
+            .filter(|code| claimed.contains(code.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let available = factories.len().saturating_sub(unavailable_autofactories.len());
+        (available, unavailable_autofactories, location.to_owned())
+    };
+
+    if let Some(location) = pinned.filter(|value| !value.trim().is_empty()) {
+        let factories = factories_by_location.get(location).ok_or_else(|| {
+            format!("no owned Autofactory is present at requested manufacturing home {location}")
+        })?;
+        let (available, unavailable_autofactories, location) = select(location, factories);
+        return Ok((available != 0).then_some(ExplorationHomeSelection {
+            location,
+            unavailable_autofactories,
+        }));
+    }
+
+    let mut best = None::<(usize, ExplorationHomeSelection)>;
+    for (location, factories) in &factories_by_location {
+        let (available, unavailable_autofactories, location) = select(location, factories);
+        if available == 0 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(count, _)| available > *count) {
+            best = Some((
+                available,
+                ExplorationHomeSelection {
+                    location,
+                    unavailable_autofactories,
+                },
+            ));
+        }
+    }
+    Ok(best.map(|(_, selection)| selection))
+}
+
+fn reconcile_exploration_autofactory_claims(
+    context: &WorkflowContext,
+    required: &BTreeSet<String>,
+) -> Result<(), String> {
+    let stale = context
+        .claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Autofactory(code) if !required.contains(&code) => {
+                Some(ResourceKey::Autofactory(code))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for resource in stale {
+        context.release_claim(&resource).map_err(string_error)?;
+    }
+    for code in required {
+        claim(context, ResourceKey::Autofactory(code.clone()))?;
+    }
+    Ok(())
+}
+
+fn release_exploration_autofactory_claims(context: &WorkflowContext) -> Result<(), String> {
+    reconcile_exploration_autofactory_claims(context, &BTreeSet::new())
+}
+
+fn release_legacy_exploration_location_claims(context: &WorkflowContext) -> Result<(), String> {
+    let legacy = context
+        .claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Namespaced { namespace, key } if namespace == "location" => {
+                Some(ResourceKey::Namespaced { namespace, key })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for resource in &legacy {
+        context.release_claim(resource).map_err(string_error)?;
+    }
+    if !legacy.is_empty() {
+        tracing::info!(
+            workflow_id = %context.id(),
+            released = legacy.len(),
+            "released legacy exploration manufacturing-location claim"
+        );
+    }
+    Ok(())
+}
+
 async fn resolve_replicant(client: &Client, pinned: Option<&str>) -> Result<String, String> {
     if let Some(code) = pinned.filter(|value| !value.trim().is_empty()) {
         client
@@ -4882,6 +7563,11 @@ mod tests {
         ));
         assert!(retryable_event_campaign_failure("client is closed"));
         assert!(!event_campaign_failure_requires_replan("client is closed"));
+        let blocked =
+            "all currently feasible events completed, but blocked events remain; replenish resources";
+        assert!(retryable_event_campaign_failure(blocked));
+        assert!(event_campaign_failure_waits_for_inputs(blocked));
+        assert!(!event_campaign_failure_requires_replan(blocked));
         assert!(!retryable_event_campaign_failure(
             "event criterion is structurally invalid"
         ));
@@ -4897,6 +7583,9 @@ mod tests {
         ));
         assert!(retryable_connectivity_dependency_failure(
             "missing blueprint for requested device type `comm_satellite`"
+        ));
+        assert!(retryable_connectivity_dependency_failure(
+            "EIRFARYR has no known L4 or L5 deployment location"
         ));
         assert!(retryable_connectivity_dependency_failure(
             "insufficient manufacturing inventory at SCEPTURUM-BELT-1"
@@ -4967,6 +7656,10 @@ mod tests {
             "logistics.manifest"
         );
         assert_eq!(
+            trade_fulfillment_workflow_kind().as_str(),
+            "trade.fulfillment"
+        );
+        assert_eq!(
             blueprint_acquire_workflow_kind().as_str(),
             "blueprint.acquire"
         );
@@ -4983,6 +7676,67 @@ mod tests {
             region_establish_workflow_kind().as_str(),
             "region.establish"
         );
+    }
+
+    #[test]
+    fn trade_fulfillment_checkpoint_is_restart_safe() {
+        let checkpoint = TradeFulfillmentCheckpoint {
+            home: Some("SCEPTURUM-BELT-1".to_owned()),
+            home_system: Some("SCEPTURUM".to_owned()),
+            replicant: Some("CHAT-1".to_owned()),
+            criteria: Some(TradeBundle {
+                resources: BTreeMap::from([("structural".to_owned(), 200)]),
+                ..TradeBundle::default()
+            }),
+            rewards: Some(TradeBundle {
+                devices: BTreeMap::from([("service_bot".to_owned(), 1)]),
+                ..TradeBundle::default()
+            }),
+            purchase_authorized: true,
+            purchase_submitted: true,
+            purchase_operation: Some("OP-TRADE".to_owned()),
+            purchase_observed: true,
+            reward_devices: vec!["BOT-1".to_owned()],
+            reward_storage: BTreeMap::from([("BOT-1".to_owned(), "stowed".to_owned())]),
+            ..TradeFulfillmentCheckpoint::default()
+        };
+
+        let encoded = serde_json::to_value(&checkpoint).expect("serialize checkpoint");
+        let restored: TradeFulfillmentCheckpoint =
+            serde_json::from_value(encoded).expect("restore checkpoint");
+        assert_eq!(restored.home.as_deref(), Some("SCEPTURUM-BELT-1"));
+        assert_eq!(restored.replicant.as_deref(), Some("CHAT-1"));
+        assert!(restored.purchase_authorized);
+        assert!(restored.purchase_observed);
+        assert_eq!(restored.reward_devices, vec!["BOT-1"]);
+        assert_eq!(
+            restored.reward_storage.get("BOT-1").map(String::as_str),
+            Some("stowed")
+        );
+    }
+
+    #[test]
+    fn blueprint_control_positioning_accepts_any_location_in_target_system() {
+        assert!(blueprint_replicant_destination_matches(
+            "RHYVENAI-OORT",
+            "RHYVENAI",
+            true
+        ));
+        assert!(blueprint_replicant_destination_matches(
+            "RHYVENAI-3",
+            "RHYVENAI",
+            true
+        ));
+        assert!(!blueprint_replicant_destination_matches(
+            "OTHER-3",
+            "RHYVENAI",
+            true
+        ));
+        assert!(!blueprint_replicant_destination_matches(
+            "SCEPTURUM-7-L4",
+            "SCEPTURUM-BELT-1",
+            false
+        ));
     }
 
     #[test]
@@ -5013,6 +7767,7 @@ mod tests {
                     decommission_submitted: true,
                     decommission_operation: Some("OP-1".to_owned()),
                     blueprint_verified: false,
+                    control_escort_required: true,
                     ..BlueprintAcquireCheckpoint::default()
                 },
             ))
@@ -5030,6 +7785,7 @@ mod tests {
         assert!(checkpoint.decommission_submitted);
         assert_eq!(checkpoint.decommission_operation.as_deref(), Some("OP-1"));
         assert_eq!(checkpoint.source_device.as_deref(), Some("DEVICE-1"));
+        assert!(checkpoint.control_escort_required);
 
         drop(repository);
         let _ = std::fs::remove_file(path);

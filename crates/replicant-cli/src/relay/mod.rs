@@ -68,6 +68,7 @@ mod tests {
             mission_file: PathBuf::from("relay.json"),
             max_hop_ly: 7.4,
             wait_timeout: Duration::from_secs(30),
+            unavailable_autofactories: Default::default(),
         });
         assert_eq!(request.kind.0, "relay.expansion");
         assert_eq!(request.parameters["targets_csv"], "ALPHA,BETA");

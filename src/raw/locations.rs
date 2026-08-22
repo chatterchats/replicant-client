@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::Error;
 use crate::raw::common::{encode_path_segment, with_query};
@@ -42,6 +42,25 @@ pub struct LocationSystemMap {
     pub locations: HashMap<String, LocationCounts>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AtmosphereWire {
+    Classification(String),
+    Present(bool),
+}
+
+fn deserialize_atmosphere<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<AtmosphereWire>::deserialize(deserializer)?;
+    Ok(value.map(|value| match value {
+        AtmosphereWire::Classification(value) => value,
+        AtmosphereWire::Present(true) => "present".to_owned(),
+        AtmosphereWire::Present(false) => "none".to_owned(),
+    }))
+}
+
 /// Surveyed environment details for a planet or moon.
 ///
 /// The location contract leaves this object open, so only fields verified by
@@ -53,6 +72,11 @@ pub struct PlanetaryBody {
     /// Whether this planet or moon has been scanned.
     pub scanned: Option<bool>,
     /// Reported atmospheric classification.
+    ///
+    /// The upstream API historically returned descriptive strings here, but
+    /// some live planet responses now return a boolean presence flag. Keep the
+    /// public raw shape string-compatible while accepting both wire forms.
+    #[serde(default, deserialize_with = "deserialize_atmosphere")]
     pub atmosphere: Option<String>,
     /// Whether the body is inside the star's habitable zone.
     pub in_habitable_zone: Option<bool>,
@@ -231,5 +255,35 @@ mod tests {
         .unwrap();
         assert_eq!(location.planet.unwrap().scanned, Some(true));
         assert_eq!(location.moon.unwrap().scanned, Some(false));
+    }
+
+    #[test]
+    fn atmosphere_accepts_boolean_or_classification_string() {
+        let present: Location = serde_json::from_value(serde_json::json!({
+            "location": "DRANYNLL-3",
+            "planet": {"atmosphere": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            present.planet.unwrap().atmosphere.as_deref(),
+            Some("present")
+        );
+
+        let absent: Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-2",
+            "planet": {"atmosphere": false}
+        }))
+        .unwrap();
+        assert_eq!(absent.planet.unwrap().atmosphere.as_deref(), Some("none"));
+
+        let classified: Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-3",
+            "planet": {"atmosphere": "thin"}
+        }))
+        .unwrap();
+        assert_eq!(
+            classified.planet.unwrap().atmosphere.as_deref(),
+            Some("thin")
+        );
     }
 }

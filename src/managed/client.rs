@@ -29,6 +29,7 @@ use crate::{
 };
 
 use super::{
+    events::{EventTelemetrySample, EventTelemetrySink},
     state::StateEngine,
     store::{StoreError, StoreHandle},
 };
@@ -298,6 +299,7 @@ pub struct ClientBuilder {
     read_rate_limit_policy: Option<RateLimitPolicy>,
     action_rate_limit_policy: Option<RateLimitPolicy>,
     event_stream_options: EventStreamOptions,
+    event_telemetry_sink: Option<Arc<dyn EventTelemetrySink>>,
     reconciliation_policy: ReconciliationPolicy,
     #[cfg(feature = "shared-rate-limit")]
     shared_rate_limit_path: Option<PathBuf>,
@@ -312,6 +314,7 @@ impl fmt::Debug for ClientBuilder {
             .field("read_rate_limit_policy", &self.read_rate_limit_policy)
             .field("action_rate_limit_policy", &self.action_rate_limit_policy)
             .field("event_stream_options", &self.event_stream_options)
+            .field("event_telemetry", &self.event_telemetry_sink.is_some())
             .field("reconciliation_policy", &self.reconciliation_policy)
             .finish()
     }
@@ -334,6 +337,7 @@ impl ClientBuilder {
             read_rate_limit_policy: None,
             action_rate_limit_policy: None,
             event_stream_options: EventStreamOptions::default(),
+            event_telemetry_sink: None,
             reconciliation_policy: ReconciliationPolicy::default(),
             #[cfg(feature = "shared-rate-limit")]
             shared_rate_limit_path: None,
@@ -440,6 +444,13 @@ impl ClientBuilder {
     #[must_use]
     pub fn api_telemetry_sink(mut self, sink: Arc<dyn ApiTelemetrySink>) -> Self {
         self.raw = self.raw.api_telemetry_sink(sink);
+        self
+    }
+
+    /// Installs a best-effort sink for managed event/SSE telemetry.
+    #[must_use]
+    pub fn event_telemetry_sink(mut self, sink: Arc<dyn EventTelemetrySink>) -> Self {
+        self.event_telemetry_sink = Some(sink);
         self
     }
 
@@ -610,6 +621,7 @@ impl ClientBuilder {
             store,
             state,
             events: super::events::EventEngine::new(),
+            event_telemetry: self.event_telemetry_sink,
             sync: SyncEngine,
             operations: super::operation::OperationEngine::new(),
             lifecycle: Lifecycle::new(),
@@ -826,6 +838,7 @@ struct ClientInner {
     #[allow(dead_code)] // Public state queries arrive in a later phase.
     state: StateEngine,
     events: super::events::EventEngine,
+    event_telemetry: Option<Arc<dyn EventTelemetrySink>>,
     #[allow(dead_code)]
     sync: SyncEngine,
     operations: super::operation::OperationEngine,
@@ -998,6 +1011,12 @@ impl Client {
 
     pub(crate) fn managed_events(&self) -> &super::events::EventEngine {
         &self.inner.events
+    }
+
+    pub(crate) fn record_event_telemetry(&self, sample: EventTelemetrySample) {
+        if let Some(sink) = self.inner.event_telemetry.as_ref() {
+            sink.record(sample);
+        }
     }
 
     pub(crate) fn managed_operations(&self) -> &super::operation::OperationEngine {

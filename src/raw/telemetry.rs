@@ -138,25 +138,13 @@ pub fn normalize_route_key(path: &str) -> String {
     for index in 0..segments.len() {
         if segments[index] == "verify" && index > 0 && segments[index - 1] == "accounts" {
             replace_next(&mut segments, index, "{token}", &[]);
-        } else if segments[index] == "events"
-            && index >= 2
-            && segments[index - 2] == "locations"
-        {
+        } else if segments[index] == "events" && index >= 2 && segments[index - 2] == "locations" {
             replace_next(&mut segments, index, "{event}", &[]);
-        } else if segments[index] == "simulate"
-            && index >= 2
-            && segments[index - 2] == "devices"
-        {
+        } else if segments[index] == "simulate" && index >= 2 && segments[index - 2] == "devices" {
             replace_next(&mut segments, index, "{simulation}", &["active"]);
-        } else if segments[index] == "trades"
-            && index >= 2
-            && segments[index - 2] == "devices"
-        {
+        } else if segments[index] == "trades" && index >= 2 && segments[index - 2] == "devices" {
             replace_next(&mut segments, index, "{trade}", &[]);
-        } else if segments[index] == "stars"
-            && index >= 2
-            && segments[index - 2] == "replicants"
-        {
+        } else if segments[index] == "stars" && index >= 2 && segments[index - 2] == "replicants" {
             replace_next(&mut segments, index, "{star}", &[]);
         } else if segments[index] == "simulations"
             && index > 0
@@ -169,7 +157,12 @@ pub fn normalize_route_key(path: &str) -> String {
     segments.join("/")
 }
 
-fn replace_after(segments: &mut [String], collection: &str, placeholder: &str, exceptions: &[&str]) {
+fn replace_after(
+    segments: &mut [String],
+    collection: &str,
+    placeholder: &str,
+    exceptions: &[&str],
+) {
     for index in 0..segments.len() {
         if segments[index] == collection {
             replace_next(segments, index, placeholder, exceptions);

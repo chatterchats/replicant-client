@@ -122,6 +122,10 @@ pub struct BootstrapMission {
     pub version: u32,
     pub mission_id: String,
     pub mission_tag: String,
+    /// Historical UUID-derived mission tags still recognized while an old
+    /// checkpoint or print queue is being migrated to the system tag.
+    #[serde(default)]
+    pub legacy_mission_tags: Vec<String>,
     pub region_tag: String,
     pub phase: MissionPhase,
     pub region: String,

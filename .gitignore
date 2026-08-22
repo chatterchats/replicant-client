@@ -30,6 +30,7 @@ __pycache__/
 patches/
 logs/
 *.json
+!deploy/grafana/dashboards/*.json
 *.zip
 mining-expansion*
 *.lock

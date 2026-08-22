@@ -434,7 +434,8 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<()> {
     let requirements = ark_device_requirements(&config.profile);
     let mut mission = BootstrapMission {
         version: PLAN_VERSION,
-        mission_tag: mission_tag(&mission_id),
+        mission_tag: mission_tag(&landing_star),
+        legacy_mission_tags: Vec::new(),
         region_tag: format!("region:{region}"),
         mission_id,
         phase: MissionPhase::Planned,
@@ -566,7 +567,28 @@ pub fn load_mission(path: &Path) -> AnyResult<BootstrapMission> {
     }
     mission.operator.migrate();
     mission.explorer.migrate();
+    migrate_mission_tag_metadata(&mut mission);
     Ok(mission)
+}
+
+/// Upgrades an in-memory legacy bootstrap checkpoint while retaining old aliases.
+pub(crate) fn migrate_mission_tag_metadata(mission: &mut BootstrapMission) -> bool {
+    let desired = mission_tag(&mission.landing_star);
+    let mut changed = false;
+    if mission.mission_tag != desired {
+        let previous = std::mem::replace(&mut mission.mission_tag, desired.clone());
+        if previous.starts_with("boot-m:") && !mission.legacy_mission_tags.contains(&previous) {
+            mission.legacy_mission_tags.push(previous);
+        }
+        changed = true;
+    }
+    let before = mission.legacy_mission_tags.len();
+    mission
+        .legacy_mission_tags
+        .retain(|tag| tag.starts_with("boot-m:") && tag != &desired);
+    mission.legacy_mission_tags.sort();
+    mission.legacy_mission_tags.dedup();
+    changed || mission.legacy_mission_tags.len() != before
 }
 
 pub(crate) fn save_mission(path: &Path, mission: &BootstrapMission) -> AnyResult<()> {
