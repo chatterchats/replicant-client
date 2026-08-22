@@ -9,6 +9,7 @@ mod model;
 mod registry;
 mod repository;
 mod supervisor;
+mod telemetry;
 
 pub use model::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
@@ -23,3 +24,4 @@ pub use supervisor::{
     BoxWorkflowFuture, ControlRequest, SupervisorError, WorkflowContext, WorkflowExecutor,
     WorkflowSupervisor, WorkflowWaitError,
 };
+pub use telemetry::{WorkflowTelemetrySample, WorkflowTelemetrySink};

@@ -288,6 +288,36 @@ fn device_claims_bulk_query_excludes_other_resource_kinds() {
 }
 
 #[test]
+fn autofactory_claims_bulk_query_excludes_other_resource_kinds() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let first = create(&repository, None);
+    let second = create(&repository, None);
+    repository
+        .acquire_claim(first.id, ResourceKey::Autofactory("FACTORY-1".into()))
+        .expect("claim first Autofactory");
+    repository
+        .acquire_claim(second.id, ResourceKey::Autofactory("FACTORY-2".into()))
+        .expect("claim second Autofactory");
+    repository
+        .acquire_claim(first.id, ResourceKey::Device("SURVEY-1".into()))
+        .expect("claim device");
+
+    let claims = repository
+        .autofactory_claims()
+        .expect("list Autofactory claims");
+
+    assert_eq!(claims.len(), 2);
+    assert!(claims.iter().any(|claim| {
+        claim.workflow_id == first.id
+            && claim.resource == ResourceKey::Autofactory("FACTORY-1".into())
+    }));
+    assert!(claims.iter().any(|claim| {
+        claim.workflow_id == second.id
+            && claim.resource == ResourceKey::Autofactory("FACTORY-2".into())
+    }));
+}
+
+#[test]
 fn concurrent_workflows_cannot_claim_the_same_resource() {
     let path = std::env::temp_dir().join(format!(
         "replicant-workflow-claims-{}.sqlite",

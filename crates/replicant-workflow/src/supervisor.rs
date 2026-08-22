@@ -14,7 +14,7 @@ use tokio::{sync::watch, task::JoinHandle};
 use crate::{
     ClaimAcquireOutcome, NewWorkflow, RepositoryError, ResourceClaim, ResourceKey, WaitIntent,
     WaitOutcome, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository, WorkflowState,
-    WorkflowStatus,
+    WorkflowStatus, WorkflowTelemetrySample, WorkflowTelemetrySink,
 };
 
 // Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
@@ -62,6 +62,7 @@ pub struct WorkflowContext {
     instance: WorkflowInstance,
     client: Option<Client>,
     control: watch::Receiver<ControlRequest>,
+    telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
 }
 
 impl WorkflowContext {
@@ -70,12 +71,14 @@ impl WorkflowContext {
         instance: WorkflowInstance,
         client: Option<Client>,
         control: watch::Receiver<ControlRequest>,
+        telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
     ) -> Self {
         Self {
             repository,
             instance,
             client,
             control,
+            telemetry,
         }
     }
 
@@ -172,7 +175,15 @@ impl WorkflowContext {
         &self,
         resource: ResourceKey,
     ) -> Result<ClaimAcquireOutcome, RepositoryError> {
-        self.repository.acquire_claim(self.instance.id, resource)
+        let resource_kind = resource_kind(&resource).to_owned();
+        match self.repository.acquire_claim(self.instance.id, resource) {
+            Ok(outcome) => Ok(outcome),
+            Err(error @ RepositoryError::ClaimConflict { .. }) => {
+                self.record_telemetry("claim_conflict", "conflict", Some(resource_kind), None);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Releases one claim only if this workflow owns it.
@@ -367,6 +378,27 @@ impl WorkflowContext {
         })
     }
 
+    fn record_telemetry(
+        &self,
+        metric: &'static str,
+        outcome: impl Into<String>,
+        detail: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(sink) = self.telemetry.as_ref() else {
+            return;
+        };
+        sink.record(WorkflowTelemetrySample {
+            observed_at_ms: telemetry_now_millis(),
+            workflow_id: self.instance.id.to_string(),
+            workflow_kind: self.instance.kind.as_str().to_owned(),
+            metric,
+            outcome: outcome.into(),
+            detail,
+            duration_ms,
+        });
+    }
+
     fn checkpoint_value(&self) -> Result<Value, RepositoryError> {
         self.instance.checkpoint()
     }
@@ -435,6 +467,7 @@ pub struct WorkflowSupervisor {
     tasks: HashMap<WorkflowId, JoinHandle<()>>,
     controls: HashMap<WorkflowId, watch::Sender<ControlRequest>>,
     client: Option<Client>,
+    telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
     claims_reconciled: bool,
 }
 
@@ -448,6 +481,7 @@ impl WorkflowSupervisor {
             tasks: HashMap::new(),
             controls: HashMap::new(),
             client: None,
+            telemetry: None,
             claims_reconciled: false,
         }
     }
@@ -462,6 +496,13 @@ impl WorkflowSupervisor {
         let mut supervisor = Self::new(repository, registry);
         supervisor.client = Some(client);
         supervisor
+    }
+
+    /// Installs a best-effort telemetry sink for executor lifecycle observations.
+    #[must_use]
+    pub fn with_telemetry_sink(mut self, sink: Arc<dyn WorkflowTelemetrySink>) -> Self {
+        self.telemetry = Some(sink);
+        self
     }
 
     /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
@@ -691,6 +732,7 @@ impl WorkflowSupervisor {
                     instance,
                     self.client.clone(),
                     control,
+                    self.telemetry.clone(),
                 );
                 context.mark_failed("workflow kind has no executor")?;
                 return Ok(());
@@ -702,6 +744,7 @@ impl WorkflowSupervisor {
                     instance,
                     self.client.clone(),
                     control,
+                    self.telemetry.clone(),
                 );
                 context.mark_failed(error.to_string())?;
                 return Ok(());
@@ -710,11 +753,25 @@ impl WorkflowSupervisor {
         let id = instance.id;
         let kind = instance.kind.clone();
         tracing::info!(workflow_id = %id, kind = %kind, "workflow executor starting");
+        if let Some(sink) = self.telemetry.as_ref() {
+            sink.record(WorkflowTelemetrySample {
+                observed_at_ms: telemetry_now_millis(),
+                workflow_id: id.to_string(),
+                workflow_kind: kind.as_str().to_owned(),
+                metric: "executor_started",
+                outcome: "started".to_owned(),
+                detail: None,
+                duration_ms: None,
+            });
+        }
         let repository = self.repository.clone();
         let client = self.client.clone();
+        let telemetry = self.telemetry.clone();
         let (control_sender, control) = watch::channel(ControlRequest::Continue);
         let task = tokio::spawn(async move {
-            let mut context = WorkflowContext::new(repository, instance, client, control);
+            let executor_started = std::time::Instant::now();
+            let mut context =
+                WorkflowContext::new(repository, instance, client, control, telemetry.clone());
             if let Err(error) = executor.execute(&mut context).await {
                 tracing::error!(
                     workflow_id = %id,
@@ -734,6 +791,23 @@ impl WorkflowSupervisor {
                 );
             } else {
                 tracing::info!(workflow_id = %id, kind = %kind, "workflow executor finished");
+            }
+            if let Some(sink) = telemetry.as_ref() {
+                sink.record(WorkflowTelemetrySample {
+                    observed_at_ms: telemetry_now_millis(),
+                    workflow_id: id.to_string(),
+                    workflow_kind: kind.as_str().to_owned(),
+                    metric: "executor_finished",
+                    outcome: context.instance.status.as_str().to_owned(),
+                    detail: context.instance.current_step.clone(),
+                    duration_ms: Some(
+                        executor_started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    ),
+                });
             }
         });
         self.tasks.insert(id, task);
@@ -758,6 +832,7 @@ impl WorkflowSupervisor {
             instance,
             self.client.clone(),
             control,
+            self.telemetry.clone(),
         )
         .mark_failed(error)?;
         Ok(())
@@ -784,6 +859,7 @@ impl WorkflowSupervisor {
                         instance,
                         self.client.clone(),
                         control,
+                        self.telemetry.clone(),
                     );
                     context.mark_failed(format!("workflow executor task failed: {error}"))?;
                 }
@@ -794,6 +870,24 @@ impl WorkflowSupervisor {
         }
         Ok(())
     }
+}
+
+fn resource_kind(resource: &ResourceKey) -> &'static str {
+    match resource {
+        ResourceKey::Replicant(_) => "replicant",
+        ResourceKey::Device(_) => "device",
+        ResourceKey::Autofactory(_) => "autofactory",
+        ResourceKey::Namespaced { .. } => "namespaced",
+    }
+}
+
+fn telemetry_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 fn polling_wait_retry_due(instance: &WorkflowInstance) -> bool {
