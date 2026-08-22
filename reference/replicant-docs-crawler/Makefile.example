@@ -1,0 +1,4 @@
+docs-reference-sync:
+	python3 scripts/replicant-docs-crawler/crawl_replicant_docs.py \
+		--output docs/reference/replicant-space \
+		--refresh
