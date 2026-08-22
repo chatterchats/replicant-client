@@ -5,7 +5,8 @@ The archive contains tracked files plus untracked files that are not ignored,
 using the files as they exist in the working tree rather than the contents of
 HEAD. Git metadata, Cargo build output, and SQLite databases are excluded.
 Untracked files matched by the repository ignore rules are omitted using normal
-Git semantics; tracked repository files remain included.
+Git semantics, except for the machine-readable JSON artifacts in versioned
+Replicant Space reference snapshots. Tracked repository files remain included.
 """
 
 from __future__ import annotations
@@ -17,6 +18,15 @@ import subprocess
 import sys
 from datetime import datetime
 import zipfile
+
+
+REFERENCE_SNAPSHOT_JSON_FILES = frozenset(
+    {
+        "crawl-errors.json",
+        "manifest.json",
+        "openapi.json",
+    }
+)
 
 
 SQLITE_SUFFIXES = (
@@ -47,6 +57,23 @@ def git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
 
 def nul_paths(data: bytes) -> list[str]:
     return [os.fsdecode(item) for item in data.split(b"\0") if item]
+
+
+def reference_snapshot_jsons(root: Path) -> set[str]:
+    """Return ignored JSON artifacts that belong in versioned reference snapshots."""
+    reference = root / "reference"
+    if not reference.is_dir():
+        return set()
+
+    paths: set[str] = set()
+    for snapshot in reference.glob("replicant-space-*"):
+        if not snapshot.is_dir():
+            continue
+        for filename in REFERENCE_SNAPSHOT_JSON_FILES:
+            source = snapshot / filename
+            if source.is_file():
+                paths.add(source.relative_to(root).as_posix())
+    return paths
 
 
 def explicitly_excluded(path: str) -> bool:
@@ -100,9 +127,12 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        candidates = nul_paths(
-            git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        candidates = set(
+            nul_paths(
+                git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+            )
         )
+        candidates.update(reference_snapshot_jsons(root))
     except (OSError, RuntimeError) as error:
         print(f"error: unable to enumerate repository files: {error}", file=sys.stderr)
         return 2
