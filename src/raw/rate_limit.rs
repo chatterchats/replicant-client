@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn queued_foreground_request_precedes_background_work() {
+    async fn background_yields_to_foreground_but_runs_after_eight_permits() {
         let coordinator = RateLimitCoordinator::new();
         coordinator
             .set_policy(
@@ -912,10 +912,16 @@ mod tests {
         coordinator.acquire(RateLimitBucket::Read).await;
 
         let (sent, mut received) = mpsc::unbounded_channel();
-        for (priority, name) in [
-            (super::RequestPriority::Background, "background"),
-            (super::RequestPriority::Foreground, "foreground"),
-        ] {
+        for (priority, name) in
+            std::iter::once((super::RequestPriority::Background, "background".to_owned())).chain(
+                (1..=9).map(|id| {
+                    (
+                        super::RequestPriority::Foreground,
+                        format!("foreground-{id}"),
+                    )
+                }),
+            )
+        {
             let coordinator = coordinator.clone();
             let sent = sent.clone();
             tokio::spawn(async move {
@@ -927,10 +933,14 @@ mod tests {
             yield_now().await;
         }
 
+        for id in 1..=8 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(received.recv().await, Some(format!("foreground-{id}")));
+        }
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(received.recv().await, Some("foreground"));
+        assert_eq!(received.recv().await.as_deref(), Some("background"));
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(received.recv().await, Some("background"));
+        assert_eq!(received.recv().await.as_deref(), Some("foreground-9"));
     }
 
     #[tokio::test(start_paused = true)]

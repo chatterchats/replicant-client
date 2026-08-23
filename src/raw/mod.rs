@@ -71,6 +71,7 @@ pub use client::{
     TokenProvider, Url,
 };
 pub use common::{JsonObject, Position};
+pub use rate_limit::RequestPriority;
 pub use telemetry::{
     ApiAttemptOutcome, ApiAttemptTelemetry, ApiAttemptTimings, ApiRateLimitTelemetry,
     ApiTelemetrySink, normalize_route_key,

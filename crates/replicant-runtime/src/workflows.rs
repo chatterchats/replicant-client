@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use replicant_client::raw::RequestPriority;
 use replicant_workflow::{
     BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError, ResourceKey,
     WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind, WorkflowRegistry,
@@ -312,6 +313,7 @@ impl WorkflowExecutor for EventWorkflow {
                 .managed_client()
                 .cloned()
                 .ok_or_else(|| "event workflow requires a managed client".to_owned())?;
+            let background_client = client.with_priority(RequestPriority::Background);
             claim(
                 context,
                 ResourceKey::Namespaced {
@@ -331,7 +333,7 @@ impl WorkflowExecutor for EventWorkflow {
                         "event workflow planning requires a manufacturing home".to_owned()
                     })?;
                     plan_event_mission(
-                        &client,
+                        &background_client,
                         &EventPlanningRequest {
                             event: event.to_owned(),
                             criterion: config.criterion.clone(),
@@ -350,7 +352,7 @@ impl WorkflowExecutor for EventWorkflow {
                 let targets = BTreeSet::from([preflight.target_system.clone()]);
                 if !reconcile_event_connectivity(
                     context,
-                    &client,
+                    &background_client,
                     &mut checkpoint.connectivity_workflows,
                     &mut checkpoint.replan_after_connectivity,
                     &preflight.replicant,
@@ -371,7 +373,7 @@ impl WorkflowExecutor for EventWorkflow {
 
                 if checkpoint.replan_after_connectivity {
                     plan_event_mission(
-                        &client,
+                        &background_client,
                         &EventPlanningRequest {
                             event: preflight.event,
                             criterion: Some(preflight.criterion),
@@ -847,7 +849,7 @@ impl WorkflowExecutor for RequirementWorkflow {
                         status: child.status,
                     })
                     .collect::<Vec<_>>();
-                let facts = managed_facts(&client)
+                let facts = managed_facts(&client.with_priority(RequestPriority::Background))
                     .await
                     .map_err(|error| error.to_string())?;
                 let plan = evaluate_requirement(&config.requirement, &facts, &active);

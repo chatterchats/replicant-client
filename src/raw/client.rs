@@ -25,8 +25,8 @@ pub use secrecy::SecretString;
 
 use crate::error::{Error, ErrorDetails};
 use crate::raw::rate_limit::{
-    RateLimitBucket, RateLimitCoordinator, RateLimitReset, RateLimitSnapshot, RetryAfter,
-    bucket_for,
+    RateLimitBucket, RateLimitCoordinator, RateLimitReset, RateLimitSnapshot, RequestPriority,
+    RetryAfter, bucket_for,
 };
 use crate::raw::telemetry::{
     ApiAttemptOutcome, ApiAttemptTelemetry, ApiAttemptTimings, ApiRateLimitTelemetry,
@@ -428,6 +428,7 @@ impl ClientBuilder {
                 config: self.config,
                 telemetry: self.telemetry,
             }),
+            priority: RequestPriority::default(),
         })
     }
 }
@@ -454,6 +455,7 @@ impl Default for ClientBuilder {
 #[derive(Clone)]
 pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
+    priority: RequestPriority,
 }
 
 pub(crate) struct ClientInner {
@@ -492,6 +494,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("base_url", &self.inner.base_url)
+            .field("priority", &self.priority)
             .finish_non_exhaustive()
     }
 }
@@ -501,6 +504,16 @@ impl Client {
     #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
+    }
+
+    /// Returns a cheap clone whose requests use `priority` while waiting for
+    /// rate-limit permits.
+    #[must_use]
+    pub fn with_priority(&self, priority: RequestPriority) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            priority,
+        }
     }
 
     pub(crate) fn max_star_catalogue_response_body_bytes(&self) -> usize {
@@ -737,7 +750,10 @@ impl Client {
         let mut attempts: u32 = 0;
         loop {
             let permit_started = Instant::now();
-            self.inner.rate_limits.acquire(bucket).await;
+            self.inner
+                .rate_limits
+                .acquire_with_priority(bucket, self.priority)
+                .await;
             let permit_wait = permit_started.elapsed();
             attempts += 1;
             let attempt_started = Instant::now();
@@ -750,6 +766,7 @@ impl Client {
                     local_request_id = %request_id,
                     attempt = attempts,
                     ?bucket,
+                    priority = ?self.priority,
                     ?safety,
                     authenticated,
                     response_body_limit_bytes = response_body_limit,
@@ -1446,6 +1463,15 @@ mod tests {
             .unwrap();
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn request_priority_is_scoped_and_foreground_by_default() {
+        let foreground = Client::builder().build().expect("client");
+        let background = foreground.with_priority(RequestPriority::Background);
+
+        assert_eq!(foreground.priority, RequestPriority::Foreground);
+        assert_eq!(background.priority, RequestPriority::Background);
     }
 
     #[test]

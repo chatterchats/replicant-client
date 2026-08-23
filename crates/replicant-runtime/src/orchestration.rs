@@ -19,6 +19,7 @@ use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Location, Replicant, Star,
     domain::{GalacticPosition, Inventory, InventoryOwner},
+    raw::RequestPriority,
 };
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
@@ -447,6 +448,7 @@ pub async fn reconcile_director(
     allow_launch: bool,
     force_slow_refresh: bool,
 ) -> Result<DirectorSnapshot, ApplicationError> {
+    let client = &client.with_priority(RequestPriority::Background);
     let started = Instant::now();
     let settings = director_settings(&repository)?;
     let now = now_millis();
@@ -454,6 +456,7 @@ pub async fn reconcile_director(
         revision,
         mode = ?settings.mode,
         allow_launch,
+        priority = ?RequestPriority::Background,
         "Director reconciliation started"
     );
     let catalogue = client.galaxy().catalogue();

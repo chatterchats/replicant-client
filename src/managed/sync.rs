@@ -12,7 +12,7 @@ use std::{
 use crate::{
     Error, Result,
     domain::{self, DeviceKey, Realm},
-    raw,
+    raw::{self, RequestPriority},
 };
 use tracing::{debug, info, warn};
 
@@ -334,7 +334,7 @@ pub struct SyncClient {
 impl SyncClient {
     pub(crate) fn new(client: Client) -> Self {
         Self {
-            client,
+            client: client.with_priority(RequestPriority::Background),
             cancellation: SyncCancellation::default(),
             max_pages: 100,
         }

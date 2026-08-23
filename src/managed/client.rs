@@ -23,8 +23,8 @@ use crate::raw::rate_limit::{RateLimitBucket, RateLimitCoordinator, RateLimitPol
 use crate::{
     AccountId, Error, Result,
     raw::{
-        ApiTelemetrySink, Client as RawClient, ClientBuilder as RawClientBuilder, SecretString,
-        TlsBackend, Url,
+        ApiTelemetrySink, Client as RawClient, ClientBuilder as RawClientBuilder, RequestPriority,
+        SecretString, TlsBackend, Url,
     },
 };
 
@@ -629,7 +629,10 @@ impl ClientBuilder {
             status,
             readiness,
         });
-        let client = Client { inner };
+        let client = Client {
+            raw: inner.raw.clone(),
+            inner,
+        };
         client.set_readiness(|readiness| {
             readiness.local_restoration = ReadinessComponent::Ready;
             readiness.store_health = ReadinessComponent::Ready;
@@ -852,13 +855,14 @@ struct ClientInner {
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
+    raw: RawClient,
 }
 
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("status", &self.status())
-            .field("raw", &self.inner.raw)
+            .field("raw", &self.raw)
             .field("store", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -887,7 +891,16 @@ impl Client {
     /// otherwise alter managed state.
     #[must_use]
     pub fn raw(&self) -> RawClient {
-        self.inner.raw.clone()
+        self.raw.clone()
+    }
+
+    /// Returns a cheap clone whose remote requests use `priority`.
+    #[must_use]
+    pub fn with_priority(&self, priority: RequestPriority) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            raw: self.raw.with_priority(priority),
+        }
     }
 
     /// Managed account observations commit before this gateway returns.
@@ -1024,7 +1037,7 @@ impl Client {
     }
 
     pub(crate) fn managed_raw(&self) -> &RawClient {
-        &self.inner.raw
+        &self.raw
     }
 
     /// A non-owning reference used by background lifecycle tasks so they
@@ -1223,7 +1236,10 @@ impl WeakClient {
     /// Upgrades to a live [`Client`], or `None` once every real clone (and
     /// thus the managed client itself) has been dropped.
     pub(crate) fn upgrade(&self) -> Option<Client> {
-        self.0.upgrade().map(|inner| Client { inner })
+        self.0.upgrade().map(|inner| Client {
+            raw: inner.raw.clone(),
+            inner,
+        })
     }
 }
 
