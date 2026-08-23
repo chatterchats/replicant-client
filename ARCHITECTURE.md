@@ -100,6 +100,16 @@ Tauri does not require Docker, and Docker does not require Tauri.
 - Container logs default to stdout/stderr.
 - Default Compose publishes only the web/proxy port, not the daemon.
 
+### Managed-store reserved tables
+
+The managed inbox is persisted incrementally in `messages`; its cursor, unread count, and refresh
+time live in `message_metadata`. The older generic provenance scaffold remains intentionally
+reserved rather than partially implemented. In particular, BobNet history is volatile,
+relay/request-scoped data and is not cached, while the remaining unused tables have no hot-path
+consumer. `source_documents` cannot be dropped safely without rebuilding populated SQLite tables
+whose legacy foreign-key columns still reference it, so that destructive cleanup is deferred until
+those columns have a tested forward migration.
+
 ## Intent-driven automation
 
 Web and Tauri automation is goal-oriented rather than CLI-shaped. Frontends submit a small,

@@ -43,7 +43,10 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::domain::{self, DeviceId, DeviceKey, LocationId, LocationKey, OperationId, Realm};
+use crate::domain::{
+    self, DeviceId, DeviceKey, LocationId, LocationKey, Message, ObservationTime, OperationId,
+    Realm,
+};
 use crate::error::Error;
 use crate::raw;
 use crate::{Client, Result};
@@ -836,9 +839,157 @@ pub struct MessagesGateway {
     client: Client,
 }
 
+/// Durable account inbox projection.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MessageInbox {
+    /// Messages ordered newest first.
+    pub messages: Vec<Message>,
+    /// Upstream incremental-sync cursor.
+    pub last_cursor: Option<i64>,
+    /// Account-wide unread count when supplied upstream.
+    pub unread_count: Option<i64>,
+    /// Last successful full pagination pass.
+    pub refreshed_at: Option<ObservationTime>,
+}
+
+const MESSAGE_PAGE_SIZE: i64 = 100;
+const MESSAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 impl MessagesGateway {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Returns the durable inbox projection without network I/O.
+    pub fn cached(&self) -> Result<MessageInbox> {
+        self.client.ensure_open()?;
+        let (messages, metadata) = self
+            .client
+            .managed_state()
+            .messages()
+            .map_err(persistence_error)?;
+        Ok(MessageInbox {
+            messages: messages
+                .into_iter()
+                .map(|observation| observation.value)
+                .collect(),
+            last_cursor: metadata.last_cursor,
+            unread_count: metadata.unread_count,
+            refreshed_at: metadata.refreshed_at,
+        })
+    }
+
+    /// Returns the durable projection, refreshing it when its short freshness
+    /// window has expired.
+    pub async fn list(&self) -> Result<MessageInbox> {
+        let cached = self.cached()?;
+        let now = ObservationTime::now();
+        if cached.refreshed_at.is_some_and(|refreshed_at| {
+            now.unix_millis().saturating_sub(refreshed_at.unix_millis())
+                < MESSAGE_REFRESH_INTERVAL.as_millis() as i64
+        }) {
+            return Ok(cached);
+        }
+        self.refresh().await
+    }
+
+    /// Explicitly refreshes every new inbox page and commits each message row.
+    pub async fn refresh(&self) -> Result<MessageInbox> {
+        self.client.ensure_open()?;
+        let mut metadata = self
+            .client
+            .managed_state()
+            .messages()
+            .map_err(persistence_error)?
+            .1;
+        let mut cursor = metadata.last_cursor;
+        loop {
+            let response = self
+                .client
+                .managed_raw()
+                .messages()
+                .list(&raw::messages::MessageListQuery {
+                    cursor,
+                    limit: Some(MESSAGE_PAGE_SIZE),
+                    latest: None,
+                    unread_only: None,
+                })
+                .await?;
+            let next_cursor = response.value.next_cursor;
+            metadata.unread_count = response
+                .value
+                .unread_message_count
+                .or(metadata.unread_count);
+            let observed_at = ObservationTime::now();
+            let messages = response
+                .value
+                .messages
+                .into_iter()
+                .map(|message| domain::message(message, observed_at))
+                .collect::<Vec<_>>();
+            let page_last_id = messages.last().and_then(|message| message.value.id);
+            self.client
+                .managed_state()
+                .persist_messages(&messages)
+                .map_err(persistence_error)?;
+            metadata.last_cursor = next_cursor.or(page_last_id).or(metadata.last_cursor);
+
+            let Some(next) = next_cursor else {
+                break;
+            };
+            if cursor == Some(next) {
+                warn!(
+                    cursor = next,
+                    "account message pagination cursor did not advance"
+                );
+                break;
+            }
+            cursor = Some(next);
+        }
+        metadata.refreshed_at = Some(ObservationTime::now());
+        self.client
+            .managed_state()
+            .persist_message_metadata(metadata)
+            .map_err(persistence_error)?;
+        self.cached()
+    }
+
+    /// Applies a confirmed read mutation to the durable projection.
+    pub fn mark_cached_read(&self, ids: &[i64], mark_all: bool) -> Result<MessageInbox> {
+        let (messages, mut metadata) = self
+            .client
+            .managed_state()
+            .messages()
+            .map_err(persistence_error)?;
+        let mut changed = Vec::new();
+        let mut newly_read = 0_i64;
+        for mut message in messages {
+            if mark_all || message.value.id.is_some_and(|id| ids.contains(&id)) {
+                if message.value.is_read == Some(false) {
+                    newly_read += 1;
+                }
+                if message.value.is_read != Some(true) {
+                    message.value.is_read = Some(true);
+                    changed.push(message);
+                }
+            }
+        }
+        metadata.unread_count = if mark_all {
+            Some(0)
+        } else {
+            metadata
+                .unread_count
+                .map(|count| count.saturating_sub(newly_read))
+        };
+        self.client
+            .managed_state()
+            .persist_messages(&changed)
+            .map_err(persistence_error)?;
+        self.client
+            .managed_state()
+            .persist_message_metadata(metadata)
+            .map_err(persistence_error)?;
+        self.cached()
     }
 
     /// Marks one, several, or all inbox messages read.
@@ -2337,7 +2488,7 @@ mod tests {
 
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        matchers::{method, path, query_param, query_param_is_missing},
     };
 
     use super::*;
@@ -2515,6 +2666,66 @@ mod tests {
 
         client.close().await.expect("close");
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn message_pages_persist_by_row_and_survive_restart_without_refetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("limit", "100"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [
+                    {"id": 1, "title": "One", "is_read": true},
+                    {"id": 2, "title": "Two", "is_read": false}
+                ],
+                "next_cursor": 2,
+                "unread_message_count": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("cursor", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 3, "title": "Three", "is_read": false}],
+                "next_cursor": null,
+                "unread_message_count": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let path =
+            std::env::temp_dir().join(format!("replicant-message-{}.sqlite", Uuid::new_v4()));
+        let build = || {
+            Client::builder()
+                .authentication_token(SecretString::from("token".to_owned()))
+                .base_url(Url::parse(&server.uri()).expect("mock URL"))
+                .sqlite(&path)
+                .startup_policy(StartupPolicy::RestoreOnly)
+        };
+        let client = build().start().await.expect("first client");
+        let inbox = client
+            .messages()
+            .list()
+            .await
+            .expect("initial message sync");
+        assert_eq!(inbox.messages.len(), 3);
+        assert_eq!(inbox.last_cursor, Some(3));
+        client.close().await.expect("close first client");
+
+        let client = build().start().await.expect("restarted client");
+        let restored = client.messages().list().await.expect("restored inbox");
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.unread_count, Some(2));
+        client.close().await.expect("close restarted client");
+        server.verify().await;
+
+        let _ = std::fs::remove_file(super::super::store::history_database_path(&path));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -25,8 +25,9 @@ use tracing::{debug, info, warn};
 
 use crate::domain::{
     Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    LocationId, LocationKey, Observation, ObservationMetadata, Realm, Replicant, ReplicantId,
-    ReplicantKey, Simulation, SimulationId, Star, StarId, StarKey, StarKnowledge,
+    LocationId, LocationKey, Message, Observation, ObservationMetadata, ObservationTime, Realm,
+    Replicant, ReplicantId, ReplicantKey, Simulation, SimulationId, Star, StarId, StarKey,
+    StarKnowledge,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -35,9 +36,10 @@ const DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA: &str =
 const RECONCILIATION_LEADER_SCHEMA: &str =
     include_str!("../../migrations/0003_reconciliation_leader.sql");
 const HISTORY_SPLIT_SCHEMA: &str = include_str!("../../migrations/0004_history_split.sql");
+const MESSAGE_METADATA_SCHEMA: &str = include_str!("../../migrations/0005_message_metadata.sql");
 const HISTORY_INITIAL_SCHEMA: &str = include_str!("../../migrations/history/0001_initial.sql");
 const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_indexes.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 1;
 const AMI_RAW_RETENTION_DAYS: i64 = 30;
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -97,6 +99,13 @@ pub(crate) struct StoreProxy(StoreHandle);
 const STORE_QUEUE_CAPACITY: usize = 64;
 type CloseResponse = oneshot::Receiver<Result<(), StoreError>>;
 type CatalogueRows = (BTreeMap<StarKey, Observation<Star>>, Option<String>);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MessageMetadata {
+    pub(crate) last_cursor: Option<i64>,
+    pub(crate) unread_count: Option<i64>,
+    pub(crate) refreshed_at: Option<ObservationTime>,
+}
 
 enum StoreCommand {
     Execute {
@@ -422,6 +431,27 @@ impl StoreProxy {
         let value = value.clone();
         self.0
             .execute_blocking(move |s| s.persist_inventory(&value))
+    }
+    pub(crate) fn persist_messages(
+        &mut self,
+        values: &[Observation<Message>],
+    ) -> Result<(), StoreError> {
+        let values = values.to_vec();
+        self.0
+            .execute_blocking(move |s| s.persist_messages(&values))
+    }
+    pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
+        self.0.execute_blocking(|store| store.restore_messages())
+    }
+    pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
+        self.0.execute_blocking(|store| store.message_metadata())
+    }
+    pub(crate) fn persist_message_metadata(
+        &mut self,
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        self.0
+            .execute_blocking(move |s| s.persist_message_metadata(metadata))
     }
     pub(crate) fn has_event(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_owned();
@@ -796,11 +826,25 @@ impl Store {
 
         let migrated_history_split = if version == 3 {
             Self::migrate_history_split(&mut connection, &mut history)?;
-            version = CURRENT_SCHEMA_VERSION;
+            version = 4;
             true
         } else {
             false
         };
+        if version == 4 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MESSAGE_METADATA_SCHEMA)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = 5 WHERE version = 4",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '5') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 5;
+        }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
                 found: version,
@@ -2029,6 +2073,87 @@ impl Store {
         Ok(inventories)
     }
 
+    pub(crate) fn persist_messages(
+        &mut self,
+        messages: &[Observation<Message>],
+    ) -> Result<(), StoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO messages(message_id, payload_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET payload_json = excluded.payload_json",
+            )?;
+            for message in messages {
+                let key = match message.value.id {
+                    Some(id) => id.to_string(),
+                    None => format!("anonymous:{}", serde_json::to_string(&message.value)?),
+                };
+                statement.execute(params![key, serde_json::to_string(message)?])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM messages")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut messages = rows
+            .map(|row| {
+                row.map_err(StoreError::from).and_then(|value| {
+                    serde_json::from_str::<Observation<Message>>(&value).map_err(StoreError::from)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.sort_by(|left, right| {
+            right
+                .value
+                .created_at
+                .cmp(&left.value.created_at)
+                .then_with(|| right.value.id.cmp(&left.value.id))
+        });
+        Ok(messages)
+    }
+
+    pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT last_cursor, unread_count, refreshed_at FROM message_metadata WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(MessageMetadata {
+                        last_cursor: row.get(0)?,
+                        unread_count: row.get(1)?,
+                        refreshed_at: row
+                            .get::<_, Option<i64>>(2)?
+                            .map(ObservationTime::from_unix_millis),
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn persist_message_metadata(
+        &mut self,
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO message_metadata(singleton, last_cursor, unread_count, refreshed_at) VALUES (1, ?1, ?2, ?3) ON CONFLICT(singleton) DO UPDATE SET last_cursor = excluded.last_cursor, unread_count = excluded.unread_count, refreshed_at = excluded.refreshed_at",
+            params![
+                metadata.last_cursor,
+                metadata.unread_count,
+                metadata.refreshed_at.map(ObservationTime::unix_millis)
+            ],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.connection
             .query_row(
@@ -2680,14 +2805,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (5);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (6);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 5,
-                supported: 4
+                found: 6,
+                supported: 5
             })
         ));
         fs::remove_file(path).expect("remove test database");

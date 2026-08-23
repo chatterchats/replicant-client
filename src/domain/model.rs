@@ -514,6 +514,17 @@ pub struct Blueprint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: Option<i64>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub category: Option<String>,
+    pub message_type: Option<String>,
+    pub is_read: Option<bool>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Achievement {
     pub id: AchievementId,
     pub title: Option<String>,

@@ -105,8 +105,9 @@ pub mod managed {
     };
     pub use operation::{
         ConfirmAccountWipe, DynamicCommand, LocationEventsGateway, LocationHydration,
-        LocationHydrationFailure, LocationHydrationReport, LocationsGateway, MessagesGateway,
-        Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway,
+        LocationHydrationFailure, LocationHydrationReport, LocationsGateway, MessageInbox,
+        MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
+        OperationsGateway,
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use state::{GalaxyRevisionWatch, StateGateway, StateRevisionWatch};

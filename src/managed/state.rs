@@ -12,11 +12,13 @@ use tracing::{debug, info};
 
 use crate::domain::{
     AccessScope, Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    LocationKey, MergeOutcome, Observation, Realm, Replicant, ReplicantKey, Simulation,
+    LocationKey, MergeOutcome, Message, Observation, Realm, Replicant, ReplicantKey, Simulation,
     SimulationId, Star, StarKey, StarKnowledge, merge_device, merge_star,
 };
 
-use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
+use super::store::{
+    MessageMetadata, OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle,
+};
 
 /// Local-only managed-state revision gateway.
 #[derive(Clone, Debug)]
@@ -450,6 +452,27 @@ impl StateEngine {
 
     pub(crate) fn inventory(&self, owner: &InventoryOwner) -> Option<Observation<Inventory>> {
         self.snapshot().inventories.get(owner).cloned()
+    }
+
+    pub(crate) fn messages(
+        &self,
+    ) -> Result<(Vec<Observation<Message>>, MessageMetadata), StoreError> {
+        let store = self.store.lock();
+        Ok((store.restore_messages()?, store.message_metadata()?))
+    }
+
+    pub(crate) fn persist_messages(
+        &self,
+        messages: &[Observation<Message>],
+    ) -> Result<(), StoreError> {
+        self.store.lock().persist_messages(messages)
+    }
+
+    pub(crate) fn persist_message_metadata(
+        &self,
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        self.store.lock().persist_message_metadata(metadata)
     }
 
     pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {

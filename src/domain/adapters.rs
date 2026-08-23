@@ -393,6 +393,32 @@ pub fn blueprint(raw: &raw::blueprints::Blueprint) -> Result<Blueprint, Normaliz
     })
 }
 
+/// Normalizes one account inbox message.
+pub fn message(
+    raw: raw::messages::Message,
+    observed_at: impl Into<ObservationTime>,
+) -> Observation<Message> {
+    Observation {
+        value: Message {
+            id: raw.id,
+            title: raw.title,
+            body: raw.body,
+            category: raw.category,
+            message_type: raw.message_type,
+            is_read: raw.is_read,
+            created_at: raw.created_at,
+        },
+        metadata: metadata(
+            "GET /v1/messages",
+            observed_at,
+            ObservationSource::RestCollection,
+            ObservationAuthority::CollectionMember,
+            AccessScope::Owned,
+            Reachability::Reachable,
+        ),
+    }
+}
+
 pub fn device_detail(
     raw: &raw::devices::DeviceStatus,
     realm: Realm,

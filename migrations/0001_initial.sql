@@ -9,6 +9,13 @@ CREATE TABLE account_binding (
     account_id TEXT NOT NULL,
     bound_at TEXT NOT NULL
 );
+-- Reserved provenance scaffold: source_documents and the generic payload tables
+-- were created before typed managed projections became the durable design.
+-- Messages now use their table directly; blueprints, BobNet messages,
+-- achievements, reputation, species, trades, resource sites, location events,
+-- directory profiles, discovery data, and freshness remain intentionally
+-- unwritten. Keep the scaffold because populated tables still carry foreign
+-- keys to source_documents; removing it requires tested SQLite table rebuilds.
 CREATE TABLE source_documents (
     id TEXT PRIMARY KEY NOT NULL,
     operation TEXT NOT NULL,

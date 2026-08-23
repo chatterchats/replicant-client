@@ -87,7 +87,7 @@ use replicant_runtime::{
     config::{self, RuntimeConfig},
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
-    intelligence::{account_profile, inbox_page, leaderboard, leaderboard_index, standing},
+    intelligence::{account_profile, leaderboard, leaderboard_index, standing},
     orchestration::{
         assign_replicant_region, cached_director_snapshot, parse_goal_kind, reconcile_director,
         set_director_mode, set_goal_enabled,
@@ -3570,28 +3570,18 @@ async fn reports(
     })))
 }
 
-const MESSAGE_CACHE_NAMESPACE: &str = "messages";
-const MESSAGE_CACHE_KEY: &str = "inbox";
-const MESSAGE_PAGE_SIZE: i64 = 100;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct MessageInboxCache {
-    #[serde(default)]
-    inbox: Vec<InboxMessageSummary>,
-    last_cursor: Option<i64>,
-    unread_count: Option<i64>,
-}
-
 async fn messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
     let _guard = state.message_sync.lock().await;
-    let cache = sync_message_cache(&state).await?;
-    Ok(Json(Versioned::current(MessagesSnapshot {
-        metadata: state.snapshot_metadata()?,
-        inbox: cache.inbox,
-        unread_count: cache.unread_count,
-    })))
+    let inbox = state.client().messages().list().await.map_err(|error| {
+        tracing::warn!(error = %error, "account message projection refresh failed");
+        ApiError::unavailable()
+    })?;
+    if let Err(error) = state.repository.delete_document("messages", "inbox") {
+        tracing::warn!(error = %error, "legacy runtime message cache cleanup failed");
+    }
+    Ok(Json(Versioned::current(messages_snapshot(&state, inbox)?)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3614,9 +3604,8 @@ async fn mark_messages_read(
 
     let _guard = state.message_sync.lock().await;
     let ids = request.ids.into_iter().collect::<BTreeSet<_>>();
-    let operation = state
-        .client()
-        .messages()
+    let gateway = state.client().messages();
+    let operation = gateway
         .mark_read(replicant_client::raw::messages::MessagesReadRequest {
             ids: (!request.mark_all).then(|| ids.iter().copied().collect()),
             mark_all: request.mark_all.then_some(true),
@@ -3638,112 +3627,19 @@ async fn mark_messages_read(
         return Err(ApiError::unavailable());
     }
 
-    let mut cache = load_message_cache(&state.repository)?;
-    let mut newly_read = 0_i64;
-    for message in &mut cache.inbox {
-        if request.mark_all || message.id.is_some_and(|id| ids.contains(&id)) {
-            if message.is_read == Some(false) {
-                newly_read += 1;
-            }
-            message.is_read = Some(true);
-        }
-    }
-    cache.unread_count = if request.mark_all {
-        Some(0)
-    } else {
-        cache
-            .unread_count
-            .map(|count| count.saturating_sub(newly_read))
-    };
-    persist_message_cache(&state.repository, &cache)?;
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let inbox = gateway
+        .mark_cached_read(&ids, request.mark_all)
+        .map_err(|error| {
+            tracing::error!(error = %error, "updating managed message projection failed");
+            ApiError::internal()
+        })?;
     state.invalidate(DomainSlice::Messages);
 
-    Ok(Json(Versioned::current(MessagesSnapshot {
-        metadata: state.snapshot_metadata()?,
-        inbox: cache.inbox,
-        unread_count: cache.unread_count,
-    })))
+    Ok(Json(Versioned::current(messages_snapshot(&state, inbox)?)))
 }
 
-async fn sync_message_cache(state: &AppState) -> Result<MessageInboxCache, ApiError> {
-    let mut cache = load_message_cache(&state.repository)?;
-    let mut cursor = cache.last_cursor;
-
-    loop {
-        let page = inbox_page(state.client(), cursor, MESSAGE_PAGE_SIZE)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    cursor,
-                    "account message sync failed"
-                );
-                ApiError::unavailable()
-            })?;
-        let next_cursor = page.next_cursor;
-        let previous_unread_count = cache.unread_count;
-        let previous_cursor = cache.last_cursor;
-        cache.unread_count = page.unread_message_count.or(cache.unread_count);
-        let page_messages = page
-            .messages
-            .into_iter()
-            .map(inbox_message_summary)
-            .collect::<Vec<_>>();
-        let page_last_id = page_messages.last().and_then(|message| message.id);
-        let page_had_messages = !page_messages.is_empty();
-        merge_inbox_messages(&mut cache.inbox, page_messages);
-
-        // `next_cursor` is the authoritative checkpoint while another page
-        // exists. On the final page retain the last observed message ID so a
-        // later refresh can request only messages added after this sync.
-        cache.last_cursor = next_cursor.or(page_last_id).or(cache.last_cursor);
-        if page_had_messages
-            || cache.last_cursor != previous_cursor
-            || cache.unread_count != previous_unread_count
-        {
-            persist_message_cache(&state.repository, &cache)?;
-        }
-
-        let Some(next) = next_cursor else {
-            break;
-        };
-        if cursor == Some(next) {
-            tracing::warn!(
-                cursor = next,
-                "account message pagination cursor did not advance"
-            );
-            break;
-        }
-        cursor = Some(next);
-    }
-
-    Ok(cache)
-}
-
-fn load_message_cache(repository: &WorkflowRepository) -> Result<MessageInboxCache, ApiError> {
-    let Some((value, _revision)) = repository
-        .read_document(MESSAGE_CACHE_NAMESPACE, MESSAGE_CACHE_KEY)
-        .map_err(ApiError::repository)?
-    else {
-        return Ok(MessageInboxCache::default());
-    };
-    serde_json::from_value(value).map_err(|error| {
-        tracing::error!(error = %error, "persisted message cache is invalid");
-        ApiError::internal()
-    })
-}
-
-fn persist_message_cache(
-    repository: &WorkflowRepository,
-    cache: &MessageInboxCache,
-) -> Result<(), ApiError> {
-    repository
-        .put_document(MESSAGE_CACHE_NAMESPACE, MESSAGE_CACHE_KEY, cache)
-        .map_err(ApiError::repository)?;
-    Ok(())
-}
-
-fn inbox_message_summary(message: replicant_client::raw::messages::Message) -> InboxMessageSummary {
+fn inbox_message_summary(message: replicant_client::domain::Message) -> InboxMessageSummary {
     InboxMessageSummary {
         id: message.id,
         title: message.title,
@@ -3755,33 +3651,19 @@ fn inbox_message_summary(message: replicant_client::raw::messages::Message) -> I
     }
 }
 
-fn merge_inbox_messages(inbox: &mut Vec<InboxMessageSummary>, incoming: Vec<InboxMessageSummary>) {
-    let mut by_id = BTreeMap::new();
-    let mut without_id = Vec::new();
-    for message in inbox.drain(..) {
-        if let Some(id) = message.id {
-            by_id.insert(id, message);
-        } else if !without_id.contains(&message) {
-            without_id.push(message);
-        }
-    }
-
-    for message in incoming {
-        if let Some(id) = message.id {
-            by_id.insert(id, message);
-        } else if !without_id.contains(&message) {
-            without_id.push(message);
-        }
-    }
-
-    inbox.extend(by_id.into_values());
-    inbox.extend(without_id);
-    inbox.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+fn messages_snapshot(
+    state: &AppState,
+    inbox: replicant_client::managed::MessageInbox,
+) -> Result<MessagesSnapshot, ApiError> {
+    Ok(MessagesSnapshot {
+        metadata: state.snapshot_metadata()?,
+        inbox: inbox
+            .messages
+            .into_iter()
+            .map(inbox_message_summary)
+            .collect(),
+        unread_count: inbox.unread_count,
+    })
 }
 
 #[derive(Deserialize)]
@@ -6977,72 +6859,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn message_cache_merges_pages_without_duplicates_and_survives_reload() {
-        let repository = WorkflowRepository::open_in_memory().expect("runtime database");
-        let mut cache = MessageInboxCache::default();
-        merge_inbox_messages(
-            &mut cache.inbox,
-            vec![
-                InboxMessageSummary {
-                    id: Some(1),
-                    title: Some("Older".to_owned()),
-                    body: None,
-                    category: None,
-                    message_type: Some("system".to_owned()),
-                    is_read: Some(true),
-                    created_at: Some("2026-08-18T10:00:00Z".to_owned()),
-                },
-                InboxMessageSummary {
-                    id: Some(2),
-                    title: Some("Original".to_owned()),
-                    body: None,
-                    category: None,
-                    message_type: Some("social".to_owned()),
-                    is_read: Some(false),
-                    created_at: Some("2026-08-18T11:00:00Z".to_owned()),
-                },
-            ],
-        );
-        merge_inbox_messages(
-            &mut cache.inbox,
-            vec![
-                InboxMessageSummary {
-                    id: Some(2),
-                    title: Some("Updated".to_owned()),
-                    body: None,
-                    category: None,
-                    message_type: Some("social".to_owned()),
-                    is_read: Some(true),
-                    created_at: Some("2026-08-18T11:00:00Z".to_owned()),
-                },
-                InboxMessageSummary {
-                    id: Some(3),
-                    title: Some("Newest".to_owned()),
-                    body: None,
-                    category: None,
-                    message_type: Some("system".to_owned()),
-                    is_read: Some(false),
-                    created_at: Some("2026-08-18T12:00:00Z".to_owned()),
-                },
-            ],
-        );
-        cache.last_cursor = Some(3);
-        cache.unread_count = Some(1);
-        assert!(persist_message_cache(&repository, &cache).is_ok());
-
-        let restored = match load_message_cache(&repository) {
-            Ok(cache) => cache,
-            Err(_) => panic!("load message cache"),
-        };
-        assert_eq!(restored.last_cursor, Some(3));
-        assert_eq!(restored.unread_count, Some(1));
-        assert_eq!(restored.inbox.len(), 3);
-        assert_eq!(restored.inbox[0].id, Some(3));
-        assert_eq!(restored.inbox[1].title.as_deref(), Some("Updated"));
-        assert_eq!(restored.inbox[1].is_read, Some(true));
-    }
-
     #[tokio::test]
     async fn mark_messages_read_updates_the_persisted_projection() {
         let server = MockServer::start().await;
@@ -7100,22 +6916,6 @@ mod tests {
         assert_eq!(response.payload.inbox[1].id, Some(1));
         assert_eq!(response.payload.inbox[1].is_read, Some(true));
         client.close().await.expect("close client");
-    }
-
-    #[test]
-    fn message_cache_preserves_messages_without_ids() {
-        let message = InboxMessageSummary {
-            id: None,
-            title: Some("No ID".to_owned()),
-            body: Some("fallback".to_owned()),
-            category: None,
-            message_type: None,
-            is_read: Some(false),
-            created_at: Some("2026-08-18T12:00:00Z".to_owned()),
-        };
-        let mut inbox = vec![message.clone()];
-        merge_inbox_messages(&mut inbox, vec![message]);
-        assert_eq!(inbox.len(), 1);
     }
 
     #[tokio::test]
