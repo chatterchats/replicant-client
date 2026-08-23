@@ -84,7 +84,12 @@ fn travel_and_device_status_decode_new_additive_fields() {
     }))
     .expect("device status");
     assert_eq!(device.short_description.as_deref(), Some("System ward"));
-    assert!(device.description.as_deref().is_some_and(|value| value.contains("mining")));
+    assert!(
+        device
+            .description
+            .as_deref()
+            .is_some_and(|value| value.contains("mining"))
+    );
 }
 
 #[tokio::test]

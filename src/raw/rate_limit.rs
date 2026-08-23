@@ -28,7 +28,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 #[cfg(feature = "shared-rate-limit")]
 use tracing::warn;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -80,9 +80,9 @@ impl RateLimitPolicy {
 
     fn default_for(bucket: RateLimitBucket) -> Self {
         match bucket {
-            RateLimitBucket::Read => Self::new(120, Duration::from_secs(60)),
+            RateLimitBucket::Read => Self::new(DEFAULT_READ_CAPACITY, Duration::from_secs(60)),
             RateLimitBucket::Action | RateLimitBucket::Sse => {
-                Self::new(60, Duration::from_secs(60))
+                Self::new(DEFAULT_ACTION_CAPACITY, Duration::from_secs(60))
             }
             RateLimitBucket::Registration => Self::new(10, Duration::from_secs(3600)),
             RateLimitBucket::Verification => Self::new(30, Duration::from_secs(3600)),
@@ -90,6 +90,16 @@ impl RateLimitPolicy {
             RateLimitBucket::StarCatalogue => Self::new(1, Duration::from_secs(60)),
         }
     }
+}
+
+// Stay slightly below the documented 120/60 window ceilings to absorb clock skew.
+const DEFAULT_READ_CAPACITY: u32 = 115;
+const DEFAULT_ACTION_CAPACITY: u32 = 57;
+
+fn credit_floor(now: Instant, policy: RateLimitPolicy) -> Instant {
+    let capacity = policy.capacity.max(1);
+    let saved_credit = (policy.refill_every / capacity).saturating_mul(capacity - 1);
+    now.checked_sub(saved_credit).unwrap_or(now)
 }
 
 /// A server-mandated relative delay from `Retry-After`.
@@ -174,18 +184,79 @@ struct Bucket {
     server: Option<RateLimitSnapshot>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RequestQueue {
-    foreground: VecDeque<Arc<AtomicBool>>,
-    background: VecDeque<Arc<AtomicBool>>,
+    foreground: VecDeque<Arc<TicketState>>,
+    background: VecDeque<Arc<TicketState>>,
     foreground_streak: u8,
+    changed: Arc<Notify>,
 }
 
-struct QueueTicket(Arc<AtomicBool>);
+impl Default for RequestQueue {
+    fn default() -> Self {
+        Self {
+            foreground: VecDeque::new(),
+            background: VecDeque::new(),
+            foreground_streak: 0,
+            changed: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl RequestQueue {
+    fn prune_cancelled(&mut self) {
+        self.foreground
+            .retain(|ticket| ticket.active.load(Ordering::Acquire));
+        self.background
+            .retain(|ticket| ticket.active.load(Ordering::Acquire));
+        if self.foreground.is_empty() && self.background.is_empty() {
+            self.foreground_streak = 0;
+        }
+    }
+
+    fn foreground_turn(&self) -> bool {
+        !self.foreground.is_empty() && (self.background.is_empty() || self.foreground_streak < 8)
+    }
+
+    fn next(&self) -> Option<&Arc<TicketState>> {
+        if self.foreground_turn() {
+            self.foreground.front()
+        } else {
+            self.background.front()
+        }
+    }
+
+    fn pop_next(&mut self) {
+        if self.foreground_turn() {
+            self.foreground.pop_front();
+            self.foreground_streak = self.foreground_streak.saturating_add(1);
+        } else {
+            self.background.pop_front();
+            self.foreground_streak = 0;
+        }
+        if self.foreground.is_empty() && self.background.is_empty() {
+            self.foreground_streak = 0;
+        } else if let Some(ticket) = self.next() {
+            ticket.notify.notify_one();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TicketState {
+    active: AtomicBool,
+    notify: Notify,
+}
+
+struct QueueTicket {
+    state: Arc<TicketState>,
+    changed: Arc<Notify>,
+}
 
 impl Drop for QueueTicket {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.state.active.store(false, Ordering::Release);
+        self.changed.notify_waiters();
     }
 }
 
@@ -218,11 +289,12 @@ impl RateLimitCoordinator {
         let buckets = ALL_BUCKETS
             .into_iter()
             .map(|kind| {
+                let policy = RateLimitPolicy::default_for(kind);
                 (
                     kind,
                     Bucket {
-                        next: now,
-                        policy: RateLimitPolicy::default_for(kind),
+                        next: credit_floor(now, policy),
+                        policy,
                         server: None,
                     },
                 )
@@ -240,6 +312,7 @@ impl RateLimitCoordinator {
     pub async fn set_policy(&self, kind: RateLimitBucket, policy: RateLimitPolicy) {
         if let Some(bucket) = self.buckets.lock().await.get_mut(&kind) {
             bucket.policy = policy;
+            bucket.next = credit_floor(Instant::now(), policy);
         }
     }
 
@@ -289,36 +362,39 @@ impl RateLimitCoordinator {
     /// Waits for a permit. Queued foreground work runs first, except that a
     /// background request gets one turn after eight foreground permits.
     pub async fn acquire_with_priority(&self, kind: RateLimitBucket, priority: RequestPriority) {
-        let ticket = QueueTicket(Arc::new(AtomicBool::new(true)));
-        {
+        let ticket = {
             let mut queues = self.queues.lock().await;
             let queue = queues.entry(kind).or_default();
+            let state = Arc::new(TicketState {
+                active: AtomicBool::new(true),
+                notify: Notify::new(),
+            });
             match priority {
-                RequestPriority::Foreground => queue.foreground.push_back(ticket.0.clone()),
-                RequestPriority::Background => queue.background.push_back(ticket.0.clone()),
+                RequestPriority::Foreground => queue.foreground.push_back(state.clone()),
+                RequestPriority::Background => queue.background.push_back(state.clone()),
             }
-        }
+            QueueTicket {
+                state,
+                changed: queue.changed.clone(),
+            }
+        };
         loop {
+            let changed = ticket.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let permitted = {
                 let mut queues = self.queues.lock().await;
                 let queue = queues.entry(kind).or_default();
+                queue.prune_cancelled();
                 queue
-                    .foreground
-                    .retain(|entry| entry.load(Ordering::Acquire));
-                queue
-                    .background
-                    .retain(|entry| entry.load(Ordering::Acquire));
-                let foreground_turn = !queue.foreground.is_empty()
-                    && (queue.background.is_empty() || queue.foreground_streak < 8);
-                let next = if foreground_turn {
-                    queue.foreground.front()
-                } else {
-                    queue.background.front()
-                };
-                next.is_some_and(|entry| Arc::ptr_eq(entry, &ticket.0))
+                    .next()
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &ticket.state))
             };
             if !permitted {
-                tokio::task::yield_now().await;
+                tokio::select! {
+                    () = ticket.state.notify.notified() => {}
+                    () = &mut changed => {}
+                }
                 continue;
             }
             let wait = {
@@ -327,21 +403,15 @@ impl RateLimitCoordinator {
                     return;
                 };
                 let now = Instant::now();
+                bucket.next = bucket.next.max(credit_floor(now, bucket.policy));
                 if bucket.next <= now {
                     let spacing = bucket.policy.refill_every / bucket.policy.capacity.max(1);
-                    bucket.next = now + spacing;
+                    bucket.next += spacing;
                     drop(all);
                     let mut queues = self.queues.lock().await;
                     let queue = queues.entry(kind).or_default();
-                    let foreground_turn = !queue.foreground.is_empty()
-                        && (queue.background.is_empty() || queue.foreground_streak < 8);
-                    if foreground_turn {
-                        queue.foreground.pop_front();
-                        queue.foreground_streak = queue.foreground_streak.saturating_add(1);
-                    } else {
-                        queue.background.pop_front();
-                        queue.foreground_streak = 0;
-                    }
+                    queue.prune_cancelled();
+                    queue.pop_next();
                     break;
                 }
                 bucket.next.saturating_duration_since(now)
@@ -353,7 +423,10 @@ impl RateLimitCoordinator {
                 delay_ms = wait.as_millis() as u64,
                 "waiting for rate-limit permit"
             );
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = &mut changed => {}
+            }
         }
 
         #[cfg(feature = "shared-rate-limit")]
@@ -433,6 +506,11 @@ impl RateLimitCoordinator {
                 }
                 bucket.server = Some(snapshot);
             }
+        }
+        if enforced_delay.is_some()
+            && let Some(queue) = self.queues.lock().await.get(&kind)
+        {
+            queue.changed.notify_waiters();
         }
 
         #[cfg(feature = "shared-rate-limit")]
@@ -692,6 +770,109 @@ mod tests {
     };
 
     #[tokio::test(start_paused = true)]
+    async fn idle_bucket_restores_a_full_burst() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 3,
+                    refill_every: Duration::from_secs(30),
+                },
+            )
+            .await;
+        for _ in 0..3 {
+            coordinator.acquire(RateLimitBucket::Read).await;
+        }
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let now = tokio::time::Instant::now();
+        for _ in 0..3 {
+            coordinator.acquire(RateLimitBucket::Read).await;
+        }
+
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert_eq!(
+            coordinator
+                .queues
+                .lock()
+                .await
+                .get(&RateLimitBucket::Read)
+                .expect("read queue exists")
+                .foreground_streak,
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accumulated_credit_is_capped_at_capacity() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 3,
+                    refill_every: Duration::from_secs(30),
+                },
+            )
+            .await;
+        for _ in 0..3 {
+            coordinator.acquire(RateLimitBucket::Read).await;
+        }
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..3 {
+            coordinator.acquire(RateLimitBucket::Read).await;
+        }
+
+        let permit = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.acquire(RateLimitBucket::Read).await }
+        });
+        yield_now().await;
+        assert!(!permit.is_finished());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        yield_now().await;
+        assert!(permit.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_waiters_sleep_and_wake_one_at_a_time() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 1,
+                    refill_every: Duration::from_secs(10),
+                },
+            )
+            .await;
+        coordinator.acquire(RateLimitBucket::Read).await;
+
+        let (sent, mut received) = mpsc::unbounded_channel();
+        let waiters = (0..50)
+            .map(|id| {
+                let coordinator = coordinator.clone();
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    coordinator.acquire(RateLimitBucket::Read).await;
+                    sent.send(id).expect("receiver remains open");
+                })
+            })
+            .collect::<Vec<_>>();
+        yield_now().await;
+        assert!(received.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        yield_now().await;
+        received.try_recv().expect("one waiter receives a permit");
+        assert!(received.try_recv().is_err());
+        for waiter in waiters {
+            waiter.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancelled_wait_does_not_consume_a_future_permit() {
         let coordinator = RateLimitCoordinator::new();
         coordinator
@@ -798,8 +979,8 @@ mod tests {
             .set_policy(
                 RateLimitBucket::Read,
                 RateLimitPolicy {
-                    capacity: 120,
-                    refill_every: Duration::from_secs(60),
+                    capacity: 1,
+                    refill_every: Duration::from_millis(500),
                 },
             )
             .await;
@@ -809,8 +990,8 @@ mod tests {
             .observe(
                 RateLimitBucket::Read,
                 RateLimitSnapshot {
-                    limit: Some(120),
-                    remaining: Some(117),
+                    limit: Some(1),
+                    remaining: Some(1),
                     reset: Some(RateLimitReset {
                         epoch_seconds: 0,
                         delay: Duration::from_secs(45),
