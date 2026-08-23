@@ -3,7 +3,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App, relatedDeviceLabel } from "./App";
+import { App, relatedDeviceLabel, specializeDeviceCommand } from "./App";
+import type { DescriptorCommand } from "./CommandPalette";
 import { DaemonProvider } from "./daemon";
 import type {
   AccountEventsSnapshot,
@@ -16,6 +17,7 @@ import type {
   DaemonHealth,
   DescriptorCatalog,
   DevicesSnapshot,
+  DeviceSummary,
   DirectorSnapshot,
   DirectorySnapshot,
   EntitySummary,
@@ -404,5 +406,33 @@ describe("device inspector labels", () => {
       "survey_drone (CHILD-1)",
     );
     expect(relatedDeviceLabel("UNKNOWN", related)).toBe("UNKNOWN");
+  });
+
+  it("limits detach targets to devices attached to the selected host", () => {
+    const command = {
+      operationClass: "action",
+      descriptor: {
+        kind: "device.detach",
+        parameters: [{ name: "target" }],
+      },
+    } as DescriptorCommand;
+    const specialized = specializeDeviceCommand(
+      command,
+      {
+        attached_devices: ["CHILD-1"],
+        available_commands: ["detach"],
+      } as DeviceSummary,
+      {
+        "device:CHILD-1": { entity_type: "survey_drone" } as EntitySummary,
+        "device:OTHER": { entity_type: "mining_drone" } as EntitySummary,
+      } satisfies Record<string, EntitySummary>,
+    );
+
+    expect(specialized.descriptor.parameters[0]?.kind).toEqual({
+      type: "enum",
+    });
+    expect(specialized.descriptor.parameters[0]?.options).toEqual([
+      { value: "CHILD-1", label: "survey_drone (CHILD-1)" },
+    ]);
   });
 });

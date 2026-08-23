@@ -248,6 +248,8 @@ export function ParameterField({
     blueprintTypes,
   );
   const help = error ?? parameter.description;
+  const allowsAllDevices =
+    operationKind === "device.detach" && parameter.name === "target";
   if (parameter.kind.type === "boolean") {
     return (
       <label className="boolean-field" htmlFor={id}>
@@ -280,7 +282,9 @@ export function ParameterField({
             onChange(event.target.value);
           }}
         >
-          <option value="">Select…</option>
+          <option value="">
+            {allowsAllDevices ? "All devices" : "Select…"}
+          </option>
           {parameter.options.map((option) => (
             <option key={option.value} value={option.value}>
               {option.label}
@@ -293,8 +297,6 @@ export function ParameterField({
   }
   const numeric =
     parameter.kind.type === "integer" || parameter.kind.type === "number";
-  const allowsAllDevices =
-    operationKind === "device.detach" && parameter.name === "target";
   const restrictedDevice =
     parameter.kind.type === "device" &&
     (allowsAllDevices ||

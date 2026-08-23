@@ -333,10 +333,31 @@ function commandFitsDevice(command: DescriptorCommand, device: DeviceSummary) {
   return true;
 }
 
-function specializeDeviceCommand(
+export function specializeDeviceCommand(
   command: DescriptorCommand,
   device: DeviceSummary,
+  entities: Record<string, EntitySummary> = {},
 ): DescriptorCommand {
+  if (command.descriptor.kind === "device.detach") {
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "target"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: device.attached_devices.map((code) => ({
+                  value: code,
+                  label: relatedDeviceLabel(code, entities),
+                })),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
   if (
     command.descriptor.kind !== "device.lifecycle" ||
     device.available_commands.length === 0
@@ -407,7 +428,9 @@ function Inspector({
                 command.operationClass === "action" &&
                 commandFitsDevice(command, device),
             )
-            .map((command) => specializeDeviceCommand(command, device))
+            .map((command) =>
+              specializeDeviceCommand(command, device, entities),
+            )
             .filter(
               (command) =>
                 command.descriptor.kind !== "device.lifecycle" ||
@@ -418,7 +441,7 @@ function Inspector({
                 ),
             )
         : [],
-    [descriptors, device],
+    [descriptors, device, entities],
   );
   useEffect(() => {
     setInventory(undefined);
