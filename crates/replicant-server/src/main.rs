@@ -178,10 +178,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         value: 1,
         duration_ms: None,
     });
-    if let Some(empire_telemetry) = empire_telemetry {
-        if let Err(error) = empire_telemetry.shutdown() {
-            tracing::warn!(error = %error, "empire telemetry shutdown did not complete cleanly");
-        }
+    if let Some(empire_telemetry) = empire_telemetry
+        && let Err(error) = empire_telemetry.shutdown()
+    {
+        tracing::warn!(error = %error, "empire telemetry shutdown did not complete cleanly");
     }
     client.close().await?;
     telemetry.shutdown()?;

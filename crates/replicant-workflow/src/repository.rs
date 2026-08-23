@@ -1,8 +1,9 @@
 use std::{
+    ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -134,6 +135,36 @@ pub struct WorkflowRepository {
     connection: Mutex<Connection>,
 }
 
+struct ConnectionGuard<'a> {
+    connection: MutexGuard<'a, Connection>,
+    acquired_at: Instant,
+    wait_micros: u64,
+}
+
+impl Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for ConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            wait_micros = self.wait_micros,
+            held_micros = u64::try_from(self.acquired_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "workflow repository connection released"
+        );
+    }
+}
+
 impl WorkflowRepository {
     /// Opens or creates a runtime database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RepositoryError> {
@@ -168,10 +199,17 @@ impl WorkflowRepository {
         Ok(repository)
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>, RepositoryError> {
-        self.connection
+    fn connection(&self) -> Result<ConnectionGuard<'_>, RepositoryError> {
+        let waiting_at = Instant::now();
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| RepositoryError::LockPoisoned)
+            .map_err(|_| RepositoryError::LockPoisoned)?;
+        Ok(ConnectionGuard {
+            connection,
+            acquired_at: Instant::now(),
+            wait_micros: u64::try_from(waiting_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+        })
     }
 
     fn migrate(&self) -> Result<(), RepositoryError> {

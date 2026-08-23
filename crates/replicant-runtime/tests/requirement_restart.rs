@@ -1,3 +1,5 @@
+//! Integration coverage for requirement-plan restart persistence.
+
 use std::{collections::BTreeMap, fs};
 
 use replicant_runtime::{

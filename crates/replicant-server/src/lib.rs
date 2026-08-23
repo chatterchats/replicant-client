@@ -251,8 +251,7 @@ impl DaemonConfig {
 fn default_log_directory(runtime_database: &std::path::Path) -> PathBuf {
     runtime_database
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
+        .unwrap_or_else(|| std::path::Path::new(""))
         .join("logs")
 }
 
@@ -290,7 +289,7 @@ pub enum ConfigError {
 pub struct AppState {
     context: ApplicationContext,
     repository: Arc<WorkflowRepository>,
-    supervisor: Mutex<WorkflowSupervisor>,
+    supervisor: WorkflowSupervisor,
     catalogue: OperationCatalogue,
     live: broadcast::Sender<LiveMessage>,
     revision: AtomicU64,
@@ -351,7 +350,7 @@ impl AppState {
         Ok(Arc::new(Self {
             context: ApplicationContext::new(client, runtime_config),
             repository,
-            supervisor: Mutex::new(supervisor),
+            supervisor,
             catalogue,
             live: broadcast::channel(LIVE_BUFFER).0,
             revision: AtomicU64::new(revision),
@@ -645,7 +644,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
         tokio::select! {
             _ = interval.tick() => {
                 let tick_started = Instant::now();
-                let tick_result = state.supervisor.lock().await.tick().await;
+                let tick_result = state.supervisor.tick().await;
                 let tick_duration_ms = tick_started
                     .elapsed()
                     .as_millis()
@@ -1370,7 +1369,7 @@ async fn overview(
         .take(12)
         .map(protocol_activity)
         .collect::<Result<Vec<_>, _>>()?;
-    recent_activity.sort_by(|left, right| right.id.cmp(&left.id));
+    recent_activity.sort_by_key(|activity| std::cmp::Reverse(activity.id));
     Ok(Json(Versioned::current(build_overview_snapshot(
         metadata,
         DaemonHealth {
@@ -4030,9 +4029,7 @@ async fn network(
     let account_future =
         tokio::time::timeout(Duration::from_secs(8), account_profile(state.client()));
     let channels_future = async {
-        let Some(relay_code) = source_code.as_deref() else {
-            return None;
-        };
+        let relay_code = source_code.as_deref()?;
         Some(
             tokio::time::timeout(
                 Duration::from_secs(6),
@@ -4338,7 +4335,7 @@ fn bootstrap_mission_summaries(
         });
     }
     let mut missions = latest.into_values().collect::<Vec<_>>();
-    missions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    missions.sort_by_key(|mission| std::cmp::Reverse(mission.updated_at_ms));
     missions
 }
 
@@ -5259,14 +5256,10 @@ fn validate_trigger_request(
         ProtocolTriggerCondition::StateCondition { .. } => {
             replicant_protocol::TriggerKind::StateCondition
         }
-        ProtocolTriggerCondition::ParentWorkflow { status, .. }
-            if matches!(
-                status,
-                ProtocolStatus::Succeeded | ProtocolStatus::Failed | ProtocolStatus::Cancelled
-            ) =>
-        {
-            replicant_protocol::TriggerKind::ParentWorkflow
-        }
+        ProtocolTriggerCondition::ParentWorkflow {
+            status: ProtocolStatus::Succeeded | ProtocolStatus::Failed | ProtocolStatus::Cancelled,
+            ..
+        } => replicant_protocol::TriggerKind::ParentWorkflow,
         ProtocolTriggerCondition::ParentWorkflow { .. } => {
             return Err(ApiError::invalid("parent workflow status must be terminal"));
         }
@@ -5841,7 +5834,6 @@ async fn control_automation(
         .repository
         .automation_policy()
         .map_err(ApiError::repository)?;
-    let supervisor = state.supervisor.lock().await;
     let affected_workflows = match request.action {
         AutomationControlAction::EnableTriggers => {
             policy.automatic_triggers_enabled = true;
@@ -5857,7 +5849,7 @@ async fn control_automation(
                 .repository
                 .set_automation_policy(policy)
                 .map_err(ApiError::repository)?;
-            supervisor.pause_all().map_err(supervisor_error)?
+            state.supervisor.pause_all().map_err(supervisor_error)?
         }
         AutomationControlAction::ResumeAll => {
             policy.workflows_paused = false;
@@ -5865,7 +5857,7 @@ async fn control_automation(
                 .repository
                 .set_automation_policy(policy)
                 .map_err(ApiError::repository)?;
-            supervisor.resume_all().map_err(supervisor_error)?
+            state.supervisor.resume_all().map_err(supervisor_error)?
         }
         AutomationControlAction::Cancel => {
             let ids = request
@@ -5873,10 +5865,12 @@ async fn control_automation(
                 .iter()
                 .map(|id| parse_id(&id.0))
                 .collect::<Result<Vec<_>, _>>()?;
-            supervisor.cancel_selected(&ids).map_err(supervisor_error)?
+            state
+                .supervisor
+                .cancel_selected(&ids)
+                .map_err(supervisor_error)?
         }
     };
-    drop(supervisor);
     policy = state
         .repository
         .set_automation_policy(policy)
@@ -5922,14 +5916,12 @@ async fn control_workflow(
     control: Control,
 ) -> Result<Json<Versioned<WorkflowControlResponse>>, ApiError> {
     let id = parse_id(&id)?;
-    let supervisor = state.supervisor.lock().await;
     match control {
-        Control::Pause => supervisor.pause(id),
-        Control::Resume => supervisor.resume(id),
-        Control::Cancel => supervisor.cancel(id),
+        Control::Pause => state.supervisor.pause(id),
+        Control::Resume => state.supervisor.resume(id),
+        Control::Cancel => state.supervisor.cancel(id),
     }
     .map_err(supervisor_error)?;
-    drop(supervisor);
     let instance = state
         .repository
         .read(id)
@@ -6105,7 +6097,7 @@ fn detail(
         created_at_ms: instance.created_at,
         finished_at_ms: instance.status.is_terminal().then_some(instance.updated_at),
         error: if instance.status == WorkflowStatus::Failed {
-            instance.last_error.clone()
+            workflow_error(instance)
         } else {
             None
         },
@@ -6235,7 +6227,7 @@ fn operational_notifications(
 }
 
 fn workflow_notification(workflow: &WorkflowInstance) -> Option<Notification> {
-    let error = workflow.last_error.as_deref()?;
+    let error = workflow_error(workflow)?;
     let blocked = error.contains("claimed by workflow") || error.contains("ClaimConflict");
     Some(Notification {
         id: EntityId(format!("workflow:{}:attention", workflow.id)),
@@ -6257,6 +6249,14 @@ fn workflow_notification(workflow: &WorkflowInstance) -> Option<Notification> {
         },
         created_at_ms: workflow.updated_at,
     })
+}
+
+fn workflow_error(workflow: &WorkflowInstance) -> Option<String> {
+    let error = workflow.last_error.clone()?;
+    let safe = workflow
+        .config::<Value>()
+        .is_ok_and(|config| sanitize_result(config.clone()) == config);
+    Some(if safe { error } else { "[redacted]".to_owned() })
 }
 
 fn sync_notification(sync: &RuntimeSyncStatus) -> Notification {
@@ -7866,9 +7866,10 @@ mod tests {
             .expect("response"),
         )
         .await;
-        assert_eq!(
-            entities["payload"]["entities"][0]["entity"]["kind"],
-            "workflow"
+        assert!(
+            entities["payload"]["entities"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
         );
         assert!(!entities.to_string().contains("do-not-export"));
         assert!(!entities.to_string().contains("also-private"));
@@ -8319,7 +8320,7 @@ mod tests {
     async fn bootstrap_action_completion_invalidates_missions() {
         let (_, client, state) = test_app().await;
         let mut updates = state.live.subscribe();
-        operation_response(
+        let _ = operation_response(
             &state,
             FiniteExecutionClass::Action,
             "bootstrap.run",

@@ -1,3 +1,5 @@
+//! Integration coverage for persisted finite-execution history.
+
 use replicant_workflow::{FiniteExecutionClass, FiniteExecutionStatus, WorkflowRepository};
 use serde_json::json;
 

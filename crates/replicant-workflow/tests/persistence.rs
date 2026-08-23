@@ -569,8 +569,7 @@ async fn startup_reconciles_terminal_and_missing_claim_owners() {
     .expect("insert missing owner claim");
 
     let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
-    let mut supervisor =
-        WorkflowSupervisor::new(repository.clone(), Arc::new(WorkflowRegistry::new()));
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(WorkflowRegistry::new()));
     supervisor.tick().await.expect("startup reconciliation");
     assert!(
         repository
@@ -722,7 +721,7 @@ async fn explicitly_migrates_old_checkpoint_before_executor_resolution() {
     registry
         .register(Arc::new(Factory { kind: kind() }))
         .expect("register factory");
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
 
     supervisor.tick().await.expect("migrate workflow");
 
@@ -771,7 +770,7 @@ async fn unsupported_checkpoint_fails_without_running_or_losing_claims_history()
     registry
         .register(Arc::new(UnsupportedFactory(kind())))
         .expect("register factory");
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
 
     supervisor
         .tick()

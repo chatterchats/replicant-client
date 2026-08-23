@@ -1708,7 +1708,7 @@ async fn scan_system(client: &Client, replicant_code: &str, system: &str) -> Any
         }
     }
 
-    let location = client.locations().get(system).await?;
+    let location = projected_location(client, system)?;
     let belts = belts_from_location(&location);
     info!(
         replicant = replicant_code,
@@ -3397,7 +3397,7 @@ async fn belt_candidates(
         .collect::<BTreeMap<_, _>>();
     let mut result = Vec::new();
     for system in systems {
-        let location = client.locations().get(system).await?;
+        let location = projected_location(client, system)?;
         let position = positions.get(system).copied().ok_or_else(|| {
             app_error(
                 io::ErrorKind::InvalidData,
@@ -3417,6 +3417,15 @@ async fn belt_candidates(
         );
     }
     Ok(result)
+}
+
+fn projected_location(client: &Client, designation: &str) -> AnyResult<Location> {
+    client.locations().cached(designation).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("{designation} is missing from the managed location projection"),
+        )
+    })
 }
 
 fn belts_from_location(location: &Location) -> Vec<(String, String)> {

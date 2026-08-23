@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -481,11 +484,17 @@ pub enum WorkflowWaitError {
 pub struct WorkflowSupervisor {
     repository: Arc<WorkflowRepository>,
     registry: Arc<WorkflowRegistry>,
-    tasks: HashMap<WorkflowId, JoinHandle<()>>,
-    controls: HashMap<WorkflowId, watch::Sender<ControlRequest>>,
+    executors: Mutex<Executors>,
+    tick_lock: tokio::sync::Mutex<()>,
     client: Option<Client>,
     telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
-    claims_reconciled: bool,
+    claims_reconciled: AtomicBool,
+}
+
+#[derive(Default)]
+struct Executors {
+    tasks: HashMap<WorkflowId, JoinHandle<()>>,
+    controls: HashMap<WorkflowId, watch::Sender<ControlRequest>>,
 }
 
 impl WorkflowSupervisor {
@@ -495,11 +504,11 @@ impl WorkflowSupervisor {
         Self {
             repository,
             registry,
-            tasks: HashMap::new(),
-            controls: HashMap::new(),
+            executors: Mutex::new(Executors::default()),
+            tick_lock: tokio::sync::Mutex::new(()),
             client: None,
             telemetry: None,
-            claims_reconciled: false,
+            claims_reconciled: AtomicBool::new(false),
         }
     }
 
@@ -523,8 +532,9 @@ impl WorkflowSupervisor {
     }
 
     /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
-    pub async fn tick(&mut self) -> Result<(), SupervisorError> {
-        let instances = if !self.claims_reconciled {
+    pub async fn tick(&self) -> Result<(), SupervisorError> {
+        let _tick = self.tick_lock.lock().await;
+        let instances = if !self.claims_reconciled.load(Ordering::Acquire) {
             let released_claims = self.repository.reconcile_claims()?;
             let instances = self.repository.list()?;
             let resumable = instances
@@ -555,7 +565,7 @@ impl WorkflowSupervisor {
                 released_claims,
                 "workflow startup reconciliation complete"
             );
-            self.claims_reconciled = true;
+            self.claims_reconciled.store(true, Ordering::Release);
             Some(instances)
         } else {
             None
@@ -568,7 +578,7 @@ impl WorkflowSupervisor {
             Some(instances) => instances,
             None => self.repository.list_active()?,
         } {
-            if self.tasks.contains_key(&instance.id) {
+            if self.executors().controls.contains_key(&instance.id) {
                 continue;
             }
             if instance.status == WorkflowStatus::Waiting
@@ -597,14 +607,18 @@ impl WorkflowSupervisor {
 
     /// Durably requests a cooperative pause while retaining resource claims.
     pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
-        let instance = self.read(id)?;
+        self.pause_instance(self.read(id)?)
+    }
+
+    fn pause_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+        let id = instance.id;
         tracing::info!(
             workflow_id = %id,
             kind = %instance.kind,
             "workflow pause requested"
         );
         self.transition(instance, WorkflowStatus::Paused)?;
-        if let Some(control) = self.controls.get(&id) {
+        if let Some(control) = self.executors().controls.get(&id) {
             control.send_replace(ControlRequest::Pause);
         }
         Ok(())
@@ -612,7 +626,11 @@ impl WorkflowSupervisor {
 
     /// Durably resumes a paused workflow through reconciliation.
     pub fn resume(&self, id: WorkflowId) -> Result<(), SupervisorError> {
-        let instance = self.read(id)?;
+        self.resume_instance(self.read(id)?)
+    }
+
+    fn resume_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+        let id = instance.id;
         tracing::info!(
             workflow_id = %id,
             kind = %instance.kind,
@@ -627,17 +645,23 @@ impl WorkflowSupervisor {
     /// Claims remain held until a running executor reaches its safe boundary;
     /// a workflow without an executor releases them immediately.
     pub fn cancel(&self, id: WorkflowId) -> Result<(), SupervisorError> {
-        let instance = self.read(id)?;
+        self.cancel_instance(self.read(id)?)
+    }
+
+    fn cancel_instance(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+        let id = instance.id;
         tracing::info!(
             workflow_id = %id,
             kind = %instance.kind,
             "workflow cancellation requested"
         );
         self.transition(instance, WorkflowStatus::Cancelled)?;
-        if let Some(control) = self.controls.get(&id) {
+        let executors = self.executors();
+        if let Some(control) = executors.controls.get(&id) {
             control.send_replace(ControlRequest::Cancel);
         }
-        if !self.tasks.contains_key(&id) {
+        if !executors.controls.contains_key(&id) {
+            drop(executors);
             self.repository.release_claims(id)?;
         }
         Ok(())
@@ -650,7 +674,7 @@ impl WorkflowSupervisor {
             if instance.status.can_transition_to(WorkflowStatus::Paused)
                 && instance.status != WorkflowStatus::Paused
             {
-                self.pause(instance.id)?;
+                self.pause_instance(instance)?;
                 paused += 1;
             }
         }
@@ -662,7 +686,7 @@ impl WorkflowSupervisor {
         let mut resumed = 0;
         for instance in self.repository.list_active()? {
             if instance.status == WorkflowStatus::Paused {
-                self.resume(instance.id)?;
+                self.resume_instance(instance)?;
                 resumed += 1;
             }
         }
@@ -675,7 +699,7 @@ impl WorkflowSupervisor {
         let mut cancelled = 0;
         for instance in instances {
             if !instance.status.is_terminal() && (ids.is_empty() || ids.contains(&instance.id)) {
-                self.cancel(instance.id)?;
+                self.cancel_instance(instance)?;
                 cancelled += 1;
             }
         }
@@ -685,7 +709,7 @@ impl WorkflowSupervisor {
     /// Returns whether this supervisor currently owns the instance executor.
     #[must_use]
     pub fn has_executor(&self, id: WorkflowId) -> bool {
-        self.tasks.contains_key(&id)
+        self.executors().controls.contains_key(&id)
     }
 
     fn read(&self, id: WorkflowId) -> Result<WorkflowInstance, RepositoryError> {
@@ -714,7 +738,7 @@ impl WorkflowSupervisor {
         )
     }
 
-    fn start(&mut self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
+    fn start(&self, instance: WorkflowInstance) -> Result<(), SupervisorError> {
         let instance = match self.registry.migration(&instance) {
             Ok(Some((target_version, migration))) => {
                 let migrated =
@@ -735,40 +759,48 @@ impl WorkflowSupervisor {
                 return Ok(());
             }
         };
-        let instance = self.transition(instance, WorkflowStatus::Running)?;
-        let mut executor = match self
-            .registry
-            .resolve(&instance)
-            .map(|factory| factory.create_executor())
-        {
-            Ok(Some(executor)) => executor,
-            Ok(None) => {
-                let (_, control) = watch::channel(ControlRequest::Continue);
-                let mut context = WorkflowContext::new(
-                    self.repository.clone(),
-                    instance,
-                    self.client.clone(),
-                    control,
-                    self.telemetry.clone(),
-                );
-                context.mark_failed("workflow kind has no executor")?;
-                return Ok(());
-            }
+        let id = instance.id;
+        let kind = instance.kind.clone();
+        let (control_sender, control) = watch::channel(ControlRequest::Continue);
+        self.executors().controls.insert(id, control_sender);
+        let instance = match self.transition(instance, WorkflowStatus::Running) {
+            Ok(instance) => instance,
             Err(error) => {
-                let (_, control) = watch::channel(ControlRequest::Continue);
-                let mut context = WorkflowContext::new(
+                self.clear_start(id)?;
+                return Err(error.into());
+            }
+        };
+        let mut executor = match self.registry.resolve(&instance) {
+            Ok(factory) => match factory.create_executor() {
+                Some(executor) => executor,
+                None => {
+                    let result = WorkflowContext::new(
+                        self.repository.clone(),
+                        instance,
+                        self.client.clone(),
+                        control,
+                        self.telemetry.clone(),
+                    )
+                    .mark_failed("workflow kind has no executor");
+                    self.clear_start(id)?;
+                    result?;
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                let result = WorkflowContext::new(
                     self.repository.clone(),
                     instance,
                     self.client.clone(),
                     control,
                     self.telemetry.clone(),
-                );
-                context.mark_failed(error.to_string())?;
+                )
+                .mark_failed(error.to_string());
+                self.clear_start(id)?;
+                result?;
                 return Ok(());
             }
         };
-        let id = instance.id;
-        let kind = instance.kind.clone();
         tracing::info!(workflow_id = %id, kind = %kind, "workflow executor starting");
         if let Some(sink) = self.telemetry.as_ref() {
             sink.record(WorkflowTelemetrySample {
@@ -784,7 +816,6 @@ impl WorkflowSupervisor {
         let repository = self.repository.clone();
         let client = self.client.clone();
         let telemetry = self.telemetry.clone();
-        let (control_sender, control) = watch::channel(ControlRequest::Continue);
         let task = tokio::spawn(async move {
             let executor_started = std::time::Instant::now();
             let mut context =
@@ -827,8 +858,7 @@ impl WorkflowSupervisor {
                 });
             }
         });
-        self.tasks.insert(id, task);
-        self.controls.insert(id, control_sender);
+        self.executors().tasks.insert(id, task);
         Ok(())
     }
 
@@ -855,15 +885,25 @@ impl WorkflowSupervisor {
         Ok(())
     }
 
-    async fn reap_finished(&mut self) -> Result<(), SupervisorError> {
-        let finished: Vec<_> = self
-            .tasks
-            .iter()
-            .filter_map(|(id, task)| task.is_finished().then_some(*id))
-            .collect();
-        for id in finished {
-            let task = self.tasks.remove(&id).expect("finished task exists");
-            self.controls.remove(&id);
+    async fn reap_finished(&self) -> Result<(), SupervisorError> {
+        let finished = {
+            let mut executors = self.executors();
+            let ids = executors
+                .tasks
+                .iter()
+                .filter_map(|(id, task)| task.is_finished().then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .map(|id| {
+                    executors.controls.remove(&id);
+                    (
+                        id,
+                        executors.tasks.remove(&id).expect("finished task exists"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, task) in finished {
             if let Err(error) = task.await {
                 let instance = self.read(id)?;
                 if !matches!(
@@ -884,6 +924,20 @@ impl WorkflowSupervisor {
             if self.read(id)?.status == WorkflowStatus::Cancelled {
                 self.repository.release_claims(id)?;
             }
+        }
+        Ok(())
+    }
+
+    fn executors(&self) -> MutexGuard<'_, Executors> {
+        self.executors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn clear_start(&self, id: WorkflowId) -> Result<(), RepositoryError> {
+        self.executors().controls.remove(&id);
+        if self.read(id)?.status == WorkflowStatus::Cancelled {
+            self.repository.release_claims(id)?;
         }
         Ok(())
     }
@@ -968,7 +1022,11 @@ fn deadline_delay(deadline: Option<i64>) -> Result<Duration, WorkflowWaitError> 
 
 impl Drop for WorkflowSupervisor {
     fn drop(&mut self) {
-        for task in self.tasks.values() {
+        let executors = self
+            .executors
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        for task in executors.tasks.values() {
             task.abort();
         }
     }

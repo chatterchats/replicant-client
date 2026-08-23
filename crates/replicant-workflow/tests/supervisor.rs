@@ -1,7 +1,7 @@
 //! Durable supervisor lifecycle integration tests.
 
 use std::sync::{
-    Arc,
+    Arc, Barrier,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -58,6 +58,28 @@ impl WorkflowFactory for Factory {
         Some(Box::new(TestWorkflow {
             harness: self.harness.clone(),
         }))
+    }
+}
+
+struct BlockingFactory {
+    inner: Factory,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl WorkflowFactory for BlockingFactory {
+    fn kind(&self) -> &WorkflowKind {
+        self.inner.kind()
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        self.entered.wait();
+        self.release.wait();
+        self.inner.create_executor()
     }
 }
 
@@ -152,7 +174,7 @@ async fn reach_step(harness: &Harness) {
 }
 
 async fn wait_for_status(
-    supervisor: &mut WorkflowSupervisor,
+    supervisor: &WorkflowSupervisor,
     repository: &WorkflowRepository,
     id: WorkflowId,
     expected: WorkflowStatus,
@@ -174,16 +196,80 @@ async fn finish_remaining(harness: &Harness, completed: usize) {
     }
 }
 
+#[test]
+fn controls_remain_available_while_tick_starts_executor() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.concurrent-control").expect("valid kind");
+    let instance = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: Config {
+                steps: 1,
+                panic_after_first_step: false,
+            },
+            checkpoint: Checkpoint { completed: 0 },
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create workflow");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(BlockingFactory {
+            inner: Factory {
+                kind,
+                harness: Arc::new(Harness::default()),
+            },
+            entered: entered.clone(),
+            release: release.clone(),
+        }))
+        .expect("register workflow");
+    let supervisor = Arc::new(WorkflowSupervisor::new(
+        repository.clone(),
+        Arc::new(registry),
+    ));
+    let ticking = supervisor.clone();
+    let tick = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime")
+            .block_on(ticking.tick())
+    });
+
+    entered.wait();
+    let (paused, pause_result) = std::sync::mpsc::channel();
+    let controlling = supervisor.clone();
+    let control = std::thread::spawn(move || {
+        paused
+            .send(controlling.pause(instance.id))
+            .expect("send pause result");
+    });
+    let pause_result = pause_result.recv_timeout(std::time::Duration::from_secs(2));
+    release.wait();
+    tick.join().expect("tick thread").expect("tick supervisor");
+    control.join().expect("control thread");
+    pause_result
+        .expect("pause is not blocked by tick")
+        .expect("pause during tick");
+    assert_eq!(
+        repository.read(instance.id).unwrap().unwrap().status,
+        WorkflowStatus::Paused
+    );
+}
+
 #[tokio::test]
 async fn completes_and_checkpoints_each_step() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    let (id, harness, _, supervisor) = setup(repository.clone(), false);
     repository
         .acquire_claim(id, ResourceKey::Replicant("ADA".into()))
         .expect("claim resource");
     supervisor.tick().await.expect("start workflow");
     finish_remaining(&harness, 0).await;
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
 
     let checkpoint: Checkpoint = repository
         .read(id)
@@ -199,7 +285,7 @@ async fn completes_and_checkpoints_each_step() {
 #[tokio::test]
 async fn pauses_and_resumes_cooperatively() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    let (id, harness, _, supervisor) = setup(repository.clone(), false);
     repository
         .acquire_claim(id, ResourceKey::Device("VESSEL-1".into()))
         .expect("claim resource");
@@ -207,7 +293,7 @@ async fn pauses_and_resumes_cooperatively() {
     reach_step(&harness).await;
     supervisor.pause(id).expect("request pause");
     harness.proceed.add_permits(1);
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Paused).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Paused).await;
     while supervisor.has_executor(id) {
         tokio::task::yield_now().await;
         supervisor.tick().await.expect("reap paused executor");
@@ -217,7 +303,7 @@ async fn pauses_and_resumes_cooperatively() {
     supervisor.resume(id).expect("resume workflow");
     supervisor.tick().await.expect("restart workflow");
     finish_remaining(&harness, 1).await;
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(harness.executions.load(Ordering::SeqCst), 2);
 }
 
@@ -240,7 +326,7 @@ async fn pause_all_survives_restart_and_blocks_executor_start() {
     drop(repository);
 
     let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry);
+    let supervisor = WorkflowSupervisor::new(repository.clone(), registry);
     supervisor.tick().await.expect("reconcile while paused");
     assert!(
         repository
@@ -262,7 +348,7 @@ async fn pause_all_survives_restart_and_blocks_executor_start() {
 #[tokio::test]
 async fn cancels_cooperatively() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, harness, _, mut supervisor) = setup(repository.clone(), false);
+    let (id, harness, _, supervisor) = setup(repository.clone(), false);
     repository
         .acquire_claim(id, ResourceKey::Autofactory("FACTORY-1".into()))
         .expect("claim resource");
@@ -312,7 +398,7 @@ async fn reopens_and_resumes_without_repeating_completed_steps() {
         supervisor = WorkflowSupervisor::new(repository.clone(), registry.clone());
     }
 
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
 
     let activity = repository.activity(id).expect("read activity");
     assert_eq!(activity.len(), 3);
@@ -420,7 +506,7 @@ async fn restart_after_mutation_submission_reconciles_evidence_without_resubmitt
         }))
         .unwrap();
     let registry = Arc::new(registry);
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry.clone());
+    let supervisor = WorkflowSupervisor::new(repository.clone(), registry.clone());
     supervisor.tick().await.unwrap();
     harness
         .submitted_before_checkpoint
@@ -433,9 +519,9 @@ async fn restart_after_mutation_submission_reconciles_evidence_without_resubmitt
     tokio::task::yield_now().await;
 
     let repository = Arc::new(WorkflowRepository::open(&path).expect("reopen repository"));
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), registry);
+    let supervisor = WorkflowSupervisor::new(repository.clone(), registry);
     wait_for_status(
-        &mut supervisor,
+        &supervisor,
         &repository,
         workflow.id,
         WorkflowStatus::Succeeded,
@@ -459,11 +545,11 @@ async fn restart_after_mutation_submission_reconciles_evidence_without_resubmitt
 #[tokio::test]
 async fn records_executor_panics_as_failures() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, harness, _, mut supervisor) = setup(repository.clone(), true);
+    let (id, harness, _, supervisor) = setup(repository.clone(), true);
     supervisor.tick().await.expect("start workflow");
     reach_step(&harness).await;
     harness.proceed.add_permits(1);
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Failed).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Failed).await;
     assert!(
         repository
             .read(id)
@@ -531,10 +617,10 @@ async fn polling_wait_is_not_restarted_on_every_supervisor_tick() {
             executions: executions.clone(),
         }))
         .expect("register workflow");
-    let mut supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
 
     wait_for_status(
-        &mut supervisor,
+        &supervisor,
         &repository,
         workflow.id,
         WorkflowStatus::Waiting,
@@ -687,7 +773,7 @@ async fn wait_uses_authoritative_poll_fallback() {
             satisfy_on_poll: true,
         }))
         .expect("register workflow");
-    let mut supervisor = WorkflowSupervisor::with_managed_client(
+    let supervisor = WorkflowSupervisor::with_managed_client(
         repository.clone(),
         Arc::new(registry),
         managed_client().await,
@@ -695,7 +781,7 @@ async fn wait_uses_authoritative_poll_fallback() {
 
     supervisor.tick().await.expect("start workflow");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
 }
 
 fn unix_millis() -> i64 {
@@ -711,14 +797,14 @@ fn unix_millis() -> i64 {
 #[tokio::test]
 async fn wait_persists_intent_and_wakes_on_pause() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, _, mut supervisor) = waiting_setup(
+    let (id, _, supervisor) = waiting_setup(
         repository.clone(),
         managed_client().await,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         unix_millis() + 60_000,
     );
     supervisor.tick().await.expect("start workflow");
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Waiting).await;
     assert_eq!(
         repository
             .read(id)
@@ -733,7 +819,7 @@ async fn wait_persists_intent_and_wakes_on_pause() {
     );
 
     supervisor.pause(id).expect("pause wait");
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Paused).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Paused).await;
     while supervisor.has_executor(id) {
         tokio::task::yield_now().await;
         supervisor.tick().await.expect("reap paused wait");
@@ -743,14 +829,14 @@ async fn wait_persists_intent_and_wakes_on_pause() {
 #[tokio::test]
 async fn wait_wakes_on_cancel() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, _, mut supervisor) = waiting_setup(
+    let (id, _, supervisor) = waiting_setup(
         repository.clone(),
         managed_client().await,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         unix_millis() + 60_000,
     );
     supervisor.tick().await.expect("start workflow");
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Waiting).await;
     supervisor.cancel(id).expect("cancel wait");
     while supervisor.has_executor(id) {
         tokio::task::yield_now().await;
@@ -779,7 +865,7 @@ async fn restart_reconciles_wait_and_rechecks_managed_state() {
     );
     for _ in 0..3 {
         supervisor.tick().await.expect("start workflow");
-        wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Waiting).await;
+        wait_for_status(&supervisor, &repository, id, WorkflowStatus::Waiting).await;
         drop(supervisor);
         drop(repository);
         tokio::task::yield_now().await;
@@ -792,7 +878,7 @@ async fn restart_reconciles_wait_and_rechecks_managed_state() {
     }
 
     satisfied.store(true, Ordering::SeqCst);
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(
         repository
             .read(id)
@@ -810,13 +896,13 @@ async fn restart_reconciles_wait_and_rechecks_managed_state() {
 #[tokio::test]
 async fn wait_wakes_at_persisted_deadline() {
     let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
-    let (id, _, mut supervisor) = waiting_setup(
+    let (id, _, supervisor) = waiting_setup(
         repository.clone(),
         managed_client().await,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         unix_millis(),
     );
-    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
+    wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(
         repository
             .read(id)
