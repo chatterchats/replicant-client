@@ -108,7 +108,8 @@ use replicant_workflow::{
     FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
     RepositoryError, ResourceKey, SupervisorError, TriggerCondition, TriggerId, TriggerState,
     TriggerTarget, TriggerTargetClass, WorkflowId, WorkflowInstance, WorkflowKind,
-    WorkflowRepository, WorkflowStatus, WorkflowSupervisor, WorkflowTelemetrySink,
+    WorkflowRepository, WorkflowStatus, WorkflowSummary as StoredWorkflowSummary,
+    WorkflowSupervisor, WorkflowTelemetrySink,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -131,6 +132,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const UPSTREAM_FANOUT: usize = 8;
 const CARGO_CACHE_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_WORKFLOW_RETENTION_DAYS: u64 = 90;
+const WORKFLOW_RETENTION_SWEEP: Duration = Duration::from_secs(60 * 60);
 const BILL_REPLICANT_CODE: &str = "A8F48B26";
 const BILL_DEFAULT_TRACKING_BEACON: &str = "FEB51E1B";
 const BILL_MAX_CANDIDATES: usize = 12;
@@ -168,6 +171,8 @@ pub struct DaemonConfig {
     /// already implies local access. Any non-loopback bind requires one: see
     /// [`DaemonConfig::validate`].
     pub token: Option<String>,
+    /// Terminal workflow retention in days, or `None` to preserve full history.
+    pub workflow_retention_days: Option<u64>,
 }
 
 impl DaemonConfig {
@@ -196,6 +201,18 @@ impl DaemonConfig {
             .ok()
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty());
+        let workflow_retention_days = match env::var("REPLICANT_WORKFLOW_RETENTION_DAYS") {
+            Ok(value) if matches!(value.trim(), "0" | "off" | "none") => None,
+            Ok(value) => Some(
+                value
+                    .parse()
+                    .map_err(|_| ConfigError::WorkflowRetention(value))?,
+            ),
+            Err(env::VarError::NotPresent) => Some(DEFAULT_WORKFLOW_RETENTION_DAYS),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::WorkflowRetention("<non-unicode>".to_owned()));
+            }
+        };
         let config = Self {
             profile,
             managed_database,
@@ -204,6 +221,7 @@ impl DaemonConfig {
             log_directory,
             bind,
             token,
+            workflow_retention_days,
         };
         config.validate()?;
         Ok(config)
@@ -263,6 +281,9 @@ pub enum ConfigError {
          every daemon route can start workflows and run actions"
     )]
     MissingToken(SocketAddr),
+    /// The terminal workflow retention window was malformed.
+    #[error("invalid REPLICANT_WORKFLOW_RETENTION_DAYS {0:?}; use a day count or off")]
+    WorkflowRetention(String),
 }
 
 /// Shared daemon services. HTTP handlers never construct managed clients.
@@ -600,6 +621,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut telemetry_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut retention_interval = tokio::time::interval(WORKFLOW_RETENTION_SWEEP);
+    retention_interval.tick().await;
+    retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count = 0_i64;
     let mut tick_errors = 0_i64;
@@ -610,7 +634,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
     let mut bobnet = state.client().bobnet().watch().await.ok();
     let mut workflows = state
         .repository
-        .list()
+        .list_summaries()
         .unwrap_or_default()
         .into_iter()
         .map(|workflow| (workflow.id.to_string(), workflow.revision))
@@ -694,6 +718,20 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                 tick_duration_sum_ms = 0;
                 tick_duration_max_ms = 0;
             }
+            _ = retention_interval.tick(), if state.daemon.workflow_retention_days.is_some() => {
+                let days = state.daemon.workflow_retention_days.expect("guarded");
+                let age_millis = days.saturating_mul(24 * 60 * 60 * 1_000);
+                let cutoff = now_millis()
+                    .unwrap_or_default()
+                    .saturating_sub(i64::try_from(age_millis).unwrap_or(i64::MAX));
+                match state.repository.prune_terminal_before(cutoff) {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, days, "pruned retained terminal workflows");
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(error = %error, "workflow retention sweep failed"),
+                }
+            }
             revision = async { revisions.as_mut().expect("guarded").next().await }, if revisions.is_some() => {
                 match revision {
                     Ok(_) => {
@@ -759,7 +797,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
 }
 
 fn record_workflow_snapshot(state: &AppState) {
-    let Ok(workflows) = state.repository.list() else {
+    let Ok(workflows) = state.repository.list_summaries() else {
         return;
     };
     let now = now_millis().unwrap_or_default();
@@ -1057,12 +1095,14 @@ fn publish_workflow_updates(
     revisions: &mut BTreeMap<String, u64>,
     activity_cursor: &mut i64,
 ) {
-    if let Ok(current) = state.repository.list() {
+    if let Ok(current) = state.repository.list_summaries() {
+        let mut present = BTreeSet::new();
         for workflow in current {
+            present.insert(workflow.id.to_string());
             let delta = match revisions.insert(workflow.id.to_string(), workflow.revision) {
-                None => Some(LiveDelta::WorkflowCreated(summary(&workflow))),
+                None => Some(LiveDelta::WorkflowCreated(stored_summary(&workflow))),
                 Some(revision) if revision != workflow.revision => {
-                    Some(LiveDelta::WorkflowUpdated(summary(&workflow)))
+                    Some(LiveDelta::WorkflowUpdated(stored_summary(&workflow)))
                 }
                 _ => None,
             };
@@ -1079,11 +1119,14 @@ fn publish_workflow_updates(
                 ] {
                     state.invalidate(slice);
                 }
-                if let Some(notification) = workflow_notification(&workflow) {
-                    state.notify(notification);
+                if let Ok(Some(instance)) = state.repository.read(workflow.id)
+                    && let Some(notification) = workflow_notification(&instance)
+                {
+                    state.notify(notification)
                 }
             }
         }
+        revisions.retain(|id, _| present.contains(id));
     }
     if let Ok(activity) = state.repository.activity_since(*activity_cursor) {
         for record in activity {
@@ -1903,10 +1946,11 @@ async fn survey_missions(
     let devices = devices.as_ref();
     let mut fleet_codes = std::collections::BTreeSet::new();
     let mut missions = Vec::new();
-    for workflow in state.repository.list().map_err(ApiError::repository)? {
-        if !active_workflow(workflow.status) {
-            continue;
-        }
+    for workflow in state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?
+    {
         match workflow.kind.as_str() {
             "survey.route" => {
                 let config = workflow
@@ -2062,17 +2106,16 @@ async fn mining_missions(
     let metadata = state.snapshot_metadata()?;
     let workflows = state
         .repository
-        .list()
+        .list_active()
         .map_err(ApiError::repository)?
         .into_iter()
         .filter(|workflow| {
-            active_workflow(workflow.status)
-                && (workflow.kind.as_str().contains("mining")
-                    || workflow.kind.as_str() == "salvage.site"
-                    || workflow
-                        .current_step
-                        .as_deref()
-                        .is_some_and(|step| step.contains("mining")))
+            workflow.kind.as_str().contains("mining")
+                || workflow.kind.as_str() == "salvage.site"
+                || workflow
+                    .current_step
+                    .as_deref()
+                    .is_some_and(|step| step.contains("mining"))
         })
         .map(|workflow| summary(&workflow))
         .collect();
@@ -2087,7 +2130,10 @@ async fn relay_missions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<RelaySnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let workflows = state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?;
     let devices = device_rows(&state).await?.as_ref().clone();
     Ok(Json(Versioned::current(relay_snapshot(
         metadata,
@@ -2962,10 +3008,10 @@ async fn trade(
     let devices = devices.as_ref();
     let workflows = state
         .repository
-        .list()
+        .list_summaries()
         .map_err(ApiError::repository)?
         .into_iter()
-        .map(|workflow| (workflow.id.to_string(), summary(&workflow)))
+        .map(|workflow| (workflow.id.to_string(), stored_summary(&workflow)))
         .collect::<BTreeMap<_, _>>();
     let client = state.client().clone();
     let trade_results = futures_util::stream::iter(traders.into_iter().map(|trader| {
@@ -3486,9 +3532,9 @@ fn existing_bill_expansion(
     repository: &WorkflowRepository,
     target: &str,
 ) -> Result<Option<WorkflowInstance>, ApiError> {
-    let workflows = repository.list().map_err(ApiError::repository)?;
+    let workflows = repository.list_active().map_err(ApiError::repository)?;
     for workflow in workflows.into_iter().rev() {
-        if workflow.kind.as_str() != "exploration.frontier" || workflow.status.is_terminal() {
+        if workflow.kind.as_str() != "exploration.frontier" {
             continue;
         }
         let Ok(intent) = workflow.config::<ExplorationIntent>() else {
@@ -4631,7 +4677,10 @@ async fn entity_index(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<EntityIndexSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let workflows = state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?;
     let entities = build_entity_index(&state, &workflows)
         .await
         .map_err(|error| {
@@ -4753,7 +4802,10 @@ fn wire_value<T: Serialize>(value: Option<&T>) -> Option<String> {
 async fn galaxy_scene(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<GalaxySceneSnapshot>>, ApiError> {
-    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let workflows = state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?;
     let revision = state.revision.load(Ordering::Relaxed);
     let scene = build_galaxy_scene(state.client(), &workflows, revision, now_millis()?)
         .await
@@ -4768,7 +4820,10 @@ async fn system_scene(
     State(state): State<Arc<AppState>>,
     Path(system): Path<String>,
 ) -> Result<Json<Versioned<SystemSceneSnapshot>>, ApiError> {
-    let workflows = state.repository.list().map_err(ApiError::repository)?;
+    let workflows = state
+        .repository
+        .list_active()
+        .map_err(ApiError::repository)?;
     let revision = state.revision.load(Ordering::Relaxed);
     let scene = build_system_scene(state.client(), &workflows, &system, revision, now_millis()?)
         .await
@@ -5537,7 +5592,7 @@ async fn list_workflows(
 ) -> Result<Json<Versioned<WorkflowListResponse>>, ApiError> {
     let workflows = state
         .repository
-        .list()
+        .list_summaries()
         .map_err(ApiError::repository)?
         .iter()
         .filter(|instance| {
@@ -5545,7 +5600,7 @@ async fn list_workflows(
                 .status
                 .is_none_or(|status| status == protocol_status(instance.status))
         })
-        .map(summary)
+        .map(stored_summary)
         .collect();
     Ok(Json(Versioned::current(WorkflowListResponse { workflows })))
 }
@@ -5948,6 +6003,17 @@ fn parse_trigger_id(id: &str) -> Result<TriggerId, ApiError> {
 }
 
 fn summary(instance: &WorkflowInstance) -> WorkflowSummary {
+    WorkflowSummary {
+        id: ProtocolWorkflowId(instance.id.to_string()),
+        kind: OperationKind(instance.kind.as_str().to_owned()),
+        status: protocol_status(instance.status),
+        current_step: instance.current_step.clone(),
+        revision: instance.revision,
+        updated_at_ms: instance.updated_at,
+    }
+}
+
+fn stored_summary(instance: &StoredWorkflowSummary) -> WorkflowSummary {
     WorkflowSummary {
         id: ProtocolWorkflowId(instance.id.to_string()),
         kind: OperationKind(instance.kind.as_str().to_owned()),
@@ -6526,6 +6592,7 @@ mod tests {
             log_directory: PathBuf::from("logs"),
             bind: DEFAULT_BIND.parse().expect("default bind address"),
             token: None,
+            workflow_retention_days: Some(DEFAULT_WORKFLOW_RETENTION_DAYS),
         }
     }
 
@@ -6685,6 +6752,7 @@ mod tests {
                 rewards: Some(serde_json::json!({"devices": {"probe": 1}})),
                 ..ShopTrade::default()
             }],
+            "available",
             None,
         );
         assert_eq!(controller.entity.id.0, "TC-1");
@@ -6798,12 +6866,11 @@ mod tests {
 
     #[test]
     fn trade_details_classifies_missing_comms_as_partial_availability() {
+        let mut details = replicant_client::ErrorDetails::default();
+        details.message = Some("No replicant or comms device in this star system".to_owned());
         let error: replicant_runtime::ApplicationError = Box::new(ClientError::Contract {
             status: 403,
-            details: Box::new(replicant_client::ErrorDetails {
-                message: Some("No replicant or comms device in this star system".to_owned()),
-                ..replicant_client::ErrorDetails::default()
-            }),
+            details: Box::new(details),
         });
         assert_eq!(trade_details_status(&error), "out_of_comms");
     }
@@ -8203,7 +8270,10 @@ mod tests {
             .repository
             .append_activity(workflow.id, "started")
             .expect("append activity");
-        publish_workflow_updates(&state, &mut BTreeMap::new(), &mut 0);
+        let missing = WorkflowId::new().to_string();
+        let mut revisions = BTreeMap::from([(missing.clone(), 0)]);
+        publish_workflow_updates(&state, &mut revisions, &mut 0);
+        assert!(!revisions.contains_key(&missing));
 
         assert!(matches!(
             updates.recv().await.expect("workflow update").delta,
@@ -8264,7 +8334,6 @@ mod tests {
         client.close().await.expect("close client");
     }
 
-    #[test]
     #[test]
     fn non_loopback_binds_require_a_token() {
         let mut config = test_daemon_config();

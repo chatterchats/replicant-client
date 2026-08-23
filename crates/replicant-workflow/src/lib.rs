@@ -16,7 +16,7 @@ pub use model::{
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
     ResourceKey, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
     WaitIntent, WaitOutcome, WorkflowActivity, WorkflowId, WorkflowInstance, WorkflowKind,
-    WorkflowState, WorkflowStatus,
+    WorkflowState, WorkflowStatus, WorkflowSummary,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowMigration, WorkflowRegistry};
 pub use repository::{RepositoryError, WorkflowRepository};

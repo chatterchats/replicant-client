@@ -2952,12 +2952,10 @@ fn active_connectivity_workflow(
 ) -> Result<Option<WorkflowId>, String> {
     for workflow in context
         .repository()
-        .list()
+        .list_active()
         .map_err(string_error)?
         .into_iter()
-        .filter(|workflow| {
-            workflow.kind == exploration_workflow_kind() && !workflow.status.is_terminal()
-        })
+        .filter(|workflow| workflow.kind == exploration_workflow_kind())
     {
         let intent = workflow
             .config::<ExplorationIntent>()

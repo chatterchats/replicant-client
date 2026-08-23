@@ -49,6 +49,38 @@ fn create(
         .expect("create workflow")
 }
 
+fn complete(
+    repository: &WorkflowRepository,
+    workflow: replicant_workflow::WorkflowInstance,
+) -> replicant_workflow::WorkflowInstance {
+    let workflow = repository
+        .update(
+            workflow.id,
+            workflow.revision,
+            WorkflowState::<_, ResultMetadata> {
+                status: WorkflowStatus::Running,
+                current_step: workflow.current_step,
+                checkpoint: Checkpoint { visits: 0 },
+                last_error: None,
+                result: None,
+            },
+        )
+        .expect("start workflow");
+    repository
+        .update(
+            workflow.id,
+            workflow.revision,
+            WorkflowState {
+                status: WorkflowStatus::Succeeded,
+                current_step: None,
+                checkpoint: Checkpoint { visits: 1 },
+                last_error: None,
+                result: Some(ResultMetadata { surveyed: 1 }),
+            },
+        )
+        .expect("complete workflow")
+}
+
 #[test]
 fn creates_reads_and_lists_typed_workflows() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
@@ -76,6 +108,77 @@ fn creates_reads_and_lists_typed_workflows() {
         Checkpoint { visits: 0 }
     );
     assert_eq!(repository.list().expect("list workflows").len(), 2);
+}
+
+#[test]
+fn filtered_lists_exclude_terminal_rows_and_use_parent_identity() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let parent = create(&repository, None);
+    let child = create(&repository, Some(parent.id));
+    let completed = complete(&repository, create(&repository, None));
+
+    assert_eq!(repository.list_active().expect("active workflows").len(), 2);
+    assert_eq!(
+        repository
+            .list_children(parent.id)
+            .expect("child workflows")
+            .into_iter()
+            .map(|workflow| workflow.id)
+            .collect::<Vec<_>>(),
+        vec![child.id]
+    );
+    assert_eq!(repository.list_summaries().expect("summaries").len(), 3);
+    assert_eq!(
+        repository
+            .list_active_summaries()
+            .expect("active summaries")
+            .len(),
+        2
+    );
+    assert_eq!(
+        repository
+            .read(completed.id)
+            .expect("read completed")
+            .expect("completed exists")
+            .status,
+        WorkflowStatus::Succeeded
+    );
+}
+
+#[test]
+fn retention_removes_completed_trees_but_preserves_live_children_and_claims() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+
+    let completed_parent = create(&repository, None);
+    let completed_child = create(&repository, Some(completed_parent.id));
+    let completed_parent = complete(&repository, completed_parent);
+    let completed_child = complete(&repository, completed_child);
+    repository
+        .append_activity(completed_child.id, "finished")
+        .expect("append activity");
+
+    let retained_parent = create(&repository, None);
+    let live_child = create(&repository, Some(retained_parent.id));
+    let retained_parent = complete(&repository, retained_parent);
+
+    let claimed = create(&repository, None);
+    repository
+        .acquire_claim(claimed.id, ResourceKey::Device("CLAIMED".to_owned()))
+        .expect("acquire claim");
+    let claimed = complete(&repository, claimed);
+
+    assert_eq!(
+        repository
+            .prune_terminal_before(i64::MAX)
+            .expect("prune terminal workflows"),
+        2
+    );
+    assert!(repository.read(completed_parent.id).unwrap().is_none());
+    assert!(repository.read(completed_child.id).unwrap().is_none());
+    assert!(repository.read(retained_parent.id).unwrap().is_some());
+    assert!(repository.read(live_child.id).unwrap().is_some());
+    assert!(repository.read(claimed.id).unwrap().is_some());
+    assert_eq!(repository.activity(completed_child.id).unwrap(), Vec::new());
 }
 
 #[test]

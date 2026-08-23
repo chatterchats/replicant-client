@@ -14,7 +14,7 @@ use crate::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
     ResourceKey, TriggerId, TriggerState, WorkflowActivity, WorkflowId, WorkflowInstance,
-    WorkflowKind, WorkflowState, WorkflowStatus,
+    WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
@@ -649,6 +649,94 @@ impl WorkflowRepository {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    /// Lists non-terminal workflow instances in creation order.
+    pub fn list_active(&self) -> Result<Vec<WorkflowInstance>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {COLUMNS} FROM workflow_instances
+             WHERE status IN ('queued', 'running', 'waiting', 'reconciling', 'paused')
+             ORDER BY created_at, id"
+        ))?;
+        let rows = statement.query_map([], row_to_instance)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Lists direct child workflows in creation order.
+    pub fn list_children(
+        &self,
+        parent_id: WorkflowId,
+    ) -> Result<Vec<WorkflowInstance>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {COLUMNS} FROM workflow_instances WHERE parent_id = ?1 ORDER BY created_at, id"
+        ))?;
+        let rows = statement.query_map([parent_id.to_string()], row_to_instance)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Lists blob-free workflow summaries in creation order.
+    pub fn list_summaries(&self) -> Result<Vec<WorkflowSummary>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {SUMMARY_COLUMNS} FROM workflow_instances ORDER BY created_at, id"
+        ))?;
+        let rows = statement.query_map([], row_to_summary)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Lists blob-free summaries for non-terminal workflows in creation order.
+    pub fn list_active_summaries(&self) -> Result<Vec<WorkflowSummary>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {SUMMARY_COLUMNS} FROM workflow_instances
+             WHERE status IN ('queued', 'running', 'waiting', 'reconciling', 'paused')
+             ORDER BY created_at, id"
+        ))?;
+        let rows = statement.query_map([], row_to_summary)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Removes terminal leaf rows older than `cutoff_millis`, including completed trees.
+    ///
+    /// Rows with claims or any retained child are preserved. Activity is removed in the
+    /// same transaction before each leaf row so foreign keys remain valid.
+    pub fn prune_terminal_before(&self, cutoff_millis: i64) -> Result<usize, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed = 0;
+        loop {
+            let ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT workflow.id FROM workflow_instances workflow
+                     WHERE workflow.status IN ('succeeded', 'failed', 'cancelled')
+                       AND workflow.updated_at < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM workflow_resource_claims claim
+                           WHERE claim.workflow_id = workflow.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM workflow_instances child
+                           WHERE child.parent_id = workflow.id
+                       )",
+                )?;
+                statement
+                    .query_map([cutoff_millis], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if ids.is_empty() {
+                break;
+            }
+            for id in &ids {
+                transaction
+                    .execute("DELETE FROM workflow_activity WHERE workflow_id = ?1", [id])?;
+                transaction.execute("DELETE FROM workflow_instances WHERE id = ?1", [id])?;
+            }
+            removed += ids.len();
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     /// Persists a completed, sanitized report or action execution.
     pub fn record_finite_execution(
         &self,
@@ -1176,6 +1264,8 @@ const COLUMNS: &str = "id, kind, schema_version, config_json, checkpoint_json, s
                        current_step, created_at, updated_at, last_error, result_json, \
                        parent_id, revision, wait_intent_json";
 
+const SUMMARY_COLUMNS: &str = "id, kind, status, revision, current_step, updated_at";
+
 const TRIGGER_COLUMNS: &str = "id, name, condition_json, target_json, enabled, created_at, \
                                updated_at, last_fired_at, next_run_at, last_error, \
                                event_cursor, revision";
@@ -1269,6 +1359,23 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> Result<WorkflowInstance, rusqlite
     })
 }
 
+fn row_to_summary(row: &rusqlite::Row<'_>) -> Result<WorkflowSummary, rusqlite::Error> {
+    let id = row.get::<_, String>(0)?;
+    let kind = row.get::<_, String>(1)?;
+    let status = row.get::<_, String>(2)?;
+    let revision = row.get::<_, i64>(3)?;
+    Ok(WorkflowSummary {
+        id: parse_id(id)?,
+        kind: WorkflowKind::new(kind).map_err(to_sql_conversion_error)?,
+        status: WorkflowStatus::from_str(&status).map_err(to_sql_conversion_error)?,
+        revision: u64::try_from(revision).map_err(|_| {
+            to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
+        })?,
+        current_step: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
 fn parse_id(value: String) -> Result<WorkflowId, rusqlite::Error> {
     WorkflowId::from_str(&value)
         .map_err(|_| to_sql_conversion_error(RepositoryError::InvalidStoredId(value)))
@@ -1319,4 +1426,80 @@ fn now_millis() -> Result<i64, RepositoryError> {
         .map_err(|_| RepositoryError::Clock)?
         .as_millis();
     i64::try_from(millis).map_err(|_| RepositoryError::Clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtered_queries_use_existing_indexes_and_skip_terminal_payloads() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let parent = WorkflowId::new();
+        {
+            let mut connection = repository.connection().expect("connection");
+            let transaction = connection.transaction().expect("transaction");
+            transaction
+                .execute(
+                    "INSERT INTO workflow_instances
+                     (id, kind, schema_version, config_json, checkpoint_json, status,
+                      current_step, created_at, updated_at, parent_id)
+                     VALUES (?1, 'test.active', 1, '{}', '{}', 'queued', NULL, 0, 0, NULL)",
+                    [parent.to_string()],
+                )
+                .expect("insert active workflow");
+            for created_at in 1..=3_000_i64 {
+                transaction
+                    .execute(
+                        "INSERT INTO workflow_instances
+                         (id, kind, schema_version, config_json, checkpoint_json, status,
+                          current_step, created_at, updated_at, parent_id)
+                         VALUES (?1, 'test.terminal', 1, '{}', '{}', 'succeeded',
+                                 NULL, ?2, ?2, ?3)",
+                        params![
+                            WorkflowId::new().to_string(),
+                            created_at,
+                            parent.to_string()
+                        ],
+                    )
+                    .expect("insert terminal workflow");
+            }
+            transaction.commit().expect("commit fixtures");
+        }
+
+        assert_eq!(repository.list().expect("all workflows").len(), 3_001);
+        assert_eq!(repository.list_active().expect("active workflows").len(), 1);
+
+        let connection = repository.connection().expect("connection");
+        let plans = [
+            (
+                format!(
+                    "EXPLAIN QUERY PLAN SELECT {COLUMNS} FROM workflow_instances
+                     WHERE status IN ('queued', 'running', 'waiting', 'reconciling', 'paused')
+                     ORDER BY created_at, id"
+                ),
+                "workflow_instances_status_idx",
+            ),
+            (
+                format!(
+                    "EXPLAIN QUERY PLAN SELECT {COLUMNS} FROM workflow_instances
+                     WHERE parent_id = '{}' ORDER BY created_at, id",
+                    parent
+                ),
+                "workflow_instances_parent_idx",
+            ),
+        ];
+        for (query, index) in plans {
+            let mut statement = connection.prepare(&query).expect("query plan");
+            let details = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("plan rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan details");
+            assert!(
+                details.iter().any(|detail| detail.contains(index)),
+                "{index} missing from {details:?}"
+            );
+        }
+    }
 }

@@ -593,6 +593,23 @@ pub struct WorkflowInstance {
     pub(crate) wait_intent_json: Option<String>,
 }
 
+/// Blob-free workflow row for hot status and revision queries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowSummary {
+    /// Stable instance identifier.
+    pub id: WorkflowId,
+    /// Registered workflow kind.
+    pub kind: WorkflowKind,
+    /// Current lifecycle status.
+    pub status: WorkflowStatus,
+    /// Current logical step.
+    pub current_step: Option<String>,
+    /// Last update time in Unix milliseconds.
+    pub updated_at: i64,
+    /// Optimistic concurrency revision.
+    pub revision: u64,
+}
+
 impl WorkflowInstance {
     /// Decodes the typed workflow configuration.
     pub fn config<C: DeserializeOwned>(&self) -> Result<C, RepositoryError> {

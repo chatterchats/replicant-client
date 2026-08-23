@@ -128,12 +128,7 @@ impl WorkflowContext {
     /// This lets restart reconciliation reattach to child work that was
     /// created immediately before a parent checkpoint write was interrupted.
     pub fn child_workflows(&self) -> Result<Vec<WorkflowInstance>, RepositoryError> {
-        Ok(self
-            .repository
-            .list()?
-            .into_iter()
-            .filter(|workflow| workflow.parent_id == Some(self.instance.id))
-            .collect())
+        self.repository.list_children(self.instance.id)
     }
 
     /// Atomically advances to a named logical step and persists its checkpoint.
@@ -549,7 +544,7 @@ impl WorkflowSupervisor {
         }
         for instance in match instances {
             Some(instances) => instances,
-            None => self.repository.list()?,
+            None => self.repository.list_active()?,
         } {
             if self.tasks.contains_key(&instance.id) {
                 continue;
@@ -629,7 +624,7 @@ impl WorkflowSupervisor {
     /// Durably pauses every eligible workflow and requests cooperative stops.
     pub fn pause_all(&self) -> Result<usize, SupervisorError> {
         let mut paused = 0;
-        for instance in self.repository.list()? {
+        for instance in self.repository.list_active()? {
             if instance.status.can_transition_to(WorkflowStatus::Paused)
                 && instance.status != WorkflowStatus::Paused
             {
@@ -643,7 +638,7 @@ impl WorkflowSupervisor {
     /// Durably resumes every paused workflow through reconciliation.
     pub fn resume_all(&self) -> Result<usize, SupervisorError> {
         let mut resumed = 0;
-        for instance in self.repository.list()? {
+        for instance in self.repository.list_active()? {
             if instance.status == WorkflowStatus::Paused {
                 self.resume(instance.id)?;
                 resumed += 1;
@@ -654,7 +649,7 @@ impl WorkflowSupervisor {
 
     /// Durably cancels the selected workflows, or every eligible workflow when empty.
     pub fn cancel_selected(&self, ids: &[WorkflowId]) -> Result<usize, SupervisorError> {
-        let instances = self.repository.list()?;
+        let instances = self.repository.list_active()?;
         let mut cancelled = 0;
         for instance in instances {
             if !instance.status.is_terminal() && (ids.is_empty() || ids.contains(&instance.id)) {

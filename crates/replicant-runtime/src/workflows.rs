@@ -1007,16 +1007,15 @@ fn equivalent_active(context: &WorkflowContext, key: &str) -> Result<Option<Work
     };
     for workflow in context
         .repository()
-        .list()
+        .list_active()
         .map_err(|error| error.to_string())?
     {
-        if !workflow.status.is_terminal()
-            && context
-                .repository()
-                .claims(workflow.id)
-                .map_err(|error| error.to_string())?
-                .iter()
-                .any(|claim| claim.resource == resource)
+        if context
+            .repository()
+            .claims(workflow.id)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|claim| claim.resource == resource)
         {
             return Ok(Some(workflow.id));
         }
