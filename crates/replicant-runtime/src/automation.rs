@@ -13,8 +13,8 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Device, DeviceType, MiningDirective, Operation, OperationId, OperationStatus,
-    SurveyDirective, domain::AccessScope,
+    Client, Device, DeviceHandle, DeviceType, MiningDirective, Operation, OperationId,
+    OperationStatus, SurveyDirective, domain::AccessScope,
 };
 use replicant_printing::{
     PrintRequest,
@@ -3603,22 +3603,63 @@ async fn owned_device_snapshots(client: &Client) -> Result<Vec<Device>, String> 
         .collect()
         .await
         .map_err(string_error)?;
+    device_snapshots(client, handles).await
+}
+
+async fn device_snapshots(
+    client: &Client,
+    handles: Vec<DeviceHandle>,
+) -> Result<Vec<Device>, String> {
     let mut devices = Vec::with_capacity(handles.len());
+    let mut missing = Vec::new();
     for handle in handles {
-        let device = match handle.snapshot().await {
-            Ok(device) => device,
-            Err(_) => handle
-                .refresh()
-                .await
-                .map_err(string_error)?
-                .snapshot()
-                .await
-                .map_err(string_error)?,
-        };
-        devices.push(device);
+        match handle.snapshot().await {
+            Ok(device) => devices.push(device),
+            Err(_) => missing.push(handle),
+        }
+    }
+    if !missing.is_empty() {
+        client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .map_err(string_error)?;
+        for handle in missing {
+            let device = match handle.snapshot().await {
+                Ok(device) => device,
+                Err(_) => client
+                    .devices()
+                    .get(handle.id().as_str())
+                    .await
+                    .map_err(string_error)?
+                    .snapshot()
+                    .await
+                    .map_err(string_error)?,
+            };
+            devices.push(device);
+        }
     }
     devices.sort_by(|left, right| left.key.id.cmp(&right.key.id));
     Ok(devices)
+}
+
+#[derive(Default)]
+struct DeviceCensus {
+    devices: Option<Vec<Device>>,
+}
+
+impl DeviceCensus {
+    async fn snapshots<'a>(&'a mut self, client: &Client) -> Result<&'a [Device], String> {
+        if self.devices.is_none() {
+            self.devices = Some(owned_device_snapshots(client).await?);
+        }
+        Ok(self.devices.as_deref().unwrap_or_default())
+    }
+
+    fn invalidate(&mut self) {
+        self.devices = None;
+    }
 }
 
 fn validate_trade_fulfillment_intent(intent: &TradeFulfillmentIntent) -> Result<(), String> {
@@ -3888,7 +3929,8 @@ async fn ensure_trade_payment_ready(
         }
     }
 
-    let mut devices = owned_device_snapshots(client).await?;
+    let mut census = DeviceCensus::default();
+    let mut devices = census.snapshots(client).await?;
     let unlocked = client
         .blueprints()
         .unlocked_device_types()
@@ -3982,7 +4024,8 @@ async fn ensure_trade_payment_ready(
             .collect()
             .await
             .map_err(string_error)?;
-        devices = owned_device_snapshots(client).await?;
+        census.invalidate();
+        devices = census.snapshots(client).await?;
     }
 
     let inventories = fetch_account_inventories(client).await?;
@@ -5148,7 +5191,8 @@ async fn prepare_shop_blueprint_source_via_trade(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "shop blueprint acquisition requires an Autofactory".to_owned())?;
 
-    let devices = owned_device_snapshots(client).await?;
+    let mut census = DeviceCensus::default();
+    let devices = census.snapshots(client).await?;
     let factory = devices
         .iter()
         .find(|device| {
@@ -5223,19 +5267,15 @@ async fn prepare_shop_blueprint_source_via_trade(
         WorkflowStatus::Succeeded => {
             let trade_checkpoint: TradeFulfillmentCheckpoint =
                 child.checkpoint().map_err(string_error)?;
-            let refreshed = owned_device_snapshots(client).await?;
+            let refreshed = census.snapshots(client).await?;
             let mut candidates = trade_checkpoint
                 .reward_devices
                 .iter()
                 .filter_map(|code| {
                     refreshed.iter().find(|device| {
                         device.key.id.as_str().eq_ignore_ascii_case(code)
-                            && blueprint_source_is_candidate(
-                                device,
-                                &intent.device_type,
-                                &refreshed,
-                            )
-                            && blueprint_source_location(device, &refreshed).is_some_and(
+                            && blueprint_source_is_candidate(device, &intent.device_type, refreshed)
+                            && blueprint_source_location(device, refreshed).is_some_and(
                                 |location| location.eq_ignore_ascii_case(&factory_location),
                             )
                     })
@@ -5590,7 +5630,8 @@ async fn ensure_shop_trade_criteria(
         return Ok(false);
     }
 
-    let mut devices = owned_device_snapshots(client).await?;
+    let mut census = DeviceCensus::default();
+    let mut devices = census.snapshots(client).await?;
     let mut print_requests = Vec::new();
     for (device_type, required) in &criteria.devices {
         let available = devices
@@ -5626,7 +5667,8 @@ async fn ensure_shop_trade_criteria(
             .collect()
             .await
             .map_err(string_error)?;
-        devices = owned_device_snapshots(client).await?;
+        census.invalidate();
+        devices = census.snapshots(client).await?;
     }
 
     let inventories = fetch_account_inventories(client).await?;
@@ -7517,6 +7559,116 @@ mod tests {
             }],
             "next_cursor": next_cursor
         }))
+    }
+
+    fn device_list_response(codes: &[&str]) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": codes
+                .iter()
+                .map(|code| serde_json::json!({
+                    "device_code": code,
+                    "device_type": "survey_drone",
+                    "status": "idle"
+                }))
+                .collect::<Vec<_>>(),
+            "next_cursor": null
+        }))
+    }
+
+    async fn mount_device_list(server: &MockServer, codes: &[&str]) {
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(device_list_response(codes))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn missing_device_snapshots_use_one_bulk_refresh() {
+        let server = MockServer::start().await;
+        mount_device_list(&server, &["DEVICE-B", "DEVICE-A"]).await;
+        let client = test_client_at(&server).await;
+        let stale_handles = client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .expect("seed device handles");
+
+        server.reset().await;
+        mount_device_list(&server, &[]).await;
+        client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .expect("remove cached devices");
+
+        server.reset().await;
+        mount_device_list(&server, &["DEVICE-B", "DEVICE-A"]).await;
+        let snapshots = device_snapshots(&client, stale_handles)
+            .await
+            .expect("bulk fallback");
+
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|device| device.key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["DEVICE-A", "DEVICE-B"]
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn device_census_reuses_results_and_invalidates_after_mutation() {
+        let server = MockServer::start().await;
+        mount_device_list(&server, &["DEVICE-A"]).await;
+        let client = test_client_at(&server).await;
+        client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .expect("seed device cache");
+
+        let expected = owned_device_snapshots(&client)
+            .await
+            .expect("direct census");
+        let mut census = DeviceCensus::default();
+        let first = census.snapshots(&client).await.expect("memoized census");
+        assert_eq!(first, expected);
+        let first_ptr = first.as_ptr();
+        assert_eq!(
+            census
+                .snapshots(&client)
+                .await
+                .expect("reused census")
+                .as_ptr(),
+            first_ptr
+        );
+
+        server.reset().await;
+        mount_device_list(&server, &["DEVICE-B"]).await;
+        client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .expect("mutate device projection");
+        census.invalidate();
+
+        assert_eq!(
+            census.snapshots(&client).await.expect("fresh census")[0]
+                .key
+                .id
+                .as_str(),
+            "DEVICE-B"
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
     }
 
     #[tokio::test]
