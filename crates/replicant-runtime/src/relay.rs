@@ -46,7 +46,8 @@ use crate::{
     config::ManagedClientConfig, orchestration::REGION_GATEWAY_HUB_RANGE_LY, start_managed_client,
 };
 use replicant_client::{
-    Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, raw,
+    Client, Device, DeviceHandle, DeviceType, Operation, OperationId, OperationStatus, Replicant,
+    raw,
 };
 // Workflow device claims are shared vocabulary; see
 // `replicant_protocol::RESERVED_WORKFLOW_TAG_PREFIXES`.
@@ -104,6 +105,13 @@ pub type AnyResult<T> = Result<T, AnyError>;
 
 fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
+}
+
+async fn projected_device(client: &Client, code: &str) -> AnyResult<DeviceHandle> {
+    Ok(match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1372,7 +1380,11 @@ async fn create_plan(
         .cloned()
         .collect::<Vec<_>>();
 
-    let vessel = client.devices().get(vessel_code).await?.snapshot().await?;
+    // Device census populated the selected vessel projection.
+    let vessel = projected_device(client, vessel_code)
+        .await?
+        .snapshot()
+        .await?;
     let free_slots = vessel
         .stow_capacity
         .unwrap_or(0)
@@ -3141,7 +3153,8 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         let Some(code) = plan.stops[index].relay_code.clone() else {
             continue;
         };
-        let Ok(handle) = client.devices().get(&code).await else {
+        // Reconciliation consumes the census-backed relay projection.
+        let Ok(handle) = projected_device(client, &code).await else {
             continue;
         };
         let snapshot = handle.snapshot().await?;
@@ -3181,7 +3194,8 @@ async fn reconcile_plan(client: &Client, plan: &mut MissionPlan) -> AnyResult<()
         .as_ref()
         .is_none_or(|supply| supply.carriers.iter().all(|carrier| carrier.returned_home));
     let dsr_carrier_home = if let Some(code) = plan.dsr_carrier_code.as_deref() {
-        match client.devices().get(code).await {
+        // Reconciliation consumes the census-backed carrier projection.
+        match projected_device(client, code).await {
             Ok(handle) => match handle.snapshot().await {
                 Ok(carrier) => device_at(&carrier, &plan.hub_location),
                 Err(_) => false,
@@ -3237,9 +3251,8 @@ fn trip_deploy_count(stops: &[RelayStop], indices: &[usize]) -> usize {
 }
 
 async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyResult<usize> {
-    let vessel = client
-        .devices()
-        .get(&plan.vessel_code)
+    // Capacity planning reads the live mission-vessel projection.
+    let vessel = projected_device(client, &plan.vessel_code)
         .await?
         .snapshot()
         .await?;
@@ -3256,7 +3269,8 @@ async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyR
         .filter_map(|stop| stop.relay_code.as_deref())
         .collect::<BTreeSet<_>>();
     for code in mission_codes {
-        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        // Mission relay stow state is maintained by the event projection.
+        let snapshot = projected_device(client, code).await?.snapshot().await?;
         if snapshot
             .relationships
             .stowed_in
@@ -3392,7 +3406,8 @@ fn carrier_all_assigned_relay_codes(plan: &MissionPlan, carrier_code: &str) -> B
 async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -> AnyResult<()> {
     let mission_tag = relay_system_mission_tag(&plan.start_system);
     let aliases = relay_mission_tag_aliases(plan);
-    let handle = client.devices().get(code).await?;
+    // Supply planning already selected this projection-backed carrier.
+    let handle = projected_device(client, code).await?;
     let snapshot = handle.snapshot().await?;
     let conflicting = snapshot
         .tags
@@ -3425,7 +3440,8 @@ async fn ensure_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -
 
 async fn release_carrier_claim(client: &Client, plan: &MissionPlan, code: &str) -> AnyResult<()> {
     let aliases = relay_mission_tag_aliases(plan);
-    let handle = client.devices().get(code).await?;
+    // Claim cleanup uses the same live carrier projection.
+    let handle = projected_device(client, code).await?;
     let snapshot = handle.snapshot().await?;
     let removable = snapshot
         .tags
@@ -3530,7 +3546,11 @@ async fn ensure_dsr_carrier_at_hub(
     plan: &MissionPlan,
     carrier_code: &str,
 ) -> AnyResult<()> {
-    let carrier = client.devices().get(carrier_code).await?.snapshot().await?;
+    // Travel events maintain the DSR carrier projection.
+    let carrier = projected_device(client, carrier_code)
+        .await?
+        .snapshot()
+        .await?;
     if device_at(&carrier, &plan.hub_location) {
         return Ok(());
     }
@@ -3576,7 +3596,11 @@ async fn ensure_dsr_carrier_dispatched(
     transfer_trip_relays(client, config, plan, &[index]).await?;
     ensure_carrier_claim(client, plan, &carrier_code).await?;
 
-    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    // Relay assignment and transfer steps keep this stop projection current.
+    let relay = projected_device(client, relay_code)
+        .await?
+        .snapshot()
+        .await?;
     if relay.relationships.attached_to.is_none()
         && relay.relationships.stowed_in.is_none()
         && device_location(&relay)
@@ -3603,9 +3627,8 @@ async fn ensure_dsr_carrier_dispatched(
                 ),
             ));
         }
-        let carrier = client
-            .devices()
-            .get(&carrier_code)
+        // Carrier travel waits update the projection before this check.
+        let carrier = projected_device(client, &carrier_code)
             .await?
             .snapshot()
             .await?;
@@ -3643,7 +3666,8 @@ async fn ensure_dsr_carrier_dispatched(
 
     ensure_dsr_carrier_at_hub(client, config, plan, &carrier_code).await?;
     ensure_relay_attachable(client, config, relay_code).await?;
-    let carrier = client.devices().get(&carrier_code).await?;
+    // Hub travel and attachability checks keep both devices current.
+    let carrier = projected_device(client, &carrier_code).await?;
     let snapshot = carrier.snapshot().await?;
     if snapshot.attach_capacity.unwrap_or(0) <= 0 {
         return Err(app_error(
@@ -3685,7 +3709,11 @@ async fn detach_dsr_at_stop(
     relay_code: &str,
     carrier_code: &str,
 ) -> AnyResult<()> {
-    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    // Stop execution starts from the live assigned-relay projection.
+    let relay = projected_device(client, relay_code)
+        .await?
+        .snapshot()
+        .await?;
     if relay.relationships.attached_to.is_none()
         && relay.relationships.stowed_in.is_none()
         && device_location(&relay)
@@ -3694,7 +3722,11 @@ async fn detach_dsr_at_stop(
         return Ok(());
     }
     wait_device_at_location(client, config, carrier_code, &stop.location).await?;
-    let relay = client.devices().get(relay_code).await?.snapshot().await?;
+    // The carrier arrival wait keeps attached relay state current via SSE.
+    let relay = projected_device(client, relay_code)
+        .await?
+        .snapshot()
+        .await?;
     if relay
         .relationships
         .attached_to
@@ -3709,9 +3741,8 @@ async fn detach_dsr_at_stop(
             ),
         ));
     }
-    let operation = client
-        .devices()
-        .get(carrier_code)
+    // Carrier and payload projections were verified immediately above.
+    let operation = projected_device(client, carrier_code)
         .await?
         .command(raw::devices::DeviceCommand::Detach(
             raw::devices::TargetsCommand {
@@ -3784,7 +3815,8 @@ fn travel_destination(device: &Device) -> Option<&str> {
 }
 
 async fn start_device_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Travel events maintain device location and route state locally.
+    let handle = projected_device(client, code).await?;
     let snapshot = handle.snapshot().await?;
     if device_at(&snapshot, destination) {
         return Ok(());
@@ -3820,7 +3852,8 @@ async fn wait_device_at_location(
     code: &str,
     destination: &str,
 ) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // The event-backed wait begins from the current projection.
+    let handle = projected_device(client, code).await?;
     let snapshot = handle.snapshot().await?;
     if device_at(&snapshot, destination) {
         return Ok(());
@@ -3888,7 +3921,8 @@ async fn wait_for_carrier_payload(
 }
 
 async fn ensure_relay_attachable(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Mission selection and travel keep the relay projection current.
+    let handle = projected_device(client, code).await?;
     let mut snapshot = handle.snapshot().await?;
     let modular = snapshot
         .features
@@ -3938,7 +3972,8 @@ async fn ensure_relay_attachable(client: &Client, config: &Config, code: &str) -
 }
 
 async fn ensure_relay_unfurled(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Mission selection and travel keep the relay projection current.
+    let handle = projected_device(client, code).await?;
     let mut snapshot = handle.snapshot().await?;
     if device_status(&snapshot) == Some(RELAYING) {
         return Ok(());
@@ -3983,7 +4018,8 @@ async fn attach_carrier_payload(
     }
     transfer_trip_relays(client, config, plan, indices).await?;
     ensure_carrier_claim(client, plan, carrier_code).await?;
-    let handle = client.devices().get(carrier_code).await?;
+    // Carrier travel and claim steps maintain the supply projection.
+    let handle = projected_device(client, carrier_code).await?;
     let carrier = handle.snapshot().await?;
     if !device_at(&carrier, &plan.hub_location) {
         return Err(app_error(
@@ -4027,7 +4063,8 @@ async fn attach_carrier_payload(
         if attached.contains(code) {
             continue;
         }
-        let device = client.devices().get(code).await?.snapshot().await?;
+        // Assigned payload devices are maintained by attachment events.
+        let device = projected_device(client, code).await?.snapshot().await?;
         if device
             .relationships
             .attached_to
@@ -4211,7 +4248,11 @@ async fn ensure_carrier_dispatched(
     if !wait_for_payload && !trip_relays_ready(&plan.stops, &pending_indices) {
         return Ok(false);
     }
-    let mut carrier = client.devices().get(carrier_code).await?.snapshot().await?;
+    // Dispatch reconciliation reads the live supply-carrier projection.
+    let mut carrier = projected_device(client, carrier_code)
+        .await?
+        .snapshot()
+        .await?;
     let attached = carrier
         .relationships
         .attached_devices
@@ -4263,7 +4304,11 @@ async fn ensure_carrier_dispatched(
             return Ok(false);
         }
         wait_device_at_location(client, config, carrier_code, &plan.hub_location).await?;
-        carrier = client.devices().get(carrier_code).await?.snapshot().await?;
+        // The carrier arrival wait updated this projection via SSE.
+        carrier = projected_device(client, carrier_code)
+            .await?
+            .snapshot()
+            .await?;
     }
 
     if device_at(&carrier, &plan.hub_location) && !payload_loaded {
@@ -4346,7 +4391,8 @@ async fn detach_restock_payload(
                 format!("stop {} has no assigned relay", plan.stops[*index].system),
             )
         })?;
-        let device = client.devices().get(code).await?.snapshot().await?;
+        // Restock payload membership is maintained by attachment events.
+        let device = projected_device(client, code).await?.snapshot().await?;
         if device
             .relationships
             .attached_to
@@ -4385,9 +4431,8 @@ async fn detach_restock_payload(
     if attached.is_empty() {
         return Ok(());
     }
-    let operation = client
-        .devices()
-        .get(&restock.carrier_code)
+    // Payload inspection above established the live restock carrier.
+    let operation = projected_device(client, &restock.carrier_code)
         .await?
         .command(raw::devices::DeviceCommand::Detach(
             raw::devices::TargetsCommand {
@@ -4428,7 +4473,8 @@ async fn stow_restock_payload(
                 format!("stop {} has no assigned relay", plan.stops[*index].system),
             )
         })?;
-        let device = client.devices().get(code).await?.snapshot().await?;
+        // Restock relay placement is maintained by stow events.
+        let device = projected_device(client, code).await?.snapshot().await?;
         if device
             .relationships
             .stowed_in
@@ -4468,9 +4514,8 @@ async fn stow_restock_payload(
         }
         to_stow.push(code.to_owned());
     }
-    let vessel = client
-        .devices()
-        .get(&plan.vessel_code)
+    // Vessel capacity is part of the managed mission projection.
+    let vessel = projected_device(client, &plan.vessel_code)
         .await?
         .snapshot()
         .await?;
@@ -4491,9 +4536,8 @@ async fn stow_restock_payload(
         ));
     }
     for code in to_stow {
-        let operation = client
-            .devices()
-            .get(&code)
+        // The placement pass above populated each relay handle.
+        let operation = projected_device(client, &code)
             .await?
             .stow(Some(plan.vessel_code.clone()))
             .await?;
@@ -5059,7 +5103,8 @@ async fn transfer_trip_relays(
         .filter_map(|index| plan.stops[*index].relay_code.clone())
         .collect::<BTreeSet<_>>();
     for code in codes {
-        let handle = client.devices().get(&code).await?;
+        // Trip relays are selected from the managed mission projection.
+        let handle = projected_device(client, &code).await?;
         let snapshot = handle.snapshot().await?;
         if assigned_replicant(&snapshot) != Some(plan.replicant_code.as_str()) {
             if !device_has_command(&snapshot, "change_owner") {
@@ -5100,7 +5145,8 @@ async fn stow_trip_relays(
                 format!("stop {} has no assigned relay", stop.system),
             )
         })?;
-        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        // Trip relay placement is maintained by managed stow events.
+        let snapshot = projected_device(client, code).await?.snapshot().await?;
         if snapshot
             .relationships
             .stowed_in
@@ -5144,9 +5190,8 @@ async fn stow_trip_relays(
         return Ok(());
     }
     travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
-    let vessel = client
-        .devices()
-        .get(&plan.vessel_code)
+    // Mission-vessel capacity is maintained by managed stow events.
+    let vessel = projected_device(client, &plan.vessel_code)
         .await?
         .snapshot()
         .await?;
@@ -5166,7 +5211,8 @@ async fn stow_trip_relays(
     }
 
     for code in to_stow {
-        let handle = client.devices().get(&code).await?;
+        // The stow preparation pass already populated this relay projection.
+        let handle = projected_device(client, &code).await?;
         let snapshot = handle.snapshot().await?;
         if !device_has_command(&snapshot, "stow") {
             ensure_relay_attachable(client, config, &code).await?;
@@ -5241,7 +5287,8 @@ async fn execute_stop(
             "DSR detached from carrier at deployment stop"
         );
     } else {
-        let relay = client.devices().get(relay_code).await?;
+        // Stop execution uses the live assigned-relay projection.
+        let relay = projected_device(client, relay_code).await?;
         let snapshot = relay.snapshot().await?;
         if stop.action == StopAction::DeployAndActivate
             && snapshot.relationships.stowed_in.is_some()
@@ -5264,6 +5311,7 @@ async fn execute_stop(
     }
 
     ensure_relay_unfurled(client, config, relay_code).await?;
+    // This authoritative read confirms unfurling before activation ordering.
     let snapshot = client.devices().get(relay_code).await?.snapshot().await?;
     if device_status(&snapshot) != Some(RELAYING) {
         info!(
@@ -5277,7 +5325,11 @@ async fn execute_stop(
                 format!("relay {relay_code} does not currently advertise activate"),
             ));
         }
-        let operation = client.devices().get(relay_code).await?.activate().await?;
+        // The authoritative activation preflight just populated this handle.
+        let operation = projected_device(client, relay_code)
+            .await?
+            .activate()
+            .await?;
         ensure_operation_accepted(&operation).await?;
         wait_for_device(client, config, relay_code, |device| {
             device_status(device) == Some(RELAYING)
@@ -5557,7 +5609,11 @@ async fn wait_for_parent_connection(
     // another already-reachable relay-capable system. Either proves the new
     // relay has joined the expanding mesh.
     loop {
-        let network = client.devices().get(relay_code).await?.network().await?;
+        // `/network` stays authoritative; only its projection-backed handle is cached.
+        let network = projected_device(client, relay_code)
+            .await?
+            .network()
+            .await?;
         if let Some(connected_via) = network.connections.iter().find_map(|connection| {
             connection
                 .star
@@ -6429,6 +6485,26 @@ mod tests {
             .mount(server)
             .await;
         client.devices().get(code).await.expect("seed device");
+    }
+
+    #[tokio::test]
+    async fn projected_device_reuses_cached_handle_without_another_request() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        seed_relay_device(&server, &client, "RELAY-1", FTL_RELAY, &["relay"]).await;
+
+        projected_device(&client, "RELAY-1")
+            .await
+            .expect("cached relay handle");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "cached access must not issue a second GET"
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
     }
 
     #[tokio::test]

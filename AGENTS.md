@@ -122,6 +122,23 @@ replicantd
 - daemon-to-GUI updates: local WebSocket;
 - no webhook architecture.
 
+### Device Reads: Prefer the Managed Projection
+
+Default to `client.devices().cached(code)`, which performs no network request.
+Use `client.devices().get(code)` or `DeviceHandle::refresh()` only when:
+
+1. a mutation must be confirmed before ordering-dependent work continues and
+   its effect is not observable through the event stream;
+2. an explicit staleness signal requires an authoritative poll, such as a
+   cache miss, a lagged/`Gap` watcher, or a wait loop's poll fallback; or
+3. the projection does not carry the required field, such as volatile
+   `/network` data.
+
+On a cache miss, fall back to `get()`. For many devices, prefer a filtered
+`refresh_many()` over a loop of individual `get()` calls. Raw gateway reads
+return endpoint DTOs and remain explicit authoritative requests; do not swap
+them for managed snapshots without verifying every required field.
+
 ### Do Not Turn RuntimeSnapshot Into "Everything"
 
 `GET /api/snapshot` is intentionally a compact runtime/lifecycle snapshot.

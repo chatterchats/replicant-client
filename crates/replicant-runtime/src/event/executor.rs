@@ -1764,7 +1764,11 @@ async fn submit_available_print_batches(
             flatpacked,
             "submitting event print batch"
         );
-        let factory = client.devices().get(&batch.factory_code).await?;
+        // Factory planning already populated the selected factory projection.
+        let factory = match client.devices().cached(&batch.factory_code) {
+            Some(handle) => handle,
+            None => client.devices().get(&batch.factory_code).await?,
+        };
         let operation = factory
             .enqueue_print_configured(batch.device_type.clone(), options)
             .await?;
@@ -2267,10 +2271,11 @@ async fn claim_device(
     }
     save_plan(&config.plan_path, plan)?;
 
-    // One managed detail read supplies the durable command handle for both
-    // tag and ownership changes. The old code repeated this GET up to three
-    // times while claiming a single device.
-    let handle = client.devices().get(code).await?;
+    // The owned-device projection and raw preflight already established this asset.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     if !missing_tags.is_empty() {
         let operation = handle
             .configure(raw::devices::DeviceConfiguration {
@@ -2462,7 +2467,12 @@ async fn ensure_free_standing(client: &Client, config: &Config, code: &str) -> A
         ));
     }
     if detail.stowed_in_device_code.is_some() {
-        let operation = client.devices().get(code).await?.deploy().await?;
+        // The free-standing preflight reads projection-backed placement fields.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        let operation = handle.deploy().await?;
         ensure_operation_accepted(&operation).await?;
         wait_for_raw_device(client, config, code, |device| {
             device.stowed_in_device_code.is_none()
@@ -2550,7 +2560,12 @@ async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) 
     }
 
     info!(device = %code, "compacting modular event payload for carrier attachment");
-    let operation = client.devices().get(code).await?.compact().await?;
+    // The attachability preflight already established the managed device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let operation = handle.compact().await?;
     ensure_operation_accepted(&operation).await?;
     wait_for_raw_device(client, config, code, |device| {
         status_is(device, "compacted")
@@ -2853,7 +2868,12 @@ async fn install_beacon(
                 format!("beacon {code} does not currently advertise the deploy command"),
             ));
         }
-        let operation = client.devices().get(&code).await?.deploy().await?;
+        // Event travel and detach waits keep beacon placement current locally.
+        let handle = match client.devices().cached(&code) {
+            Some(handle) => handle,
+            None => client.devices().get(&code).await?,
+        };
+        let operation = handle.deploy().await?;
         ensure_operation_accepted(&operation).await?;
         wait_for_raw_device(client, config, &code, |device| {
             device.location.as_deref() == Some(plan.event.location.as_str())
@@ -3740,11 +3760,11 @@ async fn ensure_device_at(
 }
 
 async fn start_device_travel_to(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
-    // One authoritative managed read is enough both to decide whether travel
-    // is necessary and to obtain the durable command handle. The old path did
-    // a raw detail GET and then another managed detail GET before every
-    // departure.
-    let handle = client.devices().get(code).await?;
+    // Travel events keep mission-device location and travel state current.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let detail = handle.snapshot().await?;
     if detail.travel.is_none()
         && detail
@@ -4117,10 +4137,12 @@ async fn collect_resources(
         return Ok(());
     }
     let before = cargo_map(&client.raw().devices().get(code).await?.value);
-    let operation = client
-        .devices()
-        .get(code)
-        .await?
+    // Mission cargo is already tracked by the managed projection.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let operation = handle
         .command(raw::devices::DeviceCommand::CollectResources {
             resources: resource_json(resources),
         })
@@ -4155,10 +4177,12 @@ async fn deposit_resources(
         return Ok(());
     }
     let requested = resources.cloned().unwrap_or_else(|| before.clone());
-    let operation = client
-        .devices()
-        .get(code)
-        .await?
+    // Mission cargo is already tracked by the managed projection.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let operation = handle
         .command(raw::devices::DeviceCommand::DepositResources {
             resources: resources.map(resource_json),
         })
@@ -4187,10 +4211,12 @@ async fn attach_devices(
     if devices.is_empty() {
         return Ok(());
     }
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
+    // Mission carriers are maintained by attachment and travel events.
+    let handle = match client.devices().cached(carrier) {
+        Some(handle) => handle,
+        None => client.devices().get(carrier).await?,
+    };
+    let operation = handle
         .attach(raw::devices::TargetsCommand {
             device: None,
             devices: Some(Value::Array(
@@ -4219,7 +4245,11 @@ async fn detach_devices(
     if devices.is_empty() {
         return Ok(());
     }
-    let handle = client.devices().get(carrier).await?;
+    // Attachment waits keep the mission carrier projection current.
+    let handle = match client.devices().cached(carrier) {
+        Some(handle) => handle,
+        None => client.devices().get(carrier).await?,
+    };
     let snapshot = handle.snapshot().await?;
     if !snapshot.available_commands.is_empty()
         && !snapshot

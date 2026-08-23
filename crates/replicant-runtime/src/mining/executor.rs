@@ -185,7 +185,12 @@ async fn reconcile_carrier_claims(client: &Client, mission: &mut MiningMission) 
         let Some(carrier) = site.carrier.clone() else {
             continue;
         };
-        let snapshot = client.devices().get(&carrier).await?.snapshot().await?;
+        // Reconciliation just refreshed the owned-device projection in bulk.
+        let handle = match client.devices().cached(&carrier) {
+            Some(handle) => handle,
+            None => client.devices().get(&carrier).await?,
+        };
+        let snapshot = handle.snapshot().await?;
         if device_location(&snapshot) == Some(mission.hub_location.as_str())
             && snapshot.travel.is_none()
             && snapshot.relationships.attached_devices.is_empty()
@@ -1189,7 +1194,12 @@ async fn configure_site(
 ) -> AnyResult<()> {
     let site = &mission.sites[index];
     for code in site.assets.codes() {
-        let snapshot = client.devices().get(&code).await?.snapshot().await?;
+        // Arrival events keep each site asset current in the projection.
+        let handle = match client.devices().cached(&code) {
+            Some(handle) => handle,
+            None => client.devices().get(&code).await?,
+        };
+        let snapshot = handle.snapshot().await?;
         if device_location(&snapshot) != Some(site.belt.as_str()) {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
@@ -1215,11 +1225,12 @@ async fn configure_site(
     save_plan(&config.plan_path, mission)?;
     let site = &mission.sites[index];
     let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
-    let mining = client
-        .devices()
-        .get(mining_controller)
-        .await?
-        .as_mining_controller()?;
+    // Fleet reconciliation already populated the selected controller.
+    let mining_handle = match client.devices().cached(mining_controller) {
+        Some(handle) => handle,
+        None => client.devices().get(mining_controller).await?,
+    };
+    let mining = mining_handle.as_mining_controller()?;
     let mining_snapshot = mining.device().snapshot().await?;
     if !has_directive(&mining_snapshot, "deplete_smallest") {
         let operation = mining
@@ -1237,11 +1248,12 @@ async fn configure_site(
     }
 
     let survey_controller = site.assets.survey_controller.as_deref().unwrap_or_default();
-    let survey = client
-        .devices()
-        .get(survey_controller)
-        .await?
-        .as_survey_controller()?;
+    // Fleet reconciliation already populated the selected controller.
+    let survey_handle = match client.devices().cached(survey_controller) {
+        Some(handle) => handle,
+        None => client.devices().get(survey_controller).await?,
+    };
+    let survey = survey_handle.as_survey_controller()?;
     let survey_snapshot = survey.device().snapshot().await?;
     if !has_directive(&survey_snapshot, "belt_search") {
         ensure_operation_accepted(&survey.set_directive(SurveyDirective::BeltSearch).await?)
@@ -1260,7 +1272,11 @@ async fn configure_site(
         site.assets.maintenance_drone.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no maintenance drone")
         })?;
-    let maintenance_handle = client.devices().get(maintenance).await?;
+    // Fleet reconciliation already populated the maintenance drone.
+    let maintenance_handle = match client.devices().cached(maintenance) {
+        Some(handle) => handle,
+        None => client.devices().get(maintenance).await?,
+    };
     let maintenance_snapshot = maintenance_handle.snapshot().await?;
     if !has_directive(&maintenance_snapshot, "patrol") {
         ensure_operation_accepted(
@@ -1312,10 +1328,12 @@ async fn ensure_adoption(client: &Client, controller: &str, devices: &[String]) 
     if missing.is_empty() {
         return Ok(());
     }
-    let operation = client
-        .devices()
-        .get(controller)
-        .await?
+    // Adoption checks read the controller and drone projection immediately above.
+    let handle = match client.devices().cached(controller) {
+        Some(handle) => handle,
+        None => client.devices().get(controller).await?,
+    };
+    let operation = handle
         .command(api_raw::devices::DeviceCommand::Adopt(targets(&missing)))
         .await?;
     ensure_operation_accepted(&operation).await
@@ -1421,11 +1439,12 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         .as_deref()
         .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route has no Cargo Freighter"))?;
     ensure_adoption(client, controller, &[freighter.to_owned()]).await?;
-    let transport = client
-        .devices()
-        .get(controller)
-        .await?
-        .as_transport_controller()?;
+    // Adoption and fleet reconciliation already populated the controller.
+    let handle = match client.devices().cached(controller) {
+        Some(handle) => handle,
+        None => client.devices().get(controller).await?,
+    };
+    let transport = handle.as_transport_controller()?;
     let snapshot = transport.device().snapshot().await?;
     if !super::ferry_route_matches(&snapshot, &route.belt, hub) {
         ensure_operation_accepted(
@@ -1484,7 +1503,12 @@ async fn return_and_release_carriers(
             let Some(carrier) = site.carrier.clone() else {
                 continue;
             };
-            let snapshot = client.devices().get(&carrier).await?.snapshot().await?;
+            // Travel events keep returning carriers current between loop passes.
+            let handle = match client.devices().cached(&carrier) {
+                Some(handle) => handle,
+                None => client.devices().get(&carrier).await?,
+            };
+            let snapshot = handle.snapshot().await?;
             if snapshot.travel.is_none()
                 && device_location(&snapshot) == Some(mission.hub_location.as_str())
                 && snapshot.relationships.attached_devices.is_empty()
@@ -1549,7 +1573,11 @@ async fn migrate_legacy_mission_devices(
         if removable.is_empty() {
             continue;
         }
-        let handle = client.devices().get(device.key.id.as_str()).await?;
+        // The bulk refresh that produced `device` also populated its handle.
+        let handle = match client.devices().cached(device.key.id.as_str()) {
+            Some(handle) => handle,
+            None => client.devices().get(device.key.id.as_str()).await?,
+        };
         let add_tags = (!device.tags.contains(&mission.mission_tag))
             .then_some(vec![mission.mission_tag.clone()]);
         ensure_operation_accepted(
@@ -1607,7 +1635,11 @@ async fn ensure_asset_ownership(
     selected_replicant: &str,
 ) -> AnyResult<()> {
     for code in codes {
-        let handle = client.devices().get(code).await?;
+        // Selected mission assets are maintained by the SSE projection.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
         let snapshot = handle.snapshot().await?;
         if snapshot
             .relationships
@@ -1622,7 +1654,11 @@ async fn ensure_asset_ownership(
 }
 
 async fn add_tags(client: &Client, code: &str, desired: &[String]) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Mission tag mutations operate on projection-backed selected assets.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let snapshot = handle.snapshot().await?;
     let missing = desired
         .iter()
@@ -1644,7 +1680,11 @@ async fn add_tags(client: &Client, code: &str, desired: &[String]) -> AnyResult<
 }
 
 async fn remove_tags(client: &Client, code: &str, removable: &[String]) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Mission tag mutations operate on projection-backed selected assets.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let snapshot = handle.snapshot().await?;
     let present = removable
         .iter()
@@ -1677,7 +1717,11 @@ fn targets(devices: &[String]) -> api_raw::devices::TargetsCommand {
 }
 
 async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
-    let handle = client.devices().get(code).await?;
+    // Travel events keep mission-device location and travel state current.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let snapshot = handle.snapshot().await?;
     if snapshot.travel.is_none() && device_location(&snapshot) == Some(destination) {
         return Ok(());

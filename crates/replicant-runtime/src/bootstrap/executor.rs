@@ -1743,12 +1743,12 @@ async fn recover_legacy_quick_survey_fleet(
         return Ok(());
     }
 
-    let vessel = client
-        .devices()
-        .get(&mission.explorer.vessel)
-        .await?
-        .snapshot()
-        .await?;
+    // Bootstrap planning already populated the explorer vessel projection.
+    let vessel_handle = match client.devices().cached(&mission.explorer.vessel) {
+        Some(handle) => handle,
+        None => client.devices().get(&mission.explorer.vessel).await?,
+    };
+    let vessel = vessel_handle.snapshot().await?;
     let vessel_location = vessel
         .location
         .as_ref()
@@ -1776,7 +1776,12 @@ async fn recover_legacy_quick_survey_fleet(
     selected.extend(drones);
     let mut recoverable = Vec::new();
     for code in selected {
-        let snapshot = client.devices().get(&code).await?.snapshot().await?;
+        // Legacy fleet discovery populated each selected device projection.
+        let handle = match client.devices().cached(&code) {
+            Some(handle) => handle,
+            None => client.devices().get(&code).await?,
+        };
+        let snapshot = handle.snapshot().await?;
         if snapshot.relationships.attached_to.is_some()
             || snapshot
                 .relationships
@@ -1842,7 +1847,12 @@ async fn recover_legacy_quick_survey_fleet(
         "recovering survey devices launched by the legacy quick-scout workflow"
     );
     for code in &recoverable {
-        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        // The recovery preflight above populated every recoverable device.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        let snapshot = handle.snapshot().await?;
         let already_returned = snapshot.travel.is_none()
             && snapshot
                 .location
@@ -1859,7 +1869,7 @@ async fn recover_legacy_quick_survey_fleet(
                 .is_some_and(|status| status.as_str() == "recalling")
             || (snapshot.location.is_none() && snapshot.relationships.stowed_in.is_none());
         if can_recall {
-            ensure_operation(&client.devices().get(code).await?.recall().await?).await?;
+            ensure_operation(&handle.recall().await?).await?;
         } else if !already_returned && !recall_in_progress {
             return Err(app_error(
                 io::ErrorKind::InvalidInput,
@@ -1881,7 +1891,12 @@ async fn recover_legacy_quick_survey_fleet(
     .await?;
 
     for code in &recoverable {
-        let snapshot = client.devices().get(code).await?.snapshot().await?;
+        // The return wait keeps each recoverable device current via SSE.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        let snapshot = handle.snapshot().await?;
         if snapshot
             .relationships
             .stowed_in
@@ -1890,15 +1905,7 @@ async fn recover_legacy_quick_survey_fleet(
         {
             continue;
         }
-        ensure_operation(
-            &client
-                .devices()
-                .get(code)
-                .await?
-                .stow(Some(mission.explorer.vessel.clone()))
-                .await?,
-        )
-        .await?;
+        ensure_operation(&handle.stow(Some(mission.explorer.vessel.clone())).await?).await?;
     }
 
     wait_devices_stowed_in_vessel(
@@ -2711,11 +2718,13 @@ async fn deposit_all(client: &Client, code: &str) -> AnyResult<()> {
     if cargo_map(&detail).is_empty() {
         return Ok(());
     }
+    // The cargo preflight above established this projection-backed device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     ensure_operation(
-        &client
-            .devices()
-            .get(code)
-            .await?
+        &handle
             .command(raw::devices::DeviceCommand::DepositResources { resources: None })
             .await?,
     )
@@ -2816,15 +2825,12 @@ async fn attach_devices(client: &Client, carrier: &str, devices: &[String]) -> A
     if missing.is_empty() {
         return Ok(());
     }
-    ensure_operation(
-        &client
-            .devices()
-            .get(carrier)
-            .await?
-            .attach(targets(&missing))
-            .await?,
-    )
-    .await
+    // Carrier attachment inspection above uses the live projection.
+    let handle = match client.devices().cached(carrier) {
+        Some(handle) => handle,
+        None => client.devices().get(carrier).await?,
+    };
+    ensure_operation(&handle.attach(targets(&missing)).await?).await
 }
 
 async fn detach_devices(client: &Client, carrier: &str, devices: &[String]) -> AnyResult<()> {
@@ -2841,11 +2847,13 @@ async fn detach_devices(client: &Client, carrier: &str, devices: &[String]) -> A
     if present.is_empty() {
         return Ok(());
     }
+    // Carrier detachment inspection above uses the live projection.
+    let handle = match client.devices().cached(carrier) {
+        Some(handle) => handle,
+        None => client.devices().get(carrier).await?,
+    };
     ensure_operation(
-        &client
-            .devices()
-            .get(carrier)
-            .await?
+        &handle
             .command(raw::devices::DeviceCommand::Detach(targets(&present)))
             .await?,
     )
@@ -3297,7 +3305,12 @@ async fn configure_structure(client: &Client, code: &str, set_entry: bool) -> An
         .iter()
         .any(|command| command == "unfurl")
     {
-        ensure_operation(&client.devices().get(code).await?.unfurl().await?).await?;
+        // The raw capability preflight confirms the cached handle is safe to command.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        ensure_operation(&handle.unfurl().await?).await?;
         detail = client.raw().devices().get(code).await?.value;
     }
     if detail.status.as_deref() != Some("active")
@@ -3306,7 +3319,12 @@ async fn configure_structure(client: &Client, code: &str, set_entry: bool) -> An
             .iter()
             .any(|command| command == "activate")
     {
-        ensure_operation(&client.devices().get(code).await?.activate().await?).await?;
+        // The raw capability preflight confirms the cached handle is safe to command.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
+        ensure_operation(&handle.activate().await?).await?;
         detail = client.raw().devices().get(code).await?.value;
     }
     if set_entry
@@ -3315,11 +3333,13 @@ async fn configure_structure(client: &Client, code: &str, set_entry: bool) -> An
             .iter()
             .any(|command| command == "set_entry_point")
     {
+        // Structure configuration has kept this device in the projection.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
         ensure_operation(
-            &client
-                .devices()
-                .get(code)
-                .await?
+            &handle
                 .command(raw::devices::DeviceCommand::SetEntryPoint)
                 .await?,
         )
@@ -3336,11 +3356,13 @@ async fn set_patrol(client: &Client, code: &str) -> AnyResult<()> {
         .and_then(|value| value.get("directive"))
         .and_then(Value::as_str);
     if current != Some("patrol") {
+        // The patrol preflight reads the same managed bootstrap device.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
         ensure_operation(
-            &client
-                .devices()
-                .get(code)
-                .await?
+            &handle
                 .command(raw::devices::DeviceCommand::SetDirective {
                     directive: "patrol".into(),
                     configuration: None,

@@ -1550,7 +1550,11 @@ async fn prepare_fleet(client: &Client, config: &Config, plan: &mut RoutePlan) -
 
     verify_fleet(client, config, plan, FleetVerification::for_plan(plan)).await?;
 
-    let controller_handle = client.devices().get(&controller_code).await?;
+    // Fleet verification just refreshed the selected controller projection.
+    let controller_handle = match client.devices().cached(&controller_code) {
+        Some(handle) => handle,
+        None => client.devices().get(&controller_code).await?,
+    };
     let controller = controller_handle.as_survey_controller()?;
 
     let mut needs_adoption = Vec::new();
@@ -1849,7 +1853,11 @@ async fn ensure_replicant_owns_device(
         target_replicant = replicant,
         "transferring device to the target replicant"
     );
-    let handle = client.devices().get(code).await?;
+    // The ownership preflight above refreshed this same device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let operation = handle.change_owner(replicant.to_owned()).await?;
     wait_for_device_owner(client, code, replicant, &operation).await
 }
@@ -2189,7 +2197,11 @@ async fn ensure_device_stowed_idempotently(
         "stowing survey-fleet device"
     );
 
-    let handle = client.devices().get(code).await?;
+    // The stow preflight above refreshed this same device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let operation = handle.stow(Some(config.vessel.clone())).await?;
     wait_for_authoritative_stow(client, config, code, &operation).await
 }
@@ -2552,11 +2564,12 @@ async fn recover_fleet_for_maintenance(
         && active_directive_status(&controller_snapshot) != Some("inactive")
         && device_has_command(&controller_snapshot, "clear_directive")
     {
-        let controller = client
-            .devices()
-            .get(controller_code)
-            .await?
-            .as_survey_controller()?;
+        // The maintenance preflight just refreshed the controller.
+        let handle = match client.devices().cached(controller_code) {
+            Some(handle) => handle,
+            None => client.devices().get(controller_code).await?,
+        };
+        let controller = handle.as_survey_controller()?;
         let operation = controller.clear_directive().await?;
         wait_immediate_operation("pause survey directive for maintenance", &operation).await?;
     }
@@ -2584,7 +2597,12 @@ async fn recover_fleet_for_maintenance(
                 capacity_pct = capacity,
                 "recalling a still-functional survey device before maintenance"
             );
-            let operation = client.devices().get(code).await?.recall().await?;
+            // The maintenance loop just refreshed this device.
+            let handle = match client.devices().cached(code) {
+                Some(handle) => handle,
+                None => client.devices().get(code).await?,
+            };
+            let operation = handle.recall().await?;
             wait_immediate_operation("recall survey device for maintenance", &operation).await?;
         }
     }
@@ -2726,7 +2744,12 @@ async fn deploy_device_for_maintenance(
             ),
         ));
     }
-    let operation = client.devices().get(code).await?.deploy().await?;
+    // The deployment preflight just refreshed this device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
+    let operation = handle.deploy().await?;
     wait_immediate_operation("deploy survey device for maintenance", &operation).await?;
     let started = Instant::now();
     loop {
@@ -2750,7 +2773,11 @@ async fn stop_device_for_repair(client: &Client, code: &str) -> AnyResult<()> {
         return Ok(());
     }
 
-    let handle = client.devices().get(code).await?;
+    // The repair preflight just refreshed this device.
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let operation = if device_has_command(&device, "clear_directive") {
         handle
             .command(raw::devices::DeviceCommand::ClearDirective)
@@ -2846,7 +2873,11 @@ async fn repair_survey_fleet(client: &Client, config: &Config, plan: &RoutePlan)
             ),
         ));
     }
-    let maintenance = client.devices().get(&maintenance_drone_code).await?;
+    // The repair capability check just refreshed the maintenance drone.
+    let maintenance = match client.devices().cached(&maintenance_drone_code) {
+        Some(handle) => handle,
+        None => client.devices().get(&maintenance_drone_code).await?,
+    };
     for code in survey_fleet_codes(plan) {
         let device = refresh_device_snapshot(client, code).await?;
         let capacity = operational_capacity_percent(&device).ok_or_else(|| {
@@ -2895,11 +2926,12 @@ async fn repair_survey_fleet(client: &Client, config: &Config, plan: &RoutePlan)
             "route plan has no survey controller",
         )
     })?;
-    let controller = client
-        .devices()
-        .get(controller_code)
-        .await?
-        .as_survey_controller()?;
+    // Fleet inspection already populated the survey controller projection.
+    let handle = match client.devices().cached(controller_code) {
+        Some(handle) => handle,
+        None => client.devices().get(controller_code).await?,
+    };
+    let controller = handle.as_survey_controller()?;
     let operation = controller
         .set_directive(SurveyDirective::SurveySystem {
             planets: "all".to_owned(),
@@ -3496,10 +3528,12 @@ async fn detach_survey_fleet_from_carriers(
             star = target,
             "detaching survey-fleet devices from their transport carrier before surveying"
         );
-        let operation = client
-            .devices()
-            .get(carrier)
-            .await?
+        // Attachment inspection above uses the live carrier projection.
+        let handle = match client.devices().cached(carrier) {
+            Some(handle) => handle,
+            None => client.devices().get(carrier).await?,
+        };
+        let operation = handle
             .command(raw::devices::DeviceCommand::Detach(
                 raw::devices::TargetsCommand {
                     device: None,
@@ -3604,7 +3638,11 @@ async fn run_survey(
         );
         return Ok(SurveyRunOutcome::MaintenanceRequired);
     }
-    let controller_handle = client.devices().get(controller_code).await?;
+    // The fleet health preflight reads the live survey projection.
+    let controller_handle = match client.devices().cached(controller_code) {
+        Some(handle) => handle,
+        None => client.devices().get(controller_code).await?,
+    };
     let controller = controller_handle.as_survey_controller()?;
 
     // A device can be physically present in the target system while still
@@ -4000,7 +4038,11 @@ async fn request_direct_fleet_recall(
             vessel_location,
             "recalling survey-fleet device directly to the replicant vessel"
         );
-        let handle = client.devices().get(code).await?;
+        // The assigned-device bulk refresh above populated this handle.
+        let handle = match client.devices().cached(code) {
+            Some(handle) => handle,
+            None => client.devices().get(code).await?,
+        };
         let operation = handle.recall().await?;
         let label = format!("recall survey-fleet device {code}");
         wait_immediate_operation(&label, &operation).await?;
