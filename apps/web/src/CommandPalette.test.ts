@@ -132,10 +132,18 @@ it("uses selected device context only once when an action has two device paramet
   });
 });
 
-it("uses click confirmation for individual device controls", () => {
+it.each([
+  "device.lifecycle",
+  "device.travel",
+  "device.stow",
+  "device.attach",
+  "device.detach",
+  "device.repair",
+  "device.change_owner",
+])("uses click confirmation for individual %s controls", (kind) => {
   const control: ActionDescriptor = {
     ...descriptor,
-    kind: "device.lifecycle",
+    kind,
     display_name: "Control device",
     operation_class: "action",
   };
@@ -145,15 +153,24 @@ it("uses click confirmation for individual device controls", () => {
       operationClass: "action",
     }),
   ).toBe(false);
+});
+
+it("keeps typed confirmation for bulk and non-device elevated actions", () => {
+  const control: ActionDescriptor = {
+    ...descriptor,
+    kind: "device.lifecycle.bulk",
+    display_name: "Control selected devices",
+    operation_class: "action",
+  };
   expect(
     requiresTypedConfirmation({
-      descriptor: { ...control, kind: "device.travel" },
+      descriptor: control,
       operationClass: "action",
     }),
-  ).toBe(false);
+  ).toBe(true);
   expect(
     requiresTypedConfirmation({
-      descriptor: { ...control, kind: "device.decommission" },
+      descriptor: { ...control, kind: "trade.delete" },
       operationClass: "action",
     }),
   ).toBe(true);
