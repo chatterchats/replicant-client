@@ -6,7 +6,7 @@ use std::{
 
 use futures::future::{join_all, try_join_all};
 use replicant_client::{
-    AutofactoryPrintOptions, Client, Device, Operation, OperationId, OperationStatus,
+    AutofactoryPrintOptions, Client, Device, DeviceType, Operation, OperationId, OperationStatus,
     domain::AccessScope, raw,
 };
 use replicant_event_planner::{
@@ -3171,12 +3171,7 @@ async fn recover_rewards(
         )
         .await?;
 
-        let mut carrying_rewards = false;
-        for code in &cargo {
-            let detail = client.raw().devices().get(code).await?.value;
-            ensure_uncontrolled_cargo(&detail, code)?;
-            carrying_rewards |= !cargo_map(&detail).is_empty();
-        }
+        let carrying_rewards = reward_cargo_is_loaded(client, &plan.mission_tag, &cargo).await?;
         if carrying_rewards {
             return_reward_cargo_home(client, config, plan, &cargo).await?;
             checkpoint_and_deposit_rewards(client, config, plan, &cargo).await?;
@@ -3274,6 +3269,53 @@ async fn recover_rewards(
             sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+async fn reward_cargo_is_loaded(
+    client: &Client,
+    mission_tag: &str,
+    cargo: &[String],
+) -> AnyResult<bool> {
+    let requested = cargo.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let handles = client
+        .devices()
+        .refresh_many()
+        .with_tag(mission_tag.to_owned())
+        .of_type(DeviceType::from(CARGO_FREIGHTER))
+        .page_size(50)
+        .collect()
+        .await?;
+    let mut found = BTreeSet::new();
+    let mut carrying_rewards = false;
+    for handle in handles {
+        let code = handle.id().as_str();
+        if !requested.contains(code) {
+            continue;
+        }
+        let detail = handle.snapshot().await?;
+        if detail.relationships.controller.is_some() {
+            return Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!("cargo freighter {code} became controlled by an AMI during the mission"),
+            ));
+        }
+        carrying_rewards |= !detail.cargo.is_empty();
+        found.insert(code.to_owned());
+    }
+    if found.len() != requested.len() {
+        return Err(app_error(
+            io::ErrorKind::NotFound,
+            format!(
+                "event cargo missing from managed projection: {}",
+                requested
+                    .into_iter()
+                    .filter(|code| !found.contains(*code))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ));
+    }
+    Ok(carrying_rewards)
 }
 
 async fn initialize_reward_accounting(
@@ -4741,13 +4783,65 @@ fn format_device_requirements(requirements: &[DeviceRequirement]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use replicant_client::raw;
+    use replicant_client::{Client, SecretString, StartupPolicy, raw, raw::Url};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
 
     use super::{
         ReplicantTravelDecision, ResourceMap, allocate_manifests, command_available,
         is_modular_device, legacy_recovered_rewards, merge_recovered_rewards, merge_resources,
-        print_batch_tag, replicant_travel_decision, resources_available_from, status_is,
+        print_batch_tag, replicant_travel_decision, resources_available_from,
+        reward_cargo_is_loaded, status_is,
     };
+
+    async fn test_client_at(server: &MockServer) -> Client {
+        Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client")
+    }
+
+    #[tokio::test]
+    async fn reward_cargo_inspection_uses_one_bulk_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .and(query_param("device_type", "cargo_freighter"))
+            .and(query_param("tag", "evt-m:test"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [
+                    {
+                        "device_code": "CARGO-1",
+                        "device_type": "cargo_freighter",
+                        "cargo": [{"resource_type": "conductive", "quantity": 12}]
+                    },
+                    {"device_code": "CARGO-2", "device_type": "cargo_freighter"},
+                    {"device_code": "CARGO-3", "device_type": "cargo_freighter"}
+                ],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let cargo = ["CARGO-1", "CARGO-2", "CARGO-3"].map(str::to_owned);
+
+        assert!(
+            reward_cargo_is_loaded(&client, "evt-m:test", &cargo)
+                .await
+                .expect("inspect cargo")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
 
     #[test]
     fn event_print_batch_tags_survive_workflow_recreation() {

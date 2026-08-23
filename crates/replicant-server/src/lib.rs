@@ -7253,6 +7253,8 @@ mod tests {
                 assigned_replicant: Some(ReplicantKey::live("R-1".into())),
                 ..DeviceRelationships::default()
             },
+            cargo: Default::default(),
+            cargo_capacity: None,
             attach_capacity: None,
             stow_capacity: Some(100),
             stow_used: Some(25),

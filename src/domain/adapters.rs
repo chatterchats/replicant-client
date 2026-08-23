@@ -284,6 +284,12 @@ fn device(
             assigned_replicant,
             hosting_replicant,
         },
+        cargo: raw
+            .cargo
+            .iter()
+            .filter_map(|item| Some((item.resource_type.clone()?, item.quantity?)))
+            .collect(),
+        cargo_capacity: raw.cargo_capacity,
         attach_capacity: raw.attach_capacity,
         stow_capacity: raw.stow_capacity,
         stow_used: raw.stow_used,
@@ -1110,6 +1116,8 @@ mod location_tests {
             "attached_devices": [{"device_code": "ATTACHED"}],
             "controlled_devices": [{"device_code": "CONTROLLED"}],
             "stowed_devices": [{"device_code": "STOWED"}],
+            "cargo": [{"resource_type": "conductive", "quantity": 12}],
+            "cargo_capacity": 500,
             "attach_capacity": 2,
             "stow_capacity": 5,
             "stow_used": 3,
@@ -1192,6 +1200,8 @@ mod location_tests {
                 .collect::<Vec<_>>(),
             ["STOWED"]
         );
+        assert_eq!(device.cargo.get("conductive"), Some(&12));
+        assert_eq!(device.cargo_capacity, Some(500));
         assert_eq!(device.attach_capacity, Some(2));
         assert_eq!(device.stow_capacity, Some(5));
         assert_eq!(device.stow_used, Some(3));

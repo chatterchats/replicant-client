@@ -115,6 +115,12 @@ pub struct Device {
     pub available_directives: Vec<DeviceDirective>,
     pub tags: Vec<String>,
     pub relationships: DeviceRelationships,
+    /// Resource quantities currently carried by this device.
+    #[serde(default)]
+    pub cargo: BTreeMap<String, i64>,
+    /// Maximum resource quantity this device can carry.
+    #[serde(default)]
+    pub cargo_capacity: Option<i64>,
     #[serde(default)]
     pub attach_capacity: Option<i64>,
     #[serde(default)]

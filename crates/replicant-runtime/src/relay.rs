@@ -6468,6 +6468,8 @@ mod tests {
             available_directives: Vec::new(),
             tags: Vec::new(),
             relationships: replicant_client::domain::DeviceRelationships::default(),
+            cargo: Default::default(),
+            cargo_capacity: None,
             attach_capacity: None,
             stow_capacity: None,
             stow_used: None,

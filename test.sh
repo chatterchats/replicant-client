@@ -1,4 +1,4 @@
-#/bin/bash
+#!/bin/bash
 DATA_DIR="${REPLICANT_DATA_DIR:-$HOME/.local/share/replicant}"
 
 echo "=== replicantd configured path ==="
