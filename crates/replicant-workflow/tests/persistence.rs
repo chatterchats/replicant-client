@@ -212,6 +212,52 @@ fn persists_across_reopen() {
 }
 
 #[test]
+fn file_database_uses_wal() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-wal-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    drop(WorkflowRepository::open(&path).expect("open repository"));
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect database");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read journal mode");
+    assert_eq!(journal_mode, "wal");
+    drop(connection);
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
+fn converts_rollback_journal_database_without_data_loss() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-wal-migration-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let id = {
+        let repository = WorkflowRepository::open(&path).expect("create repository");
+        create(&repository, None).id
+    };
+    let connection = rusqlite::Connection::open(&path).expect("open existing database");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("use rollback journal");
+    assert_eq!(journal_mode, "delete");
+    drop(connection);
+
+    let repository = WorkflowRepository::open(&path).expect("convert repository to WAL");
+    assert!(repository.read(id).expect("read workflow").is_some());
+    drop(repository);
+    let connection = rusqlite::Connection::open(&path).expect("inspect converted database");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read journal mode");
+    assert_eq!(journal_mode, "wal");
+    drop(connection);
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
 fn claims_are_typed_idempotent_and_exclusive() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
     let owner = create(&repository, None);
@@ -534,7 +580,7 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         WorkflowRepository::open(&path),
         Err(RepositoryError::UnsupportedDatabaseSchema {
             found: 99,
-            supported: 8
+            supported: 9
         })
     ));
     fs::remove_file(path).expect("remove test database");

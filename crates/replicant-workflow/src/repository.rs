@@ -138,15 +138,18 @@ impl WorkflowRepository {
     /// Opens or creates a runtime database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RepositoryError> {
         let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, true)
     }
 
     /// Creates an isolated in-memory runtime database.
     pub fn open_in_memory() -> Result<Self, RepositoryError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, false)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, RepositoryError> {
+    fn from_connection(
+        connection: Connection,
+        file_database: bool,
+    ) -> Result<Self, RepositoryError> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let integrity: String =
@@ -154,6 +157,10 @@ impl WorkflowRepository {
         if integrity != "ok" {
             return Err(RepositoryError::DatabaseIntegrity(integrity));
         }
+        if file_database {
+            connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+        }
+        connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
         let repository = Self {
             connection: Mutex::new(connection),
         };
