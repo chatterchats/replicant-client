@@ -7453,6 +7453,8 @@ fn read_json(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use replicant_workflow::WorkflowRepository;
+
     use super::*;
 
     #[test]

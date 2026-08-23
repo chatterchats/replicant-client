@@ -82,7 +82,7 @@ const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // A system hub has 15 LY operational reach. An owned hub just outside a named
 // region can therefore serve as that region's gateway capital when it can
 // directly reach at least one known star inside the region.
-const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
+pub(crate) const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
 const EVENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
 const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;

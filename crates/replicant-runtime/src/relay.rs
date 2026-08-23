@@ -42,7 +42,9 @@ use std::{
     time::Duration,
 };
 
-use crate::{config::ManagedClientConfig, start_managed_client};
+use crate::{
+    config::ManagedClientConfig, orchestration::REGION_GATEWAY_HUB_RANGE_LY, start_managed_client,
+};
 use replicant_client::{
     Client, Device, DeviceType, Operation, OperationId, OperationStatus, Replicant, raw,
 };
@@ -2107,39 +2109,50 @@ async fn refresh_device_census(
         }
     }
     // Standard FTL relays continue to use the configured conventional
-    // `--max-hop`. For other relay-capable devices, ask the authoritative
-    // network endpoint for the device's actual advertised range. This keeps
-    // System Hubs (15 ly), Deep Space Relay Stations (10 ly), and future
-    // relay hardware from being flattened to the ordinary relay range.
+    // `--max-hop`. Known hardware uses its documented range without remote
+    // I/O; future relay types retain an authoritative network lookup.
+    let mut discovered_ranges_ly = BTreeMap::<String, Option<f64>>::new();
     for (code, system, relay_type) in relay_range_devices {
-        let range = match client.devices().get(&code).await {
-            Ok(handle) => match handle.network().await {
-                Ok(network) => network
-                    .range_ly
-                    .filter(|range| range.is_finite() && *range > 0.0),
+        let range = if let Some(range) = documented_relay_range_ly(&relay_type) {
+            Some(range)
+        } else if let Some(range) = discovered_ranges_ly.get(&relay_type) {
+            *range
+        } else {
+            let handle = if let Some(handle) = client.devices().cached(&code) {
+                Ok(handle)
+            } else {
+                client.devices().get(&code).await
+            };
+            let range = match handle {
+                Ok(handle) => match handle.network().await {
+                    Ok(network) => network
+                        .range_ly
+                        .filter(|range| range.is_finite() && *range > 0.0),
+                    Err(error) => {
+                        warn!(
+                            device = %code,
+                            system = %system,
+                            device_type = %relay_type,
+                            %error,
+                            "could not read relay-capable device network range; using documented fallback when available"
+                        );
+                        None
+                    }
+                },
                 Err(error) => {
                     warn!(
                         device = %code,
                         system = %system,
                         device_type = %relay_type,
                         %error,
-                        "could not read relay-capable device network range; using documented fallback when available"
+                        "could not open relay-capable device for network range lookup; using documented fallback when available"
                     );
                     None
                 }
-            },
-            Err(error) => {
-                warn!(
-                    device = %code,
-                    system = %system,
-                    device_type = %relay_type,
-                    %error,
-                    "could not open relay-capable device for network range lookup; using documented fallback when available"
-                );
-                None
-            }
-        }
-        .or_else(|| documented_relay_range_ly(&relay_type));
+            };
+            discovered_ranges_ly.insert(relay_type, range);
+            range
+        };
 
         if let Some(range_ly) = range {
             relay_code_ranges_ly.insert(code, range_ly);
@@ -6009,8 +6022,11 @@ fn relay_device_recoverable(device: &Device) -> bool {
 }
 
 fn documented_relay_range_ly(device_type: &str) -> Option<f64> {
+    // Replicant Space 2.5.1 reference: `ftl-relays/index.md`,
+    // `system-hubs/index.md`, and the DSR note in `changelog/index.md`.
     match device_type {
-        SYSTEM_HUB => Some(15.0),
+        FTL_RELAY => Some(DEFAULT_MAX_HOP_LY),
+        SYSTEM_HUB => Some(REGION_GATEWAY_HUB_RANGE_LY),
         DEEP_SPACE_RELAY => Some(DEEP_SPACE_RELAY_RANGE_LY),
         _ => None,
     }
@@ -6338,6 +6354,17 @@ pub fn restore_relay_checkpoint(path: &Path, checkpoint: &RelayExecutionState) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{method, path, path_regex},
+    };
+
     use super::*;
 
     fn test_relay_device(device_type_name: &str, status: &str, commands: &[&str]) -> Device {
@@ -6369,6 +6396,109 @@ mod tests {
             travel: None,
             access: replicant_client::domain::AccessScope::Owned,
         }
+    }
+
+    async fn test_client_at(server: &MockServer) -> Client {
+        Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client")
+    }
+
+    async fn seed_relay_device(
+        server: &MockServer,
+        client: &Client,
+        code: &str,
+        device_type: &str,
+        features: &[&str],
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": code,
+                "device_type": device_type,
+                "features": features,
+                "location": "ANTAR-1-L4",
+                "status": "active"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client.devices().get(code).await.expect("seed device");
+    }
+
+    #[tokio::test]
+    async fn census_uses_documented_hub_and_dsr_ranges_without_network_requests() {
+        let server = MockServer::start().await;
+        let network_calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/devices/[^/]+/network$"))
+            .respond_with({
+                let network_calls = Arc::clone(&network_calls);
+                move |_: &Request| {
+                    network_calls.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"range_ly": 99.0}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        seed_relay_device(&server, &client, "HUB-1", SYSTEM_HUB, &[]).await;
+        seed_relay_device(&server, &client, "DSR-1", DEEP_SPACE_RELAY, &[]).await;
+
+        let census = refresh_device_census(
+            &client,
+            "ANTAR-1-L4",
+            "VESSEL-1",
+            &BTreeSet::from(["ANTAR".to_owned()]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("refresh census");
+
+        assert_eq!(network_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(census.relay_ranges_ly["ANTAR"], REGION_GATEWAY_HUB_RANGE_LY);
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn census_reads_unknown_relay_range_once_per_device_type() {
+        let server = MockServer::start().await;
+        let network_calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/devices/UNKNOWN-[12]/network$"))
+            .respond_with({
+                let network_calls = Arc::clone(&network_calls);
+                move |_: &Request| {
+                    network_calls.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"range_ly": 12.5}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        seed_relay_device(&server, &client, "UNKNOWN-1", "future_relay", &["relay"]).await;
+        seed_relay_device(&server, &client, "UNKNOWN-2", "future_relay", &["relay"]).await;
+
+        let census = refresh_device_census(
+            &client,
+            "ANTAR-1-L4",
+            "VESSEL-1",
+            &BTreeSet::from(["ANTAR".to_owned()]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("refresh census");
+
+        assert_eq!(network_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(census.relay_ranges_ly["ANTAR"], 12.5);
+        server.verify().await;
+        client.close().await.expect("close client");
     }
 
     #[test]
@@ -6550,10 +6680,18 @@ mod tests {
     }
 
     #[test]
-    fn deep_space_relay_station_has_documented_ten_ly_fallback() {
+    fn known_relay_types_have_documented_ranges() {
         assert_eq!(
-            documented_relay_range_ly("deep_space_relay_station"),
-            Some(10.0)
+            documented_relay_range_ly(FTL_RELAY),
+            Some(DEFAULT_MAX_HOP_LY)
+        );
+        assert_eq!(
+            documented_relay_range_ly(SYSTEM_HUB),
+            Some(REGION_GATEWAY_HUB_RANGE_LY)
+        );
+        assert_eq!(
+            documented_relay_range_ly(DEEP_SPACE_RELAY),
+            Some(DEEP_SPACE_RELAY_RANGE_LY)
         );
     }
 
