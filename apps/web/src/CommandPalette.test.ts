@@ -132,7 +132,7 @@ it("uses selected device context only once when an action has two device paramet
   });
 });
 
-it("uses click confirmation for individual device control", () => {
+it("uses click confirmation for individual device controls", () => {
   const control: ActionDescriptor = {
     ...descriptor,
     kind: "device.lifecycle",
@@ -142,6 +142,12 @@ it("uses click confirmation for individual device control", () => {
   expect(
     requiresTypedConfirmation({
       descriptor: control,
+      operationClass: "action",
+    }),
+  ).toBe(false);
+  expect(
+    requiresTypedConfirmation({
+      descriptor: { ...control, kind: "device.travel" },
       operationClass: "action",
     }),
   ).toBe(false);

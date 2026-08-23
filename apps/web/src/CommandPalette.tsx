@@ -28,7 +28,7 @@ export interface DescriptorCommand {
 export function requiresTypedConfirmation(command: DescriptorCommand) {
   return (
     command.descriptor.risk === "elevated" &&
-    command.descriptor.kind !== "device.lifecycle"
+    !["device.lifecycle", "device.travel"].includes(command.descriptor.kind)
   );
 }
 
