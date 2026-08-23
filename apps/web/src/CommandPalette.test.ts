@@ -3,10 +3,15 @@ import { describe, expect, it } from "vitest";
 import {
   applicableDescriptorCommands,
   descriptorCommands,
+  requiresTypedConfirmation,
   resolveContextDefaults,
   searchDescriptors,
 } from "./CommandPalette";
-import type { DescriptorCatalog, WorkflowDescriptor } from "./protocol";
+import type {
+  ActionDescriptor,
+  DescriptorCatalog,
+  WorkflowDescriptor,
+} from "./protocol";
 
 const descriptor: WorkflowDescriptor = {
   kind: "survey.route",
@@ -125,4 +130,25 @@ it("uses selected device context only once when an action has two device paramet
     device: "HOST-1",
     target: "",
   });
+});
+
+it("uses click confirmation for individual device control", () => {
+  const control: ActionDescriptor = {
+    ...descriptor,
+    kind: "device.lifecycle",
+    display_name: "Control device",
+    operation_class: "action",
+  };
+  expect(
+    requiresTypedConfirmation({
+      descriptor: control,
+      operationClass: "action",
+    }),
+  ).toBe(false);
+  expect(
+    requiresTypedConfirmation({
+      descriptor: { ...control, kind: "device.decommission" },
+      operationClass: "action",
+    }),
+  ).toBe(true);
 });

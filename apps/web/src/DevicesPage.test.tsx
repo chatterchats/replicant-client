@@ -5,9 +5,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  BULK_DEVICE_COMMANDS,
   DeviceSelection,
   DevicesContent,
   bulkDeviceEligibility,
+  bulkDeviceOperationParameters,
   bulkDeviceResultItems,
   deviceCategory,
   filterAndSortDevices,
@@ -219,6 +221,16 @@ describe("device fleet browser", () => {
     expect(eligibility.incompatible.map((row) => row.entity.id)).toEqual([
       "D-2",
     ]);
+    expect(
+      BULK_DEVICE_COMMANDS.some((command) => command.id === "travel"),
+    ).toBe(true);
+    expect(
+      bulkDeviceOperationParameters("travel", rows.slice(0, 2), " SOL-4 "),
+    ).toEqual({
+      devices: "D-1,D-2",
+      command: "travel",
+      destination: "SOL-4",
+    });
     expect(
       bulkDeviceResultItems({
         results: [

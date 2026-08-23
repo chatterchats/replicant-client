@@ -136,6 +136,7 @@ export const BULK_DEVICE_COMMANDS = [
   { id: "scan", label: "Scan", destructive: false },
   { id: "search", label: "Search", destructive: false },
   { id: "system_scan", label: "System scan", destructive: false },
+  { id: "travel", label: "Travel", destructive: false },
   { id: "withdraw", label: "Withdraw", destructive: false },
   { id: "retrieve", label: "Retrieve", destructive: false },
 ] as const;
@@ -202,6 +203,18 @@ export function bulkDeviceResultItems(result: unknown): BulkDeviceResultItem[] {
       },
     ];
   });
+}
+
+export function bulkDeviceOperationParameters(
+  command: BulkDeviceCommand,
+  devices: DeviceSummary[],
+  destination: string,
+): Record<string, string> {
+  return {
+    devices: devices.map((device) => device.entity.id).join(","),
+    command,
+    ...(command === "travel" ? { destination: destination.trim() } : {}),
+  };
 }
 
 function bulkCommandInfo(command: BulkDeviceCommand | "") {
@@ -563,6 +576,7 @@ export function DevicesContent({
     () => new Set(),
   );
   const [bulkCommand, setBulkCommand] = useState<BulkDeviceCommand | "">("");
+  const [bulkDestination, setBulkDestination] = useState("");
   const [bulkRun, setBulkRun] = useState<{
     command: BulkDeviceCommand;
     deviceIds: string[];
@@ -697,10 +711,7 @@ export function DevicesContent({
       const execution = await daemonApi.runOperation(
         "action",
         "device.lifecycle.bulk",
-        {
-          devices: targets.map((device) => device.entity.id).join(","),
-          command,
-        },
+        bulkDeviceOperationParameters(command, targets, bulkDestination),
       );
       setBulkRun({
         command,
@@ -713,7 +724,13 @@ export function DevicesContent({
   };
 
   const requestBulkCommand = () => {
-    if (!bulkCommand || bulkEligible.length === 0 || bulkRunning) return;
+    if (
+      !bulkCommand ||
+      bulkEligible.length === 0 ||
+      bulkRunning ||
+      (bulkCommand === "travel" && !bulkDestination.trim())
+    )
+      return;
     const info = bulkCommandInfo(bulkCommand);
     if (!info) return;
     const skipped = bulkIncompatible.length;
@@ -725,8 +742,16 @@ export function DevicesContent({
         skipped > 0
           ? `${String(skipped)} selected ${
               skipped === 1 ? "device does" : "devices do"
-            } not currently advertise this command and will be skipped.`
-          : "The command will be submitted through the managed device operation path for every selected compatible device.",
+            } not currently advertise this command and will be skipped.${
+              bulkCommand === "travel"
+                ? ` Destination: ${bulkDestination.trim()}.`
+                : ""
+            }`
+          : `The command will be submitted through the managed device operation path for every selected compatible device.${
+              bulkCommand === "travel"
+                ? ` Destination: ${bulkDestination.trim()}.`
+                : ""
+            }`,
       items: confirmationItems(bulkEligible),
       confirmLabel: `${info.label} ${String(bulkEligible.length)}`,
       cancelLabel: "Cancel",
@@ -915,12 +940,26 @@ export function DevicesContent({
                   ))}
                 </select>
               </label>
+              {bulkCommand === "travel" ? (
+                <label>
+                  <span>Destination</span>
+                  <input
+                    aria-label="Bulk travel destination"
+                    placeholder="System or location"
+                    value={bulkDestination}
+                    onChange={(event) => {
+                      setBulkDestination(event.target.value);
+                    }}
+                  />
+                </label>
+              ) : null}
               <button
                 className={bulkInfo?.destructive ? "danger" : "primary"}
                 disabled={
                   !hasBulkLifecycleAction ||
                   !bulkCommand ||
                   bulkEligible.length === 0 ||
+                  (bulkCommand === "travel" && !bulkDestination.trim()) ||
                   bulkRunning
                 }
                 onClick={requestBulkCommand}

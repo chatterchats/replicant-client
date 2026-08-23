@@ -1539,9 +1539,10 @@ fn descriptors() -> DescriptorCatalog {
                     enum_parameter(
                         "command",
                         "Command",
-                        DEVICE_LIFECYCLE_COMMANDS,
+                        BULK_DEVICE_LIFECYCLE_COMMANDS,
                         "activate",
                     ),
+                    optional("destination", "Destination", ParameterKind::Location),
                 ],
             ),
             simple_action(
@@ -1806,6 +1807,25 @@ const DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
     "withdraw",
     "retrieve",
 ];
+const BULK_DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
+    "activate",
+    "assemble",
+    "cancel",
+    "clear_queue",
+    "deactivate",
+    "decommission",
+    "deploy",
+    "compact",
+    "unfurl",
+    "launch",
+    "recall",
+    "scan",
+    "search",
+    "system_scan",
+    "travel",
+    "withdraw",
+    "retrieve",
+];
 const BULK_DEVICE_COMMAND_CONCURRENCY: usize = 4;
 
 fn device_lifecycle_command(command: &str) -> Result<raw::devices::DeviceCommand, CatalogueError> {
@@ -1835,6 +1855,7 @@ async fn create_device_lifecycle_operation(
     client: &Client,
     device: &str,
     command: &str,
+    destination: Option<&str>,
 ) -> Result<Operation, CatalogueError> {
     if command == "retrieve" {
         client
@@ -1844,6 +1865,21 @@ async fn create_device_lifecycle_operation(
             .map_err(runtime_error)
     } else {
         let handle = client.devices().get(device).await.map_err(runtime_error)?;
+        if command == "travel" {
+            let destination = destination
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    CatalogueError::Invalid("bulk device travel requires a destination".to_owned())
+                })?;
+            return handle
+                .command(raw::devices::DeviceCommand::Travel {
+                    destination: destination.trim().to_owned(),
+                    dry_run: None,
+                    via: None,
+                })
+                .await
+                .map_err(runtime_error);
+        }
         handle
             .command(device_lifecycle_command(command)?)
             .await
@@ -1856,7 +1892,8 @@ async fn run_device_lifecycle(
     device: &str,
     command: &str,
 ) -> Result<Value, CatalogueError> {
-    managed_operation_value(create_device_lifecycle_operation(client, device, command).await?).await
+    managed_operation_value(create_device_lifecycle_operation(client, device, command, None).await?)
+        .await
 }
 
 fn bulk_device_codes(value: &str) -> Result<Vec<String>, CatalogueError> {
@@ -1881,18 +1918,19 @@ async fn run_bulk_device_lifecycle(
     input: DeviceBulkLifecycleAction,
 ) -> Result<Value, CatalogueError> {
     let devices = bulk_device_codes(&input.devices)?;
-    if input.command != "retrieve" {
-        device_lifecycle_command(&input.command)?;
-    }
+    validate_bulk_device_lifecycle(&input)?;
     let command = input.command;
+    let destination = input.destination;
     let mut results = stream::iter(devices.into_iter().enumerate())
         .map(|(index, device)| {
             let command = command.clone();
+            let destination = destination.clone();
             async move {
                 let operation = match create_device_lifecycle_operation(
                     client,
                     &device,
                     &command,
+                    destination.as_deref(),
                 )
                 .await
                 {
@@ -1958,6 +1996,23 @@ async fn run_bulk_device_lifecycle(
             .map(|(_, result)| result)
             .collect::<Vec<_>>(),
     }))
+}
+
+fn validate_bulk_device_lifecycle(input: &DeviceBulkLifecycleAction) -> Result<(), CatalogueError> {
+    match input.command.as_str() {
+        "travel"
+            if input
+                .destination
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty()) =>
+        {
+            Err(CatalogueError::Invalid(
+                "bulk device travel requires a destination".to_owned(),
+            ))
+        }
+        "travel" | "retrieve" => Ok(()),
+        command => device_lifecycle_command(command).map(drop),
+    }
 }
 
 async fn managed_operation_value(
@@ -2688,6 +2743,8 @@ struct DeviceLifecycleAction {
 struct DeviceBulkLifecycleAction {
     devices: String,
     command: String,
+    #[serde(default)]
+    destination: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct DeviceTargetAction {
@@ -3177,6 +3234,40 @@ mod tests {
             vec!["D-1".to_owned(), "D-2".to_owned()]
         );
         assert!(bulk_device_codes(" , \n ").is_err());
+
+        let travel = DeviceBulkLifecycleAction {
+            devices: "D-1,D-2".to_owned(),
+            command: "travel".to_owned(),
+            destination: Some("SOL-4".to_owned()),
+        };
+        validate_bulk_device_lifecycle(&travel).expect("travel destination");
+        assert!(
+            validate_bulk_device_lifecycle(&DeviceBulkLifecycleAction {
+                destination: None,
+                ..travel
+            })
+            .is_err()
+        );
+
+        let descriptor = catalogue
+            .descriptors()
+            .actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "device.lifecycle.bulk")
+            .expect("bulk lifecycle descriptor");
+        assert!(descriptor.parameters.iter().any(|parameter| {
+            parameter.name == "command"
+                && parameter
+                    .options
+                    .iter()
+                    .any(|option| option.value == "travel")
+        }));
+        assert!(
+            descriptor
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "destination" && !parameter.required)
+        );
     }
 
     #[test]

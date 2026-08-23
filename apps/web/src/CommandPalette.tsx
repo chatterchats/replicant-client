@@ -25,6 +25,13 @@ export interface DescriptorCommand {
   initialParameters?: Record<string, unknown>;
 }
 
+export function requiresTypedConfirmation(command: DescriptorCommand) {
+  return (
+    command.descriptor.risk === "elevated" &&
+    command.descriptor.kind !== "device.lifecycle"
+  );
+}
+
 export function descriptorCommands(
   catalog: DescriptorCatalog,
 ): DescriptorCommand[] {
@@ -220,7 +227,7 @@ export function CommandPalette({
             </span>
             <h2>Confirm {selected.descriptor.display_name}</h2>
             <p>This {selected.operationClass} can change game state.</p>
-            {selected.descriptor.risk === "elevated" ? (
+            {requiresTypedConfirmation(selected) ? (
               <label>
                 Type <strong>{selected.descriptor.display_name}</strong> to
                 continue
@@ -232,7 +239,9 @@ export function CommandPalette({
                   }}
                 />
               </label>
-            ) : null}
+            ) : (
+              <p>Click to confirm.</p>
+            )}
             {serverError ? <p className="form-error">{serverError}</p> : null}
             <div className="palette-actions">
               <button
@@ -246,7 +255,7 @@ export function CommandPalette({
                 className="primary"
                 disabled={
                   submitting ||
-                  (selected.descriptor.risk === "elevated" &&
+                  (requiresTypedConfirmation(selected) &&
                     confirmation !== selected.descriptor.display_name)
                 }
                 onClick={() => {
