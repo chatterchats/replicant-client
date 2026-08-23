@@ -7,8 +7,8 @@ use std::sync::{
 
 use replicant_workflow::{
     AutomationPolicy, BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent,
-    WaitOutcome, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
-    WorkflowRegistry, WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
+    WaitOutcome, WaitSignal, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
+    WorkflowKind, WorkflowRegistry, WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -563,6 +563,7 @@ struct WaitingFactory {
     kind: WorkflowKind,
     satisfied: Arc<std::sync::atomic::AtomicBool>,
     deadline_millis: i64,
+    satisfy_on_poll: bool,
 }
 
 impl WorkflowFactory for WaitingFactory {
@@ -578,6 +579,7 @@ impl WorkflowFactory for WaitingFactory {
         Some(Box::new(WaitingWorkflow {
             satisfied: self.satisfied.clone(),
             deadline_millis: self.deadline_millis,
+            satisfy_on_poll: self.satisfy_on_poll,
         }))
     }
 }
@@ -585,17 +587,27 @@ impl WorkflowFactory for WaitingFactory {
 struct WaitingWorkflow {
     satisfied: Arc<std::sync::atomic::AtomicBool>,
     deadline_millis: i64,
+    satisfy_on_poll: bool,
 }
 
 impl WorkflowExecutor for WaitingWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         Box::pin(async move {
+            let poll_interval = if self.satisfy_on_poll {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(10)
+            };
             let outcome = context
                 .wait_until(
                     WaitIntent::state("test state is ready")
                         .for_event("test.changed")
+                        .polling_every(poll_interval)
                         .until(self.deadline_millis),
-                    |_| Ok(self.satisfied.load(Ordering::SeqCst)),
+                    |_, signal| {
+                        std::future::ready(Ok(self.satisfied.load(Ordering::SeqCst)
+                            || self.satisfy_on_poll && signal == WaitSignal::Poll))
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -643,11 +655,47 @@ fn waiting_setup(
             kind,
             satisfied,
             deadline_millis,
+            satisfy_on_poll: false,
         }))
         .expect("register workflow");
     let registry = Arc::new(registry);
     let supervisor = WorkflowSupervisor::with_managed_client(repository, registry.clone(), client);
     (id, registry, supervisor)
+}
+
+#[tokio::test]
+async fn wait_uses_authoritative_poll_fallback() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.poll-wait").expect("valid kind");
+    let id = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: (),
+            checkpoint: (),
+            current_step: Some("wait".into()),
+            parent_id: None,
+        })
+        .expect("create workflow")
+        .id;
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(WaitingFactory {
+            kind,
+            satisfied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline_millis: unix_millis() + 60_000,
+            satisfy_on_poll: true,
+        }))
+        .expect("register workflow");
+    let mut supervisor = WorkflowSupervisor::with_managed_client(
+        repository.clone(),
+        Arc::new(registry),
+        managed_client().await,
+    );
+
+    supervisor.tick().await.expect("start workflow");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    wait_for_status(&mut supervisor, &repository, id, WorkflowStatus::Succeeded).await;
 }
 
 fn unix_millis() -> i64 {

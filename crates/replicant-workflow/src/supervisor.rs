@@ -13,8 +13,8 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
     ClaimAcquireOutcome, NewWorkflow, RepositoryError, ResourceClaim, ResourceKey, WaitIntent,
-    WaitOutcome, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository, WorkflowState,
-    WorkflowStatus, WorkflowTelemetrySample, WorkflowTelemetrySink,
+    WaitOutcome, WaitSignal, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository,
+    WorkflowState, WorkflowStatus, WorkflowTelemetrySample, WorkflowTelemetrySink,
 };
 
 // Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
@@ -208,13 +208,14 @@ impl WorkflowContext {
 
     /// Waits for SSE-backed event or managed-state revision signals, then
     /// verifies `predicate` against managed durable state.
-    pub async fn wait_until<F>(
+    pub async fn wait_until<F, Fut>(
         &mut self,
         intent: WaitIntent,
         mut predicate: F,
     ) -> Result<WaitOutcome, WorkflowWaitError>
     where
-        F: FnMut(&Client) -> Result<bool, String>,
+        F: FnMut(&Client, WaitSignal) -> Fut,
+        Fut: Future<Output = Result<bool, String>>,
     {
         let client = self
             .client
@@ -227,18 +228,23 @@ impl WorkflowContext {
         self.persist_wait(&intent)?;
         let mut events = client.events().watch().await?;
         let mut revisions = client.state().watch()?;
+        let poll_interval = Duration::from_millis(intent.poll_interval_millis.unwrap_or(30_000));
+        let mut poll_deadline = tokio::time::Instant::now() + poll_interval;
+
+        if predicate(&client, WaitSignal::Initial)
+            .await
+            .map_err(WorkflowWaitError::Predicate)?
+            || self.recover_history(&client, &mut intent).await?
+                && predicate(&client, WaitSignal::History)
+                    .await
+                    .map_err(WorkflowWaitError::Predicate)?
+        {
+            self.clear_wait()?;
+            return Ok(WaitOutcome::Satisfied);
+        }
 
         loop {
-            if predicate(&client).map_err(WorkflowWaitError::Predicate)? {
-                self.clear_wait()?;
-                return Ok(WaitOutcome::Satisfied);
-            }
-            if self.recover_history(&client, &mut intent).await?
-                && predicate(&client).map_err(WorkflowWaitError::Predicate)?
-            {
-                self.clear_wait()?;
-                return Ok(WaitOutcome::Satisfied);
-            }
+            let mut signal = None;
             let deadline = deadline_delay(intent.deadline_millis)?;
             tokio::select! {
                 control = self.control.changed() => {
@@ -255,24 +261,40 @@ impl WorkflowContext {
                     self.clear_wait()?;
                     return Ok(WaitOutcome::Deadline);
                 }
+                _ = tokio::time::sleep_until(poll_deadline) => {
+                    poll_deadline = tokio::time::Instant::now() + poll_interval;
+                    signal = Some(WaitSignal::Poll);
+                }
                 revision = revisions.next() => {
                     revision?;
+                    signal = Some(WaitSignal::StateRevision);
                 }
                 event = events.next() => {
                     match event {
                         Ok(event) => {
+                            let relevant = wait_event_matches(&intent, &event);
                             intent.cursor = Some(event.id.to_string());
                             self.persist_wait(&intent)?;
+                            if relevant {
+                                signal = Some(WaitSignal::Event);
+                            }
                         }
                         Err(replicant_client::Error::Transport { message, .. })
                             if message.contains("lagged") => {
-                            // A bounded local watcher can lag. Durable history and
-                            // state verification below recover without trusting it.
                             self.recover_history(&client, &mut intent).await?;
+                            signal = Some(WaitSignal::WatcherGap);
                         }
                         Err(error) => return Err(error.into()),
                     }
                 }
+            }
+            if let Some(signal) = signal
+                && predicate(&client, signal)
+                    .await
+                    .map_err(WorkflowWaitError::Predicate)?
+            {
+                self.clear_wait()?;
+                return Ok(WaitOutcome::Satisfied);
             }
         }
     }
@@ -297,7 +319,7 @@ impl WorkflowContext {
             intent.cursor = Some(event.id.to_string());
             self.persist_wait(intent)?;
         }
-        Ok(!events.is_empty())
+        Ok(events.iter().any(|event| wait_event_matches(intent, event)))
     }
 
     fn persist_wait(&mut self, intent: &WaitIntent) -> Result<(), RepositoryError> {
@@ -874,6 +896,27 @@ fn resource_kind(resource: &ResourceKey) -> &'static str {
         ResourceKey::Autofactory(_) => "autofactory",
         ResourceKey::Namespaced { .. } => "namespaced",
     }
+}
+
+fn wait_event_matches(intent: &WaitIntent, event: &replicant_client::domain::Event) -> bool {
+    intent
+        .event_name
+        .as_deref()
+        .is_none_or(|name| event.name.as_str() == name)
+        && if let Some(device) = intent.device_code.as_deref() {
+            event
+                .device
+                .as_ref()
+                .is_some_and(|event_device| event_device.id.as_str() == device)
+        } else {
+            intent.device_codes.is_empty()
+                || event.device.as_ref().is_some_and(|event_device| {
+                    intent
+                        .device_codes
+                        .iter()
+                        .any(|device| event_device.id.as_str() == device)
+                })
+        }
 }
 
 fn telemetry_now_millis() -> i64 {

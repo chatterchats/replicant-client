@@ -335,10 +335,16 @@ pub struct WaitIntent {
     pub event_name: Option<String>,
     /// Optional device code narrowing event evidence.
     pub device_code: Option<String>,
+    /// Optional device codes narrowing event evidence to any listed device.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_codes: Vec<String>,
     /// Durable managed event cursor from which recovery should continue.
     pub cursor: Option<String>,
     /// Optional absolute Unix deadline in milliseconds.
     pub deadline_millis: Option<i64>,
+    /// Milliseconds between authoritative poll fallbacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_millis: Option<u64>,
 }
 
 impl WaitIntent {
@@ -349,8 +355,10 @@ impl WaitIntent {
             description: description.into(),
             event_name: None,
             device_code: None,
+            device_codes: Vec::new(),
             cursor: None,
             deadline_millis: None,
+            poll_interval_millis: None,
         }
     }
 
@@ -365,6 +373,15 @@ impl WaitIntent {
     #[must_use]
     pub fn for_device(mut self, device_code: impl Into<String>) -> Self {
         self.device_code = Some(device_code.into());
+        self.device_codes.clear();
+        self
+    }
+
+    /// Narrows event evidence to any of the listed device codes.
+    #[must_use]
+    pub fn for_devices(mut self, device_codes: impl IntoIterator<Item = String>) -> Self {
+        self.device_code = None;
+        self.device_codes = device_codes.into_iter().collect();
         self
     }
 
@@ -374,6 +391,34 @@ impl WaitIntent {
         self.deadline_millis = Some(deadline_millis);
         self
     }
+
+    /// Sets the authoritative poll fallback interval.
+    #[must_use]
+    pub fn polling_every(mut self, interval: std::time::Duration) -> Self {
+        self.poll_interval_millis = Some(
+            u64::try_from(interval.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+        );
+        self
+    }
+}
+
+/// Evidence that caused a durable wait predicate to be rechecked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitSignal {
+    /// The wait was just entered or resumed.
+    Initial,
+    /// Relevant durable history was recovered after the persisted cursor.
+    History,
+    /// A matching managed event arrived.
+    Event,
+    /// Managed state published a revision.
+    StateRevision,
+    /// The authoritative poll fallback became due.
+    Poll,
+    /// The bounded event watcher lagged and durable history was recovered.
+    WatcherGap,
 }
 
 /// Result of a cooperative workflow wait.
@@ -654,5 +699,22 @@ impl fmt::Debug for WorkflowInstance {
             .field("parent_id", &self.parent_id)
             .field("revision", &self.revision)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WaitIntent;
+
+    #[test]
+    fn old_wait_intent_json_remains_compatible() {
+        let wait: WaitIntent = serde_json::from_str(
+            r#"{"description":"ready","event_name":null,"device_code":"D1","cursor":"1-0","deadline_millis":null}"#,
+        )
+        .expect("deserialize old wait intent");
+
+        assert_eq!(wait.device_code.as_deref(), Some("D1"));
+        assert!(wait.device_codes.is_empty());
+        assert_eq!(wait.poll_interval_millis, None);
     }
 }
