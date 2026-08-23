@@ -89,6 +89,26 @@ describe("descriptor workflow form", () => {
       replicant: "Required",
     });
   });
+
+  it("offers all devices when detach has no target", () => {
+    const target = {
+      ...parameter("target", { type: "device" } as const),
+      required: false,
+    };
+    const html = renderToStaticMarkup(
+      <ParameterField
+        parameter={target}
+        value=""
+        entities={{ "device:D-1": { device_type: "carrier" } }}
+        operationKind="device.detach"
+        onChange={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("<select");
+    expect(html).toContain("All devices");
+    expect(html).toContain("D-1");
+  });
 });
 
 describe("workflow lifecycle requests", () => {

@@ -434,7 +434,7 @@ impl OperationCatalogue {
                 .await
             }
             "device.detach" => {
-                let input: DeviceTargetAction = decode(parameters)?;
+                let input: DeviceDetachAction = decode(parameters)?;
                 let handle = client
                     .devices()
                     .get(&input.device)
@@ -444,7 +444,7 @@ impl OperationCatalogue {
                     handle
                         .command(raw::devices::DeviceCommand::Detach(
                             raw::devices::TargetsCommand {
-                                target: Some(input.target),
+                                target: input.target.filter(|target| !target.trim().is_empty()),
                                 ..raw::devices::TargetsCommand::default()
                             },
                         ))
@@ -1597,7 +1597,7 @@ fn descriptors() -> DescriptorCatalog {
                 vec![EntityKind::Device],
                 vec![
                     required("device", "Host device", ParameterKind::Device),
-                    required("target", "Device to detach", ParameterKind::Device),
+                    optional("target", "Device to detach", ParameterKind::Device),
                 ],
             ),
             simple_action(
@@ -2752,6 +2752,12 @@ struct DeviceTargetAction {
     target: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceDetachAction {
+    device: String,
+    #[serde(default)]
+    target: Option<String>,
+}
+#[derive(Debug, Deserialize)]
 struct AutofactoryPrintAction {
     device: String,
     device_type: String,
@@ -3267,6 +3273,40 @@ mod tests {
                 .parameters
                 .iter()
                 .any(|parameter| parameter.name == "destination" && !parameter.required)
+        );
+    }
+
+    #[test]
+    fn detach_without_a_target_serializes_no_command_arguments() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let parameters =
+            BTreeMap::from([("device".to_owned(), Value::String("HOST-1".to_owned()))]);
+        catalogue
+            .validate_invocation(OperationClass::Action, "device.detach", parameters.clone())
+            .expect("targetless detach should validate");
+        let input: DeviceDetachAction = decode(parameters).expect("detach input");
+        assert_eq!(input.target, None);
+        assert_eq!(
+            serde_json::to_value(raw::devices::DeviceCommand::Detach(
+                raw::devices::TargetsCommand {
+                    target: input.target,
+                    ..raw::devices::TargetsCommand::default()
+                },
+            ))
+            .expect("detach command"),
+            serde_json::json!({ "command": "detach" })
+        );
+        let descriptor = catalogue
+            .descriptors()
+            .actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "device.detach")
+            .expect("detach descriptor");
+        assert!(
+            descriptor
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "target" && !parameter.required)
         );
     }
 

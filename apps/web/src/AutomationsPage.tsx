@@ -293,9 +293,12 @@ export function ParameterField({
   }
   const numeric =
     parameter.kind.type === "integer" || parameter.kind.type === "number";
+  const allowsAllDevices =
+    operationKind === "device.detach" && parameter.name === "target";
   const restrictedDevice =
     parameter.kind.type === "device" &&
-    ((operationKind === "replicant.teleport" && parameter.name === "target") ||
+    (allowsAllDevices ||
+      (operationKind === "replicant.teleport" && parameter.name === "target") ||
       (operationKind === "clone.replicate" &&
         (parameter.name === "target" || parameter.name === "source")) ||
       (operationKind === "clone.stow_target" && parameter.name === "matrix") ||
@@ -317,13 +320,19 @@ export function ParameterField({
           id={id}
           name={parameter.name}
           required={parameter.required}
-          disabled={options.length === 0}
+          disabled={options.length === 0 && !allowsAllDevices}
           value={stringValue(value)}
           onChange={(event) => {
             onChange(event.target.value);
           }}
         >
-          <option value="">{options.length > 0 ? "Select…" : emptyHint}</option>
+          <option value="">
+            {allowsAllDevices
+              ? "All devices"
+              : options.length > 0
+                ? "Select…"
+                : emptyHint}
+          </option>
           {options.map((option) => (
             <option key={option.value} value={option.value}>
               {option.label}
@@ -331,7 +340,7 @@ export function ParameterField({
           ))}
         </select>
         <small className={error ? "field-error" : ""}>
-          {options.length === 0 ? emptyHint : help}
+          {options.length === 0 && !allowsAllDevices ? emptyHint : help}
         </small>
       </label>
     );
