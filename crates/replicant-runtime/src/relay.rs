@@ -3268,9 +3268,28 @@ async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyR
         .filter(|stop| stop_uses_vessel_stow(stop) && !stop.completed)
         .filter_map(|stop| stop.relay_code.as_deref())
         .collect::<BTreeSet<_>>();
-    for code in mission_codes {
-        // Mission relay stow state is maintained by the event projection.
-        let snapshot = projected_device(client, code).await?.snapshot().await?;
+    let handles = if mission_codes
+        .iter()
+        .all(|code| client.devices().cached(code).is_some())
+    {
+        mission_codes
+            .iter()
+            .filter_map(|code| client.devices().cached(code))
+            .collect()
+    } else {
+        client
+            .devices()
+            .refresh_many()
+            .with_tag(relay_system_mission_tag(&plan.start_system))
+            .page_size(50)
+            .collect()
+            .await?
+    };
+    for handle in handles {
+        if !mission_codes.contains(handle.id().as_str()) {
+            continue;
+        }
+        let snapshot = handle.snapshot().await?;
         if snapshot
             .relationships
             .stowed_in
@@ -5127,6 +5146,26 @@ async fn transfer_trip_relays(
     Ok(())
 }
 
+async fn prepare_relay_stow(
+    client: &Client,
+    config: &Config,
+    code: &str,
+) -> AnyResult<DeviceHandle> {
+    let handle = projected_device(client, code).await?;
+    let mut snapshot = handle.snapshot().await?;
+    if !device_has_command(&snapshot, "stow") {
+        ensure_relay_attachable(client, config, code).await?;
+        snapshot = handle.refresh().await?.snapshot().await?;
+    }
+    if !device_has_command(&snapshot, "stow") {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("relay {code} does not currently advertise stow"),
+        ));
+    }
+    Ok(handle)
+}
+
 async fn stow_trip_relays(
     client: &Client,
     config: &Config,
@@ -5211,19 +5250,7 @@ async fn stow_trip_relays(
     }
 
     for code in to_stow {
-        // The stow preparation pass already populated this relay projection.
-        let handle = projected_device(client, &code).await?;
-        let snapshot = handle.snapshot().await?;
-        if !device_has_command(&snapshot, "stow") {
-            ensure_relay_attachable(client, config, &code).await?;
-        }
-        let refreshed = handle.refresh().await?.snapshot().await?;
-        if !device_has_command(&refreshed, "stow") {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!("relay {code} does not currently advertise stow"),
-            ));
-        }
+        let handle = prepare_relay_stow(client, config, &code).await?;
         let operation = handle.stow(Some(plan.vessel_code.clone())).await?;
         ensure_operation_accepted(&operation).await?;
         wait_for_device(client, config, &code, |device| {
@@ -5609,7 +5636,7 @@ async fn wait_for_parent_connection(
     // another already-reachable relay-capable system. Either proves the new
     // relay has joined the expanding mesh.
     loop {
-        // `/network` stays authoritative; only its projection-backed handle is cached.
+        // Each pass performs one authoritative `/network` read; the handle is cached.
         let network = projected_device(client, relay_code)
             .await?
             .network()
@@ -6465,6 +6492,25 @@ mod tests {
             .expect("start test client")
     }
 
+    fn test_config() -> Config {
+        Config {
+            command: Command::Run,
+            database: PathBuf::new(),
+            replicant: "REP-1".to_owned(),
+            hub: "ROOT-1-L4".to_owned(),
+            plan_path: PathBuf::new(),
+            max_hop_ly: DEFAULT_MAX_HOP_LY,
+            replace_plan: false,
+            reuse_account_relays: false,
+            ignore_printers: BTreeSet::new(),
+            supply_strategy: RequestedSupplyStrategy::Auto,
+            wait_timeout: Duration::from_secs(1),
+            targets: vec!["TARGET".to_owned()],
+            verbose: false,
+            log_file: None,
+        }
+    }
+
     async fn seed_relay_device(
         server: &MockServer,
         client: &Client,
@@ -6503,6 +6549,129 @@ mod tests {
             1,
             "cached access must not issue a second GET"
         );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn transport_capacity_bulk_refreshes_missing_relay_projections_once() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/VESSEL-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "VESSEL-1",
+                "device_type": "ftl_transport",
+                "location": "ROOT-1-L4",
+                "status": "active",
+                "stow_capacity": 2,
+                "stow_used": 0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client.devices().get("VESSEL-1").await.expect("seed vessel");
+
+        let mission_tag = relay_system_mission_tag("ROOT");
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [
+                    {"device_code": "RELAY-1", "device_type": FTL_RELAY, "tags": [mission_tag], "stowed_in_device_code": "VESSEL-1"},
+                    {"device_code": "RELAY-2", "device_type": FTL_RELAY, "tags": [mission_tag]},
+                    {"device_code": "RELAY-3", "device_type": FTL_RELAY, "tags": [mission_tag]}
+                ],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut plan = execution_state();
+        plan.stops[0].relay_code = Some("RELAY-1".to_owned());
+        for (system, code) in [("TARGET-2", "RELAY-2"), ("TARGET-3", "RELAY-3")] {
+            let mut stop = plan.stops[0].clone();
+            stop.system = system.to_owned();
+            stop.relay_code = Some(code.to_owned());
+            plan.stops.push(stop);
+        }
+
+        assert_eq!(
+            current_transport_capacity(&client, &plan)
+                .await
+                .expect("transport capacity"),
+            3
+        );
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/v1/devices")
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| { !request.url.path().starts_with("/v1/devices/RELAY-") })
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn parent_connection_pass_only_reads_network_for_cached_relay() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        seed_relay_device(&server, &client, "RELAY-1", FTL_RELAY, &["relay"]).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY-1/network"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "connections": [{"star": "ROOT"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wait_for_parent_connection(&client, &test_config(), &execution_state(), 0, "RELAY-1")
+            .await
+            .expect("connected relay");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/v1/devices/RELAY-1")
+                .count(),
+            1,
+            "the wait must reuse the seeded handle"
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn advertised_stow_command_avoids_redundant_device_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "RELAY-1",
+                "device_type": FTL_RELAY,
+                "location": "ROOT-1-L4",
+                "status": "active",
+                "available_commands": ["stow"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        client.devices().get("RELAY-1").await.expect("seed relay");
+
+        prepare_relay_stow(&client, &test_config(), "RELAY-1")
+            .await
+            .expect("stow-ready relay");
+
         server.verify().await;
         client.close().await.expect("close client");
     }
