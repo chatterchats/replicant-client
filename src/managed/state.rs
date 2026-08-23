@@ -11,9 +11,9 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::domain::{
-    Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location, LocationKey,
-    MergeOutcome, Observation, Realm, Replicant, ReplicantKey, Simulation, SimulationId, Star,
-    StarKey, StarKnowledge, merge_device, merge_star,
+    AccessScope, Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location,
+    LocationKey, MergeOutcome, Observation, Realm, Replicant, ReplicantKey, Simulation,
+    SimulationId, Star, StarKey, StarKnowledge, merge_device, merge_star,
 };
 
 use super::store::{OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle};
@@ -39,6 +39,34 @@ impl StateGateway {
     pub fn galaxy_revision(&self) -> crate::Result<u64> {
         self.client.ensure_open()?;
         Ok(self.client.managed_state().snapshot().galaxy_revision())
+    }
+
+    /// Returns current durable owned-device projections without network I/O.
+    pub fn owned_devices(&self) -> crate::Result<Vec<Device>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_state()
+            .snapshot()
+            .devices
+            .values()
+            .filter(|observation| observation.value.access == AccessScope::Owned)
+            .map(|observation| observation.value.clone())
+            .collect())
+    }
+
+    /// Returns current durable owned-Replicant projections without network I/O.
+    pub fn owned_replicants(&self) -> crate::Result<Vec<Replicant>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .client
+            .managed_state()
+            .snapshot()
+            .replicants
+            .values()
+            .filter(|observation| observation.value.access == AccessScope::Owned)
+            .map(|observation| observation.value.clone())
+            .collect())
     }
 
     /// Returns current durable inventory projections without network I/O.

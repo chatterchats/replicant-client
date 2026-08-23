@@ -30,7 +30,7 @@ use replicant_transport::ResourceMap;
 use replicant_workflow::{
     ResourceKey, WorkflowId, WorkflowInstance, WorkflowRepository, WorkflowStatus,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -229,8 +229,23 @@ struct BlueprintCatalogueCache {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct HubRefreshCache {
-    #[serde(default)]
-    refreshed_at_ms: BTreeMap<String, i64>,
+    #[serde(default, deserialize_with = "deserialize_hub_refresh_time")]
+    refreshed_at_ms: i64,
+}
+
+fn deserialize_hub_refresh_time<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("hub refresh timestamp must be an integer")),
+        Value::Object(_) => Ok(0),
+        _ => Err(serde::de::Error::custom(
+            "hub refresh timestamp must be an integer or legacy device map",
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -439,6 +454,88 @@ fn apply_durable_snapshot_overrides(
     Ok(())
 }
 
+async fn refresh_system_hubs(
+    client: &Client,
+    repository: &WorkflowRepository,
+    devices: &mut Vec<Device>,
+    now: i64,
+    force: bool,
+) -> Result<BTreeMap<String, String>, ApplicationError> {
+    let mut errors = BTreeMap::new();
+    let mut expected = devices
+        .iter()
+        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
+        .map(|device| device.key.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    if expected.is_empty() {
+        return Ok(errors);
+    }
+
+    let cache = repository
+        .read_document(HUB_REFRESH_CACHE_NS, HUB_REFRESH_CACHE_KEY)?
+        .map(|(value, _)| serde_json::from_value::<HubRefreshCache>(value))
+        .transpose()?
+        .unwrap_or_default();
+    let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+    if !force && cache.refreshed_at_ms > 0 && age_ms <= HUB_REFRESH_CACHE_TTL_MS {
+        tracing::debug!(
+            age_ms,
+            ttl_ms = HUB_REFRESH_CACHE_TTL_MS,
+            phase = "devices",
+            "Director reused SSE-backed System Hub state"
+        );
+        return Ok(errors);
+    }
+
+    match client
+        .devices()
+        .refresh_many()
+        .of_type(DeviceType::SystemHub)
+        .page_size(50)
+        .collect()
+        .await
+    {
+        Ok(handles) => {
+            for handle in handles {
+                let code = handle.id().as_str().to_owned();
+                expected.remove(&code);
+                match handle.snapshot().await {
+                    Ok(refreshed) => {
+                        if let Some(device) = devices
+                            .iter_mut()
+                            .find(|device| device.key.id.as_str() == code)
+                        {
+                            *device = refreshed;
+                        } else {
+                            devices.push(refreshed);
+                        }
+                    }
+                    Err(error) => {
+                        errors.insert(code, error.to_string());
+                    }
+                }
+            }
+            for code in expected {
+                errors.insert(code, "missing from bulk System Hub refresh".to_owned());
+            }
+            if errors.is_empty() {
+                repository.put_document(
+                    HUB_REFRESH_CACHE_NS,
+                    HUB_REFRESH_CACHE_KEY,
+                    &HubRefreshCache {
+                        refreshed_at_ms: now,
+                    },
+                )?;
+            }
+        }
+        Err(error) => {
+            let error = error.to_string();
+            errors.extend(expected.into_iter().map(|code| (code, error.clone())));
+        }
+    }
+    Ok(errors)
+}
+
 /// Evaluates all standing goals and, in automatic mode, creates the batch work
 /// required to move them forward.
 pub async fn reconcile_director(
@@ -469,75 +566,15 @@ pub async fn reconcile_director(
         "Director managed world phase complete"
     );
     tracing::debug!(phase = "devices", "Director loading managed world state");
-    let device_handles = client.devices().find().owned().collect().await?;
-    let mut devices = Vec::with_capacity(device_handles.len());
-    for handle in device_handles {
-        devices.push(handle.snapshot().await?);
-    }
+    let mut devices = client.state().owned_devices()?;
     tracing::debug!(
         phase = "devices",
         count = devices.len(),
         elapsed_ms = started.elapsed().as_millis(),
         "Director managed world phase complete"
     );
-    let mut hub_refresh_errors = BTreeMap::new();
-    let mut hub_refresh_cache = repository
-        .read_document(HUB_REFRESH_CACHE_NS, HUB_REFRESH_CACHE_KEY)?
-        .map(|(value, _)| serde_json::from_value::<HubRefreshCache>(value))
-        .transpose()?
-        .unwrap_or_default();
-    let mut hub_refresh_cache_changed = false;
-    let hub_codes = devices
-        .iter()
-        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::SystemHub))
-        .map(|device| device.key.id.as_str().to_owned())
-        .collect::<Vec<_>>();
-    for code in hub_codes {
-        let age_ms = hub_refresh_cache
-            .refreshed_at_ms
-            .get(&code)
-            .map(|refreshed_at| now.saturating_sub(*refreshed_at));
-        if !force_slow_refresh
-            && let Some(age_ms) = age_ms
-            && age_ms <= HUB_REFRESH_CACHE_TTL_MS
-        {
-            tracing::debug!(
-                device = %code,
-                age_ms,
-                ttl_ms = HUB_REFRESH_CACHE_TTL_MS,
-                phase = "devices",
-                "Director reused SSE-backed System Hub state"
-            );
-            continue;
-        }
-        match client.devices().refresh(&code).await {
-            Ok(handle) => match handle.snapshot().await {
-                Ok(refreshed) => {
-                    if let Some(device) = devices
-                        .iter_mut()
-                        .find(|device| device.key.id.as_str() == code.as_str())
-                    {
-                        *device = refreshed;
-                    }
-                    hub_refresh_cache.refreshed_at_ms.insert(code.clone(), now);
-                    hub_refresh_cache_changed = true;
-                }
-                Err(error) => {
-                    hub_refresh_errors.insert(code, error.to_string());
-                }
-            },
-            Err(error) => {
-                hub_refresh_errors.insert(code, error.to_string());
-            }
-        }
-    }
-    if hub_refresh_cache_changed {
-        repository.put_document(
-            HUB_REFRESH_CACHE_NS,
-            HUB_REFRESH_CACHE_KEY,
-            &hub_refresh_cache,
-        )?;
-    }
+    let hub_refresh_errors =
+        refresh_system_hubs(client, &repository, &mut devices, now, force_slow_refresh).await?;
     let inventories = client.state().inventories()?;
     tracing::debug!(
         phase = "inventory",
@@ -546,11 +583,7 @@ pub async fn reconcile_director(
         "Director loaded durable managed inventory projections"
     );
     tracing::debug!(phase = "replicants", "Director loading managed world state");
-    let replicant_handles = client.replicants().find().owned().collect().await?;
-    let mut replicants = Vec::with_capacity(replicant_handles.len());
-    for handle in replicant_handles {
-        replicants.push(handle.snapshot().await?);
-    }
+    let replicants = client.state().owned_replicants()?;
     tracing::debug!(
         phase = "replicants",
         count = replicants.len(),
@@ -4618,7 +4651,24 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+
     use super::*;
+
+    async fn test_client_at(server: &MockServer) -> Client {
+        Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client")
+    }
 
     fn test_worker(code: &str, region: &str, location: &str) -> WorkerView {
         WorkerView {
@@ -4662,6 +4712,127 @@ mod tests {
             travel: None,
             access: replicant_client::domain::AccessScope::Owned,
         }
+    }
+
+    fn test_hubs(count: usize) -> Vec<Device> {
+        (0..count)
+            .map(|index| {
+                let mut hub = test_hub_device();
+                hub.key = replicant_client::DeviceKey::live(format!("HUB-{index}").into());
+                hub
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_per_device_hub_refresh_cache_requires_one_bulk_sweep() {
+        let cache = serde_json::from_value::<HubRefreshCache>(serde_json::json!({
+            "refreshed_at_ms": {"HUB-0": 123, "HUB-1": 456}
+        }))
+        .expect("deserialize legacy cache");
+
+        assert_eq!(cache.refreshed_at_ms, 0);
+    }
+
+    fn hub_collection(count: usize) -> ResponseTemplate {
+        let devices = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "device_code": format!("HUB-{index}"),
+                    "device_type": "system_hub",
+                    "status": "active",
+                    "location": "SCEPTURUM-7-L4"
+                })
+            })
+            .collect::<Vec<_>>();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": devices,
+            "next_cursor": null
+        }))
+    }
+
+    #[tokio::test]
+    async fn system_hubs_refresh_in_one_page_instead_of_one_request_each() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .and(query_param("device_type", "system_hub"))
+            .and(query_param("limit", "50"))
+            .respond_with(hub_collection(20))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let mut devices = test_hubs(20);
+
+        let errors = refresh_system_hubs(&client, &repository, &mut devices, 1_000_000, false)
+            .await
+            .expect("refresh hubs");
+
+        assert!(errors.is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn system_hub_refresh_cache_suppresses_sweeps_unless_forced() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(hub_collection(1))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let mut devices = test_hubs(1);
+        let now = 1_000_000;
+
+        refresh_system_hubs(&client, &repository, &mut devices, now, false)
+            .await
+            .expect("initial refresh");
+        refresh_system_hubs(
+            &client,
+            &repository,
+            &mut devices,
+            now + HUB_REFRESH_CACHE_TTL_MS,
+            false,
+        )
+        .await
+        .expect("cached refresh");
+        refresh_system_hubs(
+            &client,
+            &repository,
+            &mut devices,
+            now + HUB_REFRESH_CACHE_TTL_MS,
+            true,
+        )
+        .await
+        .expect("forced refresh");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn bulk_hub_refresh_failures_are_reported_for_each_device() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let mut devices = test_hubs(3);
+
+        let errors = refresh_system_hubs(&client, &repository, &mut devices, 1_000_000, false)
+            .await
+            .expect("report bulk failure");
+
+        assert_eq!(errors.len(), 3);
+        assert!((0..3).all(|index| errors.contains_key(&format!("HUB-{index}"))));
+        server.verify().await;
     }
 
     #[test]
