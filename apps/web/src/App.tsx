@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { useEffect, useMemo, useReducer, useState } from "react";
 
 import {
@@ -178,6 +179,14 @@ function isDeviceSummary(value: unknown): value is DeviceSummary {
     asRecord(record?.entity)?.kind === "device" &&
     typeof record?.ownership === "string"
   );
+}
+
+export function relatedDeviceLabel(
+  code: string,
+  entities: Record<string, EntitySummary>,
+) {
+  const related = entities[`device:${code}`];
+  return related?.entity_type ? `${related.entity_type} (${code})` : code;
 }
 
 function isWorkflowSummary(value: unknown): value is WorkflowSummary {
@@ -443,10 +452,6 @@ function Inspector({
     };
   }, [entity.id, entity.kind]);
 
-  const relatedDevice = (code: string) => {
-    const related = entities[`device:${code}`];
-    return related ? `${related.label} (${code})` : code;
-  };
   const systemResources =
     entity.kind === "system"
       ? aggregateInventory(inventory, (row) => row.system === entity.id)
@@ -525,9 +530,9 @@ function Inspector({
                 <dt>Relationship</dt>
                 <dd>
                   {device.attached_to
-                    ? `Attached to ${device.attached_to}`
+                    ? `Attached to ${relatedDeviceLabel(device.attached_to, entities)}`
                     : device.stowed_in
-                      ? `Stowed in ${device.stowed_in}`
+                      ? `Stowed in ${relatedDeviceLabel(device.stowed_in, entities)}`
                       : `Controlled by ${device.controller ?? "—"}`}
                 </dd>
               </>
@@ -537,7 +542,7 @@ function Inspector({
                 <dt>Controlled devices</dt>
                 <dd>
                   {device.controlled_devices.map((code) => (
-                    <div key={code}>{relatedDevice(code)}</div>
+                    <div key={code}>{relatedDeviceLabel(code, entities)}</div>
                   ))}
                 </dd>
               </>
@@ -547,7 +552,7 @@ function Inspector({
                 <dt>Attached devices</dt>
                 <dd>
                   {device.attached_devices.map((code) => (
-                    <div key={code}>{relatedDevice(code)}</div>
+                    <div key={code}>{relatedDeviceLabel(code, entities)}</div>
                   ))}
                 </dd>
               </>
@@ -557,7 +562,7 @@ function Inspector({
                 <dt>Stowed devices</dt>
                 <dd>
                   {device.stowed_devices.map((code) => (
-                    <div key={code}>{relatedDevice(code)}</div>
+                    <div key={code}>{relatedDeviceLabel(code, entities)}</div>
                   ))}
                 </dd>
               </>

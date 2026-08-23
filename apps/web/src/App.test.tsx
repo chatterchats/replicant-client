@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App } from "./App";
+import { App, relatedDeviceLabel } from "./App";
 import { DaemonProvider } from "./daemon";
 import type {
   AccountEventsSnapshot,
@@ -18,6 +18,7 @@ import type {
   DevicesSnapshot,
   DirectorSnapshot,
   DirectorySnapshot,
+  EntitySummary,
   EntityIndexSnapshot,
   EventsSnapshot,
   GalaxySceneSnapshot,
@@ -382,5 +383,26 @@ describe("App navigation", () => {
       ).toBeTruthy();
       expect(container.textContent).not.toContain(placeholderLede);
     }
+  });
+});
+
+describe("device inspector labels", () => {
+  it("shows related device types with their codes", () => {
+    const related = {
+      "device:CHILD-1": {
+        entity: { kind: "device", id: "CHILD-1" },
+        label: "CHILD-1",
+        secondary_label: "survey_drone",
+        system: "SOL",
+        location: "SOL-1",
+        entity_type: "survey_drone",
+        status: "active",
+      },
+    } satisfies Record<string, EntitySummary>;
+
+    expect(relatedDeviceLabel("CHILD-1", related)).toBe(
+      "survey_drone (CHILD-1)",
+    );
+    expect(relatedDeviceLabel("UNKNOWN", related)).toBe("UNKNOWN");
   });
 });
