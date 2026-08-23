@@ -45,6 +45,7 @@ use crate::{
         execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
         reconcile_event_stock, restore_event_campaign,
     },
+    failure::{FailureClass, failure_class, failure_class_from_message},
     mining::{MiningExpansionRequest, execute_expansion},
     observatory::auto_prospect,
     relay::{
@@ -390,6 +391,8 @@ pub struct LogisticsWorkflowCheckpoint {
     pub plan: Option<DeliveryPlan>,
     /// Whether execution entered the reusable transport executor.
     pub started: bool,
+    #[serde(default)]
+    failure_class: Option<FailureClass>,
 }
 
 /// Intent for a fully provisioned buyer-side trade run.
@@ -574,6 +577,8 @@ pub struct ExplorationWorkflowCheckpoint {
     pub hub: Option<String>,
     /// Last authoritative relay executor state.
     pub state: Option<RelayExecutionState>,
+    #[serde(default)]
+    failure_class: Option<FailureClass>,
 }
 
 /// Goal-level event input shared by delivery and tour workflows.
@@ -1308,9 +1313,16 @@ impl WorkflowExecutor for LogisticsWorkflow {
                 return_transports: intent.return_transports,
                 ..DeliveryOptions::default()
             };
-            let report = execute_delivery(&client, &plan, options)
-                .await
-                .map_err(string_error)?;
+            let report = match execute_delivery(&client, &plan, options).await {
+                Ok(report) => report,
+                Err(error) => {
+                    checkpoint.failure_class = logistics_failure_class(&error);
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    return Err(string_error(error));
+                }
+            };
             context.mark_succeeded(Some(report)).map_err(string_error)
         })
     }
@@ -1442,26 +1454,34 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                 return_transports: intent.return_transports,
                 ..DeliveryOptions::default()
             };
-            let report = execute_delivery(&client, &plan, options)
-                .await
-                .map_err(string_error)?;
+            let report = match execute_delivery(&client, &plan, options).await {
+                Ok(report) => report,
+                Err(error) => {
+                    checkpoint.failure_class = logistics_failure_class(&error);
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                    return Err(string_error(error));
+                }
+            };
             context.mark_succeeded(Some(report)).map_err(string_error)
         })
     }
 }
 
 fn retryable_manifest_planning_failure(error: &TransportError) -> bool {
-    match error {
-        // Missing stock, carriers, or payloads are mutable world-state blockers,
-        // not terminal workflow defects. Director manifests should wait for the
-        // hub/projection to change and then select a fresh plan.
-        TransportError::NotFound(_) => true,
-        TransportError::Invalid(message) => {
-            message.contains("not a free inactive payload")
-                || message.contains("reserved by another workflow")
-        }
-        _ => false,
-    }
+    matches!(
+        error,
+        TransportError::NotFound(_) | TransportError::PayloadUnavailable(_)
+    )
+}
+
+fn logistics_failure_class(error: &TransportError) -> Option<FailureClass> {
+    matches!(
+        error,
+        TransportError::StaleResourcePickup(_) | TransportError::PayloadUnavailable(_)
+    )
+    .then_some(FailureClass::LogisticsStateStale)
 }
 
 struct TradeFulfillmentWorkflow;
@@ -2268,9 +2288,9 @@ impl WorkflowExecutor for ExplorationWorkflow {
             };
             let result = execute_relay_workflow(&client, &request, |state| {
                 let (replicant, devices, factories) = state.resources();
-                claim(context, ResourceKey::Replicant(replicant.to_owned()))?;
+                claim_relay_resource(context, ResourceKey::Replicant(replicant.to_owned()))?;
                 for device in devices {
-                    claim_device(context, device)?;
+                    claim_relay_resource(context, ResourceKey::Device(device.to_owned()))?;
                 }
                 let factories = factories
                     .into_iter()
@@ -2290,7 +2310,8 @@ impl WorkflowExecutor for ExplorationWorkflow {
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if stale_relay_plan_failure(&message) {
+                    let class = failure_class(error.as_ref());
+                    if stale_relay_plan_failure(error.as_ref()) {
                         release_exploration_autofactory_claims(context)?;
                         tracing::warn!(
                             workflow_id = %context.id(),
@@ -2304,7 +2325,7 @@ impl WorkflowExecutor for ExplorationWorkflow {
                             .advance_to("replanning_relay_coverage", &checkpoint)
                             .map_err(string_error)?;
                         context.mark_waiting().map_err(string_error)
-                    } else if resource_claim_contention(&message) {
+                    } else if resource_claim_contention(error.as_ref()) {
                         release_exploration_autofactory_claims(context)?;
                         tracing::warn!(
                             workflow_id = %context.id(),
@@ -2318,7 +2339,7 @@ impl WorkflowExecutor for ExplorationWorkflow {
                             .advance_to("awaiting_available_resources", &checkpoint)
                             .map_err(string_error)?;
                         context.mark_waiting().map_err(string_error)
-                    } else if retryable_connectivity_dependency_failure(&message) {
+                    } else if retryable_connectivity_dependency_failure(error.as_ref()) {
                         tracing::warn!(
                             workflow_id = %context.id(),
                             target = %intent.target,
@@ -2330,6 +2351,10 @@ impl WorkflowExecutor for ExplorationWorkflow {
                             .map_err(string_error)?;
                         context.mark_waiting().map_err(string_error)
                     } else {
+                        checkpoint.failure_class = class;
+                        context
+                            .persist_checkpoint(&checkpoint)
+                            .map_err(string_error)?;
                         Err(message)
                     }
                 }
@@ -2672,8 +2697,8 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                         Ok(state) => break state,
                         Err(error) => {
                             let message = error.to_string();
-                            if retryable_event_campaign_failure(&message) {
-                                if event_campaign_failure_requires_replan(&message) {
+                            if retryable_event_campaign_failure(error.as_ref()) {
+                                if event_campaign_failure_requires_replan(error.as_ref()) {
                                     checkpoint.archive = None;
                                     clear_scratch_file(&plan_file)?;
                                     context
@@ -2683,7 +2708,7 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                                     if let Ok(archive) = archive_event_campaign(&plan_file) {
                                         checkpoint.archive = Some(archive);
                                     }
-                                    let step = if event_campaign_failure_waits_for_inputs(&message)
+                                    let step = if event_campaign_failure_waits_for_inputs(error.as_ref())
                                     {
                                         "waiting_for_event_inputs"
                                     } else {
@@ -2727,28 +2752,24 @@ impl WorkflowExecutor for EventCampaignWorkflow {
     }
 }
 
-fn event_campaign_failure_waits_for_inputs(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("all currently feasible events completed, but blocked events remain")
+fn event_campaign_failure_waits_for_inputs(error: &(dyn std::error::Error + 'static)) -> bool {
+    failure_class(error) == Some(FailureClass::EventInputsUnavailable)
 }
 
-fn retryable_event_campaign_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    event_campaign_failure_waits_for_inputs(&message)
-        || message.contains("out of comms range")
-        || message.contains("out of control range")
-        || message.contains("not your device")
-        || message.contains("not present in the account-owned device projection")
-        || message.contains("unexpected http status 500")
-        || message.contains("internal server error")
-        || message.contains("client is closed")
+fn retryable_event_campaign_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        failure_class(error),
+        Some(
+            FailureClass::EventInputsUnavailable
+                | FailureClass::EventControlUnavailable
+                | FailureClass::EventAssetStale
+                | FailureClass::TransientUpstream
+        )
+    )
 }
 
-fn event_campaign_failure_requires_replan(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("not your device")
-        || message.contains("not present in the account-owned device projection")
+fn event_campaign_failure_requires_replan(error: &(dyn std::error::Error + 'static)) -> bool {
+    failure_class(error) == Some(FailureClass::EventAssetStale)
 }
 
 async fn ensure_event_campaign_connectivity(
@@ -2816,12 +2837,27 @@ pub(crate) async fn reconcile_event_connectivity(
                 completed_dependencies.insert(target.clone(), workflow_id);
             }
             WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let class = workflow
+                    .checkpoint::<ExplorationWorkflowCheckpoint>()
+                    .ok()
+                    .and_then(|checkpoint| checkpoint.failure_class)
+                    .or_else(|| {
+                        workflow
+                            .last_error
+                            .as_deref()
+                            .and_then(failure_class_from_message)
+                    });
                 let error = workflow
                     .last_error
                     .as_deref()
                     .unwrap_or("no error was recorded");
                 if workflow.status == WorkflowStatus::Failed
-                    && retryable_connectivity_dependency_failure(error)
+                    && matches!(
+                        class,
+                        Some(
+                            FailureClass::ConnectivityDependency | FailureClass::TransientUpstream
+                        )
+                    )
                 {
                     const CONNECTIVITY_RETRY_COOLDOWN_MS: i64 = 30 * 60 * 1_000;
                     let now = SystemTime::now()
@@ -2917,32 +2953,19 @@ pub(crate) async fn reconcile_event_connectivity(
     Ok(true)
 }
 
-fn stale_relay_plan_failure(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("planned account-owned relay coverage is no longer relaying")
+fn stale_relay_plan_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    failure_class(error) == Some(FailureClass::RelayPlanStale)
 }
 
-fn resource_claim_contention(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("resource is already claimed by workflow")
+fn resource_claim_contention(error: &(dyn std::error::Error + 'static)) -> bool {
+    failure_class(error) == Some(FailureClass::ResourceClaimContention)
 }
 
-fn retryable_connectivity_dependency_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("no relay network connects")
-        || message.contains("blueprint is not unlocked")
-        || message.contains("missing blueprint")
-        || message.contains("insufficient manufacturing inventory")
-        || message.contains("requires an idle attachment carrier")
-        || message.contains("no usable stow capacity")
-        || message.contains("not currently projected as stationary in a star system")
-        || message.contains("has no known l4 or l5 deployment location")
-        || message.contains("client is closed")
-        || message.contains("no eligible autofactory")
-        || message.contains("internal server error")
-        || message.contains("unexpected http status 500")
+fn retryable_connectivity_dependency_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        failure_class(error),
+        Some(FailureClass::ConnectivityDependency | FailureClass::TransientUpstream)
+    )
 }
 
 fn active_connectivity_workflow(
@@ -3515,6 +3538,16 @@ fn claim_device(context: &WorkflowContext, code: &str) -> Result<(), String> {
     claim(context, ResourceKey::Device(code.to_owned()))
 }
 
+fn claim_relay_resource(
+    context: &WorkflowContext,
+    key: ResourceKey,
+) -> crate::relay::AnyResult<()> {
+    context
+        .acquire_claim(key)
+        .map(|_| ())
+        .map_err(|error| Box::new(error) as crate::relay::AnyError)
+}
+
 fn claim_target(context: &WorkflowContext, namespace: &str, key: &str) -> Result<(), String> {
     claim(
         context,
@@ -3897,9 +3930,13 @@ async fn ensure_trade_payment_ready(
                     .map_err(string_error)?;
             }
             WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let class = child
+                    .checkpoint::<LogisticsWorkflowCheckpoint>()
+                    .ok()
+                    .and_then(|checkpoint| checkpoint.failure_class);
                 let error = child.last_error.unwrap_or_default();
                 if child.status == WorkflowStatus::Failed
-                    && retryable_trade_criteria_logistics_failure(&error)
+                    && retryable_trade_criteria_logistics_failure(class, &error)
                 {
                     checkpoint.payment_logistics_child = None;
                     checkpoint.outbound_plan = None;
@@ -5896,9 +5933,13 @@ async fn await_child_workflow(
         match child.status {
             WorkflowStatus::Succeeded => return Ok(true),
             WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                let class = child
+                    .checkpoint::<LogisticsWorkflowCheckpoint>()
+                    .ok()
+                    .and_then(|checkpoint| checkpoint.failure_class);
                 let error = child.last_error.unwrap_or_default();
                 if child.status == WorkflowStatus::Failed
-                    && retryable_trade_criteria_logistics_failure(&error)
+                    && retryable_trade_criteria_logistics_failure(class, &error)
                 {
                     checkpoint.criteria_logistics_child = None;
                     context
@@ -5932,15 +5973,12 @@ async fn await_child_workflow(
     }
 }
 
-fn retryable_trade_criteria_logistics_failure(error: &str) -> bool {
-    let stale_snapshot =
-        error.contains("planned resource pickup at ") && error.contains(" is stale: need ");
-    let insufficient_at_source = error.contains("Insufficient ")
-        && error.contains(" at location: need ")
-        && error.contains(", have ");
-    let stale_payload = error.contains("not a free inactive payload")
-        || error.contains("reserved by another workflow");
-    stale_snapshot || insufficient_at_source || stale_payload
+fn retryable_trade_criteria_logistics_failure(
+    class: Option<FailureClass>,
+    legacy_message: &str,
+) -> bool {
+    class.or_else(|| failure_class_from_message(legacy_message))
+        == Some(FailureClass::LogisticsStateStale)
 }
 
 async fn ensure_replicant_at_shop(
@@ -7186,10 +7224,9 @@ async fn resolve_exploration_home(
 fn reconcile_exploration_autofactory_claims(
     context: &WorkflowContext,
     required: &BTreeSet<String>,
-) -> Result<(), String> {
+) -> Result<(), RepositoryError> {
     let stale = context
-        .claims()
-        .map_err(string_error)?
+        .claims()?
         .into_iter()
         .filter_map(|claim| match claim.resource {
             ResourceKey::Autofactory(code) if !required.contains(&code) => {
@@ -7199,16 +7236,16 @@ fn reconcile_exploration_autofactory_claims(
         })
         .collect::<Vec<_>>();
     for resource in stale {
-        context.release_claim(&resource).map_err(string_error)?;
+        context.release_claim(&resource)?;
     }
     for code in required {
-        claim(context, ResourceKey::Autofactory(code.clone()))?;
+        context.acquire_claim(ResourceKey::Autofactory(code.clone()))?;
     }
     Ok(())
 }
 
 fn release_exploration_autofactory_claims(context: &WorkflowContext) -> Result<(), String> {
-    reconcile_exploration_autofactory_claims(context, &BTreeSet::new())
+    reconcile_exploration_autofactory_claims(context, &BTreeSet::new()).map_err(string_error)
 }
 
 fn release_legacy_exploration_location_claims(context: &WorkflowContext) -> Result<(), String> {
@@ -7531,6 +7568,8 @@ fn read_json(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use replicant_client::{SecretString, StartupPolicy, raw::Url};
     use replicant_workflow::WorkflowRepository;
     use wiremock::{
@@ -7539,6 +7578,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::failure::ClassifiedError;
 
     async fn test_client_at(server: &MockServer) -> Client {
         Client::builder()
@@ -7859,75 +7899,98 @@ mod tests {
 
     #[test]
     fn stale_trade_criteria_resource_failures_are_retryable() {
+        let stale = TransportError::StaleResourcePickup(
+            "operator wording can change without changing retry behavior".to_owned(),
+        );
+        let payload = TransportError::PayloadUnavailable("payload copy was reworded".to_owned());
         assert!(retryable_trade_criteria_logistics_failure(
+            logistics_failure_class(&stale),
+            ""
+        ));
+        assert!(retryable_trade_criteria_logistics_failure(
+            logistics_failure_class(&payload),
+            ""
+        ));
+        assert!(retryable_trade_criteria_logistics_failure(
+            None,
             "operation rejected: Insufficient structural at location: need 49.0, have 0"
         ));
-        assert!(retryable_trade_criteria_logistics_failure(
-            "planned resource pickup at SCEPTURUM-BELT-1 is stale: need 17 conductive, have 0"
-        ));
-        assert!(retryable_trade_criteria_logistics_failure(
-            "payload device DEVICE-1 is not a free inactive payload"
-        ));
         assert!(!retryable_trade_criteria_logistics_failure(
+            None,
             "transport CARRIER-1 has no usable cargo capacity"
         ));
     }
 
     #[test]
     fn event_campaign_runtime_failures_choose_waiting_or_replan() {
+        let control = ClassifiedError::new(
+            FailureClass::EventControlUnavailable,
+            io::ErrorKind::WouldBlock,
+            "completely reworded control failure",
+        );
+        let stale = ClassifiedError::new(
+            FailureClass::EventAssetStale,
+            io::ErrorKind::NotFound,
+            "completely reworded stale asset failure",
+        );
+        let blocked = ClassifiedError::new(
+            FailureClass::EventInputsUnavailable,
+            io::ErrorKind::Other,
+            "completely reworded input failure",
+        );
+        assert!(retryable_event_campaign_failure(&control));
+        assert!(!event_campaign_failure_requires_replan(&control));
+        assert!(retryable_event_campaign_failure(&stale));
+        assert!(event_campaign_failure_requires_replan(&stale));
+        assert!(retryable_event_campaign_failure(&blocked));
+        assert!(event_campaign_failure_waits_for_inputs(&blocked));
+        assert!(!event_campaign_failure_requires_replan(&blocked));
         assert!(retryable_event_campaign_failure(
-            "Device is out of comms range"
+            &replicant_client::Error::Closed
         ));
-        assert!(!event_campaign_failure_requires_replan(
-            "Device is out of comms range"
-        ));
-        assert!(retryable_event_campaign_failure("403 Not your device"));
-        assert!(event_campaign_failure_requires_replan(
-            "403 Not your device"
-        ));
-        assert!(event_campaign_failure_requires_replan(
-            "event asset D-1 is not present in the account-owned device projection; replan required"
-        ));
-        assert!(retryable_event_campaign_failure(
-            "unexpected HTTP status 500: Internal server error"
-        ));
-        assert!(!event_campaign_failure_requires_replan(
-            "unexpected HTTP status 500: Internal server error"
-        ));
-        assert!(retryable_event_campaign_failure("client is closed"));
-        assert!(!event_campaign_failure_requires_replan("client is closed"));
-        let blocked = "all currently feasible events completed, but blocked events remain; replenish resources";
-        assert!(retryable_event_campaign_failure(blocked));
-        assert!(event_campaign_failure_waits_for_inputs(blocked));
-        assert!(!event_campaign_failure_requires_replan(blocked));
-        assert!(!retryable_event_campaign_failure(
+        let legacy_upstream = io::Error::other("403 Not your device");
+        assert!(retryable_event_campaign_failure(&legacy_upstream));
+        assert!(event_campaign_failure_requires_replan(&legacy_upstream));
+        assert!(!retryable_event_campaign_failure(&io::Error::other(
             "event criterion is structurally invalid"
-        ));
+        )));
     }
 
     #[test]
     fn relay_connectivity_capacity_blockers_are_retryable_without_campaign_failure() {
+        let route = replicant_route_planner::PlannerError::Disconnected;
+        let local = ClassifiedError::new(
+            FailureClass::ConnectivityDependency,
+            io::ErrorKind::NotFound,
+            "completely reworded relay prerequisite",
+        );
+        assert!(retryable_connectivity_dependency_failure(&route));
+        assert!(retryable_connectivity_dependency_failure(&local));
         assert!(retryable_connectivity_dependency_failure(
-            "no relay network connects SCEPTURUM to ALIPHERATZ; closest gap is ANTAR -> ALIPHERATZ at 8.403 ly"
+            &replicant_client::Error::Closed
         ));
         assert!(retryable_connectivity_dependency_failure(
-            "deep_space_relay_station blueprint is not unlocked"
-        ));
-        assert!(retryable_connectivity_dependency_failure(
-            "missing blueprint for requested device type `comm_satellite`"
-        ));
-        assert!(retryable_connectivity_dependency_failure(
-            "EIRFARYR has no known L4 or L5 deployment location"
-        ));
-        assert!(retryable_connectivity_dependency_failure(
-            "insufficient manufacturing inventory at SCEPTURUM-BELT-1"
-        ));
-        assert!(retryable_connectivity_dependency_failure(
-            "Deep Space Relay Station deployment from SCEPTURUM-BELT-1 requires an idle attachment carrier in system SCEPTURUM"
+            &io::Error::other("missing blueprint for requested device type `comm_satellite`")
         ));
         assert!(!retryable_connectivity_dependency_failure(
-            "relay checkpoint is malformed"
+            &io::Error::other("relay checkpoint is malformed")
         ));
+    }
+
+    #[test]
+    fn relay_plan_and_repository_claim_errors_keep_their_types() {
+        let stale = ClassifiedError::new(
+            FailureClass::RelayPlanStale,
+            io::ErrorKind::InvalidData,
+            "the relay message was reworded",
+        );
+        let contention = RepositoryError::ClaimConflict {
+            resource: ResourceKey::Device("D-1".to_owned()),
+            owner: WorkflowId::new(),
+        };
+        assert!(stale_relay_plan_failure(&stale));
+        assert!(resource_claim_contention(&contention));
+        assert!(!stale_relay_plan_failure(&contention));
     }
 
     #[test]
@@ -7938,9 +8001,7 @@ mod tests {
             )
         ));
         assert!(retryable_manifest_planning_failure(
-            &TransportError::Invalid(
-                "payload device DEVICE-1 is not a free inactive payload".to_owned(),
-            )
+            &TransportError::PayloadUnavailable("payload message was reworded".to_owned())
         ));
         assert!(!retryable_manifest_planning_failure(
             &TransportError::Invalid("destination must be an exact location".to_owned(),)

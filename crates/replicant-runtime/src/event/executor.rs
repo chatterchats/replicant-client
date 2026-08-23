@@ -27,6 +27,8 @@ use serde_json::{Map, Value};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 
+use crate::failure::{FailureClass, classified_error};
+
 use super::{
     AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, MissionPhase,
     app_error, build_context, fetch_blueprints, fetch_devices, fetch_earned_achievements,
@@ -2190,7 +2192,8 @@ async fn claim_device(
         .iter()
         .any(|handle| handle.id().as_str().eq_ignore_ascii_case(code))
     {
-        return Err(app_error(
+        return Err(classified_error(
+            FailureClass::EventAssetStale,
             io::ErrorKind::NotFound,
             format!(
                 "event asset {code} is not present in the account-owned device projection; replan required"
@@ -4299,7 +4302,8 @@ async fn detach_devices(
             .iter()
             .any(|command| command.as_str() == "detach")
     {
-        return Err(app_error(
+        return Err(classified_error(
+            FailureClass::EventControlUnavailable,
             io::ErrorKind::WouldBlock,
             format!(
                 "carrier {carrier} cannot currently detach payload; it may be out of control range"

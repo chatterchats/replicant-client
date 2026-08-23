@@ -43,7 +43,10 @@ use std::{
 };
 
 use crate::{
-    config::ManagedClientConfig, orchestration::REGION_GATEWAY_HUB_RANGE_LY, start_managed_client,
+    config::ManagedClientConfig,
+    failure::{FailureClass, classified_error},
+    orchestration::REGION_GATEWAY_HUB_RANGE_LY,
+    start_managed_client,
 };
 use replicant_client::{
     Client, Device, DeviceHandle, DeviceType, Operation, OperationId, OperationStatus, Replicant,
@@ -1361,7 +1364,8 @@ async fn create_plan(
                 .first()
                 .map(|carrier| carrier.code.clone())
                 .ok_or_else(|| {
-                    app_error(
+                    classified_error(
+                        FailureClass::ConnectivityDependency,
                         io::ErrorKind::NotFound,
                         format!(
                             "Deep Space Relay Station deployment from {} requires an idle attachment carrier in system {}",
@@ -1410,7 +1414,8 @@ async fn create_plan(
             .count(),
     )?;
     if transport_required > 0 && transport_capacity <= 0 {
-        return Err(app_error(
+        return Err(classified_error(
+            FailureClass::ConnectivityDependency,
             io::ErrorKind::Other,
             format!(
                 "vessel {vessel_code} has no usable stow capacity for the {transport_required} ordinary mission relay(s)"
@@ -2298,7 +2303,8 @@ fn reserved_print_seconds(
         let seconds = blueprints
             .get(&job.device_type)
             .ok_or_else(|| {
-                app_error(
+                classified_error(
+                    FailureClass::ConnectivityDependency,
                     io::ErrorKind::NotFound,
                     format!("{} blueprint is not unlocked", job.device_type),
                 )
@@ -2363,7 +2369,8 @@ fn assign_job_indices_with_shared_scheduler(
         }
     }
     if assigned != indices.len() || by_type.values().any(|queue| !queue.is_empty()) {
-        return Err(app_error(
+        return Err(classified_error(
+            FailureClass::RelayPlanStale,
             io::ErrorKind::InvalidData,
             format!(
                 "shared print scheduler assigned {assigned} of {} relay print units",
@@ -3538,7 +3545,8 @@ async fn ensure_dsr_carrier_assignment(
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let Some((capacity, code)) = candidates.into_iter().next() else {
-        return Err(app_error(
+        return Err(classified_error(
+            FailureClass::ConnectivityDependency,
             io::ErrorKind::NotFound,
             format!(
                 "Deep Space Relay Station deployment from {} requires an idle attachment carrier in system {}",
@@ -4812,7 +4820,8 @@ async fn execute_hub_return_plan(
             .filter(|stop| stop_uses_vessel_stow(stop) && !stop.completed)
             .count();
         if pending_deploys > 0 && transport_capacity == 0 {
-            return Err(app_error(
+            return Err(classified_error(
+                FailureClass::ConnectivityDependency,
                 io::ErrorKind::Other,
                 format!(
                     "vessel {} has no usable stow capacity for {pending_deploys} remaining mission relay(s)",

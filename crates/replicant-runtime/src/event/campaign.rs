@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
+use crate::failure::{FailureClass, classified_error};
+
 use super::{
     AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventExecutionState,
     EventMissionPlan, EventScope, MissionPhase, PLAN_VERSION, app_error, build_factory_workloads,
@@ -675,7 +677,8 @@ pub(crate) async fn execute_campaign(
         save_campaign(&config.plan_path, campaign)?;
         if added == 0 {
             show_campaign_status(config, campaign)?;
-            return Err(app_error(
+            return Err(classified_error(
+                FailureClass::EventInputsUnavailable,
                 io::ErrorKind::Other,
                 "all currently feasible events completed, but blocked events remain; replenish resources or resolve the listed blockers and run again",
             ));

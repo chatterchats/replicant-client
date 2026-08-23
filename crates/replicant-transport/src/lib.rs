@@ -180,6 +180,12 @@ pub enum TransportError {
     /// Required stock or transport could not be found.
     #[error("{0}")]
     NotFound(String),
+    /// A selected payload became unavailable while managed state was changing.
+    #[error("{0}")]
+    PayloadUnavailable(String),
+    /// A planned resource pickup no longer has the required stock.
+    #[error("{0}")]
+    StaleResourcePickup(String),
     /// A state transition exceeded the configured wait bound.
     #[error("{0}")]
     TimedOut(String),
@@ -316,9 +322,9 @@ pub async fn plan_delivery_with(
 /// snapshot before any delivery mutation begins.
 ///
 /// A durable workflow can hold a plan across scheduler turns while other
-/// automations move stock. Returning [`TransportError::NotFound`] here lets the
-/// coordinator discard that stale plan and replan without partially executing
-/// an obsolete manifest.
+/// automations move stock. Returning [`TransportError::StaleResourcePickup`]
+/// here lets the coordinator discard that stale plan and replan without
+/// partially executing an obsolete manifest.
 pub async fn validate_resource_pickups(client: &Client, plan: &DeliveryPlan) -> Result<()> {
     if plan.resource_pickups.is_empty() {
         return Ok(());
@@ -346,7 +352,7 @@ pub async fn validate_resource_pickups(client: &Client, plan: &DeliveryPlan) -> 
                 .copied()
                 .unwrap_or_default();
             if present < *required {
-                return Err(TransportError::NotFound(format!(
+                return Err(TransportError::StaleResourcePickup(format!(
                     "planned resource pickup at {} is stale: need {} {}, have {}",
                     pickup.location, required, resource, present
                 )));
@@ -392,7 +398,7 @@ async fn validate_resource_manifest_at_location(
             .copied()
             .unwrap_or_default();
         if present < *required {
-            return Err(TransportError::NotFound(format!(
+            return Err(TransportError::StaleResourcePickup(format!(
                 "planned resource pickup at {location} is stale: need {required} {resource}, have {present}"
             )));
         }
@@ -702,12 +708,12 @@ fn select_payload_devices(
             )));
         }
         if !eligible_payload(device) {
-            return Err(TransportError::Invalid(format!(
+            return Err(TransportError::PayloadUnavailable(format!(
                 "payload device {code} is not a free inactive payload"
             )));
         }
         if workflow_reserved(&device.tags) {
-            return Err(TransportError::Invalid(format!(
+            return Err(TransportError::PayloadUnavailable(format!(
                 "payload device {code} is reserved by another workflow"
             )));
         }
@@ -766,12 +772,12 @@ fn select_payload_devices(
                 continue;
             }
             if !eligible_payload(device) {
-                return Err(TransportError::Invalid(format!(
+                return Err(TransportError::PayloadUnavailable(format!(
                     "device {code} tagged {tag} is in the origin scope but is not a free inactive payload"
                 )));
             }
             if workflow_reserved(&device.tags) {
-                return Err(TransportError::Invalid(format!(
+                return Err(TransportError::PayloadUnavailable(format!(
                     "device {code} tagged {tag} is reserved by another workflow"
                 )));
             }
@@ -1832,7 +1838,7 @@ async fn ensure_resource_collect_accepted(operation: &Operation, location: &str)
         outcome.response
     );
     if error.contains("Insufficient ") && error.contains(" at location: need ") {
-        return Err(TransportError::NotFound(format!(
+        return Err(TransportError::StaleResourcePickup(format!(
             "planned resource pickup at {location} became stale during collection: {error}"
         )));
     }

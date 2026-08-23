@@ -12,6 +12,8 @@
 use replicant_client::Client;
 use std::error::Error;
 
+mod failure;
+
 /// Error returned by an application report or action.
 pub type ApplicationError = Box<dyn Error + Send + Sync + 'static>;
 
