@@ -84,7 +84,7 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
-    SurveyDirective, SyncDomain, domain::GalacticPosition, raw,
+    SurveyDirective, SyncDomain, domain::GalacticPosition, managed::GalaxyGateway, raw,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -287,6 +287,9 @@ const DEFAULT_MAINTENANCE_RESUME_PCT: f64 = 95.0;
 const DEFAULT_MAINTENANCE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const DEVICE_FUNCTIONAL_FLOOR_PCT: f64 = 21.0;
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+// A bulk page carries 100 stars, so four targeted reads are the approximate
+// crossover for the usual <=400-star account projection.
+const BULK_STAR_SYNC_THRESHOLD: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Plan,
@@ -1029,6 +1032,69 @@ async fn load_or_create_plan(client: &Client, config: &Config) -> AnyResult<Rout
     create_plan(client, config).await
 }
 
+fn projected_explored_by_star(galaxy: &GalaxyGateway, replicant: &str) -> BTreeMap<String, bool> {
+    galaxy
+        .replicant_star_knowledge(replicant)
+        .into_iter()
+        .filter_map(|knowledge| {
+            knowledge
+                .explored
+                .map(|explored| (knowledge.star.id.as_str().to_owned(), explored))
+        })
+        .collect()
+}
+
+async fn resolve_missing_star_knowledge(
+    galaxy: &GalaxyGateway,
+    replicant: &str,
+    explored_by_star: &mut BTreeMap<String, bool>,
+    missing: Vec<String>,
+    concurrency: usize,
+) -> AnyResult<(usize, bool)> {
+    if missing.len() > BULK_STAR_SYNC_THRESHOLD {
+        match galaxy.sync_replicant_stars(replicant).await {
+            Ok(_) => {
+                *explored_by_star = projected_explored_by_star(galaxy, replicant);
+                return Ok((missing.len(), true));
+            }
+            Err(error) => warn!(
+                target: "replicant_client::explore",
+                replicant,
+                error = %error,
+                "bulk star sync failed; falling back to targeted reads"
+            ),
+        }
+    }
+
+    let refreshed = stream::iter(missing.into_iter().map(|star| {
+        let galaxy = galaxy.clone();
+        let replicant = replicant.to_owned();
+        async move {
+            let started = Instant::now();
+            let result = galaxy.refresh_replicant_star(&replicant, &star).await;
+            (star, started.elapsed(), result)
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let refreshed_count = refreshed.len();
+    for (star, elapsed, result) in refreshed {
+        let knowledge = result?;
+        explored_by_star.insert(star.clone(), knowledge.explored.unwrap_or(false));
+        debug!(
+            target: "replicant_client::explore",
+            event = "route.star_detail_resolved",
+            star,
+            explored = knowledge.explored,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "resolved targeted star knowledge"
+        );
+    }
+    Ok((refreshed_count, false))
+}
+
 async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
     let planning_started = Instant::now();
 
@@ -1096,16 +1162,8 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
     candidates.sort_by(|left, right| left.star.cmp(&right.star));
 
     let knowledge_started = Instant::now();
-    let mut explored_by_star = client
-        .galaxy()
-        .replicant_star_knowledge(&config.replicant)
-        .into_iter()
-        .filter_map(|knowledge| {
-            knowledge
-                .explored
-                .map(|explored| (knowledge.star.id.as_str().to_owned(), explored))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let galaxy = client.galaxy();
+    let mut explored_by_star = projected_explored_by_star(&galaxy, &config.replicant);
 
     let mut required_stars = candidates
         .iter()
@@ -1121,34 +1179,14 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         .cloned()
         .collect::<Vec<_>>();
     let local_hits = required_stars.len() - missing.len();
-
-    let refreshed = stream::iter(missing.into_iter().map(|star| {
-        let galaxy = client.galaxy();
-        let replicant = config.replicant.clone();
-        async move {
-            let started = Instant::now();
-            let result = galaxy.refresh_replicant_star(&replicant, &star).await;
-            (star, started.elapsed(), result)
-        }
-    }))
-    .buffer_unordered(config.star_detail_concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut refreshed_count = 0_usize;
-    for (star, elapsed, result) in refreshed {
-        let knowledge = result?;
-        explored_by_star.insert(star.clone(), knowledge.explored.unwrap_or(false));
-        refreshed_count += 1;
-        debug!(
-            target: "replicant_client::explore",
-            event = "route.star_detail_resolved",
-            star,
-            explored = knowledge.explored,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "resolved targeted star knowledge"
-        );
-    }
+    let (refreshed_count, bulk_synced) = resolve_missing_star_knowledge(
+        &galaxy,
+        &config.replicant,
+        &mut explored_by_star,
+        missing,
+        config.star_detail_concurrency,
+    )
+    .await?;
 
     info!(
         target: "replicant_client::explore",
@@ -1156,9 +1194,10 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         candidates = required_stars.len(),
         local_hits,
         refreshed = refreshed_count,
+        bulk_synced,
         concurrency = config.star_detail_concurrency,
         elapsed_ms = knowledge_started.elapsed().as_millis() as u64,
-        "resolved only the star knowledge needed for route planning"
+        "resolved star knowledge needed for route planning"
     );
 
     candidates.retain(|candidate| {
@@ -4884,7 +4923,145 @@ pub async fn execute_survey(client: &Client, request: &SurveyRequest) -> AnyResu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use replicant_client::{DeviceId, DeviceKey, StarId, domain::StarKey};
+    use replicant_client::{
+        DeviceId, DeviceKey, SecretString, StarId, StartupPolicy, domain::StarKey, raw::Url,
+    };
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{method, path, path_regex},
+    };
+
+    async fn test_client_at(server: &MockServer) -> Client {
+        Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client")
+    }
+
+    fn missing_stars(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("STAR-{index}")).collect()
+    }
+
+    fn expected_explored(stars: &[String]) -> BTreeMap<String, bool> {
+        stars
+            .iter()
+            .enumerate()
+            .map(|(index, star)| (star.clone(), index % 2 == 0))
+            .collect()
+    }
+
+    async fn mount_targeted_star_reads(server: &MockServer, count: usize) {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/replicants/REP/stars/STAR-\d+$"))
+            .respond_with(|request: &Request| {
+                let designation = request
+                    .url
+                    .path_segments()
+                    .and_then(Iterator::last)
+                    .expect("star path segment");
+                let index = designation
+                    .strip_prefix("STAR-")
+                    .expect("star prefix")
+                    .parse::<usize>()
+                    .expect("star index");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "star": {"designation": designation, "explored": index % 2 == 0}
+                }))
+            })
+            .expect(count as u64)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn many_missing_stars_use_one_bulk_sync_and_rebuild_projection() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let missing = missing_stars(BULK_STAR_SYNC_THRESHOLD + 1);
+        let stars = missing
+            .iter()
+            .enumerate()
+            .map(|(index, designation)| {
+                serde_json::json!({"designation": designation, "explored": index % 2 == 0})
+            })
+            .collect::<Vec<_>>();
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/REP/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "page": 1,
+                "total_pages": 1,
+                "stars": stars
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let galaxy = client.galaxy();
+        let mut explored = BTreeMap::new();
+        let (_, bulk_synced) =
+            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
+                .await
+                .expect("resolve star knowledge");
+
+        assert!(bulk_synced);
+        assert_eq!(explored, expected_explored(&missing));
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn few_missing_stars_keep_targeted_reads() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let missing = missing_stars(BULK_STAR_SYNC_THRESHOLD - 1);
+        mount_targeted_star_reads(&server, missing.len()).await;
+
+        let galaxy = client.galaxy();
+        let mut explored = BTreeMap::new();
+        let (_, bulk_synced) =
+            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
+                .await
+                .expect("resolve star knowledge");
+
+        assert!(!bulk_synced);
+        assert_eq!(explored, expected_explored(&missing));
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn bulk_max_pages_failure_falls_back_to_targeted_reads() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let missing = missing_stars(BULK_STAR_SYNC_THRESHOLD + 1);
+        mount_targeted_star_reads(&server, missing.len()).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/REP/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "page": 1,
+                "total_pages": 2,
+                "stars": [{"designation": "STAR-0", "explored": true}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let galaxy = client.galaxy().max_star_pages(1);
+        let mut explored = BTreeMap::new();
+        let (_, bulk_synced) =
+            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
+                .await
+                .expect("targeted fallback");
+
+        assert!(!bulk_synced);
+        assert_eq!(explored, expected_explored(&missing));
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
 
     #[test]
     fn operational_capacity_accepts_fraction_and_percentage_wire_shapes() {
