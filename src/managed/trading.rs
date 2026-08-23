@@ -174,7 +174,7 @@ mod tests {
             .expect("execute");
         assert_eq!(
             operation.status().await.expect("status"),
-            crate::managed::OperationStatus::ReconciliationRequired
+            crate::managed::OperationStatus::AwaitingEvidence
         );
 
         let requests = server.received_requests().await.expect("recorded requests");

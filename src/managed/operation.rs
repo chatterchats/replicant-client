@@ -253,12 +253,21 @@ impl TypedMutationAdapter for MutationAdapter {
     }
 
     fn expects_evidence(&self) -> bool {
+        if operation_evidence(self)["event_names"]
+            .as_array()
+            .is_some_and(|names| !names.is_empty())
+        {
+            return true;
+        }
         match self {
             Self::DeviceCommand { command, .. } => device_command_expects_evidence(command),
-            Self::DeviceDynamicCommand { .. }
-            | Self::ReplicantPrint { .. }
-            | Self::ReplicantTeleport { .. }
-            | Self::ReplicantTravel { .. } => true,
+            Self::DeviceDynamicCommand { .. } | Self::ReplicantTeleport { .. } => true,
+            Self::ReplicantPrint { request, .. } => {
+                request.command.is_none() && request.device_type.is_some()
+            }
+            Self::ReplicantTravel { request, .. } => {
+                request.dry_run != Some(true) && request.destination.is_some()
+            }
             _ => false,
         }
     }
@@ -1634,57 +1643,213 @@ fn device_command_requires_star_system(command_name: &str) -> bool {
 /// per the response shapes in `crate::raw::devices::DeviceCommandResponse`.
 /// Every other command's response is already the complete, final outcome.
 fn device_command_expects_evidence(command: &raw::devices::DeviceCommand) -> bool {
-    matches!(
-        command,
-        raw::devices::DeviceCommand::Compact
-            | raw::devices::DeviceCommand::Travel { .. }
-            | raw::devices::DeviceCommand::EnqueuePrint { .. }
-            | raw::devices::DeviceCommand::Prospect { .. }
-            | raw::devices::DeviceCommand::Repair { .. }
-            | raw::devices::DeviceCommand::Scan
-            | raw::devices::DeviceCommand::SystemScan
-            | raw::devices::DeviceCommand::Triangulate { .. }
-            | raw::devices::DeviceCommand::Unfurl
-    )
+    match command {
+        raw::devices::DeviceCommand::Travel { dry_run, .. } => dry_run != &Some(true),
+        _ => matches!(
+            command,
+            raw::devices::DeviceCommand::Compact
+                | raw::devices::DeviceCommand::EnqueuePrint { .. }
+                | raw::devices::DeviceCommand::Prospect { .. }
+                | raw::devices::DeviceCommand::Repair { .. }
+                | raw::devices::DeviceCommand::Scan
+                | raw::devices::DeviceCommand::SystemScan
+                | raw::devices::DeviceCommand::Triangulate { .. }
+                | raw::devices::DeviceCommand::Unfurl
+        ),
+    }
 }
 
 fn operation_evidence(adapter: &MutationAdapter) -> Value {
-    let default = || {
+    fn events(names: &[&str], failures: &[&str], payload: Value) -> Value {
         serde_json::json!({
-            "event_names": [],
-            "failure_event_names": [],
-            "payload": {},
+            "event_names": names,
+            "failure_event_names": failures,
+            "payload": payload,
             "expected_state": null
         })
-    };
-    let MutationAdapter::DeviceCommand { command, .. } = adapter else {
-        return default();
-    };
-    match command {
-        raw::devices::DeviceCommand::Compact => serde_json::json!({
-            "event_names": ["device.compacted"],
-            "failure_event_names": [],
-            "payload": {},
-            "expected_state": null
-        }),
-        raw::devices::DeviceCommand::Unfurl => serde_json::json!({
-            "event_names": ["device.unfurled"],
-            "failure_event_names": [],
-            "payload": {},
-            "expected_state": null
-        }),
-        raw::devices::DeviceCommand::Prospect { .. } => serde_json::json!({
-            "event_names": ["prospect.completed"],
-            "failure_event_names": [],
-            "payload": {},
-            "expected_state": null
-        }),
-        raw::devices::DeviceCommand::Triangulate { signature, target } => serde_json::json!({
-            "event_names": ["triangulation.complete"],
-            "failure_event_names": ["triangulation.failed"],
-            "payload": {"signature": signature, "target": target},
-            "expected_state": null
-        }),
+    }
+    let default = || events(&[], &[], serde_json::json!({}));
+
+    match adapter {
+        MutationAdapter::DeviceCommand { command, .. } => match command {
+            raw::devices::DeviceCommand::Activate => events(
+                &[
+                    "diversion.activated",
+                    "hub.activated",
+                    "relay.activated",
+                    "ward.activated",
+                ],
+                &[],
+                serde_json::json!({}),
+            ),
+            raw::devices::DeviceCommand::Assemble => {
+                events(&["ami.assembled"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Adopt(_) => {
+                events(&["ami.adopted"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Attach(_) => {
+                events(&["device.attached"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::ChangeOwner { target } => events(
+                &["device.changed_owner"],
+                &[],
+                serde_json::json!({"to_replicant": target}),
+            ),
+            raw::devices::DeviceCommand::ClearDirective => {
+                events(&["directive.cleared"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::CollectResources { resources } => events(
+                &["transport.collected"],
+                &[],
+                serde_json::json!({"resources": resources}),
+            ),
+            raw::devices::DeviceCommand::Compact => {
+                events(&["device.compacted"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Decommission => {
+                events(&["device.decommissioned"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Deploy => {
+                events(&["device.deployed"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::DepositResources { resources } => events(
+                &["transport.delivered"],
+                &[],
+                resources.as_ref().map_or_else(
+                    || serde_json::json!({}),
+                    |resources| serde_json::json!({"resources": resources}),
+                ),
+            ),
+            raw::devices::DeviceCommand::Detach(_) => {
+                events(&["device.detached"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::EnqueuePrint { device_type, .. } => events(
+                &["print.completed"],
+                &[],
+                serde_json::json!({"device_type": device_type}),
+            ),
+            raw::devices::DeviceCommand::Launch => {
+                events(&["ami.launched"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Message { channel, text } => events(
+                &["bobnet.new"],
+                &[],
+                serde_json::json!({"channel": channel, "message": text}),
+            ),
+            raw::devices::DeviceCommand::Prospect { .. } => {
+                events(&["prospect.completed"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Recall | raw::devices::DeviceCommand::Stow { .. } => {
+                events(&["device.stowed"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Release(_) => {
+                events(&["ami.released"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Rename { designation, name } => events(
+                &["system.body_renamed"],
+                &[],
+                serde_json::json!({"designation": designation, "new_name": name}),
+            ),
+            raw::devices::DeviceCommand::Retarget { resource_type } => events(
+                &["mining.retargeted"],
+                &[],
+                serde_json::json!({"new_resource": resource_type}),
+            ),
+            raw::devices::DeviceCommand::Scan => {
+                events(&["scan.completed"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Search => {
+                events(&["search.completed"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::SetDirective { directive, .. } => events(
+                &["directive.set"],
+                &[],
+                serde_json::json!({"directive": directive}),
+            ),
+            raw::devices::DeviceCommand::SetEntryPoint => {
+                events(&["system.entry_point_set"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::StartMining { resource_type, .. } => events(
+                &["mining.started"],
+                &[],
+                serde_json::json!({"resource_type": resource_type}),
+            ),
+            raw::devices::DeviceCommand::Travel {
+                destination,
+                dry_run,
+                ..
+            } if dry_run != &Some(true) => events(
+                &["travel.arrived"],
+                &[],
+                serde_json::json!({"destination": destination}),
+            ),
+            raw::devices::DeviceCommand::Triangulate { signature, target } => events(
+                &["triangulation.complete"],
+                &["triangulation.failed"],
+                serde_json::json!({"signature": signature, "target": target}),
+            ),
+            raw::devices::DeviceCommand::Unfurl => {
+                events(&["device.unfurled"], &[], serde_json::json!({}))
+            }
+            raw::devices::DeviceCommand::Withdraw => {
+                events(&["ami.withdrawn"], &[], serde_json::json!({}))
+            }
+            // The 2.5.1 event catalogue documents no unambiguous outcome event
+            // or managed target state for the remaining commands.
+            _ => default(),
+        },
+        MutationAdapter::DeviceCreateTrade { .. } => {
+            events(&["trade.created"], &[], serde_json::json!({}))
+        }
+        MutationAdapter::DeviceDeleteTrade { trade_code, .. } => events(
+            &["trade.deleted"],
+            &[],
+            serde_json::json!({"trade_code": trade_code}),
+        ),
+        MutationAdapter::DeviceFulfillTrade { trade_code, .. } => events(
+            &["trade.completed"],
+            &[],
+            serde_json::json!({"trade_code": trade_code}),
+        ),
+        MutationAdapter::ReplicantMine { request, .. } => events(
+            &["mining.started"],
+            &[],
+            serde_json::json!({"resource_type": request.resource_type}),
+        ),
+        MutationAdapter::ReplicantStopMining { .. } => {
+            events(&["mining.stopped"], &[], serde_json::json!({}))
+        }
+        MutationAdapter::ReplicantPrint { request, .. } => {
+            match (request.command.as_deref(), request.device_type.as_deref()) {
+                (None, Some(device_type)) => events(
+                    &["print.completed"],
+                    &[],
+                    serde_json::json!({"device_type": device_type}),
+                ),
+                _ => default(),
+            }
+        }
+        MutationAdapter::ReplicantTeleport { request, .. } => events(
+            &["teleport.completed"],
+            &["teleport.failed"],
+            serde_json::json!({"target_matrix_code": request.target}),
+        ),
+        MutationAdapter::ReplicantTravel { request, .. } => {
+            match (request.dry_run, request.destination.as_deref()) {
+                (Some(true), _) | (_, None) => default(),
+                (_, Some(destination)) => events(
+                    &["travel.arrived"],
+                    &[],
+                    serde_json::json!({"destination": destination}),
+                ),
+            }
+        }
+        MutationAdapter::ReplicantCancelTravel { .. } => {
+            events(&["travel.cancelled"], &[], serde_json::json!({}))
+        }
+        // The 2.5.1 event catalogue documents no unambiguous outcome event
+        // or managed target state for the remaining adapters.
         _ => default(),
     }
 }
@@ -3108,6 +3273,255 @@ mod tests {
         );
     }
 
+    #[test]
+    fn newly_covered_commands_use_documented_event_names() {
+        fn assert_events(adapter: MutationAdapter, expected: &[&str]) {
+            assert_eq!(
+                operation_evidence(&adapter)["event_names"],
+                serde_json::json!(expected)
+            );
+        }
+        fn device(command: raw::devices::DeviceCommand) -> MutationAdapter {
+            MutationAdapter::DeviceCommand {
+                device_code: "D1".into(),
+                command,
+            }
+        }
+        let resources =
+            || serde_json::from_value(serde_json::json!({"structural": 10})).expect("object");
+
+        assert_events(
+            device(raw::devices::DeviceCommand::Activate),
+            &[
+                "diversion.activated",
+                "hub.activated",
+                "relay.activated",
+                "ward.activated",
+            ],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Assemble),
+            &["ami.assembled"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Adopt(Default::default())),
+            &["ami.adopted"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Attach(Default::default())),
+            &["device.attached"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::ChangeOwner {
+                target: "R2".into(),
+            }),
+            &["device.changed_owner"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::ClearDirective),
+            &["directive.cleared"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::CollectResources {
+                resources: resources(),
+            }),
+            &["transport.collected"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Decommission),
+            &["device.decommissioned"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Deploy),
+            &["device.deployed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::DepositResources {
+                resources: Some(resources()),
+            }),
+            &["transport.delivered"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Detach(Default::default())),
+            &["device.detached"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::EnqueuePrint {
+                device_type: "mining_drone".into(),
+                quantity: None,
+                controller: None,
+                oncomplete: None,
+                tags: None,
+                flatpack: None,
+            }),
+            &["print.completed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Launch),
+            &["ami.launched"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Message {
+                channel: "ops".into(),
+                text: "ready".into(),
+            }),
+            &["bobnet.new"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Recall),
+            &["device.stowed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Release(Default::default())),
+            &["ami.released"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Rename {
+                designation: "SOL-4".into(),
+                name: "Earth".into(),
+            }),
+            &["system.body_renamed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Retarget {
+                resource_type: "carbon".into(),
+            }),
+            &["mining.retargeted"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Scan),
+            &["scan.completed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Search),
+            &["search.completed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::SetDirective {
+                directive: "mine_belt".into(),
+                configuration: None,
+                notify: None,
+            }),
+            &["directive.set"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::SetEntryPoint),
+            &["system.entry_point_set"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::StartMining {
+                resource_type: "carbon".into(),
+                target: None,
+            }),
+            &["mining.started"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Stow {
+                target: Some("V1".into()),
+            }),
+            &["device.stowed"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Travel {
+                destination: "SOL".into(),
+                dry_run: None,
+                via: None,
+            }),
+            &["travel.arrived"],
+        );
+        assert_events(
+            device(raw::devices::DeviceCommand::Withdraw),
+            &["ami.withdrawn"],
+        );
+        assert_events(
+            MutationAdapter::DeviceCreateTrade {
+                device_code: "D1".into(),
+                request: resources(),
+            },
+            &["trade.created"],
+        );
+        assert_events(
+            MutationAdapter::DeviceDeleteTrade {
+                device_code: "D1".into(),
+                trade_code: "T1".into(),
+            },
+            &["trade.deleted"],
+        );
+        assert_events(
+            MutationAdapter::DeviceFulfillTrade {
+                device_code: "D1".into(),
+                trade_code: "T1".into(),
+            },
+            &["trade.completed"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantMine {
+                replicant_code: "R1".into(),
+                request: raw::replicants::MineRequest {
+                    notify: None,
+                    resource_type: "carbon".into(),
+                    target: None,
+                },
+            },
+            &["mining.started"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantStopMining {
+                replicant_code: "R1".into(),
+            },
+            &["mining.stopped"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantPrint {
+                replicant_code: "R1".into(),
+                request: raw::replicants::PrintRequest {
+                    command: None,
+                    device_type: Some("mining_drone".into()),
+                    flatpack: None,
+                    notify: None,
+                },
+            },
+            &["print.completed"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantTeleport {
+                replicant_code: "R1".into(),
+                request: raw::replicants::TeleportRequest {
+                    target: "M1".into(),
+                },
+            },
+            &["teleport.completed"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantTravel {
+                replicant_code: "R1".into(),
+                request: raw::replicants::TravelRequest {
+                    destination: Some("SOL".into()),
+                    dry_run: None,
+                    notify: None,
+                    via: None,
+                },
+            },
+            &["travel.arrived"],
+        );
+        assert_events(
+            MutationAdapter::ReplicantCancelTravel {
+                replicant_code: "R1".into(),
+            },
+            &["travel.cancelled"],
+        );
+    }
+
+    #[test]
+    fn commands_without_documented_evidence_remain_explicitly_empty() {
+        let evidence = operation_evidence(&MutationAdapter::DeviceCommand {
+            device_code: "D1".into(),
+            command: raw::devices::DeviceCommand::SystemScan,
+        });
+        assert_eq!(evidence["event_names"], serde_json::json!([]));
+        assert!(evidence["expected_state"].is_null());
+    }
+
     #[tokio::test]
     async fn triangulation_failed_marks_the_operation_failed() {
         let server = MockServer::start().await;
@@ -3178,7 +3592,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_evidence_resolves_an_awaiting_operation() {
+    async fn documented_event_completes_an_operation_with_populated_evidence() {
+        let client = client_at(&MockServer::start().await.uri()).await;
+        client
+            .managed_state()
+            .set_event_cursor("1-0")
+            .expect("set submission cursor");
+        let evidence = operation_evidence(&MutationAdapter::DeviceCommand {
+            device_code: "D1".into(),
+            command: raw::devices::DeviceCommand::Deploy,
+        });
+        client
+            .managed_state()
+            .record_operation(
+                "op-deploy",
+                OperationStatus::Prepared.as_str(),
+                Some("live"),
+                Some("device"),
+                Some("D1"),
+                &serde_json::json!({"evidence": evidence}),
+            )
+            .expect("record operation");
+        assert!(
+            client
+                .managed_state()
+                .claim_operation_submission("op-deploy", "attempt-1")
+                .expect("claim submission")
+        );
+        client
+            .managed_state()
+            .set_operation_state("op-deploy", OperationStatus::AwaitingEvidence.as_str())
+            .expect("await evidence");
+
+        resolve_awaiting_evidence(
+            &client,
+            &domain::Event {
+                id: crate::domain::EventId::new("2-0"),
+                realm: Some(Realm::Live),
+                name: domain::EventName::from("device.deployed"),
+                category: domain::EventCategory::from("device"),
+                device: Some(DeviceKey::live(DeviceId::from("D1"))),
+                replicant: None,
+                location: None,
+                star: None,
+                occurred_at: "2026-08-23T00:00:00Z".into(),
+                payload: Default::default(),
+            },
+        )
+        .expect("resolve evidence");
+
+        assert_eq!(
+            client
+                .operations()
+                .get(OperationId::new("op-deploy"))
+                .status()
+                .await
+                .expect("status"),
+            OperationStatus::Completed
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn empty_evidence_is_ignored_without_error_or_terminal_transition() {
         let client = client_at(&MockServer::start().await.uri()).await;
         client
             .managed_state()

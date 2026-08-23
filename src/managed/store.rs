@@ -42,6 +42,7 @@ const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_i
 const CURRENT_SCHEMA_VERSION: i64 = 5;
 const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 1;
 const AMI_RAW_RETENTION_DAYS: i64 = 30;
+const OPERATION_TERMINAL_RETENTION_DAYS: i64 = 30;
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, thiserror::Error)]
@@ -715,12 +716,19 @@ impl Store {
     }
 
     fn configure(connection: &Connection, file_database: bool) -> Result<(), StoreError> {
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         connection.busy_timeout(Duration::from_secs(15))?;
         if file_database {
+            let table_count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )?;
+            if table_count == 0 {
+                connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+            }
             connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         }
-        connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
         Ok(())
     }
 
@@ -886,6 +894,7 @@ impl Store {
             fail_next_commit: false,
         };
         store.reconcile_history_visibility()?;
+        store.recover_orphaned_reconciliation_work()?;
         store.maintain_history()?;
         Ok(store)
     }
@@ -1034,6 +1043,23 @@ impl Store {
             return Ok(());
         }
         let modifier = format!("-{AMI_RAW_RETENTION_DAYS} days");
+        let operation_modifier = format!("-{OPERATION_TERMINAL_RETENTION_DAYS} days");
+        let operations_deleted = self.connection.execute(
+            "DELETE FROM operation_journal WHERE state IN ('completed', 'rejected') AND datetime(updated_at) < datetime('now', ?1)",
+            [operation_modifier],
+        )?;
+        if operations_deleted > 0 {
+            self.connection.execute_batch(
+                "PRAGMA wal_checkpoint(PASSIVE); PRAGMA incremental_vacuum(2000);",
+            )?;
+            info!(
+                target: "replicant_client::store",
+                event = "operation.journal_pruned",
+                deleted = operations_deleted,
+                retention_days = OPERATION_TERMINAL_RETENTION_DAYS,
+                "pruned expired terminal operations"
+            );
+        }
         let deleted = self.history.execute(
             "DELETE FROM event_history WHERE applied_at IS NOT NULL AND event_name IN ('ami.mining.digest', 'ami.transport.digest', 'ami.survey.digest') AND datetime(appended_at) < datetime('now', ?1)",
             [modifier],
@@ -1050,6 +1076,22 @@ impl Store {
             );
         }
         self.last_history_maintenance = Instant::now();
+        Ok(())
+    }
+
+    fn recover_orphaned_reconciliation_work(&mut self) -> Result<(), StoreError> {
+        let recovered = self.connection.execute(
+            "UPDATE reconciliation_queue SET state = 'queued' WHERE state = 'running' AND NOT EXISTS (SELECT 1 FROM reconciliation_leader WHERE lease_until > CAST(strftime('%s','now') AS INTEGER))",
+            [],
+        )?;
+        if recovered > 0 {
+            info!(
+                target: "replicant_client::store",
+                event = "reconciliation.orphaned_work_recovered",
+                recovered,
+                "returned orphaned reconciliation work to the queue"
+            );
+        }
         Ok(())
     }
 
@@ -3470,6 +3512,74 @@ mod tests {
                 .is_none()
         );
         fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn startup_recovers_running_reconciliation_work_without_a_live_owner() {
+        let path = test_path("orphaned-reconciliation");
+        {
+            let mut store = Store::open_file(&path).expect("open file store");
+            store
+                .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
+                .expect("enqueue");
+            store
+                .connection
+                .execute(
+                    "UPDATE reconciliation_queue SET state = 'running' WHERE work_id = 'device:d1'",
+                    [],
+                )
+                .expect("orphan work");
+            store
+                .connection
+                .execute("DELETE FROM reconciliation_leader", [])
+                .expect("remove owner");
+        }
+
+        let mut restored = Store::open_file(&path).expect("restart store");
+        assert_eq!(
+            restored
+                .claim_reconciliation_work()
+                .expect("claim recovered work")
+                .expect("work is queued")
+                .work_id,
+            "device:d1"
+        );
+        drop(restored);
+        fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn operation_retention_removes_only_expired_completed_and_rejected_rows() {
+        let mut store = Store::open_memory().expect("open memory store");
+        for (id, state) in [
+            ("old-completed", "completed"),
+            ("old-rejected", "rejected"),
+            ("old-awaiting", "awaiting_evidence"),
+            ("recent-completed", "completed"),
+        ] {
+            store
+                .record_operation(id, state, None, None, None, &json!({}))
+                .expect("record operation");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal SET updated_at = datetime('now', '-31 days') WHERE operation_id LIKE 'old-%'",
+                [],
+            )
+            .expect("backdate operations");
+        store.last_history_maintenance = Instant::now() - HISTORY_MAINTENANCE_INTERVAL;
+        store.maintain_history().expect("run retention");
+
+        let ids = store
+            .connection
+            .prepare("SELECT operation_id FROM operation_journal ORDER BY operation_id")
+            .expect("prepare remaining operations")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query remaining operations")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect remaining operations");
+        assert_eq!(ids, vec!["old-awaiting", "recent-completed"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
