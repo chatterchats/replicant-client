@@ -4137,10 +4137,7 @@ async fn ensure_trade_payment_ready(
             }
         }
     }
-    let resources_now = inventory_at_location(
-        &fetch_account_inventories(client).await?,
-        &intent.shop_location,
-    );
+    let resources_now = fetch_inventory_at_location(client, &intent.shop_location).await?;
     if criteria.resources.iter().any(|(resource, required)| {
         resources_now.get(resource).copied().unwrap_or_default() < *required
     }) {
@@ -4838,19 +4835,43 @@ async fn wait_for_trade_reward_resources(
     rewards: &ResourceMap,
     attempts: usize,
 ) -> Result<bool, String> {
-    for attempt in 0..attempts.max(1) {
-        let inventory =
-            inventory_at_location(&fetch_account_inventories(client).await?, shop_location);
-        if rewards.iter().all(|(resource, quantity)| {
-            inventory.get(resource).copied().unwrap_or_default() >= *quantity
-        }) {
+    let attempts = attempts.max(1);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(5).saturating_mul(u32::try_from(attempts).unwrap_or(u32::MAX));
+    let mut watch = client.events().watch().await.map_err(string_error)?;
+    for attempt in 0..attempts {
+        let cached = inventory_at_location(
+            &client.state().inventories().map_err(string_error)?,
+            shop_location,
+        );
+        if trade_rewards_satisfied(&cached, rewards) {
             return Ok(true);
         }
-        if attempt + 1 < attempts.max(1) {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let inventory = fetch_inventory_at_location(client, shop_location).await?;
+        if trade_rewards_satisfied(&inventory, rewards) {
+            return Ok(true);
+        }
+        if attempt + 1 == attempts {
+            break;
+        }
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining.min(Duration::from_secs(30)), watch.next()).await {
+                Ok(Ok(event)) if event.name.as_str() == "trade.completed" => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
         }
     }
     Ok(false)
+}
+
+fn trade_rewards_satisfied(inventory: &ResourceMap, rewards: &ResourceMap) -> bool {
+    rewards.iter().all(|(resource, quantity)| {
+        inventory.get(resource).copied().unwrap_or_default() >= *quantity
+    })
 }
 
 async fn load_trade_reward_resources(
@@ -5806,8 +5827,7 @@ async fn ensure_shop_trade_criteria(
             claim_device(context, &code)?;
         }
     }
-    let resources_now =
-        inventory_at_location(&fetch_account_inventories(client).await?, shop_location);
+    let resources_now = fetch_inventory_at_location(client, shop_location).await?;
     if criteria.resources.iter().any(|(resource, required)| {
         resources_now.get(resource).copied().unwrap_or_default() < *required
     }) {
@@ -5951,7 +5971,7 @@ async fn fetch_account_inventories(
             .list(&replicant_client::raw::inventory::AccountInventoryQuery {
                 location: None,
                 cursor,
-                limit: Some(50),
+                limit: Some(100),
             })
             .await
             .map_err(string_error)?;
@@ -5962,6 +5982,22 @@ async fn fetch_account_inventories(
         cursor = Some(next);
     }
     Err("account inventory exceeded the 100-page safety bound".to_owned())
+}
+
+async fn fetch_inventory_at_location(
+    client: &Client,
+    location: &str,
+) -> Result<ResourceMap, String> {
+    let (inventories, _) = client
+        .inventory()
+        .list(&replicant_client::raw::inventory::AccountInventoryQuery {
+            location: Some(location.to_owned()),
+            cursor: None,
+            limit: Some(100),
+        })
+        .await
+        .map_err(string_error)?;
+    Ok(inventory_at_location(&inventories, location))
 }
 
 fn inventory_at_location(
@@ -7453,9 +7489,118 @@ fn read_json(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use replicant_client::{SecretString, StartupPolicy, raw::Url};
     use replicant_workflow::WorkflowRepository;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
 
     use super::*;
+
+    async fn test_client_at(server: &MockServer) -> Client {
+        Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start test client")
+    }
+
+    fn inventory_response(quantity: i64, next_cursor: Option<&str>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "locations": [{
+                "location": "SHOP-1",
+                "items": [{"resource_type": "rares", "quantity": quantity}]
+            }],
+            "next_cursor": next_cursor
+        }))
+    }
+
+    #[tokio::test]
+    async fn trade_reward_wait_fetches_one_filtered_page_per_check() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .and(query_param("location", "SHOP-1"))
+            .and(query_param("limit", "100"))
+            .respond_with(inventory_response(10, Some("must-not-follow")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+
+        assert!(
+            wait_for_trade_reward_resources(
+                &client,
+                "SHOP-1",
+                &ResourceMap::from([("rares".to_owned(), 10)]),
+                1,
+            )
+            .await
+            .expect("wait for rewards")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn trade_reward_wait_uses_satisfied_projection_without_a_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .respond_with(inventory_response(10, None))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        fetch_inventory_at_location(&client, "SHOP-1")
+            .await
+            .expect("seed projection");
+
+        assert!(
+            wait_for_trade_reward_resources(
+                &client,
+                "SHOP-1",
+                &ResourceMap::from([("rares".to_owned(), 10)]),
+                1,
+            )
+            .await
+            .expect("wait for rewards")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn trade_reward_wait_returns_false_on_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .respond_with(inventory_response(9, None))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+
+        assert!(
+            !wait_for_trade_reward_resources(
+                &client,
+                "SHOP-1",
+                &ResourceMap::from([("rares".to_owned(), 10)]),
+                1,
+            )
+            .await
+            .expect("wait for rewards")
+        );
+
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
 
     #[test]
     fn logistics_intent_builds_resource_delivery_without_executor_plumbing() {
