@@ -734,10 +734,10 @@ pub async fn reconcile_director(
         .cloned()
         .collect::<Vec<_>>();
 
-    // A partially bootstrapped region can use its already-staged Replicants to
-    // improve catalogue coverage while its System Hub is still being printed
-    // or deployed. Do not start hub-dependent event/mining/maintenance goals
-    // until the foothold becomes fully established.
+    // A partially bootstrapped region can use its staged Replicants and
+    // manufacturing foothold to discover belts, extend relay coverage, and
+    // deploy mines while its System Hub is still being completed. Event and
+    // hub-maintenance goals remain established-region concerns.
     for region in &establishing_regions {
         goals.push(reconcile_enhance_catalogue(
             client,
@@ -746,6 +746,41 @@ pub async fn reconcile_director(
             &workers,
             &mut reserved_workers,
             &mut requirements,
+        )?);
+        goals.push(reconcile_discover_belts(
+            &goal_context,
+            region,
+            &workers,
+            &mut reserved_workers,
+            &mut requirements,
+            &locations,
+            &location_systems,
+        )?);
+        goals.push(reconcile_expand_mining(
+            &repository,
+            region,
+            &workers,
+            &workflows,
+            &devices,
+            &locations,
+            &location_systems,
+            &system_regions,
+            &goal_controls,
+            automatic,
+            &mut reserved_workers,
+            &mut requirements,
+            now,
+        )?);
+        goals.push(reconcile_expand_ftl_network(
+            &goal_context,
+            region,
+            &workers,
+            &mut reserved_workers,
+            &mut requirements,
+            &devices,
+            &locations,
+            &location_systems,
+            &BTreeSet::new(),
         )?);
     }
 
