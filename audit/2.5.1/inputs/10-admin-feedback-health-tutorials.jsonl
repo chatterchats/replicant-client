@@ -1,0 +1,14 @@
+{"group":"health","kind":"operation","slice":10,"source":"/paths/~1v1~1health/get","unit":"operation:GET:/v1/health"}
+{"group":"tutorials","kind":"operation","slice":10,"source":"/paths/~1v1~1tutorials/get","unit":"operation:GET:/v1/tutorials"}
+{"group":"tutorials","kind":"operation","slice":10,"source":"/paths/~1v1~1tutorials~1{slug}/get","unit":"operation:GET:/v1/tutorials/{slug}"}
+{"group":"admin","kind":"operation","slice":10,"source":"/paths/~1v1~1admin~1message/post","unit":"operation:POST:/v1/admin/message"}
+{"group":"admin","kind":"operation","slice":10,"source":"/paths/~1v1~1admin~1story~1advance/post","unit":"operation:POST:/v1/admin/story/advance"}
+{"group":"feedback","kind":"operation","slice":10,"source":"/paths/~1v1~1feedback/post","unit":"operation:POST:/v1/feedback"}
+{"group":"admin","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_admin_AdminMessageRequestSchema","unit":"schema:app_schemas_admin_AdminMessageRequestSchema"}
+{"group":"admin","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_admin_AdminMessageResponseSchema","unit":"schema:app_schemas_admin_AdminMessageResponseSchema"}
+{"group":"admin","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_admin_StoryAdvanceRequestSchema","unit":"schema:app_schemas_admin_StoryAdvanceRequestSchema"}
+{"group":"admin","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_admin_StoryAdvanceResponseSchema","unit":"schema:app_schemas_admin_StoryAdvanceResponseSchema"}
+{"group":"feedback","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_feedback_FeedbackSubmitRequestSchema","unit":"schema:app_schemas_feedback_FeedbackSubmitRequestSchema"}
+{"group":"feedback","kind":"schema","slice":10,"source":"/components/schemas/app_schemas_feedback_FeedbackSubmitResponseSchema","unit":"schema:app_schemas_feedback_FeedbackSubmitResponseSchema"}
+{"group":"flask","kind":"schema","slice":10,"source":"/components/schemas/flask_smorest_error_handler_ErrorSchema","unit":"schema:flask_smorest_error_handler_ErrorSchema"}
+{"group":"flask","kind":"schema","slice":10,"source":"/components/schemas/flask_smorest_pagination_PaginationMetadataSchema","unit":"schema:flask_smorest_pagination_PaginationMetadataSchema"}
