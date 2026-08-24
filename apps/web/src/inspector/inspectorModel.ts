@@ -1,5 +1,6 @@
 import type { DescriptorCommand } from "../CommandPalette";
 import type {
+  DescriptorCatalog,
   DeviceSummary,
   EntitySummary,
   EventSummary,
@@ -238,4 +239,54 @@ export function specializeDeviceCommand(
     ),
   };
   return { ...command, descriptor };
+}
+
+export interface DescriptorDeviceCommand extends DescriptorCommand {
+  bindingCommand: string;
+}
+
+export function advertisedDeviceCommands(
+  catalog: DescriptorCatalog,
+  device: DeviceSummary,
+  entities: Record<string, EntitySummary> = {},
+): DescriptorDeviceCommand[] {
+  const seen = new Set<string>();
+  return device.available_commands
+    .filter((command) => {
+      if (seen.has(command)) return false;
+      seen.add(command);
+      return true;
+    })
+    .flatMap((bindingCommand) => {
+      const descriptor = catalog.actions.find((action) =>
+        (action.device_commands ?? []).some(
+          (binding) => binding.command === bindingCommand,
+        ),
+      );
+      const binding = descriptor?.device_commands?.find(
+        (candidate) => candidate.command === bindingCommand,
+      );
+      if (!descriptor || !binding) return [];
+      const lifecycleLabel =
+        descriptor.kind === "device.lifecycle"
+          ? descriptor.parameters
+              .find((parameter) => parameter.name === "command")
+              ?.options.find((option) => option.value === bindingCommand)?.label
+          : undefined;
+      const command = specializeDeviceCommand(
+        {
+          operationClass: "action",
+          descriptor: lifecycleLabel
+            ? { ...descriptor, display_name: lifecycleLabel }
+            : descriptor,
+          initialParameters: {
+            ...binding.parameters,
+            device: device.entity.id,
+          },
+        },
+        device,
+        entities,
+      );
+      return [{ ...command, bindingCommand }];
+    });
 }

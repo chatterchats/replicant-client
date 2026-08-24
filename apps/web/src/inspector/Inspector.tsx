@@ -78,7 +78,15 @@ export function InspectorView({
   if (snapshot?.detail.kind === "device") {
     const device = snapshot.detail.detail;
     slots = {
-      body: <DeviceInspector device={device} entities={entities} />,
+      body: (
+        <DeviceInspector
+          device={device}
+          descriptors={props.descriptors}
+          entities={entities}
+          onRunCommand={props.onRunCommand}
+          onOperationFinished={props.onOperationFinished}
+        />
+      ),
       activity:
         device.ownership.toLowerCase() === "owned" ? (
           <DeviceLogPanel device={device.entity.id} />
@@ -98,7 +106,15 @@ export function InspectorView({
     };
   } else if (isDeviceSummary(value)) {
     slots = {
-      body: <DeviceInspector device={value} entities={entities} />,
+      body: (
+        <DeviceInspector
+          device={value}
+          descriptors={props.descriptors}
+          entities={entities}
+          onRunCommand={props.onRunCommand}
+          onOperationFinished={props.onOperationFinished}
+        />
+      ),
       activity:
         value.ownership.toLowerCase() === "owned" ? (
           <DeviceLogPanel device={value.entity.id} />
