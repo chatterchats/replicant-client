@@ -632,18 +632,7 @@ pub async fn reconcile_director(
         .collect::<Vec<_>>();
     workers.sort_by(|left, right| left.replicant.key.id.cmp(&right.replicant.key.id));
     mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
-
-    for region in regions.values_mut() {
-        if let Some(home) = preferred_home_location(
-            &region.region,
-            region.hub_system.as_deref(),
-            &devices,
-            &location_systems,
-            &system_regions,
-        ) {
-            region.hub_location = Some(home);
-        }
-    }
+    mark_manufacturing_footholds(&mut regions, &devices, &location_systems, &system_regions);
 
     let goal_controls = load_goal_controls(&repository)?;
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
@@ -4096,6 +4085,38 @@ fn mark_partial_region_footholds(
     }
 }
 
+fn mark_manufacturing_footholds(
+    regions: &mut BTreeMap<String, RegionView>,
+    devices: &[Device],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+) {
+    for region in regions.values_mut() {
+        let Some(home) = preferred_home_location(
+            &region.region,
+            region.hub_system.as_deref(),
+            devices,
+            location_systems,
+            system_regions,
+        ) else {
+            continue;
+        };
+        let system = location_systems
+            .get(&home)
+            .cloned()
+            .unwrap_or_else(|| system_prefix(&home).to_owned());
+        if region.status != DirectorRegionStatus::Established
+            && system_regions
+                .get(&system)
+                .is_some_and(|candidate| candidate == &region.region)
+        {
+            region.status = DirectorRegionStatus::Establishing;
+            region.hub_system = Some(system);
+        }
+        region.hub_location = Some(home);
+    }
+}
+
 fn preferred_home_location(
     region: &str,
     hub_system: Option<&str>,
@@ -4946,6 +4967,38 @@ mod tests {
         mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
 
         assert_eq!(regions["beta"].status, DirectorRegionStatus::Establishing);
+    }
+
+    #[test]
+    fn regional_autofactory_marks_a_stable_manufacturing_foothold() {
+        let mut regions = BTreeMap::from([(
+            "delta".to_owned(),
+            RegionView {
+                region: "delta".to_owned(),
+                status: DirectorRegionStatus::Discovered,
+                hub_system: None,
+                hub_location: None,
+                known_systems: BTreeSet::from(["PHASYRIS".to_owned()]),
+            },
+        )]);
+        let mut factory = test_hub_device();
+        factory.device_type = Some(DeviceType::Autofactory);
+        factory.location = Some(replicant_client::LocationKey::live(
+            "PHASYRIS-BELT-1".into(),
+        ));
+        mark_manufacturing_footholds(
+            &mut regions,
+            &[factory],
+            &BTreeMap::from([("PHASYRIS-BELT-1".to_owned(), "PHASYRIS".to_owned())]),
+            &BTreeMap::from([("PHASYRIS".to_owned(), "delta".to_owned())]),
+        );
+
+        assert_eq!(regions["delta"].status, DirectorRegionStatus::Establishing);
+        assert_eq!(regions["delta"].hub_system.as_deref(), Some("PHASYRIS"));
+        assert_eq!(
+            regions["delta"].hub_location.as_deref(),
+            Some("PHASYRIS-BELT-1")
+        );
     }
 
     #[test]
