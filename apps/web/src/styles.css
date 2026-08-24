@@ -707,7 +707,8 @@ h1 {
   text-transform: uppercase;
 }
 .inspector {
-  width: 390px;
+  position: relative;
+  width: var(--inspector-width, 390px);
   min-width: 320px;
   max-width: min(55vw, 680px);
   display: flex;
@@ -715,6 +716,33 @@ h1 {
   border-left: 1px solid rgba(255, 255, 255, 0.16);
   background: #212121;
   box-shadow: -16px 0 40px rgba(0, 0, 0, 0.18);
+}
+.inspector-resize-handle {
+  position: absolute;
+  z-index: 2;
+  inset: 0 auto 0 -5px;
+  width: 10px;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.inspector-resize-handle::after {
+  position: absolute;
+  inset: 0 auto 0 4px;
+  width: 2px;
+  background: transparent;
+  content: "";
+}
+
+.inspector-resize-handle:hover::after,
+.inspector-resize-handle:focus-visible::after,
+.inspector-resize-handle.dragging::after {
+  background: var(--accent);
+}
+
+.inspector-resize-handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .drawer-header {
   display: flex;

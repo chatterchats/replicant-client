@@ -1,6 +1,62 @@
-import type { CSSProperties, ReactNode } from "react";
+import {
+  useEffect,
+  useState,
+  type CSSProperties,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 
 import type { EntityProvenance, EntitySummary } from "../protocol";
+
+const INSPECTOR_WIDTH_KEY = "replicant.inspector.width.v1";
+const DEFAULT_INSPECTOR_WIDTH = 390;
+const MIN_INSPECTOR_WIDTH = 320;
+const INSPECTOR_WIDTH_STEP = 16;
+
+function maximumInspectorWidth() {
+  return Math.min(680, window.innerWidth * 0.55);
+}
+
+function clampInspectorWidth(value: number) {
+  const maximum = Math.max(MIN_INSPECTOR_WIDTH, maximumInspectorWidth());
+  return Math.min(maximum, Math.max(MIN_INSPECTOR_WIDTH, value));
+}
+
+function storedInspectorWidth() {
+  const stored = Number(window.localStorage.getItem(INSPECTOR_WIDTH_KEY));
+  return clampInspectorWidth(
+    Number.isFinite(stored) && stored > 0 ? stored : DEFAULT_INSPECTOR_WIDTH,
+  );
+}
+
+export function useInspectorWidth() {
+  const [width, setWidthState] = useState(storedInspectorWidth);
+  const [desktop, setDesktop] = useState(() => window.innerWidth > 720);
+  const setWidth = (value: number) => {
+    const next = clampInspectorWidth(value);
+    setWidthState(next);
+    try {
+      window.localStorage.setItem(INSPECTOR_WIDTH_KEY, String(next));
+    } catch {
+      // Width persistence is a UI preference; storage failure is non-fatal.
+    }
+  };
+  useEffect(() => {
+    const resize = () => {
+      setDesktop(window.innerWidth > 720);
+      setWidthState((current) => clampInspectorWidth(current));
+    };
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
+  }, []);
+  return {
+    width,
+    desktop,
+    minimum: MIN_INSPECTOR_WIDTH,
+    maximum: Math.max(MIN_INSPECTOR_WIDTH, maximumInspectorWidth()),
+    setWidth,
+  };
+}
 
 function Section({ title, children }: { title: string; children?: ReactNode }) {
   return children ? (
@@ -23,8 +79,6 @@ export function InspectorShell({
   warning,
   onClose,
   onClear,
-  style,
-  resizeHandle,
 }: {
   summary: EntitySummary;
   vitals?: ReactNode;
@@ -37,16 +91,55 @@ export function InspectorShell({
   warning?: ReactNode;
   onClose: () => void;
   onClear: () => void;
-  style?: CSSProperties;
-  resizeHandle?: ReactNode;
 }) {
+  const size = useInspectorWidth();
+  const [drag, setDrag] = useState<{ x: number; width: number } | null>(null);
+  const startDrag = (event: PointerEvent<HTMLDivElement>) => {
+    setDrag({ x: event.clientX, width: size.width });
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const moveDrag = (event: PointerEvent<HTMLDivElement>) => {
+    if (drag) size.setWidth(drag.width + drag.x - event.clientX);
+  };
+  const stopDrag = (event: PointerEvent<HTMLDivElement>) => {
+    setDrag(null);
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+  };
+  const style = {
+    "--inspector-width": `${String(size.width)}px`,
+  } as CSSProperties;
   return (
     <aside
       className="inspector"
       aria-label="Selected entity inspector"
       style={style}
     >
-      {resizeHandle}
+      {size.desktop ? (
+        <div
+          className={`inspector-resize-handle ${drag ? "dragging" : ""}`}
+          role="separator"
+          aria-label="Resize inspector"
+          aria-orientation="vertical"
+          aria-valuenow={Math.round(size.width)}
+          aria-valuemin={size.minimum}
+          aria-valuemax={Math.round(size.maximum)}
+          tabIndex={0}
+          onPointerDown={startDrag}
+          onPointerMove={moveDrag}
+          onPointerUp={stopDrag}
+          onPointerCancel={stopDrag}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft")
+              size.setWidth(size.width + INSPECTOR_WIDTH_STEP);
+            else if (event.key === "ArrowRight")
+              size.setWidth(size.width - INSPECTOR_WIDTH_STEP);
+            else if (event.key === "Home") size.setWidth(size.minimum);
+            else if (event.key === "End") size.setWidth(size.maximum);
+            else return;
+            event.preventDefault();
+          }}
+        />
+      ) : null}
       <header className="drawer-header">
         <div>
           <small>{summary.entity.kind}</small>
