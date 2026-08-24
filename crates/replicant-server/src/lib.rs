@@ -1550,8 +1550,39 @@ async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, 
             claims.remove(handle.id().as_str()),
         ));
     }
+    inherit_stowed_locations(&mut rows);
     rows.sort_by(|left, right| left.entity.cmp(&right.entity));
     Ok(rows)
+}
+
+fn inherit_stowed_locations(devices: &mut [DeviceSummary]) {
+    for _ in 0..devices.len() {
+        let hosts = devices
+            .iter()
+            .filter_map(|device| {
+                Some((
+                    device.entity.id.0.clone(),
+                    (device.location.clone()?, device.system.clone()),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut changed = false;
+        for device in devices
+            .iter_mut()
+            .filter(|device| device.location.is_none())
+        {
+            if let Some((location, system)) =
+                device.stowed_in.as_ref().and_then(|host| hosts.get(host))
+            {
+                device.location = Some(location.clone());
+                device.system.clone_from(system);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Reads full device status in paginated list calls instead of issuing one
@@ -6659,6 +6690,29 @@ mod tests {
             travel_destination: None,
             claim: None,
         }
+    }
+
+    #[test]
+    fn stowed_devices_inherit_their_host_location() {
+        let mut host = projected_device("HOST");
+        host.location = Some("SOL-HUB".to_owned());
+        host.system = Some("SOL".to_owned());
+        let mut child = projected_device("CHILD");
+        child.stowed_in = Some("HOST".to_owned());
+        let mut nested = projected_device("NESTED");
+        nested.stowed_in = Some("CHILD".to_owned());
+        let mut explicit = projected_device("EXPLICIT");
+        explicit.stowed_in = Some("HOST".to_owned());
+        explicit.location = Some("PHASYRIS-HUB".to_owned());
+        explicit.system = Some("PHASYRIS".to_owned());
+        let mut devices = vec![nested, child, host, explicit];
+
+        inherit_stowed_locations(&mut devices);
+
+        assert_eq!(devices[0].location.as_deref(), Some("SOL-HUB"));
+        assert_eq!(devices[0].system.as_deref(), Some("SOL"));
+        assert_eq!(devices[1].location.as_deref(), Some("SOL-HUB"));
+        assert_eq!(devices[3].location.as_deref(), Some("PHASYRIS-HUB"));
     }
 
     #[test]
