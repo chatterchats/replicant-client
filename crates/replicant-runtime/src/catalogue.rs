@@ -14,9 +14,9 @@ use replicant_client::{
     raw,
 };
 use replicant_protocol::{
-    ActionDescriptor, DescriptorCatalog, EntityKind, MutationRisk, OperationClass, OperationKind,
-    ParameterDescriptor, ParameterKind, ParameterOption, ParameterValidation, ReportDescriptor,
-    TriggerKind, WorkflowDescriptor,
+    ActionDescriptor, DescriptorCatalog, DeviceCommandBinding, EntityKind, MutationRisk,
+    OperationClass, OperationKind, ParameterDescriptor, ParameterKind, ParameterOption,
+    ParameterValidation, ReportDescriptor, TriggerKind, WorkflowDescriptor,
 };
 use replicant_workflow::{
     RegistryError, RepositoryError, WorkflowInstance, WorkflowRegistry, WorkflowRepository,
@@ -119,6 +119,7 @@ impl OperationCatalogue {
         for (class, kind) in descriptor_kinds(&catalogue.descriptors) {
             catalogue.validate(class, kind, BTreeMap::new(), true)?;
         }
+        catalogue.validate_device_command_bindings()?;
         Ok(catalogue)
     }
 
@@ -152,6 +153,33 @@ impl OperationCatalogue {
     pub fn is_applicable(&self, class: OperationClass, kind: &str, entity: &EntityKind) -> bool {
         self.applicable_to(class, kind)
             .is_some_and(|kinds| kinds.contains(entity))
+    }
+
+    fn validate_device_command_bindings(&self) -> Result<(), CatalogueError> {
+        for descriptor in &self.descriptors.actions {
+            let mut commands = BTreeSet::new();
+            for binding in &descriptor.device_commands {
+                if binding.parameters.contains_key("device") {
+                    return Err(CatalogueError::Invalid(format!(
+                        "device command binding `{}` for `{}` fixes reserved parameter `device`",
+                        binding.command, descriptor.kind.0
+                    )));
+                }
+                if !commands.insert(binding.command.as_str()) {
+                    return Err(CatalogueError::Invalid(format!(
+                        "duplicate device command binding `{}` for `{}`",
+                        binding.command, descriptor.kind.0
+                    )));
+                }
+                self.validate(
+                    OperationClass::Action,
+                    &descriptor.kind.0,
+                    binding.parameters.clone(),
+                    true,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Validates and executes a read-only report through its reusable runtime function.
@@ -396,6 +424,59 @@ impl OperationCatalogue {
                 )
                 .await
             }
+            "device.retarget" => {
+                let input: DeviceResourceAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Retarget {
+                            resource_type: input.resource_type,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.start_mining" => {
+                let input: DeviceMiningAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::StartMining {
+                            resource_type: input.resource_type,
+                            target: input.target,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.stellar_census" => {
+                let input: DeviceCensusAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::StellarCensus {
+                            page: input.page,
+                            per_page: input.per_page,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
             "device.adopt" | "device.release" => {
                 let input: DeviceTargetAction = decode(parameters)?;
                 let handle = client
@@ -557,6 +638,21 @@ impl OperationCatalogue {
                 managed_operation_value(
                     handle
                         .enqueue_print_configured(input.device_type, options)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "autofactory.dequeue_print" => {
+                let input: AutofactoryDequeueAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::DequeuePrint { index: input.index })
                         .await
                         .map_err(runtime_error)?,
                 )
@@ -1247,7 +1343,7 @@ fn validate_parameter(
 }
 
 fn descriptors() -> DescriptorCatalog {
-    DescriptorCatalog {
+    let mut catalogue = DescriptorCatalog {
         reports: vec![ReportDescriptor {
             kind: operation_kind("nearby_belts"),
             display_name: "Nearby belt report".to_owned(),
@@ -1587,6 +1683,52 @@ fn descriptors() -> DescriptorCatalog {
                 ],
             ),
             simple_action(
+                "device.retarget",
+                "Retarget device",
+                "Change the resource targeted by one compatible device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("resource_type", "Resource type", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "device.start_mining",
+                "Start mining",
+                "Begin mining one resource at the current or selected site.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("resource_type", "Resource type", ParameterKind::String),
+                    optional("target", "Mining site", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
+                "device.stellar_census",
+                "Stellar census",
+                "Fetch one page of the selected device's stellar census.",
+                "devices",
+                MutationRisk::Low,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    bounded(
+                        optional("page", "Page", ParameterKind::Integer),
+                        Some(1.0),
+                        None,
+                    ),
+                    bounded(
+                        optional("per_page", "Items per page", ParameterKind::Integer),
+                        Some(1.0),
+                        None,
+                    ),
+                ],
+            ),
+            simple_action(
                 "device.adopt",
                 "Adopt device",
                 "Bring a device under the selected AMI controller's control.",
@@ -1688,6 +1830,22 @@ fn descriptors() -> DescriptorCatalog {
                     ),
                     optional("tags", "Tags (comma separated)", ParameterKind::String),
                     defaulted("flatpack", "Print compacted", ParameterKind::Boolean, false),
+                ],
+            ),
+            simple_action(
+                "autofactory.dequeue_print",
+                "Remove queued print",
+                "Remove one queued Autofactory print job.",
+                "manufacturing",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Autofactory", ParameterKind::Device),
+                    bounded(
+                        optional("index", "Queue index", ParameterKind::Integer),
+                        Some(0.0),
+                        None,
+                    ),
                 ],
             ),
             simple_action(
@@ -1873,6 +2031,42 @@ fn descriptors() -> DescriptorCatalog {
             ),
         ],
         workflows: workflow_descriptors(),
+    };
+    bind_device_commands(&mut catalogue.actions);
+    catalogue
+}
+
+fn bind_device_commands(actions: &mut [ActionDescriptor]) {
+    for descriptor in actions {
+        descriptor.device_commands = match descriptor.kind.0.as_str() {
+            "autofactory.print" => vec![device_binding("enqueue_print", [])],
+            "autofactory.dequeue_print" => vec![device_binding("dequeue_print", [])],
+            "device.travel" => vec![device_binding("travel", [])],
+            "device.change_owner" => vec![device_binding("change_owner", [])],
+            "device.retarget" => vec![device_binding("retarget", [])],
+            "device.start_mining" => vec![device_binding("start_mining", [])],
+            "device.stellar_census" => vec![device_binding("stellar_census", [])],
+            "device.lifecycle" => DEVICE_LIFECYCLE_COMMANDS
+                .iter()
+                .map(|command| {
+                    device_binding(command, [("command", Value::String((*command).to_owned()))])
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    }
+}
+
+fn device_binding<const N: usize>(
+    command: &str,
+    parameters: [(&str, Value); N],
+) -> DeviceCommandBinding {
+    DeviceCommandBinding {
+        command: command.to_owned(),
+        parameters: parameters
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
     }
 }
 
@@ -2931,6 +3125,23 @@ struct DeviceTravelAction {
     destination: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceResourceAction {
+    device: String,
+    resource_type: String,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceMiningAction {
+    device: String,
+    resource_type: String,
+    target: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceCensusAction {
+    device: String,
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+#[derive(Debug, Deserialize)]
 struct DeviceRefreshAction {
     replicant_code: Option<String>,
     device_type: Option<String>,
@@ -3072,6 +3283,11 @@ struct DeviceDetachAction {
     device: String,
     #[serde(default)]
     target: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct AutofactoryDequeueAction {
+    device: String,
+    index: Option<i64>,
 }
 #[derive(Debug, Deserialize)]
 struct AutofactoryPrintAction {
@@ -3331,6 +3547,134 @@ fn default_mining_concurrency() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_command_bindings_cover_advertised_commands() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let actions = &catalogue.descriptors().actions;
+        let resolved = actions
+            .iter()
+            .flat_map(|descriptor| {
+                descriptor
+                    .device_commands
+                    .iter()
+                    .map(move |binding| (binding.command.clone(), descriptor.kind.0.clone()))
+            })
+            .fold(BTreeMap::new(), |mut resolved, (command, kind)| {
+                resolved.entry(command).or_insert(kind);
+                resolved
+            });
+        let advertised = [
+            "enqueue_print",
+            "travel",
+            "change_owner",
+            "activate",
+            "deactivate",
+            "clear_queue",
+            "system_scan",
+            "retarget",
+            "start_mining",
+            "stellar_census",
+        ];
+        assert_eq!(
+            advertised
+                .iter()
+                .filter(|command| resolved.contains_key(**command))
+                .count(),
+            advertised.len()
+        );
+        assert_eq!(
+            resolved.get("enqueue_print").map(String::as_str),
+            Some("autofactory.print")
+        );
+        assert_eq!(
+            resolved.get("travel").map(String::as_str),
+            Some("device.travel")
+        );
+        assert_eq!(
+            resolved.get("retarget").map(String::as_str),
+            Some("device.retarget")
+        );
+        assert_eq!(
+            resolved.get("start_mining").map(String::as_str),
+            Some("device.start_mining")
+        );
+        assert_eq!(
+            resolved.get("stellar_census").map(String::as_str),
+            Some("device.stellar_census")
+        );
+
+        let lifecycle = actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "device.lifecycle")
+            .expect("lifecycle descriptor");
+        let command_parameter = lifecycle
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "command")
+            .expect("lifecycle command parameter");
+        assert_eq!(
+            lifecycle.device_commands.len(),
+            DEVICE_LIFECYCLE_COMMANDS.len()
+        );
+        for binding in &lifecycle.device_commands {
+            assert_eq!(
+                binding.parameters.get("command").and_then(Value::as_str),
+                Some(binding.command.as_str())
+            );
+            assert!(
+                command_parameter
+                    .options
+                    .iter()
+                    .any(|option| option.value == binding.command && !option.label.is_empty())
+            );
+        }
+        assert!(
+            actions
+                .iter()
+                .find(|descriptor| descriptor.kind.0 == "replicant.slingshot")
+                .expect("slingshot descriptor")
+                .device_commands
+                .is_empty()
+        );
+
+        let mut duplicate_precedence = actions.clone();
+        duplicate_precedence
+            .last_mut()
+            .expect("last descriptor")
+            .device_commands
+            .push(device_binding("travel", []));
+        let first_travel = duplicate_precedence
+            .iter()
+            .find_map(|descriptor| {
+                descriptor
+                    .device_commands
+                    .iter()
+                    .any(|binding| binding.command == "travel")
+                    .then_some(descriptor.kind.0.as_str())
+            })
+            .expect("travel binding");
+        assert_eq!(first_travel, "device.travel");
+
+        let mut forged = OperationCatalogue::new().expect("catalogue");
+        forged.descriptors.actions[0].device_commands = vec![device_binding(
+            "forged",
+            [("device", Value::String("WRONG".to_owned()))],
+        )];
+        assert!(forged.validate_device_command_bindings().is_err());
+
+        let mut duplicate = OperationCatalogue::new().expect("catalogue");
+        let descriptor = duplicate
+            .descriptors
+            .actions
+            .iter_mut()
+            .find(|descriptor| !descriptor.device_commands.is_empty())
+            .expect("bound descriptor");
+        descriptor
+            .device_commands
+            .push(descriptor.device_commands[0].clone());
+        assert!(duplicate.validate_device_command_bindings().is_err());
+    }
 
     #[test]
     fn kinds_are_globally_unique_and_workflows_have_factories() {
