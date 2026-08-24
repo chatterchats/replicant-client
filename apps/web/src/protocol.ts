@@ -950,7 +950,7 @@ export type OperationDescriptor =
   ReportDescriptor | ActionDescriptor | WorkflowDescriptor;
 
 export type FiniteExecutionStatus =
-  "running" | "succeeded" | "skipped" | "failed";
+  "running" | "succeeded" | "skipped" | "failed" | "cancelled";
 
 export interface ResultSummary {
   succeeded: number;
@@ -1666,7 +1666,7 @@ function finiteExecution(value: unknown): FiniteExecution {
     kind: item.kind,
     status: oneOf(
       item.status,
-      ["running", "succeeded", "skipped", "failed"] as const,
+      ["running", "succeeded", "skipped", "failed", "cancelled"] as const,
       "finite execution status",
     ),
     summary: {

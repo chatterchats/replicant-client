@@ -2172,6 +2172,8 @@ pub enum FiniteExecutionStatus {
     Skipped,
     /// Execution failed.
     Failed,
+    /// Execution was cancelled by the operator.
+    Cancelled,
 }
 
 /// Success/skipped/failure counts derived from structured result events.

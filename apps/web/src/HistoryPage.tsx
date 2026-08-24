@@ -13,9 +13,13 @@ type HistoryFilter = "all" | "workflow" | "action" | "report";
 export function ResultView({
   execution,
   onSelectEntity,
+  onCancel,
+  cancelling = false,
 }: {
   execution: FiniteExecution;
   onSelectEntity: (entity: EntityRef) => void;
+  onCancel?: () => void;
+  cancelling?: boolean;
 }) {
   const sections = resultSections(execution.result);
   const excerpt = resultLogExcerpt(execution.result);
@@ -54,6 +58,13 @@ export function ResultView({
         </span>
       </div>
       <div className="result-tools">
+        {execution.operation_class === "action" &&
+        execution.status === "running" &&
+        onCancel ? (
+          <button disabled={cancelling} onClick={onCancel}>
+            {cancelling ? "Cancelling…" : "Cancel action"}
+          </button>
+        ) : null}
         <button
           onClick={() => {
             copy(executionExport(execution));
@@ -134,6 +145,7 @@ export function HistoryPage({
   const [selected, setSelected] = useState<FiniteExecution>();
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [error, setError] = useState<string>();
+  const [cancelling, setCancelling] = useState<string>();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -179,6 +191,22 @@ export function HistoryPage({
       execution,
     })),
   ].sort((left, right) => right.time - left.time);
+
+  const cancelAction = async (execution: FiniteExecution) => {
+    if (!window.confirm(`Cancel ${execution.kind}?`)) return;
+    setError(undefined);
+    setCancelling(execution.id);
+    try {
+      await daemonApi.cancelAction(execution.id);
+      const updated = await daemonApi.history();
+      setExecutions(updated);
+      setSelected(updated.find((item) => item.id === execution.id));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setCancelling(undefined);
+    }
+  };
 
   return (
     <article className="history-page">
@@ -231,7 +259,12 @@ export function HistoryPage({
           )}
         </section>
         {selected ? (
-          <ResultView execution={selected} onSelectEntity={onSelectEntity} />
+          <ResultView
+            execution={selected}
+            onSelectEntity={onSelectEntity}
+            onCancel={() => void cancelAction(selected)}
+            cancelling={cancelling === selected.id}
+          />
         ) : (
           <aside className="result-inspector empty-state">
             Select an action or report to inspect its structured result.

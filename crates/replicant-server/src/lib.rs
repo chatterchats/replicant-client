@@ -113,7 +113,10 @@ use replicant_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex, Notify, broadcast, watch};
+use tokio::{
+    sync::{Mutex, Notify, broadcast, oneshot, watch},
+    task::AbortHandle,
+};
 use tower_http::cors::CorsLayer;
 
 /// Live broadcast capacity. Deltas are coalesced per supervisor tick, so this
@@ -291,6 +294,7 @@ pub struct AppState {
     repository: Arc<WorkflowRepository>,
     supervisor: WorkflowSupervisor,
     catalogue: OperationCatalogue,
+    running_actions: StdMutex<BTreeMap<String, (String, AbortHandle)>>,
     live: broadcast::Sender<LiveMessage>,
     revision: AtomicU64,
     publish_lock: StdMutex<()>,
@@ -352,6 +356,7 @@ impl AppState {
             repository,
             supervisor,
             catalogue,
+            running_actions: StdMutex::new(BTreeMap::new()),
             live: broadcast::channel(LIVE_BUFFER).0,
             revision: AtomicU64::new(revision),
             publish_lock: StdMutex::new(()),
@@ -569,6 +574,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/descriptors", get(descriptors))
         .route("/api/reports/{kind}", post(run_report))
         .route("/api/actions/{kind}", post(run_action))
+        .route("/api/action-executions/{id}/cancel", post(cancel_action))
         .route("/api/history", get(finite_execution_history))
         .route("/api/triggers", get(list_triggers).post(create_trigger))
         .route(
@@ -1074,16 +1080,9 @@ async fn launch_trigger(
                     started_at,
                 )
                 .map_err(|error| error.to_string())?;
-            let spawned = state.clone();
             let kind = trigger.target.kind.clone();
             let parameters = trigger.target.parameters.clone();
-            tokio::spawn(async move {
-                let outcome = spawned
-                    .catalogue
-                    .run_action(spawned.client(), &kind, parameters)
-                    .await;
-                finish_action(&spawned, &execution.id, &kind, outcome);
-            });
+            spawn_action(state.clone(), execution.id, kind, parameters);
             Ok(())
         }
     }
@@ -4769,21 +4768,57 @@ async fn run_action(
         .map_err(ApiError::repository)?;
     let execution = present_execution(execution, ResultSummary::default());
 
-    let spawned = state.clone();
-    let execution_id = execution.id.clone();
-    let spawned_kind = kind.clone();
-    tokio::spawn(async move {
-        let outcome = spawned
-            .catalogue
-            .run_action(spawned.client(), &spawned_kind, request.parameters)
-            .await;
-        finish_action(&spawned, &execution_id, &spawned_kind, outcome);
-    });
+    spawn_action(state, execution.id.clone(), kind, request.parameters);
 
     Ok(Json(Versioned::current(RunOperationResponse {
         result: Value::Null,
         execution,
     })))
+}
+
+fn spawn_action(
+    state: Arc<AppState>,
+    execution_id: String,
+    kind: String,
+    parameters: BTreeMap<String, Value>,
+) {
+    let (registered, registration) = oneshot::channel();
+    let spawned = state.clone();
+    let spawned_id = execution_id.clone();
+    let spawned_kind = kind.clone();
+    let task = tokio::spawn(async move {
+        let _ = registration.await;
+        let outcome = spawned
+            .catalogue
+            .run_action(spawned.client(), &spawned_kind, parameters)
+            .await;
+        finish_action(&spawned, &spawned_id, &spawned_kind, outcome);
+    });
+    lock(&state.running_actions).insert(execution_id, (kind, task.abort_handle()));
+    let _ = registered.send(());
+}
+
+async fn cancel_action(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let (kind, task) = lock(&state.running_actions)
+        .remove(&id)
+        .ok_or_else(ApiError::action_not_running)?;
+    task.abort();
+    state
+        .repository
+        .complete_finite_execution(
+            &id,
+            StoredFiniteExecutionStatus::Cancelled,
+            None,
+            Some("cancelled by operator"),
+        )
+        .map_err(ApiError::repository)?;
+    invalidate_action_slices(&state, &kind);
+    state.invalidate(DomainSlice::History);
+    state.flush_invalidations();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Records an action's outcome and announces it to connected clients.
@@ -4793,6 +4828,9 @@ fn finish_action(
     kind: &str,
     outcome: Result<Value, CatalogueError>,
 ) {
+    if lock(&state.running_actions).remove(execution_id).is_none() {
+        return;
+    }
     let (status, result, error) = match outcome {
         Ok(result) => {
             let result = sanitize_result(result);
@@ -5336,6 +5374,7 @@ fn present_execution(
             StoredFiniteExecutionStatus::Succeeded => ProtocolFiniteExecutionStatus::Succeeded,
             StoredFiniteExecutionStatus::Skipped => ProtocolFiniteExecutionStatus::Skipped,
             StoredFiniteExecutionStatus::Failed => ProtocolFiniteExecutionStatus::Failed,
+            StoredFiniteExecutionStatus::Cancelled => ProtocolFiniteExecutionStatus::Cancelled,
         },
         summary,
         started_at_ms: execution.started_at,
@@ -6319,6 +6358,14 @@ impl ApiError {
         }
     }
 
+    fn action_not_running() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "action_not_running",
+            message: "action execution is not running",
+        }
+    }
+
     fn unavailable() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -6514,6 +6561,43 @@ mod tests {
         )
         .expect("app state");
         (router(state), client)
+    }
+
+    #[tokio::test]
+    async fn running_action_can_be_cancelled() {
+        let (app, client, state) = test_app().await;
+        let execution = state
+            .repository
+            .begin_finite_execution(FiniteExecutionClass::Action, "survey.belt_search", 1)
+            .expect("begin action");
+        let task = tokio::spawn(std::future::pending::<()>());
+        lock(&state.running_actions).insert(
+            execution.id.clone(),
+            ("survey.belt_search".to_owned(), task.abort_handle()),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/action-executions/{}/cancel", execution.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("cancel response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(task.await.expect_err("task aborted").is_cancelled());
+        let stored = state
+            .repository
+            .finite_execution_history()
+            .expect("history")
+            .into_iter()
+            .find(|item| item.id == execution.id)
+            .expect("cancelled action");
+        assert_eq!(stored.status, StoredFiniteExecutionStatus::Cancelled);
+        client.close().await.expect("close client");
     }
 
     async fn next_live(

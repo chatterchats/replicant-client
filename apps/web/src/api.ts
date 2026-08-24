@@ -432,6 +432,9 @@ export const daemonApi = {
       ),
     ).payload;
   },
+  async cancelAction(id: string) {
+    await post(`/api/action-executions/${encodeURIComponent(id)}/cancel`);
+  },
   async controlWorkflow(id: string, action: "pause" | "resume" | "cancel") {
     return parseWorkflowResponse(
       await post(`/api/workflows/${encodeURIComponent(id)}/${action}`),

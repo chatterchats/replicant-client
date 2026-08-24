@@ -29,7 +29,9 @@ const AUTOMATION_POLICY_SCHEMA: &str = include_str!("../migrations/0007_automati
 const RUNTIME_DOCUMENT_SCHEMA: &str = include_str!("../migrations/0008_runtime_documents.sql");
 const FINITE_EXECUTION_RUNNING_SCHEMA: &str =
     include_str!("../migrations/0009_finite_execution_running.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 9;
+const FINITE_EXECUTION_CANCELLED_SCHEMA: &str =
+    include_str!("../migrations/0010_finite_execution_cancelled.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 10;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -300,6 +302,13 @@ impl WorkflowRepository {
             transaction.execute_batch(FINITE_EXECUTION_RUNNING_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (9)",
+                [],
+            )?;
+        }
+        if found < 10 {
+            transaction.execute_batch(FINITE_EXECUTION_CANCELLED_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (10)",
                 [],
             )?;
         }
@@ -895,6 +904,7 @@ impl WorkflowRepository {
                 "succeeded" => FiniteExecutionStatus::Succeeded,
                 "skipped" => FiniteExecutionStatus::Skipped,
                 "failed" => FiniteExecutionStatus::Failed,
+                "cancelled" => FiniteExecutionStatus::Cancelled,
                 value => return Err(invalid_stored_execution(value)),
             };
             let result_json = row.get::<_, Option<String>>(6)?;

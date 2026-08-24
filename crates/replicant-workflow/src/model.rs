@@ -204,6 +204,8 @@ pub enum FiniteExecutionStatus {
     Skipped,
     /// Execution failed.
     Failed,
+    /// Execution was cancelled by the operator.
+    Cancelled,
 }
 
 impl FiniteExecutionStatus {
@@ -213,6 +215,7 @@ impl FiniteExecutionStatus {
             Self::Succeeded => "succeeded",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }

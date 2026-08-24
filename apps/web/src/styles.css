@@ -1361,6 +1361,10 @@ h1 {
   color: var(--danger);
   background: rgba(207, 102, 121, 0.12);
 }
+.result-status.cancelled {
+  color: var(--warning);
+  background: rgba(255, 204, 128, 0.12);
+}
 .result-summary,
 .result-tools,
 .result-links {
