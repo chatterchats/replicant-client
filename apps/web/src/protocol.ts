@@ -224,6 +224,7 @@ export interface DeviceSummary {
   location: string | null;
   available_commands: string[];
   available_directives?: string[];
+  features: string[];
   tags: string[];
   attached_to: string | null;
   stowed_in: string | null;
@@ -235,11 +236,101 @@ export interface DeviceSummary {
   attach_capacity: number | null;
   cargo_capacity: number | null;
   cargo_used: number | null;
+  cargo: CargoResourceSummary[];
+  stow_capacity: number | null;
+  stow_used: number | null;
   operational_capacity_percent: number | null;
+  grace_period_remaining: number | null;
+  upkeep_requirements: Record<string, unknown>[];
+  system_status: Record<string, unknown> | null;
   active_directive: string | null;
   directive_status: string | null;
   travel_destination: string | null;
   claim: DeviceClaim | null;
+}
+
+export interface EntityProvenance {
+  observed_at_ms: number;
+  stale: boolean;
+  reachability: string;
+  source_operation: string;
+}
+
+export interface EntityStatusCount {
+  status: string | null;
+  count: number;
+}
+
+export interface EntityGroupSummary {
+  entity_kind: EntityKind;
+  entity_type: string | null;
+  count: number;
+  statuses: EntityStatusCount[];
+}
+
+export interface EntityCollectionSummary {
+  total: number;
+  items: EntitySummary[];
+  groups: EntityGroupSummary[];
+}
+
+export interface SystemInspectorSummary {
+  name: string | null;
+  spectral_type: string | null;
+  region: string | null;
+  entry_point: string | null;
+  position: GalaxyPoint | null;
+  explored: boolean | null;
+  has_hub: boolean | null;
+  has_ward: boolean | null;
+  has_life: boolean | null;
+  children: EntityCollectionSummary;
+}
+
+export interface LocationEnvironmentSummary {
+  atmosphere: string | null;
+  magnetic_field: boolean | null;
+  gravity_g: number | null;
+  surface_temperature_c: number | null;
+  habitable_zone: boolean | null;
+  life_stage: string | null;
+  axial_tilt_degrees: number | null;
+  rotation_state: string | null;
+  star_spectral_type: string | null;
+  nearby_belt_richness: string | null;
+  distance_from_sol_light_years: number | null;
+}
+
+export interface LocationSurveySummary {
+  planets_total: number | null;
+  planets_scanned: number | null;
+  moons_total: number | null;
+  moons_scanned: number | null;
+  moons_total_estimated: boolean | null;
+}
+
+export interface LocationInspectorSummary {
+  location_type: string | null;
+  system: string | null;
+  parent: string | null;
+  scanned: boolean | null;
+  system_scanned: boolean | null;
+  system_tags: string[];
+  survey: LocationSurveySummary;
+  environment: LocationEnvironmentSummary;
+  contents: EntityCollectionSummary;
+}
+
+export type EntityInspectorDetail =
+  | { kind: "device"; detail: DeviceSummary }
+  | { kind: "system"; detail: SystemInspectorSummary }
+  | { kind: "location"; detail: LocationInspectorSummary };
+
+export interface EntityInspectorSnapshot {
+  metadata: SnapshotMetadata;
+  summary: EntitySummary;
+  provenance: EntityProvenance | null;
+  detail: EntityInspectorDetail;
 }
 
 export interface DevicesSnapshot {
@@ -930,9 +1021,15 @@ export interface ReportDescriptor extends Descriptor {
   risk: "none";
 }
 
+export interface DeviceCommandBinding {
+  command: string;
+  parameters: Record<string, unknown>;
+}
+
 export interface ActionDescriptor extends Descriptor {
   operation_class: "action";
   risk: "none" | "low" | "elevated";
+  device_commands: DeviceCommandBinding[];
 }
 
 export interface WorkflowDescriptor extends Descriptor {
@@ -1650,6 +1747,176 @@ function entitySummary(value: unknown): EntitySummary {
   };
 }
 
+function optionalString(value: unknown, name: string): string | null {
+  return value === undefined ? null : nullableString(value, name);
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "boolean") throw new Error(`Invalid ${name}`);
+  return value;
+}
+
+function optionalNumber(value: unknown, name: string): number | null {
+  return value === undefined ? null : optionalFiniteNumber(value, name);
+}
+
+function optionalInteger(value: unknown, name: string): number | null {
+  if (value === undefined || value === null) return null;
+  return number(value, name);
+}
+
+function entityCollection(value: unknown): EntityCollectionSummary {
+  const item = value === undefined ? {} : record(value, "entity collection");
+  return {
+    total: item.total === undefined ? 0 : number(item.total, "entity collection total"),
+    items:
+      item.items === undefined
+        ? []
+        : array(item.items, "entity collection items").map(entitySummary),
+    groups:
+      item.groups === undefined
+        ? []
+        : array(item.groups, "entity collection groups").map((value) => {
+            const group = record(value, "entity collection group");
+            return {
+              entity_kind: oneOf(group.entity_kind, entityKinds, "entity group kind"),
+              entity_type: optionalString(group.entity_type, "entity group type"),
+              count: number(group.count, "entity group count"),
+              statuses:
+                group.statuses === undefined
+                  ? []
+                  : array(group.statuses, "entity group statuses").map((value) => {
+                      const status = record(value, "entity status count");
+                      return {
+                        status: optionalString(status.status, "entity group status"),
+                        count: number(status.count, "entity status count"),
+                      };
+                    }),
+            };
+          }),
+  };
+}
+
+function locationSurvey(value: unknown): LocationSurveySummary {
+  const item = value === undefined ? {} : record(value, "location survey");
+  return {
+    planets_total: optionalInteger(item.planets_total, "planet total"),
+    planets_scanned: optionalInteger(item.planets_scanned, "planets scanned"),
+    moons_total: optionalInteger(item.moons_total, "moon total"),
+    moons_scanned: optionalInteger(item.moons_scanned, "moons scanned"),
+    moons_total_estimated: optionalBoolean(
+      item.moons_total_estimated,
+      "estimated moon total",
+    ),
+  };
+}
+
+function locationEnvironment(value: unknown): LocationEnvironmentSummary {
+  const item = value === undefined ? {} : record(value, "location environment");
+  return {
+    atmosphere: optionalString(item.atmosphere, "atmosphere"),
+    magnetic_field: optionalBoolean(item.magnetic_field, "magnetic field"),
+    gravity_g: optionalNumber(item.gravity_g, "gravity"),
+    surface_temperature_c: optionalNumber(
+      item.surface_temperature_c,
+      "surface temperature",
+    ),
+    habitable_zone: optionalBoolean(item.habitable_zone, "habitable zone"),
+    life_stage: optionalString(item.life_stage, "life stage"),
+    axial_tilt_degrees: optionalNumber(item.axial_tilt_degrees, "axial tilt"),
+    rotation_state: optionalString(item.rotation_state, "rotation state"),
+    star_spectral_type: optionalString(
+      item.star_spectral_type,
+      "star spectral type",
+    ),
+    nearby_belt_richness: optionalString(
+      item.nearby_belt_richness,
+      "nearby belt richness",
+    ),
+    distance_from_sol_light_years: optionalNumber(
+      item.distance_from_sol_light_years,
+      "distance from Sol",
+    ),
+  };
+}
+
+function entityInspector(value: unknown): EntityInspectorSnapshot {
+  const snapshot = record(value, "entity inspector snapshot");
+  const tagged = record(snapshot.detail, "entity inspector detail");
+  const kind = oneOf(
+    tagged.kind,
+    ["device", "system", "location"] as const,
+    "entity inspector kind",
+  );
+  const detail = record(tagged.detail, "entity inspector kind detail");
+  const provenance =
+    snapshot.provenance === undefined || snapshot.provenance === null
+      ? null
+      : (() => {
+          const item = record(snapshot.provenance, "entity provenance");
+          if (
+            typeof item.stale !== "boolean" ||
+            typeof item.reachability !== "string" ||
+            typeof item.source_operation !== "string"
+          )
+            throw new Error("Invalid entity provenance");
+          return {
+            observed_at_ms: number(item.observed_at_ms, "entity observation time"),
+            stale: item.stale,
+            reachability: item.reachability,
+            source_operation: item.source_operation,
+          };
+        })();
+  let parsedDetail: EntityInspectorDetail;
+  if (kind === "device") {
+    parsedDetail = { kind, detail: parseDeviceSummary(detail) };
+  } else if (kind === "system") {
+    parsedDetail = {
+      kind,
+      detail: {
+        name: optionalString(detail.name, "system name"),
+        spectral_type: optionalString(detail.spectral_type, "spectral type"),
+        region: optionalString(detail.region, "system region"),
+        entry_point: optionalString(detail.entry_point, "region entry point"),
+        position:
+          detail.position === undefined || detail.position === null
+            ? null
+            : point(detail.position),
+        explored: optionalBoolean(detail.explored, "system explored"),
+        has_hub: optionalBoolean(detail.has_hub, "system hub"),
+        has_ward: optionalBoolean(detail.has_ward, "system ward"),
+        has_life: optionalBoolean(detail.has_life, "system life"),
+        children: entityCollection(detail.children),
+      },
+    };
+  } else {
+    parsedDetail = {
+      kind,
+      detail: {
+        location_type: optionalString(detail.location_type, "location type"),
+        system: optionalString(detail.system, "location system"),
+        parent: optionalString(detail.parent, "parent location"),
+        scanned: optionalBoolean(detail.scanned, "location scanned"),
+        system_scanned: optionalBoolean(detail.system_scanned, "system scanned"),
+        system_tags:
+          detail.system_tags === undefined
+            ? []
+            : stringArray(detail.system_tags, "system tags"),
+        survey: locationSurvey(detail.survey),
+        environment: locationEnvironment(detail.environment),
+        contents: entityCollection(detail.contents),
+      },
+    };
+  }
+  return {
+    metadata: metadata(snapshot.metadata),
+    summary: entitySummary(snapshot.summary),
+    provenance,
+    detail: parsedDetail,
+  };
+}
+
 function finiteExecution(value: unknown): FiniteExecution {
   const item = record(value, "finite execution");
   const summary = record(item.summary, "result summary");
@@ -1839,6 +2106,16 @@ export function parseDevicesResponse(
   });
 }
 
+function parseCargoResource(value: unknown): CargoResourceSummary {
+  const resource = record(value, "cargo resource");
+  if (typeof resource.resource !== "string")
+    throw new Error("Invalid cargo resource");
+  return {
+    resource: resource.resource,
+    quantity: number(resource.quantity, "cargo resource quantity"),
+  };
+}
+
 function parseDeviceSummary(value: unknown): DeviceSummary {
   const device = record(value, "device");
   if (typeof device.ownership !== "string")
@@ -1890,6 +2167,10 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
             device.available_directives,
             "available device directives",
           ),
+    features:
+      device.features === undefined
+        ? []
+        : stringArray(device.features, "device features"),
     tags: stringArray(device.tags, "device tags"),
     attached_to: nullableString(device.attached_to, "attached device"),
     stowed_in: nullableString(device.stowed_in, "stowed device"),
@@ -1913,10 +2194,37 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
       device.cargo_used === null
         ? null
         : number(device.cargo_used, "cargo used"),
+    cargo:
+      device.cargo === undefined
+        ? []
+        : array(device.cargo, "device cargo").map(parseCargoResource),
+    stow_capacity:
+      device.stow_capacity === undefined || device.stow_capacity === null
+        ? null
+        : number(device.stow_capacity, "stow capacity"),
+    stow_used:
+      device.stow_used === undefined || device.stow_used === null
+        ? null
+        : number(device.stow_used, "stow used"),
     operational_capacity_percent: optionalFiniteNumber(
       device.operational_capacity_percent,
       "operational capacity",
     ),
+    grace_period_remaining:
+      device.grace_period_remaining === undefined ||
+      device.grace_period_remaining === null
+        ? null
+        : number(device.grace_period_remaining, "grace period remaining"),
+    upkeep_requirements:
+      device.upkeep_requirements === undefined
+        ? []
+        : array(device.upkeep_requirements, "upkeep requirements").map((value) =>
+            record(value, "upkeep requirement"),
+          ),
+    system_status:
+      device.system_status === undefined || device.system_status === null
+        ? null
+        : record(device.system_status, "device system status"),
     active_directive: nullableString(
       device.active_directive,
       "active directive",
@@ -2016,6 +2324,12 @@ export function parseMiningResponse(value: unknown): Versioned<MiningSnapshot> {
       workflows: array(snapshot.workflows, "mining workflows").map(workflow),
     };
   });
+}
+
+export function parseEntityInspectorResponse(
+  value: unknown,
+): Versioned<EntityInspectorSnapshot> {
+  return envelope(value, entityInspector);
 }
 
 export function parseRelayResponse(value: unknown): Versioned<RelaySnapshot> {
@@ -3507,6 +3821,23 @@ export function parseDescriptorsResponse(
             "action operation class",
           ),
           risk: oneOf(item.risk, ["none", "low", "elevated"] as const, "risk"),
+          device_commands:
+            item.device_commands === undefined
+              ? []
+              : array(item.device_commands, "device command bindings").map(
+                  (value) => {
+                    const binding = record(value, "device command binding");
+                    if (typeof binding.command !== "string")
+                      throw new Error("Invalid device command binding");
+                    return {
+                      command: binding.command,
+                      parameters:
+                        binding.parameters === undefined
+                          ? {}
+                          : record(binding.parameters, "device command parameters"),
+                    };
+                  },
+                ),
         };
       }),
       workflows: item.workflows.map(workflowDescriptor),

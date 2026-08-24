@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  PROTOCOL_VERSION,
   parseAutofactoryResponse,
   parseBillFinderResponse,
   parseBobnetResponse,
   parseBootstrapResponse,
   parseCargoResponse,
   parseHealthResponse,
+  parseDescriptorsResponse,
   parseDevicesResponse,
+  parseEntityInspectorResponse,
   parseDirectorResponse,
   parseInventoryResponse,
   parseLeaderboardsResponse,
@@ -96,6 +99,189 @@ describe("parseDevicesResponse", () => {
       owner_name: null,
       claim: null,
     });
+  });
+});
+
+describe("parseEntityInspectorResponse", () => {
+  const summary = {
+    entity: { kind: "device", id: "D-1" },
+    label: "D-1",
+    secondary_label: "vessel",
+    system: "SOL",
+    location: "EARTH",
+    entity_type: "vessel",
+    status: "active",
+  };
+  const envelope = (detail: unknown, provenance: unknown = null) => ({
+    protocol_version: PROTOCOL_VERSION,
+    payload: {
+      metadata: { revision: 42, generated_at_ms: 1000 },
+      summary,
+      provenance,
+      detail,
+    },
+  });
+
+  it("keeps protocol version 1 and defaults missing additive device fields", () => {
+    expect(PROTOCOL_VERSION).toBe(1);
+    const parsed = parseEntityInspectorResponse(
+      envelope({ kind: "device", detail: rawDevice }),
+    );
+    expect(parsed.protocol_version).toBe(1);
+    expect(parsed.payload.detail).toMatchObject({
+      kind: "device",
+      detail: {
+        features: [],
+        cargo: [],
+        stow_capacity: null,
+        stow_used: null,
+        grace_period_remaining: null,
+        upkeep_requirements: [],
+        system_status: null,
+      },
+    });
+  });
+
+  it("parses device, system, and location details with provenance and groups", () => {
+    const provenance = {
+      observed_at_ms: 900,
+      stale: true,
+      reachability: "local",
+      source_operation: "get_device",
+    };
+    const device = parseEntityInspectorResponse(
+      envelope(
+        {
+          kind: "device",
+          detail: {
+            ...rawDevice,
+            features: ["travel"],
+            cargo: [{ resource: "iron", quantity: 3 }],
+            stow_capacity: 10,
+            stow_used: 1,
+            grace_period_remaining: 60,
+            upkeep_requirements: [{ resource: "fuel" }],
+            system_status: { drive: "ready" },
+          },
+        },
+        provenance,
+      ),
+    );
+    expect(device.payload.provenance).toEqual(provenance);
+    expect(device.payload.detail).toMatchObject({
+      kind: "device",
+      detail: { cargo_used: 3, stow_used: 1 },
+    });
+
+    const groups = [
+      {
+        entity_kind: "location",
+        entity_type: "planet",
+        count: 54,
+        statuses: [
+          { status: null, count: 1 },
+          { status: "scanned", count: 53 },
+        ],
+      },
+    ];
+    const system = parseEntityInspectorResponse(
+      envelope({
+        kind: "system",
+        detail: {
+          name: "Sol",
+          spectral_type: "G",
+          region: "Core",
+          entry_point: "SOL",
+          position: { x: 0, y: 0, z: 0 },
+          explored: true,
+          has_hub: false,
+          has_ward: false,
+          has_life: true,
+          children: { total: 54, groups },
+        },
+      }),
+    );
+    expect(system.payload.detail).toMatchObject({
+      kind: "system",
+      detail: { has_hub: false, children: { total: 54, items: [], groups } },
+    });
+
+    const location = parseEntityInspectorResponse(
+      envelope({
+        kind: "location",
+        detail: {
+          location_type: "planet",
+          system: "SOL",
+          scanned: false,
+          system_scanned: true,
+          system_tags: ["home"],
+          survey: {
+            planets_total: 8,
+            planets_scanned: 7,
+            moons_total: 1,
+            moons_scanned: 0,
+            moons_total_estimated: false,
+          },
+          environment: {
+            magnetic_field: false,
+            gravity_g: 0,
+            life_stage: "none",
+          },
+          contents: { total: 393, groups: [] },
+        },
+      }),
+    );
+    expect(location.payload.detail).toMatchObject({
+      kind: "location",
+      detail: {
+        parent: null,
+        environment: {
+          atmosphere: null,
+          magnetic_field: false,
+          gravity_g: 0,
+          life_stage: "none",
+        },
+        contents: { total: 393, items: [] },
+      },
+    });
+  });
+});
+
+describe("parseDescriptorsResponse device bindings", () => {
+  const descriptor = {
+    kind: "device.travel",
+    display_name: "Travel",
+    aliases: [],
+    description: "Travel",
+    category: "devices",
+    operation_class: "action",
+    risk: "low",
+    applicable_to: ["device"],
+    parameters: [],
+  };
+
+  it("parses command bindings and defaults missing additive bindings", () => {
+    const parsed = parseDescriptorsResponse({
+      protocol_version: 1,
+      payload: {
+        reports: [],
+        actions: [
+          descriptor,
+          {
+            ...descriptor,
+            kind: "device.lifecycle",
+            device_commands: [
+              { command: "deactivate", parameters: { command: "deactivate" } },
+            ],
+          },
+        ],
+        workflows: [],
+      },
+    });
+    expect(parsed.payload.actions[0]?.device_commands).toEqual([]);
+    expect(parsed.payload.actions[1]?.device_commands).toEqual([
+      { command: "deactivate", parameters: { command: "deactivate" } },
+    ]);
   });
 });
 

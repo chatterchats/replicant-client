@@ -507,6 +507,9 @@ pub struct DeviceSummary {
     /// Directives currently advertised by the managed device projection.
     #[serde(default)]
     pub available_directives: Vec<String>,
+    /// Capabilities reported by the device.
+    #[serde(default)]
+    pub features: Vec<String>,
     /// User-defined device tags.
     pub tags: Vec<String>,
     /// Parent attachment relationship.
@@ -525,12 +528,30 @@ pub struct DeviceSummary {
     pub stowed_devices: Vec<String>,
     /// Maximum attached-device count, when reported.
     pub attach_capacity: Option<i64>,
-    /// Cargo/stow capacity, when reported.
+    /// Resource cargo capacity, when reported.
     pub cargo_capacity: Option<i64>,
-    /// Used cargo/stow capacity, when reported.
+    /// Sum of positive resource cargo quantities, when reported.
     pub cargo_used: Option<i64>,
+    /// Positive resource cargo entries.
+    #[serde(default)]
+    pub cargo: Vec<CargoResourceSummary>,
+    /// Physical stow capacity, when reported.
+    #[serde(default)]
+    pub stow_capacity: Option<i64>,
+    /// Used physical stow capacity, when reported.
+    #[serde(default)]
+    pub stow_used: Option<i64>,
     /// Normalized operational capacity in percentage points.
     pub operational_capacity_percent: Option<f64>,
+    /// Remaining upkeep grace period, when reported.
+    #[serde(default)]
+    pub grace_period_remaining: Option<i64>,
+    /// Structured upkeep requirements reported by the device.
+    #[serde(default)]
+    pub upkeep_requirements: Vec<BTreeMap<String, Value>>,
+    /// Structured subsystem status reported by the device.
+    #[serde(default)]
+    pub system_status: Option<BTreeMap<String, Value>>,
     /// Active AMI directive wire value, when present.
     pub active_directive: Option<String>,
     /// Active AMI directive status, when present.
@@ -539,6 +560,167 @@ pub struct DeviceSummary {
     pub travel_destination: Option<String>,
     /// Exclusive runtime claim, when held.
     pub claim: Option<DeviceClaim>,
+}
+
+/// Observation metadata for one Inspector projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntityProvenance {
+    /// Unix milliseconds when the authoritative value was observed.
+    pub observed_at_ms: i64,
+    /// Whether the observation exceeded its freshness policy.
+    pub stale: bool,
+    /// Forward-compatible reachability wire value.
+    pub reachability: String,
+    /// Upstream operation that produced the observation.
+    pub source_operation: String,
+}
+
+/// Count for one optional entity status.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntityStatusCount {
+    /// Forward-compatible status, or `None` when unknown.
+    pub status: Option<String>,
+    /// Number of matching entities.
+    pub count: u32,
+}
+
+/// Counted entity group used for large Inspector collections.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntityGroupSummary {
+    /// Normalized entity kind.
+    pub entity_kind: EntityKind,
+    /// Forward-compatible entity type, or `None` when unknown.
+    pub entity_type: Option<String>,
+    /// Number of matching entities.
+    pub count: u32,
+    /// Status buckets sorted by optional status.
+    pub statuses: Vec<EntityStatusCount>,
+}
+
+/// Bounded Inspector collection projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EntityCollectionSummary {
+    /// Total number of entities represented.
+    pub total: u32,
+    /// Sorted entities when the total is at most the inline limit.
+    pub items: Vec<EntitySummary>,
+    /// Sorted counted groups when the total exceeds the inline limit.
+    pub groups: Vec<EntityGroupSummary>,
+}
+
+/// System-specific Inspector projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SystemInspectorSummary {
+    /// Catalogue name, when observed.
+    pub name: Option<String>,
+    /// Stellar spectral type, when observed.
+    pub spectral_type: Option<String>,
+    /// Formal region, when observed.
+    pub region: Option<String>,
+    /// Region entry point, when observed.
+    pub entry_point: Option<String>,
+    /// Galactic position, when observed.
+    pub position: Option<GalaxyPoint>,
+    /// Exploration state, when observed.
+    pub explored: Option<bool>,
+    /// Hub presence, when observed.
+    pub has_hub: Option<bool>,
+    /// Ward presence, when observed.
+    pub has_ward: Option<bool>,
+    /// Life presence, when observed.
+    pub has_life: Option<bool>,
+    /// Bounded child-location projection.
+    pub children: EntityCollectionSummary,
+}
+
+/// Environment facts observed for a location.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocationEnvironmentSummary {
+    /// Atmospheric classification.
+    pub atmosphere: Option<String>,
+    /// Magnetic-field presence.
+    pub magnetic_field: Option<bool>,
+    /// Surface gravity in Earth gravities.
+    pub gravity_g: Option<f64>,
+    /// Surface temperature in Celsius.
+    pub surface_temperature_c: Option<f64>,
+    /// Habitable-zone membership.
+    pub habitable_zone: Option<bool>,
+    /// Life stage, including `none` for observed absence.
+    pub life_stage: Option<String>,
+    /// Axial tilt in degrees.
+    pub axial_tilt_degrees: Option<f64>,
+    /// Rotation-state wire value.
+    pub rotation_state: Option<String>,
+    /// Parent star spectral type.
+    pub star_spectral_type: Option<String>,
+    /// Nearby belt richness.
+    pub nearby_belt_richness: Option<String>,
+    /// Distance from Sol in light years.
+    pub distance_from_sol_light_years: Option<f64>,
+}
+
+/// Survey progress observed for a location.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocationSurveySummary {
+    /// Known total planets.
+    pub planets_total: Option<i64>,
+    /// Known scanned planets.
+    pub planets_scanned: Option<i64>,
+    /// Known total moons.
+    pub moons_total: Option<i64>,
+    /// Known scanned moons.
+    pub moons_scanned: Option<i64>,
+    /// Whether the moon total is estimated.
+    pub moons_total_estimated: Option<bool>,
+}
+
+/// Location-specific Inspector projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocationInspectorSummary {
+    /// Forward-compatible location type.
+    pub location_type: Option<String>,
+    /// Containing system.
+    pub system: Option<String>,
+    /// Parent location.
+    pub parent: Option<String>,
+    /// Location scan state.
+    pub scanned: Option<bool>,
+    /// Containing-system scan state.
+    pub system_scanned: Option<bool>,
+    /// Observed system tags.
+    pub system_tags: Vec<String>,
+    /// Survey progress.
+    pub survey: LocationSurveySummary,
+    /// Environmental facts.
+    pub environment: LocationEnvironmentSummary,
+    /// Bounded physical contents.
+    pub contents: EntityCollectionSummary,
+}
+
+/// Kind-specific payload for an entity Inspector.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum EntityInspectorDetail {
+    /// Managed device details.
+    Device(DeviceSummary),
+    /// Managed system details.
+    System(SystemInspectorSummary),
+    /// Managed location details.
+    Location(LocationInspectorSummary),
+}
+
+/// Authoritative selected-entity Inspector projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EntityInspectorSnapshot {
+    /// Snapshot identity and generation time.
+    pub metadata: SnapshotMetadata,
+    /// Shared entity identity.
+    pub summary: EntitySummary,
+    /// Authoritative observation metadata, when available.
+    pub provenance: Option<EntityProvenance>,
+    /// Kind-specific details.
+    pub detail: EntityInspectorDetail,
 }
 
 /// Typed device fleet projection.
@@ -2571,6 +2753,15 @@ pub struct ReportDescriptor {
     pub parameters: Vec<ParameterDescriptor>,
 }
 
+/// Fixed binding from an advertised device command to an action.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeviceCommandBinding {
+    /// Advertised raw device command.
+    pub command: String,
+    /// Fixed descriptor parameters excluding the selected device.
+    pub parameters: BTreeMap<String, Value>,
+}
+
 /// Descriptor for a finite mutation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionDescriptor {
@@ -2594,6 +2785,9 @@ pub struct ActionDescriptor {
     pub applicable_to: Vec<EntityKind>,
     /// Accepted parameters.
     pub parameters: Vec<ParameterDescriptor>,
+    /// Advertised device commands that execute through this descriptor.
+    #[serde(default)]
+    pub device_commands: Vec<DeviceCommandBinding>,
 }
 
 /// Descriptor for a durable workflow.
@@ -2909,6 +3103,7 @@ mod tests {
             ownership: "owned".to_owned(),
             owner: None,
             owner_name: None,
+            features: Vec::new(),
             system: None,
             region: None,
             location: None,
@@ -2920,7 +3115,13 @@ mod tests {
             controller: None,
             linked_device: None,
             attached_devices: Vec::new(),
+            cargo: Vec::new(),
+            stow_capacity: None,
+            stow_used: None,
             controlled_devices: Vec::new(),
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
             stowed_devices: Vec::new(),
             attach_capacity: None,
             cargo_capacity: None,
@@ -3360,6 +3561,163 @@ mod tests {
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(json["delta"]["type"], "workflow_updated");
         assert!(json.get("upstream_event").is_none());
+    }
+
+    #[test]
+    fn entity_inspector_payload_round_trip() {
+        let metadata = SnapshotMetadata {
+            revision: 42,
+            generated_at_ms: 1_765_000_000_000,
+        };
+        let provenance = Some(EntityProvenance {
+            observed_at_ms: 1_764_999_999_000,
+            stale: true,
+            reachability: "local".to_owned(),
+            source_operation: "get_device".to_owned(),
+        });
+        let summary = EntitySummary {
+            entity: EntityRef {
+                kind: EntityKind::Device,
+                id: EntityId("D-1".to_owned()),
+            },
+            label: "D-1".to_owned(),
+            secondary_label: Some("vessel".to_owned()),
+            system: Some("SOL".to_owned()),
+            location: Some("EARTH".to_owned()),
+            entity_type: Some("vessel".to_owned()),
+            status: Some("active".to_owned()),
+        };
+        let mut device = device();
+        device.features = vec!["travel".to_owned()];
+        device.cargo = vec![CargoResourceSummary {
+            resource: "iron".to_owned(),
+            quantity: 3,
+        }];
+        device.cargo_capacity = Some(20);
+        device.cargo_used = Some(3);
+        device.stow_capacity = Some(10);
+        device.stow_used = Some(1);
+        device.grace_period_remaining = Some(60);
+        device.upkeep_requirements =
+            vec![BTreeMap::from([("resource".to_owned(), Value::String("fuel".to_owned()))])];
+        device.system_status =
+            Some(BTreeMap::from([("drive".to_owned(), Value::String("ready".to_owned()))]));
+        round_trip(&Versioned::current(EntityInspectorSnapshot {
+            metadata: metadata.clone(),
+            summary: summary.clone(),
+            provenance: provenance.clone(),
+            detail: EntityInspectorDetail::Device(device),
+        }));
+
+        let grouped = EntityCollectionSummary {
+            total: 54,
+            items: Vec::new(),
+            groups: vec![EntityGroupSummary {
+                entity_kind: EntityKind::Location,
+                entity_type: Some("planet".to_owned()),
+                count: 54,
+                statuses: vec![
+                    EntityStatusCount {
+                        status: None,
+                        count: 1,
+                    },
+                    EntityStatusCount {
+                        status: Some("scanned".to_owned()),
+                        count: 53,
+                    },
+                ],
+            }],
+        };
+        round_trip(&Versioned::current(EntityInspectorSnapshot {
+            metadata: metadata.clone(),
+            summary: EntitySummary {
+                entity: EntityRef {
+                    kind: EntityKind::System,
+                    id: EntityId("SOL".to_owned()),
+                },
+                label: "Sol".to_owned(),
+                secondary_label: None,
+                system: Some("SOL".to_owned()),
+                location: None,
+                entity_type: Some("G".to_owned()),
+                status: Some("explored".to_owned()),
+            },
+            provenance: provenance.clone(),
+            detail: EntityInspectorDetail::System(SystemInspectorSummary {
+                name: Some("Sol".to_owned()),
+                spectral_type: Some("G".to_owned()),
+                region: Some("Core".to_owned()),
+                entry_point: Some("SOL".to_owned()),
+                position: Some(GalaxyPoint {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                }),
+                explored: Some(true),
+                has_hub: Some(false),
+                has_ward: Some(false),
+                has_life: Some(true),
+                children: grouped,
+            }),
+        }));
+
+        round_trip(&Versioned::current(EntityInspectorSnapshot {
+            metadata,
+            summary,
+            provenance,
+            detail: EntityInspectorDetail::Location(LocationInspectorSummary {
+                location_type: Some("planet".to_owned()),
+                system: Some("SOL".to_owned()),
+                parent: None,
+                scanned: Some(false),
+                system_scanned: Some(true),
+                system_tags: vec!["home".to_owned()],
+                survey: LocationSurveySummary {
+                    planets_total: Some(8),
+                    planets_scanned: Some(7),
+                    moons_total: Some(1),
+                    moons_scanned: Some(0),
+                    moons_total_estimated: Some(false),
+                },
+                environment: LocationEnvironmentSummary {
+                    atmosphere: Some("oxygen".to_owned()),
+                    magnetic_field: Some(false),
+                    gravity_g: Some(0.0),
+                    surface_temperature_c: Some(15.0),
+                    habitable_zone: Some(true),
+                    life_stage: Some("none".to_owned()),
+                    axial_tilt_degrees: Some(23.4),
+                    rotation_state: Some("rotating".to_owned()),
+                    star_spectral_type: Some("G".to_owned()),
+                    nearby_belt_richness: Some("rich".to_owned()),
+                    distance_from_sol_light_years: Some(0.0),
+                },
+                contents: EntityCollectionSummary {
+                    total: 1,
+                    items: vec![EntitySummary {
+                        entity: EntityRef {
+                            kind: EntityKind::Device,
+                            id: EntityId("D-1".to_owned()),
+                        },
+                        label: "D-1".to_owned(),
+                        secondary_label: Some("vessel".to_owned()),
+                        system: Some("SOL".to_owned()),
+                        location: Some("EARTH".to_owned()),
+                        entity_type: Some("vessel".to_owned()),
+                        status: Some("active".to_owned()),
+                    }],
+                    groups: Vec::new(),
+                },
+            }),
+        }));
+
+        round_trip(&DeviceCommandBinding {
+            command: "travel".to_owned(),
+            parameters: BTreeMap::from([(
+                "mode".to_owned(),
+                Value::String("standard".to_owned()),
+            )]),
+        });
     }
 
     #[test]

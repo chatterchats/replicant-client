@@ -1295,6 +1295,7 @@ fn descriptors() -> DescriptorCatalog {
                     required("tag_prefix", "Tag prefix", ParameterKind::Tag),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
+                device_commands: Vec::new(),
             },
             ActionDescriptor {
                 kind: operation_kind("contribute_devices"),
@@ -1321,6 +1322,7 @@ fn descriptors() -> DescriptorCatalog {
                     ),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
+                device_commands: Vec::new(),
             },
             ActionDescriptor {
                 kind: operation_kind("tag_devices"),
@@ -1336,6 +1338,7 @@ fn descriptors() -> DescriptorCatalog {
                     required("tag", "Tag", ParameterKind::Tag),
                     defaulted("dry_run", "Dry run", ParameterKind::Boolean, false),
                 ],
+                device_commands: Vec::new(),
             },
             ActionDescriptor {
                 kind: operation_kind("survey.belt_search"),
@@ -1387,6 +1390,7 @@ fn descriptors() -> DescriptorCatalog {
                         None,
                     ),
                 ],
+                device_commands: Vec::new(),
             },
             simple_action(
                 "bobnet.send",
@@ -1891,6 +1895,7 @@ fn simple_action(
         risk,
         applicable_to,
         parameters,
+        device_commands: Vec::new(),
     }
 }
 
@@ -2789,29 +2794,26 @@ fn enum_parameter(name: &str, label: &str, values: &[&str], default: &str) -> Pa
 }
 
 fn bootstrap_action(kind: &str, display_name: &str, description: &str) -> ActionDescriptor {
-    ActionDescriptor {
-        kind: operation_kind(kind),
-        display_name: display_name.to_owned(),
-        aliases: Vec::new(),
-        description: description.to_owned(),
-        category: "bootstrap".to_owned(),
-        operation_class: OperationClass::Action,
-        risk: MutationRisk::Elevated,
-        applicable_to: vec![EntityKind::System, EntityKind::Location],
-        parameters: vec![
-            required("mission_file", "Mission file", ParameterKind::String),
-            bounded(
-                defaulted(
-                    "wait_timeout_seconds",
-                    "Wait timeout (seconds)",
-                    ParameterKind::Integer,
-                    21_600,
-                ),
-                Some(1.0),
-                None,
+    ActionDescriptor { kind: operation_kind(kind),
+    display_name: display_name.to_owned(),
+    aliases: Vec::new(),
+    description: description.to_owned(),
+    category: "bootstrap".to_owned(),
+    operation_class: OperationClass::Action,
+    risk: MutationRisk::Elevated,
+    applicable_to: vec![EntityKind::System, EntityKind::Location], parameters: vec![
+        required("mission_file", "Mission file", ParameterKind::String),
+        bounded(
+            defaulted(
+                "wait_timeout_seconds",
+                "Wait timeout (seconds)",
+                ParameterKind::Integer,
+                21_600,
             ),
-        ],
-    }
+            Some(1.0),
+            None,
+        ),
+    ], device_commands: Vec::new() }
 }
 
 fn normalize_bobnet_channel(channel: &str) -> Result<String, CatalogueError> {
