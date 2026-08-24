@@ -1,578 +1,216 @@
-# Phase 9 AGENTS.md — Application Pages & Live Projections
+# AGENTS.md
 
-This file is supplemental common context for the Phase 9 prompt pack.
+Rust workspace for Replicant Space automation: a durable API client, an
+application runtime above it, a local daemon, and three frontends.
 
-**Before editing, also read and obey the repository-root `AGENTS.md`.**  
-If this file conflicts with the repository-root `AGENTS.md`, the repository-root file wins unless the current prompt explicitly narrows the Phase 9 implementation.
+This file is injected into every session. It is a map and a rulebook, not a
+tutorial. Read the linked files when you actually need them.
 
-## Phase 9 Mission
+---
 
-Replace the remaining placeholder React navigation pages with useful, daemon-backed application views.
+## Orientation
 
-At the beginning of this phase, the web shell is real, Galaxy/System are real, and the Automation pages are real, but most other navigation entries still fall through to one generic placeholder page.
+Read this section before searching the tree. It exists so you don't have to
+glob your way to the answer.
 
-The target is not merely to make every route look different. Each page should expose a typed application projection built from the managed Replicant client and the existing runtime/daemon architecture.
+| Path | What lives there | Size |
+| --- | --- | --- |
+| `src/raw/` | Typed HTTP transport, one module per API tag. DTOs, pagination, rate-limit metadata. No state. | 9.4k |
+| `src/managed/` | SQLite store, sync engine, durable operations, gateways. The managed `Client`. | — |
+| `src/domain/` | Normalized domain types and pure authority rules. | — |
+| `src/events.rs` | SSE event envelope + typed AMI digest payloads. | — |
+| `src/raw/vocab.rs` | **Event name registry.** Every `foo.bar` event string the client knows. | — |
+| `crates/replicant-runtime/` | Reports, actions, queries, Automation Director, campaign planning. | 64k |
+| `crates/replicant-workflow/` | Durable workflows: supervisor, claims, waits, checkpoints. | 5.5k |
+| `crates/replicant-server/` | `replicantd` — HTTP commands/queries + local WebSocket deltas. | 8.7k |
+| `crates/replicant-protocol/` | Typed daemon↔frontend protocol. `RuntimeSnapshot`, `DomainSlice`, `LiveDelta`. | 3.4k |
+| `crates/replicant-cli/` | Unified CLI. | 5.8k |
+| `crates/replicant-*-planner/`, `-printing`, `-transport` | Pure planning primitives. No I/O. | — |
+| `crates/galaxy-renderer/` | WASM renderer. **Not a workspace member** — built via `make galaxy-wasm`. | 2.2k |
+| `apps/web/` | React + TS + Vite + MUI. | — |
+| `apps/desktop/` | Tauri shell. Wraps `apps/web` and bundles `replicantd` as a sidecar. | — |
+| `reference/replicant-space-*/` | Pinned API doc snapshots + `openapi.json`. Read-only corpus. | — |
+| `policy/` | JSON policy files the contract gates check against. | — |
+| `scripts/` | Python policy checkers and generators. | — |
+| `tests/contract_*.rs` | Per-version contract fixtures. Wiremock-based, no live account. | — |
 
-## Current Repository State
+`replicant-runtime` is 64k lines. Never read it whole — use `grep`, `lsp`, or
+`glob` to reach the specific module. Its submodules are named for their domain
+(`mining.rs`, `survey.rs`, `relay.rs`, `orchestration.rs`, `automation.rs`).
 
-The Phase 9 pack was prepared against the Stage 8-era repository uploaded on 2026-08-15.
+---
 
-Relevant current structure includes:
+## Layering and authority
 
-```text
-apps/web/
-  src/App.tsx
-  src/api.ts
-  src/daemon.tsx
-  src/protocol.ts
-  src/GalaxyPage.tsx
-  src/SystemPage.tsx
-  src/AutomationsPage.tsx
-  src/RequirementsPage.tsx
-  src/HistoryPage.tsx
-
-crates/
-  replicant-protocol/
-  replicant-runtime/
-  replicant-server/
-  replicant-workflow/
-  replicant-cli/
-  ...
+```
+Replicant Space --SSE--> replicant-client --> replicant-runtime
+                                                    |
+                                             replicant-workflow
+                                                    |
+                                              replicantd --WebSocket--> GUI
+                                                    |
+                                            replicant-cli / React / Tauri
 ```
 
-The current navigation is approximately:
+Three databases, three different truths. Do not blur them:
 
-```text
-OPERATIONS
-  Overview
-  Galaxy
-  System
+- **managed client DB** — game/API truth and operation reconciliation.
+- **runtime/workflow DB** — application and workflow truth.
+- **frontend store** — disposable projection. Never authoritative.
 
-ASSETS
-  Devices
-  Inventory
-  Autofactory
-  Cargo
+Upstream is SSE. Daemon→GUI is WebSocket. There is no webhook architecture.
 
-MISSIONS
-  Survey
-  Mining
-  Relay
-  Events
-  Bootstrap
-  Trade
+Two invariants that are easy to violate by accident:
 
-AUTOMATION
-  Automations
-  Requirements
-  History
+- The Automation Director never issues game commands directly. Mechanical work
+  belongs in registered workflows and managed operations.
+- Workforce automation is **grow-only**. Nothing deletes, retires, or scales
+  down Replicants.
 
-INTELLIGENCE
-  Reports
-  Messages
-  Network
-  Standing
-  Leaderboards
+Read `ARCHITECTURE.md` before changing anything in the runtime/workflow/daemon
+layering or adding a workflow kind.
 
-Settings
+---
+
+## Feature tiers
+
+Module boundaries in the root package are enforced by Cargo features, not by
+crates:
+
+```
+raw  ->  events  ->  managed (default)
 ```
 
-At the start of Phase 9, these have dedicated page implementations:
+- `raw` — transport, auth, DTOs, pagination, rate-limit metadata.
+- `events` — SSE framing and streaming, on top of `raw`.
+- `managed` — SQLite store, sync, durable operations, the managed `Client`.
 
-- Galaxy
-- System
-- Automations
-- Requirements
-- History
+Do not add a dependency to a lower tier because a higher tier already uses it.
+Mark feature-specific deps `optional = true` and attach them to the owning
+feature.
 
-The others currently fall through to the generic placeholder in `App.tsx`.
+`Client` (managed) is the normal entry point. `raw` is an explicit escape
+hatch: it never hydrates, persists, publishes, journals, or reconciles.
 
-Always inspect the actual repository before editing because it may have changed since this pack was generated.
+---
 
-## Important Existing Behaviors to Preserve
+## Commands
 
-### Managed Client Is Still Authoritative
+Toolchain is pinned: Rust 1.96.0, edition 2024, MSRV 1.94.
 
-Do not implement page data by directly calling the upstream Replicant API from React or from ad-hoc server HTTP clients.
-
-Use the existing managed client and runtime:
-
-```text
-Replicant Space
-     |
-     | SSE + managed HTTP
-     v
-replicant-client
-     |
-     v
-replicant-runtime
-     |
-     v
-replicantd
-     |
-     +--> typed HTTP projections
-     |
-     +--> local WebSocket invalidations/deltas
-               |
-               v
-             React
+```sh
+make fmt          # format Rust + web + desktop
+make lint         # clippy --all-targets --all-features -D warnings
+make test         # cargo test --all-features
+make check-all    # cargo check --all-features --all-targets
+make doc          # rustdoc, warnings denied
+make policy-checks
+make ci           # everything: lint test check-all doc policy web desktop
 ```
 
-- upstream game events: SSE;
-- daemon-to-GUI updates: local WebSocket;
-- no webhook architecture.
+Cargo aliases: `cargo t` = test all features, `cargo cl` = the clippy gate.
 
-### Device Reads: Prefer the Managed Projection
+Feature-combination checks (no make target exists for these):
 
-Default to `client.devices().cached(code)`, which performs no network request.
-Use `client.devices().get(code)` or `DeviceHandle::refresh()` only when:
-
-1. a mutation must be confirmed before ordering-dependent work continues and
-   its effect is not observable through the event stream;
-2. an explicit staleness signal requires an authoritative poll, such as a
-   cache miss, a lagged/`Gap` watcher, or a wait loop's poll fallback; or
-3. the projection does not carry the required field, such as volatile
-   `/network` data.
-
-On a cache miss, fall back to `get()`. For many devices, prefer a filtered
-`refresh_many()` over a loop of individual `get()` calls. Raw gateway reads
-return endpoint DTOs and remain explicit authoritative requests; do not swap
-them for managed snapshots without verifying every required field.
-
-### Do Not Turn RuntimeSnapshot Into "Everything"
-
-`GET /api/snapshot` is intentionally a compact runtime/lifecycle snapshot.
-
-Do not stuff every device, inventory row, message, event, trade, leaderboard entry, and settings object into `RuntimeSnapshot`.
-
-Instead use typed domain snapshots/endpoints similar in spirit to:
-
-```text
-GET /api/galaxy-scene
-GET /api/system-scene/:system
+```sh
+cargo check --no-default-features --features raw
+cargo check --no-default-features --features events
+cargo check --all-features
 ```
 
-Examples of appropriate future page projections:
+**Cost discipline.** `make ci` builds the full workspace plus the web bundle
+plus the Tauri desktop check. Do not run it to validate a one-line change.
+Iterate with the narrowest thing that proves the change — `cargo check -p
+<crate>`, `cargo test --all-features <testname>`, `npm --prefix apps/web run
+test` — and run `make fmt && make ci` once, at the end, before committing.
 
-```text
-GET /api/overview
-GET /api/devices
-GET /api/inventory
-GET /api/autofactories
-GET /api/cargo
-GET /api/missions/...
-GET /api/events
-GET /api/trade
-GET /api/messages
-GET /api/network
-GET /api/standing
-GET /api/leaderboards
-GET /api/settings
+Frontend and desktop have their own gates: `make web-check`, `make
+desktop-check`. Desktop requires `make desktop-prepare` first (sidecar
+staging); `make ci` already does this.
+
+---
+
+## Contract authority
+
+The highest semantic-version snapshot under `reference/replicant-space-*` is
+the current contract. Tooling resolves it automatically. Current pin lives in
+`Cargo.toml` under `[package.metadata.replicant-space]`, including sha256
+digests of both the doc manifest and the OpenAPI document.
+
+- The reference corpus is **byte-for-byte pinned**. Do not reformat it. The
+  root `.prettierignore` excludes it; do not defeat that.
+- Refresh it only through `make docs-reference-sync`.
+- Rendered-doc deprecation asides override missing OpenAPI `deprecated` flags.
+  See `policy/contract-metadata.json`.
+- Where the rendered docs and `openapi.json` disagree, that disagreement is a
+  finding to record, not a coin flip to resolve silently.
+
+When a change affects which operations, fields, or aliases the client exposes,
+update the relevant file under `policy/` and regenerate:
+
+```sh
+python3 scripts/generate_operation_inventory.py
+python3 scripts/generate_authority_matrix.py
+python3 scripts/contract_policy_check.py
 ```
 
-Exact endpoint grouping may be adjusted if a cleaner typed design emerges.
-
-### Complete Live Projection Plumbing
-
-Current protocol already has concepts such as:
-
-- `DomainSlice`;
-- `LiveDelta::EntityUpsert`;
-- `LiveDelta::EntityRemove`;
-- `LiveDelta::DomainInvalidated`.
-
-At the start of this phase:
-
-- `RuntimeSnapshot` does not carry entity data;
-- the frontend clears `entities` to `{}` whenever a runtime snapshot is applied;
-- the frontend knows how to process entity upsert/remove deltas;
-- the server does not normally publish entity upserts;
-- managed state changes currently invalidate `DomainSlice::Universe`, but most other domain slices are not driven by the state revision watcher.
-
-Phase 9 should finish the intended live-projection architecture instead of creating unrelated polling loops per page.
-
-A good model is:
-
-```text
-managed state revision/event changes
-        |
-        v
-replicantd
-        |
-        +--> invalidate affected domain slice(s)
-        |
-        +--> optional small normalized entity updates/index
-        |
-        v
-local WebSocket
-        |
-        v
-React marks slice stale
-        |
-        v
-visible/interested page refetches typed projection
-```
-
-A coarse invalidation followed by a typed refetch is acceptable when the managed client cannot cheaply identify the exact changed entity.
-
-Correctness and maintainability matter more than micro-optimizing invalidation during this phase.
-
-### Entity Index vs Page Projection
-
-Normalized entities are useful for:
-
-- global inspector;
-- shell/current-replicant context;
-- command-palette defaults;
-- cross-page selection;
-- links from history/activity.
-
-They should **not** become a giant `unknown` blob store that replaces typed page DTOs.
-
-Prefer a small typed entity index/summary projection for cross-cutting shell functionality, while Devices/Inventory/etc. use their own typed snapshots.
-
-### Frontend Page Data Pattern
-
-Prefer one reusable pattern for domain pages:
-
-```text
-typed protocol DTO
-       |
-server projection builder
-       |
-HTTP endpoint
-       |
-daemonApi parser/client
-       |
-page hook/cache
-       |
-DomainSlice invalidation
-       |
-refetch
-```
-
-Do not copy a slightly different `useEffect(fetch(...))` implementation into every page.
-
-The shared page-data helper should support:
-
-- initial loading;
-- abort on unmount/request replacement;
-- explicit refresh;
-- invalidation-triggered refresh;
-- loading state without blanking useful stale data;
-- error state;
-- empty state;
-- revision/last-updated information when useful.
-
-### Use Existing Registered Operations
-
-For mutations and workflows, page buttons should invoke the existing:
-
-- descriptor catalogue;
-- finite reports/actions;
-- durable workflows;
-- command palette/runtime command path.
-
-Do not reimplement Survey/Mining/Relay/Bootstrap/Event/Trade algorithms in React.
-
-Mission pages are **domain dashboards around existing operations**, not alternate workflow engines.
-
-### Global Inspector
-
-The right-hand inspector should become more useful during this phase.
-
-Prefer typed summaries/cards for known entity kinds where practical rather than defaulting to raw JSON.
-
-However, do not make every page dependent on finishing a perfect inspector. Improve it incrementally.
-
-### No Strategic Huwanu/Regional Logistics Yet
-
-A separate future design exists for Regional Event Logistics / Strategic Event Readiness.
-
-Phase 9 should implement a useful normal Events page and existing event fulfillment capabilities, but must **not** expand scope into:
-
-- operational bases;
-- strategic reserve optimization;
-- true galaxy-wide event ETA;
-- regional convoy planning;
-- Huwanu-scale strategic fulfillment.
-
-The Events page should be designed so those features can be added later.
-
-## Page UX Principles
-
-### Tables Are Fine — But Use Them Well
-
-Dense operational data belongs in tables when a table is the clearest representation.
-
-Useful table behavior may include:
-
-- search;
-- sort;
-- filters;
-- sticky headings where helpful;
-- row selection;
-- multi-select only when bulk actions exist;
-- compact status chips;
-- links to system/location/entity inspector;
-- meaningful empty states.
-
-Do not replace useful dense data with a wall of oversized cards merely for aesthetics.
-
-### Keep Visual Language Consistent
-
-Reuse existing shell/map/automation styling:
-
-- existing typography;
-- panel/card treatment;
-- spacing;
-- status dots/chips;
-- buttons;
-- inspector;
-- command palette.
-
-Do not import a second design system for Phase 9.
-
-### Loading / Error / Empty
-
-Every data-backed page must distinguish:
-
-```text
-loading
-error
-empty
-loaded
-```
-
-Do not show "0 devices" when the daemon request actually failed.
-
-### Cross-Page Navigation
-
-Entity links should support flows such as:
-
-```text
-Devices -> select device -> inspector
-Inventory row -> open location/system
-Mission -> workflow detail
-Event -> Galaxy
-Galaxy/System -> domain page where appropriate
-History -> affected entity
-```
-
-Use the shell's existing selection/navigation mechanisms rather than one-off browser URLs where practical.
-
-### Read-Only First
-
-For complicated pages, first land a reliable read-only projection and then connect existing operations.
-
-Do not block the entire page on implementing every possible mutation.
-
-## Domain Expectations
-
-These are intended UX goals, not requirements to invent unavailable backend data.
-
-### Overview
-
-Useful sections can include:
-
-- daemon/sync/automation health;
-- replicants and current locations;
-- active travel;
-- active workflows;
-- workflows needing attention;
-- active/high-value events;
-- resource totals;
-- autofactory utilization;
-- recent activity;
-- current notifications.
-
-Avoid duplicating the entire contents of every other page.
-
-### Devices
-
-Expected high-value columns/filters where data exists:
-
-- code;
-- type;
-- status;
-- system/location;
-- owner/replicant;
-- tag;
-- attached/stowed/controller relationship;
-- health/maintenance/capacity;
-- workflow claim if available.
-
-Support search and useful filters.
-
-### Inventory
-
-Support both:
-
-- location-centric view;
-- resource-centric aggregation.
-
-Useful concepts:
-
-- resource totals;
-- system/location;
-- region if known;
-- selected-resource distribution;
-- selected-location contents.
-
-### Autofactory
-
-Useful concepts:
-
-- factory code/location/owner;
-- active job;
-- queue;
-- availability/status;
-- remaining time;
-- aggregate utilization/throughput.
-
-Reuse existing printing functionality for commands.
-
-### Cargo
-
-Useful concepts:
-
-- carrier/vessel;
-- current location;
-- cargo contents;
-- cargo capacity/remaining capacity;
-- attached-device capacity where applicable;
-- active transport workflow/claim;
-- transport actions.
-
-### Mission Dashboards
-
-Survey / Mining / Relay / Bootstrap should summarize domain state and expose existing planners/workflows.
-
-Do not duplicate Automation workflow-detail UI.
-
-### Events
-
-Initial Phase 9 Events page should support what the current client/runtime actually knows:
-
-- active/discovered events;
-- location/system;
-- type/category/tier;
-- criteria;
-- progress;
-- rewards;
-- existing event workflow state;
-- inspect/show on Galaxy;
-- existing plan/run actions where registered.
-
-Device rewards should be displayed if the current event model supports them by implementation time. If not, do not silently invent them; surface the limitation in the implementation report and keep DTO design extensible.
-
-### Trade
-
-Use the existing managed trading/runtime APIs. Show useful controllers/orders/trades and existing actions. Do not create a second trade engine.
-
-### Reports
-
-This page should be a discoverable UI for registered read-only Report descriptors and their recent results.
-
-### Messages
-
-Use managed BobNet/message capabilities. Prefer channel/relay/history semantics supported by the current SDK.
-
-### Network
-
-Build from actual managed/account/relay/network data. Do not invent a social graph if the SDK does not expose one.
-
-### Standing
-
-Show actual achievement/civilisation/reputation/standing information available from managed state/API.
-
-### Leaderboards
-
-May be refresh-on-demand rather than persistent managed state if the current SDK/API models it that way. Keep it typed and daemon-mediated.
-
-### Settings
-
-Settings should expose **application/runtime configuration**, not secrets.
-
-Potential categories:
-
-- daemon/profile;
-- default replicant;
-- preferred home/system/location values already represented in runtime config;
-- logging;
-- automation safety defaults;
-- UI settings;
-- Docker/headless/desktop environment information where useful;
-- data/database paths in a safe form.
-
-Do not return API keys to React.
-
-Write support should use explicit typed update APIs and safe validation.
-
-## Testing Expectations
-
-For each prompt:
-
-- Rust projection builder tests;
-- protocol serde/round-trip/parser tests;
-- server route tests;
-- frontend reducer/hook/component tests;
-- regression tests for discovered bugs.
-
-Prefer fixture/state-based tests.
-
-Do not require a live Replicant account for `make ci`.
-
-When adding page-data hooks, test invalidation/refetch behavior without timing-dependent sleeps where practical.
-
-## Scope Discipline
-
-Each numbered prompt in this pack should produce **one reviewable Conventional Commit**.
-
-Do not opportunistically implement later prompts.
-
-Small support refactors are allowed when required, but avoid sweeping unrelated architecture changes.
-
-## Mandatory Finalization
-
-Every implementation prompt must end with:
-
-1. inspect:
-   - `git status --short`
-   - final diff for accidental edits;
-2. run:
-   - `make fmt`
-   - `make ci`
-3. fix **all** failures, including Rust, Clippy, tests, docs, policy checks, web checks, and desktop checks;
-4. rerun until everything is green;
-5. stage only the files intentionally changed for the prompt;
-6. create exactly one scoped Conventional Commit.
-
-Examples:
-
-```text
-feat(projections): add typed domain snapshot plumbing
-feat(web): add operations overview
-feat(devices): add device fleet dashboard
-feat(inventory): add resource inventory views
-feat(manufacturing): add autofactory dashboard
-feat(missions): add survey and mining dashboards
-feat(events): add event and trade pages
-feat(intelligence): add reports and communications pages
-feat(settings): add runtime settings page
-```
-
-Do not commit unrelated pre-existing user edits.
-
-## Completion Report
-
-At the end of each Codex prompt, report:
-
-- what changed;
-- important design choices;
-- endpoints/DTOs added;
-- tests added/updated;
-- `make fmt` result;
-- `make ci` result;
-- commit hash and subject;
-- anything intentionally deferred.
+---
+
+## Hard rules
+
+These are gates, not preferences. Do not negotiate with them.
+
+1. **Never weaken a check to make a change pass.** Not clippy, not a test, not
+   a policy script. Fix the implementation, or amend the policy file with an
+   accurate reason and an evidence citation.
+2. **No production `todo!`, `unimplemented!`, unjustified `panic!`, or casual
+   `unwrap`/`expect`.**
+3. **Never commit secrets**: API tokens, authorization headers, private message
+   bodies, or databases containing user data. Secrets live in `.env`
+   (gitignored); `.env.example` holds placeholders only.
+4. **Never log secrets.** The client emits `tracing` events but never records
+   secret values, authorization headers, or request bodies. Keep it that way.
+5. **Do not expose deprecated or admin-only Replicant Space operations**, even
+   through `raw`.
+6. **Do not return API keys to the frontend.** `REPLICANTD_TOKEN` is injected
+   server-side by the web container and never reaches the browser.
+7. **`make ci` must never require a live Replicant account.** Tests are
+   fixture- and wiremock-based.
+
+---
+
+## Conventions
+
+- Rust: `max_width = 100`, field-init shorthand, try shorthand. `missing_docs`
+  is a warning — public items need doc comments.
+- Clippy: `correctness` and `suspicious` are **deny**; `all` is warn. Cognitive
+  complexity threshold is 20.
+- Tests: prefer fixture/state-based over timing-dependent. New contract
+  behaviour gets a case in the matching `tests/contract_<version>.rs`.
+  Regressions get a test.
+- Commits: one reviewable Conventional Commit per logical change
+  (`feat(devices): ...`, `fix(sync): ...`). Stage only files you intended to
+  touch; do not sweep up pre-existing working-tree edits.
+- Prefer a typed managed/domain read over dropping to `raw`. Reach for `raw`
+  only when a clean typed read genuinely does not exist.
+
+---
+
+## Known stale references
+
+Do not trust these; the code is authoritative:
+
+- `CONTRIBUTING.md` describes the repo as a single package with no workspace.
+  It is a 12-member workspace.
+- `CONTRIBUTING.md` cites `docs/implementation/rewrite-guide.md` and
+  `src/lib.rs` cites `docs/contract/`. Neither exists.
+- `CURRENT_STATE.md` is a historical Phase 9 UI snapshot, not current state.
+- `Makefile` `.PHONY` lists `check-raw`, `check-events`, `check-all-features`,
+  `feature-checks`, `observability-policy-check`, and
+  `remediation-policy-check`. None have recipes.
+- `scripts/mutation_adapter_policy_check.py`,
+  `scripts/package_contents_check.py`, and
+  `scripts/phase_11_5_remediation_check.py` exist but are not wired into
+  `make policy-checks`.
+
+If you fix one of these, delete its bullet here.

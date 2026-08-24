@@ -3,8 +3,9 @@
 //!
 //! The crate targets the verified Replicant Space `2.5.1` rendered and
 //! OpenAPI contract. Contract provenance, operation classifications, and
-//! release-specific schema decisions are recorded under `policy/` and
-//! `docs/contract/`.
+//! release-specific schema decisions are recorded under `policy/`; the pinned
+//! snapshot and its digests live in `Cargo.toml` under
+//! `[package.metadata.replicant-space]`.
 //!
 //! [`Client`] is the managed entry point: its gateways return normalized domain
 //! values and commit successful observations before returning. [`raw`] is the

@@ -10,7 +10,7 @@ local path dependencies.
 
 ## Requirements
 
-- Rust 1.94 or newer
+- Rust 1.96.0 (pinned by `rust-toolchain.toml`; declared MSRV is 1.94)
 - A Replicant Space API token for authenticated examples and CLI commands
 - SQLite storage for the managed client (bundled through `rusqlite`)
 
@@ -241,7 +241,7 @@ Frontend-only checks are available through `make web-check`.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo check --no-default-features --features raw
 cargo check --no-default-features --features events

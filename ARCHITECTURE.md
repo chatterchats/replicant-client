@@ -1,4 +1,13 @@
-# Target Architecture Snapshot
+# Architecture
+
+This describes the architecture as **currently implemented**, not an
+aspirational target, with two explicit exceptions called out inline: the
+`Expand FTL Network` and `Establish Beacons` Director goals are persisted goal
+kinds that remain disabled by default.
+
+Read this file before changing the runtime / workflow / daemon layering, adding
+a workflow kind, or touching Director behaviour. `AGENTS.md` carries the
+repository map and the short version of the authority rules.
 
 ```text
 Replicant Space

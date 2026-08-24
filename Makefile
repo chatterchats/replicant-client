@@ -9,7 +9,7 @@ DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 
-.PHONY: help fmt fmt-check galaxy-wasm web-fmt web-fmt-check web-check desktop-fmt desktop-fmt-check desktop-prepare desktop-check desktop-sidecar desktop-dev desktop-build lint test doc check check-raw check-events check-all-features feature-checks contract-policy-check observability-policy-check policy-checks remediation-policy-check docs-reference-sync ci docker-artifacts docker-build docker-check docker-up docker-down observability-up observability-down docker-smoke docker-persistence-smoke zip token token-rotate docker-rebuild-deploy docker-restart
+.PHONY: help build build-workspace check-all ci clean contract-policy-check desktop-build desktop-check desktop-dev desktop-fmt desktop-fmt-check desktop-prepare desktop-sidecar doc docker-artifacts docker-build docker-check docker-down docker-persistence-smoke docker-rebuild-deploy docker-restart docker-smoke docker-up docs-reference-sync else fmt fmt-check galaxy-wasm lint observability-down observability-up policy-checks test token token-rotate web-check web-fmt web-fmt-check zip
 
 help:
 	@printf '%s\n' \
@@ -17,36 +17,52 @@ help:
 	  '' \
 	  'Usage: make <target>' \
 	  '' \
-	  'fmt                    		Format Rust and frontend sources' \
-	  'fmt-check              		Verify Rust and frontend formatting' \
-	  'web-check              		Run frontend format, lint, test, and build checks' \
-	  'desktop-check          		Compile and smoke-test desktop packaging' \
-	  'desktop-sidecar        		Build the release replicantd sidecar' \
-	  'desktop-dev            		Run the desktop development shell' \
-	  'desktop-build          		Build native desktop release packages' \
-	  'lint                   		Run Clippy with warnings denied' \
-	  'test                   		Run tests with all features enabled' \
-	  'doc                    		Build docs with warnings denied' \
-	  'feature-checks         		cargo check across the supported feature combinations' \
-	  'contract-policy-check  		Verify the current Replicant Space operation inventory and exclusions' \
-	  'observability-policy-check 	Verify tracing targets, timing events, and secret guards' \
-	  'policy-checks          		Run all checked-in policy gates' \
-	  'ci                    		Run the full local CI-equivalent suite' \
-	  'docker-artifacts      		Build release daemon + web artifacts locally' \
-	  'docker-build          		Build locally, then package production images' \
-	  'docker-check          		Validate Compose and build the production images' \
-	  'docker-up             		Start the production Compose stack' \
-	  'docker-down           		Stop the stack without deleting durable data' \
-	  'observability-up      		Start Grafana with the provisioned Replicant telemetry dashboard' \
-	  'observability-down    		Stop the optional Grafana companion service' \
-	  'docker-smoke          		Start and probe a configured full stack' \
-	  'docker-persistence-smoke		Prove the data directory survives container recreation' \
-	  'docker-rebuild-deploy		Rebuild and redeploy the stack' \
-	  'docker-restart         		Restart the running stack' \
-	  'docs-reference-sync    		Refresh the newest versioned Replicant Space reference snapshot' \
-	  'zip                    		Create a clean working-tree ZIP for handoff' \
-	  'token                  		Generate a new REPLICANTD_TOKEN in .env if not present' \
-	  'token-rotate           		Rotate the REPLICANTD_TOKEN in .env
+	  'Gates' \
+	  '  ci                       Full local CI-equivalent suite (expensive)' \
+	  '  lint                     Clippy with warnings denied' \
+	  '  test                     cargo test --all-features' \
+	  '  check-all                cargo check --all-features --all-targets' \
+	  '  doc                      Build docs with warnings denied' \
+	  '  policy-checks            Run all checked-in policy gates' \
+	  '  contract-policy-check    Verify operation inventory and exclusions only' \
+	  '' \
+	  'Build and format' \
+	  '  build                    cargo build --all-features (root package)' \
+	  '  build-workspace          cargo build --workspace --all-features' \
+	  '  clean                    cargo clean' \
+	  '  fmt                      Format Rust and frontend sources' \
+	  '  fmt-check                Verify Rust and frontend formatting' \
+	  '  galaxy-wasm              Build the WASM galaxy renderer into apps/web' \
+	  '' \
+	  'Frontend and desktop' \
+	  '  web-check                Frontend format, lint, test, and build checks' \
+	  '  desktop-check            Compile and smoke-test desktop packaging' \
+	  '  desktop-sidecar          Build the release replicantd sidecar' \
+	  '  desktop-dev              Run the desktop development shell' \
+	  '  desktop-build            Build native desktop release packages' \
+	  '' \
+	  'Docker and observability' \
+	  '  docker-artifacts         Build release daemon + web artifacts locally' \
+	  '  docker-build             Build locally, then package production images' \
+	  '  docker-check             Validate Compose and build the production images' \
+	  '  docker-up                Start the production Compose stack' \
+	  '  docker-down              Stop the stack without deleting durable data' \
+	  '  docker-restart           Restart the running stack' \
+	  '  docker-rebuild-deploy    Rebuild and redeploy the stack' \
+	  '  docker-smoke             Start and probe a configured full stack' \
+	  '  docker-persistence-smoke Prove the data directory survives recreation' \
+	  '  observability-up         Start Grafana with the provisioned dashboards' \
+	  '  observability-down       Stop the optional Grafana companion service' \
+	  '' \
+	  'Utilities' \
+	  '  docs-reference-sync      Refresh the newest Replicant Space reference snapshot' \
+	  '  zip                      Create a clean working-tree ZIP for handoff' \
+	  '  token                    Generate a REPLICANTD_TOKEN in .env if not present' \
+	  '  token-rotate             Rotate the REPLICANTD_TOKEN in .env' \
+	  '' \
+	  'Feature-combination checks have no target; run cargo directly:' \
+	  '  cargo check --no-default-features --features raw' \
+	  '  cargo check --no-default-features --features events'
 
 clean:
 	$(CARGO) clean
