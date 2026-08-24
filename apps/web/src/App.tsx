@@ -408,6 +408,7 @@ export function specializeDeviceCommand(
           parameter.name === "directive"
             ? {
                 ...parameter,
+                kind: { type: "enum" as const },
                 options: (device.available_directives ?? []).map(
                   (directive) => ({
                     value: directive,

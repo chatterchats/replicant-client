@@ -471,5 +471,6 @@ describe("device inspector labels", () => {
       { value: "gather_evenly", label: "gather evenly" },
       { value: "patrol", label: "patrol" },
     ]);
+    expect(directive.descriptor.parameters[0]?.kind).toEqual({ type: "enum" });
   });
 });

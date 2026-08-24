@@ -1615,7 +1615,7 @@ fn descriptors() -> DescriptorCatalog {
                 vec![EntityKind::Device],
                 vec![
                     required("device", "Device", ParameterKind::Device),
-                    required("directive", "Directive", ParameterKind::Enum),
+                    required("directive", "Directive", ParameterKind::String),
                     optional("resources_json", "Resources JSON", ParameterKind::String),
                     optional("ratios_json", "Ratios JSON", ParameterKind::String),
                     optional("location", "Location", ParameterKind::Location),
@@ -3697,6 +3697,24 @@ mod tests {
                     .iter()
                     .any(|descriptor| descriptor.kind.0 == kind),
                 "missing {kind} descriptor"
+            );
+        }
+        for directive in ["belt_search", "deplete_smallest"] {
+            let parameters = BTreeMap::from([
+                ("device".to_owned(), Value::String("AMI-1".to_owned())),
+                ("directive".to_owned(), Value::String(directive.to_owned())),
+            ]);
+            catalogue
+                .validate_invocation(
+                    OperationClass::Action,
+                    "device.set_directive",
+                    parameters.clone(),
+                )
+                .expect("parameterless directive should validate");
+            let input: DeviceDirectiveAction = decode(parameters).expect("directive input");
+            assert_eq!(
+                directive_configuration(&input).expect("configuration"),
+                None
             );
         }
         let input = DeviceDirectiveAction {
