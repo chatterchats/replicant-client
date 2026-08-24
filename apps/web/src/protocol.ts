@@ -224,7 +224,7 @@ export interface DeviceSummary {
   location: string | null;
   available_commands: string[];
   available_directives?: string[];
-  features: string[];
+  features?: string[];
   tags: string[];
   attached_to: string | null;
   stowed_in: string | null;
@@ -236,13 +236,13 @@ export interface DeviceSummary {
   attach_capacity: number | null;
   cargo_capacity: number | null;
   cargo_used: number | null;
-  cargo: CargoResourceSummary[];
-  stow_capacity: number | null;
-  stow_used: number | null;
+  cargo?: CargoResourceSummary[];
+  stow_capacity?: number | null;
+  stow_used?: number | null;
   operational_capacity_percent: number | null;
-  grace_period_remaining: number | null;
-  upkeep_requirements: Record<string, unknown>[];
-  system_status: Record<string, unknown> | null;
+  grace_period_remaining?: number | null;
+  upkeep_requirements?: Record<string, unknown>[];
+  system_status?: Record<string, unknown> | null;
   active_directive: string | null;
   directive_status: string | null;
   travel_destination: string | null;
@@ -1029,7 +1029,7 @@ export interface DeviceCommandBinding {
 export interface ActionDescriptor extends Descriptor {
   operation_class: "action";
   risk: "none" | "low" | "elevated";
-  device_commands: DeviceCommandBinding[];
+  device_commands?: DeviceCommandBinding[];
 }
 
 export interface WorkflowDescriptor extends Descriptor {
@@ -1769,7 +1769,10 @@ function optionalInteger(value: unknown, name: string): number | null {
 function entityCollection(value: unknown): EntityCollectionSummary {
   const item = value === undefined ? {} : record(value, "entity collection");
   return {
-    total: item.total === undefined ? 0 : number(item.total, "entity collection total"),
+    total:
+      item.total === undefined
+        ? 0
+        : number(item.total, "entity collection total"),
     items:
       item.items === undefined
         ? []
@@ -1780,19 +1783,31 @@ function entityCollection(value: unknown): EntityCollectionSummary {
         : array(item.groups, "entity collection groups").map((value) => {
             const group = record(value, "entity collection group");
             return {
-              entity_kind: oneOf(group.entity_kind, entityKinds, "entity group kind"),
-              entity_type: optionalString(group.entity_type, "entity group type"),
+              entity_kind: oneOf(
+                group.entity_kind,
+                entityKinds,
+                "entity group kind",
+              ),
+              entity_type: optionalString(
+                group.entity_type,
+                "entity group type",
+              ),
               count: number(group.count, "entity group count"),
               statuses:
                 group.statuses === undefined
                   ? []
-                  : array(group.statuses, "entity group statuses").map((value) => {
-                      const status = record(value, "entity status count");
-                      return {
-                        status: optionalString(status.status, "entity group status"),
-                        count: number(status.count, "entity status count"),
-                      };
-                    }),
+                  : array(group.statuses, "entity group statuses").map(
+                      (value) => {
+                        const status = record(value, "entity status count");
+                        return {
+                          status: optionalString(
+                            status.status,
+                            "entity group status",
+                          ),
+                          count: number(status.count, "entity status count"),
+                        };
+                      },
+                    ),
             };
           }),
   };
@@ -1862,7 +1877,10 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
           )
             throw new Error("Invalid entity provenance");
           return {
-            observed_at_ms: number(item.observed_at_ms, "entity observation time"),
+            observed_at_ms: number(
+              item.observed_at_ms,
+              "entity observation time",
+            ),
             stale: item.stale,
             reachability: item.reachability,
             source_operation: item.source_operation,
@@ -1898,7 +1916,10 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
         system: optionalString(detail.system, "location system"),
         parent: optionalString(detail.parent, "parent location"),
         scanned: optionalBoolean(detail.scanned, "location scanned"),
-        system_scanned: optionalBoolean(detail.system_scanned, "system scanned"),
+        system_scanned: optionalBoolean(
+          detail.system_scanned,
+          "system scanned",
+        ),
         system_tags:
           detail.system_tags === undefined
             ? []
@@ -2218,8 +2239,8 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
     upkeep_requirements:
       device.upkeep_requirements === undefined
         ? []
-        : array(device.upkeep_requirements, "upkeep requirements").map((value) =>
-            record(value, "upkeep requirement"),
+        : array(device.upkeep_requirements, "upkeep requirements").map(
+            (value) => record(value, "upkeep requirement"),
           ),
     system_status:
       device.system_status === undefined || device.system_status === null
@@ -3834,7 +3855,10 @@ export function parseDescriptorsResponse(
                       parameters:
                         binding.parameters === undefined
                           ? {}
-                          : record(binding.parameters, "device command parameters"),
+                          : record(
+                              binding.parameters,
+                              "device command parameters",
+                            ),
                     };
                   },
                 ),
