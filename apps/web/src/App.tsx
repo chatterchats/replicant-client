@@ -430,6 +430,19 @@ export function App() {
     setSelectedAutomationWorkflow(workflowId);
     navigate("Automations");
   };
+  const finishOperation = (execution: FiniteExecution) => {
+    setSelectedExecution(execution);
+    setCommandResult({
+      message:
+        execution.status === "running"
+          ? `${execution.kind} started`
+          : `${execution.kind} ${execution.status}`,
+      actionLabel: "View in History",
+      onAction: () => {
+        navigate("History");
+      },
+    });
+  };
   const openNotification = (notification: Notification) => {
     const workflowMatch = /^workflow:([^:]+):attention$/.exec(notification.id);
     if (workflowMatch?.[1]) {
@@ -845,10 +858,12 @@ export function App() {
 
           {shell.inspectorOpen && shell.selectedEntity ? (
             <Inspector
+              key={`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`}
               entity={shell.selectedEntity}
               value={selectedValue}
               descriptors={descriptors}
               entities={entities}
+              activity={activity}
               onClose={() => {
                 dispatch({ type: "toggle_inspector" });
               }}
@@ -859,6 +874,7 @@ export function App() {
               onOpenSystem={openSystem}
               onOpenWorkflow={openWorkflow}
               onRunCommand={runCommand}
+              onOperationFinished={finishOperation}
             />
           ) : null}
         </div>
@@ -972,19 +988,7 @@ export function App() {
               },
             });
           }}
-          onOperationFinished={(execution) => {
-            setSelectedExecution(execution);
-            setCommandResult({
-              message:
-                execution.status === "running"
-                  ? `${execution.kind} started`
-                  : `${execution.kind} ${execution.status}`,
-              actionLabel: "View in History",
-              onAction: () => {
-                navigate("History");
-              },
-            });
-          }}
+          onOperationFinished={finishOperation}
         />
       ) : null}
 

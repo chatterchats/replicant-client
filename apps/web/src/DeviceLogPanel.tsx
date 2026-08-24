@@ -36,11 +36,9 @@ export function DeviceLogPanel({ device }: { device: string }) {
             .slice(0, 20)
             .map((event, index) => (
               <article className="activity-item" key={event.id ?? index}>
-                <small>
-                  {event.created_at
-                    ? new Date(event.created_at).toLocaleString()
-                    : "Unknown time"}
-                </small>
+                {event.created_at ? (
+                  <small>{new Date(event.created_at).toLocaleString()}</small>
+                ) : null}
                 <strong>{event.event_type ?? "device event"}</strong>
                 <p>{event.message ?? JSON.stringify(event.payload)}</p>
               </article>

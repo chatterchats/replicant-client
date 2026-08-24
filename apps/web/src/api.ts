@@ -11,6 +11,7 @@ import {
   parseDescriptorsResponse,
   parseDeviceLogsResponse,
   parseDevicesResponse,
+  parseEntityInspectorResponse,
   parseDirectoryReplicantResponse,
   parseDirectoryResponse,
   parseInventoryResponse,
@@ -232,6 +233,14 @@ export const daemonApi = {
   },
   async devices(signal?: AbortSignal) {
     return parseDevicesResponse(await get("/api/devices", signal)).payload;
+  },
+  async entityInspector(kind: string, id: string, signal?: AbortSignal) {
+    return parseEntityInspectorResponse(
+      await get(
+        `/api/entities/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`,
+        signal,
+      ),
+    ).payload;
   },
   async inventory(signal?: AbortSignal) {
     return parseInventoryResponse(await get("/api/inventory", signal)).payload;

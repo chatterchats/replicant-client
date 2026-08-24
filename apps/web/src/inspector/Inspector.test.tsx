@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type { DescriptorCatalog } from "../protocol";
-import { Inspector } from "./Inspector";
+import { Inspector, InspectorView } from "./Inspector";
 
 const descriptors: DescriptorCatalog = {
   reports: [],
@@ -19,6 +19,7 @@ const callbacks = {
   onOpenSystem: vi.fn(),
   onOpenWorkflow: vi.fn(),
   onRunCommand: vi.fn(),
+  onOperationFinished: vi.fn(),
 };
 
 function render(
@@ -26,12 +27,15 @@ function render(
   value: unknown,
 ) {
   return renderToStaticMarkup(
-    <Inspector
-      entity={{ kind, id: "TEST" }}
-      value={value}
-      descriptors={descriptors}
-      entities={{}}
-      {...callbacks}
+    <InspectorView
+      props={{
+        entity: { kind, id: "TEST" },
+        value,
+        descriptors,
+        entities: {},
+        activity: [],
+        ...callbacks,
+      }}
     />,
   );
 }
@@ -157,6 +161,7 @@ describe("Inspector extraction", () => {
           value={undefined}
           descriptors={descriptors}
           entities={{}}
+          activity={[]}
           {...callbacks}
         />,
       );

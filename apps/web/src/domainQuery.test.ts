@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createRequestGate } from "./domainQuery";
+import { createRequestGate, domainInvalidationKey } from "./domainQuery";
 
 describe("domain request gate", () => {
   it("coalesces repeated invalidations behind one trailing refresh", async () => {
@@ -71,5 +71,35 @@ describe("domain request gate", () => {
     void gate.run();
     gate.abort();
     expect(signal?.aborted).toBe(true);
+  });
+
+  it("tracks every listed slice revision independently", () => {
+    const slices = ["universe", "devices", "entities"] as const;
+    const initial = domainInvalidationKey(slices, {
+      universe: 1,
+      devices: 2,
+      entities: 3,
+    });
+    expect(
+      domainInvalidationKey(slices, {
+        universe: 2,
+        devices: 2,
+        entities: 3,
+      }),
+    ).not.toBe(initial);
+    expect(
+      domainInvalidationKey(slices, {
+        universe: 1,
+        devices: 3,
+        entities: 3,
+      }),
+    ).not.toBe(initial);
+    expect(
+      domainInvalidationKey(slices, {
+        universe: 1,
+        devices: 2,
+        entities: 4,
+      }),
+    ).not.toBe(initial);
   });
 });

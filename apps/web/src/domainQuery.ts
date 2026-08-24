@@ -75,18 +75,27 @@ export function createRequestGate<T>(
   };
 }
 
+export function domainInvalidationKey(
+  slice: DomainSlice | readonly DomainSlice[] | undefined,
+  invalidated: Partial<Record<DomainSlice, number>>,
+): string {
+  const slices: readonly DomainSlice[] =
+    slice === undefined ? [] : typeof slice === "string" ? [slice] : slice;
+  return slices.map((item) => invalidated[item]).join(":");
+}
+
 export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   slice,
   fetcher,
   isEmpty,
 }: {
   /** Omit for data with no corresponding live invalidation slice; use `refresh()` instead. */
-  slice?: DomainSlice;
+  slice?: DomainSlice | readonly DomainSlice[];
   fetcher: (signal: AbortSignal) => Promise<T>;
   isEmpty: (value: T) => boolean;
 }): DomainQueryResult<T> {
   const invalidated = useDaemonState().invalidated;
-  const invalidation = slice ? invalidated[slice] : undefined;
+  const invalidation = domainInvalidationKey(slice, invalidated);
   const fetcherRef = useRef(fetcher);
   const isEmptyRef = useRef(isEmpty);
   fetcherRef.current = fetcher;

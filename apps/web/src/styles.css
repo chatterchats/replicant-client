@@ -3475,3 +3475,72 @@ h1 {
   grid-template-columns: minmax(110px, 0.6fr) minmax(0, 1.4fr);
   gap: 10px;
 }
+
+.inspector-vitals,
+.inspector-provenance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.inspector-provenance {
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 0;
+}
+
+.inspector-fields {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.inspector-field {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.7fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.inspector-field dt {
+  color: var(--text-muted);
+}
+
+.inspector-field dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.inspector-groups {
+  display: grid;
+  gap: 8px;
+}
+
+.inspector-groups label {
+  display: grid;
+  gap: 4px;
+}
+
+.inspector-group {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.inspector-group summary,
+.inspector-group li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.inspector-group ul {
+  display: grid;
+  gap: 5px;
+  margin: 8px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  list-style: none;
+}
