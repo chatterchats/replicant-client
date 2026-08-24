@@ -34,6 +34,25 @@ use super::{
     store::{StoreError, StoreHandle},
 };
 
+fn data_directory(home: Option<&std::ffi::OsStr>) -> PathBuf {
+    home.map_or_else(
+        || PathBuf::from(".local/share/replicant"),
+        |home| PathBuf::from(home).join(".local/share/replicant"),
+    )
+}
+
+/// Returns the shared directory used for Replicant application data.
+#[must_use]
+pub fn default_data_directory() -> PathBuf {
+    data_directory(std::env::var_os("HOME").as_deref())
+}
+
+/// Returns the default managed-client SQLite database path.
+#[must_use]
+pub fn default_database_path() -> PathBuf {
+    default_data_directory().join("replicant-client.sqlite")
+}
+
 /// Controls how much remote work is required before [`Client::ready`] succeeds.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -332,7 +351,7 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             raw: RawClientBuilder::new(),
-            storage: Storage::File(PathBuf::from("replicant-client.sqlite")),
+            storage: Storage::File(default_database_path()),
             startup_policy: StartupPolicy::Essential,
             read_rate_limit_policy: None,
             action_rate_limit_policy: None,
@@ -1562,6 +1581,18 @@ mod tests {
             .expect_err("different account is rejected");
         assert!(matches!(error, Error::AccountStoreMismatch { .. }));
         std::fs::remove_file(path).expect("remove database");
+    }
+
+    #[test]
+    fn database_defaults_live_under_the_user_data_directory() {
+        assert_eq!(
+            data_directory(Some(std::ffi::OsStr::new("/home/test"))),
+            PathBuf::from("/home/test/.local/share/replicant"),
+        );
+        assert_eq!(
+            data_directory(None),
+            PathBuf::from(".local/share/replicant"),
+        );
     }
 
     #[test]

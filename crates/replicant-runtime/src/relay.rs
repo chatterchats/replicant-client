@@ -22,7 +22,7 @@
 //! Environment:
 //!
 //! - `RS_API_TOKEN` (required)
-//! - `REPLICANT_DB=replicant-client.sqlite`
+//! - `REPLICANT_DB=~/.local/share/replicant/replicant-client.sqlite`
 //! - `RS_RELAY_REPLICANT=Chats-1`
 //! - `RS_RELAY_HUB=SCEPTURUM-BELT-1`
 //! - `RS_RELAY_PLAN=ftl-relay-expansion.json`
@@ -184,9 +184,9 @@ impl Config {
                 ));
             }
         };
-        let mut database = PathBuf::from(
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
-        );
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let mut replicant = env::var("RS_RELAY_REPLICANT").unwrap_or_else(|_| "Chats-1".into());
         let mut hub = env::var("RS_RELAY_HUB").unwrap_or_else(|_| "SCEPTURUM-BELT-1".into());
         let mut plan_path = PathBuf::from(

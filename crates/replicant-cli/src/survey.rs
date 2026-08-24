@@ -88,7 +88,7 @@ fn parse(arguments: Vec<String>) -> crate::AnyResult<Config> {
     };
     let mut database = env::var_os("REPLICANT_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "replicant-client.sqlite".into());
+        .unwrap_or_else(replicant_client::default_database_path);
     let mut replicant = env_string("RS_EXPLORE_REPLICANT", "B6BA399E");
     let mut vessel = env_string("RS_EXPLORE_VESSEL", "FD5EA802");
     let mut center = env_string("RS_EXPLORE_CENTER", "SCEPTURUM").to_ascii_uppercase();

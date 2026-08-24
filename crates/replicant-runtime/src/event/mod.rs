@@ -80,12 +80,12 @@ impl Config {
         let mut criterion = None;
         let mut replicant = env::var("RS_EVENT_REPLICANT").ok();
         let mut home = env::var("RS_EVENT_HOME").unwrap_or_else(|_| DEFAULT_HOME.into());
-        let mut database = PathBuf::from(
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
-        );
-        let mut runtime_database = PathBuf::from(
-            env::var("REPLICANT_RUNTIME_DB").unwrap_or_else(|_| "replicant-runtime.sqlite".into()),
-        );
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
+        let mut runtime_database = env::var_os("REPLICANT_RUNTIME_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::config::default_runtime_database_path);
         let mut plan_path =
             PathBuf::from(env::var("RS_EVENT_PLAN").unwrap_or_else(|_| DEFAULT_PLAN_PATH.into()));
         let mut replace_plan = false;
@@ -364,7 +364,7 @@ fn print_help() {
     println!(
         "Replicant event logistics\n\n\
 Usage:\n  replicant-cli event\n  replicant-cli event --list [OPTIONS]\n  replicant-cli event --plan [EVENT] [OPTIONS]\n  replicant-cli event --plan --all [OPTIONS]\n  replicant-cli event --run [OPTIONS]\n  replicant-cli event --status [OPTIONS]\n  replicant-cli event reconcile-stock [--dry-run|--execute] [OPTIONS]\n\n\
-Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --region REGION           Limit discovery to a catalogue region\n  --center LOCATION         Radius centre; accepts a star, system, or location\n  --radius LY               Limit discovery to LY around --center or --home\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --runtime-database PATH   Workflow SQLite database (default: replicant-runtime.sqlite)\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  --dry-run                 Report reconcile-stock changes without mutations (default)\n  --execute                 Apply reconcile-stock tag changes\n  -h, --help                Show this help\n\n\
+Options:\n  --event DESIGNATION       Event to plan\n  --criterion NAME          Completion option to select\n  --all                     Plan every active discovered event\n  --region REGION           Limit discovery to a catalogue region\n  --center LOCATION         Radius centre; accepts a star, system, or location\n  --radius LY               Limit discovery to LY around --center or --home\n  --replicant NAME_OR_CODE  Defaults to Chats-1; interactive mode permits selection\n  --home LOCATION           Home/manufacturing hub (default: SCEPTURUM-BELT-1)\n  --database PATH           Managed SQLite database\n  --runtime-database PATH   Workflow SQLite database (default: ~/.local/share/replicant/replicant-runtime.sqlite)\n  --plan-file PATH          Saved mission or campaign (default: event-mission.json)\n  --replace-plan            Replace an existing active plan\n  --wait-timeout-secs N     Per-phase wait timeout (default: 21600)\n  --verbose                 Show tracing logs in the terminal\n  --log-file PATH           Append tracing logs to a file\n  --json                    Emit machine-readable JSON\n  --dry-run                 Report reconcile-stock changes without mutations (default)\n  --execute                 Apply reconcile-stock tag changes\n  -h, --help                Show this help\n\n\
 Planning performs no gameplay mutations. Run always reconciles and continues\n\
 the persisted mission or all-events campaign; there is no separate resume\n\
 command. `reconcile-stock` is dry-run by default; its --execute flag applies\n\

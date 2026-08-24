@@ -4,7 +4,7 @@
 //! Environment variables:
 //!
 //! - `RS_API_TOKEN` — required bearer token.
-//! - `REPLICANT_DB` — SQLite path; defaults to `replicant-client.sqlite`.
+//! - `REPLICANT_DB` — SQLite path; defaults under `~/.local/share/replicant`.
 //!
 //! Run with:
 //!
@@ -30,7 +30,7 @@ async fn main() -> AnyResult<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "RS_API_TOKEN is not set"))?;
     let database = env::var_os("REPLICANT_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
+        .unwrap_or_else(replicant_client::default_database_path);
 
     let client = Client::builder()
         .authentication_token(token)

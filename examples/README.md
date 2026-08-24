@@ -38,7 +38,7 @@ The examples use two historical token names:
   report.
 
 Managed examples usually use `REPLICANT_DB`, defaulting to
-`replicant-client.sqlite`. Use a separate database per account.
+`~/.local/share/replicant/replicant-client.sqlite`. Use a separate database per account.
 
 ## Runnable examples
 
@@ -85,7 +85,6 @@ or send messages.
 
 ```sh
 export RS_API_TOKEN='your-token'
-export REPLICANT_DB='replicant-client.sqlite'
 cargo run --example initialize_colony_database
 ```
 
@@ -143,7 +142,6 @@ This example **performs durable gameplay mutations**.
 
 ```sh
 export RS_API_TOKEN='your-token'
-export REPLICANT_DB='replicant-client.sqlite'
 cargo run --example tag_twaffy_ring_injectors
 ```
 

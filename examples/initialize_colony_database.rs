@@ -8,7 +8,7 @@
 //! Environment variables:
 //!
 //! - `RS_API_TOKEN` or `REPLICANT_TOKEN` — required bearer token.
-//! - `REPLICANT_DB` — SQLite path; defaults to `replicant-client.sqlite`.
+//! - `REPLICANT_DB` — SQLite path; defaults under `~/.local/share/replicant`.
 //! - `REPLICANT_INIT_SYSTEM_LIMIT` — optional maximum explored systems to hydrate.
 //! - `REPLICANT_INIT_OBJECT_LIMIT` — maximum known locations per system;
 //!   defaults to `14096`.
@@ -96,7 +96,7 @@ impl Config {
             token,
             database: env::var_os("REPLICANT_DB")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite")),
+                .unwrap_or_else(replicant_client::default_database_path),
             system_limit: optional_usize("REPLICANT_INIT_SYSTEM_LIMIT")?,
             object_limit: env_usize("REPLICANT_INIT_OBJECT_LIMIT", 14096)?,
             concurrency: env_usize("REPLICANT_INIT_CONCURRENCY", 4)?.max(1),

@@ -1,4 +1,5 @@
 use std::{
+    fs,
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
@@ -39,6 +40,9 @@ pub enum RepositoryError {
     /// SQLite operation failed.
     #[error("SQLite failure: {0}")]
     Sql(#[from] rusqlite::Error),
+    /// Database directory creation failed.
+    #[error("database directory failure: {0}")]
+    Io(#[from] std::io::Error),
     /// Typed payload serialization or deserialization failed.
     #[error("workflow payload serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -170,6 +174,13 @@ impl Drop for ConnectionGuard<'_> {
 impl WorkflowRepository {
     /// Opens or creates a runtime database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RepositoryError> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
         let connection = Connection::open(path)?;
         Self::from_connection(connection, true)
     }
@@ -1479,6 +1490,17 @@ fn now_millis() -> Result<i64, RepositoryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_repository_creates_its_parent_directory() {
+        let directory = std::env::temp_dir().join(format!("replicant-workflow-{}", Uuid::new_v4()));
+        let path = directory.join("replicant-runtime.sqlite");
+        let repository = WorkflowRepository::open(&path).expect("repository");
+        drop(repository);
+
+        assert!(path.is_file());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
 
     #[test]
     fn filtered_queries_use_existing_indexes_and_skip_terminal_payloads() {

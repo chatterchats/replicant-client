@@ -1280,8 +1280,9 @@ impl SmartResolver {
 
 impl SmartIndex {
     async fn load() -> AnyResult<Self> {
-        let database =
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".to_owned());
+        let database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let client = start_managed_client(ManagedClientConfig::from_env(database)?).await?;
         let index = entity_index(&client).await;
         let close = client.close().await;

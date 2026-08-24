@@ -64,9 +64,9 @@ impl Config {
             systems_file: None,
             replicant: env::var("RS_MINING_REPLICANT").unwrap_or_else(|_| DEFAULT_REPLICANT.into()),
             hub: env::var("RS_MINING_HUB").unwrap_or_else(|_| DEFAULT_HUB.into()),
-            database: env::var("REPLICANT_DB")
-                .unwrap_or_else(|_| "replicant-client.sqlite".into())
-                .into(),
+            database: env::var_os("REPLICANT_DB")
+                .map(PathBuf::from)
+                .unwrap_or_else(replicant_client::default_database_path),
             mission_file: env::var("RS_MINING_PLAN")
                 .unwrap_or_else(|_| DEFAULT_PLAN_PATH.into())
                 .into(),

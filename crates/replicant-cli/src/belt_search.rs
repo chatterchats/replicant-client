@@ -34,7 +34,7 @@ fn parse(arguments: Vec<String>) -> crate::AnyResult<Config> {
     let mut arguments = arguments.into_iter();
     let mut database = env::var_os("REPLICANT_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
+        .unwrap_or_else(replicant_client::default_database_path);
     let mut replicant = env::var("RS_BELT_SEARCH_REPLICANT").unwrap_or_else(|_| "Chats-4".into());
     let mut systems = Vec::new();
     let mut route_start = env::var("RS_BELT_SEARCH_START")

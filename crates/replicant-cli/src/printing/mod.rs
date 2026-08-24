@@ -78,9 +78,9 @@ impl Config {
 
         let mut hub = env::var("RS_PRINTING_HUB").unwrap_or_else(|_| DEFAULT_HUB.into());
         let mut system = env::var("RS_PRINTING_SYSTEM").ok();
-        let mut database = PathBuf::from(
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
-        );
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let mut requests = Vec::new();
         let mut tags = Vec::new();
         let mut preserve_active_factory_codes = BTreeSet::new();

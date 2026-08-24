@@ -185,10 +185,10 @@ impl DaemonConfig {
         let profile = env::var("REPLICANT_PROFILE").unwrap_or_else(|_| "default".to_owned());
         let managed_database = env::var_os("REPLICANT_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
+            .unwrap_or_else(replicant_client::default_database_path);
         let runtime_database = env::var_os("REPLICANT_RUNTIME_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("replicant-runtime.sqlite"));
+            .unwrap_or_else(replicant_runtime::config::default_runtime_database_path);
         let telemetry_database = env::var_os("REPLICANT_TELEMETRY_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| {

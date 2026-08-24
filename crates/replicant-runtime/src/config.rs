@@ -25,6 +25,12 @@ pub const LOG_FILTER_ENV: &str = "RUST_LOG";
 /// Default log filter directive used when `RUST_LOG` is unset.
 pub const DEFAULT_LOG_FILTER: &str = "info";
 
+/// Returns the default workflow/runtime SQLite database path.
+#[must_use]
+pub fn default_runtime_database_path() -> PathBuf {
+    replicant_client::default_data_directory().join("replicant-runtime.sqlite")
+}
+
 /// Reports how the API token is currently configured, without exposing its value.
 #[must_use]
 pub fn api_token_source() -> ApiTokenSource {
@@ -220,6 +226,14 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_database_shares_the_application_data_directory() {
+        assert_eq!(
+            default_runtime_database_path().parent(),
+            Some(replicant_client::default_data_directory().as_path()),
+        );
+    }
 
     #[test]
     fn managed_client_defaults_resolve_without_live_api() {

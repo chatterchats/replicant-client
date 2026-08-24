@@ -37,7 +37,7 @@
 //! - `RS_EXPLORE_SYSTEM_LIMIT=80`
 //! - `RS_EXPLORE_STAR_DETAIL_CONCURRENCY=8`
 //! - `RS_EXPLORE_PLAN=explore-survey-route.json`
-//! - `REPLICANT_DB=replicant-client.sqlite`
+//! - `REPLICANT_DB=~/.local/share/replicant/replicant-client.sqlite`
 //!
 //! Optional fleet overrides:
 //!

@@ -46,9 +46,9 @@ impl Config {
         let mut devices = Vec::new();
         let mut device_tags = Vec::new();
         let mut carrier = None;
-        let mut database = PathBuf::from(
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
-        );
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let mut wait_timeout = Duration::from_secs(
             env::var("RS_TRANSPORT_WAIT_TIMEOUT_SECS")
                 .ok()

@@ -43,7 +43,6 @@ struct DesktopState {
     settings: Mutex<DesktopSettings>,
     settings_path: PathBuf,
     managed_daemon: Mutex<Option<CommandChild>>,
-    data_dir: PathBuf,
     token_file: PathBuf,
 }
 
@@ -58,9 +57,7 @@ fn main() {
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = app.path().app_config_dir()?;
-    let data_dir = app.path().app_local_data_dir()?;
     fs::create_dir_all(&config_dir)?;
-    fs::create_dir_all(&data_dir)?;
 
     let settings_path = config_dir.join("desktop.json");
     let settings = load_settings(&settings_path);
@@ -68,7 +65,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         settings: Mutex::new(settings.clone()),
         settings_path,
         managed_daemon: Mutex::new(None),
-        data_dir,
         token_file: config_dir.join("api-token"),
     });
 
@@ -211,15 +207,6 @@ fn ensure_daemon(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .shell()
         .sidecar("replicantd")?
         .env("REPLICANTD_BIND", DAEMON_BIND);
-    if env::var_os("REPLICANT_DB").is_none() {
-        command = command.env("REPLICANT_DB", state.data_dir.join("client.sqlite"));
-    }
-    if env::var_os("REPLICANT_RUNTIME_DB").is_none() {
-        command = command.env(
-            "REPLICANT_RUNTIME_DB",
-            state.data_dir.join("runtime.sqlite"),
-        );
-    }
     if env::var_os("RS_API_TOKEN").is_none()
         && env::var_os("RS_API_TOKEN_FILE").is_none()
         && state.token_file.is_file()

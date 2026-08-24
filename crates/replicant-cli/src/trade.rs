@@ -18,7 +18,6 @@ use replicant_runtime::{
 use serde_json::Value;
 
 const DEFAULT_REPLICANT: &str = "Chats-1";
-const DEFAULT_DATABASE: &str = "replicant-client.sqlite";
 const DEFAULT_WIDTH: usize = 118;
 const MIN_WIDTH: usize = 84;
 const MAX_WIDTH: usize = 160;
@@ -46,8 +45,9 @@ impl Config {
         let mut command = Command::Interactive;
         let mut replicant = env::var("RS_TRADE_REPLICANT").ok();
         let mut controller = None;
-        let mut database =
-            PathBuf::from(env::var("REPLICANT_DB").unwrap_or_else(|_| DEFAULT_DATABASE.to_owned()));
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let terminal = io::stdout().is_terminal();
         let mut color = terminal && env::var_os("NO_COLOR").is_none();
         let mut clear = terminal;

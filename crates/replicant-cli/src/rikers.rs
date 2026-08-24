@@ -1,19 +1,20 @@
 //! CLI adapter for the reusable Riker colony report.
 
-use std::{env, io};
+use std::{env, io, path::PathBuf};
 
 use replicant_runtime::{config::ManagedClientConfig, rikers::riker_report, start_managed_client};
 
 struct Config {
-    database: String,
+    database: PathBuf,
     limit: usize,
     diagnostics: bool,
 }
 
 impl Config {
     fn parse(arguments: Vec<String>) -> crate::AnyResult<Option<Self>> {
-        let mut database =
-            env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into());
+        let mut database = env::var_os("REPLICANT_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(replicant_client::default_database_path);
         let mut limit = env::var("RS_RIKERS_LIMIT")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -22,7 +23,7 @@ impl Config {
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
-                "--database" => database = required(&mut arguments, "--database")?,
+                "--database" => database = required(&mut arguments, "--database")?.into(),
                 "--limit" => {
                     limit = required(&mut arguments, "--limit")?.parse().map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "--limit must be an integer")
@@ -51,7 +52,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
     let Some(config) = Config::parse(arguments)? else {
         return Ok(());
     };
-    eprintln!("database: {}", config.database);
+    eprintln!("database: {}", config.database.display());
     let client = start_managed_client(ManagedClientConfig::from_env(&config.database)?).await?;
     let report = riker_report(&client, config.diagnostics).await?;
 

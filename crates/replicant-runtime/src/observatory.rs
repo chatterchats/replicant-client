@@ -17,7 +17,6 @@ use crate::{config::ManagedClientConfig, start_managed_client};
 use replicant_client::{Client, DeviceType, OperationOutcome, OperationStatus, Star, raw};
 use serde_json::Value;
 
-const DEFAULT_DATABASE: &str = "replicant-client.sqlite";
 const DEFAULT_TRIANGULATION_SIGNATURE: &str = "934d3ac4dcc918ad";
 const MIN_TRIANGULATION_RADIUS_LY: f64 = 15_000.0;
 const TRIANGULATION_FRINGE_MARGIN_LY: f64 = 5_000.0;
@@ -562,7 +561,9 @@ fn axis_direction(star: &Option<String>, vector: [f64; 3]) -> crate::AnyResult<P
 }
 
 fn default_database() -> PathBuf {
-    PathBuf::from(env::var("REPLICANT_DB").unwrap_or_else(|_| DEFAULT_DATABASE.to_owned()))
+    env::var_os("REPLICANT_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(replicant_client::default_database_path)
 }
 
 fn validate_selector(selector: &Selector) -> crate::AnyResult<()> {

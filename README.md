@@ -44,6 +44,9 @@ replicant-client = { path = "../.." }
 HTTP transport, SQLite store, normalized state, event processing,
 synchronization, and durable operation journal.
 
+By default, managed state is stored at
+`~/.local/share/replicant/replicant-client.sqlite`.
+
 ```rust,no_run
 use replicant_client::{Client, SecretString, StartupPolicy};
 
@@ -56,7 +59,6 @@ async fn main() -> replicant_client::Result<()> {
 
     let client = Client::builder()
         .authentication_token(SecretString::from(token))
-        .sqlite("replicant-client.sqlite")
         .startup_policy(StartupPolicy::Essential)
         .start()
         .await?;
@@ -68,7 +70,7 @@ async fn main() -> replicant_client::Result<()> {
 }
 ```
 
-Use `in_memory()` instead of `sqlite(...)` for tests and disposable programs.
+Use `sqlite(...)` to override the database path or `in_memory()` for tests and disposable programs.
 
 ### Consistency rules
 

@@ -20,7 +20,6 @@ use serde::Serialize;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
-const DEFAULT_DATABASE: &str = "replicant-client.sqlite";
 const DEFAULT_OWNER: &str = "Chats-1";
 
 #[derive(Clone, Debug)]
@@ -108,9 +107,9 @@ fn parse_config(arguments: Vec<String>) -> crate::AnyResult<Config> {
     }
 
     let mut config = Config {
-        database: env::var("REPLICANT_DB")
+        database: env::var_os("REPLICANT_DB")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_DATABASE)),
+            .unwrap_or_else(replicant_client::default_database_path),
         owner: env::var("RS_OWNERSHIP_TARGET").unwrap_or_else(|_| DEFAULT_OWNER.to_owned()),
         regions: BTreeSet::new(),
         all_regions: false,
@@ -822,7 +821,7 @@ mod tests {
             star("DELTA", Some("delta")),
         ];
         let config = Config {
-            database: PathBuf::from(DEFAULT_DATABASE),
+            database: PathBuf::from("test.sqlite"),
             owner: DEFAULT_OWNER.to_owned(),
             regions: BTreeSet::new(),
             all_regions: true,
@@ -844,7 +843,7 @@ mod tests {
     fn unknown_ignored_region_is_rejected_before_mutation_selection() {
         let catalogue = vec![star("SOL", Some("solzone")), star("A", Some("alpha"))];
         let config = Config {
-            database: PathBuf::from(DEFAULT_DATABASE),
+            database: PathBuf::from("test.sqlite"),
             owner: DEFAULT_OWNER.to_owned(),
             regions: BTreeSet::new(),
             all_regions: true,

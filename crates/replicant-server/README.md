@@ -10,26 +10,26 @@ RS_API_TOKEN=... cargo run -p replicant-server --bin replicantd
 
 Configuration is environment-based:
 
-| Variable                 | Default                              | Purpose                                                                                  |
-| ------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `RS_API_TOKEN`           | required                             | Replicant Space authentication token                                                     |
-| `RS_API_TOKEN_FILE`      | unset                                | File containing the token when `RS_API_TOKEN` is absent                                  |
-| `REPLICANT_PROFILE`      | `default`                            | Local profile name                                                                       |
-| `REPLICANT_DB`           | `replicant-client.sqlite`            | Managed SDK operational database; history defaults to sibling `replicant-history.sqlite` |
-| `REPLICANT_RUNTIME_DB`   | `replicant-runtime.sqlite`           | Workflow/runtime database                                                                |
-| `REPLICANT_TELEMETRY_DB` | sibling `replicant-telemetry.sqlite` | API observability database                                                               |
-| `REPLICANT_LOG_DIR`      | sibling `logs/` directory            | Persistent daemon tracing logs                                                           |
-| `REPLICANTD_BIND`        | `127.0.0.1:8080`                     | HTTP listen address                                                                      |
-| `RUST_LOG`               | `info`                               | Tracing filter applied to console and persistent logs                                    |
+| Variable                 | Default                                                         | Purpose                                                                                  |
+| ------------------------ | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `RS_API_TOKEN`           | required                                                        | Replicant Space authentication token                                                     |
+| `RS_API_TOKEN_FILE`      | unset                                                           | File containing the token when `RS_API_TOKEN` is absent                                  |
+| `REPLICANT_PROFILE`      | `default`                                                       | Local profile name                                                                       |
+| `REPLICANT_DB`           | `~/.local/share/replicant/replicant-client.sqlite`              | Managed SDK operational database; history defaults to sibling `replicant-history.sqlite` |
+| `REPLICANT_RUNTIME_DB`   | `~/.local/share/replicant/replicant-runtime.sqlite`             | Workflow/runtime database                                                                |
+| `REPLICANT_TELEMETRY_DB` | sibling `replicant-telemetry.sqlite`                            | API observability database                                                               |
+| `REPLICANT_LOG_DIR`      | sibling `logs/` directory                                       | Persistent daemon tracing logs                                                           |
+| `REPLICANTD_BIND`        | `127.0.0.1:8080`                                                | HTTP listen address                                                                      |
+| `RUST_LOG`               | `info`                                                          | Tracing filter applied to console and persistent logs                                    |
 
 A non-empty `RS_API_TOKEN` takes precedence over `RS_API_TOKEN_FILE`. Token
 files are trimmed when read and neither source is printed in logs or status.
 
 `replicantd` writes the same tracing stream to stderr and to
 `REPLICANT_LOG_DIR/replicantd.log`. When `REPLICANT_LOG_DIR` is unset, it
-defaults to a `logs/` directory beside `REPLICANT_RUNTIME_DB`. This means a
-native default run writes `./logs/replicantd.log`, while the desktop sidecar
-writes inside the same per-user application-data directory as `runtime.sqlite`.
+defaults to a `logs/` directory beside `REPLICANT_RUNTIME_DB`; a native or
+desktop default run therefore writes
+`~/.local/share/replicant/logs/replicantd.log`.
 
 The default binding is loopback-only. Binding to a non-loopback address is an explicit advanced deployment choice and should only be done behind an authenticated same-origin proxy or on an isolated container network.
 
@@ -60,6 +60,7 @@ Workflow config/checkpoint JSON is versioned independently from the runtime data
 For a consistent backup, gracefully stop `replicantd`, then use SQLite's online-backup command for all four databases:
 
 ```sh
+cd ~/.local/share/replicant
 mkdir -p backup
 sqlite3 replicant-client.sqlite ".backup 'backup/replicant-client.sqlite'"
 sqlite3 replicant-history.sqlite ".backup 'backup/replicant-history.sqlite'"

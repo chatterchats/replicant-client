@@ -189,8 +189,9 @@ each command documents its current flags and defaults.
 ## State and recovery
 
 `replicantd` owns the normal long-running managed client and durable workflow
-supervisor. Managed state defaults to `replicant-client.sqlite`; the runtime
-database and mission files must also be retained when backing up active work.
+supervisor. Managed state defaults to
+`~/.local/share/replicant/replicant-client.sqlite`; the runtime database and
+mission files must also be retained when backing up active work.
 
 Planning commands do not perform gameplay mutations. `deliver` reconciles a saved
 bootstrap mission through arrival at its landing entry and stops before regional
@@ -204,7 +205,7 @@ There is no global `--execute` or separate resume command.
 Common configuration:
 
 - `RS_API_TOKEN` — required bearer token.
-- `REPLICANT_DB` — managed SQLite path.
+- `REPLICANT_DB` — managed SQLite path (default: `~/.local/share/replicant/replicant-client.sqlite`).
 - command-specific variables use `RS_PRINTING_*`, `RS_TRANSPORT_*`,
   `RS_EXPLORE_*`, `RS_RELAY_*`, `RS_MINING_*`, and `RS_EVENT_*` prefixes.
 - `RS_OWNERSHIP_TARGET`, `RS_OWNERSHIP_REGIONS`, `RS_OWNERSHIP_ALL_REGIONS`, and

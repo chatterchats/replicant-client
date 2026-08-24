@@ -29,7 +29,7 @@ async fn main() -> AnyResult<()> {
     let action = parse_options()?;
     let database = env::var_os("REPLICANT_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite"));
+        .unwrap_or_else(replicant_client::default_database_path);
     let client = start_managed_client(ManagedClientConfig::from_env(database)?).await?;
     client.ready().await?;
 

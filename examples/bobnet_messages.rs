@@ -92,7 +92,7 @@ impl Config {
             token,
             database: env::var_os("REPLICANT_DB")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("replicant-client.sqlite")),
+                .unwrap_or_else(replicant_client::default_database_path),
             relay,
             limit,
             channel: channel.map(|value| normalize_channel(&value)),

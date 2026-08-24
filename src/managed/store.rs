@@ -4,8 +4,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -49,6 +49,8 @@ const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub(crate) enum StoreError {
     #[error("SQLite failure: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("database directory failure: {0}")]
+    Io(#[from] std::io::Error),
     #[error("state serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("store is bound to account {stored_account_id}, not {supplied_account_id}")]
@@ -707,6 +709,12 @@ impl Store {
     }
 
     pub(crate) fn open_file(path: &Path) -> Result<Self, StoreError> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
         let history_path = history_database_path(path);
         let connection = Connection::open(path)?;
         let history = Connection::open(&history_path)?;
@@ -2793,6 +2801,17 @@ mod tests {
         assert_eq!(store.device_count().expect("device count"), 0);
         drop(store);
         fs::remove_file(path).expect("remove test database");
+    }
+
+    #[test]
+    fn file_store_creates_its_parent_directory() {
+        let directory = test_path("directory");
+        let path = directory.join("replicant-client.sqlite");
+        let store = Store::open_file(&path).expect("open store in new directory");
+        drop(store);
+
+        assert!(path.is_file());
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]

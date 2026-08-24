@@ -87,9 +87,9 @@ impl Config {
             operator: "Chats-1".into(),
             explorer: "Chats-2".into(),
             mission_file: PathBuf::from("regional-bootstrap.json"),
-            database: PathBuf::from(
-                env::var("REPLICANT_DB").unwrap_or_else(|_| "replicant-client.sqlite".into()),
-            ),
+            database: env::var_os("REPLICANT_DB")
+                .map(PathBuf::from)
+                .unwrap_or_else(replicant_client::default_database_path),
             profile: BootstrapProfile::default(),
             seed_quantity: 500,
             quick_scout_radius_ly: 7.499,

@@ -88,7 +88,8 @@ pub mod managed {
     pub use bobnet::{BobnetGateway, BobnetWatch, RelayHistoryQuery};
     pub use client::{
         Client, ClientBuilder, ClientDegradation, ClientStatus, EventStreamOptions, Readiness,
-        ReadinessComponent, ReconciliationPolicy, StartupPolicy, default_history_database_path,
+        ReadinessComponent, ReconciliationPolicy, StartupPolicy, default_data_directory,
+        default_database_path, default_history_database_path,
     };
     pub use events::{
         EventCatchUpReport, EventHistoryQuery, EventTelemetrySample, EventTelemetrySink,
@@ -137,7 +138,7 @@ pub use managed::{
     SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,
     SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
     TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
-    TutorialsGateway, default_history_database_path,
+    TutorialsGateway, default_data_directory, default_database_path, default_history_database_path,
 };
 
 #[cfg(feature = "raw")]
