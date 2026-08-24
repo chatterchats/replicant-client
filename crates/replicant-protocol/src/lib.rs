@@ -220,6 +220,8 @@ pub enum DirectorGoalKind {
     ExpandStarCatalogue,
     /// Survey known systems so the catalogue contains richer knowledge.
     EnhanceStarCatalogue,
+    /// Search known systems for asteroid belts with regional Replicants.
+    DiscoverBelts,
     /// Continually extend mining coverage to useful known belts.
     ExpandMiningOps,
     /// Batch-plan and complete active location events in each region.

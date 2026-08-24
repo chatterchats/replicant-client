@@ -83,6 +83,7 @@ export type DirectorGoalKind =
   | "establish_regions"
   | "expand_star_catalogue"
   | "enhance_star_catalogue"
+  | "discover_belts"
   | "expand_mining_ops"
   | "event_completion"
   | "blueprint_acquisition"
@@ -3664,6 +3665,7 @@ const directorGoalKinds = [
   "establish_regions",
   "expand_star_catalogue",
   "enhance_star_catalogue",
+  "discover_belts",
   "expand_mining_ops",
   "event_completion",
   "blueprint_acquisition",

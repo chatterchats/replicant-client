@@ -38,6 +38,7 @@ use crate::bootstrap::{
 };
 
 use crate::{
+    belt_search::{BeltSearchRequest, execute_belt_search},
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest,
         EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
@@ -75,6 +76,11 @@ pub fn scan_belt_workflow_kind() -> WorkflowKind {
 /// Intent-native workflow that surveys a bounded area with one racing vessel.
 pub fn scan_tour_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("scan.tour").expect("static workflow kind is valid")
+}
+
+/// Intent-native batch belt-discovery workflow.
+pub fn belt_search_campaign_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("belt_search.campaign").expect("static workflow kind is valid")
 }
 
 /// Intent-native workflow that salvages one site to depletion.
@@ -153,6 +159,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(ScanSystemWorkflowFactory::new()))?;
     registry.register(Arc::new(ScanBeltWorkflowFactory::new()))?;
     registry.register(Arc::new(ScanTourWorkflowFactory::new()))?;
+    registry.register(Arc::new(BeltSearchCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(SalvageWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
@@ -230,6 +237,23 @@ pub struct ScanTourCheckpoint {
     pub fleet_drones: Vec<String>,
     /// Last authoritative survey executor state.
     pub state: Option<SurveyExecutionState>,
+}
+
+/// Goal-level input for a bounded fast belt-search campaign.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BeltSearchCampaignIntent {
+    /// Exact systems to visit and inspect.
+    pub systems: Vec<String>,
+    /// Optional regional Replicant to pin.
+    #[serde(default)]
+    pub replicant: Option<String>,
+}
+
+/// Restart-safe fast belt-search checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BeltSearchCampaignCheckpoint {
+    /// Resolved Replicant retained across retries.
+    pub replicant: Option<String>,
 }
 
 /// Restart-safe controller workflow checkpoint.
@@ -771,6 +795,11 @@ workflow_factory!(
     scan_tour_workflow_kind
 );
 workflow_factory!(
+    BeltSearchCampaignWorkflowFactory,
+    BeltSearchCampaignWorkflow,
+    belt_search_campaign_workflow_kind
+);
+workflow_factory!(
     SalvageWorkflowFactory,
     SalvageWorkflow,
     salvage_workflow_kind
@@ -1183,6 +1212,63 @@ impl WorkflowExecutor for MiningDeployWorkflow {
                 Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
                 Err(error) => Err(error.to_string()),
             }
+        })
+    }
+}
+
+struct BeltSearchCampaignWorkflow;
+impl WorkflowExecutor for BeltSearchCampaignWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: BeltSearchCampaignIntent = context.config().map_err(string_error)?;
+            if intent.systems.is_empty() {
+                return context
+                    .mark_succeeded(Some(serde_json::json!({"systems": []})))
+                    .map_err(string_error);
+            }
+            let client = managed_client(context)?;
+            let mut checkpoint: BeltSearchCampaignCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            let replicant = match checkpoint.replicant.clone() {
+                Some(replicant) => replicant,
+                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            };
+            claim(context, ResourceKey::Replicant(replicant.clone()))?;
+            for system in &intent.systems {
+                claim_target(context, "belt-search-target", system)?;
+            }
+            checkpoint.replicant = Some(replicant.clone());
+            context
+                .advance_to("searching_for_belts", &checkpoint)
+                .map_err(string_error)?;
+
+            let system_limit = intent.systems.len();
+            let request = BeltSearchRequest {
+                replicant,
+                systems: intent.systems,
+                route_start: None,
+                radius_ly: None,
+                system_limit,
+                include_explored: true,
+                plan_only: false,
+                wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
+            };
+            let execution = execute_belt_search(&client, &request);
+            tokio::pin!(execution);
+            let mut control_interval = tokio::time::interval(Duration::from_secs(2));
+            let result = loop {
+                tokio::select! {
+                    result = &mut execution => break result.map_err(string_error)?,
+                    _ = control_interval.tick() => match context.control_request().map_err(string_error)? {
+                        replicant_workflow::ControlRequest::Continue => {}
+                        replicant_workflow::ControlRequest::Pause
+                        | replicant_workflow::ControlRequest::Cancel => return Ok(()),
+                    },
+                }
+            };
+            context
+                .mark_succeeded(Some(serde_json::to_value(result).map_err(string_error)?))
+                .map_err(string_error)
         })
     }
 }
@@ -3272,6 +3358,17 @@ pub fn new_scan_tour_workflow(
         scan_tour_workflow_kind(),
         intent,
         ScanTourCheckpoint::default(),
+    )
+}
+
+/// Creates a queued bounded fast belt-search campaign.
+pub fn new_belt_search_campaign_workflow(
+    intent: BeltSearchCampaignIntent,
+) -> NewWorkflow<BeltSearchCampaignIntent, BeltSearchCampaignCheckpoint> {
+    queued_workflow(
+        belt_search_campaign_workflow_kind(),
+        intent,
+        BeltSearchCampaignCheckpoint::default(),
     )
 }
 
@@ -8041,6 +8138,10 @@ mod tests {
         assert_eq!(scan_system_workflow_kind().as_str(), "scan.system");
         assert_eq!(scan_belt_workflow_kind().as_str(), "scan.belt");
         assert_eq!(scan_tour_workflow_kind().as_str(), "scan.tour");
+        assert_eq!(
+            belt_search_campaign_workflow_kind().as_str(),
+            "belt_search.campaign"
+        );
         assert_eq!(salvage_workflow_kind().as_str(), "salvage.site");
         assert_eq!(mining_deploy_workflow_kind().as_str(), "mining.deploy");
         assert_eq!(logistics_workflow_kind().as_str(), "logistics.delivery");

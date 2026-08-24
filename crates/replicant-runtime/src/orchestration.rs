@@ -36,14 +36,14 @@ use serde_json::Value;
 use crate::{
     ApplicationError,
     automation::{
-        BlueprintAcquireIntent, BlueprintShopPurchaseIntent, EventCampaignIntent,
-        ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent, ObservatoryIntent,
-        RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
+        BeltSearchCampaignIntent, BlueprintAcquireIntent, BlueprintShopPurchaseIntent,
+        EventCampaignIntent, ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent,
+        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
         blueprint_acquire_workflow_kind, blueprint_source_is_candidate, blueprint_source_location,
-        exploration_workflow_kind, new_blueprint_acquire_workflow, new_event_campaign_workflow,
-        new_exploration_workflow, new_logistics_manifest_workflow, new_mining_campaign_workflow,
-        new_observatory_workflow, new_region_establish_workflow, new_replicant_provision_workflow,
-        new_scan_tour_workflow,
+        exploration_workflow_kind, new_belt_search_campaign_workflow,
+        new_blueprint_acquire_workflow, new_event_campaign_workflow, new_exploration_workflow,
+        new_logistics_manifest_workflow, new_mining_campaign_workflow, new_observatory_workflow,
+        new_region_establish_workflow, new_replicant_provision_workflow, new_scan_tour_workflow,
     },
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
@@ -826,6 +826,15 @@ pub async fn reconcile_director(
             &workers,
             &mut reserved_workers,
             &mut requirements,
+        )?);
+        goals.push(reconcile_discover_belts(
+            &goal_context,
+            region,
+            &workers,
+            &mut reserved_workers,
+            &mut requirements,
+            &locations,
+            &location_systems,
         )?);
         goals.push(reconcile_expand_mining(
             &repository,
@@ -3216,6 +3225,122 @@ fn reconcile_enhance_catalogue(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn reconcile_discover_belts(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    workers: &[WorkerView],
+    reserved: &mut BTreeSet<String>,
+    requirements: &mut DirectorRequirementGraph,
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::DiscoverBelts;
+    let enabled = goal_enabled(context.controls, kind);
+    let id = goal_instance_id(kind, Some(&region.region));
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, context.workflows);
+    let searched = belt_searched_systems(locations, location_systems);
+    let targets = region
+        .known_systems
+        .difference(&searched)
+        .take(MINING_BATCH_SIZE)
+        .cloned()
+        .collect::<Vec<_>>();
+    let covered = region.known_systems.intersection(&searched).count();
+    let active = nonterminal_ids(&runtime, context.workflows);
+    let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
+    let mut blocker = None;
+    let next_action;
+    let status = if !enabled {
+        next_action =
+            Some("Enable this standing goal to search known systems for belts".to_owned());
+        DirectorGoalStatus::Waiting
+    } else if targets.is_empty() {
+        next_action = Some("Wait for newly discovered regional systems".to_owned());
+        DirectorGoalStatus::Satisfied
+    } else if !active.is_empty() {
+        next_action = Some("Continue the active regional fast belt search".to_owned());
+        DirectorGoalStatus::Active
+    } else if recently_launched {
+        next_action = Some("Wait briefly before retrying the next belt-search batch".to_owned());
+        DirectorGoalStatus::Waiting
+    } else if let Some(worker) = select_idle_worker(workers, &region.region, reserved, false) {
+        next_action = Some(format!(
+            "Search {} unscanned regional system(s) for belts with {worker}",
+            targets.len()
+        ));
+        if context.automatic {
+            let workflow = context
+                .repository
+                .create(new_belt_search_campaign_workflow(
+                    BeltSearchCampaignIntent {
+                        systems: targets,
+                        replicant: Some(worker.clone()),
+                    },
+                ))?;
+            runtime.active_workflows = vec![workflow.id];
+            runtime.last_launch_at_ms = Some(context.now);
+            reserved.insert(worker);
+        }
+        DirectorGoalStatus::Active
+    } else {
+        let reason = format!(
+            "{} has unscanned systems but no idle regional Replicant",
+            region.region
+        );
+        requirements.raise(
+            DirectorRequirement::WorkerCapacity {
+                region: region.region.clone(),
+                count: 1,
+                affinity: Some("survey".to_owned()),
+            },
+            &id,
+            reason.clone(),
+            PRIORITY_CATALOGUE,
+        )?;
+        blocker = Some(reason);
+        next_action = Some("Free a regional worker or grow the regional workforce".to_owned());
+        DirectorGoalStatus::Blocked
+    };
+    save_goal_runtime(context.repository, &id, &runtime)?;
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: format!("Discover asteroid belts throughout {}", region.region),
+        blocker,
+        next_action,
+        progress_current: covered as u64,
+        progress_total: region.known_systems.len() as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
+}
+
+fn belt_searched_systems(
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    locations
+        .iter()
+        .filter(|location| {
+            location.system_scanned == Some(true)
+                || location
+                    .location_type
+                    .as_ref()
+                    .is_some_and(|kind| kind.as_str() == "belt")
+        })
+        .filter_map(|location| {
+            location
+                .system
+                .clone()
+                .or_else(|| location_systems.get(location.key.id.as_str()).cloned())
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reconcile_expand_mining(
     repository: &WorkflowRepository,
     region: &RegionView,
@@ -3261,11 +3386,12 @@ fn reconcile_expand_mining(
         .filter(|device| device.device_type.as_ref() == Some(&DeviceType::MiningController))
         .filter_map(|device| device_system(device, location_systems))
         .collect::<BTreeSet<_>>();
-    let targets = belt_systems
+    let relay_systems = relay_device_systems(devices, location_systems);
+    let unstaffed = belt_systems
         .difference(&staffed_systems)
-        .take(MINING_BATCH_SIZE)
         .cloned()
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let targets = relay_connected_mining_targets(&unstaffed, &relay_systems);
     let covered = belt_systems
         .len()
         .saturating_sub(belt_systems.difference(&staffed_systems).count());
@@ -3275,7 +3401,7 @@ fn reconcile_expand_mining(
     let mut next_action = None;
     let status = if !enabled {
         DirectorGoalStatus::Waiting
-    } else if targets.is_empty() {
+    } else if unstaffed.is_empty() {
         next_action = Some("Wait for newly discovered belts or depleted mining spokes".to_owned());
         DirectorGoalStatus::Satisfied
     } else if !active.is_empty() {
@@ -3284,6 +3410,10 @@ fn reconcile_expand_mining(
     } else if recently_launched {
         next_action =
             Some("Wait briefly before replanning the next mining expansion batch".to_owned());
+        DirectorGoalStatus::Waiting
+    } else if targets.is_empty() {
+        next_action =
+            Some("Wait for FTL relay coverage to reach a discovered belt system".to_owned());
         DirectorGoalStatus::Waiting
     } else if let Some(worker) = select_idle_worker(workers, &region.region, reserved, false) {
         next_action = Some(format!(
@@ -3352,6 +3482,17 @@ fn reconcile_expand_mining(
     })
 }
 
+fn relay_connected_mining_targets(
+    unstaffed_belt_systems: &BTreeSet<String>,
+    relay_systems: &BTreeSet<String>,
+) -> Vec<String> {
+    unstaffed_belt_systems
+        .intersection(relay_systems)
+        .take(MINING_BATCH_SIZE)
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconcile_expand_ftl_network(
     context: &GoalReconcileContext<'_>,
@@ -3371,7 +3512,7 @@ fn reconcile_expand_ftl_network(
     prune_runtime_workflows(&mut runtime, context.workflows);
 
     let relay_systems = relay_device_systems(devices, location_systems);
-    let dense_belts = dense_belt_systems(locations, location_systems);
+    let belt_density = belt_density_priorities(locations, location_systems);
     let covered = region.known_systems.intersection(&relay_systems).count();
     let mut uncovered = region
         .known_systems
@@ -3379,9 +3520,9 @@ fn reconcile_expand_ftl_network(
         .filter(|system| !relay_systems.contains(*system))
         .map(|system| {
             let event_priority = event_systems.contains(system);
-            let dense_priority = dense_belts.contains(system);
-            let score = ftl_priority_score(event_priority, dense_priority);
-            (system.clone(), score, event_priority, dense_priority)
+            let density_priority = belt_density.get(system).copied().unwrap_or_default();
+            let score = ftl_priority_score(event_priority, density_priority);
+            (system.clone(), score, event_priority, density_priority)
         })
         .collect::<Vec<_>>();
     uncovered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -3405,7 +3546,7 @@ fn reconcile_expand_ftl_network(
             Some("Continue the active regional FTL expansion campaign".to_owned()),
         )
     } else {
-        let (target, _, event_priority, dense_priority) = &uncovered[0];
+        let (target, _, event_priority, density_priority) = &uncovered[0];
         if let Some(existing) = active_exploration_workflow_for_target(context.workflows, target)? {
             runtime.active_workflows = vec![existing];
             active = vec![existing];
@@ -3415,7 +3556,7 @@ fn reconcile_expand_ftl_network(
                 DirectorGoalStatus::Active,
                 Some(format!(
                     "Continue the existing FTL expansion toward {target}{}",
-                    ftl_priority_suffix(*event_priority, *dense_priority)
+                    ftl_priority_suffix(*event_priority, *density_priority)
                 )),
             )
         } else if recently_launched {
@@ -3423,7 +3564,7 @@ fn reconcile_expand_ftl_network(
                 DirectorGoalStatus::Waiting,
                 Some(format!(
                     "Wait briefly before retrying FTL expansion toward {target}{}",
-                    ftl_priority_suffix(*event_priority, *dense_priority)
+                    ftl_priority_suffix(*event_priority, *density_priority)
                 )),
             )
         } else if let Some(worker) =
@@ -3460,7 +3601,7 @@ fn reconcile_expand_ftl_network(
             };
             let next_action = Some(format!(
                 "Extend FTL coverage toward {target} with {worker}{}",
-                ftl_priority_suffix(*event_priority, *dense_priority)
+                ftl_priority_suffix(*event_priority, *density_priority)
             ));
             if context.automatic {
                 let workflow =
@@ -3477,7 +3618,7 @@ fn reconcile_expand_ftl_network(
                     region = %region.region,
                     target = %target,
                     event_priority = *event_priority,
-                    dense_belt_priority = *dense_priority,
+                    belt_density_priority = *density_priority,
                     replicant = %worker,
                     "Director launched prioritized regional FTL expansion"
                 );
@@ -3562,42 +3703,66 @@ fn relay_device_systems(
         .collect()
 }
 
-fn dense_belt_systems(
+fn belt_density_priorities(
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    locations
-        .iter()
-        .filter(|location| {
-            ["belt", "asteroid_belt"].iter().any(|field| {
-                location
-                    .unknown
-                    .get(*field)
-                    .and_then(Value::as_object)
-                    .and_then(|belt| belt.get("density"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|density| density.eq_ignore_ascii_case("dense"))
-            })
-        })
-        .filter_map(|location| {
-            location
-                .system
-                .clone()
-                .or_else(|| location_systems.get(location.key.id.as_str()).cloned())
-        })
-        .collect()
+) -> BTreeMap<String, u8> {
+    let mut priorities = BTreeMap::<String, u8>::new();
+    for location in locations {
+        let density = ["belt", "asteroid_belt"]
+            .iter()
+            .filter_map(|field| location.unknown.get(*field))
+            .map(belt_density_priority)
+            .max()
+            .unwrap_or_default();
+        if density == 0 {
+            continue;
+        }
+        let Some(system) = location
+            .system
+            .clone()
+            .or_else(|| location_systems.get(location.key.id.as_str()).cloned())
+        else {
+            continue;
+        };
+        priorities
+            .entry(system)
+            .and_modify(|priority| *priority = (*priority).max(density))
+            .or_insert(density);
+    }
+    priorities
 }
 
-fn ftl_priority_score(event_priority: bool, dense_priority: bool) -> u32 {
-    (if event_priority { 200 } else { 0 }) + (if dense_priority { 160 } else { 0 })
+fn belt_density_priority(value: &Value) -> u8 {
+    let rank = |density: &str| match density.to_ascii_lowercase().as_str() {
+        "dense" => 2,
+        "moderate" => 1,
+        _ => 0,
+    };
+    value
+        .get("belts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|belt| belt.get("density").and_then(Value::as_str))
+        .chain(value.get("density").and_then(Value::as_str))
+        .map(rank)
+        .max()
+        .unwrap_or_default()
 }
 
-fn ftl_priority_suffix(event_priority: bool, dense_priority: bool) -> &'static str {
-    match (event_priority, dense_priority) {
-        (true, true) => " (active events + dense belt)",
-        (true, false) => " (active events)",
-        (false, true) => " (dense belt)",
-        (false, false) => "",
+fn ftl_priority_score(event_priority: bool, density_priority: u8) -> u32 {
+    (if event_priority { 200 } else { 0 }) + u32::from(density_priority) * 80
+}
+
+fn ftl_priority_suffix(event_priority: bool, density_priority: u8) -> &'static str {
+    match (event_priority, density_priority) {
+        (true, 2..) => " (active events + dense belt)",
+        (true, 1) => " (active events + moderate belt)",
+        (true, _) => " (active events)",
+        (false, 2..) => " (dense belt)",
+        (false, 1) => " (moderate belt)",
+        (false, _) => "",
     }
 }
 
@@ -4600,6 +4765,7 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
             "Discover new stars through observatory prospecting"
         }
         DirectorGoalKind::EnhanceStarCatalogue => "Survey known regional star systems",
+        DirectorGoalKind::DiscoverBelts => "Search known regional systems for asteroid belts",
         DirectorGoalKind::ExpandMiningOps => "Expand useful regional mining infrastructure",
         DirectorGoalKind::EventCompletion => "Complete worthwhile active regional events",
         DirectorGoalKind::BlueprintAcquisition => {
@@ -4613,11 +4779,12 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
     }
 }
 
-fn all_goal_kinds() -> [DirectorGoalKind; 9] {
+fn all_goal_kinds() -> [DirectorGoalKind; 10] {
     [
         DirectorGoalKind::EstablishRegions,
         DirectorGoalKind::ExpandStarCatalogue,
         DirectorGoalKind::EnhanceStarCatalogue,
+        DirectorGoalKind::DiscoverBelts,
         DirectorGoalKind::ExpandMiningOps,
         DirectorGoalKind::EventCompletion,
         DirectorGoalKind::BlueprintAcquisition,
@@ -4634,6 +4801,7 @@ pub fn goal_kind_key(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::EstablishRegions => "establish_regions",
         DirectorGoalKind::ExpandStarCatalogue => "expand_star_catalogue",
         DirectorGoalKind::EnhanceStarCatalogue => "enhance_star_catalogue",
+        DirectorGoalKind::DiscoverBelts => "discover_belts",
         DirectorGoalKind::ExpandMiningOps => "expand_mining_ops",
         DirectorGoalKind::EventCompletion => "event_completion",
         DirectorGoalKind::BlueprintAcquisition => "blueprint_acquisition",
@@ -4936,6 +5104,7 @@ mod tests {
     #[test]
     fn production_ready_ftl_goal_defaults_enabled() {
         assert!(default_goal_enabled(DirectorGoalKind::ExpandFtlNetwork));
+        assert!(default_goal_enabled(DirectorGoalKind::DiscoverBelts));
         assert!(!default_goal_enabled(DirectorGoalKind::EstablishBeacons));
         assert!(default_goal_enabled(DirectorGoalKind::EventCompletion));
         assert!(default_goal_enabled(DirectorGoalKind::BlueprintAcquisition));
@@ -5051,7 +5220,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_belt_priority_uses_managed_location_payload() {
+    fn belt_density_priority_uses_managed_location_payload() {
         let location = Location {
             key: replicant_client::LocationKey::live("BETA-STAR-BELT-1".into()),
             location_type: None,
@@ -5064,16 +5233,38 @@ mod tests {
             environment: replicant_client::domain::LocationEnvironment::default(),
             unknown: BTreeMap::from([("belt".to_owned(), serde_json::json!({"density": "dense"}))]),
         };
+        let moderate = Location {
+            key: replicant_client::LocationKey::live("GAMMA-STAR-BELT-1".into()),
+            system: Some("GAMMA-STAR".to_owned()),
+            unknown: BTreeMap::from([(
+                "asteroid_belt".to_owned(),
+                serde_json::json!({"belts": [{"density": "moderate"}]}),
+            )]),
+            ..location.clone()
+        };
 
         assert_eq!(
-            dense_belt_systems(&[location], &BTreeMap::new()),
-            BTreeSet::from(["BETA-STAR".to_owned()])
+            belt_density_priorities(&[location, moderate], &BTreeMap::new()),
+            BTreeMap::from([("BETA-STAR".to_owned(), 2), ("GAMMA-STAR".to_owned(), 1)])
         );
-        assert!(ftl_priority_score(true, false) > ftl_priority_score(false, true));
-        assert!(ftl_priority_score(false, true) > ftl_priority_score(false, false));
+        assert!(ftl_priority_score(true, 0) > ftl_priority_score(false, 2));
+        assert!(ftl_priority_score(false, 2) > ftl_priority_score(false, 1));
+        assert!(ftl_priority_score(false, 1) > ftl_priority_score(false, 0));
         assert_eq!(
-            ftl_priority_suffix(true, true),
+            ftl_priority_suffix(true, 2),
             " (active events + dense belt)"
+        );
+        assert_eq!(ftl_priority_suffix(false, 1), " (moderate belt)");
+    }
+
+    #[test]
+    fn mining_waits_for_relay_connected_belt_systems() {
+        let belts = BTreeSet::from(["CONNECTED".to_owned(), "UNREACHABLE".to_owned()]);
+        let relays = BTreeSet::from(["CONNECTED".to_owned(), "OTHER".to_owned()]);
+
+        assert_eq!(
+            relay_connected_mining_targets(&belts, &relays),
+            vec!["CONNECTED".to_owned()]
         );
     }
 

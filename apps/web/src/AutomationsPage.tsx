@@ -1341,6 +1341,7 @@ const goalLabels: Record<DirectorGoalKind, string> = {
   establish_regions: "Establish Regions",
   expand_star_catalogue: "Expand Star Catalogue",
   enhance_star_catalogue: "Enhance Star Catalogue",
+  discover_belts: "Discover Belts",
   expand_mining_ops: "Expand Mining Ops",
   event_completion: "Event Completion",
   blueprint_acquisition: "Blueprint Acquisition",
