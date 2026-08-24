@@ -1710,6 +1710,12 @@ fn shop_opportunities_for<'a>(
     })
 }
 
+fn blueprint_acquisition_target(device_type: &DeviceType) -> bool {
+    !device_type
+        .as_str()
+        .eq_ignore_ascii_case("replicant_matrix")
+}
+
 fn blueprint_shop_dependency_cycle(
     snapshot: &BlueprintShopSnapshot,
     target: &str,
@@ -1825,6 +1831,7 @@ fn reconcile_blueprint_acquisition(
             .iter()
             .map(|opportunity| DeviceType::from(opportunity.device_type.as_str())),
     );
+    tracked_types.retain(blueprint_acquisition_target);
     let known_tracked = tracked_types
         .iter()
         .filter(|device_type| unlocked_blueprints.contains(*device_type))
@@ -5075,6 +5082,16 @@ mod tests {
             &hosted,
             "service_bot",
             &devices
+        ));
+    }
+
+    #[test]
+    fn blueprint_acquisition_excludes_occupied_replicant_matrices() {
+        assert!(!blueprint_acquisition_target(&DeviceType::from(
+            "replicant_matrix"
+        )));
+        assert!(blueprint_acquisition_target(
+            &DeviceType::EmptyReplicantMatrix
         ));
     }
 
