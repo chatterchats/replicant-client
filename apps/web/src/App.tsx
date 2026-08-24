@@ -33,7 +33,7 @@ import { Inspector } from "./inspector/Inspector";
 export {
   relatedDeviceLabel,
   specializeDeviceCommand,
-} from "./inspector/Inspector";
+} from "./inspector/inspectorModel";
 import { LeaderboardsPage } from "./LeaderboardsPage";
 import { MessagesPage } from "./MessagesPage";
 import { MiningPage } from "./MiningPage";

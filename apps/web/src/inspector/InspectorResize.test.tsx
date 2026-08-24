@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/require-await, @typescript-eslint/no-non-null-assertion */
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -40,7 +41,9 @@ async function mount() {
 }
 
 async function unmount(root: Root) {
-  await act(async () => root.unmount());
+  await act(async () => {
+    root.unmount();
+  });
 }
 
 function pointer(type: string, clientX: number) {

@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState, type SyntheticEvent } from "react";
 
 import { ParameterField, validateParameters } from "../AutomationsPage";
 import { daemonApi } from "../api";
@@ -104,7 +104,7 @@ function InlineDeviceAction({
   const fields = command.descriptor.parameters.filter(
     (parameter) => fixed[parameter.name] === undefined,
   );
-  const submit = async (event: FormEvent) => {
+  const submit = async (event: SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault();
     const nextErrors = validateParameters(command.descriptor, values);
     setErrors(nextErrors);
@@ -125,7 +125,12 @@ function InlineDeviceAction({
     }
   };
   return (
-    <form className="inspector-command-form" onSubmit={submit}>
+    <form
+      className="inspector-command-form"
+      onSubmit={(event) => {
+        void submit(event);
+      }}
+    >
       {fields.map((parameter) => (
         <ParameterField
           key={parameter.name}
@@ -134,9 +139,9 @@ function InlineDeviceAction({
           entities={entities}
           error={errors[parameter.name]}
           operationKind={command.descriptor.kind}
-          onChange={(value) =>
-            setValues((current) => ({ ...current, [parameter.name]: value }))
-          }
+          onChange={(value) => {
+            setValues((current) => ({ ...current, [parameter.name]: value }));
+          }}
         />
       ))}
       {serverError ? <p className="inline-warning">{serverError}</p> : null}

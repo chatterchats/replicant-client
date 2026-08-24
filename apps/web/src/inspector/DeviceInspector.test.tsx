@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/require-await, @typescript-eslint/no-unnecessary-condition */
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -161,7 +162,7 @@ describe("DeviceInspector", () => {
     const container = document.createElement("div");
     const root = createRoot(container);
     const onRunCommand = vi.fn();
-    await act(async () =>
+    await act(async () => {
       root.render(
         <DeviceInspector
           device={device}
@@ -170,8 +171,8 @@ describe("DeviceInspector", () => {
           onRunCommand={onRunCommand}
           onOperationFinished={vi.fn()}
         />,
-      ),
-    );
+      );
+    });
     const commandButtons = [
       ...container.querySelectorAll(".inspector-command-grid button"),
     ];
@@ -188,15 +189,21 @@ describe("DeviceInspector", () => {
     const census = commandButtons.find((button) =>
       button.textContent?.includes("stellar_census"),
     ) as HTMLButtonElement;
-    await act(async () => census.click());
+    await act(async () => {
+      census.click();
+    });
     expect(onRunCommand).not.toHaveBeenCalled();
     expect(container.querySelector('input[name="page"]')).not.toBeNull();
 
     for (const button of commandButtons.filter((item) => item !== census)) {
-      await act(async () => (button as HTMLButtonElement).click());
+      await act(async () => {
+        (button as HTMLButtonElement).click();
+      });
     }
     expect(onRunCommand).toHaveBeenCalledTimes(9);
-    await act(async () => root.unmount());
+    await act(async () => {
+      root.unmount();
+    });
   });
 
   it("shows no actions for empty availability and resolves duplicates catalogue-first", () => {

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/require-await */
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -179,6 +180,8 @@ describe("Inspector extraction", () => {
     });
     expect(callbacks.onClose).toHaveBeenCalledOnce();
     expect(callbacks.onClear).toHaveBeenCalledOnce();
-    await act(async () => root.unmount());
+    await act(async () => {
+      root.unmount();
+    });
   });
 });

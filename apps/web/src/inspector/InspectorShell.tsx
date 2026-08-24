@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import {
   useEffect,
   useState,
@@ -47,7 +48,9 @@ export function useInspectorWidth() {
       setWidthState((current) => clampInspectorWidth(current));
     };
     window.addEventListener("resize", resize);
-    return () => window.removeEventListener("resize", resize);
+    return () => {
+      window.removeEventListener("resize", resize);
+    };
   }, []);
   return {
     width,
@@ -96,14 +99,16 @@ export function InspectorShell({
   const [drag, setDrag] = useState<{ x: number; width: number } | null>(null);
   const startDrag = (event: PointerEvent<HTMLDivElement>) => {
     setDrag({ x: event.clientX, width: size.width });
-    event.currentTarget.setPointerCapture?.(event.pointerId);
+    const capture = (event.currentTarget as Partial<HTMLElement>).setPointerCapture;
+    if (typeof capture === "function") capture.call(event.currentTarget, event.pointerId);
   };
   const moveDrag = (event: PointerEvent<HTMLDivElement>) => {
     if (drag) size.setWidth(drag.width + drag.x - event.clientX);
   };
   const stopDrag = (event: PointerEvent<HTMLDivElement>) => {
     setDrag(null);
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    const release = (event.currentTarget as Partial<HTMLElement>).releasePointerCapture;
+    if (typeof release === "function") release.call(event.currentTarget, event.pointerId);
   };
   const style = {
     "--inspector-width": `${String(size.width)}px`,

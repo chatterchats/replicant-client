@@ -10,7 +10,7 @@ export function GenericInspector({ value }: { value: unknown }) {
     <p>
       {value === undefined
         ? "This entity is not present in the current daemon projection."
-        : String(value)}
+        : JSON.stringify(value)}
     </p>
   );
 }

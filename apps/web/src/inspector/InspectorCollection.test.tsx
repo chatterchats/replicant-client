@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/require-await, @typescript-eslint/restrict-template-expressions */
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -51,9 +52,9 @@ describe("InspectorCollection", () => {
     }
     const container = document.createElement("div");
     const root = createRoot(container);
-    await act(async () =>
-      root.render(<InspectorCollection collection={grouped(393)} />),
-    );
+    await act(async () => {
+      root.render(<InspectorCollection collection={grouped(393)} />);
+    });
     const input = container.querySelector("input");
     await act(async () => {
       if (input) {
@@ -65,6 +66,8 @@ describe("InspectorCollection", () => {
       }
     });
     expect(container.querySelectorAll("details")).toHaveLength(0);
-    await act(async () => root.unmount());
+    await act(async () => {
+      root.unmount();
+    });
   });
 });

@@ -72,7 +72,9 @@ export function InspectorCollection({
         <input
           type="search"
           value={filter}
-          onChange={(event) => setFilter(event.target.value)}
+          onChange={(event) => {
+            setFilter(event.target.value);
+          }}
         />
       </label>
       {groups.map((group) => (

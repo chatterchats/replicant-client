@@ -28,8 +28,6 @@ import {
   isWorkflowSummary,
 } from "./inspectorModel";
 
-export { relatedDeviceLabel, specializeDeviceCommand } from "./inspectorModel";
-
 interface InspectorSlots {
   vitals?: ReactNode;
   body?: ReactNode;
@@ -149,16 +147,28 @@ export function InspectorView({
       <>
         {targetSystem ? (
           <>
-            <button onClick={() => props.onOpenGalaxy(targetSystem)}>
+            <button
+              onClick={() => {
+                props.onOpenGalaxy(targetSystem);
+              }}
+            >
               Show on Galaxy
             </button>
-            <button onClick={() => props.onOpenSystem(targetSystem)}>
+            <button
+              onClick={() => {
+                props.onOpenSystem(targetSystem);
+              }}
+            >
               Show on System
             </button>
           </>
         ) : null}
         {entity.kind === "workflow" ? (
-          <button onClick={() => props.onOpenWorkflow(entity.id)}>
+          <button
+            onClick={() => {
+              props.onOpenWorkflow(entity.id);
+            }}
+          >
             Open in Automation
           </button>
         ) : null}
