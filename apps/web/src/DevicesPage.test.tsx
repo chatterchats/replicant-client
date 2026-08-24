@@ -37,6 +37,7 @@ const device = (
   owner: "R-1",
   owner_name: "Ada",
   system: "SOL",
+  region: "solzone",
   location: "SOL-1",
   available_commands: [],
   tags: [],
@@ -62,6 +63,7 @@ const filters: DeviceFilters = {
   search: "",
   status: "",
   type: "",
+  region: "",
   system: "",
   owner: "",
 };
@@ -106,11 +108,23 @@ function click(node: ReactNode): boolean {
 }
 
 describe("device fleet browser", () => {
-  it("consolidates activity statuses and filters by owning replicant", () => {
+  it("consolidates activity statuses and filters by owner and region", () => {
     const rows = [
-      device("D-1", { status: "mining (Conductive)", owner: "R-1" }),
-      device("D-2", { status: "mining (Silicates)", owner: "R-2" }),
-      device("D-3", { status: "repairing hull", owner: "R-1" }),
+      device("D-1", {
+        status: "mining (Conductive)",
+        owner: "R-1",
+        region: "alpha",
+      }),
+      device("D-2", {
+        status: "mining (Silicates)",
+        owner: "R-2",
+        region: "beta",
+      }),
+      device("D-3", {
+        status: "repairing hull",
+        owner: "R-1",
+        region: "alpha",
+      }),
     ];
     expect(normalizedDeviceStatus(rows[0]?.status ?? null)).toBe("mining");
     expect(normalizedDeviceStatus(rows[2]?.status ?? null)).toBe("repairing");
@@ -121,6 +135,11 @@ describe("device fleet browser", () => {
         "code",
       ).map((row) => row.entity.id),
     ).toEqual(["D-2"]);
+    expect(
+      filterAndSortDevices(rows, { ...filters, region: "alpha" }, "code").map(
+        (row) => row.entity.id,
+      ),
+    ).toEqual(["D-1", "D-3"]);
   });
 
   it("orders systems by device count and then system name", () => {

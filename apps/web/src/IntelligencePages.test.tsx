@@ -35,6 +35,7 @@ const device = {
   owner: null,
   owner_name: null,
   system: "SOL",
+  region: "solzone",
   location: "SOL-1",
   available_commands: [],
   tags: [],

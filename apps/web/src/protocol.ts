@@ -220,6 +220,7 @@ export interface DeviceSummary {
   owner: string | null;
   owner_name: string | null;
   system: string | null;
+  region: string | null;
   location: string | null;
   available_commands: string[];
   available_directives?: string[];
@@ -1873,6 +1874,10 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
         ? null
         : nullableString(device.owner_name, "device owner name"),
     system: nullableString(device.system, "device system"),
+    region:
+      device.region === undefined
+        ? null
+        : nullableString(device.region, "device region"),
     location: nullableString(device.location, "device location"),
     available_commands:
       device.available_commands === undefined

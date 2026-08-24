@@ -12,6 +12,7 @@ const device: DeviceSummary = {
   owner: "R-1",
   owner_name: "Ada",
   system: "SOL",
+  region: "solzone",
   location: "SOL-HUB",
   available_commands: [],
   tags: [],

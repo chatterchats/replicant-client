@@ -31,6 +31,7 @@ const relay = {
   owner: "R-1",
   owner_name: "Ada",
   system: "SOL",
+  region: "solzone",
   location: "SOL-1",
   tags: ["network"],
   available_commands: [],

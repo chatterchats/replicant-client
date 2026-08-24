@@ -4378,6 +4378,48 @@ fn system_region_map(catalogue: &[Star]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Maps catalogue systems to their formal region, extending each region by
+/// the same 15 LY gateway margin used for unregioned automation footholds.
+#[must_use]
+pub fn expanded_system_region_map(catalogue: &[Star]) -> BTreeMap<String, String> {
+    let mut regions = system_region_map(catalogue);
+    let regional_systems = catalogue
+        .iter()
+        .filter_map(|star| {
+            Some((
+                star.key.id.as_str(),
+                canonical_region(star.region.as_deref()?),
+                star.position?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    for star in catalogue.iter().filter(|star| star.region.is_none()) {
+        let Some(position) = star.position else {
+            continue;
+        };
+        let nearest = regional_systems
+            .iter()
+            .map(|(system, region, candidate)| {
+                (
+                    galactic_distance(position, *candidate),
+                    region.as_str(),
+                    *system,
+                )
+            })
+            .filter(|(distance, _, _)| *distance <= REGION_GATEWAY_HUB_RANGE_LY)
+            .min_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(right.1))
+                    .then_with(|| left.2.cmp(right.2))
+            });
+        if let Some((_, region, _)) = nearest {
+            regions.insert(star.key.id.as_str().to_owned(), region.to_owned());
+        }
+    }
+    regions
+}
+
 fn device_system(device: &Device, location_systems: &BTreeMap<String, String>) -> Option<String> {
     device
         .location
@@ -4955,6 +4997,22 @@ mod tests {
                 hub
             })
             .collect()
+    }
+
+    fn positioned_star(name: &str, x: f64, region: Option<&str>) -> Star {
+        Star {
+            key: replicant_client::domain::StarKey::live(replicant_client::StarId::from(name)),
+            name: None,
+            spectral_type: None,
+            entry_point: None,
+            position: Some(GalacticPosition { x, y: 0.0, z: 0.0 }),
+            has_hub: None,
+            has_ward: None,
+            knowledge_observed: false,
+            explored: None,
+            has_life: None,
+            region: region.map(str::to_owned),
+        }
     }
 
     #[test]
@@ -5653,6 +5711,24 @@ mod tests {
             z: 12.0,
         };
         assert!((galactic_distance(left, right) - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn device_region_map_extends_formal_bounds_by_fifteen_ly() {
+        let regions = expanded_system_region_map(&[
+            positioned_star("ALPHA-EDGE", 0.0, Some("Alpha")),
+            positioned_star("SCEPTURUM", 15.0, None),
+            positioned_star("TOO-FAR", 15.01, None),
+        ]);
+
+        assert_eq!(regions.get("ALPHA-EDGE").map(String::as_str), Some("alpha"));
+        assert_eq!(regions.get("SCEPTURUM").map(String::as_str), Some("alpha"));
+        assert!(!regions.contains_key("TOO-FAR"));
+        let formal = expanded_system_region_map(&[
+            positioned_star("ALPHA-EDGE", 0.0, Some("Alpha")),
+            positioned_star("FORMAL-BETA", 1.0, Some("Beta")),
+        ]);
+        assert_eq!(formal.get("FORMAL-BETA").map(String::as_str), Some("beta"));
     }
 
     #[test]

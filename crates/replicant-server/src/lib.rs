@@ -88,6 +88,7 @@ use replicant_runtime::{
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     intelligence::{account_profile, leaderboard, leaderboard_index, standing},
+    orchestration::expanded_system_region_map,
     orchestration::{
         assign_replicant_region, cached_director_snapshot, parse_goal_kind, reconcile_director,
         set_director_mode, set_goal_enabled,
@@ -1481,6 +1482,7 @@ async fn device_rows(state: &Arc<AppState>) -> Result<Arc<Vec<DeviceSummary>>, A
 }
 
 async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, ApiError> {
+    let system_regions = expanded_system_region_map(&state.client().galaxy().catalogue());
     let location_systems = state
         .client()
         .locations()
@@ -1546,6 +1548,7 @@ async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, 
         rows.push(device_summary(
             device,
             &location_systems,
+            &system_regions,
             &replicant_names,
             claims.remove(handle.id().as_str()),
         ));
@@ -1562,7 +1565,11 @@ fn inherit_stowed_locations(devices: &mut [DeviceSummary]) {
             .filter_map(|device| {
                 Some((
                     device.entity.id.0.clone(),
-                    (device.location.clone()?, device.system.clone()),
+                    (
+                        device.location.clone()?,
+                        device.system.clone(),
+                        device.region.clone(),
+                    ),
                 ))
             })
             .collect::<BTreeMap<_, _>>();
@@ -1571,11 +1578,12 @@ fn inherit_stowed_locations(devices: &mut [DeviceSummary]) {
             .iter_mut()
             .filter(|device| device.location.is_none())
         {
-            if let Some((location, system)) =
+            if let Some((location, system, region)) =
                 device.stowed_in.as_ref().and_then(|host| hosts.get(host))
             {
                 device.location = Some(location.clone());
                 device.system.clone_from(system);
+                device.region.clone_from(region);
                 changed = true;
             }
         }
@@ -4484,6 +4492,7 @@ fn inventory_snapshot(
 fn device_summary(
     device: Device,
     location_systems: &BTreeMap<String, Option<String>>,
+    system_regions: &BTreeMap<String, String>,
     replicant_names: &BTreeMap<String, String>,
     claim: Option<DeviceClaim>,
 ) -> DeviceSummary {
@@ -4502,6 +4511,12 @@ fn device_summary(
         .iter()
         .map(|directive| directive.as_str().to_owned())
         .collect();
+    let system = location
+        .as_ref()
+        .and_then(|value| device_system(value, location_systems));
+    let region = system
+        .as_ref()
+        .and_then(|value| system_regions.get(value).cloned());
     DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
@@ -4511,9 +4526,8 @@ fn device_summary(
             .as_ref()
             .and_then(|value| replicant_names.get(value).cloned()),
         owner,
-        system: location
-            .as_ref()
-            .and_then(|value| device_system(value, location_systems)),
+        system,
+        region,
         location,
         available_commands,
         available_directives,
@@ -6677,6 +6691,7 @@ mod tests {
             owner: None,
             owner_name: None,
             system: None,
+            region: None,
             location: None,
             available_commands: Vec::new(),
             available_directives: Vec::new(),
@@ -6704,6 +6719,7 @@ mod tests {
         let mut host = projected_device("HOST");
         host.location = Some("SOL-HUB".to_owned());
         host.system = Some("SOL".to_owned());
+        host.region = Some("solzone".to_owned());
         let mut child = projected_device("CHILD");
         child.stowed_in = Some("HOST".to_owned());
         let mut nested = projected_device("NESTED");
@@ -6718,6 +6734,7 @@ mod tests {
 
         assert_eq!(devices[0].location.as_deref(), Some("SOL-HUB"));
         assert_eq!(devices[0].system.as_deref(), Some("SOL"));
+        assert_eq!(devices[0].region.as_deref(), Some("solzone"));
         assert_eq!(devices[1].location.as_deref(), Some("SOL-HUB"));
         assert_eq!(devices[3].location.as_deref(), Some("PHASYRIS-HUB"));
     }
@@ -7193,7 +7210,6 @@ mod tests {
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),
-            available_directives: Vec::new(),
             tags: vec!["hauler".to_owned()],
             relationships: DeviceRelationships {
                 assigned_replicant: Some(ReplicantKey::live("R-1".into())),
@@ -7215,6 +7231,7 @@ mod tests {
         let row = device_summary(
             device,
             &BTreeMap::from([("EARTH".to_owned(), Some("SOL".to_owned()))]),
+            &BTreeMap::from([("SOL".to_owned(), "solzone".to_owned())]),
             &BTreeMap::from([("R-1".to_owned(), "Ada".to_owned())]),
             Some(DeviceClaim {
                 workflow_id: ProtocolWorkflowId("wf-1".to_owned()),
@@ -7227,6 +7244,7 @@ mod tests {
         assert_eq!(row.status, None);
         assert_eq!(row.owner.as_deref(), Some("R-1"));
         assert_eq!(row.system.as_deref(), Some("SOL"));
+        assert_eq!(row.region.as_deref(), Some("solzone"));
         assert_eq!(row.owner_name.as_deref(), Some("Ada"));
         assert_eq!(row.operational_capacity_percent, Some(75.0));
         assert_eq!(row.claim.expect("claim").workflow_id.0, "wf-1");

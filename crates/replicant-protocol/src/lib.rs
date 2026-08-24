@@ -496,6 +496,9 @@ pub struct DeviceSummary {
     pub owner_name: Option<String>,
     /// Containing system, when known.
     pub system: Option<String>,
+    /// Formal or 15 LY gateway-expanded region, when known.
+    #[serde(default)]
+    pub region: Option<String>,
     /// Current location, when known.
     pub location: Option<String>,
     /// Commands currently advertised by the managed device projection.
@@ -2907,6 +2910,7 @@ mod tests {
             owner: None,
             owner_name: None,
             system: None,
+            region: None,
             location: None,
             available_commands: Vec::new(),
             available_directives: Vec::new(),

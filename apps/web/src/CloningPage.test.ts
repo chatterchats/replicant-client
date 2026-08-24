@@ -15,6 +15,7 @@ function device(
     owner: null,
     owner_name: null,
     system: null,
+    region: null,
     location: null,
     available_commands: [],
     tags: [],

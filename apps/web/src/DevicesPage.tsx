@@ -88,6 +88,7 @@ export interface DeviceFilters {
   search: string;
   status: string;
   type: string;
+  region: string;
   system: string;
   owner: string;
 }
@@ -117,6 +118,7 @@ const emptyFilters: DeviceFilters = {
   search: "",
   status: "",
   type: "",
+  region: "",
   system: "",
   owner: "",
 };
@@ -299,6 +301,7 @@ export function filterAndSortDevices(
       device.status,
       device.owner,
       device.owner_name,
+      device.region,
       device.system,
       device.location,
       ...device.tags,
@@ -312,6 +315,7 @@ export function filterAndSortDevices(
       (!filters.status ||
         normalizedDeviceStatus(device.status) === filters.status) &&
       (!filters.type || device.device_type === filters.type) &&
+      (!filters.region || device.region === filters.region) &&
       (!filters.system || device.system === filters.system) &&
       (!filters.owner || device.owner === filters.owner)
     );
@@ -670,6 +674,10 @@ export function DevicesContent({
       ].sort((left, right) => left[1].localeCompare(right[1])),
     [allDevices],
   );
+  const regions = useMemo(
+    () => uniqueStrings(allDevices.map((device) => device.region)),
+    [allDevices],
+  );
   useEffect(() => {
     const present = new Set(allDevices.map((device) => device.entity.id));
     setSelectedDevices((current) => {
@@ -923,6 +931,22 @@ export function DevicesContent({
                 update("system", value);
               }}
             />
+            <label>
+              <span>Region</span>
+              <select
+                value={filters.region}
+                onChange={(event) => {
+                  update("region", event.target.value);
+                }}
+              >
+                <option value="">All regions</option>
+                {regions.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </label>
             <label>
               <span>Ownership</span>
               <select
