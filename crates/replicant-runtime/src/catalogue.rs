@@ -2794,26 +2794,30 @@ fn enum_parameter(name: &str, label: &str, values: &[&str], default: &str) -> Pa
 }
 
 fn bootstrap_action(kind: &str, display_name: &str, description: &str) -> ActionDescriptor {
-    ActionDescriptor { kind: operation_kind(kind),
-    display_name: display_name.to_owned(),
-    aliases: Vec::new(),
-    description: description.to_owned(),
-    category: "bootstrap".to_owned(),
-    operation_class: OperationClass::Action,
-    risk: MutationRisk::Elevated,
-    applicable_to: vec![EntityKind::System, EntityKind::Location], parameters: vec![
-        required("mission_file", "Mission file", ParameterKind::String),
-        bounded(
-            defaulted(
-                "wait_timeout_seconds",
-                "Wait timeout (seconds)",
-                ParameterKind::Integer,
-                21_600,
+    ActionDescriptor {
+        kind: operation_kind(kind),
+        display_name: display_name.to_owned(),
+        aliases: Vec::new(),
+        description: description.to_owned(),
+        category: "bootstrap".to_owned(),
+        operation_class: OperationClass::Action,
+        risk: MutationRisk::Elevated,
+        applicable_to: vec![EntityKind::System, EntityKind::Location],
+        parameters: vec![
+            required("mission_file", "Mission file", ParameterKind::String),
+            bounded(
+                defaulted(
+                    "wait_timeout_seconds",
+                    "Wait timeout (seconds)",
+                    ParameterKind::Integer,
+                    21_600,
+                ),
+                Some(1.0),
+                None,
             ),
-            Some(1.0),
-            None,
-        ),
-    ], device_commands: Vec::new() }
+        ],
+        device_commands: Vec::new(),
+    }
 }
 
 fn normalize_bobnet_channel(channel: &str) -> Result<String, CatalogueError> {

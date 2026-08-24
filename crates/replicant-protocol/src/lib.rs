@@ -637,26 +637,37 @@ pub struct SystemInspectorSummary {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocationEnvironmentSummary {
     /// Atmospheric classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atmosphere: Option<String>,
     /// Magnetic-field presence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub magnetic_field: Option<bool>,
     /// Surface gravity in Earth gravities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gravity_g: Option<f64>,
     /// Surface temperature in Celsius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_temperature_c: Option<f64>,
     /// Habitable-zone membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub habitable_zone: Option<bool>,
     /// Life stage, including `none` for observed absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub life_stage: Option<String>,
     /// Axial tilt in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axial_tilt_degrees: Option<f64>,
     /// Rotation-state wire value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_state: Option<String>,
     /// Parent star spectral type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_spectral_type: Option<String>,
     /// Nearby belt richness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nearby_belt_richness: Option<String>,
     /// Distance from Sol in light years.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_from_sol_light_years: Option<f64>,
 }
 
@@ -3598,10 +3609,14 @@ mod tests {
         device.stow_capacity = Some(10);
         device.stow_used = Some(1);
         device.grace_period_remaining = Some(60);
-        device.upkeep_requirements =
-            vec![BTreeMap::from([("resource".to_owned(), Value::String("fuel".to_owned()))])];
-        device.system_status =
-            Some(BTreeMap::from([("drive".to_owned(), Value::String("ready".to_owned()))]));
+        device.upkeep_requirements = vec![BTreeMap::from([(
+            "resource".to_owned(),
+            Value::String("fuel".to_owned()),
+        )])];
+        device.system_status = Some(BTreeMap::from([(
+            "drive".to_owned(),
+            Value::String("ready".to_owned()),
+        )]));
         round_trip(&Versioned::current(EntityInspectorSnapshot {
             metadata: metadata.clone(),
             summary: summary.clone(),
@@ -3713,10 +3728,7 @@ mod tests {
 
         round_trip(&DeviceCommandBinding {
             command: "travel".to_owned(),
-            parameters: BTreeMap::from([(
-                "mode".to_owned(),
-                Value::String("standard".to_owned()),
-            )]),
+            parameters: BTreeMap::from([("mode".to_owned(), Value::String("standard".to_owned()))]),
         });
     }
 

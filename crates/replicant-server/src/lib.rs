@@ -1,5 +1,7 @@
 //! HTTP query/command API for the local `replicantd` process.
 
+mod inspector;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -7,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -52,10 +54,11 @@ use replicant_protocol::{
     DeviceLogsSnapshot, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
     DirectorModeRequest, DirectorReplicantRegionRequest, DirectorSnapshot,
     DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary,
-    DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityKind, EntityRef,
-    EntitySummary, ErrorResponse, EventCriterionSummary, EventRequirementKind,
-    EventRequirementSummary, EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot,
-    FactoryJobSummary, FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
+    DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityInspectorDetail,
+    EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
+    EventCriterionSummary, EventRequirementKind, EventRequirementSummary, EventRewardItem,
+    EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
+    FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
     InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
@@ -135,7 +138,6 @@ fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const UPSTREAM_FANOUT: usize = 8;
-const CARGO_CACHE_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_WORKFLOW_RETENTION_DAYS: u64 = 90;
 const WORKFLOW_RETENTION_SWEEP: Duration = Duration::from_secs(60 * 60);
 const BILL_REPLICANT_CODE: &str = "A8F48B26";
@@ -144,12 +146,6 @@ const BILL_MAX_CANDIDATES: usize = 12;
 const BILL_HIGH_CONFIDENCE_DEG: f64 = 0.75;
 const BILL_MEDIUM_CONFIDENCE_DEG: f64 = 2.0;
 const BILL_AMBIGUITY_GAP_DEG: f64 = 0.35;
-
-#[derive(Clone)]
-struct CargoCacheEntry {
-    refreshed_at: Instant,
-    carriers: Vec<CargoCarrierSummary>,
-}
 
 /// Default loopback address used by the daemon.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -309,12 +305,6 @@ pub struct AppState {
     /// from. `/api/devices`, `/api/autofactories`, and the relay projection all
     /// rebuild the identical row set, previously once per request.
     device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
-    /// Last successful cargo detail projection. Cargo contents require fields
-    /// not yet normalized into the managed Device model, so retain the latest
-    /// successful upstream result and refresh it stale-while-revalidate.
-    cargo_cache: tokio::sync::Mutex<Option<CargoCacheEntry>>,
-    cargo_refresh: Mutex<()>,
-    cargo_refreshing: AtomicBool,
     message_sync: Mutex<()>,
     director_reconcile: Mutex<()>,
     director_wake: Notify,
@@ -364,9 +354,6 @@ impl AppState {
             pending_slices: StdMutex::new(BTreeSet::new()),
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
-            cargo_cache: tokio::sync::Mutex::new(None),
-            cargo_refresh: Mutex::new(()),
-            cargo_refreshing: AtomicBool::new(false),
             message_sync: Mutex::new(()),
             director_reconcile: Mutex::new(()),
             director_wake: Notify::new(),
@@ -569,6 +556,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/leaderboards", get(leaderboards))
         .route("/api/settings", get(settings))
         .route("/api/entities", get(entity_index))
+        .route("/api/entities/{kind}/{id}", get(entity_inspector))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
         .route("/ws", get(websocket))
@@ -1551,7 +1539,7 @@ async fn build_device_rows(state: &Arc<AppState>) -> Result<Vec<DeviceSummary>, 
             &system_regions,
             &replicant_names,
             claims.remove(handle.id().as_str()),
-        ));
+        )?);
     }
     inherit_stowed_locations(&mut rows);
     rows.sort_by(|left, right| left.entity.cmp(&right.entity));
@@ -1772,176 +1760,29 @@ fn number_field(value: &Map<String, Value>, names: &[&str]) -> Option<f64> {
         .find_map(|name| value.get(*name).and_then(Value::as_f64))
 }
 
-fn group_device_codes_by_type(
-    devices: &[DeviceSummary],
-) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
-    let mut codes_by_type = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut untyped_codes = BTreeSet::new();
-    for device in devices {
-        if let Some(device_type) = device.device_type.as_ref() {
-            codes_by_type
-                .entry(device_type.clone())
-                .or_default()
-                .insert(device.entity.id.0.clone());
-        } else {
-            untyped_codes.insert(device.entity.id.0.clone());
-        }
-    }
-    (codes_by_type, untyped_codes)
-}
-
 async fn cargo(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<CargoSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
-    if let Some(cache) = state.cargo_cache.lock().await.clone() {
-        let age = cache.refreshed_at.elapsed();
-        if age <= CARGO_CACHE_TTL {
-            return Ok(Json(Versioned::current(cargo_snapshot(
-                metadata,
-                cache.carriers,
-            ))));
-        }
-
-        if state
-            .cargo_refreshing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                match refresh_cargo_cache(&state).await {
-                    Ok(_) => {
-                        state.invalidate(DomainSlice::Cargo);
-                        state.flush_invalidations();
-                    }
-                    Err(error) => tracing::warn!(
-                        status = error.status.as_u16(),
-                        code = error.code,
-                        message = error.message,
-                        "background cargo refresh failed; retaining stale snapshot"
-                    ),
-                }
-                state.cargo_refreshing.store(false, Ordering::Release);
-            });
-        }
-
-        tracing::debug!(
-            age_ms = age.as_millis(),
-            ttl_ms = CARGO_CACHE_TTL.as_millis(),
-            "serving stale cargo snapshot while refreshing in background"
-        );
-        return Ok(Json(Versioned::current(cargo_snapshot(
-            metadata,
-            cache.carriers,
-        ))));
-    }
-
-    let carriers = refresh_cargo_cache(&state).await?;
-    Ok(Json(Versioned::current(cargo_snapshot(metadata, carriers))))
-}
-
-async fn refresh_cargo_cache(state: &Arc<AppState>) -> Result<Vec<CargoCarrierSummary>, ApiError> {
-    let _guard = state.cargo_refresh.lock().await;
-    if let Some(cache) = state.cargo_cache.lock().await.clone()
-        && cache.refreshed_at.elapsed() <= CARGO_CACHE_TTL
-    {
-        return Ok(cache.carriers);
-    }
-
-    let carriers = load_cargo_carriers(state).await?;
-    *state.cargo_cache.lock().await = Some(CargoCacheEntry {
-        refreshed_at: Instant::now(),
-        carriers: carriers.clone(),
-    });
-    Ok(carriers)
-}
-
-async fn load_cargo_carriers(state: &Arc<AppState>) -> Result<Vec<CargoCarrierSummary>, ApiError> {
-    let device_rows = device_rows(state).await?;
-    let carrier_devices = device_rows
+    let carriers = device_rows(&state)
+        .await?
         .iter()
         .filter(|device| {
             device.cargo_capacity.unwrap_or_default() > 0
+                || !device.cargo.is_empty()
                 || device.attach_capacity.unwrap_or_default() > 0
                 || !device.attached_devices.is_empty()
-                || !device.stowed_devices.is_empty()
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    if carrier_devices.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The upstream list endpoint can filter by one device type, but not by a
-    // list of device codes. Group the already-known carriers by type and make
-    // one paginated bulk-list pass per unique type instead of one GET per
-    // carrier. Multiple type passes may run concurrently, while pagination
-    // within each type remains sequential.
-    let (carrier_codes_by_type, untyped_carrier_codes) =
-        group_device_codes_by_type(&carrier_devices);
-
-    let client = state.client().clone();
-    let detail_results = futures_util::stream::iter(carrier_codes_by_type.into_iter().map(
-        |(device_type, expected_codes)| {
-            let client = client.clone();
-            async move {
-                let details = raw_device_details(&client, Some(&device_type)).await?;
-                Ok::<_, ApiError>((expected_codes, details))
-            }
-        },
-    ))
-    .buffered(UPSTREAM_FANOUT)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut details = BTreeMap::new();
-    for result in detail_results {
-        let (expected_codes, mut type_details) = result?;
-        for code in expected_codes {
-            if let Some(detail) = type_details.remove(&code) {
-                details.insert(code, detail);
-            }
-        }
-    }
-
-    // Device type is expected to be present in managed state. If an older or
-    // forward-compatible device arrives without one, fall back to a single
-    // unfiltered bulk-list pass rather than reintroducing per-device GETs.
-    if !untyped_carrier_codes.is_empty() {
-        let mut all_details = raw_device_details(state.client(), None).await?;
-        for code in untyped_carrier_codes {
-            if let Some(detail) = all_details.remove(&code) {
-                details.insert(code, detail);
-            }
-        }
-    }
-    let mut carriers = Vec::with_capacity(carrier_devices.len());
-    for device in carrier_devices {
-        let detail = details
-            .remove(&device.entity.id.0)
-            .ok_or_else(ApiError::unavailable)?;
-        let mut resources = detail
-            .cargo
-            .into_iter()
-            .filter_map(|item| {
-                let quantity = item.quantity.unwrap_or_default();
-                if quantity <= 0 {
-                    return None;
-                }
-                Some(CargoResourceSummary {
-                    resource: item.resource_type?,
-                    quantity,
-                })
+        .map(|device| {
+            Ok(CargoCarrierSummary {
+                attachment_used: i64::try_from(device.attached_devices.len())
+                    .map_err(|_| ApiError::unavailable())?,
+                resources: device.cargo.clone(),
+                device: device.clone(),
             })
-            .collect::<Vec<_>>();
-        resources.sort_by(|left, right| left.resource.cmp(&right.resource));
-        carriers.push(CargoCarrierSummary {
-            attachment_used: i64::try_from(device.attached_devices.len()).unwrap_or(i64::MAX),
-            device,
-            resources,
-        });
-    }
-    Ok(carriers)
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(Versioned::current(cargo_snapshot(metadata, carriers))))
 }
 
 fn cargo_snapshot(metadata: SnapshotMetadata, carriers: Vec<CargoCarrierSummary>) -> CargoSnapshot {
@@ -4495,11 +4336,12 @@ fn device_summary(
     system_regions: &BTreeMap<String, String>,
     replicant_names: &BTreeMap<String, String>,
     claim: Option<DeviceClaim>,
-) -> DeviceSummary {
+) -> Result<DeviceSummary, ApiError> {
     let location = device.location.map(|value| value.id.to_string());
     let owner = device
         .relationships
         .assigned_replicant
+        .as_ref()
         .map(|value| value.id.to_string());
     let available_commands = device
         .available_commands
@@ -4511,13 +4353,44 @@ fn device_summary(
         .iter()
         .map(|directive| directive.as_str().to_owned())
         .collect();
+    let features = device
+        .features
+        .iter()
+        .filter_map(|feature| wire_value(Some(feature)))
+        .collect();
     let system = location
         .as_ref()
         .and_then(|value| device_system(value, location_systems));
     let region = system
         .as_ref()
         .and_then(|value| system_regions.get(value).cloned());
-    DeviceSummary {
+    let cargo_capacity = device.cargo_capacity;
+    let mut cargo = device
+        .cargo
+        .into_iter()
+        .filter_map(|(resource, quantity)| {
+            (quantity > 0).then_some(CargoResourceSummary { resource, quantity })
+        })
+        .collect::<Vec<_>>();
+    cargo.sort_by(|left, right| left.resource.cmp(&right.resource));
+    let cargo_used = if cargo.is_empty() && cargo_capacity.is_none() {
+        None
+    } else {
+        Some(cargo.iter().try_fold(0_i64, |total, item| {
+            total
+                .checked_add(item.quantity)
+                .ok_or_else(ApiError::unavailable)
+        })?)
+    };
+    let active_directive = device
+        .active_directive
+        .as_ref()
+        .and_then(|value| wire_value(value.directive.as_ref()));
+    let directive_status = device
+        .active_directive
+        .as_ref()
+        .and_then(|value| value.status.clone());
+    Ok(DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
         status: wire_value(device.status.as_ref()),
@@ -4531,6 +4404,7 @@ fn device_summary(
         location,
         available_commands,
         available_directives,
+        features,
         tags: device.tags,
         attached_to: device
             .relationships
@@ -4567,16 +4441,19 @@ fn device_summary(
             .map(|value| value.id.to_string())
             .collect(),
         attach_capacity: device.attach_capacity,
-        cargo_capacity: device.stow_capacity,
-        cargo_used: device.stow_used,
+        cargo_capacity,
+        cargo_used,
+        cargo,
+        stow_capacity: device.stow_capacity,
+        stow_used: device.stow_used,
         operational_capacity_percent: device
             .operational_capacity
             .map(replicant_client::domain::OperationalCapacity::percent),
-        active_directive: device
-            .active_directive
-            .as_ref()
-            .and_then(|value| wire_value(value.directive.as_ref())),
-        directive_status: device.active_directive.and_then(|value| value.status),
+        grace_period_remaining: device.grace_period_remaining,
+        upkeep_requirements: device.upkeep_requirements,
+        system_status: device.system_status,
+        active_directive,
+        directive_status,
         travel_destination: device.travel.and_then(|value| {
             value
                 .final_destination
@@ -4584,7 +4461,7 @@ fn device_summary(
                 .map(|destination| destination.id.to_string())
         }),
         claim,
-    }
+    })
 }
 
 fn device_system(
@@ -4618,8 +4495,166 @@ async fn entity_index(
         })?;
     Ok(Json(Versioned::current(EntityIndexSnapshot {
         metadata,
+
         entities,
     })))
+}
+async fn entity_inspector(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<Json<Versioned<EntityInspectorSnapshot>>, ApiError> {
+    let metadata = state.snapshot_metadata()?;
+    let snapshot = match kind.as_str() {
+        "device" => {
+            let rows = device_rows(&state).await?;
+            let device = rows
+                .iter()
+                .find(|device| device.entity.id.0 == id)
+                .cloned()
+                .ok_or_else(ApiError::entity_not_found)?;
+            let observation = state
+                .client()
+                .devices()
+                .cached(&id)
+                .ok_or_else(ApiError::entity_not_found)?
+                .observation()
+                .await
+                .map_err(|_| ApiError::unavailable())?;
+            EntityInspectorSnapshot {
+                metadata,
+                summary: EntitySummary {
+                    entity: device.entity.clone(),
+                    label: device.entity.id.0.clone(),
+                    secondary_label: device.device_type.clone(),
+                    system: device.system.clone(),
+                    location: device.location.clone(),
+                    entity_type: device.device_type.clone(),
+                    status: device.status.clone(),
+                },
+                provenance: Some(inspector::provenance(&observation.metadata)),
+                detail: EntityInspectorDetail::Device(device),
+            }
+        }
+        "system" => {
+            let locations = state
+                .client()
+                .locations()
+                .find()
+                .in_system(&id)
+                .collect_observations()
+                .await
+                .map_err(|_| ApiError::unavailable())?;
+            let stars = state.client().galaxy().catalogue_observations();
+            let star = stars
+                .iter()
+                .find(|observation| observation.value.key.id.as_str() == id);
+            if star.is_none() && locations.is_empty() {
+                return Err(ApiError::entity_not_found());
+            }
+            let detail = inspector::system_detail(star, &locations).map_err(|error| {
+                tracing::error!(%error, system = id, "system Inspector projection failed");
+                ApiError::unavailable()
+            })?;
+            EntityInspectorSnapshot {
+                metadata,
+                summary: EntitySummary {
+                    entity: summary_ref(EntityKind::System, id.clone()),
+                    label: star
+                        .and_then(|observation| observation.value.name.clone())
+                        .unwrap_or_else(|| id.clone()),
+                    secondary_label: star
+                        .and_then(|observation| observation.value.spectral_type.clone()),
+                    system: Some(id.clone()),
+                    location: None,
+                    entity_type: star
+                        .and_then(|observation| observation.value.spectral_type.clone()),
+                    status: star.and_then(|observation| {
+                        observation.value.explored.map(|explored| {
+                            if explored { "explored" } else { "unexplored" }.to_owned()
+                        })
+                    }),
+                },
+                provenance: star.map(|observation| inspector::provenance(&observation.metadata)),
+                detail: EntityInspectorDetail::System(detail),
+            }
+        }
+        "location" => {
+            let mut locations = state
+                .client()
+                .locations()
+                .find()
+                .at(&id)
+                .collect_observations()
+                .await
+                .map_err(|_| ApiError::unavailable())?;
+            let observation = locations.pop().ok_or_else(ApiError::entity_not_found)?;
+            let mut contents = device_rows(&state)
+                .await?
+                .iter()
+                .filter(|device| device.location.as_deref() == Some(id.as_str()))
+                .map(|device| EntitySummary {
+                    entity: device.entity.clone(),
+                    label: device.entity.id.0.clone(),
+                    secondary_label: device.device_type.clone(),
+                    system: device.system.clone(),
+                    location: device.location.clone(),
+                    entity_type: device.device_type.clone(),
+                    status: device.status.clone(),
+                })
+                .collect::<Vec<_>>();
+            for handle in state
+                .client()
+                .replicants()
+                .find()
+                .owned()
+                .collect()
+                .await
+                .map_err(|_| ApiError::unavailable())?
+            {
+                let replicant = handle
+                    .snapshot()
+                    .await
+                    .map_err(|_| ApiError::unavailable())?;
+                if replicant
+                    .location
+                    .as_ref()
+                    .map(|location| location.id.as_str())
+                    != Some(id.as_str())
+                {
+                    continue;
+                }
+                let code = replicant.key.id.to_string();
+                let name = replicant.name.clone();
+                contents.push(EntitySummary {
+                    entity: summary_ref(EntityKind::Replicant, code.clone()),
+                    label: name.clone().unwrap_or_else(|| code.clone()),
+                    secondary_label: name.map(|_| code),
+                    system: observation.value.system.clone(),
+                    location: Some(id.clone()),
+                    entity_type: None,
+                    status: wire_value(replicant.status.as_ref()),
+                });
+            }
+            let summary = inspector::location_entity_summary(&observation.value);
+            let detail =
+                inspector::location_detail(&observation.value, contents).map_err(|error| {
+                    tracing::error!(%error, location = id, "location Inspector projection failed");
+                    ApiError::unavailable()
+                })?;
+            EntityInspectorSnapshot {
+                metadata,
+                summary,
+                provenance: Some(inspector::provenance(&observation.metadata)),
+                detail: EntityInspectorDetail::Location(detail),
+            }
+        }
+        _ => {
+            return Err(ApiError::invalid(
+                "entity Inspector supports only device, system, and location",
+            ));
+        }
+    };
+    Ok(Json(Versioned::current(snapshot)))
 }
 
 async fn build_entity_index(
@@ -6354,6 +6389,7 @@ fn present_activity(message: &str) -> (ActivityLevel, Option<String>, String) {
     }
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -6398,6 +6434,14 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "workflow_not_found",
             message: "workflow not found",
+        }
+    }
+
+    fn entity_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "entity_not_found",
+            message: "entity is not present in managed state",
         }
     }
 
@@ -6695,6 +6739,7 @@ mod tests {
             location: None,
             available_commands: Vec::new(),
             available_directives: Vec::new(),
+            features: Vec::new(),
             tags: Vec::new(),
             attached_to: None,
             stowed_in: None,
@@ -6706,7 +6751,13 @@ mod tests {
             attach_capacity: None,
             cargo_capacity: None,
             cargo_used: None,
+            cargo: Vec::new(),
+            stow_capacity: None,
+            stow_used: None,
             operational_capacity_percent: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
             active_directive: None,
             directive_status: None,
             travel_destination: None,
@@ -6714,10 +6765,223 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn entity_inspector_route_projects_compact_authoritative_details() {
+        let server = MockServer::start().await;
+        let devices = (0..393)
+            .map(|index| {
+                let mut device = serde_json::json!({
+                    "device_code": format!("D-{index:03}"),
+                    "device_type": "mining_drone",
+                    "status": "idle",
+                    "location": "SOL-BELT",
+                    "cargo": [{"resource_type": "iron", "quantity": 3}],
+                    "cargo_capacity": 20,
+                    "stow_capacity": 10,
+                    "stow_used": 1
+                });
+                if index == 0 {
+                    device["features"] = serde_json::json!(["travel"]);
+                    device["available_commands"] = serde_json::json!([
+                        "enqueue_print",
+                        "travel",
+                        "change_owner",
+                        "activate",
+                        "deactivate",
+                        "clear_queue",
+                        "system_scan",
+                        "retarget",
+                        "start_mining",
+                        "stellar_census"
+                    ]);
+                }
+                device
+            })
+            .collect::<Vec<_>>();
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": devices,
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (app, client) = test_app_at(&server.uri()).await;
+        client
+            .devices()
+            .refresh_many()
+            .collect()
+            .await
+            .expect("refresh devices");
+        for index in 0..54 {
+            let designation = if index == 0 {
+                "SOL-BELT".to_owned()
+            } else {
+                format!("SOL-{index}")
+            };
+            let mut body = serde_json::json!({
+                "location": designation,
+                "location_type": if index == 0 { "asteroid_belt" } else { "planet" },
+                "system": "SOL",
+                "scanned": if index % 3 == 0 { Value::Null } else { Value::Bool(index % 2 == 0) }
+            });
+            if index == 1 {
+                body["planet"] = serde_json::json!({
+                    "scanned": false,
+                    "magnetic_field": false,
+                    "surface_gravity": 0.0
+                });
+            }
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/locations/{designation}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            client
+                .locations()
+                .get(&designation)
+                .await
+                .expect("refresh location");
+        }
+
+        let system = json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/entities/system/SOL")
+                        .body(Body::empty())
+                        .expect("system request"),
+                )
+                .await
+                .expect("system response"),
+        )
+        .await;
+        assert_eq!(
+            system["payload"]["detail"]["detail"]["children"]["total"],
+            54
+        );
+        assert_eq!(
+            system["payload"]["detail"]["detail"]["children"]["items"],
+            serde_json::json!([])
+        );
+        assert!(
+            system["payload"]["detail"]["detail"]["children"]["groups"]
+                .as_array()
+                .is_some_and(|groups| !groups.is_empty())
+        );
+        assert!(system["payload"]["provenance"].is_null());
+
+        let location = json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/entities/location/SOL-BELT")
+                        .body(Body::empty())
+                        .expect("location request"),
+                )
+                .await
+                .expect("location response"),
+        )
+        .await;
+        assert_eq!(
+            location["payload"]["detail"]["detail"]["contents"]["total"],
+            393
+        );
+        assert_eq!(
+            location["payload"]["detail"]["detail"]["contents"]["items"],
+            serde_json::json!([])
+        );
+
+        let planet = json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/entities/location/SOL-1")
+                        .body(Body::empty())
+                        .expect("planet request"),
+                )
+                .await
+                .expect("planet response"),
+        )
+        .await;
+        let environment = &planet["payload"]["detail"]["detail"]["environment"];
+        assert_eq!(environment["magnetic_field"], false);
+        assert_eq!(environment["gravity_g"], 0.0);
+        assert!(environment.get("atmosphere").is_none());
+        assert_eq!(planet["payload"]["detail"]["detail"]["scanned"], false);
+
+        let device = json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/entities/device/D-000")
+                        .body(Body::empty())
+                        .expect("device request"),
+                )
+                .await
+                .expect("device response"),
+        )
+        .await;
+        let detail = &device["payload"]["detail"]["detail"];
+        assert_eq!(detail["cargo_used"], 3);
+        assert_eq!(detail["cargo_capacity"], 20);
+        assert_eq!(detail["stow_used"], 1);
+        assert_eq!(detail["stow_capacity"], 10);
+        assert_eq!(
+            detail["available_commands"].as_array().map(Vec::len),
+            Some(10)
+        );
+        assert!(
+            device["payload"]["provenance"]["observed_at_ms"]
+                .as_i64()
+                .is_some()
+        );
+        assert_eq!(
+            device["payload"]["provenance"]["source_operation"],
+            "GET /v1/devices"
+        );
+
+        let cargo = json(
+            app.clone()
+                .oneshot(
+                    Request::get("/api/cargo")
+                        .body(Body::empty())
+                        .expect("cargo request"),
+                )
+                .await
+                .expect("cargo response"),
+        )
+        .await;
+        let carrier = cargo["payload"]["carriers"]
+            .as_array()
+            .and_then(|carriers| {
+                carriers
+                    .iter()
+                    .find(|carrier| carrier["device"]["entity"]["id"] == "D-000")
+            })
+            .expect("device cargo carrier");
+        assert_eq!(carrier["resources"], detail["cargo"]);
+        assert_eq!(carrier["device"]["cargo_used"], detail["cargo_used"]);
+
+        let snapshot = json(
+            app.oneshot(
+                Request::get("/api/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response"),
+        )
+        .await;
+        assert!(snapshot["payload"].get("entity_inspector").is_none());
+
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
     #[test]
     fn stowed_devices_inherit_their_host_location() {
         let mut host = projected_device("HOST");
         host.location = Some("SOL-HUB".to_owned());
+
         host.system = Some("SOL".to_owned());
         host.region = Some("solzone".to_owned());
         let mut child = projected_device("CHILD");
@@ -7238,7 +7502,8 @@ mod tests {
                 workflow_kind: OperationKind("transport.route".to_owned()),
                 workflow_status: ProtocolStatus::Running,
             }),
-        );
+        )
+        .expect("device projection");
 
         assert_eq!(row.device_type.as_deref(), Some("future_device"));
         assert_eq!(row.status, None);
@@ -7358,33 +7623,6 @@ mod tests {
         );
         assert_eq!((cargo.cargo_used, cargo.cargo_capacity), (3, 10));
         assert_eq!((cargo.attachment_used, cargo.attachment_capacity), (2, 4));
-    }
-
-    #[test]
-    fn carrier_bulk_refresh_groups_codes_by_device_type() {
-        let mut surge_one = projected_device("SURGE-1");
-        surge_one.device_type = Some("surge_carrier".to_owned());
-        let mut surge_two = projected_device("SURGE-2");
-        surge_two.device_type = Some("surge_carrier".to_owned());
-        let mut fleet = projected_device("FLEET-1");
-        fleet.device_type = Some("mobile_fleet".to_owned());
-        let untyped = projected_device("UNKNOWN-1");
-
-        let (by_type, untyped_codes) =
-            group_device_codes_by_type(&[surge_one, surge_two, fleet, untyped]);
-
-        assert_eq!(
-            by_type.get("surge_carrier"),
-            Some(&BTreeSet::from([
-                "SURGE-1".to_owned(),
-                "SURGE-2".to_owned(),
-            ]))
-        );
-        assert_eq!(
-            by_type.get("mobile_fleet"),
-            Some(&BTreeSet::from(["FLEET-1".to_owned()]))
-        );
-        assert_eq!(untyped_codes, BTreeSet::from(["UNKNOWN-1".to_owned()]));
     }
 
     #[test]

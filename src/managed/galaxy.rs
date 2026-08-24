@@ -85,12 +85,16 @@ impl GalaxyGateway {
     /// Returns the locally committed catalogue; no network I/O occurs.
     #[must_use]
     pub fn catalogue(&self) -> Vec<Star> {
-        self.client
-            .managed_state()
-            .catalogue()
+        self.catalogue_observations()
             .into_iter()
-            .map(|value| value.value)
+            .map(|observation| observation.value)
             .collect()
+    }
+
+    /// Returns locally committed catalogue observations with their provenance.
+    #[must_use]
+    pub fn catalogue_observations(&self) -> Vec<domain::Observation<Star>> {
+        self.client.managed_state().catalogue()
     }
     /// Returns the persisted generation timestamp, if a catalogue has been fetched.
     #[must_use]

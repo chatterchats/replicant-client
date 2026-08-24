@@ -261,7 +261,28 @@ impl LocationQuery {
 
     /// Returns a stable key-sorted local snapshot; it never performs network I/O.
     pub async fn collect(self) -> Result<Vec<Location>> {
-        Ok(self.evaluate().matches)
+        Ok(self
+            .collect_observations()
+            .await?
+            .into_iter()
+            .map(|observation| observation.value)
+            .collect())
+    }
+
+    /// Returns stable key-sorted observations without discarding provenance.
+    pub async fn collect_observations(self) -> Result<Vec<domain::Observation<Location>>> {
+        Ok(self
+            .client
+            .managed_state()
+            .locations()
+            .into_iter()
+            .filter(|observation| {
+                self.predicates.iter().all(|predicate| {
+                    evaluate_location(predicate, &observation.value).outcome
+                        == LocationPredicateOutcome::Matched
+                })
+            })
+            .collect())
     }
 
     /// Returns the same local evaluation as [`Self::collect`] plus predicate traces.
@@ -992,12 +1013,17 @@ impl DeviceHandle {
     pub fn realm(&self) -> &Realm {
         &self.key.realm
     }
+    /// Returns the current cached value without its observation metadata.
     pub async fn snapshot(&self) -> Result<Device> {
+        Ok(self.observation().await?.value)
+    }
+
+    /// Returns the current cached device with authoritative observation metadata.
+    pub async fn observation(&self) -> Result<domain::Observation<Device>> {
         self.client.ensure_open()?;
         self.client
             .managed_state()
             .device(&self.key)
-            .map(|observation| observation.value)
             .ok_or_else(|| Error::Configuration {
                 message: "device is not cached".into(),
             })
@@ -1557,10 +1583,11 @@ impl DeviceQuery {
         self
     }
 
-    fn matching_entries(
+    fn matching_entries<T>(
         &self,
         devices: impl IntoIterator<Item = domain::Observation<Device>>,
-    ) -> BTreeMap<DeviceKey, Device> {
+        map: impl Fn(&domain::Observation<Device>) -> T,
+    ) -> BTreeMap<DeviceKey, T> {
         let started = Instant::now();
         let devices: Vec<_> = devices.into_iter().collect();
         let input = devices.len();
@@ -1633,7 +1660,7 @@ impl DeviceQuery {
                 continue;
             }
             adoption_matches += 1;
-            result.insert(entry.value.key.clone(), entry.value.clone());
+            result.insert(entry.value.key.clone(), map(entry));
         }
 
         debug!(
@@ -1668,7 +1695,9 @@ impl DeviceQuery {
     pub async fn collect(self) -> Result<Vec<DeviceHandle>> {
         self.client.ensure_open()?;
         let started = Instant::now();
-        let entries = self.matching_entries(self.client.managed_state().devices());
+        let entries = self.matching_entries(self.client.managed_state().devices(), |entry| {
+            entry.value.clone()
+        });
         let handles = self.handles(&entries);
         debug!(
             target: "replicant_client::query::devices",
@@ -1682,13 +1711,24 @@ impl DeviceQuery {
         Ok(handles)
     }
 
+    /// Collects stable key-sorted device observations without discarding provenance.
+    pub async fn collect_observations(self) -> Result<Vec<domain::Observation<Device>>> {
+        self.client.ensure_open()?;
+        Ok(self
+            .matching_entries(self.client.managed_state().devices(), Clone::clone)
+            .into_values()
+            .collect())
+    }
+
     /// Subscribes to meaningful changes to this local result set. The first
     /// [`DeviceQuerySubscription::try_next`] returns an initial result; later
     /// calls coalesce all pending revisions into their newest distinct result.
     pub async fn subscribe(self) -> Result<DeviceQuerySubscription> {
         self.client.ensure_open()?;
         let receiver = self.client.managed_state().subscribe();
-        let initial = self.matching_entries(self.client.managed_state().devices());
+        let initial = self.matching_entries(self.client.managed_state().devices(), |entry| {
+            entry.value.clone()
+        });
         Ok(DeviceQuerySubscription {
             query: self,
             receiver,
@@ -1776,7 +1816,9 @@ impl DeviceQuerySubscription {
     fn change(&self, snapshot: Arc<super::state::StateSnapshot>) -> Option<DeviceQueryChange> {
         let next = self
             .query
-            .matching_entries(snapshot.devices().values().cloned());
+            .matching_entries(snapshot.devices().values().cloned(), |entry| {
+                entry.value.clone()
+            });
         let mut previous = self
             .previous
             .lock()
@@ -2977,7 +3019,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let optimized = DeviceQuery::new(client.clone())
             .without_adopted_devices()
-            .matching_entries(devices);
+            .matching_entries(devices, |entry| entry.value.clone());
 
         assert_eq!(optimized, reference);
         client.close().await.expect("close");
@@ -3049,6 +3091,94 @@ mod tests {
 
         client.close().await.expect("close");
         assert!(subscription.try_next().is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn observation_reads_preserve_metadata() {
+        let server = MockServer::start().await;
+        let client = client_at(&server.uri()).await;
+        let mut device = cached_device("D-1", DeviceType::MiningDrone, DeviceStatus::Idle);
+        device.metadata.observed_at = "2026-07-25T01:02:03Z".into();
+        device.metadata.reachability = domain::Reachability::OutOfRange;
+        device.metadata.stale = true;
+        device.metadata.source_document.operation = "device_detail".into();
+        let device_metadata = device.metadata.clone();
+        client
+            .managed_state()
+            .persist_devices(&[device])
+            .expect("persist device");
+
+        let handle_observation = client
+            .devices()
+            .cached("D-1")
+            .expect("cached device")
+            .observation()
+            .await
+            .expect("device observation");
+        assert_eq!(handle_observation.metadata, device_metadata);
+        let query_observations = client
+            .devices()
+            .find()
+            .collect_observations()
+            .await
+            .expect("device query observations");
+        assert_eq!(query_observations[0].metadata, device_metadata);
+
+        let location = domain::Observation {
+            value: Location {
+                key: domain::LocationKey::live("SOL-1".into()),
+                location_type: Some(LocationType::Planet),
+                scanned: Some(false),
+                system_scanned: Some(true),
+                system_tags: Vec::new(),
+                system: Some("SOL".into()),
+                parent: None,
+                survey_progress: Default::default(),
+                environment: Default::default(),
+                unknown: BTreeMap::new(),
+            },
+            metadata: device_metadata.clone(),
+        };
+        client
+            .managed_state()
+            .persist_location(location)
+            .expect("persist location");
+        let location_observations = client
+            .locations()
+            .find()
+            .at("SOL-1")
+            .collect_observations()
+            .await
+            .expect("location observations");
+        assert_eq!(location_observations[0].metadata, device_metadata);
+
+        let star = domain::Observation {
+            value: domain::Star {
+                key: domain::StarKey::live("SOL".into()),
+                name: Some("Sol".into()),
+                spectral_type: Some("G".into()),
+                entry_point: None,
+                position: None,
+                has_hub: Some(false),
+                has_ward: Some(false),
+                knowledge_observed: true,
+                explored: Some(true),
+                has_life: Some(true),
+                region: None,
+            },
+            metadata: device_metadata.clone(),
+        };
+        client
+            .managed_state()
+            .replace_catalogue(vec![star], None)
+            .expect("persist catalogue");
+        assert_eq!(
+            client.galaxy().catalogue_observations()[0].metadata,
+            device_metadata
+        );
+
+        client.close().await.expect("close");
         server.verify().await;
     }
 
