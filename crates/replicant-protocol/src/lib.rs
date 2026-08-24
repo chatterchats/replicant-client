@@ -499,6 +499,9 @@ pub struct DeviceSummary {
     /// Commands currently advertised by the managed device projection.
     #[serde(default)]
     pub available_commands: Vec<String>,
+    /// Directives currently advertised by the managed device projection.
+    #[serde(default)]
+    pub available_directives: Vec<String>,
     /// User-defined device tags.
     pub tags: Vec<String>,
     /// Parent attachment relationship.
@@ -2904,6 +2907,7 @@ mod tests {
             system: None,
             location: None,
             available_commands: Vec::new(),
+            available_directives: Vec::new(),
             tags: Vec::new(),
             attached_to: None,
             stowed_in: None,

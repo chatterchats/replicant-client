@@ -435,4 +435,41 @@ describe("device inspector labels", () => {
       { value: "CHILD-1", label: "survey_drone (CHILD-1)" },
     ]);
   });
+
+  it("limits release targets and directives to the selected controller", () => {
+    const release = specializeDeviceCommand(
+      {
+        operationClass: "action",
+        descriptor: {
+          kind: "device.release",
+          parameters: [{ name: "target" }],
+        },
+      } as DescriptorCommand,
+      {
+        controlled_devices: ["CHILD-1"],
+      } as DeviceSummary,
+      {
+        "device:CHILD-1": { entity_type: "mining_drone" } as EntitySummary,
+        "device:OTHER": { entity_type: "survey_drone" } as EntitySummary,
+      },
+    );
+    const directive = specializeDeviceCommand(
+      {
+        operationClass: "action",
+        descriptor: {
+          kind: "device.set_directive",
+          parameters: [{ name: "directive" }],
+        },
+      } as DescriptorCommand,
+      { available_directives: ["gather_evenly", "patrol"] } as DeviceSummary,
+    );
+
+    expect(release.descriptor.parameters[0]?.options).toEqual([
+      { value: "CHILD-1", label: "mining_drone (CHILD-1)" },
+    ]);
+    expect(directive.descriptor.parameters[0]?.options).toEqual([
+      { value: "gather_evenly", label: "gather evenly" },
+      { value: "patrol", label: "patrol" },
+    ]);
+  });
 });

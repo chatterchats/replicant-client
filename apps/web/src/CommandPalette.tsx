@@ -109,6 +109,32 @@ export function resolveContextDefaults(
   );
 }
 
+const directiveParameters: Record<string, readonly string[]> = {
+  gather_resources: ["resources_json"],
+  maintain_ratios: ["ratios_json"],
+  gather_salvage: ["location", "recall"],
+  survey_system: ["planets", "moons", "recall"],
+  delivery: ["collect", "deliver", "requirement_json"],
+  shuttle: ["collect", "deliver", "priority"],
+  ferry: ["collect", "deliver", "priority"],
+  consolidate: ["deliver", "priority"],
+};
+
+export function visibleParameters(
+  descriptor: OperationDescriptor,
+  values: Record<string, unknown>,
+) {
+  if (descriptor.kind !== "device.set_directive") return descriptor.parameters;
+  const visible = new Set([
+    "device",
+    "directive",
+    ...(directiveParameters[String(values.directive)] ?? []),
+  ]);
+  return descriptor.parameters.filter((parameter) =>
+    visible.has(parameter.name),
+  );
+}
+
 export function CommandPalette({
   catalog,
   context,
@@ -325,23 +351,25 @@ export function CommandPalette({
               <p>{selected.descriptor.description}</p>
             </header>
             <div className="form-grid">
-              {selected.descriptor.parameters.map((parameter) => (
-                <ParameterField
-                  key={parameter.name}
-                  parameter={parameter}
-                  value={values[parameter.name]}
-                  entities={entities}
-                  operationKind={selected.descriptor.kind}
-                  blueprintTypes={blueprintTypes}
-                  error={errors[parameter.name]}
-                  onChange={(value) => {
-                    setValues((current) => ({
-                      ...current,
-                      [parameter.name]: value,
-                    }));
-                  }}
-                />
-              ))}
+              {visibleParameters(selected.descriptor, values).map(
+                (parameter) => (
+                  <ParameterField
+                    key={parameter.name}
+                    parameter={parameter}
+                    value={values[parameter.name]}
+                    entities={entities}
+                    operationKind={selected.descriptor.kind}
+                    blueprintTypes={blueprintTypes}
+                    error={errors[parameter.name]}
+                    onChange={(value) => {
+                      setValues((current) => ({
+                        ...current,
+                        [parameter.name]: value,
+                      }));
+                    }}
+                  />
+                ),
+              )}
             </div>
             {serverError ? <p className="form-error">{serverError}</p> : null}
             <button className="primary" disabled={submitting} type="submit">

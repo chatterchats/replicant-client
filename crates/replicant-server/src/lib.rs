@@ -4497,6 +4497,11 @@ fn device_summary(
         .iter()
         .filter_map(|command| wire_value(Some(command)))
         .collect();
+    let available_directives = device
+        .available_directives
+        .iter()
+        .map(|directive| directive.as_str().to_owned())
+        .collect();
     DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
@@ -4511,6 +4516,7 @@ fn device_summary(
             .and_then(|value| device_system(value, location_systems)),
         location,
         available_commands,
+        available_directives,
         tags: device.tags,
         attached_to: device
             .relationships
@@ -6673,6 +6679,7 @@ mod tests {
             system: None,
             location: None,
             available_commands: Vec::new(),
+            available_directives: Vec::new(),
             tags: Vec::new(),
             attached_to: None,
             stowed_in: None,
@@ -7185,6 +7192,7 @@ mod tests {
             location: Some(LocationKey::live("EARTH".into())),
             features: Vec::new(),
             available_commands: Vec::new(),
+            available_directives: Vec::new(),
             available_directives: Vec::new(),
             tags: vec!["hauler".to_owned()],
             relationships: DeviceRelationships {

@@ -6,6 +6,7 @@ import {
   requiresTypedConfirmation,
   resolveContextDefaults,
   searchDescriptors,
+  visibleParameters,
 } from "./CommandPalette";
 import type {
   ActionDescriptor,
@@ -138,6 +139,9 @@ it.each([
   "device.stow",
   "device.attach",
   "device.detach",
+  "device.adopt",
+  "device.release",
+  "device.set_directive",
   "device.repair",
   "device.change_owner",
 ])("uses click confirmation for individual %s controls", (kind) => {
@@ -153,6 +157,36 @@ it.each([
       operationClass: "action",
     }),
   ).toBe(false);
+});
+
+it("shows only configuration fields used by the selected directive", () => {
+  const base = descriptor.parameters[0];
+  if (!base) throw new Error("test descriptor must define a parameter");
+  const directive = {
+    ...descriptor,
+    kind: "device.set_directive",
+    parameters: [
+      "device",
+      "directive",
+      "resources_json",
+      "location",
+      "recall",
+      "collect",
+      "deliver",
+      "priority",
+    ].map((name) => ({ ...base, name })),
+  };
+
+  expect(
+    visibleParameters(directive, { directive: "gather_salvage" }).map(
+      (parameter) => parameter.name,
+    ),
+  ).toEqual(["device", "directive", "location", "recall"]);
+  expect(
+    visibleParameters(directive, { directive: "patrol" }).map(
+      (parameter) => parameter.name,
+    ),
+  ).toEqual(["device", "directive"]);
 });
 
 it("keeps typed confirmation for bulk and non-device elevated actions", () => {

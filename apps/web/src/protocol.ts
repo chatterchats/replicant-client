@@ -221,6 +221,7 @@ export interface DeviceSummary {
   system: string | null;
   location: string | null;
   available_commands: string[];
+  available_directives?: string[];
   tags: string[];
   attached_to: string | null;
   stowed_in: string | null;
@@ -1876,6 +1877,13 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
       device.available_commands === undefined
         ? []
         : stringArray(device.available_commands, "available device commands"),
+    available_directives:
+      device.available_directives === undefined
+        ? []
+        : stringArray(
+            device.available_directives,
+            "available device directives",
+          ),
     tags: stringArray(device.tags, "device tags"),
     attached_to: nullableString(device.attached_to, "attached device"),
     stowed_in: nullableString(device.stowed_in, "stowed device"),

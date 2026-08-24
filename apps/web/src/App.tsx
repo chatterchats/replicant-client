@@ -320,6 +320,15 @@ function commandFitsDevice(command: DescriptorCommand, device: DeviceSummary) {
   if (kind === "device.stow") return supports("stow");
   if (kind === "device.attach") return supports("attach");
   if (kind === "device.detach") return supports("detach");
+  if (kind === "device.adopt" || kind === "device.release") {
+    return deviceType.startsWith("ami_") && supports(kind.slice(7));
+  }
+  if (kind === "device.set_directive") {
+    return (
+      (device.available_directives ?? []).length > 0 &&
+      supports("set_directive")
+    );
+  }
   if (kind === "device.repair") return supports("repair");
   if (kind === "device.change_owner") return supports("change_owner");
   if (kind === "device.travel") return supports("travel");
@@ -338,7 +347,14 @@ export function specializeDeviceCommand(
   device: DeviceSummary,
   entities: Record<string, EntitySummary> = {},
 ): DescriptorCommand {
-  if (command.descriptor.kind === "device.detach") {
+  if (
+    command.descriptor.kind === "device.detach" ||
+    command.descriptor.kind === "device.release"
+  ) {
+    const targets =
+      command.descriptor.kind === "device.detach"
+        ? device.attached_devices
+        : device.controlled_devices;
     return {
       ...command,
       descriptor: {
@@ -348,10 +364,56 @@ export function specializeDeviceCommand(
             ? {
                 ...parameter,
                 kind: { type: "enum" as const },
-                options: device.attached_devices.map((code) => ({
+                options: targets.map((code) => ({
                   value: code,
                   label: relatedDeviceLabel(code, entities),
                 })),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (command.descriptor.kind === "device.adopt") {
+    const targets = Object.keys(entities)
+      .filter(
+        (key) => key.startsWith("device:") && key.slice(7) !== device.entity.id,
+      )
+      .map((key) => key.slice(7));
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "target"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: targets.map((code) => ({
+                  value: code,
+                  label: relatedDeviceLabel(code, entities),
+                })),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (command.descriptor.kind === "device.set_directive") {
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "directive"
+            ? {
+                ...parameter,
+                options: (device.available_directives ?? []).map(
+                  (directive) => ({
+                    value: directive,
+                    label: directive.replaceAll("_", " "),
+                  }),
+                ),
               }
             : parameter,
         ),

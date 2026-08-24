@@ -396,6 +396,55 @@ impl OperationCatalogue {
                 )
                 .await
             }
+            "device.adopt" | "device.release" => {
+                let input: DeviceTargetAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                let targets = raw::devices::TargetsCommand {
+                    target: Some(input.target),
+                    ..raw::devices::TargetsCommand::default()
+                };
+                let command = if kind == "device.adopt" {
+                    raw::devices::DeviceCommand::Adopt(targets)
+                } else {
+                    raw::devices::DeviceCommand::Release(targets)
+                };
+                managed_operation_value(handle.command(command).await.map_err(runtime_error)?).await
+            }
+            "device.set_directive" => {
+                let input: DeviceDirectiveAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                let snapshot = handle.snapshot().await.map_err(runtime_error)?;
+                if !snapshot
+                    .available_directives
+                    .iter()
+                    .any(|directive| directive.as_str() == input.directive)
+                {
+                    return Err(CatalogueError::Invalid(format!(
+                        "device `{}` does not advertise directive `{}`",
+                        input.device, input.directive
+                    )));
+                }
+                let configuration = directive_configuration(&input)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::SetDirective {
+                            directive: input.directive,
+                            configuration,
+                            notify: None,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
             "device.lifecycle" => {
                 let input: DeviceLifecycleAction = decode(parameters)?;
                 run_device_lifecycle(client, &input.device, &input.command).await
@@ -1531,6 +1580,52 @@ fn descriptors() -> DescriptorCatalog {
                 vec![
                     required("device", "Device", ParameterKind::Device),
                     required("destination", "Destination", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
+                "device.adopt",
+                "Adopt device",
+                "Bring a device under the selected AMI controller's control.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "AMI controller", ParameterKind::Device),
+                    required("target", "Device to adopt", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.release",
+                "Release device",
+                "Release a controlled device from the selected AMI controller.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "AMI controller", ParameterKind::Device),
+                    required("target", "Device to release", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.set_directive",
+                "Set directive",
+                "Set one directive currently advertised by the selected device.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("directive", "Directive", ParameterKind::Enum),
+                    optional("resources_json", "Resources JSON", ParameterKind::String),
+                    optional("ratios_json", "Ratios JSON", ParameterKind::String),
+                    optional("location", "Location", ParameterKind::Location),
+                    defaulted("recall", "Recall when complete", ParameterKind::Boolean, false),
+                    enum_parameter("planets", "Planets", &["all", "none"], "all"),
+                    enum_parameter("moons", "Moons", &["all", "none"], "all"),
+                    optional("collect", "Collect from", ParameterKind::Location),
+                    optional("deliver", "Deliver to", ParameterKind::Location),
+                    optional("requirement_json", "Requirement JSON", ParameterKind::String),
+                    optional("priority", "Priority resources (comma separated)", ParameterKind::String),
                 ],
             ),
             simple_action(
@@ -2857,6 +2952,116 @@ struct DeviceTargetAction {
     target: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceDirectiveAction {
+    device: String,
+    directive: String,
+    resources_json: Option<String>,
+    ratios_json: Option<String>,
+    location: Option<String>,
+    #[serde(default)]
+    recall: bool,
+    planets: Option<String>,
+    moons: Option<String>,
+    collect: Option<String>,
+    deliver: Option<String>,
+    requirement_json: Option<String>,
+    priority: Option<String>,
+}
+
+fn directive_configuration(
+    input: &DeviceDirectiveAction,
+) -> Result<Option<Map<String, Value>>, CatalogueError> {
+    let required = |value: Option<&str>, label: &str| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| CatalogueError::Invalid(format!("{label} is required")))
+    };
+    let object = |value: Option<&str>, label: &str| {
+        let value = required(value, label)?;
+        serde_json::from_str::<Map<String, Value>>(&value)
+            .map_err(|error| CatalogueError::Invalid(format!("invalid {label}: {error}")))
+    };
+    let route = |collect: Option<&str>,
+                 deliver: Option<&str>|
+     -> Result<Map<String, Value>, CatalogueError> {
+        Ok(Map::from_iter([
+            (
+                "collect".to_owned(),
+                Value::String(required(collect, "collect location")?),
+            ),
+            (
+                "deliver".to_owned(),
+                Value::String(required(deliver, "delivery location")?),
+            ),
+        ]))
+    };
+    let priority = || {
+        Value::Array(
+            input
+                .priority
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| Value::String(value.to_owned()))
+                .collect(),
+        )
+    };
+
+    let configuration = match input.directive.as_str() {
+        "gather_resources" => object(input.resources_json.as_deref(), "resources JSON")?,
+        "maintain_ratios" => object(input.ratios_json.as_deref(), "ratios JSON")?,
+        "gather_salvage" => Map::from_iter([
+            (
+                "location".to_owned(),
+                Value::String(required(input.location.as_deref(), "location")?),
+            ),
+            ("recall".to_owned(), Value::Bool(input.recall)),
+        ]),
+        "survey_system" => Map::from_iter([
+            (
+                "planets".to_owned(),
+                Value::String(input.planets.clone().unwrap_or_else(|| "all".to_owned())),
+            ),
+            (
+                "moons".to_owned(),
+                Value::String(input.moons.clone().unwrap_or_else(|| "all".to_owned())),
+            ),
+            ("recall".to_owned(), Value::Bool(input.recall)),
+        ]),
+        "delivery" => Map::from_iter([
+            (
+                "route".to_owned(),
+                Value::Object(route(input.collect.as_deref(), input.deliver.as_deref())?),
+            ),
+            (
+                "requirement".to_owned(),
+                Value::Object(object(
+                    input.requirement_json.as_deref(),
+                    "requirement JSON",
+                )?),
+            ),
+        ]),
+        "shuttle" | "ferry" => {
+            let mut configuration = route(input.collect.as_deref(), input.deliver.as_deref())?;
+            configuration.insert("priority".to_owned(), priority());
+            configuration
+        }
+        "consolidate" => Map::from_iter([
+            (
+                "deliver".to_owned(),
+                Value::String(required(input.deliver.as_deref(), "delivery location")?),
+            ),
+            ("priority".to_owned(), priority()),
+        ]),
+        _ => return Ok(None),
+    };
+    Ok(Some(configuration))
+}
+#[derive(Debug, Deserialize)]
 struct DeviceDetachAction {
     device: String,
     #[serde(default)]
@@ -3478,6 +3683,53 @@ mod tests {
                 .parameters
                 .iter()
                 .any(|parameter| parameter.name == "target" && !parameter.required)
+        );
+    }
+
+    #[test]
+    fn device_directive_configuration_matches_the_managed_ami_wire_shape() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        for kind in ["device.adopt", "device.release", "device.set_directive"] {
+            assert!(
+                catalogue
+                    .descriptors()
+                    .actions
+                    .iter()
+                    .any(|descriptor| descriptor.kind.0 == kind),
+                "missing {kind} descriptor"
+            );
+        }
+        let input = DeviceDirectiveAction {
+            device: "AMI-1".to_owned(),
+            directive: "delivery".to_owned(),
+            resources_json: None,
+            ratios_json: None,
+            location: None,
+            recall: false,
+            planets: None,
+            moons: None,
+            collect: Some("SOL-1".to_owned()),
+            deliver: Some("SOL-2".to_owned()),
+            requirement_json: Some(r#"{"iron":12}"#.to_owned()),
+            priority: None,
+        };
+        assert_eq!(
+            directive_configuration(&input).expect("delivery configuration"),
+            Some(Map::from_iter([
+                (
+                    "route".to_owned(),
+                    serde_json::json!({"collect":"SOL-1","deliver":"SOL-2"}),
+                ),
+                ("requirement".to_owned(), serde_json::json!({"iron":12}),),
+            ]))
+        );
+        assert!(
+            directive_configuration(&DeviceDirectiveAction {
+                directive: "gather_resources".to_owned(),
+                resources_json: Some("[]".to_owned()),
+                ..input
+            })
+            .is_err()
         );
     }
 
