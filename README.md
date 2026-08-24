@@ -149,15 +149,42 @@ Safe reads may use bounded retries. Mutations are never automatically retried.
 
 ## Workspace packages
 
-| Package                                                             | Purpose                                                                                                                                                    |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`replicant-cli`](crates/replicant-cli)                             | Unified CLI for printing, transport, survey, relay, mining, regional ownership reassignment, observatory operations, events, bootstrap, and Riker reports. |
-| [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules.                                                                                                   |
-| [`replicant-event-planner`](crates/replicant-event-planner)         | Pure civilisation-event logistics planning.                                                                                                                |
-| [`replicant-mining-planner`](crates/replicant-mining-planner)       | Pure mining-network bills of materials and resource expansion.                                                                                             |
-| [`replicant-printing`](crates/replicant-printing)                   | Pure print scheduling plus optional managed Autofactory workflows.                                                                                         |
-| [`replicant-route-planner`](crates/replicant-route-planner)         | Pure survey-route and FTL relay-network algorithms.                                                                                                        |
-| [`replicant-transport`](crates/replicant-transport)                 | Managed point-to-point resource and device delivery.                                                                                                       |
+The root package is the durable client. Members under `crates/` build the
+application on top of it.
+
+**Application stack** — layered, each depending on the one above:
+
+| Package | Purpose |
+| --- | --- |
+| [`replicant-runtime`](crates/replicant-runtime) | Application services above the managed client: reports, actions, the operation catalogue, campaign planning, and the Automation Director. |
+| [`replicant-workflow`](crates/replicant-workflow) | Durable workflow state, resource claims, waits, checkpoints, and supervision. |
+| [`replicant-server`](crates/replicant-server) | `replicantd` — the long-running local daemon. HTTP commands/queries plus a local WebSocket delta stream. |
+| [`replicant-protocol`](crates/replicant-protocol) | Versioned DTOs shared by `replicantd` and its frontends. Types only. |
+| [`replicant-cli`](crates/replicant-cli) | Unified CLI. Parses commands, renders results, dispatches durable work to `replicantd`. |
+
+**Reusable libraries** — pure planning primitives and managed helpers:
+
+| Package | Purpose |
+| --- | --- |
+| [`replicant-bootstrap-planner`](crates/replicant-bootstrap-planner) | Pure regional-bootstrap sizing and belt-selection rules. |
+| [`replicant-event-planner`](crates/replicant-event-planner) | Pure civilisation-event logistics planning. |
+| [`replicant-mining-planner`](crates/replicant-mining-planner) | Pure mining-network bills of materials and resource expansion. |
+| [`replicant-route-planner`](crates/replicant-route-planner) | Pure survey-route and FTL relay-network algorithms. |
+| [`replicant-printing`](crates/replicant-printing) | Pure print scheduling plus optional managed Autofactory workflows. |
+| [`replicant-transport`](crates/replicant-transport) | Managed point-to-point resource and device delivery. |
+
+**Outside the Cargo workspace:**
+
+| Package | Purpose |
+| --- | --- |
+| [`galaxy-renderer`](crates/galaxy-renderer) | Browser-only WASM `cdylib`. Built with `make galaxy-wasm`, not by `cargo build --workspace`. |
+
+**Applications:**
+
+| Path | Purpose |
+| --- | --- |
+| [`apps/web`](apps/web) | React + TypeScript + Vite frontend. |
+| [`apps/desktop`](apps/desktop) | Tauri 2 shell wrapping the web app with a loopback-only `replicantd` sidecar. |
 
 Run the consolidated CLI locally:
 
