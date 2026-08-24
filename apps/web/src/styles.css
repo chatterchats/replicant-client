@@ -1576,6 +1576,13 @@ h1 {
   margin-bottom: var(--space-4);
 }
 
+.page-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 /* Page identity is intentionally compact: the category path and page name read
    as one breadcrumb-like title instead of spending a quarter of the viewport on
    a hero header. The page name remains accented for quick visual scanning. */

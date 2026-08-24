@@ -9,6 +9,7 @@ use std::{
 
 use futures::{StreamExt, stream};
 use replicant_client::{
+    DeviceType,
     managed::{AutofactoryPrintOptions, Client, Operation, OperationStatus},
     raw,
 };
@@ -372,6 +373,9 @@ impl OperationCatalogue {
                         .map_err(runtime_error)?,
                 )
                 .await
+            }
+            "device.refresh" => {
+                run_device_refresh(client, decode::<DeviceRefreshAction>(parameters)?).await
             }
             "device.travel" => {
                 let input: DeviceTravelAction = decode(parameters)?;
@@ -932,6 +936,9 @@ impl OperationCatalogue {
         }
         if class == OperationClass::Action && kind == "survey.belt_search" {
             validate_belt_search_parameters(&values, defaults_only)?;
+        }
+        if class == OperationClass::Action && kind == "device.refresh" {
+            validate_device_refresh_parameters(&values)?;
         }
         Ok(values)
     }
@@ -1495,6 +1502,26 @@ fn descriptors() -> DescriptorCatalog {
                 ],
             ),
             simple_action(
+                "device.refresh",
+                "Refresh devices",
+                "Paginate the upstream device collection and update managed device state. Leave every filter empty to refresh all devices.",
+                "devices",
+                MutationRisk::None,
+                vec![],
+                vec![
+                    optional("replicant_code", "Assigned replicant", ParameterKind::Replicant),
+                    optional("device_type", "Device type", ParameterKind::DeviceType),
+                    optional("tags", "Tag patterns (comma separated)", ParameterKind::String),
+                    optional(
+                        "exclude_tags",
+                        "Exclude tag patterns (comma separated)",
+                        ParameterKind::String,
+                    ),
+                    defaulted("untagged", "Only untagged devices", ParameterKind::Boolean, false),
+                    optional("location", "System or location", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
                 "device.travel",
                 "Travel device",
                 "Send one travel-capable device to a location or system.",
@@ -1774,6 +1801,74 @@ fn simple_action(
 
 fn runtime_error(error: replicant_client::Error) -> CatalogueError {
     CatalogueError::Runtime(error.to_string())
+}
+
+fn validate_device_refresh_parameters(
+    values: &BTreeMap<String, Value>,
+) -> Result<(), CatalogueError> {
+    let untagged = values
+        .get("untagged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_tag_filters = ["tags", "exclude_tags"].iter().any(|name| {
+        values
+            .get(*name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if untagged && has_tag_filters {
+        return Err(CatalogueError::Invalid(
+            "device refresh cannot combine `untagged` with tag filters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+async fn run_device_refresh(
+    client: &Client,
+    input: DeviceRefreshAction,
+) -> Result<Value, CatalogueError> {
+    let replicant_code = nonempty(input.replicant_code);
+    let device_type = nonempty(input.device_type);
+    let tags = nonempty(input.tags);
+    let exclude_tags = nonempty(input.exclude_tags);
+    let location = nonempty(input.location);
+    let filtered = replicant_code.is_some()
+        || device_type.is_some()
+        || tags.is_some()
+        || exclude_tags.is_some()
+        || input.untagged
+        || location.is_some();
+    let mut query = client.devices().refresh_many();
+    if let Some(value) = replicant_code {
+        query = query.assigned_to(value);
+    }
+    if let Some(value) = device_type {
+        query = query.of_type(DeviceType::from(value.as_str()));
+    }
+    if let Some(value) = tags {
+        query = query.with_tag_patterns(value);
+    }
+    if let Some(value) = exclude_tags {
+        query = query.excluding_tag_patterns(value);
+    }
+    if input.untagged {
+        query = query.untagged();
+    }
+    if let Some(value) = location {
+        query = query.at(value);
+    }
+    let devices = query.collect().await.map_err(runtime_error)?;
+    Ok(serde_json::json!({
+        "refreshed_devices": devices.len(),
+        "filtered": filtered,
+    }))
 }
 
 fn find_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -2735,6 +2830,16 @@ struct DeviceTravelAction {
     destination: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceRefreshAction {
+    replicant_code: Option<String>,
+    device_type: Option<String>,
+    tags: Option<String>,
+    exclude_tags: Option<String>,
+    #[serde(default)]
+    untagged: bool,
+    location: Option<String>,
+}
+#[derive(Debug, Deserialize)]
 struct DeviceLifecycleAction {
     device: String,
     command: String,
@@ -3273,6 +3378,72 @@ mod tests {
                 .parameters
                 .iter()
                 .any(|parameter| parameter.name == "destination" && !parameter.required)
+        );
+    }
+
+    #[test]
+    fn device_refresh_accepts_composable_upstream_filters() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        catalogue
+            .validate_invocation(OperationClass::Action, "device.refresh", BTreeMap::new())
+            .expect("unfiltered refresh");
+        catalogue
+            .validate_invocation(
+                OperationClass::Action,
+                "device.refresh",
+                BTreeMap::from([
+                    (
+                        "replicant_code".to_owned(),
+                        Value::String("Chats-1".to_owned()),
+                    ),
+                    (
+                        "device_type".to_owned(),
+                        Value::String("mining_drone".to_owned()),
+                    ),
+                    (
+                        "tags".to_owned(),
+                        Value::String("squad2:*,*:miners".to_owned()),
+                    ),
+                    ("location".to_owned(), Value::String("PHASYRIS".to_owned())),
+                ]),
+            )
+            .expect("combined refresh filters");
+        assert!(
+            catalogue
+                .validate_invocation(
+                    OperationClass::Action,
+                    "device.refresh",
+                    BTreeMap::from([
+                        ("untagged".to_owned(), Value::Bool(true)),
+                        (
+                            "exclude_tags".to_owned(),
+                            Value::String("*:miners".to_owned())
+                        ),
+                    ]),
+                )
+                .is_err()
+        );
+        let descriptor = catalogue
+            .descriptors()
+            .actions
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "device.refresh")
+            .expect("refresh descriptor");
+        assert!(descriptor.applicable_to.is_empty());
+        assert_eq!(
+            descriptor
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "replicant_code",
+                "device_type",
+                "tags",
+                "exclude_tags",
+                "untagged",
+                "location",
+            ]
         );
     }
 

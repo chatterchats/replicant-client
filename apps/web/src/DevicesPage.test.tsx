@@ -11,6 +11,7 @@ import {
   bulkDeviceEligibility,
   bulkDeviceOperationParameters,
   bulkDeviceResultItems,
+  deviceRefreshParameters,
   deviceCategory,
   filterAndSortDevices,
   groupDevices,
@@ -76,6 +77,17 @@ const bulkDescriptors: DescriptorCatalog = {
       category: "devices",
       operation_class: "action" as const,
       risk: "elevated" as const,
+      applicable_to: [],
+      parameters: [],
+    },
+    {
+      kind: "device.refresh",
+      display_name: "Refresh devices",
+      aliases: [],
+      description: "Refresh devices",
+      category: "devices",
+      operation_class: "action" as const,
+      risk: "none" as const,
       applicable_to: [],
       parameters: [],
     },
@@ -230,6 +242,18 @@ describe("device fleet browser", () => {
       devices: "D-1,D-2",
       command: "travel",
       destination: "SOL-4",
+    });
+    expect(
+      deviceRefreshParameters({
+        ...filters,
+        owner: "Chats-1",
+        type: "mining_drone",
+        system: "PHASYRIS",
+      }),
+    ).toEqual({
+      replicant_code: "Chats-1",
+      device_type: "mining_drone",
+      location: "PHASYRIS",
     });
     expect(
       bulkDeviceResultItems({

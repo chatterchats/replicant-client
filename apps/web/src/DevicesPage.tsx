@@ -121,6 +121,16 @@ const emptyFilters: DeviceFilters = {
   owner: "",
 };
 
+export function deviceRefreshParameters(
+  filters: DeviceFilters,
+): Record<string, string> {
+  return {
+    ...(filters.owner ? { replicant_code: filters.owner } : {}),
+    ...(filters.type ? { device_type: filters.type } : {}),
+    ...(filters.system ? { location: filters.system } : {}),
+  };
+}
+
 export const BULK_DEVICE_COMMANDS = [
   { id: "activate", label: "Activate", destructive: false },
   { id: "assemble", label: "Assemble", destructive: false },
@@ -603,6 +613,17 @@ export function DevicesContent({
       ),
     [descriptors.actions],
   );
+  const deviceRefreshAction = useMemo(
+    () =>
+      descriptors.actions.find(
+        (descriptor) => descriptor.kind === "device.refresh",
+      ),
+    [descriptors.actions],
+  );
+  const currentRefreshParameters = useMemo(
+    () => deviceRefreshParameters(filters),
+    [filters],
+  );
   const selectedCount = selectedDevices.size;
   const { eligible: bulkEligible, incompatible: bulkIncompatible } = useMemo(
     () => bulkDeviceEligibility(allDevices, selectedDevices, bulkCommand),
@@ -763,6 +784,15 @@ export function DevicesContent({
     });
   };
 
+  const openDeviceRefresh = (initialParameters: Record<string, string>) => {
+    if (!deviceRefreshAction) return;
+    onRunCommand({
+      descriptor: deviceRefreshAction,
+      operationClass: "action",
+      initialParameters,
+    });
+  };
+
   const chooseSort = (next: DeviceSortKey) => {
     setDescending(next === sort ? !descending : false);
     setSort(next);
@@ -812,9 +842,31 @@ export function DevicesContent({
             Managed fleet state, physical hierarchy, capacity, and ownership.
           </p>
         </div>
-        <button disabled={refreshing} onClick={() => void refresh()}>
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
+        <div className="page-heading-actions">
+          <button disabled={refreshing} onClick={() => void refresh()}>
+            {refreshing ? "Reloading…" : "Reload view"}
+          </button>
+          <button
+            disabled={!deviceRefreshAction}
+            onClick={() => {
+              openDeviceRefresh({});
+            }}
+          >
+            Refresh devices…
+          </button>
+          <button
+            disabled={
+              !deviceRefreshAction ||
+              Object.keys(currentRefreshParameters).length === 0
+            }
+            title="Uses the current Type, System, and Ownership filters"
+            onClick={() => {
+              openDeviceRefresh(currentRefreshParameters);
+            }}
+          >
+            Refresh current filters…
+          </button>
+        </div>
       </header>
 
       {error ? <p className="inline-warning">Refresh failed: {error}</p> : null}

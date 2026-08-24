@@ -7497,6 +7497,11 @@ mod tests {
                                 && action["applicable_to"]
                                     .as_array()
                                     .is_some_and(Vec::is_empty)
+                        }) && actions.iter().any(|action| {
+                            action["kind"] == "device.refresh"
+                                && action["applicable_to"]
+                                    .as_array()
+                                    .is_some_and(Vec::is_empty)
                         }))
                 );
             }
