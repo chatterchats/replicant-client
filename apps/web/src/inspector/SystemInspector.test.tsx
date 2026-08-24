@@ -1,0 +1,48 @@
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+import type { EntitySummary, SystemInspectorSummary } from "../protocol";
+import { SystemInspector } from "./SystemInspector";
+const summary: EntitySummary = {
+  entity: { kind: "system", id: "SOL" },
+  label: "Sol",
+  secondary_label: null,
+  system: "SOL",
+  location: null,
+  entity_type: "G",
+  status: "explored",
+};
+const detail: SystemInspectorSummary = {
+  name: "Sol",
+  spectral_type: "G",
+  region: "Core",
+  entry_point: "SOL-1",
+  position: { x: 0, y: 1, z: 2 },
+  explored: true,
+  has_hub: false,
+  has_ward: false,
+  has_life: true,
+  children: {
+    total: 54,
+    items: [],
+    groups: [
+      {
+        entity_kind: "location",
+        entity_type: "planet",
+        count: 54,
+        statuses: [{ status: "scanned", count: 54 }],
+      },
+    ],
+  },
+};
+describe("SystemInspector", () => {
+  it("renders typed fields and bounded 54-body summaries", () => {
+    const html = renderToStaticMarkup(
+      <SystemInspector summary={summary} detail={detail} />,
+    );
+    expect(html).toContain("Spectral type");
+    expect(html).toContain("0.00, 1.00, 2.00 LY");
+    expect(html).toContain("54");
+    expect(html).toContain("<details");
+    expect(html).not.toContain("Location 0");
+  });
+});
