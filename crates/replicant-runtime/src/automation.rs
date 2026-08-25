@@ -3050,7 +3050,11 @@ fn resource_claim_contention(error: &(dyn std::error::Error + 'static)) -> bool 
 fn retryable_connectivity_dependency_failure(error: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
         failure_class(error),
-        Some(FailureClass::ConnectivityDependency | FailureClass::TransientUpstream)
+        Some(
+            FailureClass::ConnectivityDependency
+                | FailureClass::ManufacturingCapacity
+                | FailureClass::TransientUpstream
+        )
     )
 }
 
@@ -8356,5 +8360,15 @@ mod tests {
         assert_eq!(intent.device_codes, ["DEVICE-1"]);
         assert!(intent.return_transports);
         assert!(intent.allow_transport_staging);
+    }
+    #[test]
+    fn manufacturing_capacity_failure_waits_instead_of_failing_exploration() {
+        let error = crate::failure::ClassifiedError::new(
+            FailureClass::ManufacturingCapacity,
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for autofactory queue capacity",
+        );
+
+        assert!(retryable_connectivity_dependency_failure(&error));
     }
 }

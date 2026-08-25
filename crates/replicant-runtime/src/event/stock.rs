@@ -237,6 +237,20 @@ pub async fn reconcile_event_stock(
                     ..Default::default()
                 })
                 .await?;
+            if operation_device_missing(&operation).await? {
+                report.event_tagged_devices = report.event_tagged_devices.saturating_sub(1);
+                if target_is_regional_stock {
+                    report.regional_stock_reclaims =
+                        report.regional_stock_reclaims.saturating_sub(1);
+                } else {
+                    report.event_reclaims = report.event_reclaims.saturating_sub(1);
+                }
+                warn!(
+                    device = %handle.id().as_str(),
+                    "event-stock cleanup target disappeared after discovery; skipping stale device"
+                );
+                continue;
+            }
             ensure_operation_accepted(&operation).await?;
             info!(
                 device = %handle.id().as_str(),
@@ -413,6 +427,23 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
+fn response_is_device_missing(response: Option<&serde_json::Value>) -> bool {
+    response.is_some_and(|response| {
+        response.get("status").and_then(serde_json::Value::as_i64) == Some(404)
+            || response
+                .get("server")
+                .and_then(|server| server.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.eq_ignore_ascii_case("Device not found"))
+    })
+}
+
+async fn operation_device_missing(operation: &replicant_client::Operation) -> AnyResult<bool> {
+    let outcome = operation.outcome().await?;
+    Ok(outcome.status == OperationStatus::Rejected
+        && response_is_device_missing(outcome.response.as_ref()))
+}
+
 async fn ensure_operation_accepted(operation: &replicant_client::Operation) -> AnyResult<()> {
     let outcome = operation.outcome().await?;
     if matches!(
@@ -456,5 +487,19 @@ mod tests {
         assert_eq!(event_stock_tag(region), event_stock_tag(region));
         assert!(event_stock_tag(region).len() <= MAX_TAG_CHARACTERS);
         assert_eq!(event_stock_tag("Beta"), "evt-stock:beta");
+    }
+
+    #[test]
+    fn rejected_missing_device_is_a_stale_cleanup_target() {
+        let response = serde_json::json!({
+            "message": "unexpected HTTP status 404: Device not found",
+            "server": {"error": "Device not found"},
+            "status": 404
+        });
+
+        assert!(response_is_device_missing(Some(&response)));
+        assert!(!response_is_device_missing(Some(
+            &serde_json::json!({"status": 400, "server": {"error": "Not your device"}})
+        )));
     }
 }

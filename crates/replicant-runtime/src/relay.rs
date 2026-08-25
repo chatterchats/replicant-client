@@ -91,6 +91,7 @@ const DEEP_SPACE_RELAY_RANGE_LY: f64 = 10.0;
 const SYSTEM_HUB: &str = "system_hub";
 const RELAYING: &str = "relaying";
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
+const WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Upper bound between authoritative refreshes while waiting on the event
 /// stream. Event-driven waits wake immediately on a relevant event; this only
 /// bounds how long a missed event can delay progress.
@@ -161,6 +162,7 @@ struct Config {
     ignore_printers: BTreeSet<String>,
     supply_strategy: RequestedSupplyStrategy,
     wait_timeout: Duration,
+    queue_capacity_timeout: Duration,
     targets: Vec<String>,
     verbose: bool,
     log_file: Option<PathBuf>,
@@ -329,6 +331,7 @@ impl Config {
             ignore_printers,
             supply_strategy,
             wait_timeout,
+            queue_capacity_timeout: wait_timeout,
             targets,
             verbose,
             log_file,
@@ -3870,7 +3873,25 @@ async fn start_device_travel(client: &Client, code: &str, destination: &str) -> 
             via: None,
         })
         .await?;
-    ensure_operation_accepted(&operation).await
+    if let Err(error) = ensure_operation_accepted(&operation).await {
+        if operation_rejected_with(
+            &operation,
+            &["Already at destination", "Already travelling"],
+        )
+        .await?
+        {
+            let refreshed = client.devices().get(code).await?.snapshot().await?;
+            if device_at(&refreshed, destination)
+                || refreshed.travel.is_some()
+                    && travel_destination(&refreshed)
+                        .is_some_and(|planned| relay_destination_matches(planned, destination))
+            {
+                return Ok(());
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn wait_device_at_location(
@@ -4918,10 +4939,11 @@ async fn submit_print_jobs(
     }
     save_plan(&config.plan_path, plan)?;
     let mut watch = client.events().watch().await?;
-    let deadline = Instant::now() + config.wait_timeout;
+    let deadline = Instant::now() + config.queue_capacity_timeout;
     while plan.print_jobs.iter().any(|job| !job.submitted) {
         if Instant::now() >= deadline {
-            return Err(app_error(
+            return Err(classified_error(
+                FailureClass::ManufacturingCapacity,
                 io::ErrorKind::TimedOut,
                 "timed out waiting for autofactory queue capacity",
             ));
@@ -5434,7 +5456,29 @@ async fn travel_to(
             "dispatching relay deployment travel"
         );
         let operation = handle.travel().to(destination).depart().await?;
-        ensure_operation_accepted(&operation).await?;
+        if let Err(error) = ensure_operation_accepted(&operation).await {
+            if operation_rejected_with(
+                &operation,
+                &["Already at destination", "Already travelling"],
+            )
+            .await?
+            {
+                handle = handle.refresh().await?;
+                snapshot = handle.snapshot().await?;
+                if snapshot.travel.is_none()
+                    && snapshot.location.as_ref().is_some_and(|location| {
+                        relay_destination_matches(location.id.as_str(), destination)
+                    })
+                {
+                    return Ok(());
+                }
+                if snapshot.travel.is_none() {
+                    return Err(error);
+                }
+            } else {
+                return Err(error);
+            }
+        }
     }
 
     let mut watch = client.events().watch().await?;
@@ -5468,7 +5512,29 @@ async fn travel_to(
             );
             departure_origin = Some(location.to_owned());
             let operation = handle.travel().to(destination).depart().await?;
-            ensure_operation_accepted(&operation).await?;
+            if let Err(error) = ensure_operation_accepted(&operation).await {
+                if operation_rejected_with(
+                    &operation,
+                    &["Already at destination", "Already travelling"],
+                )
+                .await?
+                {
+                    handle = handle.refresh().await?;
+                    snapshot = handle.snapshot().await?;
+                    if snapshot.travel.is_none()
+                        && snapshot.location.as_ref().is_some_and(|location| {
+                            relay_destination_matches(location.id.as_str(), destination)
+                        })
+                    {
+                        return Ok(());
+                    }
+                    if snapshot.travel.is_none() {
+                        return Err(error);
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
             continue;
         }
 
@@ -5770,6 +5836,32 @@ async fn wait_for_relevant_event(
             }
         }
     }
+}
+
+fn operation_response_contains(response: Option<&Value>, expected: &[&str]) -> bool {
+    let candidates = response
+        .into_iter()
+        .flat_map(|response| {
+            [
+                response.get("message").and_then(Value::as_str),
+                response
+                    .get("server")
+                    .and_then(|server| server.get("error"))
+                    .and_then(Value::as_str),
+            ]
+        })
+        .flatten();
+    candidates.into_iter().any(|message| {
+        expected
+            .iter()
+            .any(|expected| message.eq_ignore_ascii_case(expected) || message.contains(expected))
+    })
+}
+
+async fn operation_rejected_with(operation: &Operation, expected: &[&str]) -> AnyResult<bool> {
+    let outcome = operation.outcome().await?;
+    Ok(outcome.status == OperationStatus::Rejected
+        && operation_response_contains(outcome.response.as_ref(), expected))
 }
 
 async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
@@ -6383,13 +6475,32 @@ pub async fn execute_expansion(
     client: &Client,
     request: &RelayExpansionRequest,
 ) -> AnyResult<RelayExpansionReport> {
+    execute_expansion_with_queue_timeout(client, request, request.wait_timeout).await
+}
+
+async fn execute_expansion_with_queue_timeout(
+    client: &Client,
+    request: &RelayExpansionRequest,
+    queue_capacity_timeout: Duration,
+) -> AnyResult<RelayExpansionReport> {
     if request.targets.is_empty() && !request.mission_file.exists() {
         return Err(app_error(
             io::ErrorKind::InvalidInput,
             "a new relay child mission requires at least one target",
         ));
     }
-    let config = Config {
+    let config = expansion_config(request, queue_capacity_timeout);
+    let _lock = MissionLock::acquire(&request.mission_file)?;
+    let plan = run(client, &config).await?;
+    Ok(RelayExpansionReport {
+        targets: plan.targets.clone(),
+        stops: plan.stops.len(),
+        state: plan,
+    })
+}
+
+fn expansion_config(request: &RelayExpansionRequest, queue_capacity_timeout: Duration) -> Config {
+    Config {
         command: Command::Run,
         database: PathBuf::new(),
         replicant: request.replicant.clone(),
@@ -6401,6 +6512,7 @@ pub async fn execute_expansion(
         ignore_printers: request.unavailable_autofactories.clone(),
         supply_strategy: RequestedSupplyStrategy::Auto,
         wait_timeout: request.wait_timeout,
+        queue_capacity_timeout,
         targets: request
             .targets
             .iter()
@@ -6408,14 +6520,7 @@ pub async fn execute_expansion(
             .collect(),
         verbose: false,
         log_file: None,
-    };
-    let _lock = MissionLock::acquire(&request.mission_file)?;
-    let plan = run(client, &config).await?;
-    Ok(RelayExpansionReport {
-        targets: plan.targets.clone(),
-        stops: plan.stops.len(),
-        state: plan,
-    })
+    }
 }
 
 /// Executes relay expansion while reporting every durable phase checkpoint.
@@ -6428,7 +6533,10 @@ where
     F: FnMut(RelayExecutionState) -> AnyResult<()>,
 {
     let (sender, mut receiver) = mpsc::unbounded_channel();
-    let execution = WORKFLOW_CHECKPOINTS.scope(sender, execute_expansion(client, request));
+    let execution = WORKFLOW_CHECKPOINTS.scope(
+        sender,
+        execute_expansion_with_queue_timeout(client, request, WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT),
+    );
     tokio::pin!(execution);
     loop {
         tokio::select! {
@@ -6520,10 +6628,32 @@ mod tests {
             ignore_printers: BTreeSet::new(),
             supply_strategy: RequestedSupplyStrategy::Auto,
             wait_timeout: Duration::from_secs(1),
+            queue_capacity_timeout: Duration::from_secs(1),
             targets: vec!["TARGET".to_owned()],
             verbose: false,
             log_file: None,
         }
+    }
+
+    #[test]
+    fn workflow_queue_wait_does_not_shorten_travel_deadline() {
+        let request = RelayExpansionRequest {
+            replicant: "REP-1".to_owned(),
+            hub: "ROOT-1-L4".to_owned(),
+            targets: vec!["TARGET".to_owned()],
+            mission_file: PathBuf::from("relay-plan.json"),
+            max_hop_ly: DEFAULT_MAX_HOP_LY,
+            wait_timeout: Duration::from_secs(21_600),
+            unavailable_autofactories: BTreeSet::new(),
+        };
+
+        let config = expansion_config(&request, WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT);
+
+        assert_eq!(config.wait_timeout, Duration::from_secs(21_600));
+        assert_eq!(
+            config.queue_capacity_timeout,
+            WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT
+        );
     }
 
     async fn seed_relay_device(
@@ -6564,6 +6694,58 @@ mod tests {
             1,
             "cached access must not issue a second GET"
         );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn device_travel_adopts_authoritative_arrival_after_stale_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/CARRIER-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "CARRIER-1",
+                "device_type": "racing_vessel",
+                "location": "ROOT-1-L4",
+                "status": "active",
+                "available_commands": ["travel"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        client
+            .devices()
+            .get("CARRIER-1")
+            .await
+            .expect("seed carrier");
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/CARRIER-1"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "Already at destination"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/CARRIER-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "CARRIER-1",
+                "device_type": "racing_vessel",
+                "location": "TARGET-1-L4",
+                "status": "active",
+                "available_commands": ["travel"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        start_device_travel(&client, "CARRIER-1", "TARGET-1-L4")
+            .await
+            .expect("adopt authoritative arrival");
+
         server.verify().await;
         client.close().await.expect("close client");
     }

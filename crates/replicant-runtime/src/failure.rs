@@ -11,6 +11,7 @@ pub(crate) enum FailureClass {
     RelayPlanStale,
     ResourceClaimContention,
     ConnectivityDependency,
+    ManufacturingCapacity,
     TransientUpstream,
     LogisticsStateStale,
 }
@@ -112,6 +113,8 @@ pub(crate) fn failure_class_from_message(message: &str) -> Option<FailureClass> 
         Some(FailureClass::RelayPlanStale)
     } else if lower.contains("resource is already claimed by workflow") {
         Some(FailureClass::ResourceClaimContention)
+    } else if lower.contains("timed out waiting for autofactory queue capacity") {
+        Some(FailureClass::ManufacturingCapacity)
     } else if lower.contains("no relay network connects")
         || lower.contains("blueprint is not unlocked")
         || lower.contains("missing blueprint")
@@ -134,5 +137,18 @@ pub(crate) fn failure_class_from_message(message: &str) -> Option<FailureClass> 
         Some(FailureClass::LogisticsStateStale)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autofactory_capacity_timeout_is_retryable_manufacturing_pressure() {
+        assert_eq!(
+            failure_class_from_message("timed out waiting for autofactory queue capacity"),
+            Some(FailureClass::ManufacturingCapacity)
+        );
     }
 }
