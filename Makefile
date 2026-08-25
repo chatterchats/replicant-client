@@ -8,6 +8,8 @@ WEB_DIR := apps/web
 DESKTOP_DIR := apps/desktop
 GALAXY_RENDERER_DIR := crates/galaxy-renderer
 GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
+DOCS_CRAWLER_DIR := reference/replicant-docs-crawler
+DOCS_CRAWLER_PYTHON ?= $(DOCS_CRAWLER_DIR)/venv/bin/python
 
 .PHONY: help build build-workspace check-all ci clean contract-policy-check desktop-build desktop-check desktop-dev desktop-fmt desktop-fmt-check desktop-prepare desktop-sidecar doc docker-artifacts docker-build docker-check docker-down docker-persistence-smoke docker-rebuild-deploy docker-restart docker-smoke docker-up docs-reference-sync else fmt fmt-check galaxy-wasm lint observability-down observability-up policy-checks test token token-rotate web-check web-fmt web-fmt-check zip
 
@@ -134,7 +136,13 @@ doc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --all-features --no-deps
 
 docs-reference-sync:
-	$(PYTHON) reference/replicant-docs-crawler/crawl_replicant_docs.py --refresh
+	@test -x "$(DOCS_CRAWLER_PYTHON)" || { \
+	  printf '%s\n' "Missing crawler virtualenv: $(DOCS_CRAWLER_PYTHON)" \
+	    "Create it with: python3 -m venv $(DOCS_CRAWLER_DIR)/venv" \
+	    "Then install: $(DOCS_CRAWLER_PYTHON) -m pip install -r $(DOCS_CRAWLER_DIR)/requirements.txt"; \
+	  exit 1; \
+	}
+	$(DOCS_CRAWLER_PYTHON) $(DOCS_CRAWLER_DIR)/crawl_replicant_docs.py --refresh
 
 contract-policy-check:
 	$(PYTHON) scripts/contract_policy_check.py
