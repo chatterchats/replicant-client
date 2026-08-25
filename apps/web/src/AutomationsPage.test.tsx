@@ -143,3 +143,43 @@ describe("workflow lifecycle requests", () => {
     },
   );
 });
+
+describe("Director goal controls", () => {
+  it("sends the selected region with a goal toggle", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          protocol_version: 1,
+          payload: {
+            metadata: { revision: 2, generated_at_ms: 10 },
+            mode: "automatic",
+            regions: [],
+            goals: [],
+            replicants: [],
+            requirements: [],
+            workforce: {
+              total: 0,
+              busy: 0,
+              idle: 0,
+              idle_ratio: 1,
+              pending_worker_demand: 0,
+              scale_up_recommended: false,
+              scale_reason: null,
+            },
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await daemonApi.setDirectorGoal("enhance_star_catalogue", "alpha", false);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/director/goals/enhance_star_catalogue",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ region: "alpha", enabled: false }),
+      }),
+    );
+  });
+});

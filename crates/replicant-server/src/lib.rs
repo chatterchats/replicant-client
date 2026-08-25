@@ -93,8 +93,8 @@ use replicant_runtime::{
     intelligence::{account_profile, leaderboard, leaderboard_index, standing},
     orchestration::expanded_system_region_map,
     orchestration::{
-        assign_replicant_region, cached_director_snapshot, parse_goal_kind, reconcile_director,
-        set_director_mode, set_goal_enabled,
+        assign_replicant_region, cached_director_snapshot, goal_is_regional, parse_goal_kind,
+        reconcile_director, set_director_mode, set_goal_enabled,
     },
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
@@ -5728,8 +5728,29 @@ async fn update_director_goal(
         return Err(ApiError::invalid("unknown Director goal kind"));
     };
     let Json(request) = payload.map_err(|_| ApiError::invalid("invalid Director goal request"))?;
-    tracing::info!(goal = ?kind, enabled = request.enabled, "Automation Director goal changed");
-    set_goal_enabled(&state.repository, kind, request.enabled).map_err(ApiError::runtime)?;
+    let region = request
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|region| !region.is_empty());
+    if goal_is_regional(kind) && region.is_none() {
+        return Err(ApiError::invalid(
+            "regional Director goal requires a region",
+        ));
+    }
+    if !goal_is_regional(kind) && region.is_some() {
+        return Err(ApiError::invalid(
+            "global Director goal does not accept a region",
+        ));
+    }
+    tracing::info!(
+        goal = ?kind,
+        region,
+        enabled = request.enabled,
+        "Automation Director goal changed"
+    );
+    set_goal_enabled(&state.repository, kind, region, request.enabled)
+        .map_err(ApiError::runtime)?;
     director_control_changed(&state)
 }
 
@@ -6372,7 +6393,9 @@ fn status_detail(status: &ClientStatus) -> Option<&'static str> {
             Some("managed event continuity is degraded")
         }
         ClientStatus::Degraded(_) => Some("managed synchronization is degraded"),
-        ClientStatus::Offline => Some("managed client is offline"),
+        ClientStatus::Offline => Some(
+            "managed SSE connection is offline; durable state and REST synchronization remain available",
+        ),
         ClientStatus::Closing | ClientStatus::Closed => Some("managed client is closed"),
         _ => Some("managed client status is unknown"),
     }
@@ -8771,6 +8794,12 @@ mod tests {
         assert_eq!(
             status_detail(&ClientStatus::Degraded(ClientDegradation::EventContinuity)),
             Some("managed event continuity is degraded")
+        );
+        assert_eq!(
+            status_detail(&ClientStatus::Offline),
+            Some(
+                "managed SSE connection is offline; durable state and REST synchronization remain available"
+            )
         );
     }
 }

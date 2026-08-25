@@ -1403,9 +1403,6 @@ function DirectorView() {
     },
     {},
   );
-  const goalPolicies = Array.from(
-    new Map(data.goals.map((goal) => [goal.kind, goal.enabled])).entries(),
-  );
   const replicantLabels = new Map(
     data.replicants.map((replicant) => [
       replicant.code,
@@ -1510,27 +1507,6 @@ function DirectorView() {
         </section>
       ) : null}
 
-      <section className="director-policy">
-        <h3>Standing goal policy</h3>
-        <div className="director-policy-grid">
-          {goalPolicies.map(([kind, enabled]) => (
-            <label key={kind} className="director-toggle">
-              <input
-                type="checkbox"
-                checked={enabled}
-                disabled={mutating}
-                onChange={(event) =>
-                  void mutate(() =>
-                    daemonApi.setDirectorGoal(kind, event.target.checked),
-                  )
-                }
-              />
-              {goalLabels[kind]}
-            </label>
-          ))}
-        </div>
-      </section>
-
       <div className="director-goal-grid">
         {globalGoals.map((goal) => (
           <article className={`director-goal ${goal.status}`} key={goal.id}>
@@ -1539,7 +1515,24 @@ function DirectorView() {
                 <span>Global goal</span>
                 <h3>{goalLabels[goal.kind]}</h3>
               </div>
-              <span>{goal.enabled ? "enabled" : "disabled"}</span>
+              <label className="director-toggle">
+                <input
+                  type="checkbox"
+                  checked={goal.enabled}
+                  disabled={mutating}
+                  aria-label={`${goalLabels[goal.kind]} global goal`}
+                  onChange={(event) =>
+                    void mutate(() =>
+                      daemonApi.setDirectorGoal(
+                        goal.kind,
+                        null,
+                        event.target.checked,
+                      ),
+                    )
+                  }
+                />
+                {goal.enabled ? "enabled" : "disabled"}
+              </label>
             </header>
             <p>{goal.objective}</p>
             {goalProgress(goal) ? <strong>{goalProgress(goal)}</strong> : null}
@@ -1588,10 +1581,25 @@ function DirectorView() {
                   >
                     <div>
                       <strong>{goalLabels[goal.kind]}</strong>
-                      <span>
+                      <label className="director-toggle">
+                        <input
+                          type="checkbox"
+                          checked={goal.enabled}
+                          disabled={mutating}
+                          aria-label={`${goalLabels[goal.kind]} in ${goal.region ?? region.region}`}
+                          onChange={(event) =>
+                            void mutate(() =>
+                              daemonApi.setDirectorGoal(
+                                goal.kind,
+                                goal.region,
+                                event.target.checked,
+                              ),
+                            )
+                          }
+                        />
                         {goal.status}
                         {progress ? ` · ${progress}` : ""}
-                      </span>
+                      </label>
                     </div>
                     <p>{goal.blocker ?? goal.next_action ?? goal.objective}</p>
                   </div>

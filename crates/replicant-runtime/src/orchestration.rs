@@ -135,6 +135,26 @@ struct GoalControl {
     enabled: bool,
 }
 
+#[derive(Default)]
+struct GoalControls {
+    global: BTreeMap<DirectorGoalKind, bool>,
+    regional: BTreeMap<DirectorGoalKind, BTreeMap<String, bool>>,
+}
+
+impl GoalControls {
+    fn enabled(&self, kind: DirectorGoalKind, region: Option<&str>) -> bool {
+        region
+            .and_then(|region| {
+                self.regional
+                    .get(&kind)
+                    .and_then(|controls| controls.get(region))
+            })
+            .copied()
+            .or_else(|| self.global.get(&kind).copied())
+            .unwrap_or_else(|| default_goal_enabled(kind))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct GoalRuntime {
     #[serde(default)]
@@ -290,7 +310,7 @@ struct StockLocation {
 struct GoalReconcileContext<'a> {
     repository: &'a WorkflowRepository,
     workflows: &'a [WorkflowInstance],
-    controls: &'a BTreeMap<DirectorGoalKind, bool>,
+    controls: &'a GoalControls,
     automatic: bool,
     now: i64,
 }
@@ -328,15 +348,17 @@ pub fn set_director_mode(
     Ok(settings)
 }
 
-/// Enables or disables one standing goal type globally.
+/// Enables or disables one global or regional standing goal instance.
 pub fn set_goal_enabled(
     repository: &WorkflowRepository,
     kind: DirectorGoalKind,
+    region: Option<&str>,
     enabled: bool,
 ) -> Result<(), ApplicationError> {
+    let region = region.map(canonical_region);
     repository.put_document(
         GOAL_CONTROL_NS,
-        goal_kind_key(kind),
+        &goal_instance_id(kind, region.as_deref()),
         &GoalControl { enabled },
     )?;
     Ok(())
@@ -379,9 +401,10 @@ pub fn cached_director_snapshot(
         serde_json::from_value(value)?
     } else {
         let settings = director_settings(repository)?;
-        let controls = load_goal_controls(repository)?;
+        let controls = load_goal_controls(repository, std::iter::empty::<&str>())?;
         let goals = all_goal_kinds()
             .into_iter()
+            .filter(|kind| !goal_is_regional(*kind))
             .map(|kind| {
                 waiting_goal(
                     kind,
@@ -429,9 +452,12 @@ fn apply_durable_snapshot_overrides(
 ) -> Result<(), ApplicationError> {
     snapshot.mode = director_settings(repository)?.mode;
 
-    let controls = load_goal_controls(repository)?;
+    let controls = load_goal_controls(
+        repository,
+        snapshot.regions.iter().map(|region| region.region.as_str()),
+    )?;
     for goal in &mut snapshot.goals {
-        goal.enabled = goal_enabled(&controls, goal.kind);
+        goal.enabled = goal_enabled(&controls, goal.kind, goal.region.as_deref());
     }
 
     let assignments = load_assignments(repository)?;
@@ -599,6 +625,13 @@ pub async fn reconcile_director(
 
     let location_systems = location_system_map(&locations);
     let system_regions = system_region_map(&catalogue);
+    let catalogue_positions = catalogue
+        .iter()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.as_str().to_owned(), position))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut regions = build_regions(&catalogue, &devices, &location_systems, &system_regions);
     mark_establishing_regions(&mut regions, &workflows)?;
 
@@ -634,11 +667,11 @@ pub async fn reconcile_director(
     mark_partial_region_footholds(&mut regions, &workers, &location_systems, &system_regions);
     mark_manufacturing_footholds(&mut regions, &devices, &location_systems, &system_regions);
 
-    let goal_controls = load_goal_controls(&repository)?;
+    let goal_controls = load_goal_controls(&repository, regions.keys().map(String::as_str))?;
     let mut requirements = DirectorRequirementGraph::load(&repository, now)?;
     let blueprint_catalogue_needed =
-        goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition)
-            || (goal_enabled(&goal_controls, DirectorGoalKind::ExpandStarCatalogue)
+        goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition, None)
+            || (goal_enabled(&goal_controls, DirectorGoalKind::ExpandStarCatalogue, None)
                 && !devices.iter().any(|device| {
                     device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory)
                 }));
@@ -755,6 +788,7 @@ pub async fn reconcile_director(
             &mut requirements,
             &locations,
             &location_systems,
+            &catalogue_positions,
         )?);
         goals.push(reconcile_expand_mining(
             &repository,
@@ -786,48 +820,56 @@ pub async fn reconcile_director(
 
     let mut event_discovery_error = None;
     let mut event_systems_by_region = BTreeMap::<String, BTreeSet<String>>::new();
-    let event_designations_by_region =
-        if (goal_enabled(&goal_controls, DirectorGoalKind::EventCompletion)
-            || goal_enabled(&goal_controls, DirectorGoalKind::ExpandFtlNetwork))
-            && !established_regions.is_empty()
+    let event_controls_enabled = established_regions.iter().any(|region| {
+        goal_enabled(
+            &goal_controls,
+            DirectorGoalKind::EventCompletion,
+            Some(&region.region),
+        ) || goal_enabled(
+            &goal_controls,
+            DirectorGoalKind::ExpandFtlNetwork,
+            Some(&region.region),
+        )
+    });
+    let event_designations_by_region = if event_controls_enabled && !established_regions.is_empty()
+    {
+        match active_events_for_director(
+            client,
+            repository.as_ref(),
+            now,
+            force_slow_refresh,
+            established_regions.len(),
+        )
+        .await
         {
-            match active_events_for_director(
-                client,
-                repository.as_ref(),
-                now,
-                force_slow_refresh,
-                established_regions.len(),
-            )
-            .await
-            {
-                Ok(active_events) => {
-                    event_systems_by_region = group_active_event_systems_by_region(
-                        &active_events,
-                        &location_systems,
-                        &system_regions,
-                        &regions,
-                    );
-                    group_active_events_by_region(
-                        &active_events,
-                        &location_systems,
-                        &system_regions,
-                        &regions,
-                    )
-                }
-                Err(error) => {
-                    let message = format!("active-event discovery failed: {error}");
-                    tracing::warn!(
-                        error = %error,
-                        phase = "events",
-                        "Director active-event snapshot failed; continuing without event planning"
-                    );
-                    event_discovery_error = Some(message);
-                    BTreeMap::new()
-                }
+            Ok(active_events) => {
+                event_systems_by_region = group_active_event_systems_by_region(
+                    &active_events,
+                    &location_systems,
+                    &system_regions,
+                    &regions,
+                );
+                group_active_events_by_region(
+                    &active_events,
+                    &location_systems,
+                    &system_regions,
+                    &regions,
+                )
             }
-        } else {
-            BTreeMap::new()
-        };
+            Err(error) => {
+                let message = format!("active-event discovery failed: {error}");
+                tracing::warn!(
+                    error = %error,
+                    phase = "events",
+                    "Director active-event snapshot failed; continuing without event planning"
+                );
+                event_discovery_error = Some(message);
+                BTreeMap::new()
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
 
     for region in &established_regions {
         goals.push(reconcile_maintain_system_hubs(
@@ -870,6 +912,7 @@ pub async fn reconcile_director(
             &mut requirements,
             &locations,
             &location_systems,
+            &catalogue_positions,
         )?);
         goals.push(reconcile_expand_mining(
             &repository,
@@ -952,7 +995,7 @@ pub async fn reconcile_director(
     // copies can be learned without touching the trade directory, and an active
     // acquisition already has enough information to finish.
     let mut shop_requested_blueprints = BTreeSet::new();
-    if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition)
+    if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition, None)
         && active_blueprint_acquisition_workflow(&workflows).is_none()
     {
         for device_type in requirements.current_blueprint_priorities().keys() {
@@ -1109,7 +1152,7 @@ fn reconcile_establish_regions(
     requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EstablishRegions;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, None);
     let id = goal_instance_id(kind, None);
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -1246,7 +1289,7 @@ fn reconcile_expand_star_catalogue(
     requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandStarCatalogue;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, None);
     let id = goal_instance_id(kind, None);
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -1795,7 +1838,7 @@ fn reconcile_blueprint_acquisition(
     let location_systems = blueprint.location_systems;
     let system_regions = blueprint.system_regions;
     let kind = DirectorGoalKind::BlueprintAcquisition;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, None);
     let id = goal_instance_id(kind, None);
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -2426,7 +2469,7 @@ fn reconcile_maintain_system_hubs(
     system_regions: &BTreeMap<String, String>,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::MaintainSystemHubs;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -2961,7 +3004,7 @@ fn reconcile_event_completion(
     requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EventCompletion;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -3067,7 +3110,7 @@ fn reconcile_enhance_catalogue(
     requirements: &mut DirectorRequirementGraph,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::EnhanceStarCatalogue;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -3268,19 +3311,15 @@ fn reconcile_discover_belts(
     requirements: &mut DirectorRequirementGraph,
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
+    catalogue_positions: &BTreeMap<String, GalacticPosition>,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::DiscoverBelts;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
     let searched = belt_searched_systems(locations, location_systems);
-    let targets = region
-        .known_systems
-        .difference(&searched)
-        .take(MINING_BATCH_SIZE)
-        .cloned()
-        .collect::<Vec<_>>();
+    let targets = belt_search_targets_from_hub(region, &searched, catalogue_positions);
     let covered = region.known_systems.intersection(&searched).count();
     let active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
@@ -3352,6 +3391,37 @@ fn reconcile_discover_belts(
         enabled,
     })
 }
+fn belt_search_targets_from_hub(
+    region: &RegionView,
+    searched: &BTreeSet<String>,
+    positions: &BTreeMap<String, GalacticPosition>,
+) -> Vec<String> {
+    let hub_position = region
+        .hub_system
+        .as_deref()
+        .and_then(|hub| positions.get(hub))
+        .copied();
+    let mut targets = region
+        .known_systems
+        .difference(searched)
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        let by_distance = hub_position.map_or(std::cmp::Ordering::Equal, |hub| {
+            match (positions.get(left), positions.get(right)) {
+                (Some(left), Some(right)) => {
+                    galactic_distance(hub, *left).total_cmp(&galactic_distance(hub, *right))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+        by_distance.then_with(|| left.cmp(right))
+    });
+    targets.truncate(MINING_BATCH_SIZE);
+    targets
+}
 
 fn belt_searched_systems(
     locations: &[Location],
@@ -3385,14 +3455,14 @@ fn reconcile_expand_mining(
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
-    controls: &BTreeMap<DirectorGoalKind, bool>,
+    controls: &GoalControls,
     automatic: bool,
     reserved: &mut BTreeSet<String>,
     requirements: &mut DirectorRequirementGraph,
     now: i64,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandMiningOps;
-    let enabled = goal_enabled(controls, kind);
+    let enabled = goal_enabled(controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(repository, &id)?;
     prune_runtime_workflows(&mut runtime, workflows);
@@ -3541,7 +3611,7 @@ fn reconcile_expand_ftl_network(
     event_systems: &BTreeSet<String>,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandFtlNetwork;
-    let enabled = goal_enabled(context.controls, kind);
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
@@ -4582,10 +4652,11 @@ fn load_assignments(
         .collect()
 }
 
-fn load_goal_controls(
+fn load_goal_controls<'a>(
     repository: &WorkflowRepository,
-) -> Result<BTreeMap<DirectorGoalKind, bool>, ApplicationError> {
-    let mut controls = BTreeMap::new();
+    regions: impl IntoIterator<Item = &'a str>,
+) -> Result<GoalControls, ApplicationError> {
+    let mut controls = GoalControls::default();
     for kind in all_goal_kinds() {
         let enabled = repository
             .read_document(GOAL_CONTROL_NS, goal_kind_key(kind))?
@@ -4593,7 +4664,25 @@ fn load_goal_controls(
             .transpose()?
             .map(|control| control.enabled)
             .unwrap_or_else(|| default_goal_enabled(kind));
-        controls.insert(kind, enabled);
+        controls.global.insert(kind, enabled);
+    }
+    for region in regions {
+        for kind in all_goal_kinds()
+            .into_iter()
+            .filter(|kind| goal_is_regional(*kind))
+        {
+            let enabled = repository
+                .read_document(GOAL_CONTROL_NS, &goal_instance_id(kind, Some(region)))?
+                .map(|(value, _)| serde_json::from_value::<GoalControl>(value))
+                .transpose()?
+                .map(|control| control.enabled)
+                .unwrap_or_else(|| controls.global[&kind]);
+            controls
+                .regional
+                .entry(kind)
+                .or_default()
+                .insert(region.to_owned(), enabled);
+        }
     }
     Ok(controls)
 }
@@ -4794,12 +4883,12 @@ fn system_prefix(value: &str) -> &str {
 fn waiting_goal(
     kind: DirectorGoalKind,
     region: Option<&str>,
-    controls: &BTreeMap<DirectorGoalKind, bool>,
+    controls: &GoalControls,
     objective: &str,
     blocker: &str,
     next_action: &str,
 ) -> DirectorGoalSummary {
-    let enabled = goal_enabled(controls, kind);
+    let enabled = goal_enabled(controls, kind, region);
     DirectorGoalSummary {
         id: goal_instance_id(kind, region),
         kind,
@@ -4822,11 +4911,8 @@ fn waiting_goal(
     }
 }
 
-fn goal_enabled(controls: &BTreeMap<DirectorGoalKind, bool>, kind: DirectorGoalKind) -> bool {
-    controls
-        .get(&kind)
-        .copied()
-        .unwrap_or_else(|| default_goal_enabled(kind))
+fn goal_enabled(controls: &GoalControls, kind: DirectorGoalKind, region: Option<&str>) -> bool {
+    controls.enabled(kind, region)
 }
 
 fn default_goal_enabled(kind: DirectorGoalKind) -> bool {
@@ -4893,6 +4979,21 @@ pub fn parse_goal_kind(value: &str) -> Option<DirectorGoalKind> {
     all_goal_kinds()
         .into_iter()
         .find(|kind| goal_kind_key(*kind) == value)
+}
+
+/// Whether a standing goal is controlled independently for each region.
+#[must_use]
+pub fn goal_is_regional(kind: DirectorGoalKind) -> bool {
+    matches!(
+        kind,
+        DirectorGoalKind::EnhanceStarCatalogue
+            | DirectorGoalKind::DiscoverBelts
+            | DirectorGoalKind::ExpandMiningOps
+            | DirectorGoalKind::EventCompletion
+            | DirectorGoalKind::MaintainSystemHubs
+            | DirectorGoalKind::ExpandFtlNetwork
+            | DirectorGoalKind::EstablishBeacons
+    )
 }
 
 fn goal_instance_id(kind: DirectorGoalKind, region: Option<&str>) -> String {
@@ -5714,6 +5815,61 @@ mod tests {
     }
 
     #[test]
+    fn belt_search_targets_expand_outward_from_the_regional_hub() {
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("HUB".to_owned()),
+            hub_location: Some("HUB-BELT-1".to_owned()),
+            known_systems: BTreeSet::from([
+                "ALPHA".to_owned(),
+                "BETA".to_owned(),
+                "ZETA".to_owned(),
+                "AARDVARK".to_owned(),
+            ]),
+        };
+        let positions = BTreeMap::from([
+            (
+                "HUB".to_owned(),
+                GalacticPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "ALPHA".to_owned(),
+                GalacticPosition {
+                    x: 100.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "BETA".to_owned(),
+                GalacticPosition {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "ZETA".to_owned(),
+                GalacticPosition {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            belt_search_targets_from_hub(&region, &BTreeSet::new(), &positions),
+            ["ZETA", "BETA", "ALPHA", "AARDVARK"]
+        );
+    }
+
+    #[test]
     fn device_region_map_extends_formal_bounds_by_fifteen_ly() {
         let regions = expanded_system_region_map(&[
             positioned_star("ALPHA-EDGE", 0.0, Some("Alpha")),
@@ -5769,7 +5925,13 @@ mod tests {
         assert_eq!(snapshot.mode, DirectorMode::Advisory);
         assert!(snapshot.regions.is_empty());
         assert!(snapshot.replicants.is_empty());
-        assert_eq!(snapshot.goals.len(), all_goal_kinds().len());
+        assert_eq!(
+            snapshot.goals.len(),
+            all_goal_kinds()
+                .into_iter()
+                .filter(|kind| !goal_is_regional(*kind))
+                .count()
+        );
         assert!(snapshot.workforce.scale_reason.is_some());
 
         drop(repository);
@@ -5777,7 +5939,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_snapshot_overlays_durable_operator_controls() {
+    fn cached_snapshot_overlays_durable_regional_goal_controls() {
         let path = std::env::temp_dir().join(format!(
             "replicant-director-cache-controls-{}.sqlite",
             uuid::Uuid::new_v4()
@@ -5800,13 +5962,31 @@ mod tests {
             replicants: Vec::new(),
             known_systems: 4,
         });
+        stored.goals.push(DirectorGoalSummary {
+            id: goal_instance_id(DirectorGoalKind::ExpandFtlNetwork, Some("alpha")),
+            kind: DirectorGoalKind::ExpandFtlNetwork,
+            region: Some("alpha".to_owned()),
+            status: DirectorGoalStatus::Waiting,
+            objective: "Extend regional relay reach".to_owned(),
+            blocker: None,
+            next_action: None,
+            progress_current: 0,
+            progress_total: 4,
+            active_workflows: Vec::new(),
+            enabled: true,
+        });
         repository
             .put_document(SNAPSHOT_NS, SNAPSHOT_KEY, &stored)
             .expect("persist cached projection");
 
         set_director_mode(&repository, DirectorMode::Automatic).expect("set Director mode");
-        set_goal_enabled(&repository, DirectorGoalKind::ExpandFtlNetwork, true)
-            .expect("enable FTL goal");
+        set_goal_enabled(
+            &repository,
+            DirectorGoalKind::ExpandFtlNetwork,
+            Some("alpha"),
+            false,
+        )
+        .expect("disable Alpha FTL goal");
         assign_replicant_region(&repository, "CHAT-1", Some("Alpha"), Some("catalogue"))
             .expect("assign regional worker");
 
@@ -5814,11 +5994,14 @@ mod tests {
 
         assert_eq!(cached.mode, DirectorMode::Automatic);
         assert!(
-            cached
+            !cached
                 .goals
                 .iter()
-                .find(|goal| goal.kind == DirectorGoalKind::ExpandFtlNetwork)
-                .expect("FTL goal")
+                .find(|goal| {
+                    goal.kind == DirectorGoalKind::ExpandFtlNetwork
+                        && goal.region.as_deref() == Some("alpha")
+                })
+                .expect("Alpha FTL goal")
                 .enabled
         );
         assert_eq!(cached.replicants[0].region.as_deref(), Some("alpha"));
@@ -5830,6 +6013,32 @@ mod tests {
 
         drop(repository);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn regional_goal_controls_are_isolated() {
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        set_goal_enabled(
+            &repository,
+            DirectorGoalKind::EnhanceStarCatalogue,
+            Some("Alpha"),
+            false,
+        )
+        .expect("disable Alpha catalogue goal");
+
+        let controls =
+            load_goal_controls(&repository, ["alpha", "beta"]).expect("load goal controls");
+
+        assert!(!goal_enabled(
+            &controls,
+            DirectorGoalKind::EnhanceStarCatalogue,
+            Some("alpha")
+        ));
+        assert!(goal_enabled(
+            &controls,
+            DirectorGoalKind::EnhanceStarCatalogue,
+            Some("beta")
+        ));
     }
 
     #[test]

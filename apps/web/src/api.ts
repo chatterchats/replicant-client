@@ -191,9 +191,14 @@ export const daemonApi = {
       await send("PUT", "/api/director/mode", { mode }),
     ).payload;
   },
-  async setDirectorGoal(kind: DirectorGoalKind, enabled: boolean) {
+  async setDirectorGoal(
+    kind: DirectorGoalKind,
+    region: string | null,
+    enabled: boolean,
+  ) {
     return parseDirectorResponse(
       await send("PUT", `/api/director/goals/${encodeURIComponent(kind)}`, {
+        region,
         enabled,
       }),
     ).payload;

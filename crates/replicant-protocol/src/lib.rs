@@ -319,7 +319,7 @@ pub struct DirectorGoalSummary {
     pub progress_total: u64,
     /// Non-terminal workflows owned by this goal instance.
     pub active_workflows: Vec<WorkflowId>,
-    /// Whether this standing goal type is enabled.
+    /// Whether this global or regional goal instance is enabled.
     pub enabled: bool,
 }
 
@@ -432,9 +432,11 @@ pub struct DirectorModeRequest {
     pub mode: DirectorMode,
 }
 
-/// Enables or disables one standing goal type globally.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Enables or disables one standing goal instance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectorGoalControlRequest {
+    /// Region for a regional goal; absent for an empire-wide goal.
+    pub region: Option<String>,
     /// Whether this standing goal should be instantiated and reconciled.
     pub enabled: bool,
 }
