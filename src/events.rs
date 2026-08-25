@@ -203,6 +203,8 @@ pub struct PrintCompletedPayload {
     pub new_device_code: Option<String>,
     /// Open print origin, currently `vessel` or `autofactory`.
     pub print_mode: Option<String>,
+    /// Whether the device was printed compacted as a flatpack.
+    pub compacted: Option<bool>,
     /// Component device codes consumed by the print.
     #[serde(default)]
     pub consumed_device_codes: Vec<String>,
@@ -400,6 +402,25 @@ pub struct MultiplayerReplicantPresencePayload {
     pub extra: JsonObject,
 }
 
+/// Typed payload for `system.object_detected`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct SystemObjectDetectedPayload {
+    /// Designation assigned to the incoming object.
+    pub object_designation: Option<String>,
+    /// Open object size class, such as `large`.
+    pub size_class: Option<String>,
+    /// Location expected to be impacted.
+    pub impact_target: Option<String>,
+    /// Expected impact time, RFC3339.
+    pub impact_eta: Option<String>,
+    /// Open detection source, currently `hub` or `beacon`.
+    pub discovery_source: Option<String>,
+    /// Future object-detection fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
 /// One account-wide game event.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -545,6 +566,12 @@ impl GameEvent {
     /// different event name.
     pub fn hub_maintained(&self) -> Result<Option<HubMaintainedPayload>, Error> {
         self.decode_payload("hub.maintained")
+    }
+
+    /// Decodes this event as `system.object_detected`, returning `None` for a
+    /// different event name.
+    pub fn system_object_detected(&self) -> Result<Option<SystemObjectDetectedPayload>, Error> {
+        self.decode_payload("system.object_detected")
     }
 
     /// Decodes this event as `multiplayer.replicant_entered`, returning
@@ -736,19 +763,21 @@ mod tests {
     }
 
     #[test]
-    fn print_completed_exposes_consumed_devices_and_tags() {
+    fn print_completed_exposes_compacted_state_consumed_devices_and_tags() {
         let event = event(
             "print.completed",
             serde_json::json!({
                 "device_type": "parallax_array",
                 "new_device_code": "A1B2C3D4",
                 "print_mode": "autofactory",
+                "compacted": true,
                 "consumed_device_codes": ["E5F6G7H8", "J9K0L1M2"],
                 "tags": ["fleet-a"]
             }),
         );
         let payload = event.print_completed().unwrap().unwrap();
         assert_eq!(payload.new_device_code.as_deref(), Some("A1B2C3D4"));
+        assert_eq!(payload.compacted, Some(true));
         assert_eq!(
             payload.consumed_device_codes,
             ["E5F6G7H8".to_owned(), "J9K0L1M2".to_owned()]
@@ -792,6 +821,24 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn system_object_detected_exposes_impact_eta() {
+        let event = event(
+            "system.object_detected",
+            serde_json::json!({
+                "object_designation": "SOL-OBJ-2",
+                "size_class": "large",
+                "impact_target": "SOL-4",
+                "impact_eta": "2026-08-26T09:30:00",
+                "discovery_source": "hub"
+            }),
+        );
+        let payload = event.system_object_detected().unwrap().unwrap();
+        assert_eq!(payload.object_designation.as_deref(), Some("SOL-OBJ-2"));
+        assert_eq!(payload.impact_eta.as_deref(), Some("2026-08-26T09:30:00"));
+        assert_eq!(payload.discovery_source.as_deref(), Some("hub"));
     }
 
     #[test]

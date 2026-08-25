@@ -19,6 +19,15 @@ macro_rules! open_value {
     };
 }
 
+macro_rules! device_types {
+    ($($known:ident => $wire:literal),+ $(,)?) => {
+        open_value!(DeviceType { $($known => $wire),+ });
+
+        #[cfg(test)]
+        const KNOWN_DEVICE_TYPE_VALUES: &[&str] = &[$($wire),+];
+    };
+}
+
 open_value!(EventName {
     BobnetNew => "bobnet.new",
     DeviceCompacted => "device.compacted", DeviceCompacting => "device.compacting",
@@ -39,23 +48,24 @@ open_value!(DeviceFeature {
     Mining => "mining", Printing => "printing", Scanning => "scanning", Travel => "travel"
 });
 open_value!(DeviceStatus { Active => "active", Deactivated => "deactivated", Idle => "idle", Offline => "offline" });
-// AMI controller wire values are confirmed against
-// `reference/replicant-space-2-5-1/api/replicants/events/index.md` (`ami_mining_controller`);
-// the survey/transport/fleet siblings follow the same `ami_<kind>_controller`
-// naming convention documented in `reference/replicant-space-2-5-1/ami/index.md`.
-open_value!(DeviceType {
+// AMI controller wire values are confirmed against the Replicant Space 2.5.2
+// event and AMI documentation.
+device_types! {
     MiningController => "ami_mining_controller",
     SurveyController => "ami_survey_controller",
     TradeController => "ami_trade_controller",
     TransportController => "ami_transport_controller",
     AtmoProcessor => "atmo_processor",
     Autofactory => "autofactory",
+    BeltSurveyor => "belt_surveyor",
     CargoFreighter => "cargo_freighter",
     CargoLifter => "cargo_lifter",
     CargoVessel => "cargo_vessel",
     CasimirArray => "casimir_array",
+    ColonyShuttle => "colony_shuttle",
     CommSatellite => "comm_satellite",
     ComputeCore => "compute_core",
+    DeepSpaceRelayStation => "deep_space_relay_station",
     DefenceGrid => "defence_grid",
     ElectrodynamicTether => "electrodynamic_tether",
     EmptyReplicantMatrix => "empty_replicant_matrix",
@@ -65,6 +75,7 @@ open_value!(DeviceType {
     FleetTender => "fleet_tender",
     FtlBeacon => "ftl_beacon",
     FtlRelay => "ftl_relay",
+    FtlSlingshot => "ftl_slingshot",
     FusionBarge => "fusion_barge",
     GalacticObservatory => "galactic_observatory",
     GravityLens => "gravity_lens",
@@ -82,6 +93,7 @@ open_value!(DeviceType {
     NutrientSynthesizer => "nutrient_synthesizer",
     OrbitalDefencePlatform => "orbital_defence_platform",
     OrbitalFarm => "orbital_farm",
+    PlanetarySurveyor => "planetary_surveyor",
     PointDefenceArray => "point_defence_array",
     PowerCellArray => "power_cell_array",
     Propulsor => "propulsor",
@@ -98,16 +110,21 @@ open_value!(DeviceType {
     SurgePlatform => "surge_platform",
     SurveyDrone => "survey_drone",
     SystemHub => "system_hub",
+    SystemWard => "system_ward",
     ThermalLance => "thermal_lance",
     TidalCompensator => "tidal_compensator",
     TransportDrone => "transport_drone",
     TransportHauler => "transport_hauler",
+    // The Fleet Controller is a special reward documented in
+    // `reference/replicant-space-2-5-2/ami/fleet-controller/index.md`.
+    // Replicant interfaces are fixed datacentre devices documented in
+    // `reference/replicant-space-2-5-2/simulations/index.md`.
     FleetController => "ami_fleet_controller",
     ReplicantInterface => "replicant_interface",
-    FtlSlingshot => "ftl_slingshot",
-    SystemWard => "system_ward",
-});
-// Directive wire values from `reference/replicant-space-2-5-1/ami/*-controller/index.md`.
+    // A populated matrix is derived from the printable empty Replicant matrix.
+    ReplicantMatrix => "replicant_matrix",
+}
+// Directive wire values from `reference/replicant-space-2-5-2/ami/*-controller/index.md`.
 open_value!(DeviceDirective {
     GatherResources => "gather_resources", GatherEvenly => "gather_evenly",
     MaintainRatios => "maintain_ratios", DepleteSmallest => "deplete_smallest",
@@ -166,18 +183,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_blueprint_device_type_is_known() {
+    fn device_type_catalogue_matches_blueprints_and_non_printable_devices() {
+        use std::collections::BTreeSet;
+
         let document: serde_json::Value =
             serde_json::from_str(include_str!("../../blueprints.json")).expect("blueprints JSON");
-        for blueprint in document["blueprints"].as_array().expect("blueprints array") {
-            let wire = blueprint["device_type"]
-                .as_str()
-                .expect("blueprint device_type");
+        let blueprint_types = document["blueprints"]
+            .as_array()
+            .expect("blueprints array")
+            .iter()
+            .map(|blueprint| {
+                blueprint["device_type"]
+                    .as_str()
+                    .expect("blueprint device_type")
+            })
+            .collect::<BTreeSet<_>>();
+        let mut expected_types = blueprint_types.clone();
+        expected_types.extend([
+            "ami_fleet_controller",
+            "replicant_interface",
+            "replicant_matrix",
+        ]);
+        let known_types = KNOWN_DEVICE_TYPE_VALUES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(known_types, expected_types);
+        for wire in blueprint_types {
             let device_type = DeviceType::from(wire);
-            assert!(
-                !matches!(device_type, DeviceType::Unknown(_)),
-                "unknown blueprint device type: {wire}"
-            );
+            assert!(!matches!(device_type, DeviceType::Unknown(_)));
             assert_eq!(device_type.as_str(), wire);
         }
     }
