@@ -198,6 +198,11 @@ workflows and managed client operations. Director state (settings, goal controls
 assignments, goal runtime, and workforce pressure) is persisted in the workflow database through
 the generic `runtime_documents` store.
 
+Regional goal instances have independent enable controls. Empire-wide goals (`Establish Regions`,
+`Expand Star Catalogue`, and `Blueprint Acquisition`) retain one global control. A regional
+override is keyed by the stable goal instance identity (`kind:region`); regions without an override
+inherit the pre-existing goal-kind setting so upgrades preserve operator policy.
+
 The Director has three operating modes:
 
 - `off`: preserve configuration and report state without planning new work;
@@ -217,6 +222,8 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   four idle region-assigned Replicants/racing vessels. The shard backlog contributes real regional
   worker pressure, so the grow-only workforce policy can add catalogue capacity when useful survey
   work is persistently waiting rather than cloning merely because utilization is high.
+- **Discover Belts** searches each region outward from its selected hub system, prioritizing known
+  systems by three-dimensional galactic distance rather than catalogue name.
 - **Expand Mining Ops** batches uncovered known belt systems into regional mining campaigns.
 - **Event Completion** batches active regional events into campaign planning, staging, routing,
   and completion.
