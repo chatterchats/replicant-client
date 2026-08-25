@@ -128,6 +128,52 @@ impl WorkflowExecutor for TestWorkflow {
     }
 }
 
+struct NonCooperativeFactory {
+    kind: WorkflowKind,
+    harness: Arc<Harness>,
+}
+
+impl WorkflowFactory for NonCooperativeFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(NonCooperativeWorkflow {
+            harness: self.harness.clone(),
+        }))
+    }
+}
+
+struct NonCooperativeWorkflow {
+    harness: Arc<Harness>,
+}
+
+impl WorkflowExecutor for NonCooperativeWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            self.harness.executions.fetch_add(1, Ordering::SeqCst);
+            self.harness.reached.add_permits(1);
+            self.harness
+                .proceed
+                .acquire()
+                .await
+                .expect("test harness remains open")
+                .forget();
+            context
+                .emit_activity("mutation after wait")
+                .map_err(|error| error.to_string())?;
+            context
+                .mark_succeeded::<()>(None)
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
 fn setup(
     repository: Arc<WorkflowRepository>,
     panic_after_first_step: bool,
@@ -305,6 +351,54 @@ async fn pauses_and_resumes_cooperatively() {
     finish_remaining(&harness, 1).await;
     wait_for_status(&supervisor, &repository, id, WorkflowStatus::Succeeded).await;
     assert_eq!(harness.executions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn pause_stops_an_executor_that_does_not_poll_control() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.non-cooperative").expect("valid kind");
+    let instance = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: Config {
+                steps: 1,
+                panic_after_first_step: false,
+            },
+            checkpoint: Checkpoint { completed: 0 },
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create workflow");
+    let harness = Arc::new(Harness::default());
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(NonCooperativeFactory {
+            kind,
+            harness: harness.clone(),
+        }))
+        .expect("register workflow");
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+
+    supervisor.tick().await.expect("start workflow");
+    reach_step(&harness).await;
+    supervisor.pause(instance.id).expect("pause workflow");
+    harness.proceed.add_permits(1);
+    while supervisor.has_executor(instance.id) {
+        tokio::task::yield_now().await;
+        supervisor.tick().await.expect("reap paused executor");
+    }
+
+    assert_eq!(
+        repository.read(instance.id).unwrap().unwrap().status,
+        WorkflowStatus::Paused
+    );
+    assert!(
+        repository
+            .activity(instance.id)
+            .expect("read activity")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

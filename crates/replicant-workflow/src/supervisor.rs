@@ -605,7 +605,11 @@ impl WorkflowSupervisor {
         Ok(())
     }
 
-    /// Durably requests a cooperative pause while retaining resource claims.
+    /// Durably pauses a workflow and immediately stops its in-process executor.
+    ///
+    /// The executor future is dropped after the paused state is persisted. Any
+    /// already-submitted managed operation remains durable, but the workflow
+    /// cannot issue another command until it is resumed.
     pub fn pause(&self, id: WorkflowId) -> Result<(), SupervisorError> {
         self.pause_instance(self.read(id)?)
     }
@@ -618,8 +622,12 @@ impl WorkflowSupervisor {
             "workflow pause requested"
         );
         self.transition(instance, WorkflowStatus::Paused)?;
-        if let Some(control) = self.executors().controls.get(&id) {
+        let executors = self.executors();
+        if let Some(control) = executors.controls.get(&id) {
             control.send_replace(ControlRequest::Pause);
+        }
+        if let Some(task) = executors.tasks.get(&id) {
+            task.abort();
         }
         Ok(())
     }
@@ -801,6 +809,12 @@ impl WorkflowSupervisor {
                 return Ok(());
             }
         };
+        // A control request can race with factory construction. Do not let an
+        // executor start after its durable row was paused or cancelled.
+        if *control.borrow() != ControlRequest::Continue {
+            self.clear_start(id)?;
+            return Ok(());
+        }
         tracing::info!(workflow_id = %id, kind = %kind, "workflow executor starting");
         if let Some(sink) = self.telemetry.as_ref() {
             sink.record(WorkflowTelemetrySample {
@@ -908,7 +922,10 @@ impl WorkflowSupervisor {
                 let instance = self.read(id)?;
                 if !matches!(
                     instance.status,
-                    WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                    WorkflowStatus::Paused
+                        | WorkflowStatus::Succeeded
+                        | WorkflowStatus::Failed
+                        | WorkflowStatus::Cancelled
                 ) {
                     let (_, control) = watch::channel(ControlRequest::Continue);
                     let mut context = WorkflowContext::new(
