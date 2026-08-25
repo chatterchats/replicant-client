@@ -54,7 +54,7 @@ const categoryTypes: Record<Exclude<DeviceCategory, "other">, string[]> = {
     "racing_vessel",
     "cargo_vessel",
     "empty_replicant_matrix",
-    "replicant_interface",
+    "replicant_matrix",
     "matrix_container",
   ],
   mining: ["ami_mining_controller", "mining_drone"],
