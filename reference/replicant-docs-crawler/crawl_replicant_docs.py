@@ -226,6 +226,11 @@ def detect_latest_release_version(
         for tag in soup.find_all(id=True)
         if tag.get("id") is not None
     )
+    release_text.extend(
+        f"v{tag.get('data-version')}"
+        for tag in soup.find_all(attrs={"data-version": True})
+        if tag.get("data-version") is not None
+    )
     versions = {
         tuple(int(part) for part in match.groups())
         for text in release_text

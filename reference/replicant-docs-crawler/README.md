@@ -5,9 +5,9 @@ Mirrors `https://replicant.space/docs/` and the changelog into a local Markdown 
 ## Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r reference/replicant-docs-crawler/requirements.txt
+python3 -m venv reference/replicant-docs-crawler/venv
+reference/replicant-docs-crawler/venv/bin/python -m pip install \
+  -r reference/replicant-docs-crawler/requirements.txt
 ```
 
 ## Run
@@ -26,16 +26,18 @@ reference/replicant-space-2-5-1/
 
 Older version directories are left untouched, so the repository keeps historical contract snapshots for regression work.
 
-To run the crawler directly:
+To run the crawler directly with its required modules:
 
 ```bash
-python3 reference/replicant-docs-crawler/crawl_replicant_docs.py --refresh
+reference/replicant-docs-crawler/venv/bin/python \
+  reference/replicant-docs-crawler/crawl_replicant_docs.py --refresh
 ```
 
 To force a particular versioned destination while still using the automatic reference layout:
 
 ```bash
-python3 reference/replicant-docs-crawler/crawl_replicant_docs.py \
+reference/replicant-docs-crawler/venv/bin/python \
+  reference/replicant-docs-crawler/crawl_replicant_docs.py \
   --version 2.5.1 \
   --refresh
 ```
@@ -43,7 +45,8 @@ python3 reference/replicant-docs-crawler/crawl_replicant_docs.py \
 To write to an exact custom directory instead of the versioned reference layout:
 
 ```bash
-python3 reference/replicant-docs-crawler/crawl_replicant_docs.py \
+reference/replicant-docs-crawler/venv/bin/python \
+  reference/replicant-docs-crawler/crawl_replicant_docs.py \
   --output /tmp/replicant-space-docs \
   --refresh
 ```
