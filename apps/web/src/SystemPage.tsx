@@ -37,6 +37,8 @@ export function SystemPage({
   const revision = useGalaxyRevision();
   const [scene, setScene] = useState<SystemSceneSnapshot>();
   const [error, setError] = useState<string>();
+  const [refreshError, setRefreshError] = useState<string>();
+  const [refreshing, setRefreshing] = useState(false);
   const [zoom, setZoom] = useState(0.55);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [showHabitableZone, setShowHabitableZone] = useState(true);
@@ -92,6 +94,21 @@ export function SystemPage({
     };
     setMenu(undefined);
   };
+  const refreshLocations = () => {
+    if (!system) return;
+    setRefreshing(true);
+    setRefreshError(undefined);
+    void daemonApi
+      .refreshLocations(system)
+      .catch((reason: unknown) => {
+        setRefreshError(
+          reason instanceof Error ? reason.message : "Location refresh failed",
+        );
+      })
+      .finally(() => {
+        setRefreshing(false);
+      });
+  };
 
   return (
     <article className="page system-page">
@@ -103,8 +120,14 @@ export function SystemPage({
             Managed locations, assets, travel, and workflows in one scene.
           </p>
         </div>
-        <button onClick={onOpenGalaxy}>Back to Galaxy</button>
+        <div>
+          <button disabled={!system || refreshing} onClick={refreshLocations}>
+            {refreshing ? "Refreshing locations…" : "Refresh system locations"}
+          </button>
+          <button onClick={onOpenGalaxy}>Back to Galaxy</button>
+        </div>
       </header>
+      {refreshError ? <p className="error-state">{refreshError}</p> : null}
       {!system ? (
         <p className="empty-state">Select a system in Galaxy first.</p>
       ) : error ? (

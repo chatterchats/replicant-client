@@ -94,6 +94,7 @@ export function GalaxyPage({
   });
   const [scene, setScene] = useState<GalaxySceneSnapshot>();
   const [error, setError] = useState<string>();
+  const [refreshing, setRefreshing] = useState(false);
   const [settings, setSettings] = useState(loadSettings);
   const [jumpRegion, setJumpRegion] = useState("");
   const [menu, setMenu] = useState<{
@@ -225,6 +226,20 @@ export function GalaxyPage({
           targetMatrices.has(device.linked_device),
       )
     : [];
+  const refreshLocations = () => {
+    setRefreshing(true);
+    setError(undefined);
+    void daemonApi
+      .refreshLocations()
+      .catch((reason: unknown) => {
+        setError(
+          reason instanceof Error ? reason.message : "Location refresh failed",
+        );
+      })
+      .finally(() => {
+        setRefreshing(false);
+      });
+  };
 
   return (
     <article className="galaxy-map">
@@ -309,6 +324,9 @@ export function GalaxyPage({
             <option value="undiscovered">Undiscovered</option>
           </select>
         </label>
+        <button disabled={refreshing} onClick={refreshLocations}>
+          {refreshing ? "Refreshing locations…" : "Refresh all locations"}
+        </button>
         <details className="galaxy-layers">
           <summary>Layers</summary>
           {(

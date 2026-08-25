@@ -4654,6 +4654,10 @@ async fn prepare_carrier_supply(
         .filter(|index| !plan.stops[*index].completed)
         .collect::<Vec<_>>();
     wait_for_trip_relays(client, config, plan, &pending_initial).await?;
+    // Ownership and stow commands require the deployment Replicant to be in
+    // comms range of the hub stock. Carrier-supplied missions must rendezvous
+    // at the hub before preparing their initial load, just like hub-return missions.
+    travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
     transfer_trip_relays(client, config, plan, &pending_initial).await?;
     stow_trip_relays(client, config, plan, &pending_initial).await?;
 
@@ -6561,6 +6565,56 @@ mod tests {
             "cached access must not issue a second GET"
         );
         server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn carrier_supply_rendezvouses_at_hub_before_preparing_initial_load() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/REP-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": "REP-1",
+                "location": "ROOT-1-L4",
+                "hosted_device_code": "VESSEL-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "RELAY-1",
+                "device_type": FTL_RELAY,
+                "replicant_code": "REP-1",
+                "stowed_in_device_code": "VESSEL-1",
+                "status": "inactive"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        client.devices().get("RELAY-1").await.expect("seed relay");
+
+        let mut plan = execution_state();
+        plan.stops[0].relay_code = Some("RELAY-1".to_owned());
+        plan.print_jobs[0].relay_code = Some("RELAY-1".to_owned());
+        plan.supply = Some(RelaySupplyPlan {
+            strategy: SupplyStrategy::Staged,
+            initial_relay_stop_indices: vec![0],
+            restocks: Vec::new(),
+            carriers: Vec::new(),
+        });
+        let mut config = test_config();
+        config.plan_path =
+            env::temp_dir().join(format!("relay-rendezvous-{}.json", uuid::Uuid::new_v4()));
+
+        prepare_carrier_supply(&client, &config, &mut plan)
+            .await
+            .expect("prepare initial carrier-supplied load");
+
+        server.verify().await;
+        let _ = fs::remove_file(&config.plan_path);
         client.close().await.expect("close client");
     }
 

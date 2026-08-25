@@ -63,6 +63,8 @@ export function daemonUrl(path: string, origin?: string): string {
 const REQUEST_TIMEOUT_MS = 30_000;
 /** Reports may intentionally refresh a bounded set of upstream systems. */
 const REPORT_TIMEOUT_MS = 110_000;
+/** A serial full-system traversal can legitimately exceed report generation. */
+const LOCATION_REFRESH_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Shared secret for talking to an authenticated daemon *directly*.
@@ -381,6 +383,14 @@ export const daemonApi = {
     return parseSystemSceneResponse(
       await get(`/api/system-scene/${encodeURIComponent(system)}`, signal),
     ).payload;
+  },
+  async refreshLocations(system?: string) {
+    const suffix = system === undefined ? "" : `/${encodeURIComponent(system)}`;
+    await post(
+      `/api/locations/refresh${suffix}`,
+      undefined,
+      LOCATION_REFRESH_TIMEOUT_MS,
+    );
   },
   async descriptors(signal?: AbortSignal) {
     return parseDescriptorsResponse(await get("/api/descriptors", signal))

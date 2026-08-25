@@ -1371,7 +1371,7 @@ impl LocationHydration {
     }
 }
 
-fn object_designation(value: &raw::JsonObject) -> Option<String> {
+pub(super) fn object_designation(value: &raw::JsonObject) -> Option<String> {
     ["designation", "location", "code"]
         .into_iter()
         .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))

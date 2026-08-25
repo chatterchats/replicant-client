@@ -1,7 +1,7 @@
 //! Dependency-aware managed synchronization and safe device reconciliation.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -778,19 +778,27 @@ impl SyncClient {
     }
 
     async fn sync_locations(&self) -> std::result::Result<SyncOutcome, SyncDomainError> {
-        let mut designations = BTreeSet::new();
+        let mut queue = BTreeSet::new();
+        for location in self.client.managed_state().locations() {
+            queue.insert(location.value.key.id.as_str().to_owned());
+        }
         for device in self.client.managed_state().devices() {
             if let Some(location) = device.value.location {
-                designations.insert(location.id.as_str().to_owned());
+                queue.insert(location.id.as_str().to_owned());
             }
         }
         for replicant in self.client.managed_state().replicants() {
             if let Some(location) = replicant.value.location {
-                designations.insert(location.id.as_str().to_owned());
+                queue.insert(location.id.as_str().to_owned());
             }
         }
+        let mut queue = queue.into_iter().collect::<VecDeque<_>>();
+        let mut seen = BTreeSet::new();
         let mut completed = 0;
-        for (index, designation) in designations.iter().enumerate() {
+        while let Some(designation) = queue.pop_front() {
+            if !seen.insert(designation.clone()) {
+                continue;
+            }
             if self.cancellation.is_cancelled() {
                 return Err(SyncDomainError {
                     outcome: SyncOutcome {
@@ -810,8 +818,8 @@ impl SyncClient {
                 target: "replicant_client::sync",
                 event = "sync.location_started",
                 designation = %designation,
-                index = index + 1,
-                total = designations.len(),
+                queue_remaining = queue.len(),
+                visited = seen.len(),
                 "synchronizing location"
             );
             let request_started = Instant::now();
@@ -819,7 +827,7 @@ impl SyncClient {
                 .client
                 .managed_raw()
                 .locations()
-                .get(designation, None)
+                .get(&designation, None)
                 .await
             {
                 Ok(response) => response,
@@ -828,8 +836,6 @@ impl SyncClient {
                         target: "replicant_client::sync",
                         event = "sync.location_unobservable",
                         designation = %designation,
-                        index = index + 1,
-                        total = designations.len(),
                         "skipping location detail that currently requires a replicant in-system"
                     );
                     continue;
@@ -848,6 +854,11 @@ impl SyncClient {
                 }
             };
             let request_elapsed = request_started.elapsed();
+            for child in Self::refresh_child_designations(&response.value) {
+                if !seen.contains(&child) {
+                    queue.push_back(child);
+                }
+            }
             let normalize_started = Instant::now();
             let observation = domain::location_detail(&response.value, Realm::Live, observed_at())
                 .map_err(|_| SyncDomainError {
@@ -884,8 +895,8 @@ impl SyncClient {
                 target: "replicant_client::sync",
                 event = "sync.location_completed",
                 designation = %designation,
-                index = completed,
-                total = designations.len(),
+                committed = completed,
+                queue_remaining = queue.len(),
                 request_ms = request_elapsed.as_millis() as u64,
                 normalize_ms = normalize_elapsed.as_millis() as u64,
                 persist_ms = persist_started.elapsed().as_millis() as u64,
@@ -894,12 +905,41 @@ impl SyncClient {
             );
         }
         Ok(SyncOutcome {
-            pages: usize::from(!designations.is_empty()),
+            pages: usize::from(!seen.is_empty()),
             items: completed,
             revisions: completed,
             complete: true,
             reconciliation_queued: false,
         })
+    }
+
+    fn refresh_child_designations(location: &raw::locations::Location) -> Vec<String> {
+        let planets_complete = matches!(
+            (location.planets_scanned, location.planets_total),
+            (Some(scanned), Some(total)) if scanned == total
+        );
+        let moons_known = location.moons_total_estimated == Some(false)
+            && location.moons_total.is_some_and(|count| count > 0);
+        let mut children = BTreeSet::new();
+        if planets_complete {
+            children.extend(
+                location
+                    .planets
+                    .iter()
+                    .flatten()
+                    .filter_map(super::operation::object_designation),
+            );
+        }
+        if moons_known {
+            children.extend(
+                location
+                    .moons
+                    .iter()
+                    .flatten()
+                    .filter_map(super::operation::object_designation),
+            );
+        }
+        children.into_iter().collect()
     }
 
     async fn sync_inventory(&self) -> std::result::Result<SyncOutcome, SyncDomainError> {
@@ -1071,6 +1111,106 @@ mod tests {
             }),
         };
         assert!(!location_is_temporarily_unobservable(&other_forbidden));
+    }
+
+    #[tokio::test]
+    async fn location_sync_refreshes_complete_planets_and_exact_known_moons() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/v1/locations/SYS-A",
+                serde_json::json!({
+                    "location": "SYS-A",
+                    "location_type": "star",
+                    "planets_total": 2,
+                    "planets_scanned": 2,
+                    "planets": [
+                        {"designation": "SYS-A-1"},
+                        {"designation": "SYS-A-2"}
+                    ]
+                }),
+            ),
+            (
+                "/v1/locations/SYS-B",
+                serde_json::json!({
+                    "location": "SYS-B",
+                    "location_type": "star",
+                    "planets_total": 2,
+                    "planets_scanned": 1,
+                    "planets": [{"designation": "SYS-B-1"}]
+                }),
+            ),
+            (
+                "/v1/locations/SYS-A-1",
+                serde_json::json!({
+                    "location": "SYS-A-1",
+                    "location_type": "planet",
+                    "moons_total": 1,
+                    "moons_total_estimated": false,
+                    "moons": [{"designation": "SYS-A-1-1"}]
+                }),
+            ),
+            (
+                "/v1/locations/SYS-A-2",
+                serde_json::json!({
+                    "location": "SYS-A-2",
+                    "location_type": "planet",
+                    "moons_total": 1,
+                    "moons_total_estimated": true,
+                    "moons": [{"designation": "SYS-A-2-1"}]
+                }),
+            ),
+            (
+                "/v1/locations/SYS-A-1-1",
+                serde_json::json!({
+                    "location": "SYS-A-1-1",
+                    "location_type": "moon"
+                }),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = client_at(&server.uri()).await;
+        for designation in ["SYS-A", "SYS-B"] {
+            let raw = raw::locations::Location {
+                location: Some(designation.to_owned()),
+                location_type: Some("star".to_owned()),
+                ..Default::default()
+            };
+            let observation = domain::location_detail(&raw, Realm::Live, observed_at())
+                .expect("seed location observation");
+            client
+                .managed_state()
+                .persist_location(observation)
+                .expect("persist seed location");
+        }
+
+        let report = client
+            .sync()
+            .domain(SyncDomain::Locations)
+            .await
+            .expect("location sync report");
+
+        assert_eq!(report.completed, vec![SyncDomain::Locations]);
+        assert_eq!(report.diagnostics[0].items, 5);
+        assert!(
+            client
+                .locations()
+                .cached("SYS-A-1-1")
+                .is_some_and(|location| location
+                    .location_type
+                    .as_ref()
+                    .is_some_and(|kind| kind.as_str() == "moon"))
+        );
+        assert!(client.locations().cached("SYS-B-1").is_none());
+        assert!(client.locations().cached("SYS-A-2-1").is_none());
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[test]

@@ -67,7 +67,20 @@ const snapshot: RuntimeSnapshot = {
   notifications: [],
   slice_revisions: {},
 };
-const entities: EntityIndexSnapshot = { metadata, entities: [] };
+const entities: EntityIndexSnapshot = {
+  metadata,
+  entities: [
+    {
+      entity: { kind: "replicant", id: "R1" },
+      label: "R1",
+      secondary_label: null,
+      system: "SYS-A",
+      location: "SYS-A",
+      entity_type: "replicant",
+      status: "active",
+    },
+  ],
+};
 const descriptors: DescriptorCatalog = {
   reports: [],
   actions: [],
@@ -235,6 +248,10 @@ function systemScene(system: string): SystemSceneSnapshot {
   };
 }
 
+const mockRefreshLocations = vi.hoisted(() =>
+  vi.fn<(system?: string) => Promise<void>>(() => Promise.resolve()),
+);
+
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
   return {
@@ -269,6 +286,7 @@ vi.mock("./api", async (importOriginal) => {
       settings: () => Promise.resolve(settings),
       galaxyScene: () => Promise.resolve(galaxyScene),
       systemScene: (system: string) => Promise.resolve(systemScene(system)),
+      refreshLocations: mockRefreshLocations,
       history: () => Promise.resolve([]),
       director: () => Promise.resolve(director),
       reconcileDirector: () => Promise.resolve(director),
@@ -385,6 +403,77 @@ describe("App navigation", () => {
       ).toBeTruthy();
       expect(container.textContent).not.toContain(placeholderLede);
     }
+  });
+
+  it("runs full, targeted, and palette location refreshes", async () => {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <DaemonProvider>
+          <App />
+        </DaemonProvider>,
+      );
+      await flush();
+      await flush();
+    });
+
+    const navigate = async (destination: string) => {
+      const button = Array.from(
+        container.querySelectorAll<HTMLButtonElement>(".sidebar button"),
+      ).find((candidate) => candidate.textContent === destination);
+      await act(async () => {
+        button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await flush();
+        await flush();
+      });
+    };
+    const buttonNamed = (name: string) =>
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+        (button) => button.textContent === name,
+      );
+
+    await navigate("Galaxy");
+    await act(async () => {
+      buttonNamed("Refresh all locations")?.click();
+      await flush();
+    });
+    expect(mockRefreshLocations).toHaveBeenLastCalledWith();
+
+    await navigate("System");
+    await act(async () => {
+      buttonNamed("Refresh system locations")?.click();
+      await flush();
+    });
+    expect(mockRefreshLocations).toHaveBeenLastCalledWith("SYS-A");
+
+    await act(async () => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "k", ctrlKey: true }),
+      );
+      await flush();
+    });
+    await act(async () => {
+      Array.from(
+        container.querySelectorAll<HTMLButtonElement>(
+          ".palette-results button",
+        ),
+      )
+        .find((button) =>
+          button.textContent.includes("Refresh system locations"),
+        )
+        ?.click();
+      await flush();
+    });
+    const form = container.querySelector<HTMLFormElement>(".palette-form");
+    const input = form?.querySelector<HTMLInputElement>("input");
+    expect(input?.value).toBe("SYS-A");
+    await act(async () => {
+      form?.dispatchEvent(
+        new SubmitEvent("submit", { bubbles: true, cancelable: true }),
+      );
+      await flush();
+    });
+    expect(mockRefreshLocations).toHaveBeenLastCalledWith("SYS-A");
   });
 });
 

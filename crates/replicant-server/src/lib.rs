@@ -30,7 +30,7 @@ use futures_util::StreamExt;
 use replicant_client::{
     ClientDegradation, ClientStatus, Error as ClientError,
     domain::{AccessScope, Device, Inventory, InventoryOwner, Realm},
-    managed::{Client, OperationStatus as ManagedOperationStatus},
+    managed::{Client, OperationStatus as ManagedOperationStatus, SyncDomain},
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
         bobnet::DeviceChannelsResponse,
@@ -559,6 +559,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/entities/{kind}/{id}", get(entity_inspector))
         .route("/api/galaxy-scene", get(galaxy_scene))
         .route("/api/system-scene/{system}", get(system_scene))
+        .route("/api/locations/refresh", post(refresh_locations))
+        .route(
+            "/api/locations/refresh/{system}",
+            post(refresh_system_locations),
+        )
         .route("/ws", get(websocket))
         .route("/api/descriptors", get(descriptors))
         .route("/api/reports/{kind}", post(run_report))
@@ -4798,6 +4803,59 @@ async fn system_scene(
     Ok(Json(Versioned::current(scene)))
 }
 
+async fn refresh_locations(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    tracing::info!("full managed location refresh requested");
+    let report = state
+        .client()
+        .sync()
+        .domain(SyncDomain::Locations)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "full managed location refresh failed");
+            ApiError::unavailable()
+        })?;
+    state.invalidate(DomainSlice::Universe);
+    state.flush_invalidations();
+    if !report.completed.contains(&SyncDomain::Locations) {
+        tracing::warn!("full managed location refresh completed with failures");
+        return Err(ApiError::unavailable());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn refresh_system_locations(
+    State(state): State<Arc<AppState>>,
+    Path(system): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if system.trim().is_empty() {
+        return Err(ApiError::invalid("system designation is required"));
+    }
+    tracing::info!(system, "targeted system location refresh requested");
+    let report = state
+        .client()
+        .locations()
+        .hydrate_system(&system)
+        .planetary_bodies_only()
+        .run()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, system, "targeted system location refresh failed");
+            ApiError::unavailable()
+        })?;
+    state.invalidate(DomainSlice::Universe);
+    state.flush_invalidations();
+    if report.maximum_reached() || !report.failures().is_empty() {
+        tracing::warn!(
+            system,
+            failures = report.failures().len(),
+            maximum_reached = report.maximum_reached(),
+            "targeted system location refresh was incomplete"
+        );
+        return Err(ApiError::unavailable());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn descriptors(State(state): State<Arc<AppState>>) -> Json<Versioned<DescriptorCatalog>> {
     Json(Versioned::current(state.catalogue.descriptors().clone()))
 }
@@ -6656,6 +6714,67 @@ mod tests {
         )
         .expect("app state");
         (router(state), client)
+    }
+
+    #[tokio::test]
+    async fn location_refresh_routes_run_full_and_targeted_traversals() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/SYS-A"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "SYS-A",
+                "location_type": "star",
+                "planets_total": 0,
+                "planets_scanned": 0,
+                "planets": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/SYS-B"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "SYS-B",
+                "location_type": "star",
+                "planets": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        client
+            .locations()
+            .get("SYS-A")
+            .await
+            .expect("seed known system");
+
+        let full = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/locations/refresh")
+                    .body(Body::empty())
+                    .expect("full refresh request"),
+            )
+            .await
+            .expect("full refresh response");
+        let targeted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/locations/refresh/SYS-B")
+                    .body(Body::empty())
+                    .expect("targeted refresh request"),
+            )
+            .await
+            .expect("targeted refresh response");
+
+        assert_eq!(full.status(), StatusCode::NO_CONTENT);
+        assert_eq!(targeted.status(), StatusCode::NO_CONTENT);
+        assert!(client.locations().cached("SYS-B").is_some());
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[tokio::test]

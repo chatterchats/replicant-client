@@ -25,6 +25,38 @@ export interface DescriptorCommand {
   initialParameters?: Record<string, unknown>;
 }
 
+const refreshSystemCommand: DescriptorCommand = {
+  operationClass: "report",
+  descriptor: {
+    kind: "locations.refresh_system",
+    display_name: "Refresh system locations",
+    aliases: ["reload system", "refresh planets", "refresh moons"],
+    description:
+      "Refresh a known system and every planet and moon exposed by its location data.",
+    category: "galaxy",
+    operation_class: "report",
+    applicable_to: ["system"],
+    risk: "none",
+    parameters: [
+      {
+        name: "system",
+        label: "System",
+        description: "System designation to refresh",
+        kind: { type: "system" },
+        required: true,
+        default: null,
+        options: [],
+        validation: {
+          minimum: null,
+          maximum: null,
+          min_length: 1,
+          max_length: null,
+        },
+      },
+    ],
+  },
+};
+
 export function requiresTypedConfirmation(command: DescriptorCommand) {
   const kind = command.descriptor.kind;
   return (
@@ -189,10 +221,24 @@ export function CommandPalette({
       controller.abort();
     };
   }, []);
-  const descriptorMatches = useMemo(
-    () => searchDescriptors(catalog, query),
-    [catalog, query],
-  );
+  const descriptorMatches = useMemo(() => {
+    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const refreshHaystack = [
+      refreshSystemCommand.descriptor.display_name,
+      refreshSystemCommand.descriptor.kind,
+      ...refreshSystemCommand.descriptor.aliases,
+      refreshSystemCommand.descriptor.category,
+      "system planet moon location",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return [
+      ...(terms.every((term) => refreshHaystack.includes(term))
+        ? [refreshSystemCommand]
+        : []),
+      ...searchDescriptors(catalog, query),
+    ];
+  }, [catalog, query]);
   const pageMatches = navigation.filter((page) =>
     page.toLowerCase().includes(query.trim().toLowerCase()),
   );
@@ -216,7 +262,14 @@ export function CommandPalette({
       ),
     );
     try {
-      if (selected.operationClass === "workflow") {
+      if (selected.descriptor.kind === "locations.refresh_system") {
+        const system = parameters.system;
+        if (typeof system !== "string" || system.trim() === "") {
+          throw new Error("System designation is required");
+        }
+        await daemonApi.refreshLocations(system);
+        onClose();
+      } else if (selected.operationClass === "workflow") {
         onWorkflowStarted(
           await daemonApi.startWorkflow(selected.descriptor.kind, parameters),
         );
