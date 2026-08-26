@@ -15,8 +15,8 @@ pub use model::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
     ResourceKey, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
-    WaitIntent, WaitOutcome, WaitSignal, WorkflowActivity, WorkflowId, WorkflowInstance,
-    WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
+    WaitIntent, WaitOutcome, WaitSignal, WorkflowActivity, WorkflowFailureDisposition, WorkflowId,
+    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowMigration, WorkflowRegistry};
 pub use repository::{RepositoryError, WorkflowRepository};

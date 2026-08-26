@@ -27,7 +27,10 @@ use serde_json::{Map, Value};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 
-use crate::failure::{FailureClass, classified_error};
+use crate::failure::{
+    FailureClass, classified_error, device_fetch_is_missing, device_operation_is_missing,
+    permanent_classified_error,
+};
 
 use super::{
     AnyResult, ClaimedDevice, Config, EVENT_MISSION_TAG_PREFIX, EventMissionPlan, MissionPhase,
@@ -186,7 +189,7 @@ pub(crate) async fn prepare_campaign_resource_stage(
     for code in cargo_codes(plan) {
         claim_device(client, config, plan, &code, "cargo").await?;
         ensure_device_at(client, config, &code, &plan.home_location).await?;
-        let detail = client.raw().devices().get(&code).await?.value;
+        let detail = fetch_raw_device(client, &code).await?;
         ensure_uncontrolled_cargo(&detail, &code)?;
         if !cargo_map(&detail).is_empty() {
             deposit_all(client, config, &code).await?;
@@ -884,7 +887,7 @@ async fn nonlocal_asset_violations(
             continue;
         }
         if device.attach_used > 0 {
-            let detail = client.raw().devices().get(&transport.code).await?.value;
+            let detail = fetch_raw_device(client, &transport.code).await?;
             let mission_payload = plan
                 .execution
                 .payload_devices
@@ -1327,7 +1330,7 @@ async fn reconcile_print_batches(
 }
 
 async fn factory_job_tags(client: &Client, factory_code: &str) -> AnyResult<Vec<BTreeSet<String>>> {
-    let detail = client.raw().devices().get(factory_code).await?.value;
+    let detail = fetch_raw_device(client, factory_code).await?;
     let mut jobs = Vec::new();
     if let Some(printing) = detail.printing {
         jobs.push(printing.tags.into_iter().collect());
@@ -2200,7 +2203,7 @@ async fn claim_device(
             ),
         ));
     }
-    let detail = client.raw().devices().get(code).await?.value;
+    let detail = fetch_raw_device(client, code).await?;
     if role == "cargo" && detail.controller_device_code.is_some() {
         return Err(app_error(
             io::ErrorKind::InvalidData,
@@ -2341,7 +2344,7 @@ async fn prepare_resource_cargo(
 ) -> AnyResult<()> {
     for code in cargo_codes(plan) {
         ensure_device_at(client, config, &code, &plan.home_location).await?;
-        let detail = client.raw().devices().get(&code).await?.value;
+        let detail = fetch_raw_device(client, &code).await?;
         ensure_uncontrolled_cargo(&detail, &code)?;
         if !cargo_map(&detail).is_empty() {
             deposit_all(client, config, &code).await?;
@@ -2360,7 +2363,7 @@ async fn prepare_device_fleet(
 
     for code in carrier_codes(plan) {
         ensure_device_at(client, config, &code, &plan.home_location).await?;
-        let detail = client.raw().devices().get(&code).await?.value;
+        let detail = fetch_raw_device(client, &code).await?;
         let attached = detail
             .attached_devices
             .iter()
@@ -2400,7 +2403,7 @@ async fn prepare_home_payload_for_attachment(
         if payload.delivered {
             continue;
         }
-        let detail = client.raw().devices().get(&payload.code).await?.value;
+        let detail = fetch_raw_device(client, &payload.code).await?;
         if detail.location.as_deref() == Some(plan.home_location.as_str())
             && detail.attached_to_device_code.is_none()
         {
@@ -2418,7 +2421,7 @@ async fn gather_remote_payload(
     let carriers = carrier_codes(plan);
     for index in 0..plan.execution.payload_devices.len() {
         let code = plan.execution.payload_devices[index].code.clone();
-        let detail = client.raw().devices().get(&code).await?.value;
+        let detail = fetch_raw_device(client, &code).await?;
         if let Some(carrier) = detail.attached_to_device_code.clone() {
             if !carriers.contains(&carrier) {
                 return Err(app_error(
@@ -2462,7 +2465,7 @@ async fn gather_remote_payload(
 }
 
 async fn ensure_free_standing(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
-    let detail = client.raw().devices().get(code).await?.value;
+    let detail = fetch_raw_device(client, code).await?;
     if let Some(attached_to) = detail.attached_to_device_code {
         return Err(app_error(
             io::ErrorKind::InvalidData,
@@ -2520,7 +2523,7 @@ fn command_available(detail: &raw::devices::DeviceStatus, expected: &str) -> boo
 
 async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) -> AnyResult<()> {
     ensure_free_standing(client, config, code).await?;
-    let mut detail = client.raw().devices().get(code).await?.value;
+    let mut detail = fetch_raw_device(client, code).await?;
     if !is_modular_device(&detail) || status_is(&detail, "compacted") {
         return Ok(());
     }
@@ -2538,7 +2541,7 @@ async fn ensure_attachable_device(client: &Client, config: &Config, code: &str) 
             !status_is(device, "unfurling")
         })
         .await?;
-        detail = client.raw().devices().get(code).await?.value;
+        detail = fetch_raw_device(client, code).await?;
         if status_is(&detail, "compacted") {
             return Ok(());
         }
@@ -2634,12 +2637,8 @@ async fn stage_event_devices(
             plan.selected_criterion.beacon.action,
             BeaconAction::TransportExisting | BeaconAction::PrintAndTransport
         ) {
-        client
-            .raw()
-            .devices()
-            .get(beacon_code)
+        fetch_raw_device(client, beacon_code)
             .await?
-            .value
             .location
             .as_deref()
             != Some(plan.event.location.as_str())
@@ -2806,7 +2805,7 @@ async fn install_beacon(
         .device_code
         .clone()
         .ok_or_else(|| app_error(io::ErrorKind::NotFound, "beacon device code is missing"))?;
-    let mut detail = client.raw().devices().get(&code).await?.value;
+    let mut detail = fetch_raw_device(client, &code).await?;
     if detail.location.as_deref() != Some(plan.event.location.as_str()) {
         let carriers = carrier_codes(plan);
         if let Some(carrier) = detail.attached_to_device_code.clone() {
@@ -2837,7 +2836,7 @@ async fn install_beacon(
             ensure_device_at(client, config, &carrier, &plan.event.location).await?;
             detach_devices(client, config, &carrier, std::slice::from_ref(&code)).await?;
         }
-        detail = client.raw().devices().get(&code).await?.value;
+        detail = fetch_raw_device(client, &code).await?;
     }
 
     if detail.location.as_deref() != Some(plan.event.location.as_str()) {
@@ -2851,7 +2850,7 @@ async fn install_beacon(
     }
     if detail.attached_to_device_code.is_some() || detail.stowed_in_device_code.is_some() {
         ensure_free_standing(client, config, &code).await?;
-        detail = client.raw().devices().get(&code).await?.value;
+        detail = fetch_raw_device(client, &code).await?;
     }
     let deployed = detail.status.as_deref().is_some_and(|status| {
         matches!(
@@ -3199,7 +3198,7 @@ async fn recover_rewards(
 
         let mut capacities = Vec::with_capacity(cargo.len());
         for code in &cargo {
-            let detail = client.raw().devices().get(code).await?.value;
+            let detail = fetch_raw_device(client, code).await?;
             ensure_uncontrolled_cargo(&detail, code)?;
             if !cargo_map(&detail).is_empty() {
                 return Err(app_error(
@@ -3358,7 +3357,7 @@ async fn checkpoint_and_deposit_rewards(
         if plan.execution.reward_pending_deposits.contains_key(code) {
             continue;
         }
-        let detail = client.raw().devices().get(code).await?.value;
+        let detail = fetch_raw_device(client, code).await?;
         let manifest = resources_available_from(&remaining, &cargo_map(&detail));
         if manifest.is_empty() {
             continue;
@@ -3379,12 +3378,12 @@ async fn reconcile_pending_reward_deposits(
 ) -> AnyResult<()> {
     let pending = plan.execution.reward_pending_deposits.clone();
     for (code, manifest) in pending {
-        let mut detail = client.raw().devices().get(&code).await?.value;
+        let mut detail = fetch_raw_device(client, &code).await?;
         if !cargo_map(&detail).is_empty()
             && detail.location.as_deref() != Some(plan.home_location.as_str())
         {
             ensure_device_at(client, config, &code, &plan.home_location).await?;
-            detail = client.raw().devices().get(&code).await?.value;
+            detail = fetch_raw_device(client, &code).await?;
         }
         if !cargo_map(&detail).is_empty() {
             deposit_all(client, config, &code).await?;
@@ -3413,7 +3412,7 @@ async fn settle_reward_transport(
     plan: &EventMissionPlan,
     code: &str,
 ) -> AnyResult<()> {
-    let detail = client.raw().devices().get(code).await?.value;
+    let detail = fetch_raw_device(client, code).await?;
     ensure_uncontrolled_cargo(&detail, code)?;
     if detail.travel.is_none() {
         return Ok(());
@@ -3484,7 +3483,7 @@ async fn return_mission_assets_internal(
 ) -> AnyResult<()> {
     let cargo = cargo_codes(plan);
     for code in &cargo {
-        let detail = client.raw().devices().get(code).await?.value;
+        let detail = fetch_raw_device(client, code).await?;
         ensure_uncontrolled_cargo(&detail, code)?;
     }
 
@@ -3496,7 +3495,7 @@ async fn return_mission_assets_internal(
         .collect::<BTreeSet<_>>();
     let carriers = carrier_codes(plan);
     for code in &carriers {
-        let detail = client.raw().devices().get(code).await?.value;
+        let detail = fetch_raw_device(client, code).await?;
         if !detail.attached_devices.is_empty() {
             let attached = detail
                 .attached_devices
@@ -3539,7 +3538,7 @@ async fn recover_failed_beacon(
     let Some(code) = plan.selected_criterion.beacon.device_code.clone() else {
         return Ok(());
     };
-    let detail = client.raw().devices().get(&code).await?.value;
+    let detail = fetch_raw_device(client, &code).await?;
     let deployed = detail.status.as_deref().is_some_and(|status| {
         matches!(
             status.to_ascii_lowercase().as_str(),
@@ -4181,7 +4180,7 @@ async fn collect_resources(
     if resources.is_empty() {
         return Ok(());
     }
-    let before = cargo_map(&client.raw().devices().get(code).await?.value);
+    let before = cargo_map(&fetch_raw_device(client, code).await?);
     // Mission cargo is already tracked by the managed projection.
     let handle = match client.devices().cached(code) {
         Some(handle) => handle,
@@ -4217,7 +4216,7 @@ async fn deposit_resources(
     code: &str,
     resources: Option<&ResourceMap>,
 ) -> AnyResult<()> {
-    let before = cargo_map(&client.raw().devices().get(code).await?.value);
+    let before = cargo_map(&fetch_raw_device(client, code).await?);
     if before.is_empty() {
         return Ok(());
     }
@@ -4384,7 +4383,7 @@ async fn wait_for_raw_device(
     let mut watch = client.events().watch().await?;
     let deadline = Instant::now() + config.wait_timeout;
     loop {
-        let detail = client.raw().devices().get(code).await?.value;
+        let detail = fetch_raw_device(client, code).await?;
         if predicate(&detail) {
             return Ok(());
         }
@@ -4596,6 +4595,18 @@ fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
     }
 }
 
+async fn fetch_raw_device(client: &Client, code: &str) -> AnyResult<raw::devices::DeviceStatus> {
+    match client.raw().devices().get(code).await {
+        Ok(response) => Ok(response.value),
+        Err(error) if device_fetch_is_missing(&error) => Err(permanent_classified_error(
+            FailureClass::DeviceTargetMissing,
+            io::ErrorKind::NotFound,
+            format!("device {code} no longer exists"),
+        )),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
 /// Verifies the immediate durable classification of a submitted command.
 ///
 /// Managed mutation construction has already completed the one durable HTTP
@@ -4608,6 +4619,16 @@ fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
 /// is what actually establishes ordering.
 async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
     let outcome = operation.outcome().await?;
+    if device_operation_is_missing(&outcome) {
+        return Err(permanent_classified_error(
+            FailureClass::DeviceTargetMissing,
+            io::ErrorKind::NotFound,
+            format!(
+                "operation {} targeted a missing device",
+                operation.id().as_str()
+            ),
+        ));
+    }
     if matches!(
         outcome.status,
         OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed

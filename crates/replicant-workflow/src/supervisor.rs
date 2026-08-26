@@ -385,6 +385,32 @@ impl WorkflowContext {
         Ok(())
     }
 
+    /// Marks this invocation as permanently failed and releases its claims.
+    ///
+    /// Directors must not launch equivalent work until its identity changes.
+    pub fn mark_failed_permanently(
+        &mut self,
+        error: impl Into<String>,
+    ) -> Result<(), RepositoryError> {
+        let error = error.into();
+        let checkpoint = self.checkpoint_value()?;
+        let result = self.result_value()?;
+        self.instance = self.repository.update_with_failure_disposition(
+            self.instance.id,
+            self.instance.revision,
+            WorkflowState {
+                status: WorkflowStatus::Failed,
+                current_step: self.instance.current_step.clone(),
+                checkpoint,
+                last_error: Some(error),
+                result,
+            },
+            crate::WorkflowFailureDisposition::Permanent,
+        )?;
+        self.release_all_claims()?;
+        Ok(())
+    }
+
     /// Refreshes state and reports a cooperative pause or cancel request.
     pub fn control_request(&mut self) -> Result<ControlRequest, RepositoryError> {
         self.instance = self

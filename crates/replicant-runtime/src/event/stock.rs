@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::automation::{EventCampaignCheckpoint, EventDeliveryCheckpoint, EventTourCheckpoint};
+use crate::failure::device_operation_is_missing;
 use replicant_client::{Client, OperationStatus, Star, raw};
 use replicant_event_planner::{MAX_TAG_CHARACTERS, mission_tag};
 use replicant_workflow::WorkflowRepository;
@@ -427,21 +428,8 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
-fn response_is_device_missing(response: Option<&serde_json::Value>) -> bool {
-    response.is_some_and(|response| {
-        response.get("status").and_then(serde_json::Value::as_i64) == Some(404)
-            || response
-                .get("server")
-                .and_then(|server| server.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|error| error.eq_ignore_ascii_case("Device not found"))
-    })
-}
-
 async fn operation_device_missing(operation: &replicant_client::Operation) -> AnyResult<bool> {
-    let outcome = operation.outcome().await?;
-    Ok(outcome.status == OperationStatus::Rejected
-        && response_is_device_missing(outcome.response.as_ref()))
+    Ok(device_operation_is_missing(&operation.outcome().await?))
 }
 
 async fn ensure_operation_accepted(operation: &replicant_client::Operation) -> AnyResult<()> {
@@ -487,19 +475,5 @@ mod tests {
         assert_eq!(event_stock_tag(region), event_stock_tag(region));
         assert!(event_stock_tag(region).len() <= MAX_TAG_CHARACTERS);
         assert_eq!(event_stock_tag("Beta"), "evt-stock:beta");
-    }
-
-    #[test]
-    fn rejected_missing_device_is_a_stale_cleanup_target() {
-        let response = serde_json::json!({
-            "message": "unexpected HTTP status 404: Device not found",
-            "server": {"error": "Device not found"},
-            "status": 404
-        });
-
-        assert!(response_is_device_missing(Some(&response)));
-        assert!(!response_is_device_missing(Some(
-            &serde_json::json!({"status": 400, "server": {"error": "Not your device"}})
-        )));
     }
 }

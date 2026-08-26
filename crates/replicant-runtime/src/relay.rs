@@ -44,7 +44,9 @@ use std::{
 
 use crate::{
     config::ManagedClientConfig,
-    failure::{FailureClass, classified_error},
+    failure::{
+        FailureClass, classified_error, device_operation_is_missing, permanent_classified_error,
+    },
     orchestration::REGION_GATEWAY_HUB_RANGE_LY,
     start_managed_client,
 };
@@ -5872,6 +5874,16 @@ async fn ensure_operation_accepted(operation: &Operation) -> AnyResult<()> {
     // relay workflow call site performs its own state-specific verification when
     // ordering actually depends on the mutation being visible.
     let outcome = operation.outcome().await?;
+    if device_operation_is_missing(&outcome) {
+        return Err(permanent_classified_error(
+            FailureClass::DeviceTargetMissing,
+            io::ErrorKind::NotFound,
+            format!(
+                "operation {} targeted a missing device",
+                operation.id().as_str()
+            ),
+        ));
+    }
     if matches!(
         outcome.status,
         OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed

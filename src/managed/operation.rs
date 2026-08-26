@@ -522,6 +522,28 @@ pub struct OperationOutcome {
     pub response: Option<Value>,
 }
 
+impl OperationOutcome {
+    /// Returns the structured HTTP status from a sanitized rejection response.
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        self.response
+            .as_ref()?
+            .get("status")?
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+    }
+
+    /// Returns the structured server error from a sanitized rejection response.
+    #[must_use]
+    pub fn server_error(&self) -> Option<&str> {
+        self.response
+            .as_ref()?
+            .get("server")?
+            .get("error")?
+            .as_str()
+    }
+}
+
 /// A durable handle to one managed mutation. Construction (`operation =
 /// device.activate().await?`) only ever fails for local/infra reasons;
 /// the remote classification is observed through [`Operation::status`],
@@ -4082,5 +4104,47 @@ mod tests {
         let replay: MutationAdapter = serde_json::from_value(intent).expect("typed replay");
         assert_eq!(replay.operation_id(), "device_dynamic_command");
         assert!(include_str!("operation.rs").contains("raw.devices().command"));
+    }
+    #[test]
+    fn operation_outcome_exposes_structured_rejection() {
+        let status_rejection = OperationOutcome {
+            status: OperationStatus::Rejected,
+            response: Some(serde_json::json!({
+                "status": 404,
+                "server": {"error": "Not your device"}
+            })),
+        };
+        assert_eq!(status_rejection.http_status(), Some(404));
+        assert_eq!(status_rejection.server_error(), Some("Not your device"));
+
+        let server_rejection = OperationOutcome {
+            status: OperationStatus::Rejected,
+            response: Some(serde_json::json!({
+                "status": 400,
+                "server": {"error": "Device not found"}
+            })),
+        };
+        assert_eq!(server_rejection.http_status(), Some(400));
+        assert_eq!(server_rejection.server_error(), Some("Device not found"));
+
+        let accepted_missing_payload = OperationOutcome {
+            status: OperationStatus::Accepted,
+            response: Some(serde_json::json!({
+                "status": 404,
+                "server": {"error": "Device not found"}
+            })),
+        };
+        assert_eq!(accepted_missing_payload.http_status(), Some(404));
+        assert_eq!(
+            accepted_missing_payload.server_error(),
+            Some("Device not found")
+        );
+
+        let prose_only = OperationOutcome {
+            status: OperationStatus::Rejected,
+            response: Some(serde_json::json!({"message": "Device not found"})),
+        };
+        assert_eq!(prose_only.http_status(), None);
+        assert_eq!(prose_only.server_error(), None);
     }
 }

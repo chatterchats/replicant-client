@@ -7,8 +7,9 @@ use std::sync::{
 
 use replicant_workflow::{
     AutomationPolicy, BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent,
-    WaitOutcome, WaitSignal, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
-    WorkflowKind, WorkflowRegistry, WorkflowRepository, WorkflowStatus, WorkflowSupervisor,
+    WaitOutcome, WaitSignal, WorkflowContext, WorkflowExecutor, WorkflowFactory,
+    WorkflowFailureDisposition, WorkflowId, WorkflowKind, WorkflowRegistry, WorkflowRepository,
+    WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -652,6 +653,129 @@ async fn records_executor_panics_as_failures() {
             .last_error
             .unwrap()
             .contains("task failed")
+    );
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct FailureConfig {
+    permanent: bool,
+}
+
+struct FailureFactory {
+    kind: WorkflowKind,
+}
+
+impl WorkflowFactory for FailureFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(FailureWorkflow))
+    }
+}
+
+struct FailureWorkflow;
+
+impl WorkflowExecutor for FailureWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let config: FailureConfig = context.config().map_err(|error| error.to_string())?;
+            context
+                .acquire_claim(ResourceKey::Namespaced {
+                    namespace: "failure-test".to_owned(),
+                    key: context.id().to_string(),
+                })
+                .map_err(|error| error.to_string())?;
+            if config.permanent {
+                context
+                    .mark_failed_permanently("permanent failure")
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("ordinary failure".to_owned())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn failure_disposition_is_persisted_and_claims_are_released() {
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.failure-disposition").expect("valid kind");
+    let retryable = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: FailureConfig { permanent: false },
+            checkpoint: Checkpoint { completed: 0 },
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create retryable workflow");
+    let permanent = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: FailureConfig { permanent: true },
+            checkpoint: Checkpoint { completed: 0 },
+            current_step: None,
+            parent_id: None,
+        })
+        .expect("create permanent workflow");
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(FailureFactory { kind }))
+        .expect("register failure workflow");
+    let supervisor = WorkflowSupervisor::new(repository.clone(), Arc::new(registry));
+
+    wait_for_status(
+        &supervisor,
+        &repository,
+        retryable.id,
+        WorkflowStatus::Failed,
+    )
+    .await;
+    wait_for_status(
+        &supervisor,
+        &repository,
+        permanent.id,
+        WorkflowStatus::Failed,
+    )
+    .await;
+
+    let retryable = repository
+        .read(retryable.id)
+        .expect("read retryable")
+        .expect("retryable workflow");
+    assert_eq!(
+        retryable.failure_disposition,
+        Some(WorkflowFailureDisposition::Retryable)
+    );
+    assert_eq!(retryable.last_error.as_deref(), Some("ordinary failure"));
+    let permanent = repository
+        .read(permanent.id)
+        .expect("read permanent")
+        .expect("permanent workflow");
+    assert_eq!(
+        permanent.failure_disposition,
+        Some(WorkflowFailureDisposition::Permanent)
+    );
+    assert_eq!(permanent.last_error.as_deref(), Some("permanent failure"));
+    assert!(
+        repository
+            .claims(retryable.id)
+            .expect("retryable claims")
+            .is_empty()
+    );
+    assert!(
+        repository
+            .claims(permanent.id)
+            .expect("permanent claims")
+            .is_empty()
     );
 }
 

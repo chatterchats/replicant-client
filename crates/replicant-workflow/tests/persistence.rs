@@ -7,8 +7,8 @@ use std::{
 
 use replicant_workflow::{
     ClaimAcquireOutcome, NewWorkflow, RegistryError, RepositoryError, ResourceKey, WorkflowFactory,
-    WorkflowKind, WorkflowMigration, WorkflowRegistry, WorkflowRepository, WorkflowState,
-    WorkflowStatus, WorkflowSupervisor,
+    WorkflowFailureDisposition, WorkflowKind, WorkflowMigration, WorkflowRegistry,
+    WorkflowRepository, WorkflowState, WorkflowStatus, WorkflowSupervisor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -682,7 +682,7 @@ fn rejects_newer_database_schema_and_zero_workflow_schema() {
         WorkflowRepository::open(&path),
         Err(RepositoryError::UnsupportedDatabaseSchema {
             found: 99,
-            supported: 9
+            supported: 11
         })
     ));
     fs::remove_file(path).expect("remove test database");
@@ -828,6 +828,89 @@ fn migrates_an_existing_runtime_database_without_losing_workflows() {
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].checkpoint::<Checkpoint>().unwrap().visits, 7);
     assert_eq!(repository.automation_policy().unwrap(), Default::default());
+    drop(repository);
+    fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
+fn workflow_failure_disposition_migration_preserves_legacy_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "replicant-workflow-disposition-migration-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let failed_id = uuid::Uuid::new_v4();
+    let succeeded_id = uuid::Uuid::new_v4();
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open schema-10 database");
+        connection
+            .execute_batch(concat!(
+                include_str!("../migrations/0001_initial.sql"),
+                include_str!("../migrations/0002_activity.sql"),
+                include_str!("../migrations/0003_resource_claims.sql"),
+                include_str!("../migrations/0004_wait_intent.sql"),
+                include_str!("../migrations/0005_finite_execution_history.sql"),
+                include_str!("../migrations/0006_automation_triggers.sql"),
+                include_str!("../migrations/0007_automation_policy.sql"),
+                include_str!("../migrations/0008_runtime_documents.sql"),
+                include_str!("../migrations/0009_finite_execution_running.sql"),
+                include_str!("../migrations/0010_finite_execution_cancelled.sql"),
+                "CREATE TABLE runtime_schema_migrations (version INTEGER PRIMARY KEY NOT NULL);",
+                "INSERT INTO runtime_schema_migrations VALUES
+                 (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);"
+            ))
+            .expect("install schema 10");
+        connection
+            .execute(
+                "INSERT INTO workflow_instances
+                 (id, kind, schema_version, config_json, checkpoint_json, status,
+                  created_at, updated_at, last_error, result_json)
+                 VALUES (?1, 'event.campaign', 1, '{}', '{\"step\":7}', 'failed',
+                         1, 2, 'legacy failure', '{\"completed\":3}')",
+                [failed_id.to_string()],
+            )
+            .expect("insert failed workflow");
+        connection
+            .execute(
+                "INSERT INTO workflow_instances
+                 (id, kind, schema_version, config_json, checkpoint_json, status,
+                  created_at, updated_at, result_json)
+                 VALUES (?1, 'belt_search.campaign', 1, '{}', '{}', 'succeeded',
+                         3, 4, '{\"completed\":9}')",
+                [succeeded_id.to_string()],
+            )
+            .expect("insert succeeded workflow");
+    }
+
+    let repository = WorkflowRepository::open(&path).expect("migrate schema 11");
+    let workflows = repository.list().expect("read migrated workflows");
+    let failed = workflows
+        .iter()
+        .find(|workflow| workflow.id.to_string() == failed_id.to_string())
+        .expect("failed workflow");
+    assert_eq!(failed.status, WorkflowStatus::Failed);
+    assert_eq!(failed.last_error.as_deref(), Some("legacy failure"));
+    assert_eq!(failed.failure_disposition, None);
+    assert_eq!(
+        failed.result::<serde_json::Value>().expect("failed result"),
+        Some(serde_json::json!({"completed": 3}))
+    );
+    let succeeded = workflows
+        .iter()
+        .find(|workflow| workflow.id.to_string() == succeeded_id.to_string())
+        .expect("succeeded workflow");
+    assert_eq!(succeeded.status, WorkflowStatus::Succeeded);
+    assert_eq!(succeeded.failure_disposition, None);
+    assert_eq!(
+        succeeded
+            .result::<serde_json::Value>()
+            .expect("succeeded result"),
+        Some(serde_json::json!({"completed": 9}))
+    );
+    assert_ne!(
+        failed.failure_disposition,
+        Some(WorkflowFailureDisposition::Permanent)
+    );
+
     drop(repository);
     fs::remove_file(path).expect("remove test database");
 }

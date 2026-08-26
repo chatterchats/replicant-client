@@ -28,7 +28,8 @@ use replicant_protocol::{
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::{
-    ResourceKey, WorkflowId, WorkflowInstance, WorkflowRepository, WorkflowStatus,
+    ResourceKey, WorkflowFailureDisposition, WorkflowId, WorkflowInstance, WorkflowRepository,
+    WorkflowStatus,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -160,6 +161,26 @@ struct GoalRuntime {
     #[serde(default)]
     active_workflows: Vec<WorkflowId>,
     last_launch_at_ms: Option<i64>,
+    #[serde(default)]
+    launch_records: Vec<GoalLaunchRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum GoalWorkIdentity {
+    EventCampaign {
+        region: String,
+        events: BTreeSet<String>,
+    },
+    Exploration {
+        target: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct GoalLaunchRecord {
+    workflow_id: WorkflowId,
+    identity: GoalWorkIdentity,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -3008,6 +3029,16 @@ fn reconcile_event_completion(
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
+    let identity = GoalWorkIdentity::EventCampaign {
+        region: region.region.clone(),
+        events: events.iter().cloned().collect(),
+    };
+    let permanent_failure = if event_discovery_error.is_none() {
+        retain_work_identity(&mut runtime, &identity);
+        permanent_failure_for_identity(&runtime, context.workflows, &identity)
+    } else {
+        None
+    };
     let active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
     let mut blocker = None;
@@ -3030,6 +3061,12 @@ fn reconcile_event_completion(
             events.len()
         ));
         DirectorGoalStatus::Active
+    } else if let Some(failure) = permanent_failure {
+        blocker = failure.last_error.clone();
+        next_action = Some(
+            "Change the regional event set before launching replacement campaign work".to_owned(),
+        );
+        DirectorGoalStatus::Blocked
     } else if recently_launched {
         next_action = Some("Wait briefly before retrying the regional event campaign".to_owned());
         DirectorGoalStatus::Waiting
@@ -3060,6 +3097,7 @@ fn reconcile_event_completion(
             );
             runtime.active_workflows = vec![workflow.id];
             runtime.last_launch_at_ms = Some(context.now);
+            record_goal_launch(&mut runtime, workflow.id, identity.clone());
             reserved.insert(worker);
         }
         DirectorGoalStatus::Active
@@ -3631,6 +3669,18 @@ fn reconcile_expand_ftl_network(
         })
         .collect::<Vec<_>>();
     uncovered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let identity = uncovered
+        .first()
+        .map(|(target, ..)| GoalWorkIdentity::Exploration {
+            target: target.clone(),
+        });
+    let permanent_failure = if let Some(identity) = identity.as_ref() {
+        retain_work_identity(&mut runtime, identity);
+        permanent_failure_for_identity(&runtime, context.workflows, identity)
+    } else {
+        runtime.launch_records.clear();
+        None
+    };
 
     let mut active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
@@ -3655,6 +3705,13 @@ fn reconcile_expand_ftl_network(
         if let Some(existing) = active_exploration_workflow_for_target(context.workflows, target)? {
             runtime.active_workflows = vec![existing];
             active = vec![existing];
+            record_goal_launch(
+                &mut runtime,
+                existing,
+                GoalWorkIdentity::Exploration {
+                    target: target.clone(),
+                },
+            );
         }
         if !active.is_empty() {
             (
@@ -3662,6 +3719,14 @@ fn reconcile_expand_ftl_network(
                 Some(format!(
                     "Continue the existing FTL expansion toward {target}{}",
                     ftl_priority_suffix(*event_priority, *density_priority)
+                )),
+            )
+        } else if let Some(failure) = permanent_failure {
+            blocker = failure.last_error.clone();
+            (
+                DirectorGoalStatus::Blocked,
+                Some(format!(
+                    "Change the requested FTL target before replacing permanently failed work toward {target}"
                 )),
             )
         } else if recently_launched {
@@ -3729,6 +3794,13 @@ fn reconcile_expand_ftl_network(
                 );
                 runtime.active_workflows = vec![workflow.id];
                 runtime.last_launch_at_ms = Some(context.now);
+                record_goal_launch(
+                    &mut runtime,
+                    workflow.id,
+                    GoalWorkIdentity::Exploration {
+                        target: target.clone(),
+                    },
+                );
                 reserved.insert(worker);
             }
             (DirectorGoalStatus::Active, next_action)
@@ -4725,6 +4797,61 @@ fn prune_runtime_workflows(runtime: &mut GoalRuntime, workflows: &[WorkflowInsta
             .find(|workflow| workflow.id == *id)
             .is_some_and(|workflow| !workflow.status.is_terminal())
     });
+    runtime.launch_records.retain(|record| {
+        workflows
+            .iter()
+            .find(|workflow| workflow.id == record.workflow_id)
+            .is_some_and(|workflow| {
+                !workflow.status.is_terminal()
+                    || workflow.status == WorkflowStatus::Failed
+                        && workflow.failure_disposition
+                            == Some(WorkflowFailureDisposition::Permanent)
+            })
+    });
+}
+
+fn retain_work_identity(runtime: &mut GoalRuntime, identity: &GoalWorkIdentity) {
+    let removed_obsolete = runtime
+        .launch_records
+        .iter()
+        .any(|record| &record.identity != identity);
+    runtime
+        .launch_records
+        .retain(|record| &record.identity == identity);
+    if removed_obsolete {
+        runtime.last_launch_at_ms = None;
+    }
+}
+
+fn record_goal_launch(
+    runtime: &mut GoalRuntime,
+    workflow_id: WorkflowId,
+    identity: GoalWorkIdentity,
+) {
+    runtime.launch_records = vec![GoalLaunchRecord {
+        workflow_id,
+        identity,
+    }];
+}
+
+fn permanent_failure_for_identity<'a>(
+    runtime: &GoalRuntime,
+    workflows: &'a [WorkflowInstance],
+    identity: &GoalWorkIdentity,
+) -> Option<&'a WorkflowInstance> {
+    runtime
+        .launch_records
+        .iter()
+        .find(|record| &record.identity == identity)
+        .and_then(|record| {
+            workflows
+                .iter()
+                .find(|workflow| workflow.id == record.workflow_id)
+        })
+        .filter(|workflow| {
+            workflow.status == WorkflowStatus::Failed
+                && workflow.failure_disposition == Some(WorkflowFailureDisposition::Permanent)
+        })
 }
 
 fn launch_is_recent(runtime: &GoalRuntime, now: i64, cooldown_ms: i64) -> bool {
@@ -6064,6 +6191,376 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn permanent_failure_is_retained_only_for_equivalent_director_work() {
+        let repository = WorkflowRepository::open_in_memory().expect("open workflow repository");
+        let workflow = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: exploration_workflow_kind(),
+                schema_version: 1,
+                config: ExplorationIntent {
+                    target: "BETA".to_owned(),
+                    replicant: None,
+                    hub: None,
+                },
+                checkpoint: serde_json::Value::Null,
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("create exploration workflow");
+        let identity = GoalWorkIdentity::Exploration {
+            target: "BETA".to_owned(),
+        };
+        let mut permanent = workflow.clone();
+        permanent.status = WorkflowStatus::Failed;
+        permanent.failure_disposition = Some(WorkflowFailureDisposition::Permanent);
+        permanent.last_error = Some("immutable target is unavailable".to_owned());
+        let mut runtime = GoalRuntime {
+            active_workflows: vec![workflow.id],
+            last_launch_at_ms: Some(10),
+            launch_records: vec![GoalLaunchRecord {
+                workflow_id: workflow.id,
+                identity: identity.clone(),
+            }],
+        };
+
+        let initial_rows = repository.list().expect("initial workflows").len();
+        for _ in 0..2 {
+            prune_runtime_workflows(&mut runtime, std::slice::from_ref(&permanent));
+            assert!(runtime.active_workflows.is_empty());
+            assert_eq!(runtime.launch_records.len(), 1);
+            assert_eq!(
+                permanent_failure_for_identity(
+                    &runtime,
+                    std::slice::from_ref(&permanent),
+                    &identity
+                )
+                .and_then(|workflow| workflow.last_error.as_deref()),
+                Some("immutable target is unavailable")
+            );
+            assert_eq!(
+                repository.list().expect("workflows after reconcile").len(),
+                initial_rows
+            );
+        }
+
+        let changed = GoalWorkIdentity::Exploration {
+            target: "GAMMA".to_owned(),
+        };
+        retain_work_identity(&mut runtime, &changed);
+        assert!(runtime.launch_records.is_empty());
+        assert_eq!(runtime.last_launch_at_ms, None);
+
+        for disposition in [Some(WorkflowFailureDisposition::Retryable), None] {
+            let mut failed = permanent.clone();
+            failed.failure_disposition = disposition;
+            let mut runtime = GoalRuntime {
+                active_workflows: vec![failed.id],
+
+                last_launch_at_ms: Some(10),
+                launch_records: vec![GoalLaunchRecord {
+                    workflow_id: failed.id,
+                    identity: identity.clone(),
+                }],
+            };
+            prune_runtime_workflows(&mut runtime, std::slice::from_ref(&failed));
+            assert!(runtime.launch_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn repeated_event_reconciliation_blocks_equivalent_permanent_work() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let failed = repository
+            .create(new_event_campaign_workflow(EventCampaignIntent {
+                region: "alpha".to_owned(),
+                replicant: Some("CHAT-1".to_owned()),
+                home: Some("ALPHA-HUB".to_owned()),
+            }))
+            .expect("create failed campaign");
+        let events = vec!["ALPHA-EVENT-1".to_owned()];
+        let identity = GoalWorkIdentity::EventCampaign {
+            region: "alpha".to_owned(),
+            events: events.iter().cloned().collect(),
+        };
+        let mut failed_projection = failed.clone();
+        failed_projection.status = WorkflowStatus::Failed;
+        failed_projection.failure_disposition = Some(WorkflowFailureDisposition::Permanent);
+        failed_projection.last_error = Some("campaign target cannot be fulfilled".to_owned());
+        let workflows = vec![failed_projection];
+        let goal_id = goal_instance_id(DirectorGoalKind::EventCompletion, Some("alpha"));
+        save_goal_runtime(
+            &repository,
+            &goal_id,
+            &GoalRuntime {
+                active_workflows: vec![failed.id],
+                last_launch_at_ms: Some(0),
+                launch_records: vec![GoalLaunchRecord {
+                    workflow_id: failed.id,
+                    identity,
+                }],
+            },
+        )
+        .expect("save goal runtime");
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: DEFAULT_RETRY_COOLDOWN_MS * 2,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: Some("ALPHA-HUB".to_owned()),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        };
+        let workers = vec![test_worker("CHAT-1", "alpha", "ALPHA-HUB")];
+        let initial_rows = repository.list().expect("initial workflows").len();
+
+        for _ in 0..2 {
+            let mut reserved = BTreeSet::new();
+            let mut requirements =
+                DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+            let summary = reconcile_event_completion(
+                &context,
+                &region,
+                &events,
+                None,
+                &workers,
+                &mut reserved,
+                &mut requirements,
+            )
+            .expect("reconcile equivalent events");
+            assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+            assert_eq!(
+                summary.blocker.as_deref(),
+                Some("campaign target cannot be fulfilled")
+            );
+            assert_eq!(
+                repository
+                    .list()
+                    .expect("workflows after blocked pass")
+                    .len(),
+                initial_rows
+            );
+        }
+
+        let changed_events = vec!["ALPHA-EVENT-2".to_owned()];
+        let mut reserved = BTreeSet::new();
+        let mut requirements =
+            DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+        let summary = reconcile_event_completion(
+            &context,
+            &region,
+            &changed_events,
+            None,
+            &workers,
+            &mut reserved,
+            &mut requirements,
+        )
+        .expect("reconcile changed events");
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            repository
+                .list()
+                .expect("workflows after identity change")
+                .len(),
+            initial_rows + 1
+        );
+    }
+
+    #[test]
+    fn repeated_ftl_reconciliation_blocks_equivalent_permanent_work() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let failed = repository
+            .create(new_exploration_workflow(ExplorationIntent {
+                target: "TARGET".to_owned(),
+                replicant: Some("CHAT-1".to_owned()),
+                hub: Some("ROOT-HUB".to_owned()),
+            }))
+            .expect("create failed exploration");
+        let identity = GoalWorkIdentity::Exploration {
+            target: "TARGET".to_owned(),
+        };
+        let mut failed_projection = failed.clone();
+        failed_projection.status = WorkflowStatus::Failed;
+        failed_projection.failure_disposition = Some(WorkflowFailureDisposition::Permanent);
+        failed_projection.last_error = Some("target cannot be connected".to_owned());
+        let workflows = vec![failed_projection];
+        let goal_id = goal_instance_id(DirectorGoalKind::ExpandFtlNetwork, Some("alpha"));
+        save_goal_runtime(
+            &repository,
+            &goal_id,
+            &GoalRuntime {
+                active_workflows: vec![failed.id],
+                last_launch_at_ms: Some(0),
+                launch_records: vec![GoalLaunchRecord {
+                    workflow_id: failed.id,
+                    identity,
+                }],
+            },
+        )
+        .expect("save goal runtime");
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: DEFAULT_RETRY_COOLDOWN_MS * 2,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ROOT".to_owned()),
+            hub_location: Some("ROOT-HUB".to_owned()),
+            known_systems: BTreeSet::from(["TARGET".to_owned()]),
+        };
+        let mut worker = test_worker("CHAT-1", "alpha", "ROOT-HUB");
+        worker.racing_vessel = Some("VESSEL-1".to_owned());
+        let workers = vec![worker];
+        let mut vessel = test_hub_device();
+        vessel.key = replicant_client::DeviceKey::live("VESSEL-1".into());
+        vessel.device_type = Some(DeviceType::RacingVessel);
+        vessel.stow_capacity = Some(2);
+        vessel.stow_used = Some(0);
+        let devices = vec![vessel];
+        let initial_rows = repository.list().expect("initial workflows").len();
+
+        for _ in 0..2 {
+            let mut reserved = BTreeSet::new();
+            let mut requirements =
+                DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+            let summary = reconcile_expand_ftl_network(
+                &context,
+                &region,
+                &workers,
+                &mut reserved,
+                &mut requirements,
+                &devices,
+                &[],
+                &BTreeMap::new(),
+                &BTreeSet::from(["TARGET".to_owned()]),
+            )
+            .expect("reconcile equivalent FTL target");
+            assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+            assert_eq!(
+                summary.blocker.as_deref(),
+                Some("target cannot be connected")
+            );
+            assert_eq!(
+                repository
+                    .list()
+                    .expect("workflows after blocked pass")
+                    .len(),
+                initial_rows
+            );
+        }
+
+        let changed_region = RegionView {
+            known_systems: BTreeSet::from(["NEXT-TARGET".to_owned()]),
+            ..region
+        };
+        let mut reserved = BTreeSet::new();
+        let mut requirements =
+            DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+        let summary = reconcile_expand_ftl_network(
+            &context,
+            &changed_region,
+            &workers,
+            &mut reserved,
+            &mut requirements,
+            &devices,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::from(["NEXT-TARGET".to_owned()]),
+        )
+        .expect("reconcile changed FTL target");
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            repository
+                .list()
+                .expect("workflows after changed target")
+                .len(),
+            initial_rows + 1
+        );
+    }
+
+    #[test]
+    fn event_reconciliation_recreates_retryable_and_legacy_failures_after_cooldown() {
+        for disposition in [Some(WorkflowFailureDisposition::Retryable), None] {
+            let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+            let failed = repository
+                .create(new_event_campaign_workflow(EventCampaignIntent {
+                    region: "alpha".to_owned(),
+                    replicant: Some("CHAT-1".to_owned()),
+                    home: Some("ALPHA-HUB".to_owned()),
+                }))
+                .expect("create failed campaign");
+            let events = vec!["ALPHA-EVENT-1".to_owned()];
+            let identity = GoalWorkIdentity::EventCampaign {
+                region: "alpha".to_owned(),
+                events: events.iter().cloned().collect(),
+            };
+            let mut failed_projection = failed.clone();
+            failed_projection.status = WorkflowStatus::Failed;
+            failed_projection.failure_disposition = disposition;
+            let workflows = vec![failed_projection];
+            save_goal_runtime(
+                &repository,
+                &goal_instance_id(DirectorGoalKind::EventCompletion, Some("alpha")),
+                &GoalRuntime {
+                    active_workflows: vec![failed.id],
+                    last_launch_at_ms: Some(0),
+                    launch_records: vec![GoalLaunchRecord {
+                        workflow_id: failed.id,
+                        identity,
+                    }],
+                },
+            )
+            .expect("save goal runtime");
+            let controls = GoalControls::default();
+            let context = GoalReconcileContext {
+                repository: &repository,
+                workflows: &workflows,
+                controls: &controls,
+                automatic: true,
+                now: DEFAULT_RETRY_COOLDOWN_MS + 1,
+            };
+            let region = RegionView {
+                region: "alpha".to_owned(),
+                status: DirectorRegionStatus::Established,
+                hub_system: Some("ALPHA".to_owned()),
+                hub_location: Some("ALPHA-HUB".to_owned()),
+                known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+            };
+            let workers = vec![test_worker("CHAT-1", "alpha", "ALPHA-HUB")];
+            let initial_rows = repository.list().expect("initial workflows").len();
+            let mut reserved = BTreeSet::new();
+            let mut requirements =
+                DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+
+            let summary = reconcile_event_completion(
+                &context,
+                &region,
+                &events,
+                None,
+                &workers,
+                &mut reserved,
+                &mut requirements,
+            )
+            .expect("reconcile retryable campaign");
+
+            assert_eq!(summary.status, DirectorGoalStatus::Active);
+            assert_eq!(
+                repository.list().expect("workflows after retry").len(),
+                initial_rows + 1
+            );
+        }
+    }
     #[test]
     fn no_scale_down_goal_or_operation_exists() {
         assert!(

@@ -329,6 +329,25 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
+/// Director retry policy for a terminal workflow failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFailureDisposition {
+    /// Equivalent work may be launched again.
+    Retryable,
+    /// Equivalent work must remain blocked until its identity changes.
+    Permanent,
+}
+
+impl WorkflowFailureDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 /// Durable description of why a workflow is waiting.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WaitIntent {
@@ -565,6 +584,20 @@ impl FromStr for WorkflowStatus {
     }
 }
 
+impl FromStr for WorkflowFailureDisposition {
+    type Err = RepositoryError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "retryable" => Ok(Self::Retryable),
+            "permanent" => Ok(Self::Permanent),
+            _ => Err(RepositoryError::InvalidStoredFailureDisposition(
+                value.to_owned(),
+            )),
+        }
+    }
+}
+
 /// Initial data used to create a queued workflow.
 pub struct NewWorkflow<C, P> {
     /// Stable workflow kind.
@@ -623,6 +656,8 @@ pub struct WorkflowInstance {
     pub schema_version: u32,
     /// Current lifecycle status.
     pub status: WorkflowStatus,
+    /// Director retry policy when the lifecycle status is [`WorkflowStatus::Failed`].
+    pub failure_disposition: Option<WorkflowFailureDisposition>,
     /// Current logical step.
     pub current_step: Option<String>,
     /// Creation time in Unix milliseconds.

@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
-    ResourceKey, TriggerId, TriggerState, WorkflowActivity, WorkflowId, WorkflowInstance,
-    WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
+    ResourceKey, TriggerId, TriggerState, WorkflowActivity, WorkflowFailureDisposition, WorkflowId,
+    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
@@ -32,7 +32,9 @@ const FINITE_EXECUTION_RUNNING_SCHEMA: &str =
     include_str!("../migrations/0009_finite_execution_running.sql");
 const FINITE_EXECUTION_CANCELLED_SCHEMA: &str =
     include_str!("../migrations/0010_finite_execution_cancelled.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 10;
+const WORKFLOW_FAILURE_DISPOSITION_SCHEMA: &str =
+    include_str!("../migrations/0011_workflow_failure_disposition.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 11;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +57,9 @@ pub enum RepositoryError {
     /// A malformed lifecycle status was found in SQLite.
     #[error("invalid persisted workflow status {0:?}")]
     InvalidStoredStatus(String),
+    /// A malformed workflow failure disposition was found in SQLite.
+    #[error("invalid persisted workflow failure disposition {0:?}")]
+    InvalidStoredFailureDisposition(String),
     /// A malformed workflow ID was found in SQLite.
     #[error("invalid persisted workflow ID {0:?}")]
     InvalidStoredId(String),
@@ -320,6 +325,13 @@ impl WorkflowRepository {
             transaction.execute_batch(FINITE_EXECUTION_CANCELLED_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (10)",
+                [],
+            )?;
+        }
+        if found < 11 {
+            transaction.execute_batch(WORKFLOW_FAILURE_DISPOSITION_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (11)",
                 [],
             )?;
         }
@@ -1218,7 +1230,9 @@ impl WorkflowRepository {
         expected_revision: u64,
         state: WorkflowState<P, R>,
     ) -> Result<WorkflowInstance, RepositoryError> {
-        self.update_with_wait(id, expected_revision, state, None)
+        let failure_disposition = (state.status == WorkflowStatus::Failed)
+            .then_some(WorkflowFailureDisposition::Retryable);
+        self.update_state(id, expected_revision, state, None, failure_disposition)
     }
 
     pub(crate) fn update_with_wait<P: Serialize, R: Serialize>(
@@ -1228,6 +1242,44 @@ impl WorkflowRepository {
         state: WorkflowState<P, R>,
         wait_intent: Option<&crate::WaitIntent>,
     ) -> Result<WorkflowInstance, RepositoryError> {
+        let failure_disposition = (state.status == WorkflowStatus::Failed)
+            .then_some(WorkflowFailureDisposition::Retryable);
+        self.update_state(
+            id,
+            expected_revision,
+            state,
+            wait_intent,
+            failure_disposition,
+        )
+    }
+
+    pub(crate) fn update_with_failure_disposition<P: Serialize, R: Serialize>(
+        &self,
+        id: WorkflowId,
+        expected_revision: u64,
+        state: WorkflowState<P, R>,
+        failure_disposition: WorkflowFailureDisposition,
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        self.update_state(
+            id,
+            expected_revision,
+            state,
+            None,
+            Some(failure_disposition),
+        )
+    }
+
+    fn update_state<P: Serialize, R: Serialize>(
+        &self,
+        id: WorkflowId,
+        expected_revision: u64,
+        state: WorkflowState<P, R>,
+        wait_intent: Option<&crate::WaitIntent>,
+        failure_disposition: Option<WorkflowFailureDisposition>,
+    ) -> Result<WorkflowInstance, RepositoryError> {
+        let failure_disposition = (state.status == WorkflowStatus::Failed)
+            .then(|| failure_disposition.map(WorkflowFailureDisposition::as_str))
+            .flatten();
         let checkpoint_json = serde_json::to_string(&state.checkpoint)?;
         let result_json = state
             .result
@@ -1256,7 +1308,8 @@ impl WorkflowRepository {
             "UPDATE workflow_instances SET
                 status = ?1, current_step = ?2, checkpoint_json = ?3,
                 last_error = ?4, result_json = ?5, updated_at = ?6,
-                revision = revision + 1, wait_intent_json = ?9
+                revision = revision + 1, wait_intent_json = ?9,
+                failure_disposition = ?10
              WHERE id = ?7 AND revision = ?8",
             params![
                 state.status.as_str(),
@@ -1268,6 +1321,7 @@ impl WorkflowRepository {
                 id.to_string(),
                 expected_revision,
                 wait_intent_json,
+                failure_disposition,
             ],
         )?;
         let updated = read_in(&transaction, id)?.ok_or(RepositoryError::NotFound(id))?;
@@ -1321,7 +1375,7 @@ impl WorkflowRepository {
 
 const COLUMNS: &str = "id, kind, schema_version, config_json, checkpoint_json, status, \
                        current_step, created_at, updated_at, last_error, result_json, \
-                       parent_id, revision, wait_intent_json";
+                       parent_id, revision, wait_intent_json, failure_disposition";
 
 const SUMMARY_COLUMNS: &str = "id, kind, status, revision, current_step, updated_at";
 
@@ -1415,6 +1469,11 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> Result<WorkflowInstance, rusqlite
             to_sql_conversion_error(RepositoryError::InvalidStoredRevision(revision))
         })?,
         wait_intent_json: row.get(13)?,
+        failure_disposition: row
+            .get::<_, Option<String>>(14)?
+            .map(|value| WorkflowFailureDisposition::from_str(&value))
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -1571,5 +1630,48 @@ mod tests {
                 "{index} missing from {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn nonfailed_state_replacement_clears_failure_disposition() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let id = WorkflowId::new();
+        repository
+            .connection()
+            .expect("connection")
+            .execute(
+                "INSERT INTO workflow_instances
+                 (id, kind, schema_version, config_json, checkpoint_json, status,
+                  current_step, created_at, updated_at, failure_disposition)
+                 VALUES (?1, 'test.clear-disposition', 1, '{}', '{}', 'running',
+                         'executing', 0, 0, 'permanent')",
+                [id.to_string()],
+            )
+            .expect("insert inconsistent legacy fixture");
+        let workflow = repository
+            .read(id)
+            .expect("read workflow")
+            .expect("workflow");
+        assert_eq!(
+            workflow.failure_disposition,
+            Some(WorkflowFailureDisposition::Permanent)
+        );
+
+        let updated = repository
+            .update(
+                id,
+                workflow.revision,
+                WorkflowState {
+                    status: WorkflowStatus::Waiting,
+                    current_step: Some("waiting".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("replace nonfailed state");
+
+        assert_eq!(updated.status, WorkflowStatus::Waiting);
+        assert_eq!(updated.failure_disposition, None);
     }
 }

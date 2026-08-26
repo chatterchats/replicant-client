@@ -8,7 +8,11 @@ use std::{
     time::Duration,
 };
 
-use crate::{config::ManagedClientConfig, start_managed_client};
+use crate::{
+    config::ManagedClientConfig,
+    failure::{FailureClass, classified_error},
+    start_managed_client,
+};
 use replicant_client::{Client, Replicant, Star, SyncDomain, raw};
 use replicant_event_planner::{
     BlueprintSpec, CriterionAssessment, DeviceStock, EventDefinition, EventPlan, FactoryWorkload,
@@ -833,7 +837,8 @@ impl MissionLock {
                     let owner_is_running =
                         owner.is_some_and(|pid| PathBuf::from(format!("/proc/{pid}")).exists());
                     if owner_is_running {
-                        return Err(app_error(
+                        return Err(classified_error(
+                            FailureClass::EventExecutorContention,
                             io::ErrorKind::WouldBlock,
                             format!(
                                 "another event executor holds {} (pid {})",
@@ -847,7 +852,8 @@ impl MissionLock {
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(app_error(
+        Err(classified_error(
+            FailureClass::EventExecutorContention,
             io::ErrorKind::WouldBlock,
             format!("could not acquire {}", lock_path.display()),
         ))
@@ -2323,5 +2329,28 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].designation.as_deref(), Some("hub"));
         assert_eq!(filtered[1].designation.as_deref(), Some("near"));
+    }
+    #[test]
+    fn live_mission_lock_contention_is_retryable_executor_contention() {
+        let directory =
+            std::env::temp_dir().join(format!("replicant-event-lock-{}", uuid::Uuid::new_v4()));
+        let mission = directory.join("campaign.json");
+        let first = MissionLock::acquire(&mission).expect("first mission lock");
+        let error = match MissionLock::acquire(&mission) {
+            Ok(_) => panic!("second lock must contend"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            crate::failure::failure_class(error.as_ref()),
+            Some(FailureClass::EventExecutorContention)
+        );
+        assert_eq!(
+            crate::failure::failure_disposition(error.as_ref()),
+            replicant_workflow::WorkflowFailureDisposition::Retryable
+        );
+
+        drop(first);
+        std::fs::remove_dir_all(directory).expect("remove lock fixture");
     }
 }

@@ -46,7 +46,7 @@ use crate::{
         execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
         reconcile_event_stock, restore_event_campaign,
     },
-    failure::{FailureClass, failure_class, failure_class_from_message},
+    failure::{FailureClass, failure_class, failure_class_from_message, failure_disposition},
     mining::{MiningExpansionRequest, execute_expansion},
     observatory::auto_prospect,
     relay::{
@@ -2395,23 +2395,18 @@ impl WorkflowExecutor for ExplorationWorkflow {
                     context.mark_succeeded(Some(report)).map_err(string_error)
                 }
                 Err(error) => {
+                    if persist_stale_exploration_replan(
+                        context,
+                        &mut checkpoint,
+                        &plan_file,
+                        &intent.target,
+                        error.as_ref(),
+                    )? {
+                        return Ok(());
+                    }
                     let message = error.to_string();
                     let class = failure_class(error.as_ref());
-                    if stale_relay_plan_failure(error.as_ref()) {
-                        release_exploration_autofactory_claims(context)?;
-                        tracing::warn!(
-                            workflow_id = %context.id(),
-                            target = %intent.target,
-                            error = %message,
-                            "relay topology changed underneath the saved plan; discarding it and replanning"
-                        );
-                        checkpoint.state = None;
-                        clear_scratch_file(&plan_file)?;
-                        context
-                            .advance_to("replanning_relay_coverage", &checkpoint)
-                            .map_err(string_error)?;
-                        context.mark_waiting().map_err(string_error)
-                    } else if resource_claim_contention(error.as_ref()) {
+                    if resource_claim_contention(error.as_ref()) {
                         release_exploration_autofactory_claims(context)?;
                         tracing::warn!(
                             workflow_id = %context.id(),
@@ -2441,7 +2436,15 @@ impl WorkflowExecutor for ExplorationWorkflow {
                         context
                             .persist_checkpoint(&checkpoint)
                             .map_err(string_error)?;
-                        Err(message)
+                        if failure_disposition(error.as_ref())
+                            == replicant_workflow::WorkflowFailureDisposition::Permanent
+                        {
+                            context
+                                .mark_failed_permanently(message)
+                                .map_err(string_error)
+                        } else {
+                            Err(message)
+                        }
                     }
                 }
             }
@@ -2782,35 +2785,27 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                     result = &mut execution => match result {
                         Ok(state) => break state,
                         Err(error) => {
+                            if persist_retryable_event_campaign_failure(
+                                context,
+                                &mut checkpoint,
+                                &plan_file,
+                                error.as_ref(),
+                            )? {
+                                return Ok(());
+                            }
                             let message = error.to_string();
-                            if retryable_event_campaign_failure(error.as_ref()) {
-                                if event_campaign_failure_requires_replan(error.as_ref()) {
-                                    checkpoint.archive = None;
-                                    clear_scratch_file(&plan_file)?;
-                                    context
-                                        .advance_to("replanning_after_stale_asset", &checkpoint)
-                                        .map_err(string_error)?;
-                                } else {
-                                    if let Ok(archive) = archive_event_campaign(&plan_file) {
-                                        checkpoint.archive = Some(archive);
-                                    }
-                                    let step = if event_campaign_failure_waits_for_inputs(error.as_ref())
-                                    {
-                                        "waiting_for_event_inputs"
-                                    } else {
-                                        "waiting_for_control_range"
-                                    };
-                                    context
-                                        .advance_to(step, &checkpoint)
-                                        .map_err(string_error)?;
+                            if failure_disposition(error.as_ref())
+                                == replicant_workflow::WorkflowFailureDisposition::Permanent
+                            {
+                                if let Ok(archive) = archive_event_campaign(&plan_file) {
+                                    checkpoint.archive = Some(archive);
                                 }
-                                context.persist_checkpoint(&checkpoint).map_err(string_error)?;
                                 context
-                                    .emit_activity(format!(
-                                        "event campaign hit a recoverable execution condition ({message}); waiting to retry"
-                                    ))
+                                    .persist_checkpoint(&checkpoint)
                                     .map_err(string_error)?;
-                                context.mark_waiting().map_err(string_error)?;
+                                context
+                                    .mark_failed_permanently(message)
+                                    .map_err(string_error)?;
                                 return Ok(());
                             }
                             return Err(string_error(error));
@@ -2838,8 +2833,40 @@ impl WorkflowExecutor for EventCampaignWorkflow {
     }
 }
 
-fn event_campaign_failure_waits_for_inputs(error: &(dyn std::error::Error + 'static)) -> bool {
-    failure_class(error) == Some(FailureClass::EventInputsUnavailable)
+fn persist_retryable_event_campaign_failure(
+    context: &mut WorkflowContext,
+    checkpoint: &mut EventCampaignCheckpoint,
+    plan_file: &Path,
+    error: &(dyn std::error::Error + 'static),
+) -> Result<bool, String> {
+    if !retryable_event_campaign_failure(error) {
+        return Ok(false);
+    }
+    let message = error.to_string();
+    if event_campaign_failure_requires_replan(error) {
+        checkpoint.archive = None;
+        clear_scratch_file(plan_file)?;
+        context
+            .advance_to("replanning_after_stale_asset", checkpoint)
+            .map_err(string_error)?;
+    } else {
+        if let Ok(archive) = archive_event_campaign(plan_file) {
+            checkpoint.archive = Some(archive);
+        }
+        context
+            .advance_to(event_campaign_wait_step(error), checkpoint)
+            .map_err(string_error)?;
+    }
+    context
+        .persist_checkpoint(checkpoint)
+        .map_err(string_error)?;
+    context
+        .emit_activity(format!(
+            "event campaign hit a recoverable execution condition ({message}); waiting to retry"
+        ))
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(true)
 }
 
 fn retryable_event_campaign_failure(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -2849,13 +2876,26 @@ fn retryable_event_campaign_failure(error: &(dyn std::error::Error + 'static)) -
             FailureClass::EventInputsUnavailable
                 | FailureClass::EventControlUnavailable
                 | FailureClass::EventAssetStale
+                | FailureClass::DeviceTargetMissing
+                | FailureClass::EventExecutorContention
                 | FailureClass::TransientUpstream
         )
     )
 }
+fn event_campaign_wait_step(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    match failure_class(error) {
+        Some(FailureClass::EventInputsUnavailable) => "waiting_for_event_inputs",
+        Some(FailureClass::TransientUpstream) => "waiting_for_managed_client",
+        Some(FailureClass::EventExecutorContention) => "waiting_for_event_executor",
+        _ => "waiting_for_control_range",
+    }
+}
 
 fn event_campaign_failure_requires_replan(error: &(dyn std::error::Error + 'static)) -> bool {
-    failure_class(error) == Some(FailureClass::EventAssetStale)
+    matches!(
+        failure_class(error),
+        Some(FailureClass::EventAssetStale | FailureClass::DeviceTargetMissing)
+    )
 }
 
 async fn ensure_event_campaign_connectivity(
@@ -3039,8 +3079,36 @@ pub(crate) async fn reconcile_event_connectivity(
     Ok(true)
 }
 
+fn persist_stale_exploration_replan(
+    context: &mut WorkflowContext,
+    checkpoint: &mut ExplorationWorkflowCheckpoint,
+    plan_file: &Path,
+    target: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> Result<bool, String> {
+    if !stale_relay_plan_failure(error) {
+        return Ok(false);
+    }
+    release_exploration_autofactory_claims(context)?;
+    tracing::warn!(
+        workflow_id = %context.id(),
+        target,
+        error = %error,
+        "relay topology changed underneath the saved plan; discarding it and replanning"
+    );
+    checkpoint.state = None;
+    clear_scratch_file(plan_file)?;
+    context
+        .advance_to("replanning_relay_coverage", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)?;
+    Ok(true)
+}
 fn stale_relay_plan_failure(error: &(dyn std::error::Error + 'static)) -> bool {
-    failure_class(error) == Some(FailureClass::RelayPlanStale)
+    matches!(
+        failure_class(error),
+        Some(FailureClass::RelayPlanStale | FailureClass::DeviceTargetMissing)
+    )
 }
 
 fn resource_claim_contention(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -7997,6 +8065,291 @@ mod tests {
             }]
         );
     }
+    #[derive(Clone, Deserialize, Serialize)]
+    enum FailureRoutingFixture {
+        EventInputs,
+        ManagedClientClosed,
+        EventExecutorContention,
+        EventDeviceMissing,
+        ExplorationDeviceMissing,
+    }
+
+    struct FailureRoutingFactory {
+        kind: WorkflowKind,
+    }
+
+    impl WorkflowFactory for FailureRoutingFactory {
+        fn kind(&self) -> &WorkflowKind {
+            &self.kind
+        }
+
+        fn current_schema_version(&self) -> u32 {
+            1
+        }
+
+        fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+            Some(Box::new(FailureRoutingWorkflow))
+        }
+    }
+
+    struct FailureRoutingWorkflow;
+
+    impl WorkflowExecutor for FailureRoutingWorkflow {
+        fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+            Box::pin(async move {
+                let fixture: FailureRoutingFixture = context.config().map_err(string_error)?;
+                let plan_file = scratch_file(context.id(), "failure-routing.json")?;
+                fs::write(&plan_file, "stale scratch state").map_err(string_error)?;
+                match fixture {
+                    FailureRoutingFixture::EventInputs
+                    | FailureRoutingFixture::ManagedClientClosed
+                    | FailureRoutingFixture::EventExecutorContention
+                    | FailureRoutingFixture::EventDeviceMissing => {
+                        let mut checkpoint: EventCampaignCheckpoint =
+                            context.checkpoint().map_err(string_error)?;
+                        let handled = match fixture {
+                            FailureRoutingFixture::EventInputs => {
+                                let error = ClassifiedError::new(
+                                    FailureClass::EventInputsUnavailable,
+                                    io::ErrorKind::WouldBlock,
+                                    "blocked events remain",
+                                );
+                                persist_retryable_event_campaign_failure(
+                                    context,
+                                    &mut checkpoint,
+                                    &plan_file,
+                                    &error,
+                                )?
+                            }
+                            FailureRoutingFixture::ManagedClientClosed => {
+                                persist_retryable_event_campaign_failure(
+                                    context,
+                                    &mut checkpoint,
+                                    &plan_file,
+                                    &replicant_client::Error::Closed,
+                                )?
+                            }
+                            FailureRoutingFixture::EventExecutorContention => {
+                                let error = ClassifiedError::new(
+                                    FailureClass::EventExecutorContention,
+                                    io::ErrorKind::WouldBlock,
+                                    "campaign file is locked",
+                                );
+                                persist_retryable_event_campaign_failure(
+                                    context,
+                                    &mut checkpoint,
+                                    &plan_file,
+                                    &error,
+                                )?
+                            }
+                            FailureRoutingFixture::EventDeviceMissing => {
+                                let error = ClassifiedError::permanent(
+                                    FailureClass::DeviceTargetMissing,
+                                    io::ErrorKind::NotFound,
+                                    "selected device no longer exists",
+                                );
+                                persist_retryable_event_campaign_failure(
+                                    context,
+                                    &mut checkpoint,
+                                    &plan_file,
+                                    &error,
+                                )?
+                            }
+                            FailureRoutingFixture::ExplorationDeviceMissing => unreachable!(),
+                        };
+                        if handled {
+                            Ok(())
+                        } else {
+                            Err("event failure fixture was not routed".to_owned())
+                        }
+                    }
+                    FailureRoutingFixture::ExplorationDeviceMissing => {
+                        let mut checkpoint: ExplorationWorkflowCheckpoint =
+                            context.checkpoint().map_err(string_error)?;
+                        let error = ClassifiedError::permanent(
+                            FailureClass::DeviceTargetMissing,
+                            io::ErrorKind::NotFound,
+                            "selected relay no longer exists",
+                        );
+                        if persist_stale_exploration_replan(
+                            context,
+                            &mut checkpoint,
+                            &plan_file,
+                            "BETA",
+                            &error,
+                        )? {
+                            Ok(())
+                        } else {
+                            Err("exploration failure fixture was not routed".to_owned())
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    fn relay_execution_fixture() -> RelayExecutionState {
+        serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "mission_id": "relay-test",
+            "replicant_code": "REP-1",
+            "vessel_code": "VESSEL-1",
+            "hub_location": "ROOT-1-L4",
+            "start_system": "ROOT",
+            "targets": ["TARGET"],
+            "max_hop_ly": 7.499,
+            "network": {
+                "start": "ROOT",
+                "requested_targets": ["TARGET"],
+                "max_hop_ly": 7.499,
+                "nodes": [],
+                "edges": [],
+                "new_relay_systems": ["TARGET"],
+                "activation_systems": [],
+                "active_relay_systems": ["ROOT"],
+                "execution_order": ["TARGET"],
+                "execution_order_optimal": true,
+                "execution_hops": 2,
+                "execution_distance_ly": 12.0,
+                "total_edge_distance_ly": 6.0
+            },
+            "stops": [{
+                "system": "TARGET",
+                "location": "TARGET-1-L4",
+                "parent_system": "ROOT",
+                "action": "deploy_and_activate",
+                "relay_code": null,
+                "completed": false
+            }],
+            "hub_stock_relays": [],
+            "print_jobs": [],
+            "planned_transport_capacity": 1,
+            "supply": null,
+            "returned_to_hub": false
+        }))
+        .expect("relay execution fixture")
+    }
+
+    #[tokio::test]
+    async fn failure_routes_persist_waiting_checkpoints_without_new_rows() {
+        let repository =
+            std::sync::Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let kind = WorkflowKind::new("test.failure-routing").expect("valid kind");
+        let event_checkpoint = EventCampaignCheckpoint {
+            archive: Some(EventCampaignArchive {
+                campaign_json: "durable campaign".to_owned(),
+                mission_json: BTreeMap::new(),
+            }),
+            ..EventCampaignCheckpoint::default()
+        };
+        let fixtures = [
+            (
+                FailureRoutingFixture::EventInputs,
+                serde_json::to_value(&event_checkpoint).expect("event checkpoint"),
+                "waiting_for_event_inputs",
+            ),
+            (
+                FailureRoutingFixture::ManagedClientClosed,
+                serde_json::to_value(&event_checkpoint).expect("event checkpoint"),
+                "waiting_for_managed_client",
+            ),
+            (
+                FailureRoutingFixture::EventExecutorContention,
+                serde_json::to_value(&event_checkpoint).expect("event checkpoint"),
+                "waiting_for_event_executor",
+            ),
+            (
+                FailureRoutingFixture::EventDeviceMissing,
+                serde_json::to_value(&event_checkpoint).expect("event checkpoint"),
+                "replanning_after_stale_asset",
+            ),
+            (
+                FailureRoutingFixture::ExplorationDeviceMissing,
+                serde_json::to_value(ExplorationWorkflowCheckpoint {
+                    state: Some(relay_execution_fixture()),
+                    ..ExplorationWorkflowCheckpoint::default()
+                })
+                .expect("exploration checkpoint"),
+                "replanning_relay_coverage",
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (fixture, checkpoint, expected_step) in fixtures {
+            let workflow = repository
+                .create(NewWorkflow {
+                    kind: kind.clone(),
+                    schema_version: 1,
+                    config: fixture,
+                    checkpoint,
+                    current_step: None,
+                    parent_id: None,
+                })
+                .expect("create routing fixture");
+            ids.push((workflow.id, expected_step));
+        }
+        let initial_rows = repository.list().expect("initial rows").len();
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(std::sync::Arc::new(FailureRoutingFactory { kind }))
+            .expect("register routing fixture");
+        let supervisor = replicant_workflow::WorkflowSupervisor::new(
+            repository.clone(),
+            std::sync::Arc::new(registry),
+        );
+
+        for _ in 0..100 {
+            supervisor.tick().await.expect("supervisor tick");
+            if ids.iter().all(|(id, _)| {
+                repository
+                    .read(*id)
+                    .expect("read fixture")
+                    .is_some_and(|workflow| workflow.status == WorkflowStatus::Waiting)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(repository.list().expect("final rows").len(), initial_rows);
+        for (id, expected_step) in ids {
+            let workflow = repository
+                .read(id)
+                .expect("read routed workflow")
+                .expect("routed workflow");
+            assert_eq!(workflow.status, WorkflowStatus::Waiting);
+            assert_eq!(workflow.current_step.as_deref(), Some(expected_step));
+            assert_eq!(workflow.last_error, None);
+            if expected_step == "replanning_after_stale_asset" {
+                let checkpoint: EventCampaignCheckpoint =
+                    workflow.checkpoint().expect("event checkpoint");
+                assert!(checkpoint.archive.is_none());
+                assert!(
+                    !scratch_file(id, "failure-routing.json")
+                        .expect("scratch path")
+                        .exists()
+                );
+            } else if expected_step == "replanning_relay_coverage" {
+                let checkpoint: ExplorationWorkflowCheckpoint =
+                    workflow.checkpoint().expect("exploration checkpoint");
+                assert!(checkpoint.state.is_none());
+                assert!(
+                    !scratch_file(id, "failure-routing.json")
+                        .expect("scratch path")
+                        .exists()
+                );
+            } else {
+                let checkpoint: EventCampaignCheckpoint =
+                    workflow.checkpoint().expect("event checkpoint");
+                assert_eq!(
+                    checkpoint
+                        .archive
+                        .as_ref()
+                        .map(|archive| archive.campaign_json.as_str()),
+                    Some("durable campaign")
+                );
+            }
+        }
+    }
 
     #[test]
     fn stale_trade_criteria_resource_failures_are_retryable() {
@@ -8023,7 +8376,7 @@ mod tests {
     }
 
     #[test]
-    fn event_campaign_runtime_failures_choose_waiting_or_replan() {
+    fn event_campaign_failure_routing() {
         let control = ClassifiedError::new(
             FailureClass::EventControlUnavailable,
             io::ErrorKind::WouldBlock,
@@ -8039,22 +8392,69 @@ mod tests {
             io::ErrorKind::Other,
             "completely reworded input failure",
         );
+        let missing = ClassifiedError::permanent(
+            FailureClass::DeviceTargetMissing,
+            io::ErrorKind::NotFound,
+            "selected device no longer exists",
+        );
+        let contention = ClassifiedError::new(
+            FailureClass::EventExecutorContention,
+            io::ErrorKind::WouldBlock,
+            "another executor owns the campaign file",
+        );
         assert!(retryable_event_campaign_failure(&control));
         assert!(!event_campaign_failure_requires_replan(&control));
         assert!(retryable_event_campaign_failure(&stale));
         assert!(event_campaign_failure_requires_replan(&stale));
         assert!(retryable_event_campaign_failure(&blocked));
-        assert!(event_campaign_failure_waits_for_inputs(&blocked));
+        assert_eq!(
+            event_campaign_wait_step(&blocked),
+            "waiting_for_event_inputs"
+        );
         assert!(!event_campaign_failure_requires_replan(&blocked));
+        assert!(retryable_event_campaign_failure(&missing));
+        assert!(event_campaign_failure_requires_replan(&missing));
+        assert!(stale_relay_plan_failure(&missing));
+        assert!(retryable_event_campaign_failure(&contention));
+        assert_eq!(
+            event_campaign_wait_step(&contention),
+            "waiting_for_event_executor"
+        );
         assert!(retryable_event_campaign_failure(
             &replicant_client::Error::Closed
         ));
+        assert_eq!(
+            event_campaign_wait_step(&replicant_client::Error::Closed),
+            "waiting_for_managed_client"
+        );
         let legacy_upstream = io::Error::other("403 Not your device");
         assert!(retryable_event_campaign_failure(&legacy_upstream));
         assert!(event_campaign_failure_requires_replan(&legacy_upstream));
         assert!(!retryable_event_campaign_failure(&io::Error::other(
             "event criterion is structurally invalid"
         )));
+    }
+
+    #[test]
+    fn exploration_failure_routing() {
+        let missing = ClassifiedError::permanent(
+            FailureClass::DeviceTargetMissing,
+            io::ErrorKind::NotFound,
+            "selected relay no longer exists",
+        );
+        assert!(stale_relay_plan_failure(&missing));
+        assert_eq!(
+            failure_disposition(&missing),
+            replicant_workflow::WorkflowFailureDisposition::Permanent
+        );
+
+        let contention = ClassifiedError::new(
+            FailureClass::ResourceClaimContention,
+            io::ErrorKind::WouldBlock,
+            "resource owner is still active",
+        );
+        assert!(resource_claim_contention(&contention));
+        assert!(!stale_relay_plan_failure(&contention));
     }
 
     #[test]
