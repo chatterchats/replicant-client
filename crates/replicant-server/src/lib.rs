@@ -4842,13 +4842,27 @@ async fn refresh_system_locations(
             tracing::warn!(error = %error, system, "targeted system location refresh failed");
             ApiError::unavailable()
         })?;
+    let inventory_report = state
+        .client()
+        .sync()
+        .domain(SyncDomain::Inventory)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, system, "inventory refresh after system hydration failed");
+            ApiError::unavailable()
+        })?;
     state.invalidate(DomainSlice::Universe);
+    state.invalidate(DomainSlice::Inventory);
     state.flush_invalidations();
-    if report.maximum_reached() || !report.failures().is_empty() {
+    if report.maximum_reached()
+        || !report.failures().is_empty()
+        || !inventory_report.completed.contains(&SyncDomain::Inventory)
+    {
         tracing::warn!(
             system,
             failures = report.failures().len(),
             maximum_reached = report.maximum_reached(),
+            inventory_complete = inventory_report.completed.contains(&SyncDomain::Inventory),
             "targeted system location refresh was incomplete"
         );
         return Err(ApiError::unavailable());
@@ -6669,7 +6683,7 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path},
+        matchers::{body_json, method, path, query_param},
     };
 
     use super::*;
@@ -6764,6 +6778,23 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .and(query_param("limit", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "locations": [{
+                    "location": "SYS-B",
+                    "location_name": "Phasyris",
+                    "items": [{
+                        "resource_type": "structural",
+                        "quantity": 37
+                    }]
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         let (app, client) = test_app_at(&server.uri()).await;
         client
             .locations()
@@ -6796,6 +6827,24 @@ mod tests {
         assert_eq!(full.status(), StatusCode::NO_CONTENT);
         assert_eq!(targeted.status(), StatusCode::NO_CONTENT);
         assert!(client.locations().cached("SYS-B").is_some());
+        let inventories = client.state().inventories().expect("managed inventories");
+        let refreshed = inventories
+            .iter()
+            .find(|inventory| {
+                matches!(
+                    &inventory.owner,
+                    InventoryOwner::Location(location) if location.id.as_str() == "SYS-B"
+                )
+            })
+            .expect("targeted system inventory");
+        assert_eq!(
+            refreshed
+                .items
+                .iter()
+                .find(|item| item.resource == "structural")
+                .map(|item| item.quantity),
+            Some(37)
+        );
         server.verify().await;
         client.close().await.expect("close");
     }
