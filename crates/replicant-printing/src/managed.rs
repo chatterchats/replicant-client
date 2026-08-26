@@ -468,7 +468,7 @@ pub async fn fetch_blueprints(
                     device_type,
                     print_time_seconds: blueprint.print_time.unwrap_or(0.0),
                     features: blueprint.features.unwrap_or_default(),
-                    components: numeric_map(blueprint.components.as_ref()),
+                    components: blueprint.components.unwrap_or_default(),
                 },
             ))
         })
@@ -1990,6 +1990,7 @@ fn string_array_field(object: &Map<String, Value>, name: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn numeric_map(object: Option<&Map<String, Value>>) -> QuantityMap {
     object
         .into_iter()

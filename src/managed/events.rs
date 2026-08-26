@@ -15,6 +15,10 @@
 //! of whether it arrived through the log or SSE, and is stored, reduced, and
 //! cursor-advanced in one atomic commit before publication.
 
+mod projection;
+
+use projection::*;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -29,7 +33,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::domain::{self, DeviceId, DeviceKey, Event, Realm};
+use crate::domain::{self, Event, Realm};
 use crate::events::{EventLogQuery, GameEvent};
 use crate::raw;
 use crate::{Error, Result};
@@ -37,7 +41,7 @@ use crate::{Error, Result};
 use super::client::{
     Client, EventStreamOptions, ReadinessComponent, ReconciliationPolicy, StartupPolicy, WeakClient,
 };
-use super::store::{ReconciliationWork, StoreError};
+use super::store::{EventProjectionBatch, ReconciliationWork, StoreError};
 
 /// A bounded queue deliberately applies backpressure to both input lanes: log
 /// catch-up and SSE await durable application instead of growing memory or
@@ -426,27 +430,231 @@ fn resolve_realm(client: &Client, raw_event: &GameEvent) -> Option<Realm> {
             return realms.pop();
         }
     }
-    None
+    (raw_event.location.is_some() || raw_event.star.is_some()).then_some(Realm::Live)
 }
 
-fn consumed_print_devices(event: &Event) -> Vec<DeviceKey> {
-    if event.name != domain::EventName::PrintCompleted {
-        return Vec::new();
-    }
-    let Some(realm) = event.realm.clone() else {
-        return Vec::new();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventProjectionKind {
+    Upsert,
+    Delete,
+    ReconciliationOnly,
+    HistoryOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventReplayKind {
+    Rebuild,
+    Reconcile,
+    ForwardOnly,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy)]
+struct EventTreatment {
+    name: &'static str,
+    projection: EventProjectionKind,
+    replay: EventReplayKind,
+    reduce: fn(&Client, &Event) -> Result<EventProjectionBatch>,
+}
+
+macro_rules! event_treatments {
+    ($($name:literal => ($projection:ident, $replay:ident, $function:ident, $reducer:ident)),+ $(,)?) => {
+        $(
+            fn $function(client: &Client, event: &Event) -> Result<EventProjectionBatch> {
+                $reducer(client, event)
+            }
+        )+
+
+        const EVENT_TREATMENTS: &[EventTreatment] = &[
+            $(
+                EventTreatment {
+                    name: $name,
+                    projection: EventProjectionKind::$projection,
+                    replay: EventReplayKind::$replay,
+                    reduce: $function,
+                },
+            )+
+        ];
     };
-    event
-        .payload
-        .get("consumed_device_codes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(|code| DeviceKey::in_realm(realm.clone(), DeviceId::from(code)))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+}
+
+event_treatments! {
+    "ami.adopted" => (Upsert, ForwardOnly, projection_ami_adopted, projection_operational_lifecycle),
+    "ami.assembled" => (ReconciliationOnly, Reconcile, projection_ami_assembled, projection_reconciliation_only),
+    "ami.launched" => (ReconciliationOnly, Reconcile, projection_ami_launched, projection_reconciliation_only),
+    "ami.mining.digest" => (HistoryOnly, NotApplicable, projection_ami_mining_digest, projection_history_only),
+    "ami.released" => (Upsert, ForwardOnly, projection_ami_released, projection_operational_lifecycle),
+    "ami.survey.digest" => (Upsert, Rebuild, projection_ami_survey_digest, projection_world_lifecycle),
+    "ami.transport.digest" => (HistoryOnly, NotApplicable, projection_ami_transport_digest, projection_history_only),
+    "ami.withdrawn" => (ReconciliationOnly, Reconcile, projection_ami_withdrawn, projection_reconciliation_only),
+    "blueprint.unlocked" => (Upsert, ForwardOnly, projection_blueprint_unlocked, projection_account_content),
+    "bobnet.new" => (HistoryOnly, NotApplicable, projection_bobnet_new, projection_history_only),
+    "device.attached" => (Upsert, ForwardOnly, projection_device_attached, projection_device_movement),
+    "device.changed_owner" => (Upsert, ForwardOnly, projection_device_changed_owner, projection_device_movement),
+    "device.compacted" => (ReconciliationOnly, Reconcile, projection_device_compacted, projection_reconciliation_only),
+    "device.compacting" => (ReconciliationOnly, Reconcile, projection_device_compacting, projection_reconciliation_only),
+    "device.decommissioned" => (Delete, ForwardOnly, projection_device_decommissioned, projection_device_movement),
+    "device.deployed" => (Upsert, ForwardOnly, projection_device_deployed, projection_device_movement),
+    "device.detached" => (Upsert, ForwardOnly, projection_device_detached, projection_device_movement),
+    "device.stowed" => (Upsert, ForwardOnly, projection_device_stowed, projection_device_movement),
+    "device.unfurled" => (ReconciliationOnly, Reconcile, projection_device_unfurled, projection_reconciliation_only),
+    "device.unfurling" => (ReconciliationOnly, Reconcile, projection_device_unfurling, projection_reconciliation_only),
+    "directive.cleared" => (Upsert, ForwardOnly, projection_directive_cleared, projection_operational_lifecycle),
+    "directive.completed" => (Upsert, ForwardOnly, projection_directive_completed, projection_operational_lifecycle),
+    "directive.paused" => (Upsert, ForwardOnly, projection_directive_paused, projection_operational_lifecycle),
+    "directive.resumed" => (Upsert, ForwardOnly, projection_directive_resumed, projection_operational_lifecycle),
+    "directive.set" => (Upsert, ForwardOnly, projection_directive_set, projection_operational_lifecycle),
+    "diversion.activated" => (Upsert, Rebuild, projection_diversion_activated, projection_automation_primitives),
+    "diversion.deactivated" => (Upsert, Rebuild, projection_diversion_deactivated, projection_automation_primitives),
+    "diversion.diverted" => (Upsert, Rebuild, projection_diversion_diverted, projection_automation_primitives),
+    "diversion.impacted" => (Upsert, Rebuild, projection_diversion_impacted, projection_automation_primitives),
+    "diversion.partial" => (Upsert, Rebuild, projection_diversion_partial, projection_automation_primitives),
+    "event.completed" => (Delete, Rebuild, projection_event_completed, projection_world_lifecycle),
+    "event.discovered" => (Upsert, Rebuild, projection_event_discovered, projection_world_lifecycle),
+    "experience.gained" => (ReconciliationOnly, Reconcile, projection_experience_gained, projection_reconciliation_only),
+    "hub.activated" => (Upsert, ForwardOnly, projection_hub_activated, projection_world_lifecycle),
+    "hub.destroyed" => (Upsert, ForwardOnly, projection_hub_destroyed, projection_world_lifecycle),
+    "hub.maintained" => (Upsert, ForwardOnly, projection_hub_maintained, projection_world_lifecycle),
+    "hub.warning" => (Upsert, ForwardOnly, projection_hub_warning, projection_world_lifecycle),
+    "megastructure.contributed" => (Delete, ForwardOnly, projection_megastructure_contributed, projection_account_content),
+    "message.new" => (Upsert, ForwardOnly, projection_message_new, projection_account_content),
+    "mining.retargeted" => (ReconciliationOnly, Reconcile, projection_mining_retargeted, projection_reconciliation_only),
+    "mining.started" => (ReconciliationOnly, Reconcile, projection_mining_started, projection_reconciliation_only),
+    "mining.stopped" => (ReconciliationOnly, Reconcile, projection_mining_stopped, projection_reconciliation_only),
+    "multiplayer.replicant_entered" => (HistoryOnly, NotApplicable, projection_multiplayer_replicant_entered, projection_history_only),
+    "multiplayer.replicant_left" => (HistoryOnly, NotApplicable, projection_multiplayer_replicant_left, projection_history_only),
+    "print.completed" => (Upsert, ForwardOnly, projection_print_completed, projection_operational_lifecycle),
+    "print.started" => (HistoryOnly, NotApplicable, projection_print_started, projection_history_only),
+    "prospect.completed" => (ReconciliationOnly, Reconcile, projection_prospect_completed, projection_reconciliation_only),
+    "relay.activated" => (ReconciliationOnly, Reconcile, projection_relay_activated, projection_reconciliation_only),
+    "replicant.transferred" => (Upsert, ForwardOnly, projection_replicant_transferred, projection_device_movement),
+    "salvage.depleted" => (Delete, Rebuild, projection_salvage_depleted, projection_automation_primitives),
+    "salvage.discovered" => (Upsert, Rebuild, projection_salvage_discovered, projection_automation_primitives),
+    "scan.completed" => (Upsert, Rebuild, projection_scan_completed, projection_world_lifecycle),
+    "scan.started" => (HistoryOnly, NotApplicable, projection_scan_started, projection_history_only),
+    "search.completed" => (Upsert, Rebuild, projection_search_completed, projection_world_lifecycle),
+    "search.started" => (HistoryOnly, NotApplicable, projection_search_started, projection_history_only),
+    "simulation.abandoned" => (Delete, ForwardOnly, projection_simulation_abandoned, projection_operational_lifecycle),
+    "simulation.completed" => (Delete, ForwardOnly, projection_simulation_completed, projection_operational_lifecycle),
+    "simulation.expired" => (Delete, ForwardOnly, projection_simulation_expired, projection_operational_lifecycle),
+    "simulation.started" => (Upsert, ForwardOnly, projection_simulation_started, projection_operational_lifecycle),
+    "site.depleted" => (Delete, Rebuild, projection_site_depleted, projection_world_lifecycle),
+    "story.awakened" => (ReconciliationOnly, Reconcile, projection_story_awakened, projection_reconciliation_only),
+    "story.hint" => (HistoryOnly, NotApplicable, projection_story_hint, projection_history_only),
+    "system.body_renamed" => (Upsert, ForwardOnly, projection_system_body_renamed, projection_world_lifecycle),
+    "system.devices_halted" => (ReconciliationOnly, Reconcile, projection_system_devices_halted, projection_reconciliation_only),
+    "system.entry_point_set" => (Upsert, ForwardOnly, projection_system_entry_point_set, projection_world_lifecycle),
+    "system.object_detected" => (Upsert, Rebuild, projection_system_object_detected, projection_automation_primitives),
+    "teleport.completed" => (Upsert, ForwardOnly, projection_teleport_completed, projection_device_movement),
+    "teleport.failed" => (HistoryOnly, NotApplicable, projection_teleport_failed, projection_history_only),
+    "teleport.started" => (HistoryOnly, NotApplicable, projection_teleport_started, projection_history_only),
+    "trade.completed" => (Upsert, ForwardOnly, projection_trade_completed, projection_account_content),
+    "trade.created" => (Upsert, ForwardOnly, projection_trade_created, projection_account_content),
+    "trade.deleted" => (Delete, ForwardOnly, projection_trade_deleted, projection_account_content),
+    "transport.collected" => (Upsert, ForwardOnly, projection_transport_collected, projection_operational_lifecycle),
+    "transport.delivered" => (Upsert, ForwardOnly, projection_transport_delivered, projection_operational_lifecycle),
+    "travel.arrived" => (Upsert, ForwardOnly, projection_travel_arrived, projection_device_movement),
+    "travel.cancelled" => (Upsert, ForwardOnly, projection_travel_cancelled, projection_device_movement),
+    "travel.departed" => (Upsert, ForwardOnly, projection_travel_departed, projection_device_movement),
+    "triangulation.complete" => (HistoryOnly, NotApplicable, projection_triangulation_complete, projection_history_only),
+    "triangulation.failed" => (HistoryOnly, NotApplicable, projection_triangulation_failed, projection_history_only),
+    "triangulation.started" => (HistoryOnly, NotApplicable, projection_triangulation_started, projection_history_only),
+    "ward.activated" => (Upsert, ForwardOnly, projection_ward_activated, projection_world_lifecycle),
+    "ward.deactivated" => (Upsert, ForwardOnly, projection_ward_deactivated, projection_world_lifecycle),
+}
+
+fn event_treatment(name: &str) -> Option<&'static EventTreatment> {
+    EVENT_TREATMENTS
+        .iter()
+        .find(|treatment| treatment.name == name)
+}
+
+const EVENT_PROJECTION_NAME: &str = "event_owned";
+pub(crate) const EVENT_PROJECTION_VERSION: i64 = 1;
+const EVENT_PROJECTION_REPLAY_PAGE_SIZE: usize = 1_000;
+
+fn replay_owned_batch(mut batch: EventProjectionBatch) -> EventProjectionBatch {
+    batch.devices.clear();
+    batch.replicants.clear();
+    batch.locations.clear();
+    batch.stars.clear();
+    batch.messages.clear();
+    batch.blueprints.clear();
+    batch.trades.clear();
+    batch.simulations.clear();
+    batch.reconciliation.clear();
+    batch.deletions.retain(|deletion| {
+        matches!(
+            deletion.kind,
+            "resource_site" | "location_event" | "incoming_object"
+        )
+    });
+    batch
+}
+
+impl Client {
+    pub(crate) fn replay_event_projections(&self) -> Result<()> {
+        let replay = self
+            .managed_state()
+            .prepare_projection_replay(EVENT_PROJECTION_NAME, EVENT_PROJECTION_VERSION)
+            .map_err(persistence_error)?;
+        if replay.complete {
+            return Ok(());
+        }
+        let mut last_rowid = replay.last_history_rowid;
+        loop {
+            let rows = self
+                .managed_state()
+                .read_projection_history(
+                    last_rowid,
+                    replay.high_water_rowid,
+                    EVENT_PROJECTION_REPLAY_PAGE_SIZE,
+                )
+                .map_err(persistence_error)?;
+            if rows.is_empty() {
+                break;
+            }
+            let page_last_rowid = rows.last().map(|(rowid, _)| *rowid).unwrap_or(last_rowid);
+            for (rowid, event) in rows {
+                let Some(treatment) = event_treatment(event.name.as_str()) else {
+                    continue;
+                };
+                if treatment.replay != EventReplayKind::Rebuild {
+                    continue;
+                }
+                let batch = replay_owned_batch((treatment.reduce)(self, &event)?);
+                self.managed_state()
+                    .apply_replay_projection(
+                        EVENT_PROJECTION_NAME,
+                        EVENT_PROJECTION_VERSION,
+                        rowid,
+                        replay.high_water_rowid,
+                        batch,
+                    )
+                    .map_err(persistence_error)?;
+                last_rowid = rowid;
+            }
+            if page_last_rowid > last_rowid {
+                self.managed_state()
+                    .apply_replay_projection(
+                        EVENT_PROJECTION_NAME,
+                        EVENT_PROJECTION_VERSION,
+                        page_last_rowid,
+                        replay.high_water_rowid,
+                        EventProjectionBatch::default(),
+                    )
+                    .map_err(persistence_error)?;
+                last_rowid = page_last_rowid;
+            }
+        }
+        self.managed_state()
+            .complete_projection_replay(
+                EVENT_PROJECTION_NAME,
+                EVENT_PROJECTION_VERSION,
+                replay.high_water_rowid,
+            )
+            .map_err(persistence_error)
+    }
 }
 
 fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<ApplyOutcome> {
@@ -461,26 +669,32 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<ApplyOutcome> {
     let event =
         domain::account_event(raw_event, resolve_realm(client, raw_event), observed_at()).value;
     let cursor = raw_event.id.clone();
-    let (scan_locations, scan_fallbacks) = scan_projection(&event);
-    let mut decommissioned = consumed_print_devices(&event);
-    if event.name == domain::EventName::DeviceDecommissioned {
-        // Device decommissioning is an explicit removal signal (unlike a
-        // filtered or visibility-scoped collection page).
-        decommissioned.extend(event.device.iter().cloned());
-    }
-    decommissioned.sort();
-    decommissioned.dedup();
-    let inserted = if !decommissioned.is_empty() {
-        client
-            .managed_state()
-            .apply_event_with_decommission(&event, &cursor, &decommissioned)
-            .map_err(persistence_error)?
+    let treatment = event_treatment(event.name.as_str());
+    let (batch, reconciliation_outcome) = if let Some(treatment) = treatment {
+        let batch = (treatment.reduce)(client, &event)?;
+        let outcome = if batch.reconciliation.is_empty() {
+            matches!(
+                treatment.projection,
+                EventProjectionKind::Upsert | EventProjectionKind::Delete
+            )
+            .then_some("avoided")
+        } else if treatment.projection == EventProjectionKind::ReconciliationOnly {
+            Some("queued")
+        } else {
+            Some("fallback")
+        };
+        let _replay = treatment.replay;
+        (batch, outcome)
     } else {
-        client
-            .managed_state()
-            .apply_event_with_locations(&event, &cursor, scan_locations, scan_fallbacks)
-            .map_err(persistence_error)?
+        (
+            projection::projection_reconciliation_only(client, &event)?,
+            Some("fallback"),
+        )
     };
+    let inserted = client
+        .managed_state()
+        .apply_event_projection(&event, &cursor, batch)
+        .map_err(persistence_error)?;
     if !inserted {
         debug!(
             target: "replicant_client::events",
@@ -489,23 +703,21 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<ApplyOutcome> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "skipping duplicate account event"
         );
-        // The transaction's insert-if-absent claim was lost to the other
-        // lane, so no reducer, publisher, evidence, or reconciliation side
-        // effect may run here.
         return Ok(ApplyOutcome::Duplicate);
     }
-    if event.realm.is_some() && event.name != domain::EventName::DeviceDecommissioned {
-        // This client does not (yet) reduce every documented event type into
-        // a domain projection. Schedule the narrowest safe reconciliation
-        // inferred from the envelope rather than silently trusting the event
-        // payload for anything beyond what was just journaled.
-        schedule_narrow_reconciliation(client, &event)?;
+    if let Some(outcome) = reconciliation_outcome {
+        client.record_event_telemetry(EventTelemetrySample {
+            observed_at_ms: telemetry_now_millis(),
+            metric: "event_reconciliation",
+            outcome: outcome.to_owned(),
+            event_name: Some(event.name.as_str().to_owned()),
+            event_count: 1,
+            page_count: 0,
+            duration_ms: None,
+        });
     }
     if event.realm.is_some() {
         super::operation::resolve_awaiting_evidence(client, &event)?;
-        schedule_print_completion_reconciliation(client, &event)?;
-        schedule_trade_completion_reconciliation(client, &event)?;
-        apply_simulation_lifecycle(client, &event)?;
     }
     let event_name = event.name.as_str().to_owned();
     let realm = event.realm.clone();
@@ -660,122 +872,6 @@ fn scan_projection(
             .map(|target| (realm.clone(), target))
             .collect(),
     )
-}
-
-/// A completed print names the newly created device in its payload rather
-/// than the event envelope. Reconcile it explicitly so tags, ownership, and
-/// placement become visible without waiting for a full device traversal.
-fn schedule_print_completion_reconciliation(client: &Client, event: &Event) -> Result<()> {
-    if event.name != domain::EventName::PrintCompleted {
-        return Ok(());
-    }
-    let Some(realm) = event.realm.as_ref() else {
-        return Ok(());
-    };
-    let Some(code) = event.payload.get("new_device_code").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    client
-        .managed_state()
-        .enqueue_reconciliation(
-            &format!("device:{code}"),
-            realm,
-            "device",
-            &serde_json::json!({ "id": code }),
-        )
-        .map_err(persistence_error)
-}
-
-/// `trade.completed` cross-domain reconciliation: the buyer/seller device
-/// and replicant named on the event envelope are already covered by
-/// [`schedule_narrow_reconciliation`]; this additionally targets any device
-/// codes the payload names directly (the legacy `new_device_codes` field and
-/// 2.3.5's role-specific `rewards_received.devices` or
-/// `criteria_received.devices`), which the envelope's own device/replicant
-/// fields never carry.
-fn schedule_trade_completion_reconciliation(client: &Client, event: &Event) -> Result<()> {
-    if event.name != domain::EventName::TradeCompleted {
-        return Ok(());
-    }
-    let mut codes = BTreeSet::new();
-    if let Some(Value::Array(values)) = event.payload.get("new_device_codes") {
-        codes.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
-    }
-    for outcome in ["rewards_received", "criteria_received"] {
-        let Some(Value::Array(values)) = event
-            .payload
-            .get(outcome)
-            .and_then(Value::as_object)
-            .and_then(|items| items.get("devices"))
-        else {
-            continue;
-        };
-        codes.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
-    }
-    let realm = event.realm.clone().unwrap_or_default();
-    for code in codes {
-        let work_id = format!("device:{code}");
-        let payload = serde_json::json!({ "id": code });
-        client
-            .managed_state()
-            .enqueue_reconciliation(&work_id, &realm, "device", &payload)
-            .map_err(persistence_error)?;
-    }
-    Ok(())
-}
-
-/// A simulation ended server-side (completed, expired, or the player
-/// abandoned it from another session) rather than through
-/// [`super::simulations::SimulationsGateway::abandon`] on this client: clean
-/// up its realm the same way either path does.
-fn apply_simulation_lifecycle(client: &Client, event: &Event) -> Result<()> {
-    if !matches!(
-        event.name.as_str(),
-        "simulation.completed" | "simulation.expired" | "simulation.abandoned"
-    ) {
-        return Ok(());
-    }
-    if let Some(id) = event.payload.get("simulation_id").and_then(Value::as_i64) {
-        super::simulations::cleanup_realm(client, crate::domain::SimulationId::new(id))?;
-    }
-    Ok(())
-}
-
-/// Enqueues durable, coalesced reconciliation work for the narrowest entity
-/// named by the event envelope. An event with no scoped entity falls back to
-/// account reconciliation; that is the narrowest safe recovery for unknown
-/// server events.
-fn schedule_narrow_reconciliation(client: &Client, event: &Event) -> Result<()> {
-    let (work_id, kind, payload) = if let Some(device) = &event.device {
-        (
-            format!("device:{}", device.id.as_str()),
-            "device",
-            serde_json::json!({ "id": device.id.as_str() }),
-        )
-    } else if let Some(replicant) = &event.replicant {
-        (
-            format!("replicant:{}", replicant.id.as_str()),
-            "replicant",
-            serde_json::json!({ "id": replicant.id.as_str() }),
-        )
-    } else if let Some(location) = &event.location {
-        (
-            format!("location:{}", location.id.as_str()),
-            "location",
-            serde_json::json!({ "id": location.id.as_str() }),
-        )
-    } else {
-        (
-            "account:event".to_owned(),
-            "account",
-            serde_json::json!({ "id": "account" }),
-        )
-    };
-    let realm = event.realm.clone().unwrap_or_default();
-    client
-        .managed_state()
-        .enqueue_reconciliation(&work_id, &realm, kind, &payload)
-        .map_err(persistence_error)
 }
 
 /// Fetches the latest unfiltered event ID as a first-start baseline
@@ -1487,7 +1583,12 @@ pub(crate) async fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use tokio::time::timeout;
     use wiremock::{
@@ -1525,6 +1626,45 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+        }
+    }
+
+    trait ApplyScanEvent {
+        fn apply_scan_event(
+            &self,
+            event: &Event,
+            cursor: &str,
+            locations: Vec<Observation<domain::Location>>,
+            fallbacks: Vec<(Realm, String)>,
+        ) -> std::result::Result<bool, StoreError>;
+    }
+
+    impl ApplyScanEvent for crate::managed::state::StateEngine {
+        fn apply_scan_event(
+            &self,
+            event: &Event,
+            cursor: &str,
+            locations: Vec<Observation<domain::Location>>,
+            fallbacks: Vec<(Realm, String)>,
+        ) -> std::result::Result<bool, StoreError> {
+            let reconciliation = fallbacks
+                .into_iter()
+                .map(|(realm, id)| super::super::store::ReconciliationTarget {
+                    work_id: format!("location:{id}"),
+                    realm,
+                    kind: "location",
+                    payload: serde_json::json!({"id": id}),
+                })
+                .collect();
+            self.apply_event_projection(
+                event,
+                cursor,
+                EventProjectionBatch {
+                    locations,
+                    reconciliation,
+                    ..EventProjectionBatch::default()
+                },
+            )
         }
     }
 
@@ -1577,15 +1717,27 @@ mod tests {
         };
         client
             .managed_state()
-            .apply_event(&first, first.id.as_str())
+            .apply_event_projection(
+                &first,
+                first.id.as_str(),
+                crate::managed::store::EventProjectionBatch::default(),
+            )
             .expect("persist first event");
         client
             .managed_state()
-            .apply_event(&second, second.id.as_str())
+            .apply_event_projection(
+                &second,
+                second.id.as_str(),
+                crate::managed::store::EventProjectionBatch::default(),
+            )
             .expect("persist second event");
         client
             .managed_state()
-            .apply_event(&other, other.id.as_str())
+            .apply_event_projection(
+                &other,
+                other.id.as_str(),
+                crate::managed::store::EventProjectionBatch::default(),
+            )
             .expect("persist other event");
 
         let events = client
@@ -1629,7 +1781,11 @@ mod tests {
             };
             client
                 .managed_state()
-                .apply_event(&event, event.id.as_str())
+                .apply_event_projection(
+                    &event,
+                    event.id.as_str(),
+                    crate::managed::store::EventProjectionBatch::default(),
+                )
                 .expect("persist event");
         }
 
@@ -1705,11 +1861,11 @@ mod tests {
         let digest_state = crate::managed::state::StateEngine::open_memory().expect("digest state");
         let (locations, fallbacks) = scan_projection(&direct);
         direct_state
-            .apply_event_with_locations(&direct, direct.id.as_str(), locations, fallbacks)
+            .apply_scan_event(&direct, direct.id.as_str(), locations, fallbacks)
             .expect("direct event");
         let (locations, fallbacks) = scan_projection(&active_digest);
         digest_state
-            .apply_event_with_locations(
+            .apply_scan_event(
                 &active_digest,
                 active_digest.id.as_str(),
                 locations,
@@ -1771,14 +1927,14 @@ mod tests {
             let (locations, fallbacks) = scan_projection(event);
             assert!(
                 direct_state
-                    .apply_event_with_locations(event, event.id.as_str(), locations, fallbacks)
+                    .apply_scan_event(event, event.id.as_str(), locations, fallbacks)
                     .expect("direct scan is committed")
             );
         }
         let (locations, fallbacks) = scan_projection(&digest);
         assert!(
             digest_state
-                .apply_event_with_locations(&digest, digest.id.as_str(), locations, fallbacks)
+                .apply_scan_event(&digest, digest.id.as_str(), locations, fallbacks)
                 .expect("digest is committed")
         );
         assert_eq!(
@@ -1798,7 +1954,7 @@ mod tests {
         let (locations, fallbacks) = scan_projection(replay);
         assert!(
             !direct_state
-                .apply_event_with_locations(replay, replay.id.as_str(), locations, fallbacks)
+                .apply_scan_event(replay, replay.id.as_str(), locations, fallbacks)
                 .expect("replayed direct scan is ignored")
         );
         assert_eq!(
@@ -1829,7 +1985,7 @@ mod tests {
         let (locations, fallbacks) = scan_projection(&event);
         assert!(
             state
-                .apply_event_with_locations(
+                .apply_scan_event(
                     &event,
                     event.id.as_str(),
                     locations.clone(),
@@ -1848,7 +2004,7 @@ mod tests {
         );
         assert!(
             !state
-                .apply_event_with_locations(&event, event.id.as_str(), locations, fallbacks)
+                .apply_scan_event(&event, event.id.as_str(), locations, fallbacks)
                 .expect("replayed event is ignored")
         );
         assert_eq!(state.snapshot().revision(), 1);
@@ -1866,7 +2022,7 @@ mod tests {
             crate::managed::state::StateEngine::open_memory().expect("fallback state");
         let (locations, fallbacks) = scan_projection(&malformed);
         fallback_state
-            .apply_event_with_locations(&malformed, malformed.id.as_str(), locations, fallbacks)
+            .apply_scan_event(&malformed, malformed.id.as_str(), locations, fallbacks)
             .expect("malformed event is still committed");
         let work = fallback_state
             .claim_reconciliation_work()
@@ -2251,6 +2407,817 @@ mod tests {
                 .expect("claim")
                 .is_none()
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn automation_events_persist_resource_sites_and_incoming_objects() {
+        let client = restore_only_client().await;
+        let mut discovered = game_event("1-0", "salvage.discovered", None);
+        discovered.location = Some("SOL-4".to_owned());
+        discovered.payload = serde_json::json!({
+            "designation": "SOL-4-SAL-1",
+            "location": "SOL-4",
+            "salvage_type": "wrecked_relay",
+            "name": "Wrecked Relay",
+            "resources": {"volatiles": 120}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &discovered).expect("apply salvage discovery");
+        let sites = client.locations().resource_sites().expect("resource sites");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].key.id.as_str(), "SOL-4-SAL-1");
+        assert_eq!(sites[0].resources["volatiles"], 120);
+
+        let mut detected = game_event("2-0", "system.object_detected", None);
+        detected.star = Some("SOL".to_owned());
+        detected.payload = serde_json::json!({
+            "object_designation": "SOL-OBJ-2",
+            "size_class": "large",
+            "impact_target": "SOL-4",
+            "impact_eta": "2026-08-26T09:30:00",
+            "discovery_source": "hub"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &detected).expect("apply object detection");
+        let objects = client
+            .locations()
+            .incoming_objects()
+            .expect("incoming objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key.id.as_str(), "SOL-OBJ-2");
+        assert_eq!(
+            objects[0].status,
+            crate::domain::IncomingObjectStatus::Detected
+        );
+
+        let mut depleted = game_event("3-0", "salvage.depleted", None);
+        depleted.location = Some("SOL-4".to_owned());
+        depleted
+            .payload
+            .insert("site".to_owned(), serde_json::json!("SOL-4-SAL-1"));
+        apply_event(&client, &depleted).expect("apply salvage depletion");
+        assert!(
+            client
+                .locations()
+                .resource_sites()
+                .expect("resource sites after depletion")
+                .is_empty()
+        );
+        client.close().await.expect("close");
+    }
+
+    fn replay_test_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "replicant-event-replay-{}-{nonce}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn event_projection_replay_rebuilds_retained_event_owned_state() {
+        let path = replay_test_path();
+        let client = Client::builder()
+            .sqlite(&path)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("open replay seed client");
+        client
+            .managed_state()
+            .persist_devices(&[device("CARRIER"), device("CHILD")])
+            .expect("seed replay devices");
+
+        let mut attached = game_event("1-0", "device.attached", Some("CARRIER"));
+        attached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        apply_event(&client, &attached).expect("apply forward-only device event");
+
+        let mut salvage = game_event("2-0", "salvage.discovered", None);
+        salvage.location = Some("SOL-4".to_owned());
+        salvage.payload = serde_json::json!({
+            "designation": "SOL-4-SAL-1",
+            "location": "SOL-4",
+            "salvage_type": "wreck",
+            "resources": {"carbon": 10}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &salvage).expect("apply salvage discovery");
+        apply_event(&client, &salvage).expect("duplicate salvage is idempotent");
+
+        let mut detected = game_event("3-0", "system.object_detected", None);
+        detected.star = Some("SOL".to_owned());
+        detected.created_at = "2026-08-26T12:00:00Z".to_owned();
+        detected.payload = serde_json::json!({
+            "object_designation": "SOL-OBJ-1",
+            "size_class": "large",
+            "impact_target": "SOL-4"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &detected).expect("apply object detection");
+
+        let mut partial = game_event("4-0", "diversion.partial", None);
+        partial.star = Some("SOL".to_owned());
+        partial.created_at = "2026-08-25T12:00:00Z".to_owned();
+        partial.payload = serde_json::json!({
+            "object_designation": "SOL-OBJ-1",
+            "outcome": "partial"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &partial).expect("apply partial diversion");
+
+        let mut diverted = game_event("5-0", "diversion.diverted", None);
+        diverted.star = Some("SOL".to_owned());
+        diverted.payload = serde_json::json!({
+            "object_designation": "SOL-OBJ-1",
+            "outcome": "diverted"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &diverted).expect("apply diverted transition");
+
+        let mut location_event = game_event("6-0", "event.discovered", None);
+        location_event.location = Some("SOL-4".to_owned());
+        location_event.payload = serde_json::json!({
+            "designation": "SOL-4-EVT-1",
+            "location": "SOL-4",
+            "event_type": "mineral_shortage",
+            "tier": 1,
+            "title": "Mineral Shortage",
+            "description": "Deliver resources",
+            "criteria": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_event(&client, &location_event).expect("apply location event discovery");
+
+        let mut completed = game_event("7-0", "event.completed", None);
+        completed.location = Some("SOL-4".to_owned());
+        completed
+            .payload
+            .insert("designation".to_owned(), serde_json::json!("SOL-4-EVT-1"));
+        apply_event(&client, &completed).expect("apply location event completion");
+
+        let mut depleted = game_event("8-0", "salvage.depleted", None);
+        depleted.location = Some("SOL-4".to_owned());
+        depleted
+            .payload
+            .insert("site".to_owned(), serde_json::json!("SOL-4-SAL-1"));
+        apply_event(&client, &depleted).expect("apply salvage depletion");
+
+        let mut old_digest = game_event("9-0", "ami.mining.digest", Some("CARRIER"));
+        old_digest.payload.insert(
+            "report".to_owned(),
+            serde_json::json!({"resources": {"carbon": {"actual": 99}}}),
+        );
+        apply_event(&client, &old_digest).expect("apply old digest history");
+        client.close().await.expect("close replay seed client");
+
+        let connection = rusqlite::Connection::open(&path).expect("open primary replay database");
+        connection
+            .execute_batch(
+                "DELETE FROM resource_sites;
+                 DELETE FROM location_events;
+                 DELETE FROM discovery_data WHERE kind = 'incoming_object';
+                 DELETE FROM event_projection_metadata;
+                 DELETE FROM device_relationships;",
+            )
+            .expect("clear replay-owned projections");
+        for observation in [device("CARRIER"), device("CHILD")] {
+            connection
+                .execute(
+                    "UPDATE devices SET observation_json = ?2 WHERE device_id = ?1",
+                    rusqlite::params![
+                        observation.value.key.id.as_str(),
+                        serde_json::to_string(&observation).expect("encode reset device")
+                    ],
+                )
+                .expect("reset forward-only device state");
+        }
+        drop(connection);
+        let history_path = super::super::store::history_database_path(&path);
+        let history =
+            rusqlite::Connection::open(&history_path).expect("open replay history database");
+        history
+            .execute(
+                "UPDATE event_history SET appended_at = datetime('now', '-31 days') WHERE event_id = '9-0'",
+                [],
+            )
+            .expect("age digest history");
+        drop(history);
+
+        let replayed = Client::builder()
+            .sqlite(&path)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("reopen and replay retained projections");
+        assert!(
+            replayed
+                .locations()
+                .resource_sites()
+                .expect("replayed resource sites")
+                .is_empty(),
+            "discovery followed by depletion must remain depleted"
+        );
+        let objects = replayed
+            .locations()
+            .incoming_objects()
+            .expect("replayed incoming objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].status,
+            crate::domain::IncomingObjectStatus::Diverted,
+            "history row order, not occurred_at order, owns replay"
+        );
+        assert!(
+            replayed
+                .locations()
+                .location_events()
+                .expect("replayed location events")
+                .is_empty(),
+            "event discovery followed by completion must remain completed"
+        );
+        let carrier = replayed
+            .managed_state()
+            .device(&DeviceKey::live(DeviceId::new("CARRIER")))
+            .expect("restored carrier");
+        assert!(
+            carrier.value.relationships.attached_devices.is_empty(),
+            "forward-only device deltas must not replay"
+        );
+        assert!(
+            replayed
+                .managed_state()
+                .events()
+                .expect("retained history")
+                .iter()
+                .all(|event| event.id.as_str() != "9-0"),
+            "expired AMI telemetry must not fabricate projected quantities"
+        );
+        replayed.close().await.expect("close replayed client");
+
+        let connection = rusqlite::Connection::open(&path).expect("inspect replay metadata");
+        let metadata = connection
+            .query_row(
+                "SELECT state, coverage FROM event_projection_metadata WHERE projection = 'event_owned'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("projection metadata row");
+        assert_eq!(
+            metadata,
+            ("complete".to_owned(), "retained_only".to_owned())
+        );
+        drop(connection);
+        fs::remove_file(&path).expect("remove replay database");
+        fs::remove_file(history_path).expect("remove replay history database");
+    }
+    fn direct_effect_count(batch: &EventProjectionBatch) -> usize {
+        batch.devices.len()
+            + batch.replicants.len()
+            + batch.locations.len()
+            + batch.stars.len()
+            + batch.resource_sites.len()
+            + batch.location_events.len()
+            + batch.incoming_objects.len()
+            + batch.messages.len()
+            + batch.blueprints.len()
+            + batch.trades.len()
+            + batch.simulations.len()
+            + batch.deletions.len()
+    }
+
+    fn collect_payload_strings(value: &Value, strings: &mut BTreeSet<String>) {
+        match value {
+            Value::String(value) if !value.is_empty() => {
+                strings.insert(value.clone());
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect_payload_strings(value, strings);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    collect_payload_strings(value, strings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn matrix_location(id: &str) -> Observation<domain::Location> {
+        Observation {
+            value: domain::Location {
+                key: domain::LocationKey::live(domain::LocationId::new(id)),
+                location_type: None,
+                scanned: None,
+                system_scanned: None,
+                system_tags: Vec::new(),
+                system: None,
+                parent: None,
+                custom_name: None,
+                survey_progress: Default::default(),
+                environment: Default::default(),
+                unknown: BTreeMap::new(),
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
+    fn matrix_replicant() -> Observation<domain::Replicant> {
+        Observation {
+            value: domain::Replicant {
+                key: domain::ReplicantKey::live(domain::ReplicantId::new("R0")),
+                name: Some("Matrix Replicant".to_owned()),
+                is_npc: Some(false),
+                status: None,
+                location: Some(domain::LocationKey::live(domain::LocationId::new("LOC"))),
+                hosted_device: Some(DeviceKey::live(DeviceId::new("D0"))),
+                travel: None,
+                private: None,
+                access: AccessScope::Owned,
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
+    fn matrix_star(id: &str) -> Observation<domain::Star> {
+        Observation {
+            value: domain::Star {
+                key: domain::StarKey::live(domain::StarId::new(id)),
+                name: Some(id.to_owned()),
+                spectral_type: None,
+                entry_point: None,
+                position: None,
+                has_hub: Some(false),
+                has_ward: Some(false),
+                knowledge_observed: true,
+                explored: Some(true),
+                has_life: None,
+                region: None,
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
+    fn matrix_simulation(id: domain::SimulationId) -> Observation<domain::Simulation> {
+        Observation {
+            value: domain::Simulation {
+                id,
+                scenario_code: Some("matrix".to_owned()),
+                scenario_name: None,
+                starting_location: None,
+                starting_star: None,
+                is_mine: true,
+                started_at: Some("2026-08-26T00:00:00Z".to_owned()),
+                completed_at: None,
+                lifecycle: domain::SimulationLifecycle::Active,
+                seed_failures: Vec::new(),
+                replicant_code: Some("R0".to_owned()),
+            },
+            metadata: device("metadata").metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_projection_policy_row_reopens_and_deduplicates() {
+        let client = restore_only_client().await;
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/events-2.5.2.json"))
+                .expect("event coverage fixture");
+        let fixtures = fixture["events"]
+            .as_array()
+            .expect("event fixture rows")
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().expect("fixture event name"),
+                    row["payload"].clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let direct = EVENT_TREATMENTS
+            .iter()
+            .filter(|treatment| {
+                matches!(
+                    treatment.projection,
+                    EventProjectionKind::Upsert | EventProjectionKind::Delete
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(direct.len(), 53, "policy direct-treatment total changed");
+
+        for (index, treatment) in direct.into_iter().enumerate() {
+            let mut payload = fixtures
+                .get(treatment.name)
+                .unwrap_or_else(|| panic!("missing fixture for {}", treatment.name))
+                .as_object()
+                .expect("fixture payload object")
+                .clone();
+            if treatment.name == "ami.survey.digest" {
+                payload.insert(
+                    "report".to_owned(),
+                    serde_json::json!({
+                        "scans": [{
+                            "device_code": "D0",
+                            "scan_target": "LOC",
+                            "scan_type": "planet",
+                            "report": {"planet": {"designation": "LOC"}}
+                        }]
+                    }),
+                );
+            }
+            if treatment.name == "diversion.deactivated" {
+                payload.insert("device_code".to_owned(), serde_json::json!("D0"));
+            }
+
+            let mut strings = BTreeSet::from(["D0".to_owned(), "LOC".to_owned()]);
+            collect_payload_strings(&Value::Object(payload.clone()), &mut strings);
+            let devices = strings.iter().map(|id| device(id)).collect::<Vec<_>>();
+            client
+                .managed_state()
+                .persist_devices(&devices)
+                .unwrap_or_else(|error| panic!("seed devices for {}: {error}", treatment.name));
+            client
+                .managed_state()
+                .persist_replicant(matrix_replicant())
+                .unwrap_or_else(|error| panic!("seed replicant for {}: {error}", treatment.name));
+
+            let mut location_ids = BTreeSet::from(["LOC".to_owned()]);
+            for field in [
+                "designation",
+                "location",
+                "scan_target",
+                "search_target",
+                "impact_target",
+            ] {
+                if let Some(id) = payload.get(field).and_then(Value::as_str) {
+                    location_ids.insert(id.to_owned());
+                }
+            }
+            for id in location_ids {
+                client
+                    .managed_state()
+                    .persist_location(matrix_location(&id))
+                    .unwrap_or_else(|error| {
+                        panic!("seed location for {}: {error}", treatment.name)
+                    });
+            }
+            let mut star_ids = BTreeSet::from(["STAR".to_owned()]);
+            if let Some(id) = payload.get("star").and_then(Value::as_str) {
+                star_ids.insert(id.to_owned());
+            }
+            client
+                .managed_state()
+                .replace_catalogue(star_ids.iter().map(|id| matrix_star(id)).collect(), None)
+                .unwrap_or_else(|error| panic!("seed stars for {}: {error}", treatment.name));
+            let simulation_id = payload
+                .get("simulation_id")
+                .and_then(Value::as_i64)
+                .map(domain::SimulationId::new)
+                .unwrap_or_else(|| domain::SimulationId::new(17));
+            client
+                .managed_state()
+                .persist_simulation(matrix_simulation(simulation_id))
+                .unwrap_or_else(|error| panic!("seed simulation for {}: {error}", treatment.name));
+            client
+                .managed_state()
+                .persist_devices(&[device_in_realm(Realm::Simulation(simulation_id), "SIM-D")])
+                .unwrap_or_else(|error| {
+                    panic!("seed simulation device for {}: {error}", treatment.name)
+                });
+
+            let cursor = format!("{}-0", index + 1);
+            let raw = GameEvent {
+                id: cursor.clone(),
+                version: 1,
+                category: "matrix".to_owned(),
+                event: treatment.name.to_owned(),
+                replicant_code: Some("R0".to_owned()),
+                device_code: Some("D0".to_owned()),
+                device_type: None,
+                star: Some("STAR".to_owned()),
+                location: Some("LOC".to_owned()),
+                payload,
+                created_at: "2026-08-26T00:00:00Z".to_owned(),
+                extra: Default::default(),
+            };
+            let event = domain::account_event(&raw, Some(Realm::Live), observed_at()).value;
+            let batch = (treatment.reduce)(&client, &event)
+                .unwrap_or_else(|error| panic!("reduce {}: {error}", treatment.name));
+            assert!(
+                direct_effect_count(&batch) > 0,
+                "{} produced no declared durable effect",
+                treatment.name
+            );
+
+            let path = replay_test_path();
+            let mut store =
+                super::super::store::Store::open_file(&path).expect("open matrix store");
+            let mut persisted_event = event.clone();
+            persisted_event.id = domain::EventId::new("1-0");
+            assert!(
+                store
+                    .apply_event_projection(&persisted_event, "1-0", &batch)
+                    .unwrap_or_else(|error| panic!("persist {}: {error}", treatment.name))
+            );
+            let persisted_rows = store
+                .projection_row_count()
+                .unwrap_or_else(|error| panic!("count {}: {error}", treatment.name));
+            assert!(
+                persisted_rows > 0,
+                "{} persisted no projection rows",
+                treatment.name
+            );
+            drop(store);
+
+            let mut reopened =
+                super::super::store::Store::open_file(&path).expect("reopen matrix store");
+            assert_eq!(
+                reopened.projection_row_count().expect("reopened row count"),
+                persisted_rows,
+                "{} changed after reopen",
+                treatment.name
+            );
+            assert!(
+                reopened
+                    .projection_batch_matches(&batch)
+                    .unwrap_or_else(|error| {
+                        panic!("verify reopened effect for {}: {error}", treatment.name)
+                    }),
+                "{} exact persisted effect differed after reopen",
+                treatment.name
+            );
+            assert!(
+                !reopened
+                    .apply_event_projection(&persisted_event, "1-0", &batch)
+                    .unwrap_or_else(|error| panic!("deduplicate {}: {error}", treatment.name))
+            );
+            assert_eq!(
+                reopened
+                    .projection_row_count()
+                    .expect("deduplicated row count"),
+                persisted_rows,
+                "{} duplicate changed projection rows",
+                treatment.name
+            );
+            assert!(
+                reopened
+                    .projection_batch_matches(&batch)
+                    .unwrap_or_else(|error| {
+                        panic!("verify deduplicated effect for {}: {error}", treatment.name)
+                    }),
+                "{} exact persisted effect differed after duplicate",
+                treatment.name
+            );
+            assert_eq!(reopened.event_count().expect("deduplicated event count"), 1);
+            drop(reopened);
+            fs::remove_file(&path).expect("remove matrix database");
+            fs::remove_file(super::super::store::history_database_path(&path))
+                .expect("remove matrix history database");
+
+            client
+                .managed_state()
+                .apply_event_projection(&event, &cursor, batch)
+                .unwrap_or_else(|error| {
+                    panic!("apply matrix context for {}: {error}", treatment.name)
+                });
+        }
+        client.close().await.expect("close matrix client");
+    }
+
+    #[derive(Default)]
+    struct RecordingTelemetry {
+        samples: Mutex<Vec<EventTelemetrySample>>,
+    }
+
+    impl EventTelemetrySink for RecordingTelemetry {
+        fn record(&self, sample: EventTelemetrySample) {
+            self.samples
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sample);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reducers_avoid_detail_gets_and_missing_state_falls_back_once() {
+        let server = MockServer::start().await;
+        for id in [
+            "MISS_ATTACH",
+            "MISS_DETACH",
+            "MISS_STOW",
+            "MISS_DEPLOY",
+            "MISS_OWNER",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/devices/{id}")))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "Device not found"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let telemetry = Arc::new(RecordingTelemetry::default());
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .event_telemetry_sink(telemetry.clone())
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only telemetry client");
+        client
+            .managed_state()
+            .persist_devices(&[device("CARRIER"), device("CHILD")])
+            .expect("seed lifecycle devices");
+
+        let mut attached = game_event("1-0", "device.attached", Some("CARRIER"));
+        attached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        let mut detached = game_event("2-0", "device.detached", Some("CARRIER"));
+        detached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        let mut stowed = game_event("3-0", "device.stowed", Some("CHILD"));
+        stowed.payload.insert(
+            "stowed_in_device_code".to_owned(),
+            serde_json::json!("CARRIER"),
+        );
+        let mut deployed = game_event("4-0", "device.deployed", Some("CHILD"));
+        deployed.payload.insert(
+            "deployed_from_device_code".to_owned(),
+            serde_json::json!("CARRIER"),
+        );
+        let mut changed_owner = game_event("5-0", "device.changed_owner", Some("CHILD"));
+        changed_owner
+            .payload
+            .insert("to_replicant".to_owned(), serde_json::json!("R2"));
+        for event in [attached, detached, stowed, deployed, changed_owner] {
+            apply_event(&client, &event).expect("apply complete lifecycle event");
+            assert!(
+                client
+                    .managed_state()
+                    .claim_reconciliation_work()
+                    .expect("claim avoided work")
+                    .is_none()
+            );
+        }
+
+        let mut missing_attached = game_event("6-0", "device.attached", Some("CARRIER"));
+        missing_attached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("MISS_ATTACH"));
+        let mut missing_detached = game_event("7-0", "device.detached", Some("CARRIER"));
+        missing_detached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("MISS_DETACH"));
+        let mut missing_stowed = game_event("8-0", "device.stowed", Some("CHILD"));
+        missing_stowed.payload.insert(
+            "stowed_in_device_code".to_owned(),
+            serde_json::json!("MISS_STOW"),
+        );
+        let mut missing_deployed = game_event("9-0", "device.deployed", Some("CHILD"));
+        missing_deployed.payload.insert(
+            "deployed_from_device_code".to_owned(),
+            serde_json::json!("MISS_DEPLOY"),
+        );
+        let mut missing_owner = game_event("10-0", "device.changed_owner", Some("MISS_OWNER"));
+        missing_owner.location = Some("LOC".to_owned());
+        missing_owner
+            .payload
+            .insert("to_replicant".to_owned(), serde_json::json!("R2"));
+        for (event, expected_id) in [
+            (missing_attached, "MISS_ATTACH"),
+            (missing_detached, "MISS_DETACH"),
+            (missing_stowed, "MISS_STOW"),
+            (missing_deployed, "MISS_DEPLOY"),
+            (missing_owner, "MISS_OWNER"),
+        ] {
+            apply_event(&client, &event).expect("apply incomplete lifecycle event");
+            let work = client
+                .managed_state()
+                .claim_reconciliation_work()
+                .expect("claim fallback work")
+                .expect("one fallback work item");
+            assert_eq!(work.work_id, format!("device:{expected_id}"));
+            process_reconciliation_work(&client, &work)
+                .await
+                .expect("404 fallback completes");
+            client
+                .managed_state()
+                .complete_reconciliation_work(&work.work_id)
+                .expect("complete fallback work");
+        }
+        server.verify().await;
+
+        {
+            let samples = telemetry
+                .samples
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                samples
+                    .iter()
+                    .filter(|sample| {
+                        sample.metric == "event_reconciliation" && sample.outcome == "avoided"
+                    })
+                    .count(),
+                5
+            );
+            let fallback_names = samples
+                .iter()
+                .filter(|sample| {
+                    sample.metric == "event_reconciliation" && sample.outcome == "fallback"
+                })
+                .filter_map(|sample| sample.event_name.as_deref())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                fallback_names,
+                BTreeSet::from([
+                    "device.attached",
+                    "device.changed_owner",
+                    "device.deployed",
+                    "device.detached",
+                    "device.stowed",
+                ])
+            );
+        }
+        client.close().await.expect("close telemetry client");
+    }
+
+    #[tokio::test]
+    async fn device_relationship_events_update_both_sides_atomically() {
+        let client = restore_only_client().await;
+        client
+            .managed_state()
+            .persist_devices(&[device("CARRIER"), device("CHILD")])
+            .expect("seed devices");
+
+        let mut attached = game_event("1-0", "device.attached", Some("CARRIER"));
+        attached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        attached
+            .payload
+            .insert("target_type".to_owned(), serde_json::json!("survey_drone"));
+        apply_event(&client, &attached).expect("apply attach");
+        let carrier_key = DeviceKey::live(DeviceId::new("CARRIER"));
+        let child_key = DeviceKey::live(DeviceId::new("CHILD"));
+        let carrier = client
+            .managed_state()
+            .device(&carrier_key)
+            .expect("carrier after attach");
+        let child = client
+            .managed_state()
+            .device(&child_key)
+            .expect("child after attach");
+        assert_eq!(
+            carrier.value.relationships.attached_devices.as_slice(),
+            std::slice::from_ref(&child_key)
+        );
+        assert_eq!(
+            child.value.relationships.attached_to,
+            Some(carrier_key.clone())
+        );
+
+        let mut detached = game_event("2-0", "device.detached", Some("CARRIER"));
+        detached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        apply_event(&client, &detached).expect("apply detach");
+        let carrier = client
+            .managed_state()
+            .device(&carrier_key)
+            .expect("carrier after detach");
+        let child = client
+            .managed_state()
+            .device(&child_key)
+            .expect("child after detach");
+        assert!(carrier.value.relationships.attached_devices.is_empty());
+        assert_eq!(child.value.relationships.attached_to, None);
         client.close().await.expect("close");
     }
 

@@ -4537,7 +4537,7 @@ async fn entity_inspector(
                     status: device.status.clone(),
                 },
                 provenance: Some(inspector::provenance(&observation.metadata)),
-                detail: EntityInspectorDetail::Device(device),
+                detail: EntityInspectorDetail::Device(Box::new(device)),
             }
         }
         "system" => {
@@ -4650,7 +4650,7 @@ async fn entity_inspector(
                 metadata,
                 summary,
                 provenance: Some(inspector::provenance(&observation.metadata)),
-                detail: EntityInspectorDetail::Location(detail),
+                detail: EntityInspectorDetail::Location(Box::new(detail)),
             }
         }
         _ => {

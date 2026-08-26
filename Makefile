@@ -148,6 +148,7 @@ contract-policy-check:
 	$(PYTHON) scripts/contract_policy_check.py
 
 policy-checks: contract-policy-check
+	$(PYTHON) scripts/contract_coverage_check.py
 	$(PYTHON) scripts/forward_compatibility_policy_check.py
 	$(PYTHON) scripts/raw_transport_policy_check.py
 	$(PYTHON) scripts/schema_policy_check.py

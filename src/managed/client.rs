@@ -652,6 +652,7 @@ impl ClientBuilder {
             raw: inner.raw.clone(),
             inner,
         };
+        client.replay_event_projections()?;
         client.set_readiness(|readiness| {
             readiness.local_restoration = ReadinessComponent::Ready;
             readiness.store_health = ReadinessComponent::Ready;

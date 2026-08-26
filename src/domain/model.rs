@@ -248,6 +248,8 @@ pub struct Location {
     pub system: Option<String>,
     pub parent: Option<LocationKey>,
     #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
     pub survey_progress: LocationSurveyProgress,
     pub environment: LocationEnvironment,
     /// Sanitized, untyped response fields retained for a later contract update.
@@ -332,6 +334,10 @@ impl Location {
         }
         self.system = newer.system.clone().or_else(|| self.system.clone());
         self.parent = newer.parent.clone().or_else(|| self.parent.clone());
+        self.custom_name = newer
+            .custom_name
+            .clone()
+            .or_else(|| self.custom_name.clone());
         self.survey_progress.planets_total = newer
             .survey_progress
             .planets_total
@@ -435,6 +441,57 @@ pub struct Inventory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSite {
+    pub key: ResourceSiteKey,
+    pub location: Option<LocationKey>,
+    pub site_type: Option<String>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub resources: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocationEvent {
+    pub key: LocationEventKey,
+    pub location: Option<LocationKey>,
+    pub event_type: Option<String>,
+    pub tier: Option<i64>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub criteria: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncomingObjectStatus {
+    #[default]
+    Detected,
+    DiversionActive,
+    Partial,
+    Diverted,
+    Impacted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncomingObject {
+    pub key: IncomingObjectKey,
+    pub star: Option<StarKey>,
+    pub size_class: Option<String>,
+    pub impact_target: Option<LocationKey>,
+    pub impact_eta: Option<String>,
+    pub discovery_source: Option<String>,
+    pub status: IncomingObjectStatus,
+    pub propulsor: Option<DeviceKey>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
     pub realm: Option<Realm>,
@@ -453,6 +510,12 @@ pub struct Trade {
     pub key: TradeKey,
     pub controller: DeviceKey,
     pub status: Option<TradeStatus>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub remaining_stock: Option<i64>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -519,6 +582,8 @@ pub struct Message {
     pub title: Option<String>,
     pub body: Option<String>,
     pub category: Option<String>,
+    #[serde(default)]
+    pub subcategory: Option<String>,
     pub message_type: Option<String>,
     pub is_read: Option<bool>,
     pub created_at: Option<String>,

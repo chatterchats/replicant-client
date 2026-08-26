@@ -10,7 +10,7 @@
 //! automatically after a request may have reached the server, since a lost
 //! response cannot prove whether the command executed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use reqwest::Method;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -464,7 +464,7 @@ pub enum DeviceCommand {
     /// Collects resources into this device's cargo.
     CollectResources {
         /// Resource type to quantity to collect.
-        resources: JsonObject,
+        resources: BTreeMap<String, f64>,
     },
     /// Compacts this device's stowed contents.
     Compact,
@@ -485,7 +485,7 @@ pub enum DeviceCommand {
     DepositResources {
         /// Resource type to quantity to deposit.
         #[serde(skip_serializing_if = "Option::is_none")]
-        resources: Option<JsonObject>,
+        resources: Option<BTreeMap<String, f64>>,
     },
     /// Removes a queued print job.
     DequeuePrint {

@@ -5059,14 +5059,11 @@ async fn secure_trade_device_rewards(
     Ok(true)
 }
 
-fn resource_command_object(
-    resources: &ResourceMap,
-) -> Result<serde_json::Map<String, Value>, String> {
-    let value = serde_json::to_value(resources).map_err(string_error)?;
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "resource manifest did not serialize as an object".to_owned())
+fn resource_command_object(resources: &ResourceMap) -> Result<BTreeMap<String, f64>, String> {
+    Ok(resources
+        .iter()
+        .map(|(resource, quantity)| (resource.clone(), *quantity as f64))
+        .collect())
 }
 
 fn raw_cargo_quantity(detail: &replicant_client::raw::devices::DeviceStatus) -> i64 {

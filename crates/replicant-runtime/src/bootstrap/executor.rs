@@ -2702,7 +2702,7 @@ async fn collect_resource_with_cargo(
         )
         .await?;
     }
-    let resources = [(resource.to_owned(), Value::from(quantity))]
+    let resources = [(resource.to_owned(), quantity as f64)]
         .into_iter()
         .collect();
     ensure_operation(

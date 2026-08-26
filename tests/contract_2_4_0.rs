@@ -106,7 +106,7 @@ fn new_event_payloads_decode_through_typed_helpers() {
             "direction": [0.4, 0.9, 0.0]
         }),
     )
-    .triangulation_completed()
+    .triangulation_complete()
     .expect("triangulation payload")
     .expect("matching triangulation event");
     assert_eq!(completed.direction, vec![0.4, 0.9, 0.0]);

@@ -1,0 +1,1029 @@
+{
+  "contract_version": "2.5.2",
+  "events": [
+    {
+      "name": "ami.adopted",
+      "payload": {
+        "devices": [
+          {
+            "device_code": "A1B2C3D4",
+            "device_type": "mining_drone"
+          },
+          {
+            "device_code": "E5F60718",
+            "device_type": "mining_drone"
+          }
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:17"
+    },
+    {
+      "name": "ami.assembled",
+      "payload": {
+        "destination": "SOL-4",
+        "assembled_count": 6
+      },
+      "evidence": "api/events/catalogue/index.md:34"
+    },
+    {
+      "name": "ami.launched",
+      "payload": {
+        "directive_status": "active",
+        "evaluated": true,
+        "devices_deployed": 4
+      },
+      "evidence": "api/events/catalogue/index.md:49"
+    },
+    {
+      "name": "ami.mining.digest",
+      "payload": {
+        "directive": "deplete_smallest",
+        "activity": {
+          "counts": {
+            "mining.resource_depleted": 1,
+            "mining.started": 1
+          },
+          "event_count": 2,
+          "window": [
+            "2026-07-16T12:48:49+01:00",
+            "2026-07-16T12:48:59+01:00"
+          ]
+        },
+        "devices": [
+          {
+            "device_code": "4EC618A9",
+            "events": 2,
+            "last_event": "mining.started",
+            "status": "mining (conductive)"
+          },
+          {
+            "device_code": "54EE8574",
+            "status": "mining (carbon)"
+          },
+          {
+            "device_code": "5E37E65A",
+            "status": "mining (conductive)"
+          }
+        ],
+        "report": {
+          "location": "NUNKA-BELT-1",
+          "resources": {
+            "carbon": {
+              "actual": 1,
+              "capacity": 28,
+              "desired": 1
+            },
+            "conductive": {
+              "actual": 2,
+              "capacity": 11,
+              "desired": 2
+            },
+            "rares": {
+              "actual": 0,
+              "capacity": 0,
+              "desired": 0,
+              "exhausted": true
+            },
+            "silicates": {
+              "actual": 0,
+              "capacity": 11,
+              "desired": 0
+            },
+            "structural": {
+              "actual": 0,
+              "capacity": 195,
+              "desired": 0
+            },
+            "volatiles": {
+              "actual": 0,
+              "capacity": 0,
+              "desired": 0,
+              "exhausted": true
+            }
+          }
+        }
+      },
+      "evidence": "api/events/ami-digests/index.md:37"
+    },
+    {
+      "name": "ami.released",
+      "payload": {
+        "devices": [
+          {
+            "device_code": "A1B2C3D4",
+            "device_type": "mining_drone"
+          }
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:65"
+    },
+    {
+      "name": "ami.survey.digest",
+      "payload": {
+        "directive": "survey_system",
+        "activity": {
+          "counts": {
+            "salvage.discovered": 1,
+            "scan.completed": 3,
+            "travel.departed": 3
+          },
+          "event_count": 7,
+          "window": [
+            "2026-07-16T12:58:01+01:00",
+            "2026-07-16T12:58:19+01:00"
+          ]
+        },
+        "devices": [
+          {
+            "device_code": "00AC58D1",
+            "events": 2,
+            "last_event": "travel.departed",
+            "status": "travelling"
+          },
+          {
+            "device_code": "0F20C3DC",
+            "events": 2,
+            "last_event": "travel.departed",
+            "status": "travelling"
+          },
+          {
+            "device_code": "73983EFE",
+            "events": 3,
+            "last_event": "travel.departed",
+            "status": "travelling"
+          }
+        ],
+        "report": {
+          "assigned_this_tick": 3,
+          "busy": 3,
+          "idle": 0,
+          "progress": {
+            "remaining": 8,
+            "scanned": 28,
+            "total": 36
+          },
+          "scans": [
+            {
+              "device_code": "00AC58D1",
+              "scan_target": "NUNKA-3",
+              "scan_type": "planet",
+              "report": {}
+            },
+            {
+              "device_code": "0F20C3DC",
+              "scan_target": "NUNKA-4",
+              "scan_type": "planet",
+              "report": {}
+            },
+            {
+              "device_code": "73983EFE",
+              "scan_target": "NUNKA-5",
+              "scan_type": "planet",
+              "report": {}
+            }
+          ]
+        }
+      },
+      "evidence": "api/events/ami-digests/index.md:38"
+    },
+    {
+      "name": "ami.transport.digest",
+      "payload": {
+        "directive": "ferry",
+        "activity": {
+          "counts": {
+            "travel.departed": 1
+          },
+          "event_count": 1,
+          "window": [
+            "2026-07-16T09:09:41+01:00",
+            "2026-07-16T09:09:41+01:00"
+          ]
+        },
+        "devices": [
+          {
+            "device_code": "43B427DC",
+            "events": 1,
+            "last_event": "travel.departed",
+            "status": "cruising"
+          },
+          {
+            "device_code": "88E8E2BA",
+            "status": "surging"
+          },
+          {
+            "device_code": "FD4580C2",
+            "status": "cruising"
+          }
+        ],
+        "report": {
+          "cargo_capacity": 60,
+          "cargo_carried": 20,
+          "collect": "ULKURUD-1",
+          "deliver": "NUNKA-BELT-1",
+          "fleet": {
+            "delivering": 3,
+            "loading": 0,
+            "waiting": 0
+          }
+        }
+      },
+      "evidence": "api/events/ami-digests/index.md:39"
+    },
+    {
+      "name": "ami.withdrawn",
+      "payload": {
+        "directive_paused": true,
+        "devices_recalled": 4
+      },
+      "evidence": "api/events/catalogue/index.md:81"
+    },
+    {
+      "name": "blueprint.unlocked",
+      "payload": {
+        "device_type": "ftl_relay",
+        "short_description": "Chunky FTL network hardware for interstellar remote control.",
+        "description": "The FTL relay is a heavy rack-like device built from stacked circuit planes, ceramic...",
+        "resources": {
+          "structural": 80,
+          "conductive": 120,
+          "silicates": 100,
+          "carbon": 20,
+          "volatiles": 10,
+          "rares": 40
+        },
+        "components": null,
+        "print_time": 600,
+        "requires_autofactory": false
+      },
+      "evidence": "api/events/catalogue/index.md:96"
+    },
+    {
+      "name": "bobnet.new",
+      "payload": {
+        "id": 4821,
+        "replicant_name": "Bob-1",
+        "replicant_code": "57F0F6C8",
+        "current_star": "SOL",
+        "channel": "general",
+        "message": "Anyone found rares in this system?"
+      },
+      "evidence": "api/events/catalogue/index.md:123"
+    },
+    {
+      "name": "device.attached",
+      "payload": {
+        "target_code": "A1B2C3D4",
+        "target_type": "mining_drone"
+      },
+      "evidence": "api/events/catalogue/index.md:142"
+    },
+    {
+      "name": "device.changed_owner",
+      "payload": {
+        "from_replicant": "57F0F6C8",
+        "to_replicant": "8AFE4482",
+        "direction": "sent"
+      },
+      "evidence": "api/events/catalogue/index.md:157"
+    },
+    {
+      "name": "device.compacted",
+      "payload": {},
+      "evidence": "api/events/catalogue/index.md:173"
+    },
+    {
+      "name": "device.compacting",
+      "payload": {
+        "completes_at": "2026-08-06T15:22:00Z"
+      },
+      "evidence": "api/events/catalogue/index.md:187"
+    },
+    {
+      "name": "device.decommissioned",
+      "payload": {
+        "resources_recovered": {
+          "structural": 50
+        },
+        "blueprint_discovered": null
+      },
+      "evidence": "api/events/catalogue/index.md:201"
+    },
+    {
+      "name": "device.deployed",
+      "payload": {
+        "deployed_from_device_code": "7FE981A0"
+      },
+      "evidence": "api/events/catalogue/index.md:216"
+    },
+    {
+      "name": "device.detached",
+      "payload": {
+        "target_code": "A1B2C3D4",
+        "target_type": "mining_drone"
+      },
+      "evidence": "api/events/catalogue/index.md:230"
+    },
+    {
+      "name": "device.stowed",
+      "payload": {
+        "stowed_in_device_code": "7FE981A0"
+      },
+      "evidence": "api/events/catalogue/index.md:273"
+    },
+    {
+      "name": "device.unfurled",
+      "payload": {},
+      "evidence": "api/events/catalogue/index.md:245"
+    },
+    {
+      "name": "device.unfurling",
+      "payload": {
+        "completes_at": "2026-08-06T15:22:00Z"
+      },
+      "evidence": "api/events/catalogue/index.md:259"
+    },
+    {
+      "name": "directive.cleared",
+      "payload": {
+        "previous_directive": "mine_belt"
+      },
+      "evidence": "api/events/catalogue/index.md:287"
+    },
+    {
+      "name": "directive.completed",
+      "payload": {
+        "directive": "mine_belt"
+      },
+      "evidence": "api/events/catalogue/index.md:301"
+    },
+    {
+      "name": "directive.paused",
+      "payload": {
+        "directive": "mine_belt"
+      },
+      "evidence": "api/events/catalogue/index.md:315"
+    },
+    {
+      "name": "directive.resumed",
+      "payload": {
+        "directive": "mine_belt"
+      },
+      "evidence": "api/events/catalogue/index.md:329"
+    },
+    {
+      "name": "directive.set",
+      "payload": {
+        "directive": "mine_belt",
+        "configuration": {
+          "resource": "structural",
+          "desired": 2000
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:343"
+    },
+    {
+      "name": "diversion.activated",
+      "payload": {
+        "object_designation": "SOL-OBJ-3",
+        "size_class": "large"
+      },
+      "evidence": "api/events/catalogue/index.md:361"
+    },
+    {
+      "name": "diversion.deactivated",
+      "payload": {
+        "device_code": "A1B2C3D4"
+      },
+      "evidence": "api/events/catalogue/index.md:376"
+    },
+    {
+      "name": "diversion.diverted",
+      "payload": {
+        "object_designation": "SOL-OBJ-3",
+        "outcome": "diverted"
+      },
+      "evidence": "api/events/catalogue/index.md:390"
+    },
+    {
+      "name": "diversion.impacted",
+      "payload": {
+        "object_designation": "SOL-OBJ-3"
+      },
+      "evidence": "api/events/catalogue/index.md:405"
+    },
+    {
+      "name": "diversion.partial",
+      "payload": {
+        "object_designation": "SOL-OBJ-3",
+        "outcome": "diverted"
+      },
+      "evidence": "api/events/catalogue/index.md:419"
+    },
+    {
+      "name": "event.completed",
+      "payload": {
+        "designation": "NUNKA-4-EVT-001",
+        "location": "NUNKA-4",
+        "event_type": "mineral_shortage",
+        "tier": 1,
+        "rewards": {
+          "xp": 450,
+          "resources": {
+            "volatiles": 150
+          },
+          "civilisation_points": 1
+        },
+        "consumed": {
+          "devices": [
+            {
+              "device_code": "A1B2C3D4",
+              "device_type": "mining_drone"
+            }
+          ],
+          "resources": {
+            "minerals": 500
+          }
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:434"
+    },
+    {
+      "name": "event.discovered",
+      "payload": {
+        "designation": "NUNKA-4-EVT-001",
+        "location": "NUNKA-4",
+        "event_type": "mineral_shortage",
+        "tier": 1,
+        "title": "Mineral Shortage",
+        "description": "The colony is running low on building materials...",
+        "criteria": [
+          {
+            "name": "default",
+            "devices": [],
+            "resources": {
+              "structural": 200,
+              "conductive": 100
+            }
+          }
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:462"
+    },
+    {
+      "name": "experience.gained",
+      "payload": {
+        "source": "location_event",
+        "amount": 450
+      },
+      "evidence": "api/events/catalogue/index.md:488"
+    },
+    {
+      "name": "hub.activated",
+      "payload": {
+        "star": "CHAMAKUY",
+        "location": "CHAMAKUY-4"
+      },
+      "evidence": "api/events/catalogue/index.md:514"
+    },
+    {
+      "name": "hub.destroyed",
+      "payload": {
+        "star": "CHAMAKUY",
+        "location": "CHAMAKUY-4"
+      },
+      "evidence": "api/events/catalogue/index.md:529"
+    },
+    {
+      "name": "hub.maintained",
+      "payload": {
+        "resources_consumed": {
+          "structural": 50,
+          "carbon": 25
+        },
+        "capacity": 67.0
+      },
+      "evidence": "api/events/catalogue/index.md:559"
+    },
+    {
+      "name": "hub.warning",
+      "payload": {
+        "capacity": 25.0,
+        "warning_type": "wear"
+      },
+      "evidence": "api/events/catalogue/index.md:544"
+    },
+    {
+      "name": "megastructure.contributed",
+      "payload": {
+        "megastructure_designation": "DATACENTRE-001",
+        "accepted_count": 2,
+        "contributed_devices": [
+          {
+            "device_code": "A1B2C3D4",
+            "device_type": "mining_drone"
+          },
+          {
+            "device_code": "E5F60718",
+            "device_type": "service_bot"
+          }
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:577"
+    },
+    {
+      "name": "message.new",
+      "payload": {
+        "message_id": 4812,
+        "message_type": "achievement",
+        "title": "Event completed: Mineral Shortage",
+        "body": "The civilisation at SOL-4 has received your assistance..."
+      },
+      "evidence": "api/events/catalogue/index.md:596"
+    },
+    {
+      "name": "mining.retargeted",
+      "payload": {
+        "location_type": "belt",
+        "location": "SOL-BELT-1",
+        "site": "SOL-BELT-1-SITE-3",
+        "old_resource": "volatiles",
+        "new_resource": "structural",
+        "availability": "high",
+        "density": "moderate",
+        "cycle_time_seconds": 52
+      },
+      "evidence": "api/events/catalogue/index.md:613"
+    },
+    {
+      "name": "mining.started",
+      "payload": {
+        "location_type": "belt",
+        "location": "SOL-BELT-1",
+        "site": "SOL-BELT-1-SITE-3",
+        "resource_type": "structural",
+        "availability": "high",
+        "density": "moderate",
+        "cycle_time_seconds": 52
+      },
+      "evidence": "api/events/catalogue/index.md:634"
+    },
+    {
+      "name": "mining.stopped",
+      "payload": {
+        "location": "SOL-BELT-1",
+        "resource_type": "structural",
+        "quantity_mined": 340
+      },
+      "evidence": "api/events/catalogue/index.md:654"
+    },
+    {
+      "name": "multiplayer.replicant_entered",
+      "payload": {
+        "replicant_code": "57F0F6C8",
+        "replicant_name": "Bob-1"
+      },
+      "evidence": "api/events/catalogue/index.md:670"
+    },
+    {
+      "name": "multiplayer.replicant_left",
+      "payload": {
+        "replicant_code": "57F0F6C8",
+        "replicant_name": "Bob-1"
+      },
+      "evidence": "api/events/catalogue/index.md:685"
+    },
+    {
+      "name": "print.completed",
+      "payload": {
+        "device_type": "parallax_array",
+        "new_device_code": "A1B2C3D4",
+        "print_mode": "autofactory",
+        "compacted": false,
+        "consumed_device_codes": [
+          "E5F6G7H8",
+          "J9K0L1M2",
+          "N3P4Q5R6"
+        ],
+        "tags": [
+          "fleet-a",
+          "miner"
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:717"
+    },
+    {
+      "name": "print.started",
+      "payload": {
+        "device_type": "mining_drone",
+        "print_mode": "vessel",
+        "completes_at": "2026-08-02T14:30:00Z",
+        "tags": [
+          "fleet-a",
+          "miner"
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:700"
+    },
+    {
+      "name": "prospect.completed",
+      "payload": {
+        "origin": "SOL",
+        "stars_generated": 3,
+        "stars": [
+          "CHAMAKUY",
+          "NERIDA",
+          "VOSSK"
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:736"
+    },
+    {
+      "name": "relay.activated",
+      "payload": {
+        "star": "CHAMAKUY",
+        "location": "CHAMAKUY-BELT-1"
+      },
+      "evidence": "api/events/catalogue/index.md:752"
+    },
+    {
+      "name": "replicant.transferred",
+      "payload": {
+        "old_host": "7FE981A0",
+        "new_host": "A1B2C3D4"
+      },
+      "evidence": "api/events/catalogue/index.md:767"
+    },
+    {
+      "name": "salvage.depleted",
+      "payload": {
+        "site": "SOL-4-SAL-1"
+      },
+      "evidence": "api/events/catalogue/index.md:782"
+    },
+    {
+      "name": "salvage.discovered",
+      "payload": {
+        "designation": "SOL-4-SAL-1",
+        "location": "SOL-4",
+        "salvage_type": "wrecked_relay",
+        "name": "Wrecked Relay",
+        "resources": {
+          "volatiles": 120,
+          "structural": 80
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:796"
+    },
+    {
+      "name": "scan.completed",
+      "payload": {
+        "scan_target": "NUNKA-BELT-1",
+        "scan_type": "belt",
+        "report": {
+          "belt": {
+            "density": "moderate",
+            "designation": "NUNKA-BELT-1",
+            "resource_sites": [
+              {
+                "designation": "NUNKA-BELT-1-SITE-17",
+                "name": "NUNKA-BELT-1 Site 17",
+                "resources": {
+                  "carbon": {
+                    "availability": "high",
+                    "depletion_pct": 100,
+                    "original": 20,
+                    "remaining": 0
+                  },
+                  "structural": {
+                    "availability": "moderate",
+                    "depletion_pct": 0,
+                    "original": 57,
+                    "remaining": 57
+                  }
+                },
+                "site_index": 17,
+                "tracked_by": "00AC58D1"
+              }
+            ]
+          }
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:814"
+    },
+    {
+      "name": "scan.started",
+      "payload": {
+        "scan_target": "SOL-4",
+        "scan_type": "planet",
+        "eta_seconds": 45
+      },
+      "evidence": "api/events/catalogue/index.md:857"
+    },
+    {
+      "name": "search.completed",
+      "payload": {
+        "search_target": "NUNKA-BELT-1",
+        "search_type": "belt",
+        "report": {
+          "site": "NUNKA-BELT-1-SITE-2",
+          "resources": {
+            "structural": 949,
+            "conductive": 63,
+            "silicates": 158,
+            "carbon": 190,
+            "volatiles": 21,
+            "rares": 27
+          }
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:873"
+    },
+    {
+      "name": "search.started",
+      "payload": {
+        "search_target": "SOL-BELT-1",
+        "search_type": "belt",
+        "eta_seconds": 30
+      },
+      "evidence": "api/events/catalogue/index.md:899"
+    },
+    {
+      "name": "simulation.abandoned",
+      "payload": {
+        "simulation_id": 17,
+        "scenario_code": "mining_rush"
+      },
+      "evidence": "api/events/catalogue/index.md:915"
+    },
+    {
+      "name": "simulation.completed",
+      "payload": {
+        "simulation_id": 17,
+        "scenario_code": "asteroid_strike",
+        "score_seconds": 842,
+        "resources_mined": 1200,
+        "devices_printed": 4
+      },
+      "evidence": "api/events/catalogue/index.md:930"
+    },
+    {
+      "name": "simulation.expired",
+      "payload": {
+        "simulation_id": 17,
+        "scenario_code": "mining_rush"
+      },
+      "evidence": "api/events/catalogue/index.md:948"
+    },
+    {
+      "name": "simulation.started",
+      "payload": {
+        "simulation_id": 17,
+        "scenario_code": "mining_rush",
+        "starting_star": "VIRTSOL"
+      },
+      "evidence": "api/events/catalogue/index.md:963"
+    },
+    {
+      "name": "site.depleted",
+      "payload": {
+        "site": "SOL-BELT-1-SITE-12"
+      },
+      "evidence": "api/events/catalogue/index.md:979"
+    },
+    {
+      "name": "story.awakened",
+      "payload": {
+        "new_replicant_code": "8AFE4482",
+        "new_replicant_name": "Bob-2",
+        "host_device_code": "7FE981A0"
+      },
+      "evidence": "api/events/catalogue/index.md:993"
+    },
+    {
+      "name": "story.hint",
+      "payload": {
+        "hint": "salvage_site",
+        "planet": "SOL-4",
+        "designation": "SOL-4-SAL-1"
+      },
+      "evidence": "api/events/catalogue/index.md:1009"
+    },
+    {
+      "name": "system.body_renamed",
+      "payload": {
+        "body_type": "planet",
+        "designation": "CHAMAKUY-4",
+        "new_name": "New Eden"
+      },
+      "evidence": "api/events/catalogue/index.md:1025"
+    },
+    {
+      "name": "system.devices_halted",
+      "payload": {
+        "star": "CHAMAKUY",
+        "devices_halted": 12
+      },
+      "evidence": "api/events/catalogue/index.md:1041"
+    },
+    {
+      "name": "system.entry_point_set",
+      "payload": {
+        "star": "CHAMAKUY",
+        "entry_point": "CHAMAKUY-4-L4"
+      },
+      "evidence": "api/events/catalogue/index.md:1056"
+    },
+    {
+      "name": "system.object_detected",
+      "payload": {
+        "object_designation": "SOL-OBJ-2",
+        "size_class": "large",
+        "impact_target": "SOL-4",
+        "impact_eta": "2026-08-26T09:30:00",
+        "discovery_source": "hub"
+      },
+      "evidence": "api/events/catalogue/index.md:1071"
+    },
+    {
+      "name": "teleport.completed",
+      "payload": {
+        "destination_star": "CHAMAKUY",
+        "new_host_code": "7FE981A0"
+      },
+      "evidence": "api/events/catalogue/index.md:1089"
+    },
+    {
+      "name": "teleport.failed",
+      "payload": {
+        "reason": "target matrix missing",
+        "target_matrix_code": "8AFE4482"
+      },
+      "evidence": "api/events/catalogue/index.md:1104"
+    },
+    {
+      "name": "teleport.started",
+      "payload": {
+        "source_star": "SOL",
+        "destination_star": "CHAMAKUY",
+        "target_matrix_code": "8AFE4482"
+      },
+      "evidence": "api/events/catalogue/index.md:1119"
+    },
+    {
+      "name": "trade.completed",
+      "payload": {
+        "trade_code": "TRD-007C22",
+        "trade_name": "Structural for Volatiles",
+        "role": "buyer",
+        "rewards_received": {
+          "resources": {
+            "structural": 200
+          },
+          "devices": [
+            "A1B2C3D4"
+          ]
+        }
+      },
+      "evidence": "api/events/catalogue/index.md:1135"
+    },
+    {
+      "name": "trade.created",
+      "payload": {
+        "trade_code": "TRD-007C22",
+        "name": "Structural for Volatiles",
+        "stock": 10
+      },
+      "evidence": "api/events/catalogue/index.md:1170"
+    },
+    {
+      "name": "trade.deleted",
+      "payload": {
+        "trade_code": "TRD-007C22",
+        "name": "Structural for Volatiles",
+        "remaining_stock": 3
+      },
+      "evidence": "api/events/catalogue/index.md:1186"
+    },
+    {
+      "name": "transport.collected",
+      "payload": {
+        "resources": {
+          "structural": 200,
+          "volatiles": 50
+        },
+        "total": 250,
+        "cargo_after": 250,
+        "cargo_capacity": 500
+      },
+      "evidence": "api/events/catalogue/index.md:1202"
+    },
+    {
+      "name": "transport.delivered",
+      "payload": {
+        "resources": {
+          "structural": 200
+        },
+        "total": 200,
+        "cargo_after": 0,
+        "cargo_capacity": 500
+      },
+      "evidence": "api/events/catalogue/index.md:1219"
+    },
+    {
+      "name": "travel.arrived",
+      "payload": {
+        "attached_devices": [
+          "8879C667"
+        ],
+        "destination": "OCRUX-BELT-1",
+        "origin": "OCRUX-5",
+        "recalling": false,
+        "travel_type": "cruise"
+      },
+      "evidence": "api/events/catalogue/index.md:1236"
+    },
+    {
+      "name": "travel.cancelled",
+      "payload": {
+        "travel_type": "surge",
+        "origin": "SOL",
+        "destination": "CHAMAKUY",
+        "return_time_seconds": 60,
+        "attached_devices": [
+          "A1B2C3D4"
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:1256"
+    },
+    {
+      "name": "travel.departed",
+      "payload": {
+        "travel_type": "cruise",
+        "origin": "SOL-4",
+        "destination": "SOL-BELT-1",
+        "distance_au": 1.82,
+        "distance_ly": 4.37,
+        "travel_time_seconds": 120,
+        "arrives_at": "2026-07-20T14:02:00Z",
+        "attached_devices": [
+          "A1B2C3D4"
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:1274"
+    },
+    {
+      "name": "triangulation.complete",
+      "payload": {
+        "signature": "a3f7c2e8b1d94f06",
+        "target": [
+          5000,
+          14000,
+          100
+        ],
+        "direction": [
+          0.4,
+          0.9,
+          0.0
+        ]
+      },
+      "evidence": "api/events/catalogue/index.md:1312"
+    },
+    {
+      "name": "triangulation.failed",
+      "payload": {
+        "signature": "a3f7c2e8b1d94f06",
+        "target": [
+          5000,
+          14000,
+          100
+        ],
+        "reason": "signature_not_found"
+      },
+      "evidence": "api/events/catalogue/index.md:1328"
+    },
+    {
+      "name": "triangulation.started",
+      "payload": {
+        "signature": "a3f7c2e8b1d94f06",
+        "target": [
+          5000,
+          14000,
+          100
+        ],
+        "completes_at": "2026-08-05T13:30:00Z"
+      },
+      "evidence": "api/events/catalogue/index.md:1344"
+    },
+    {
+      "name": "ward.activated",
+      "payload": {},
+      "evidence": "api/events/catalogue/index.md:1360"
+    },
+    {
+      "name": "ward.deactivated",
+      "payload": {},
+      "evidence": "api/events/catalogue/index.md:1374"
+    }
+  ]
+}

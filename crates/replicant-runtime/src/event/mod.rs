@@ -1688,8 +1688,8 @@ async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, Bluepri
                     cargo_capacity: blueprint.cargo_capacity.unwrap_or(0),
                     attach_capacity: blueprint.attach_capacity.unwrap_or(0),
                     stow_capacity: blueprint.stow_capacity.unwrap_or(0),
-                    resources: numeric_map(blueprint.resources.as_ref()),
-                    components: numeric_map(blueprint.components.as_ref()),
+                    resources: blueprint.resources.unwrap_or_default(),
+                    components: blueprint.components.unwrap_or_default(),
                     features: blueprint.features.unwrap_or_default().into_iter().collect(),
                 },
             ))
@@ -1759,17 +1759,6 @@ fn build_factory_workloads(
         .collect::<Vec<_>>();
     workloads.sort_by(|left, right| left.code.cmp(&right.code));
     workloads
-}
-
-fn numeric_map(object: Option<&Map<String, Value>>) -> BTreeMap<String, i64> {
-    let Some(object) = object else {
-        return BTreeMap::new();
-    };
-    object
-        .iter()
-        .filter_map(|(key, value)| value_to_i64(value).map(|amount| (key.clone(), amount)))
-        .filter(|(_, amount)| *amount > 0)
-        .collect()
 }
 
 fn value_to_i64(value: &Value) -> Option<i64> {

@@ -685,6 +685,7 @@ mod location_predicate_tests {
             system_tags: Vec::new(),
             system: Some("SOL".into()),
             parent: None,
+            custom_name: None,
             survey_progress: Default::default(),
             environment: LocationEnvironment {
                 atmosphere: Knowledge::Present(Atmosphere::Standard),
@@ -3134,6 +3135,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: Some("SOL".into()),
                 parent: None,
+                custom_name: None,
                 survey_progress: Default::default(),
                 environment: Default::default(),
                 unknown: BTreeMap::new(),
@@ -3195,6 +3197,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: None,
                 parent: None,
+                custom_name: None,
                 survey_progress: Default::default(),
                 environment: domain::LocationEnvironment {
                     atmosphere: Knowledge::Present(Atmosphere::Standard),

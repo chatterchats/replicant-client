@@ -1,10 +1,10 @@
 {
-  "$schema_note": "Provenance for the verified Replicant Space 2.5.1 OpenAPI and rendered-document corpus.",
-  "replicant_space_version": "2.5.1",
-  "crawl_timestamp": "2026-08-22T22:43:52.221888+00:00",
+  "$schema_note": "Provenance for the verified Replicant Space 2.5.2 OpenAPI and rendered-document corpus.",
+  "replicant_space_version": "2.5.2",
+  "crawl_timestamp": "2026-08-25T15:34:33.019856+00:00",
   "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
-  "openapi_fetched_at": "2026-08-22T22:43:52.221888+00:00",
-  "openapi_sha256": "732314ad27f9d1e488bf232717a4a109e793afce34d9db0468ed1b5f2eef72c1",
+  "openapi_fetched_at": "2026-08-25T15:34:33.019856+00:00",
+  "openapi_sha256": "df5f74046e95678f54161b930af6d8b1abbe4b07b1718e485b5a4d46f6757639",
   "openapi_operation_count": 89,
   "openapi_path_count": 75,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
@@ -61,13 +61,13 @@
   "notes": [
     "Versioned reference snapshots live under reference/replicant-space-X-Y-Z; scripts/reference_snapshot.py selects the highest semantic version as the current contract.",
     "Crawler-internal .source-html and .crawl-cache.json artifacts are not contract content. manifest.json and openapi.json are retained in handoff ZIPs and verified by scripts/contract_policy_check.py.",
-    "Replicant Space 2.5.1 keeps 75 paths, 89 operations, and 160 schemas. It adds has_ward to star listings, arrival_time to travel responses, description fields to device status, wildcard tags/exclude_tags device filters, and four documented hub/multiplayer events."
+    "Replicant Space 2.5.2 keeps 75 paths, 89 operations, 160 schemas, and 87 rendered pages. The schema set is unchanged; WebhookInfoSchema adds nullable blocked_until and MessageSettingsSchema only reorders an enum."
   ],
-  "documentation_version": "2.5.1",
-  "documentation_crawled_at": "2026-08-22T22:43:52.221888+00:00",
-  "openapi_version": "2.5.1",
+  "documentation_version": "2.5.2",
+  "documentation_crawled_at": "2026-08-25T15:34:33.019856+00:00",
+  "openapi_version": "2.5.2",
   "documented_operation_delta_count": 0,
-  "documentation_manifest_sha256": "0b17b844c106df449c8d36d16b471a6cbcac1c3870b6649b768442b685251bd5",
+  "documentation_manifest_sha256": "9444e118020ef8e80271b3bf8fec35e2c657d4df3e773ce8b6e0444ecacad50c",
   "documentation_page_count": 87,
   "openapi_schema_count": 160
 }

@@ -250,12 +250,20 @@ mod tests {
         };
         client
             .managed_state()
-            .apply_event(&bobnet_event, "1-0")
+            .apply_event_projection(
+                &bobnet_event,
+                "1-0",
+                crate::managed::store::EventProjectionBatch::default(),
+            )
             .expect("apply bobnet event");
         client.managed_events().notify(bobnet_event);
         client
             .managed_state()
-            .apply_event(&device_event, "2-0")
+            .apply_event_projection(
+                &device_event,
+                "2-0",
+                crate::managed::store::EventProjectionBatch::default(),
+            )
             .expect("apply device event");
         client.managed_events().notify(device_event);
 

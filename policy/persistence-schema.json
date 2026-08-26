@@ -1,6 +1,15 @@
 {
-  "schema_version": 4,
+  "schema_version": 6,
+  "event_projection_version": 1,
   "migration": "migrations/0001_initial.sql",
+  "primary_migrations": [
+    "migrations/0001_initial.sql",
+    "migrations/0002_device_relationship_semantics.sql",
+    "migrations/0003_reconciliation_leader.sql",
+    "migrations/0004_history_split.sql",
+    "migrations/0005_message_metadata.sql",
+    "migrations/0006_event_projection_metadata.sql"
+  ],
   "observation_time": "unix_milliseconds (INTEGER)",
   "sqlite_durability": "primary/history: WAL for file databases; busy_timeout=15000ms; synchronous=NORMAL; history uses incremental auto-vacuum",
   "durable_managed_projections": [
@@ -9,6 +18,12 @@
     "replicants",
     "locations",
     "inventories",
+    "discovery_data",
+    "resource_sites",
+    "location_events",
+    "messages",
+    "blueprints",
+    "trades",
     "simulations",
     "stars"
   ],
@@ -41,7 +56,8 @@
     "reconciliation_queue",
     "reconciliation_runs",
     "freshness",
-    "tombstones"
+    "tombstones",
+    "event_projection_metadata"
   ],
   "required_indexes": [
     "devices_realm_type_status",

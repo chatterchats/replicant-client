@@ -716,11 +716,11 @@ pub struct LocationInspectorSummary {
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum EntityInspectorDetail {
     /// Managed device details.
-    Device(DeviceSummary),
+    Device(Box<DeviceSummary>),
     /// Managed system details.
     System(SystemInspectorSummary),
     /// Managed location details.
-    Location(LocationInspectorSummary),
+    Location(Box<LocationInspectorSummary>),
 }
 
 /// Authoritative selected-entity Inspector projection.
@@ -3623,7 +3623,7 @@ mod tests {
             metadata: metadata.clone(),
             summary: summary.clone(),
             provenance: provenance.clone(),
-            detail: EntityInspectorDetail::Device(device),
+            detail: EntityInspectorDetail::Device(Box::new(device)),
         }));
 
         let grouped = EntityCollectionSummary {
@@ -3682,7 +3682,7 @@ mod tests {
             metadata,
             summary,
             provenance,
-            detail: EntityInspectorDetail::Location(LocationInspectorSummary {
+            detail: EntityInspectorDetail::Location(Box::new(LocationInspectorSummary {
                 location_type: Some("planet".to_owned()),
                 system: Some("SOL".to_owned()),
                 parent: None,
@@ -3725,7 +3725,7 @@ mod tests {
                     }],
                     groups: Vec::new(),
                 },
-            }),
+            })),
         }));
 
         round_trip(&DeviceCommandBinding {

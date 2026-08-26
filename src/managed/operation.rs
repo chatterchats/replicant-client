@@ -1058,6 +1058,51 @@ impl LocationsGateway {
         super::gateways::LocationQuery::new(self.client.clone())
     }
 
+    /// Returns every retained resource-site projection without network I/O.
+    pub fn resource_sites(&self) -> Result<Vec<domain::ResourceSite>> {
+        self.client.ensure_open()?;
+        let mut sites = self
+            .client
+            .managed_state()
+            .resource_sites()
+            .map_err(persistence_error)?
+            .into_iter()
+            .map(|observation| observation.value)
+            .collect::<Vec<_>>();
+        sites.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(sites)
+    }
+
+    /// Returns every retained location-event projection without network I/O.
+    pub fn location_events(&self) -> Result<Vec<domain::LocationEvent>> {
+        self.client.ensure_open()?;
+        let mut events = self
+            .client
+            .managed_state()
+            .location_events()
+            .map_err(persistence_error)?
+            .into_iter()
+            .map(|observation| observation.value)
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(events)
+    }
+
+    /// Returns every retained incoming-object projection without network I/O.
+    pub fn incoming_objects(&self) -> Result<Vec<domain::IncomingObject>> {
+        self.client.ensure_open()?;
+        let mut objects = self
+            .client
+            .managed_state()
+            .incoming_objects()
+            .map_err(persistence_error)?
+            .into_iter()
+            .map(|observation| observation.value)
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(objects)
+    }
+
     async fn get_scoped(
         &self,
         designation: &str,
@@ -3309,8 +3354,8 @@ mod tests {
                 command,
             }
         }
-        let resources =
-            || serde_json::from_value(serde_json::json!({"structural": 10})).expect("object");
+        let command_resources =
+            || std::collections::BTreeMap::from([("structural".to_owned(), 10.0)]);
 
         assert_events(
             device(raw::devices::DeviceCommand::Activate),
@@ -3345,7 +3390,7 @@ mod tests {
         );
         assert_events(
             device(raw::devices::DeviceCommand::CollectResources {
-                resources: resources(),
+                resources: command_resources(),
             }),
             &["transport.collected"],
         );
@@ -3359,7 +3404,7 @@ mod tests {
         );
         assert_events(
             device(raw::devices::DeviceCommand::DepositResources {
-                resources: Some(resources()),
+                resources: Some(command_resources()),
             }),
             &["transport.delivered"],
         );
@@ -3458,7 +3503,8 @@ mod tests {
         assert_events(
             MutationAdapter::DeviceCreateTrade {
                 device_code: "D1".into(),
-                request: resources(),
+                request: serde_json::from_value(serde_json::json!({"structural": 10}))
+                    .expect("trade request object"),
             },
             &["trade.created"],
         );

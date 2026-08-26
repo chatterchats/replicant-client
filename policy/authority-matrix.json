@@ -1,7 +1,7 @@
 {
   "version": 1,
   "sync_domain_policy": "policy/sync-domains.json",
-  "contract": "Verified Replicant Space 2.5.1 OpenAPI corpus",
+  "contract": "Verified Replicant Space 2.5.2 OpenAPI corpus",
   "operations": [
     {
       "method": "POST",

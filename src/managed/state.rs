@@ -11,13 +11,15 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::domain::{
-    AccessScope, Account, Device, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    LocationKey, MergeOutcome, Message, Observation, Realm, Replicant, ReplicantKey, Simulation,
-    SimulationId, Star, StarKey, StarKnowledge, merge_device, merge_star,
+    AccessScope, Account, Device, DeviceKey, Event, IncomingObject, Inventory, InventoryOwner,
+    Location, LocationEvent, LocationKey, MergeOutcome, Message, Observation, Realm, Replicant,
+    ReplicantKey, ResourceSite, Simulation, SimulationId, Star, StarKey, StarKnowledge,
+    merge_device, merge_star,
 };
 
 use super::store::{
-    MessageMetadata, OperationJournalEntry, ReconciliationWork, StoreError, StoreHandle,
+    EventProjectionBatch, MessageMetadata, OperationJournalEntry, ProjectionReplayState,
+    ReconciliationWork, StoreError, StoreHandle,
 };
 
 /// Local-only managed-state revision gateway.
@@ -461,6 +463,18 @@ impl StateEngine {
         Ok((store.restore_messages()?, store.message_metadata()?))
     }
 
+    pub(crate) fn resource_sites(&self) -> Result<Vec<Observation<ResourceSite>>, StoreError> {
+        self.store.lock().restore_resource_sites()
+    }
+
+    pub(crate) fn location_events(&self) -> Result<Vec<Observation<LocationEvent>>, StoreError> {
+        self.store.lock().restore_location_events()
+    }
+
+    pub(crate) fn incoming_objects(&self) -> Result<Vec<Observation<IncomingObject>>, StoreError> {
+        self.store.lock().restore_incoming_objects()
+    }
+
     pub(crate) fn persist_messages(
         &self,
         messages: &[Observation<Message>],
@@ -718,6 +732,65 @@ impl StateEngine {
             .read_events_desc(limit, offset)
     }
 
+    pub(crate) fn prepare_projection_replay(
+        &self,
+        projection: &str,
+        version: i64,
+    ) -> Result<ProjectionReplayState, StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .prepare_projection_replay(projection, version)
+    }
+
+    pub(crate) fn read_projection_history(
+        &self,
+        after_rowid: i64,
+        high_water_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Event)>, StoreError> {
+        self.store
+            .lock()
+            .as_ref()
+            .ok_or(StoreError::Closed)?
+            .read_projection_history(after_rowid, high_water_rowid, limit)
+    }
+
+    pub(crate) fn apply_replay_projection(
+        &self,
+        projection: &str,
+        version: i64,
+        last_history_rowid: i64,
+        high_water_rowid: i64,
+        batch: EventProjectionBatch,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .apply_replay_projection(
+                projection,
+                version,
+                last_history_rowid,
+                high_water_rowid,
+                &batch,
+            )
+    }
+
+    pub(crate) fn complete_projection_replay(
+        &self,
+        projection: &str,
+        version: i64,
+        high_water_rowid: i64,
+    ) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .complete_projection_replay(projection, version, high_water_rowid)
+    }
+
     /// Persists a baseline watermark with no accompanying event.
     pub(crate) fn set_event_cursor(&self, cursor: &str) -> Result<(), StoreError> {
         self.store
@@ -749,96 +822,90 @@ impl StateEngine {
             .backdate_event_cursor(seconds)
     }
 
-    /// Commits an event and advances the applied cursor atomically, then
-    /// publishes a new state revision.
-    pub(crate) fn apply_event(&self, event: &Event, cursor: &str) -> Result<bool, StoreError> {
-        self.apply_event_with_locations(event, cursor, Vec::new(), Vec::new())
-    }
-
-    /// Commits an event, any safe scan-derived locations, and fallback work in
-    /// one transaction before publishing one state revision.
-    pub(crate) fn apply_event_with_locations(
+    /// Commits every declared event effect and advances its cursor atomically,
+    /// then publishes one matching in-memory revision.
+    pub(crate) fn apply_event_projection(
         &self,
         event: &Event,
         cursor: &str,
-        locations: Vec<Observation<Location>>,
-        reconciliation_targets: Vec<(Realm, String)>,
+        mut batch: EventProjectionBatch,
     ) -> Result<bool, StoreError> {
         let previous = self.snapshot();
-        let mut next_locations = previous.locations.clone();
-        let mut projected = Vec::new();
-        for mut location in locations {
-            if let Some(existing) = next_locations.get(&location.value.key) {
+        let mut devices = previous.devices.clone();
+        let mut replicants = previous.replicants.clone();
+        let mut locations = previous.locations.clone();
+        let mut simulations = previous.simulations.clone();
+        for observation in &batch.devices {
+            devices.insert(observation.value.key.clone(), observation.clone());
+        }
+        for observation in &batch.replicants {
+            replicants.insert(observation.value.key.clone(), observation.clone());
+        }
+        for location in &mut batch.locations {
+            if let Some(existing) = locations.get(&location.value.key) {
                 let mut merged = existing.value.clone();
                 merged.merge_from(&location.value);
                 location.value = merged;
             }
-            next_locations.insert(location.value.key.clone(), location.clone());
-            if let Some(existing) =
-                projected
-                    .iter_mut()
-                    .find(|existing: &&mut Observation<Location>| {
-                        existing.value.key == location.value.key
-                    })
-            {
-                *existing = location;
-            } else {
-                projected.push(location);
+            locations.insert(location.value.key.clone(), location.clone());
+        }
+        for observation in &batch.simulations {
+            simulations.insert(observation.value.id, observation.clone());
+        }
+        for deletion in &batch.deletions {
+            if deletion.kind == "device" {
+                let key = DeviceKey::in_realm(
+                    deletion.realm.clone(),
+                    crate::domain::DeviceId::new(&deletion.item_id),
+                );
+                devices.remove(&key);
             }
         }
+        let galaxy_changed = !batch.devices.is_empty()
+            || !batch.locations.is_empty()
+            || !batch.stars.is_empty()
+            || batch
+                .deletions
+                .iter()
+                .any(|deletion| deletion.kind == "device");
         let inserted = self
             .store
             .lock()
             .as_mut()
             .ok_or(StoreError::Closed)?
-            .append_event_and_project(event, cursor, &[], &projected, &reconciliation_targets)?;
+            .apply_event_projection(event, cursor, &batch)?;
         if !inserted {
             return Ok(false);
         }
-        self.publish(StateSnapshot {
-            revision: previous.revision + 1,
-            galaxy_revision: previous.galaxy_revision,
-            devices: previous.devices.clone(),
-            account: previous.account.clone(),
-            replicants: previous.replicants.clone(),
-            locations: next_locations,
-            inventories: previous.inventories.clone(),
-            simulations: previous.simulations.clone(),
-        });
-        Ok(true)
-    }
-
-    /// Commits an event, tombstones explicitly decommissioned devices, and
-    /// advances the applied cursor atomically, then publishes a new revision.
-    pub(crate) fn apply_event_with_decommission(
-        &self,
-        event: &Event,
-        cursor: &str,
-        decommissioned: &[DeviceKey],
-    ) -> Result<bool, StoreError> {
-        let inserted = self
-            .store
-            .lock()
-            .as_mut()
-            .ok_or(StoreError::Closed)?
-            .append_event_and_decommission(event, cursor, decommissioned)?;
-        if !inserted {
-            return Ok(false);
-        }
-        let previous = self.snapshot();
-        let mut devices = previous.devices.clone();
-        for key in decommissioned {
-            devices.remove(key);
+        if !batch.stars.is_empty() {
+            let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
+                .as_ref()
+                .clone();
+            for incoming in &batch.stars {
+                let observation = if let Some(current) =
+                    galaxy.catalogue.get(&incoming.value.key).cloned()
+                {
+                    match merge_star(current, incoming.clone()) {
+                        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
+                    }
+                } else {
+                    incoming.clone()
+                };
+                galaxy
+                    .catalogue
+                    .insert(observation.value.key.clone(), observation);
+            }
+            *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
         }
         self.publish(StateSnapshot {
             revision: previous.revision + 1,
-            galaxy_revision: previous.galaxy_revision + 1,
+            galaxy_revision: previous.galaxy_revision + u64::from(galaxy_changed),
             devices,
             account: previous.account.clone(),
-            replicants: previous.replicants.clone(),
-            locations: previous.locations.clone(),
+            replicants,
+            locations,
             inventories: previous.inventories.clone(),
-            simulations: previous.simulations.clone(),
+            simulations,
         });
         Ok(true)
     }
@@ -1563,6 +1630,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: Some("SOL".into()),
                 parent: None,
+                custom_name: None,
                 survey_progress: Default::default(),
                 environment: crate::domain::LocationEnvironment {
                     atmosphere: crate::domain::Knowledge::Present(crate::domain::Atmosphere::from(
@@ -1591,6 +1659,7 @@ mod tests {
                 system_tags: Vec::new(),
                 system: None,
                 parent: None,
+                custom_name: None,
                 survey_progress: Default::default(),
                 environment: crate::domain::LocationEnvironment::default(),
                 unknown: BTreeMap::new(),

@@ -171,6 +171,9 @@ pub struct AccountMeResponse {
     pub events: Option<EventSettings>,
     /// Message notification settings.
     pub messages: Option<MessageSettings>,
+    /// Legacy open-shaped message notification settings.
+    #[serde(default)]
+    pub message_notify: JsonObject,
     /// This account's replicants.
     #[serde(default)]
     pub replicants: Vec<AccountReplicantSummary>,
@@ -204,6 +207,9 @@ pub struct AccountUpdateRequest {
     /// New message notification settings.
     #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
     pub messages: UpdateField<MessageSettings>,
+    /// Legacy open-shaped message notification settings.
+    #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
+    pub message_notify: UpdateField<JsonObject>,
 }
 
 /// Response body for `PATCH /v1/accounts/me`.
@@ -225,6 +231,9 @@ pub struct AccountUpdateResponse {
     pub events: Option<EventSettings>,
     /// Message notification settings after the update.
     pub messages: Option<MessageSettings>,
+    /// Legacy open-shaped message notification settings after the update.
+    #[serde(default)]
+    pub message_notify: JsonObject,
 }
 
 /// Response body for `DELETE /v1/accounts/me`.

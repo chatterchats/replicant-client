@@ -24,10 +24,10 @@ use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::domain::{
-    Account, AccountId, Device, DeviceId, DeviceKey, Event, Inventory, InventoryOwner, Location,
-    LocationId, LocationKey, Message, Observation, ObservationMetadata, ObservationTime, Realm,
-    Replicant, ReplicantId, ReplicantKey, Simulation, SimulationId, Star, StarId, StarKey,
-    StarKnowledge,
+    Account, AccountId, Blueprint, Device, DeviceId, DeviceKey, Event, IncomingObject, Inventory,
+    InventoryOwner, Location, LocationEvent, LocationId, LocationKey, Message, Observation,
+    ObservationMetadata, ObservationTime, Realm, Replicant, ReplicantId, ReplicantKey,
+    ResourceSite, Simulation, SimulationId, Star, StarId, StarKey, StarKnowledge, Trade,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("../../migrations/0001_initial.sql");
@@ -36,10 +36,12 @@ const DEVICE_RELATIONSHIP_SEMANTICS_SCHEMA: &str =
 const RECONCILIATION_LEADER_SCHEMA: &str =
     include_str!("../../migrations/0003_reconciliation_leader.sql");
 const HISTORY_SPLIT_SCHEMA: &str = include_str!("../../migrations/0004_history_split.sql");
+const EVENT_PROJECTION_METADATA_SCHEMA: &str =
+    include_str!("../../migrations/0006_event_projection_metadata.sql");
 const MESSAGE_METADATA_SCHEMA: &str = include_str!("../../migrations/0005_message_metadata.sql");
 const HISTORY_INITIAL_SCHEMA: &str = include_str!("../../migrations/history/0001_initial.sql");
 const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_indexes.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 1;
 const AMI_RAW_RETENTION_DAYS: i64 = 30;
 const OPERATION_TERMINAL_RETENTION_DAYS: i64 = 30;
@@ -70,6 +72,8 @@ pub(crate) enum StoreError {
     WorkerStart(#[source] std::io::Error),
     #[error("invalid Redis stream event ID: {0}")]
     InvalidEventId(String),
+    #[error("unsupported event projection tombstone kind: {0}")]
+    UnsupportedProjectionKind(&'static str),
     #[error("database schema version {found} is newer than supported version {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("history database schema version {found} is newer than supported version {supported}")]
@@ -108,6 +112,46 @@ pub(crate) struct MessageMetadata {
     pub(crate) last_cursor: Option<i64>,
     pub(crate) unread_count: Option<i64>,
     pub(crate) refreshed_at: Option<ObservationTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionTombstone {
+    pub(crate) realm: Realm,
+    pub(crate) kind: &'static str,
+    pub(crate) item_id: String,
+    pub(crate) evidence: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReconciliationTarget {
+    pub(crate) work_id: String,
+    pub(crate) realm: Realm,
+    pub(crate) kind: &'static str,
+    pub(crate) payload: Value,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct EventProjectionBatch {
+    pub(crate) devices: Vec<Observation<Device>>,
+    pub(crate) replicants: Vec<Observation<Replicant>>,
+    pub(crate) locations: Vec<Observation<Location>>,
+    pub(crate) stars: Vec<Observation<Star>>,
+    pub(crate) resource_sites: Vec<Observation<ResourceSite>>,
+    pub(crate) location_events: Vec<Observation<LocationEvent>>,
+    pub(crate) incoming_objects: Vec<Observation<IncomingObject>>,
+    pub(crate) messages: Vec<Observation<Message>>,
+    pub(crate) blueprints: Vec<Observation<Blueprint>>,
+    pub(crate) trades: Vec<Observation<Trade>>,
+    pub(crate) simulations: Vec<Observation<Simulation>>,
+    pub(crate) deletions: Vec<ProjectionTombstone>,
+    pub(crate) reconciliation: Vec<ReconciliationTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionReplayState {
+    pub(crate) last_history_rowid: i64,
+    pub(crate) high_water_rowid: i64,
+    pub(crate) complete: bool,
 }
 
 enum StoreCommand {
@@ -446,6 +490,24 @@ impl StoreProxy {
     pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
         self.0.execute_blocking(|store| store.restore_messages())
     }
+    pub(crate) fn restore_resource_sites(
+        &self,
+    ) -> Result<Vec<Observation<ResourceSite>>, StoreError> {
+        self.0
+            .execute_blocking(|store| store.restore_resource_sites())
+    }
+    pub(crate) fn restore_location_events(
+        &self,
+    ) -> Result<Vec<Observation<LocationEvent>>, StoreError> {
+        self.0
+            .execute_blocking(|store| store.restore_location_events())
+    }
+    pub(crate) fn restore_incoming_objects(
+        &self,
+    ) -> Result<Vec<Observation<IncomingObject>>, StoreError> {
+        self.0
+            .execute_blocking(|store| store.restore_incoming_objects())
+    }
     pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
         self.0.execute_blocking(|store| store.message_metadata())
     }
@@ -474,6 +536,56 @@ impl StoreProxy {
         self.0
             .execute_blocking(move |store| store.read_events_desc(limit, offset))
     }
+    pub(crate) fn prepare_projection_replay(
+        &mut self,
+        projection: &str,
+        version: i64,
+    ) -> Result<ProjectionReplayState, StoreError> {
+        let projection = projection.to_owned();
+        self.0
+            .execute_blocking(move |store| store.prepare_projection_replay(&projection, version))
+    }
+    pub(crate) fn read_projection_history(
+        &self,
+        after_rowid: i64,
+        high_water_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Event)>, StoreError> {
+        self.0.execute_blocking(move |store| {
+            store.read_projection_history(after_rowid, high_water_rowid, limit)
+        })
+    }
+    pub(crate) fn apply_replay_projection(
+        &mut self,
+        projection: &str,
+        version: i64,
+        last_history_rowid: i64,
+        high_water_rowid: i64,
+        batch: &EventProjectionBatch,
+    ) -> Result<(), StoreError> {
+        let projection = projection.to_owned();
+        let batch = batch.clone();
+        self.0.execute_blocking(move |store| {
+            store.apply_replay_projection(
+                &projection,
+                version,
+                last_history_rowid,
+                high_water_rowid,
+                &batch,
+            )
+        })
+    }
+    pub(crate) fn complete_projection_replay(
+        &mut self,
+        projection: &str,
+        version: i64,
+        high_water_rowid: i64,
+    ) -> Result<(), StoreError> {
+        let projection = projection.to_owned();
+        self.0.execute_blocking(move |store| {
+            store.complete_projection_replay(&projection, version, high_water_rowid)
+        })
+    }
     pub(crate) fn set_event_cursor(&mut self, cursor: &str) -> Result<(), StoreError> {
         let cursor = cursor.to_owned();
         self.0
@@ -488,40 +600,17 @@ impl StoreProxy {
         self.0
             .execute_blocking(move |s| s.backdate_event_cursor(seconds))
     }
-    pub(crate) fn append_event_and_project(
+    pub(crate) fn apply_event_projection(
         &mut self,
         event: &Event,
         cursor: &str,
-        devices: &[Observation<Device>],
-        locations: &[Observation<Location>],
-        reconciliation_targets: &[(Realm, String)],
+        batch: &EventProjectionBatch,
     ) -> Result<bool, StoreError> {
         let event = event.clone();
         let cursor = cursor.to_owned();
-        let devices = devices.to_vec();
-        let locations = locations.to_vec();
-        let reconciliation_targets = reconciliation_targets.to_vec();
-        self.0.execute_blocking(move |s| {
-            s.append_event_and_project(
-                &event,
-                &cursor,
-                &devices,
-                &locations,
-                &reconciliation_targets,
-            )
-        })
-    }
-    pub(crate) fn append_event_and_decommission(
-        &mut self,
-        event: &Event,
-        cursor: &str,
-        keys: &[DeviceKey],
-    ) -> Result<bool, StoreError> {
-        let event = event.clone();
-        let cursor = cursor.to_owned();
-        let keys = keys.to_vec();
+        let batch = batch.clone();
         self.0
-            .execute_blocking(move |s| s.append_event_and_decommission(&event, &cursor, &keys))
+            .execute_blocking(move |store| store.apply_event_projection(&event, &cursor, &batch))
     }
     pub(crate) fn enqueue_reconciliation(
         &mut self,
@@ -860,6 +949,20 @@ impl Store {
             )?;
             transaction.commit()?;
             version = 5;
+        }
+        if version == 5 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(EVENT_PROJECTION_METADATA_SCHEMA)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = 6 WHERE version = 5",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '6') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 6;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
@@ -1534,13 +1637,11 @@ impl Store {
         Self::commit(transaction, fail_commit)
     }
 
-    pub(crate) fn append_event_and_project(
+    pub(crate) fn apply_event_projection(
         &mut self,
         event: &Event,
         cursor: &str,
-        devices: &[Observation<Device>],
-        locations: &[Observation<Location>],
-        reconciliation_targets: &[(Realm, String)],
+        batch: &EventProjectionBatch,
     ) -> Result<bool, StoreError> {
         if self.has_event(cursor)? {
             self.mark_history_event_applied_best_effort(event.id.as_str());
@@ -1549,67 +1650,7 @@ impl Store {
         self.append_history_event(event)?;
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        for device in devices {
-            persist_device(&transaction, device)?;
-        }
-        for location in locations {
-            transaction.execute(
-                "INSERT INTO locations(realm, location_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, location_id) DO UPDATE SET observation_json = excluded.observation_json",
-                params![
-                    realm_key(&location.value.key.realm),
-                    location.value.key.id.as_str(),
-                    serde_json::to_string(location)?,
-                ],
-            )?;
-        }
-        for target in reconciliation_targets {
-            transaction.execute(
-                "INSERT INTO reconciliation_queue(work_id, realm, kind, payload_json, not_before, attempts, state) VALUES (?1, ?2, 'location', ?3, NULL, 0, 'queued') ON CONFLICT(work_id) DO UPDATE SET realm = excluded.realm, kind = excluded.kind, payload_json = excluded.payload_json, not_before = NULL, attempts = 0, state = 'queued'",
-                params![
-                    format!("location:{}", target.1),
-                    realm_key(&target.0),
-                    serde_json::to_string(&serde_json::json!({ "id": target.1 }))?,
-                ],
-            )?;
-        }
-        advance_event_cursor(&transaction, cursor)?;
-        Self::commit(transaction, fail_commit)?;
-        self.mark_history_event_applied_best_effort(event.id.as_str());
-        Ok(true)
-    }
-
-    /// Same primary-database atomic guarantee as [`Store::append_event_and_project`], but also
-    /// tombstones devices proven decommissioned by this event (an explicit
-    /// removal signal, unlike a filtered/visibility-scoped collection page).
-    pub(crate) fn append_event_and_decommission(
-        &mut self,
-        event: &Event,
-        cursor: &str,
-        decommissioned: &[DeviceKey],
-    ) -> Result<bool, StoreError> {
-        if self.has_event(cursor)? {
-            self.mark_history_event_applied_best_effort(event.id.as_str());
-            return Ok(false);
-        }
-        self.append_history_event(event)?;
-        let fail_commit = self.take_commit_failure();
-        let transaction = self.connection.transaction()?;
-        for key in decommissioned {
-            let realm = realm_key(&key.realm);
-            let device_id = key.id.as_str();
-            transaction.execute(
-                "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
-                params![&realm, device_id],
-            )?;
-            transaction.execute(
-                "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, 'device', ?2, datetime('now'), 'explicit-decommission-event')",
-                params![&realm, device_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM reconciliation_queue WHERE realm = ?1 AND kind = 'device' AND work_id = ?2",
-                params![&realm, format!("device:{device_id}")],
-            )?;
-        }
+        persist_projection_batch(&transaction, batch)?;
         advance_event_cursor(&transaction, cursor)?;
         Self::commit(transaction, fail_commit)?;
         self.mark_history_event_applied_best_effort(event.id.as_str());
@@ -1851,6 +1892,117 @@ impl Store {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    pub(crate) fn prepare_projection_replay(
+        &mut self,
+        projection: &str,
+        version: i64,
+    ) -> Result<ProjectionReplayState, StoreError> {
+        let current_high_water = self.history.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM event_history WHERE applied_at IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT version, last_history_rowid, high_water_rowid, state FROM event_projection_metadata WHERE projection = ?1",
+                [projection],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_version, last, high_water, state)) = existing
+            && stored_version == version
+        {
+            return Ok(ProjectionReplayState {
+                last_history_rowid: last,
+                high_water_rowid: high_water,
+                complete: state == "complete",
+            });
+        }
+        self.connection.execute(
+            "INSERT INTO event_projection_metadata(projection, version, last_history_rowid, high_water_rowid, state, coverage, updated_at) VALUES (?1, ?2, 0, ?3, 'running', 'retained_only', datetime('now')) ON CONFLICT(projection) DO UPDATE SET version = excluded.version, last_history_rowid = 0, high_water_rowid = excluded.high_water_rowid, state = 'running', coverage = 'retained_only', updated_at = excluded.updated_at",
+            params![projection, version, current_high_water],
+        )?;
+        Ok(ProjectionReplayState {
+            last_history_rowid: 0,
+            high_water_rowid: current_high_water,
+            complete: false,
+        })
+    }
+
+    pub(crate) fn read_projection_history(
+        &self,
+        after_rowid: i64,
+        high_water_rowid: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Event)>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.history.prepare(
+            "SELECT rowid, event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json FROM event_history WHERE applied_at IS NOT NULL AND rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![after_rowid, high_water_rowid, limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ),
+            ))
+        })?;
+        rows.map(|row| {
+            let (rowid, event) = row?;
+            Ok((rowid, decode_history_event(event)?))
+        })
+        .collect()
+    }
+
+    pub(crate) fn apply_replay_projection(
+        &mut self,
+        projection: &str,
+        version: i64,
+        last_history_rowid: i64,
+        high_water_rowid: i64,
+        batch: &EventProjectionBatch,
+    ) -> Result<(), StoreError> {
+        debug_assert!(batch.reconciliation.is_empty());
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        persist_projection_batch(&transaction, batch)?;
+        transaction.execute(
+            "UPDATE event_projection_metadata SET last_history_rowid = ?3, high_water_rowid = ?4, state = 'running', coverage = 'retained_only', updated_at = datetime('now') WHERE projection = ?1 AND version = ?2",
+            params![projection, version, last_history_rowid, high_water_rowid],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
+
+    pub(crate) fn complete_projection_replay(
+        &mut self,
+        projection: &str,
+        version: i64,
+        high_water_rowid: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE event_projection_metadata SET last_history_rowid = ?3, high_water_rowid = ?3, state = 'complete', coverage = 'retained_only', updated_at = datetime('now') WHERE projection = ?1 AND version = ?2",
+            params![projection, version, high_water_rowid],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
@@ -2169,6 +2321,52 @@ impl Store {
         Ok(messages)
     }
 
+    pub(crate) fn restore_resource_sites(
+        &self,
+    ) -> Result<Vec<Observation<ResourceSite>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM resource_sites ORDER BY realm, site_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            row.map_err(StoreError::from).and_then(|value| {
+                serde_json::from_str::<Observation<ResourceSite>>(&value).map_err(StoreError::from)
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn restore_location_events(
+        &self,
+    ) -> Result<Vec<Observation<LocationEvent>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM location_events ORDER BY realm, event_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            row.map_err(StoreError::from).and_then(|value| {
+                serde_json::from_str::<Observation<LocationEvent>>(&value).map_err(StoreError::from)
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn restore_incoming_objects(
+        &self,
+    ) -> Result<Vec<Observation<IncomingObject>>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM discovery_data WHERE kind = 'incoming_object' ORDER BY realm, item_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            row.map_err(StoreError::from).and_then(|value| {
+                serde_json::from_str::<Observation<IncomingObject>>(&value)
+                    .map_err(StoreError::from)
+            })
+        })
+        .collect()
+    }
+
     pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
         self.connection
             .query_row(
@@ -2275,6 +2473,258 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(StoreError::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_row_count(&self) -> Result<i64, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM devices) +
+                    (SELECT COUNT(*) FROM replicants) +
+                    (SELECT COUNT(*) FROM locations) +
+                    (SELECT COUNT(*) FROM stars) +
+                    (SELECT COUNT(*) FROM resource_sites) +
+                    (SELECT COUNT(*) FROM location_events) +
+                    (SELECT COUNT(*) FROM discovery_data WHERE kind = 'incoming_object') +
+                    (SELECT COUNT(*) FROM messages) +
+                    (SELECT COUNT(*) FROM blueprints) +
+                    (SELECT COUNT(*) FROM trades) +
+                    (SELECT COUNT(*) FROM simulations) +
+                    (SELECT COUNT(*) FROM tombstones)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_batch_matches(
+        &self,
+        batch: &EventProjectionBatch,
+    ) -> Result<bool, StoreError> {
+        for observation in &batch.devices {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT observation_json FROM devices WHERE realm = ?1 AND device_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.replicants {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT observation_json FROM replicants WHERE realm = ?1 AND replicant_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.locations {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT observation_json FROM locations WHERE realm = ?1 AND location_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.stars {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM stars WHERE realm = ?1 AND star_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.resource_sites {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM resource_sites WHERE realm = ?1 AND site_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.location_events {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM location_events WHERE realm = ?1 AND event_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.incoming_objects {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM discovery_data WHERE realm = ?1 AND kind = 'incoming_object' AND item_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.messages {
+            let key = observation.value.id.map_or_else(
+                || {
+                    format!(
+                        "anonymous:{}",
+                        observation.metadata.observed_at.unix_millis()
+                    )
+                },
+                |id| id.to_string(),
+            );
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM messages WHERE message_id = ?1",
+                    [&key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.blueprints {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM blueprints WHERE blueprint_id = ?1",
+                    [observation.value.id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.trades {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM trades WHERE realm = ?1 AND trade_id = ?2",
+                    params![
+                        realm_key(&observation.value.key.realm),
+                        observation.value.key.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for observation in &batch.simulations {
+            let stored = self
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM simulations WHERE simulation_id = ?1",
+                    [observation.value.id.get()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if stored.as_deref() != Some(serde_json::to_string(observation)?.as_str()) {
+                return Ok(false);
+            }
+        }
+        for deletion in &batch.deletions {
+            let realm = realm_key(&deletion.realm);
+            let evidence = self
+                .connection
+                .query_row(
+                    "SELECT evidence FROM tombstones WHERE realm = ?1 AND kind = ?2 AND item_id = ?3",
+                    params![&realm, deletion.kind, &deletion.item_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if evidence.as_deref() != Some(deletion.evidence) {
+                return Ok(false);
+            }
+            let present = match deletion.kind {
+                "device" => self.connection.query_row(
+                    "SELECT COUNT(*) FROM devices WHERE realm = ?1 AND device_id = ?2",
+                    params![&realm, &deletion.item_id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                "resource_site" => self.connection.query_row(
+                    "SELECT COUNT(*) FROM resource_sites WHERE realm = ?1 AND site_id = ?2",
+                    params![&realm, &deletion.item_id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                "location_event" => self.connection.query_row(
+                    "SELECT COUNT(*) FROM location_events WHERE realm = ?1 AND event_id = ?2",
+                    params![&realm, &deletion.item_id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                "incoming_object" => self.connection.query_row(
+                    "SELECT COUNT(*) FROM discovery_data WHERE realm = ?1 AND kind = 'incoming_object' AND item_id = ?2",
+                    params![&realm, &deletion.item_id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                "trade" => self.connection.query_row(
+                    "SELECT COUNT(*) FROM trades WHERE realm = ?1 AND trade_id = ?2",
+                    params![&realm, &deletion.item_id],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                kind => return Err(StoreError::UnsupportedProjectionKind(kind)),
+            };
+            if present != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -2500,6 +2950,169 @@ fn advance_event_cursor(transaction: &Transaction<'_>, cursor: &str) -> Result<(
         transaction.execute(
             "INSERT INTO event_cursors(stream, cursor, updated_at) VALUES ('account', ?1, datetime('now')) ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
             [cursor],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_projection_batch(
+    transaction: &Transaction<'_>,
+    batch: &EventProjectionBatch,
+) -> Result<(), StoreError> {
+    for device in &batch.devices {
+        persist_device(transaction, device)?;
+    }
+    for replicant in &batch.replicants {
+        transaction.execute(
+            "INSERT INTO replicants(realm, replicant_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, replicant_id) DO UPDATE SET observation_json = excluded.observation_json",
+            params![
+                realm_key(&replicant.value.key.realm),
+                replicant.value.key.id.as_str(),
+                serde_json::to_string(replicant)?
+            ],
+        )?;
+    }
+    for location in &batch.locations {
+        transaction.execute(
+            "INSERT INTO locations(realm, location_id, observation_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, location_id) DO UPDATE SET observation_json = excluded.observation_json",
+            params![
+                realm_key(&location.value.key.realm),
+                location.value.key.id.as_str(),
+                serde_json::to_string(location)?
+            ],
+        )?;
+    }
+    for star in &batch.stars {
+        transaction.execute(
+            "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, star_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                realm_key(&star.value.key.realm),
+                star.value.key.id.as_str(),
+                serde_json::to_string(star)?
+            ],
+        )?;
+    }
+    for site in &batch.resource_sites {
+        transaction.execute(
+            "INSERT INTO resource_sites(realm, site_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, site_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                realm_key(&site.value.key.realm),
+                site.value.key.id.as_str(),
+                serde_json::to_string(site)?
+            ],
+        )?;
+    }
+    for location_event in &batch.location_events {
+        transaction.execute(
+            "INSERT INTO location_events(realm, event_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, event_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                realm_key(&location_event.value.key.realm),
+                location_event.value.key.id.as_str(),
+                serde_json::to_string(location_event)?
+            ],
+        )?;
+    }
+    for object in &batch.incoming_objects {
+        transaction.execute(
+            "INSERT INTO discovery_data(realm, kind, item_id, payload_json) VALUES (?1, 'incoming_object', ?2, ?3) ON CONFLICT(realm, kind, item_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                realm_key(&object.value.key.realm),
+                object.value.key.id.as_str(),
+                serde_json::to_string(object)?
+            ],
+        )?;
+    }
+    for message in &batch.messages {
+        let key = message.value.id.map_or_else(
+            || format!("anonymous:{}", message.metadata.observed_at.unix_millis()),
+            |id| id.to_string(),
+        );
+        transaction.execute(
+            "INSERT INTO messages(message_id, payload_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![key, serde_json::to_string(message)?],
+        )?;
+    }
+    for blueprint in &batch.blueprints {
+        transaction.execute(
+            "INSERT INTO blueprints(blueprint_id, payload_json) VALUES (?1, ?2) ON CONFLICT(blueprint_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                blueprint.value.id.as_str(),
+                serde_json::to_string(blueprint)?
+            ],
+        )?;
+    }
+    for trade in &batch.trades {
+        transaction.execute(
+            "INSERT INTO trades(realm, trade_id, payload_json) VALUES (?1, ?2, ?3) ON CONFLICT(realm, trade_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                realm_key(&trade.value.key.realm),
+                trade.value.key.id.as_str(),
+                serde_json::to_string(trade)?
+            ],
+        )?;
+    }
+    for simulation in &batch.simulations {
+        transaction.execute(
+            "INSERT INTO simulations(simulation_id, payload_json) VALUES (?1, ?2) ON CONFLICT(simulation_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![
+                simulation.value.id.get(),
+                serde_json::to_string(simulation)?
+            ],
+        )?;
+    }
+    for deletion in &batch.deletions {
+        let realm = realm_key(&deletion.realm);
+        match deletion.kind {
+            "device" => {
+                transaction.execute(
+                    "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
+                    params![&realm, &deletion.item_id],
+                )?;
+            }
+            "resource_site" => {
+                transaction.execute(
+                    "DELETE FROM resource_sites WHERE realm = ?1 AND site_id = ?2",
+                    params![&realm, &deletion.item_id],
+                )?;
+            }
+            "location_event" => {
+                transaction.execute(
+                    "DELETE FROM location_events WHERE realm = ?1 AND event_id = ?2",
+                    params![&realm, &deletion.item_id],
+                )?;
+            }
+            "incoming_object" => {
+                transaction.execute(
+                    "DELETE FROM discovery_data WHERE realm = ?1 AND kind = 'incoming_object' AND item_id = ?2",
+                    params![&realm, &deletion.item_id],
+                )?;
+            }
+            "trade" => {
+                transaction.execute(
+                    "DELETE FROM trades WHERE realm = ?1 AND trade_id = ?2",
+                    params![&realm, &deletion.item_id],
+                )?;
+            }
+            kind => return Err(StoreError::UnsupportedProjectionKind(kind)),
+        }
+        transaction.execute(
+            "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence) VALUES (?1, ?2, ?3, datetime('now'), ?4)",
+            params![&realm, deletion.kind, &deletion.item_id, deletion.evidence],
+        )?;
+        transaction.execute(
+            "DELETE FROM reconciliation_queue WHERE realm = ?1 AND work_id = ?2",
+            params![&realm, format!("{}:{}", deletion.kind, deletion.item_id)],
+        )?;
+    }
+    for target in &batch.reconciliation {
+        transaction.execute(
+            "INSERT INTO reconciliation_queue(work_id, realm, kind, payload_json, not_before, attempts, state) VALUES (?1, ?2, ?3, ?4, NULL, 0, 'queued') ON CONFLICT(work_id) DO UPDATE SET realm = excluded.realm, kind = excluded.kind, payload_json = excluded.payload_json, not_before = NULL, attempts = 0, state = 'queued'",
+            params![
+                &target.work_id,
+                realm_key(&target.realm),
+                target.kind,
+                serde_json::to_string(&target.payload)?
+            ],
         )?;
     }
     Ok(())
@@ -2866,14 +3479,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (6);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (7);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 6,
-                supported: 5
+                found: 7,
+                supported: 6
             })
         ));
         fs::remove_file(path).expect("remove test database");
@@ -3184,12 +3797,13 @@ mod tests {
         let mut store = Store::open_memory().expect("open memory store");
         store.fail_next_commit();
         assert!(matches!(
-            store.append_event_and_project(
+            store.apply_event_projection(
                 &event(),
                 "cursor-1",
-                &[device(Realm::Live, "d1")],
-                &[],
-                &[]
+                &EventProjectionBatch {
+                    devices: vec![device(Realm::Live, "d1")],
+                    ..EventProjectionBatch::default()
+                },
             ),
             Err(StoreError::InjectedCommitFailure)
         ));
@@ -3233,7 +3847,7 @@ mod tests {
     fn journal_primitives_round_trip_event_and_operation_records() {
         let mut store = Store::open_memory().expect("open memory store");
         store
-            .append_event_and_project(&event(), "cursor-1", &[], &[], &[])
+            .apply_event_projection(&event(), "cursor-1", &EventProjectionBatch::default())
             .expect("append event");
         assert_eq!(store.read_events().expect("read events"), vec![event()]);
         store
@@ -3334,14 +3948,14 @@ mod tests {
         let mut store = Store::open_memory().expect("open memory store");
         assert!(!store.has_event("1-0").expect("has_event before append"));
         store
-            .append_event_and_project(&event(), "1-0", &[], &[], &[])
+            .apply_event_projection(&event(), "1-0", &EventProjectionBatch::default())
             .expect("append event");
         assert!(store.has_event("1-0").expect("has_event after append"));
         assert!(!store.has_event("2-0").expect("has_event for unseen id"));
     }
 
     #[test]
-    fn append_event_and_decommission_removes_device_and_tombstones_atomically() {
+    fn apply_event_projection_removes_device_and_tombstones_atomically() {
         let mut store = Store::open_memory().expect("open memory store");
         store
             .persist_devices(&[device(Realm::Live, "d1")])
@@ -3355,10 +3969,18 @@ mod tests {
         decommission_event.name = EventName::from("device.decommissioned");
         decommission_event.device = Some(key.clone());
         store
-            .append_event_and_decommission(
+            .apply_event_projection(
                 &decommission_event,
                 "cursor-decom",
-                std::slice::from_ref(&key),
+                &EventProjectionBatch {
+                    deletions: vec![ProjectionTombstone {
+                        realm: Realm::Live,
+                        kind: "device",
+                        item_id: key.id.as_str().to_owned(),
+                        evidence: "device.decommissioned",
+                    }],
+                    ..EventProjectionBatch::default()
+                },
             )
             .expect("decommission");
 
@@ -3384,10 +4006,18 @@ mod tests {
             .expect("queue reconciliation");
         store.fail_next_commit();
         assert!(matches!(
-            store.append_event_and_decommission(
+            store.apply_event_projection(
                 &event(),
                 "cursor-decom",
-                std::slice::from_ref(&key)
+                &EventProjectionBatch {
+                    deletions: vec![ProjectionTombstone {
+                        realm: Realm::Live,
+                        kind: "device",
+                        item_id: key.id.as_str().to_owned(),
+                        evidence: "device.decommissioned",
+                    }],
+                    ..EventProjectionBatch::default()
+                },
             ),
             Err(StoreError::InjectedCommitFailure)
         ));
@@ -3458,7 +4088,11 @@ mod tests {
             // crashed before the atomic store-and-advance-cursor commit.
             store.fail_next_commit();
             assert!(matches!(
-                store.append_event_and_project(&event(), "cursor-1", &[], &[], &[]),
+                store.apply_event_projection(
+                    &event(),
+                    "cursor-1",
+                    &EventProjectionBatch::default()
+                ),
                 Err(StoreError::InjectedCommitFailure)
             ));
         }
@@ -3699,5 +4333,79 @@ mod tests {
             .expect("active request joins")
             .expect("active request succeeds");
         std::thread::sleep(Duration::from_millis(10));
+    }
+
+    #[test]
+    fn replay_projection_commit_failure_rolls_back_effect_and_checkpoint() {
+        let mut store = Store::open_memory().expect("open replay store");
+        let replay = store
+            .prepare_projection_replay("event_owned", 1)
+            .expect("prepare replay");
+        let site = Observation {
+            value: ResourceSite {
+                key: crate::domain::ResourceSiteKey::live(crate::domain::ResourceSiteId::new(
+                    "SITE-1",
+                )),
+                location: None,
+                site_type: Some("salvage".to_owned()),
+                name: None,
+                resources: BTreeMap::new(),
+                extra: BTreeMap::new(),
+            },
+            metadata: device(Realm::Live, "metadata").metadata,
+        };
+        let batch = EventProjectionBatch {
+            resource_sites: vec![site],
+            ..EventProjectionBatch::default()
+        };
+        store.fail_next_commit();
+        assert!(matches!(
+            store.apply_replay_projection("event_owned", 1, 10, replay.high_water_rowid, &batch),
+            Err(StoreError::InjectedCommitFailure)
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT last_history_rowid FROM event_projection_metadata WHERE projection = 'event_owned'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("checkpoint after failed replay"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM resource_sites", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("site count after failed replay"),
+            0
+        );
+
+        store
+            .apply_replay_projection("event_owned", 1, 10, replay.high_water_rowid, &batch)
+            .expect("retry replay batch");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT last_history_rowid FROM event_projection_metadata WHERE projection = 'event_owned'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("checkpoint after retry"),
+            10
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM resource_sites", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("site count after retry"),
+            1
+        );
     }
 }

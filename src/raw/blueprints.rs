@@ -1,5 +1,7 @@
 //! Unlocked account blueprint catalogue (`GET /v1/blueprints`).
 
+use std::collections::BTreeMap;
+
 use reqwest::Method;
 use serde::Deserialize;
 
@@ -36,9 +38,9 @@ pub struct Blueprint {
     /// AMI directives this device type supports.
     pub directives: Option<Vec<String>>,
     /// Resource cost to print, keyed by resource type.
-    pub resources: Option<JsonObject>,
+    pub resources: Option<BTreeMap<String, i64>>,
     /// Component cost to print, keyed by component type.
-    pub components: Option<JsonObject>,
+    pub components: Option<BTreeMap<String, i64>>,
     /// Any other fields the server returns.
     #[serde(flatten)]
     pub extra: JsonObject,

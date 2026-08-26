@@ -10,6 +10,8 @@
 //! mutations: the raw client never retries them automatically after a
 //! request may have reached the server.
 
+use std::collections::BTreeMap;
+
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
@@ -336,8 +338,8 @@ pub struct ScanAsteroidBeltDetail {
     pub inner_radius_au: Option<f64>,
     /// Outer radius, in AU.
     pub outer_radius_au: Option<f64>,
-    /// Resource availability by type, open-shaped.
-    pub resources: Option<JsonObject>,
+    /// Resource availability by type.
+    pub resources: Option<BTreeMap<String, String>>,
 }
 
 /// A scan's asteroid belt summary.

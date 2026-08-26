@@ -319,41 +319,18 @@ fn device(
 
 /// Normalizes one unlocked account blueprint into the managed domain.
 ///
-/// Blueprint resource/component maps are typed only when the server supplies
-/// integral quantities. Unsupported values are retained in `unknown` so a
-/// future API change does not silently discard evidence.
+/// Blueprint resource/component maps are schema-backed integer quantities;
+/// unrelated open response fields remain in `unknown`.
 pub fn blueprint(raw: &raw::blueprints::Blueprint) -> Result<Blueprint, NormalizeError> {
     let device_type = required(raw.device_type.as_ref(), "device_type")?;
-    let mut unknown = raw
+    let mut unknown: BTreeMap<String, Value> = raw
         .extra
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
 
-    fn quantities(
-        raw: Option<&raw::JsonObject>,
-        unknown: &mut BTreeMap<String, Value>,
-        unknown_key: &str,
-    ) -> BTreeMap<String, i64> {
-        let mut typed = BTreeMap::new();
-        let mut unsupported = serde_json::Map::new();
-        if let Some(raw) = raw {
-            for (key, value) in raw {
-                if let Some(quantity) = value.as_i64() {
-                    typed.insert(key.clone(), quantity);
-                } else {
-                    unsupported.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        if !unsupported.is_empty() {
-            unknown.insert(unknown_key.to_owned(), Value::Object(unsupported));
-        }
-        typed
-    }
-
-    let resources = quantities(raw.resources.as_ref(), &mut unknown, "resources");
-    let components = quantities(raw.components.as_ref(), &mut unknown, "components");
+    let resources = raw.resources.clone().unwrap_or_default();
+    let components = raw.components.clone().unwrap_or_default();
     if let Some(strength) = raw.strength {
         unknown.insert("strength".to_owned(), serde_json::json!(strength));
     }
@@ -404,6 +381,7 @@ pub fn message(
             title: raw.title,
             body: raw.body,
             category: raw.category,
+            subcategory: raw.subcategory,
             message_type: raw.message_type,
             is_read: raw.is_read,
             created_at: raw.created_at,
@@ -621,6 +599,206 @@ pub fn directory_profile(
     })
 }
 
+const LOCATION_PROMOTED_FIELDS: &[&str] = &[
+    "location",
+    "location_type",
+    "scanned",
+    "system_scanned",
+    "system_tags",
+    "system",
+    "parent",
+    "planets_total",
+    "planets_scanned",
+    "moons_total",
+    "moons_scanned",
+    "moons_total_estimated",
+];
+
+const LOCATION_PASSTHROUGH_FIELDS: &[&str] = &[
+    "active_location_events",
+    "asteroid_belt",
+    "belt",
+    "devices",
+    "entry_point",
+    "estimated_travel_time",
+    "inventory",
+    "kuiper",
+    "lagrange",
+    "life_detected",
+    "location_event",
+    "megastructure",
+    "mining_bonus_pct",
+    "moon",
+    "moons",
+    "object",
+    "oort",
+    "outer_system",
+    "planet",
+    "planets",
+    "resource_sites",
+    "shops",
+    "star",
+    "system_objects",
+];
+
+fn insert_present(map: &mut BTreeMap<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        map.insert(key.to_owned(), value);
+    }
+}
+
+fn json_object_array(values: &[raw::JsonObject]) -> Value {
+    Value::Array(values.iter().cloned().map(Value::Object).collect())
+}
+
+fn planetary_body_value(body: &raw::locations::PlanetaryBody) -> Value {
+    let mut fields = body.unknown.clone().into_iter().collect::<BTreeMap<_, _>>();
+    insert_present(&mut fields, "scanned", body.scanned.map(Value::from));
+    insert_present(
+        &mut fields,
+        "atmosphere",
+        body.atmosphere.clone().map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "in_habitable_zone",
+        body.in_habitable_zone.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "life_stage",
+        body.life_stage.clone().map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "magnetic_field",
+        body.magnetic_field.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "axial_tilt_deg",
+        body.axial_tilt_deg.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "surface_gravity",
+        body.surface_gravity.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "surface_temp_c",
+        body.surface_temp_c.map(Value::from),
+    );
+    Value::Object(fields.into_iter().collect())
+}
+
+fn location_passthrough(raw: &raw::locations::Location) -> BTreeMap<String, Value> {
+    debug_assert_eq!(LOCATION_PROMOTED_FIELDS.len(), 12);
+    debug_assert_eq!(LOCATION_PASSTHROUGH_FIELDS.len(), 24);
+    let mut fields = raw.unknown.clone().into_iter().collect::<BTreeMap<_, _>>();
+    insert_present(
+        &mut fields,
+        "active_location_events",
+        raw.active_location_events.as_deref().map(json_object_array),
+    );
+    insert_present(
+        &mut fields,
+        "asteroid_belt",
+        raw.asteroid_belt.clone().map(Value::Object),
+    );
+    insert_present(&mut fields, "belt", raw.belt.clone().map(Value::Object));
+    insert_present(
+        &mut fields,
+        "devices",
+        raw.devices.as_deref().map(json_object_array),
+    );
+    insert_present(
+        &mut fields,
+        "entry_point",
+        raw.entry_point.clone().map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "estimated_travel_time",
+        raw.estimated_travel_time.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "inventory",
+        raw.inventory.as_deref().map(json_object_array),
+    );
+    insert_present(&mut fields, "kuiper", raw.kuiper.clone().map(Value::Object));
+    insert_present(
+        &mut fields,
+        "lagrange",
+        raw.lagrange.clone().map(Value::Object),
+    );
+    insert_present(
+        &mut fields,
+        "life_detected",
+        raw.life_detected.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "location_event",
+        raw.location_event.clone().map(Value::Object),
+    );
+    insert_present(
+        &mut fields,
+        "megastructure",
+        raw.megastructure.clone().map(Value::Object),
+    );
+    insert_present(
+        &mut fields,
+        "mining_bonus_pct",
+        raw.mining_bonus_pct.map(Value::from),
+    );
+    insert_present(
+        &mut fields,
+        "moon",
+        raw.moon.as_ref().map(planetary_body_value),
+    );
+    insert_present(
+        &mut fields,
+        "moons",
+        raw.moons.as_deref().map(json_object_array),
+    );
+    insert_present(&mut fields, "object", raw.object.clone().map(Value::Object));
+    insert_present(&mut fields, "oort", raw.oort.clone().map(Value::Object));
+    insert_present(
+        &mut fields,
+        "outer_system",
+        raw.outer_system.clone().map(Value::Object),
+    );
+    insert_present(
+        &mut fields,
+        "planet",
+        raw.planet.as_ref().map(planetary_body_value),
+    );
+    insert_present(
+        &mut fields,
+        "planets",
+        raw.planets.as_deref().map(json_object_array),
+    );
+    insert_present(
+        &mut fields,
+        "resource_sites",
+        raw.resource_sites.as_deref().map(json_object_array),
+    );
+    insert_present(
+        &mut fields,
+        "shops",
+        raw.shops.as_deref().map(json_object_array),
+    );
+    insert_present(&mut fields, "star", raw.star.clone().map(Value::Object));
+    insert_present(
+        &mut fields,
+        "system_objects",
+        raw.system_objects.as_deref().map(json_object_array),
+    );
+    fields
+}
+
 pub fn location_detail(
     raw: &raw::locations::Location,
     realm: Realm,
@@ -640,31 +818,7 @@ pub fn location_detail(
         .or_else(|| body.and_then(|body| body.scanned))
         .or_else(|| survey_environment_evidence.then_some(true));
     let surveyed = scanned == Some(true);
-    let mut unknown = raw.unknown.clone();
-    if let Some(belt) = &raw.belt {
-        unknown.insert("belt".into(), Value::Object(belt.clone()));
-    }
-    if let Some(asteroid_belt) = &raw.asteroid_belt {
-        unknown.insert("asteroid_belt".into(), Value::Object(asteroid_belt.clone()));
-    }
-    if let Some(mining_bonus_pct) = raw.mining_bonus_pct {
-        unknown.insert("mining_bonus_pct".into(), Value::from(mining_bonus_pct));
-    }
-    if let Some(events) = &raw.active_location_events {
-        unknown.insert(
-            "active_location_events".into(),
-            Value::Array(events.iter().cloned().map(Value::Object).collect()),
-        );
-    }
-    if let Some(sites) = &raw.resource_sites {
-        unknown.insert(
-            "resource_sites".into(),
-            Value::Array(sites.iter().cloned().map(Value::Object).collect()),
-        );
-    }
-    if let Some(megastructure) = &raw.megastructure {
-        unknown.insert("megastructure".into(), Value::Object(megastructure.clone()));
-    }
+    let unknown = location_passthrough(raw);
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),
@@ -679,6 +833,7 @@ pub fn location_detail(
             .parent
             .as_ref()
             .map(|parent| WorldKey::in_realm(realm.clone(), LocationId::new(parent))),
+        custom_name: None,
         survey_progress: LocationSurveyProgress {
             planets_total: raw.planets_total,
             planets_scanned: raw.planets_scanned,
@@ -1130,6 +1285,98 @@ mod location_tests {
     }
 
     #[test]
+    fn every_location_field_is_promoted_or_preserved() {
+        let raw: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-1",
+            "location_type": "planet",
+            "scanned": true,
+            "system_scanned": true,
+            "system_tags": ["settled"],
+            "system": "TEST",
+            "parent": "TEST-STAR",
+            "planets_total": 2,
+            "planets_scanned": 1,
+            "moons_total": 3,
+            "moons_scanned": 2,
+            "moons_total_estimated": true,
+            "active_location_events": [{"designation": "EVENT-1"}],
+            "asteroid_belt": {"designation": "BELT-1"},
+            "belt": {"designation": "BELT-0"},
+            "devices": [{"device_code": "D1"}],
+            "entry_point": "TEST-ENTRY",
+            "estimated_travel_time": 12,
+            "inventory": [{"resource_type": "carbon"}],
+            "kuiper": {"designation": "KUIPER-1"},
+            "lagrange": {"designation": "L1"},
+            "life_detected": true,
+            "location_event": {"designation": "EVENT-1"},
+            "megastructure": {"designation": "MEGA-1"},
+            "mining_bonus_pct": 12.5,
+            "moon": {"scanned": false, "future_moon": "kept"},
+            "moons": [{"designation": "MOON-1"}],
+            "object": {"designation": "OBJECT-1"},
+            "oort": {"designation": "OORT-1"},
+            "outer_system": {"designation": "OUTER-1"},
+            "planet": {"scanned": true, "future_planet": "kept"},
+            "planets": [{"designation": "PLANET-1"}],
+            "resource_sites": [{"designation": "SITE-1"}],
+            "shops": [{"designation": "SHOP-1"}],
+            "star": {"designation": "TEST"},
+            "system_objects": [{"designation": "OBJECT-1"}],
+            "future_top_level": {"kept": true}
+        }))
+        .expect("complete location fixture should decode");
+
+        let observation = location_detail(&raw, Realm::Live, ObservationTime::now())
+            .expect("complete location fixture should normalize");
+        for field in LOCATION_PASSTHROUGH_FIELDS {
+            assert!(
+                observation.value.unknown.contains_key(*field),
+                "passthrough field {field} was dropped"
+            );
+        }
+        for field in LOCATION_PROMOTED_FIELDS {
+            assert!(
+                !observation.value.unknown.contains_key(*field),
+                "promoted field {field} was duplicated"
+            );
+        }
+        assert_eq!(observation.value.unknown["planet"]["future_planet"], "kept");
+        assert_eq!(observation.value.unknown["moon"]["future_moon"], "kept");
+        assert_eq!(observation.value.unknown["future_top_level"]["kept"], true);
+        assert_eq!(observation.value.system.as_deref(), Some("TEST"));
+        assert_eq!(observation.value.survey_progress.planets_total, Some(2));
+    }
+
+    #[test]
+    fn partial_location_merge_preserves_prior_passthrough() {
+        let first: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-1",
+            "location_type": "belt",
+            "belt": {"designation": "BELT-1"},
+            "future_first": true
+        }))
+        .expect("first location should decode");
+        let second: raw::locations::Location = serde_json::from_value(serde_json::json!({
+            "location": "TEST-1",
+            "life_detected": true,
+            "future_second": true
+        }))
+        .expect("second location should decode");
+        let mut merged = location_detail(&first, Realm::Live, ObservationTime::now())
+            .expect("first location should normalize")
+            .value;
+        let later = location_detail(&second, Realm::Live, ObservationTime::now())
+            .expect("second location should normalize")
+            .value;
+        merged.merge_from(&later);
+        assert_eq!(merged.unknown["belt"]["designation"], "BELT-1");
+        assert_eq!(merged.unknown["future_first"], true);
+        assert_eq!(merged.unknown["life_detected"], true);
+        assert_eq!(merged.unknown["future_second"], true);
+    }
+
+    #[test]
     fn device_operational_state_is_retained_by_managed_normalization() {
         let raw: raw::devices::DeviceStatus = serde_json::from_value(serde_json::json!({
             "device_code": "DRONE",
@@ -1274,13 +1521,13 @@ mod location_tests {
     }
 
     #[test]
-    fn blueprint_normalization_exposes_typed_print_metadata_and_preserves_unknown_values() {
+    fn blueprint_normalization_types_quantities_and_preserves_open_fields() {
         let raw: raw::blueprints::Blueprint = serde_json::from_value(serde_json::json!({
             "device_type": "deep_space_relay_station",
             "short_description": "Long-range relay",
             "description": "A relay intended for sparse frontier links.",
             "print_time": 1800,
-            "resources": {"structural": 900, "future_fractional": 1.5},
+            "resources": {"structural": 900},
             "components": {"compute_core": 2},
             "features": ["travel", "future_feature"],
             "directives": ["future_directive"],
@@ -1298,15 +1545,6 @@ mod location_tests {
         assert_eq!(blueprint.print_time_seconds, Some(1800.0));
         assert_eq!(blueprint.resources.get("structural"), Some(&900));
         assert_eq!(blueprint.components.get("compute_core"), Some(&2));
-        assert_eq!(
-            blueprint
-                .unknown
-                .get("resources")
-                .and_then(Value::as_object)
-                .and_then(|resources| resources.get("future_fractional"))
-                .and_then(Value::as_f64),
-            Some(1.5)
-        );
         assert!(blueprint.unknown.contains_key("future_field"));
     }
 

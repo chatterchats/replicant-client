@@ -19,7 +19,7 @@ use replicant_mining_planner::{
 };
 use replicant_printing::managed::discover_factories;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tracing::info;
 
 mod executor;
@@ -1004,8 +1004,8 @@ async fn fetch_blueprints(client: &Client) -> AnyResult<BTreeMap<String, Bluepri
                 BlueprintSpec {
                     device_type,
                     print_time_seconds: blueprint.print_time.unwrap_or(0.0),
-                    resources: numeric_map(blueprint.resources.as_ref()),
-                    components: numeric_map(blueprint.components.as_ref()),
+                    resources: blueprint.resources.unwrap_or_default(),
+                    components: blueprint.components.unwrap_or_default(),
                 },
             ))
         })
@@ -1024,29 +1024,6 @@ async fn factory_workloads(
         .collect::<Vec<_>>();
     factories.sort_by(|left, right| left.code.cmp(&right.code));
     Ok(factories)
-}
-
-fn numeric_map(object: Option<&Map<String, Value>>) -> QuantityMap {
-    object
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(name, value)| {
-                    value_to_i64(value).map(|quantity| (name.clone(), quantity))
-                })
-                .filter(|(_, quantity)| *quantity > 0)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn value_to_i64(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        value
-            .as_u64()
-            .and_then(|number| i64::try_from(number).ok())
-            .or_else(|| value.as_f64().map(|number| number.round() as i64))
-    })
 }
 
 fn save_plan(path: &Path, mission: &MiningMission) -> AnyResult<()> {

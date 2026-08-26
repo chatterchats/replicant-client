@@ -1887,10 +1887,10 @@ fn cargo_map(device: &raw::devices::DeviceStatus) -> ResourceMap {
         .collect()
 }
 
-fn resource_json(resources: &ResourceMap) -> raw::JsonObject {
+fn resource_json(resources: &ResourceMap) -> BTreeMap<String, f64> {
     resources
         .iter()
-        .map(|(resource, quantity)| (resource.clone(), Value::from(*quantity)))
+        .map(|(resource, quantity)| (resource.clone(), *quantity as f64))
         .collect()
 }
 

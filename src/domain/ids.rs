@@ -48,6 +48,7 @@ string_id!(AchievementId);
 string_id!(SpeciesId);
 string_id!(ResourceSiteId);
 string_id!(LocationEventId);
+string_id!(IncomingObjectId);
 string_id!(MessageId);
 
 #[derive(
@@ -102,3 +103,6 @@ pub type ReplicantKey = WorldKey<ReplicantId>;
 pub type LocationKey = WorldKey<LocationId>;
 pub type StarKey = WorldKey<StarId>;
 pub type TradeKey = WorldKey<TradeId>;
+pub type ResourceSiteKey = WorldKey<ResourceSiteId>;
+pub type LocationEventKey = WorldKey<LocationEventId>;
+pub type IncomingObjectKey = WorldKey<IncomingObjectId>;
