@@ -2141,6 +2141,130 @@ pub struct SystemSceneSnapshot {
     pub workflow_markers: Vec<SystemWorkflowMarker>,
 }
 
+/// One phase of durable managed-client recovery.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshPhase {
+    /// Account profile.
+    Account,
+    /// Owned devices.
+    Devices,
+    /// Owned Replicants.
+    Replicants,
+    /// Global star catalogue.
+    Stars,
+    /// Explored systems.
+    Systems,
+    /// Surveyed bodies.
+    Bodies,
+    /// Event history.
+    Events,
+    /// Account inbox.
+    Messages,
+    /// Known locations.
+    Locations,
+    /// Inventory.
+    Inventory,
+    /// Simulation history.
+    Simulations,
+}
+
+/// Starts one immutable durable refresh.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartRefreshRequest {
+    /// Requested phases; empty means the full plan.
+    #[serde(default)]
+    pub phases: Vec<RefreshPhase>,
+    /// Compute deltas without mutating authoritative state.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Hard safe-read attempts per minute, from 1 through 60.
+    pub read_requests_per_minute: Option<u32>,
+}
+
+/// Exact guarded-shrink approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApproveRefreshRequest {
+    /// Phase awaiting approval.
+    pub phase: RefreshPhase,
+    /// Exact current SHA-256 proof digest.
+    pub digest: String,
+}
+
+/// Proposed and applied normalized changes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefreshDelta {
+    /// Proposed inserts.
+    pub proposed_inserts: u64,
+    /// Proposed updates.
+    pub proposed_updates: u64,
+    /// Proposed guarded tombstones.
+    pub proposed_tombstones: u64,
+    /// Applied inserts.
+    pub applied_inserts: u64,
+    /// Applied updates.
+    pub applied_updates: u64,
+    /// Applied guarded tombstones.
+    pub applied_tombstones: u64,
+}
+
+/// Durable progress for one refresh phase.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefreshPhaseSummary {
+    /// Phase identity.
+    pub phase: RefreshPhase,
+    /// Snake-case durable phase status.
+    pub status: String,
+    /// Committed pages.
+    pub pages: u64,
+    /// Committed items.
+    pub items: u64,
+    /// Safe-read attempts.
+    pub request_attempts: u64,
+    /// Proposed and applied deltas.
+    pub delta: RefreshDelta,
+    /// Retry deadline as Unix milliseconds.
+    pub retry_not_before: Option<i64>,
+    /// Exact approval digest.
+    pub approval_digest: Option<String>,
+    /// Sanitized failure kind.
+    pub failure_kind: Option<String>,
+}
+
+/// Compact durable refresh run report.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefreshRunSummary {
+    /// Opaque run ID.
+    pub run_id: String,
+    /// `apply` or `dry_run`.
+    pub mode: String,
+    /// Snake-case durable run status.
+    pub status: String,
+    /// Recovery readiness.
+    pub readiness: String,
+    /// Current phase.
+    pub current_phase: Option<RefreshPhase>,
+    /// Hard safe-read budget.
+    pub read_requests_per_minute: u32,
+    /// Total safe-read attempts.
+    pub request_attempts: u64,
+    /// Aggregate proposed and applied deltas.
+    pub delta: RefreshDelta,
+    /// Last durable update as Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// Full durable refresh run report.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefreshRunDetail {
+    /// Compact run summary.
+    pub summary: RefreshRunSummary,
+    /// Expanded requested phases.
+    pub requested_phases: Vec<RefreshPhase>,
+    /// Per-phase durable progress.
+    pub phases: Vec<RefreshPhaseSummary>,
+}
+
 /// Current daemon/runtime state returned to frontends as one consistent view.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
@@ -2164,6 +2288,9 @@ pub struct RuntimeSnapshot {
     /// stale by comparison instead of discarding everything and refetching.
     #[serde(default)]
     pub slice_revisions: BTreeMap<DomainSlice, u64>,
+    /// Nonterminal runs plus the 20 most recently updated terminal runs.
+    #[serde(default)]
+    pub refreshes: Vec<RefreshRunSummary>,
 }
 
 /// Summary-oriented operations dashboard projection.
@@ -2892,6 +3019,8 @@ pub enum DomainSlice {
     Workflows,
     /// Managed operation state.
     Operations,
+    /// Durable managed-client recovery runs.
+    Refresh,
     /// Automation Director goals, regions, and workforce state.
     Director,
 }

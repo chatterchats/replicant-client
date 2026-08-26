@@ -642,6 +642,7 @@ impl ClientBuilder {
             events: super::events::EventEngine::new(),
             event_telemetry: self.event_telemetry_sink,
             sync: SyncEngine,
+            refresh: super::refresh::RefreshEngine::new(),
             operations: super::operation::OperationEngine::new(),
             lifecycle: Lifecycle::new(),
             startup_policy: self.startup_policy,
@@ -668,6 +669,7 @@ impl ClientBuilder {
                 self.reconciliation_policy.clone(),
             )
             .await?;
+            super::refresh::spawn(&client).await?;
             debug!(
                 target: "replicant_client::client",
                 event = "client.background_engines_spawned",
@@ -862,6 +864,7 @@ struct ClientInner {
     state: StateEngine,
     events: super::events::EventEngine,
     event_telemetry: Option<Arc<dyn EventTelemetrySink>>,
+    refresh: super::refresh::RefreshEngine,
     #[allow(dead_code)]
     sync: SyncEngine,
     operations: super::operation::OperationEngine,
@@ -923,6 +926,13 @@ impl Client {
         }
     }
 
+    pub(crate) fn with_refresh_budget(&self, run_id: &str, capacity: u32) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            raw: self.raw.with_refresh_budget(run_id, capacity),
+        }
+    }
+
     /// Managed account observations commit before this gateway returns.
     #[must_use]
     pub fn account(&self) -> super::gateways::AccountGateway {
@@ -971,6 +981,11 @@ impl Client {
     #[must_use]
     pub fn sync(&self) -> super::sync::SyncClient {
         super::sync::SyncClient::new(self.clone())
+    }
+    /// Starts or inspects durable authoritative recovery work.
+    #[must_use]
+    pub fn refresh(&self) -> super::refresh::RefreshClient {
+        super::refresh::RefreshClient::new(self.clone())
     }
 
     /// Deduplicated managed event observation, combining unfiltered log
@@ -1040,6 +1055,17 @@ impl Client {
 
     pub(crate) fn managed_state(&self) -> &StateEngine {
         &self.inner.state
+    }
+    pub(crate) fn managed_store(&self) -> &StoreHandle {
+        &self.inner.store
+    }
+
+    pub(crate) fn refresh_notify(&self) -> &tokio::sync::Notify {
+        self.inner.refresh.notify()
+    }
+
+    pub(crate) fn inner_refresh_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.refresh.notify_arc()
     }
 
     pub(crate) fn managed_events(&self) -> &super::events::EventEngine {

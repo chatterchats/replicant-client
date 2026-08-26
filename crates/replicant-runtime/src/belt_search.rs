@@ -942,6 +942,7 @@ mod tests {
             system_tags: Vec::new(),
             system: Some("SOL".into()),
             parent: None,
+            custom_name: None,
             survey_progress: Default::default(),
             environment: Default::default(),
             unknown: BTreeMap::from([(

@@ -260,12 +260,26 @@ impl Drop for QueueTicket {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RefreshBudgetContext {
+    pub(crate) run_id: String,
+    pub(crate) capacity: u32,
+}
+
+#[derive(Debug)]
+struct RefreshBucket {
+    next: Instant,
+    capacity: u32,
+    permit_count: u64,
+}
+
 /// Rate-limit coordinator shared by all clones of a raw client, with optional
 /// cross-process SQLite scheduling.
 #[derive(Clone, Debug)]
 pub struct RateLimitCoordinator {
     buckets: Arc<Mutex<HashMap<RateLimitBucket, Bucket>>>,
     queues: Arc<Mutex<HashMap<RateLimitBucket, RequestQueue>>>,
+    refresh: Arc<Mutex<HashMap<String, RefreshBucket>>>,
     #[cfg(feature = "shared-rate-limit")]
     shared: Arc<StdRwLock<Option<SharedRateLimit>>>,
 }
@@ -303,6 +317,7 @@ impl RateLimitCoordinator {
         Self {
             buckets: Arc::new(Mutex::new(buckets)),
             queues: Arc::new(Mutex::new(HashMap::new())),
+            refresh: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "shared-rate-limit")]
             shared: Arc::new(StdRwLock::new(None)),
         }
@@ -362,6 +377,18 @@ impl RateLimitCoordinator {
     /// Waits for a permit. Queued foreground work runs first, except that a
     /// background request gets one turn after eight foreground permits.
     pub async fn acquire_with_priority(&self, kind: RateLimitBucket, priority: RequestPriority) {
+        self.acquire_with_refresh(kind, priority, None).await;
+    }
+
+    pub(crate) async fn acquire_with_refresh(
+        &self,
+        kind: RateLimitBucket,
+        priority: RequestPriority,
+        refresh: Option<&RefreshBudgetContext>,
+    ) {
+        if let Some(refresh) = refresh {
+            self.acquire_refresh_local(refresh).await;
+        }
         let ticket = {
             let mut queues = self.queues.lock().await;
             let queue = queues.entry(kind).or_default();
@@ -441,7 +468,7 @@ impl RateLimitCoordinator {
                     || RateLimitPolicy::default_for(kind),
                     |bucket| bucket.policy,
                 );
-                if let Err(error) = shared.acquire(kind, policy).await {
+                if let Err(error) = shared.acquire(kind, policy, refresh).await {
                     warn!(
                         target: "replicant_client::raw::rate_limit",
                         event = "rate_limit.shared_failed",
@@ -450,6 +477,64 @@ impl RateLimitCoordinator {
                         "shared SQLite rate limiter failed; continuing with in-process limiting"
                     );
                 }
+            }
+        }
+    }
+
+    async fn acquire_refresh_local(&self, context: &RefreshBudgetContext) {
+        let wait = {
+            let mut schedules = self.refresh.lock().await;
+            let now = Instant::now();
+            let schedule = schedules
+                .entry(context.run_id.clone())
+                .or_insert(RefreshBucket {
+                    next: now,
+                    capacity: context.capacity.clamp(1, 60),
+                    permit_count: 0,
+                });
+            schedule.capacity = context.capacity.clamp(1, 60);
+            let grant = schedule.next.max(now);
+            schedule.next = grant + Duration::from_secs(60) / schedule.capacity.max(1);
+            schedule.permit_count = schedule.permit_count.saturating_add(1);
+            grant.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    pub(crate) async fn refresh_permit_count(&self, run_id: &str) -> u64 {
+        #[cfg(feature = "shared-rate-limit")]
+        {
+            let shared = self
+                .shared
+                .read()
+                .expect("shared rate-limit lock poisoned")
+                .clone();
+            if let Some(shared) = shared
+                && let Ok(count) = shared.refresh_permit_count(run_id).await
+            {
+                return count;
+            }
+        }
+        self.refresh
+            .lock()
+            .await
+            .get(run_id)
+            .map_or(0, |schedule| schedule.permit_count)
+    }
+
+    pub(crate) async fn clear_refresh_schedule(&self, run_id: &str) {
+        self.refresh.lock().await.remove(run_id);
+        #[cfg(feature = "shared-rate-limit")]
+        {
+            let shared = self
+                .shared
+                .read()
+                .expect("shared rate-limit lock poisoned")
+                .clone();
+            if let Some(shared) = shared {
+                let _ = shared.clear_refresh_schedule(run_id).await;
             }
         }
     }
@@ -592,6 +677,14 @@ impl SharedRateLimit {
                        next_permit_ms INTEGER NOT NULL DEFAULT 0,\
                        blocked_until_ms INTEGER NOT NULL DEFAULT 0,\
                        PRIMARY KEY(scope, bucket)\
+                     );\
+                     CREATE TABLE IF NOT EXISTS refresh_rate_schedule (\
+                       scope TEXT NOT NULL,\
+                       run_id TEXT NOT NULL,\
+                       next_permit_ms INTEGER NOT NULL DEFAULT 0,\
+                       blocked_until_ms INTEGER NOT NULL DEFAULT 0,\
+                       permit_count INTEGER NOT NULL DEFAULT 0,\
+                       PRIMARY KEY(scope, run_id)\
                      );",
                 )
                 .map_err(|error| error.to_string())?;
@@ -613,7 +706,12 @@ impl SharedRateLimit {
             .expect("shared rate-limit scope lock poisoned") = scope;
     }
 
-    async fn acquire(&self, kind: RateLimitBucket, policy: RateLimitPolicy) -> Result<(), String> {
+    async fn acquire(
+        &self,
+        kind: RateLimitBucket,
+        policy: RateLimitPolicy,
+        refresh: Option<&RefreshBudgetContext>,
+    ) -> Result<(), String> {
         let connection = Arc::clone(&self.connection);
         let scope = self
             .scope
@@ -625,6 +723,15 @@ impl SharedRateLimit {
             .checked_div(i64::from(policy.capacity.max(1)))
             .unwrap_or(0)
             .max(1);
+        let refresh = refresh.map(|value| {
+            (
+                value.run_id.clone(),
+                60_000_i64
+                    .checked_div(i64::from(value.capacity.clamp(1, 60)))
+                    .unwrap_or(60_000)
+                    .max(1),
+            )
+        });
         let wait_ms = tokio::task::spawn_blocking(move || -> Result<i64, String> {
             let now_ms = unix_millis();
             let mut connection = connection
@@ -635,7 +742,7 @@ impl SharedRateLimit {
                 .map_err(|error| error.to_string())?;
             let current = transaction
                 .query_row(
-                    "SELECT next_permit_ms, blocked_until_ms FROM rate_limit_schedule \
+                    "SELECT next_permit_ms, blocked_until_ms FROM rate_limit_schedule
                      WHERE scope = ?1 AND bucket = ?2",
                     params![&scope, &bucket],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -643,18 +750,63 @@ impl SharedRateLimit {
                 .optional()
                 .map_err(|error| error.to_string())?;
             let (next_permit_ms, blocked_until_ms) = current.unwrap_or((0, 0));
-            let grant_at_ms = now_ms.max(next_permit_ms).max(blocked_until_ms);
+            let refresh_current = refresh
+                .as_ref()
+                .map(|(run_id, _)| {
+                    transaction
+                        .query_row(
+                            "SELECT next_permit_ms, blocked_until_ms, permit_count
+                             FROM refresh_rate_schedule WHERE scope = ?1 AND run_id = ?2",
+                            params![&scope, run_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?
+                .flatten()
+                .unwrap_or((0, 0, 0));
+            let grant_at_ms = now_ms
+                .max(next_permit_ms)
+                .max(blocked_until_ms)
+                .max(refresh_current.0)
+                .max(refresh_current.1);
             let following_permit_ms = grant_at_ms.saturating_add(spacing_ms);
             transaction
                 .execute(
-                    "INSERT INTO rate_limit_schedule(\
-                       scope, bucket, next_permit_ms, blocked_until_ms\
-                     ) VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT(scope, bucket) DO UPDATE SET \
+                    "INSERT INTO rate_limit_schedule(
+                       scope, bucket, next_permit_ms, blocked_until_ms
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(scope, bucket) DO UPDATE SET
                        next_permit_ms = excluded.next_permit_ms",
                     params![&scope, &bucket, following_permit_ms, blocked_until_ms],
                 )
                 .map_err(|error| error.to_string())?;
+            if let Some((run_id, refresh_spacing_ms)) = &refresh {
+                transaction
+                    .execute(
+                        "INSERT INTO refresh_rate_schedule(
+                           scope, run_id, next_permit_ms, blocked_until_ms, permit_count
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(scope, run_id) DO UPDATE SET
+                           next_permit_ms = excluded.next_permit_ms,
+                           permit_count = excluded.permit_count",
+                        params![
+                            &scope,
+                            run_id,
+                            grant_at_ms.saturating_add(*refresh_spacing_ms),
+                            refresh_current.1,
+                            refresh_current.2.saturating_add(1)
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             transaction.commit().map_err(|error| error.to_string())?;
             Ok(grant_at_ms.saturating_sub(now_ms))
         })
@@ -673,6 +825,58 @@ impl SharedRateLimit {
             tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
         }
         Ok(())
+    }
+
+    async fn refresh_permit_count(&self, run_id: &str) -> Result<u64, String> {
+        let connection = Arc::clone(&self.connection);
+        let scope = self
+            .scope
+            .read()
+            .expect("shared rate-limit scope lock poisoned")
+            .clone();
+        let run_id = run_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| "shared rate-limit SQLite lock poisoned".to_owned())?;
+            let count = connection
+                .query_row(
+                    "SELECT permit_count FROM refresh_rate_schedule
+                     WHERE scope = ?1 AND run_id = ?2",
+                    params![scope, run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            Ok(u64::try_from(count).unwrap_or(0))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn clear_refresh_schedule(&self, run_id: &str) -> Result<(), String> {
+        let connection = Arc::clone(&self.connection);
+        let scope = self
+            .scope
+            .read()
+            .expect("shared rate-limit scope lock poisoned")
+            .clone();
+        let run_id = run_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| "shared rate-limit SQLite lock poisoned".to_owned())?;
+            connection
+                .execute(
+                    "DELETE FROM refresh_rate_schedule WHERE scope = ?1 AND run_id = ?2",
+                    params![scope, run_id],
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     async fn block_for(&self, kind: RateLimitBucket, delay: Duration) -> Result<(), String> {
@@ -767,6 +971,7 @@ mod tests {
 
     use super::{
         RateLimitBucket, RateLimitCoordinator, RateLimitPolicy, RateLimitReset, RateLimitSnapshot,
+        RefreshBudgetContext, RequestPriority,
     };
 
     #[tokio::test(start_paused = true)]
@@ -1082,6 +1287,53 @@ mod tests {
         tokio::time::advance(Duration::from_secs(30)).await;
         yield_now().await;
         assert!(permit.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_budget_caps_attempts_without_consuming_action_capacity() {
+        let coordinator = RateLimitCoordinator::new();
+        coordinator
+            .set_policy(
+                RateLimitBucket::Read,
+                RateLimitPolicy {
+                    capacity: 10_000,
+                    refill_every: Duration::from_secs(1),
+                },
+            )
+            .await;
+        let context = RefreshBudgetContext {
+            run_id: "run-1".to_owned(),
+            capacity: 60,
+        };
+        for _ in 0..60 {
+            coordinator
+                .acquire_with_refresh(
+                    RateLimitBucket::Read,
+                    RequestPriority::Background,
+                    Some(&context),
+                )
+                .await;
+        }
+        assert_eq!(coordinator.refresh_permit_count("run-1").await, 60);
+        let next = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .acquire_with_refresh(
+                        RateLimitBucket::Read,
+                        RequestPriority::Background,
+                        Some(&context),
+                    )
+                    .await;
+            }
+        });
+        yield_now().await;
+        assert!(!next.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        assert!(next.is_finished());
+        let action_before = coordinator.snapshot(RateLimitBucket::Action).await;
+        assert!(action_before.is_none());
     }
 
     #[test]

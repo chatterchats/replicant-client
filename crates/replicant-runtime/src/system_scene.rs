@@ -443,6 +443,7 @@ mod tests {
             system_tags: Vec::new(),
             system: Some("SOL".to_owned()),
             parent: parent.map(|value| LocationKey::live(LocationId::from(value))),
+            custom_name: None,
             survey_progress: LocationSurveyProgress::default(),
             environment: LocationEnvironment::default(),
             unknown: BTreeMap::new(),

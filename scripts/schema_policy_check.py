@@ -24,4 +24,10 @@ history_required = policy.get("history_required_tables", []) + policy.get(
 history_missing = [name for name in history_required if name not in history_schema]
 if history_missing:
     raise SystemExit(f"history schema policy missing: {', '.join(history_missing)}")
+history_columns = policy.get("history_required_columns", [])
+column_missing = [name for name in history_columns if name not in history_schema]
+if column_missing:
+    raise SystemExit(
+        f"history schema policy columns missing: {', '.join(column_missing)}"
+    )
 print("schema policy ok")

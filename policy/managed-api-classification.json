@@ -4,6 +4,32 @@
     "account",
     "devices",
     "replicants",
+    "stars",
+    "systems",
+    "bodies",
+    "events",
+    "messages",
+    "locations",
+    "inventory",
+    "simulations"
+  ],
+  "bounded_rest_sync": [
+    "account",
+    "devices",
+    "replicants",
+    "locations",
+    "inventory",
+    "simulations"
+  ],
+  "durable_full_refresh": [
+    "account",
+    "devices",
+    "replicants",
+    "stars",
+    "systems",
+    "bodies",
+    "events",
+    "messages",
     "locations",
     "inventory",
     "simulations"
@@ -171,8 +197,18 @@
       "note": "tutorial progress remains authoritative server-owned onboarding state and is not persisted"
     }
   },
-  "full_sync_excludes": [
+  "bounded_rest_sync_excludes": [
     "global star catalogue",
+    "full event history",
+    "durable inbox history",
+    "leaderboards",
+    "public directory pages",
+    "BobNet history",
+    "trade views",
+    "device logs/audit",
+    "simulation scenarios/active views"
+  ],
+  "durable_full_refresh_excludes": [
     "leaderboards",
     "public directory pages",
     "BobNet history",

@@ -429,6 +429,7 @@ impl ClientBuilder {
                 telemetry: self.telemetry,
             }),
             priority: RequestPriority::default(),
+            refresh_budget: None,
         })
     }
 }
@@ -456,6 +457,7 @@ impl Default for ClientBuilder {
 pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
     priority: RequestPriority,
+    refresh_budget: Option<crate::raw::rate_limit::RefreshBudgetContext>,
 }
 
 pub(crate) struct ClientInner {
@@ -513,6 +515,18 @@ impl Client {
         Self {
             inner: self.inner.clone(),
             priority,
+            refresh_budget: self.refresh_budget.clone(),
+        }
+    }
+
+    pub(crate) fn with_refresh_budget(&self, run_id: &str, capacity: u32) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            priority: RequestPriority::Background,
+            refresh_budget: Some(crate::raw::rate_limit::RefreshBudgetContext {
+                run_id: run_id.to_owned(),
+                capacity: capacity.clamp(1, 60),
+            }),
         }
     }
 
@@ -752,7 +766,7 @@ impl Client {
             let permit_started = Instant::now();
             self.inner
                 .rate_limits
-                .acquire_with_priority(bucket, self.priority)
+                .acquire_with_refresh(bucket, self.priority, self.refresh_budget.as_ref())
                 .await;
             let permit_wait = permit_started.elapsed();
             attempts += 1;

@@ -2669,8 +2669,8 @@ mod tests {
                 .events()
                 .expect("retained history")
                 .iter()
-                .all(|event| event.id.as_str() != "9-0"),
-            "expired AMI telemetry must not fabricate projected quantities"
+                .any(|event| event.id.as_str() == "9-0"),
+            "full-refresh-compatible history must retain old AMI telemetry"
         );
         replayed.close().await.expect("close replayed client");
 

@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -23,6 +24,10 @@ use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+use super::refresh::{
+    RefreshDelta, RefreshMode, RefreshPhase, RefreshPhaseState, RefreshPhaseStatus,
+    RefreshReadiness, RefreshRunId, RefreshRunState, RefreshRunStatus,
+};
 use crate::domain::{
     Account, AccountId, Blueprint, Device, DeviceId, DeviceKey, Event, IncomingObject, Inventory,
     InventoryOwner, Location, LocationEvent, LocationId, LocationKey, Message, Observation,
@@ -41,9 +46,12 @@ const EVENT_PROJECTION_METADATA_SCHEMA: &str =
 const MESSAGE_METADATA_SCHEMA: &str = include_str!("../../migrations/0005_message_metadata.sql");
 const HISTORY_INITIAL_SCHEMA: &str = include_str!("../../migrations/history/0001_initial.sql");
 const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_indexes.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 6;
-const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 1;
-const AMI_RAW_RETENTION_DAYS: i64 = 30;
+const HISTORY_REFRESH_SCHEMA: &str =
+    include_str!("../../migrations/history/0003_refresh_archive.sql");
+const REFRESH_SCHEMA: &str = include_str!("../../migrations/0007_refresh.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 2;
+const REFRESH_LEASE_MILLIS: i64 = 300_000;
 const OPERATION_TERMINAL_RETENTION_DAYS: i64 = 30;
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -78,6 +86,8 @@ pub(crate) enum StoreError {
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("history database schema version {found} is newer than supported version {supported}")]
     UnsupportedHistorySchemaVersion { found: i64, supported: i64 },
+    #[error("durable refresh state failure: {0}")]
+    Refresh(String),
 }
 
 /// Internal durable store. No database handle crosses the crate boundary.
@@ -852,12 +862,22 @@ impl Store {
         file_database: bool,
     ) -> Result<Self, StoreError> {
         history.execute_batch(HISTORY_INITIAL_SCHEMA)?;
-        let history_version: i64 = history.query_row(
+        let mut history_version: i64 = history.query_row(
             "SELECT CAST(value AS INTEGER) FROM history_schema_metadata WHERE key = 'schema_version'",
             [],
             |row| row.get(0),
         )?;
         if history_version > CURRENT_HISTORY_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedHistorySchemaVersion {
+                found: history_version,
+                supported: CURRENT_HISTORY_SCHEMA_VERSION,
+            });
+        }
+        if history_version == 1 {
+            migrate_refresh_history(&mut history)?;
+            history_version = 2;
+        }
+        if history_version != CURRENT_HISTORY_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedHistorySchemaVersion {
                 found: history_version,
                 supported: CURRENT_HISTORY_SCHEMA_VERSION,
@@ -963,6 +983,20 @@ impl Store {
             )?;
             transaction.commit()?;
             version = 6;
+        }
+        if version == 6 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(REFRESH_SCHEMA)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = 7 WHERE version = 6",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '7') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 7;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
@@ -1112,7 +1146,7 @@ impl Store {
         let mut copied = 0usize;
         {
             let mut insert = transaction.prepare(
-                "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at, archived_only, stream_millis, stream_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 0, ?12, ?13)",
             )?;
             for row in rows {
                 let (serialized, appended_at) = row?;
@@ -1153,7 +1187,6 @@ impl Store {
         if self.last_history_maintenance.elapsed() < HISTORY_MAINTENANCE_INTERVAL {
             return Ok(());
         }
-        let modifier = format!("-{AMI_RAW_RETENTION_DAYS} days");
         let operation_modifier = format!("-{OPERATION_TERMINAL_RETENTION_DAYS} days");
         let operations_deleted = self.connection.execute(
             "DELETE FROM operation_journal WHERE state IN ('completed', 'rejected') AND datetime(updated_at) < datetime('now', ?1)",
@@ -1169,21 +1202,6 @@ impl Store {
                 deleted = operations_deleted,
                 retention_days = OPERATION_TERMINAL_RETENTION_DAYS,
                 "pruned expired terminal operations"
-            );
-        }
-        let deleted = self.history.execute(
-            "DELETE FROM event_history WHERE applied_at IS NOT NULL AND event_name IN ('ami.mining.digest', 'ami.transport.digest', 'ami.survey.digest') AND datetime(appended_at) < datetime('now', ?1)",
-            [modifier],
-        )?;
-        if deleted > 0 {
-            self.history
-                .execute_batch("PRAGMA incremental_vacuum(8192);")?;
-            info!(
-                target: "replicant_client::store",
-                event = "history.telemetry_pruned",
-                deleted,
-                retention_days = AMI_RAW_RETENTION_DAYS,
-                "pruned expired raw AMI telemetry from history database"
             );
         }
         self.last_history_maintenance = Instant::now();
@@ -1208,9 +1226,10 @@ impl Store {
 
     fn append_history_event(&mut self, event: &Event) -> Result<(), StoreError> {
         let payload = serde_json::to_string(&event.payload)?;
+        let stream = parse_event_id(event.id.as_str()).ok();
         let transaction = self.history.transaction()?;
         transaction.execute(
-            "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), NULL)",
+            "INSERT OR IGNORE INTO event_history(event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json, appended_at, applied_at, archived_only, stream_millis, stream_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), NULL, 0, ?11, ?12)",
             params![
                 event.id.as_str(),
                 event.realm.as_ref().map(realm_key),
@@ -1222,6 +1241,8 @@ impl Store {
                 event.location.as_ref().map(|key| key.id.as_str()),
                 &event.occurred_at,
                 payload,
+                stream.map(|value| value.0),
+                stream.map(|value| value.1),
             ],
         )?;
         transaction.commit()?;
@@ -1252,9 +1273,10 @@ impl Store {
         let Some(cursor) = self.event_cursor()? else {
             return Ok(());
         };
-        let mut statement = self
-            .history
-            .prepare("SELECT event_id FROM event_history WHERE applied_at IS NULL")?;
+        let mut statement = self.history.prepare(
+            "SELECT event_id FROM event_history
+             WHERE applied_at IS NULL AND archived_only = 0",
+        )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut applied = Vec::new();
         for row in rows {
@@ -1499,10 +1521,10 @@ impl Store {
     ) -> Result<(), StoreError> {
         let fail_commit = self.take_commit_failure();
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM stars", [])?;
         for star in stars {
             transaction.execute(
-                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3)",
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(realm, star_id) DO UPDATE SET payload_json = excluded.payload_json",
                 params![
                     realm_key(&star.value.key.realm),
                     star.value.key.id.as_str(),
@@ -1511,7 +1533,8 @@ impl Store {
             )?;
         }
         transaction.execute(
-            "INSERT INTO catalogue_metadata(singleton, generated_at) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET generated_at = excluded.generated_at",
+            "INSERT INTO catalogue_metadata(singleton, generated_at) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET generated_at = excluded.generated_at",
             [generated_at],
         )?;
         Self::commit(transaction, fail_commit)
@@ -1609,17 +1632,29 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })?;
+        let mut eligible = 0usize;
         let mut missing = Vec::new();
         for row in rows {
             let (realm, id, serialized) = row?;
             let observation = serde_json::from_str::<Observation<Device>>(&serialized)?;
-            if observation.metadata.reachability == crate::domain::Reachability::Reachable
-                && !present.contains(&observation.value.key)
-            {
-                missing.push((realm, id));
+            if observation.metadata.reachability == crate::domain::Reachability::Reachable {
+                eligible += 1;
+                if !present.contains(&observation.value.key) {
+                    missing.push((realm, id));
+                }
             }
         }
         drop(statement);
+        if present.is_empty() && eligible > 0 {
+            return Err(StoreError::Refresh(
+                "empty device enumeration cannot remove non-empty local state".into(),
+            ));
+        }
+        if eligible > 0 && missing.len() * 100 > eligible * 20 {
+            return Err(StoreError::Refresh(
+                "device enumeration shrink exceeds the guarded approval threshold".into(),
+            ));
+        }
         for (realm, id) in missing {
             transaction.execute(
                 "DELETE FROM devices WHERE realm = ?1 AND device_id = ?2",
@@ -2008,7 +2043,8 @@ impl Store {
     pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
         let mut statement = self.history.prepare(
             "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
-             FROM event_history WHERE applied_at IS NOT NULL ORDER BY appended_at, event_id",
+             FROM event_history WHERE applied_at IS NOT NULL OR archived_only = 1 \
+             ORDER BY stream_millis, stream_sequence",
         )?;
         let rows = statement.query_map([], history_event_row)?;
         rows.map(|row| decode_history_event(row?)).collect()
@@ -2023,7 +2059,8 @@ impl Store {
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let mut statement = self.history.prepare(
             "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
-             FROM event_history WHERE applied_at IS NOT NULL ORDER BY rowid DESC LIMIT ?1 OFFSET ?2",
+             FROM event_history WHERE applied_at IS NOT NULL OR archived_only = 1 \
+             ORDER BY stream_millis DESC, stream_sequence DESC LIMIT ?1 OFFSET ?2",
         )?;
         let rows = statement.query_map(params![limit, offset], history_event_row)?;
         rows.map(|row| decode_history_event(row?)).collect()
@@ -2727,6 +2764,1178 @@ impl Store {
         Ok(true)
     }
 }
+impl Store {
+    pub(crate) fn create_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        mode: RefreshMode,
+        phases: &[RefreshPhase],
+        read_requests_per_minute: u32,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO refresh_runs(
+                run_id, mode, requested_phases_json, read_requests_per_minute, status,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?5)",
+            params![
+                run_id.as_str(),
+                mode.as_str(),
+                serde_json::to_string(phases)?,
+                read_requests_per_minute,
+                now
+            ],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO refresh_phase_checkpoints(run_id, phase, status, checkpoint_json, updated_at_ms)
+                 VALUES (?1, ?2, 'pending', '{}', ?3)",
+            )?;
+            for phase in phases {
+                insert.execute(params![run_id.as_str(), phase.as_str(), now])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn list_refresh_runs(
+        &self,
+        limit: usize,
+        live_catchup: super::ReadinessComponent,
+    ) -> Result<Vec<RefreshRunStatus>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id FROM refresh_runs ORDER BY updated_at_ms DESC, created_at_ms DESC LIMIT ?1",
+        )?;
+        let ids = statement
+            .query_map([i64::try_from(limit).unwrap_or(100)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| {
+                let id = RefreshRunId::from_str(&id).map_err(StoreError::Refresh)?;
+                self.refresh_run_status(&id, live_catchup)?
+                    .ok_or_else(|| StoreError::Refresh("refresh run disappeared".into()))
+            })
+            .collect()
+    }
+
+    pub(crate) fn refresh_run_status(
+        &self,
+        run_id: &RefreshRunId,
+        live_catchup: super::ReadinessComponent,
+    ) -> Result<Option<RefreshRunStatus>, StoreError> {
+        type RunRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+        );
+        let row = self
+            .connection
+            .query_row(
+                "SELECT mode, requested_phases_json, status, current_phase,
+                        read_requests_per_minute, request_attempts, retry_not_before_ms,
+                        failure_kind, created_at_ms, updated_at_ms, completed_at_ms
+                 FROM refresh_runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            mode,
+            requested,
+            status,
+            current_phase,
+            read_requests_per_minute,
+            request_attempts,
+            retry_not_before_ms,
+            failure_kind,
+            created_at_ms,
+            updated_at_ms,
+            completed_at_ms,
+        )): Option<RunRow> = row
+        else {
+            return Ok(None);
+        };
+        let mode = match mode.as_str() {
+            "apply" => RefreshMode::Apply,
+            "dry_run" => RefreshMode::DryRun,
+            _ => {
+                return Err(StoreError::Refresh(format!(
+                    "invalid refresh mode `{mode}`"
+                )));
+            }
+        };
+        let requested_phases = serde_json::from_str::<Vec<RefreshPhase>>(&requested)?;
+        let status = RefreshRunState::parse(&status).map_err(StoreError::Refresh)?;
+        let current_phase = current_phase
+            .map(|phase| RefreshPhase::from_str(&phase).map_err(StoreError::Refresh))
+            .transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT phase, status, pages, items, request_attempts,
+                    proposed_inserts, proposed_updates, proposed_tombstones,
+                    applied_inserts, applied_updates, applied_tombstones,
+                    retry_not_before_ms, approval_digest, failure_kind, checkpoint_json
+             FROM refresh_phase_checkpoints WHERE run_id = ?1",
+        )?;
+        let rows = statement.query_map([run_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })?;
+        let mut by_phase = BTreeMap::new();
+        let mut history_backfilled_through = None;
+        for row in rows {
+            let (
+                phase,
+                phase_status,
+                pages,
+                items,
+                attempts,
+                proposed_inserts,
+                proposed_updates,
+                proposed_tombstones,
+                applied_inserts,
+                applied_updates,
+                applied_tombstones,
+                retry,
+                approval,
+                failure,
+                checkpoint,
+            ) = row?;
+            let phase = RefreshPhase::from_str(&phase).map_err(StoreError::Refresh)?;
+            if phase == RefreshPhase::Events {
+                history_backfilled_through = serde_json::from_str::<Value>(&checkpoint)?
+                    .get("before")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            by_phase.insert(
+                phase,
+                RefreshPhaseStatus {
+                    phase,
+                    status: RefreshPhaseState::parse(&phase_status).map_err(StoreError::Refresh)?,
+                    pages: pages.max(0) as u64,
+                    items: items.max(0) as u64,
+                    request_attempts: attempts.max(0) as u64,
+                    delta: RefreshDelta {
+                        proposed_inserts: proposed_inserts.max(0) as u64,
+                        proposed_updates: proposed_updates.max(0) as u64,
+                        proposed_tombstones: proposed_tombstones.max(0) as u64,
+                        applied_inserts: applied_inserts.max(0) as u64,
+                        applied_updates: applied_updates.max(0) as u64,
+                        applied_tombstones: applied_tombstones.max(0) as u64,
+                    },
+                    retry_not_before_ms: retry,
+                    approval_digest: approval,
+                    failure_kind: failure,
+                },
+            );
+        }
+        let phases = requested_phases
+            .iter()
+            .filter_map(|phase| by_phase.remove(phase))
+            .collect::<Vec<_>>();
+        let mut delta = RefreshDelta::default();
+        for phase in &phases {
+            delta += phase.delta;
+        }
+        let account_complete = phases.iter().any(|phase| {
+            phase.phase == RefreshPhase::Account && phase.status == RefreshPhaseState::Complete
+        });
+        let devices_complete = phases.iter().any(|phase| {
+            phase.phase == RefreshPhase::Devices && phase.status == RefreshPhaseState::Complete
+        });
+        let all_complete = phases
+            .iter()
+            .all(|phase| phase.status == RefreshPhaseState::Complete);
+        let readiness = if mode == RefreshMode::DryRun || !account_complete || !devices_complete {
+            RefreshReadiness::Unavailable
+        } else if all_complete {
+            RefreshReadiness::Complete
+        } else {
+            RefreshReadiness::RestBaseline
+        };
+        Ok(Some(RefreshRunStatus {
+            run_id: run_id.clone(),
+            mode,
+            status,
+            requested_phases,
+            current_phase,
+            read_requests_per_minute: u32::try_from(read_requests_per_minute)
+                .unwrap_or(MAX_REFRESH_RATE),
+            request_attempts: request_attempts.max(0) as u64,
+            delta,
+            readiness,
+            history_backfilled_through,
+            live_catchup,
+            retry_not_before_ms,
+            failure_kind,
+            created_at_ms,
+            updated_at_ms,
+            completed_at_ms,
+            phases,
+        }))
+    }
+
+    pub(crate) fn claim_refresh_run(
+        &mut self,
+        owner: &str,
+        now: i64,
+        lease_expires: i64,
+    ) -> Result<Option<RefreshRunId>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM refresh_runs
+             WHERE status = 'running' AND lease_expires_at_ms > ?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let id = transaction
+            .query_row(
+                "SELECT run_id FROM refresh_runs
+                 WHERE cancel_requested = 0 AND (
+                    status = 'queued'
+                    OR (status = 'running' AND COALESCE(lease_expires_at_ms, 0) <= ?1)
+                    OR (status = 'backing_off' AND COALESCE(retry_not_before_ms, 0) <= ?1)
+                 )
+                 ORDER BY created_at_ms, run_id LIMIT 1",
+                [now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'running', lease_owner = ?2,
+                    lease_expires_at_ms = ?3, updated_at_ms = ?4
+             WHERE run_id = ?1",
+            params![&id, owner, lease_expires, now],
+        )?;
+        transaction.commit()?;
+        RefreshRunId::from_str(&id)
+            .map(Some)
+            .map_err(StoreError::Refresh)
+    }
+
+    pub(crate) fn begin_refresh_phase(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        owner: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cancelled: i64 = transaction.query_row(
+            "SELECT cancel_requested FROM refresh_runs WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if cancelled != 0 {
+            transaction.execute(
+                "UPDATE refresh_runs SET status = 'cancelled', current_phase = NULL,
+                        completed_at_ms = ?2, lease_owner = NULL, lease_expires_at_ms = NULL,
+                        updated_at_ms = ?2 WHERE run_id = ?1",
+                params![run_id.as_str(), now],
+            )?;
+            transaction.execute(
+                "UPDATE refresh_phase_checkpoints SET status = 'cancelled', updated_at_ms = ?3
+                 WHERE run_id = ?1 AND phase = ?2 AND status != 'complete'",
+                params![run_id.as_str(), phase.as_str(), now],
+            )?;
+            transaction.execute(
+                "DELETE FROM refresh_stage WHERE run_id = ?1",
+                [run_id.as_str()],
+            )?;
+            transaction.commit()?;
+            return Ok(true);
+        }
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'running', current_phase = ?2,
+                    lease_owner = ?3, lease_expires_at_ms = ?4, updated_at_ms = ?5
+             WHERE run_id = ?1",
+            params![
+                run_id.as_str(),
+                phase.as_str(),
+                owner,
+                now + REFRESH_LEASE_MILLIS,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'running',
+                    phase_started_at_ms = COALESCE(phase_started_at_ms, ?3), updated_at_ms = ?3
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(false)
+    }
+
+    pub(crate) fn complete_refresh_phase(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let status: String = self.connection.query_row(
+            "SELECT status FROM refresh_phase_checkpoints WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str()],
+            |row| row.get(0),
+        )?;
+        if status == "awaiting_approval" {
+            self.connection.execute(
+                "UPDATE refresh_runs SET status = 'awaiting_approval', current_phase = ?2,
+                        lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
+                 WHERE run_id = ?1",
+                params![run_id.as_str(), phase.as_str(), now],
+            )?;
+            return Ok(true);
+        }
+        self.connection.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'complete', updated_at_ms = ?3
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), now],
+        )?;
+        Ok(false)
+    }
+
+    pub(crate) fn complete_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let mode: String = self.connection.query_row(
+            "SELECT mode FROM refresh_runs WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let status = if mode == "dry_run" {
+            "completed_dry_run"
+        } else {
+            "completed"
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = ?2, current_phase = NULL, completed_at_ms = ?3,
+                    lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
+             WHERE run_id = ?1",
+            params![run_id.as_str(), status, now],
+        )?;
+        transaction.execute(
+            "DELETE FROM refresh_stage WHERE run_id = ?1",
+            [run_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        failure: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'failed', failure_kind = ?2,
+                    updated_at_ms = ?3
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id.as_str(), failure, now],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'failed', failure_kind = ?2,
+                    completed_at_ms = ?3, lease_owner = NULL, lease_expires_at_ms = NULL,
+                    updated_at_ms = ?3 WHERE run_id = ?1",
+            params![run_id.as_str(), failure, now],
+        )?;
+        transaction.execute(
+            "DELETE FROM refresh_stage WHERE run_id = ?1",
+            [run_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn backoff_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        retry_not_before: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'backing_off',
+                    retry_not_before_ms = ?2, updated_at_ms = ?3
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id.as_str(), retry_not_before, now],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'backing_off', retry_not_before_ms = ?2,
+                    lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
+             WHERE run_id = ?1",
+            params![run_id.as_str(), retry_not_before, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_cancelled_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'cancelled', updated_at_ms = ?2
+             WHERE run_id = ?1 AND status != 'complete'",
+            params![run_id.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'cancelled', current_phase = NULL,
+                    completed_at_ms = ?2, lease_owner = NULL, lease_expires_at_ms = NULL,
+                    updated_at_ms = ?2 WHERE run_id = ?1",
+            params![run_id.as_str(), now],
+        )?;
+        transaction.execute(
+            "DELETE FROM refresh_stage WHERE run_id = ?1",
+            [run_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn block_refresh_phase(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'blocked',
+                    failure_kind = 'dependency', updated_at_ms = ?3
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'blocked', current_phase = ?2,
+                    failure_kind = 'dependency', lease_owner = NULL,
+                    lease_expires_at_ms = NULL, updated_at_ms = ?3 WHERE run_id = ?1",
+            params![run_id.as_str(), phase.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn approve_refresh_phase(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        digest: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let expected = self
+            .connection
+            .query_row(
+                "SELECT approval_digest FROM refresh_phase_checkpoints
+                 WHERE run_id = ?1 AND phase = ?2 AND status = 'awaiting_approval'",
+                params![run_id.as_str(), phase.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .ok_or_else(|| {
+                StoreError::Refresh("phase is not awaiting guarded shrink approval".into())
+            })?;
+        if expected != digest {
+            return Err(StoreError::Refresh(
+                "refresh approval digest does not match current staging".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET status = 'pending', approved_at_ms = ?3,
+                    updated_at_ms = ?3 WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET status = 'queued', failure_kind = NULL,
+                    lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2
+             WHERE run_id = ?1",
+            params![run_id.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_refresh_run(
+        &mut self,
+        run_id: &RefreshRunId,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let status = self
+            .connection
+            .query_row(
+                "SELECT status FROM refresh_runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Refresh("unknown refresh run".into()))?;
+        if RefreshRunState::parse(&status)
+            .map_err(StoreError::Refresh)?
+            .terminal()
+        {
+            return Ok(());
+        }
+        self.connection.execute(
+            "UPDATE refresh_runs SET cancel_requested = 1, updated_at_ms = ?2 WHERE run_id = ?1",
+            params![run_id.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn refresh_cancel_requested(
+        &self,
+        run_id: &RefreshRunId,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT cancel_requested != 0 FROM refresh_runs WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn refresh_checkpoint(
+        &self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+    ) -> Result<Value, StoreError> {
+        let value: String = self.connection.query_row(
+            "SELECT checkpoint_json FROM refresh_phase_checkpoints
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str()],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str(&value).map_err(StoreError::from)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_refresh_checkpoint(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        checkpoint: &Value,
+        pages: u64,
+        items: u64,
+        enumeration_complete: bool,
+        unfiltered: bool,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET checkpoint_json = ?3, pages = ?4,
+                    items = ?5, enumeration_complete = ?6, unfiltered = ?7,
+                    updated_at_ms = ?8 WHERE run_id = ?1 AND phase = ?2",
+            params![
+                run_id.as_str(),
+                phase.as_str(),
+                serde_json::to_string(checkpoint)?,
+                i64::try_from(pages).unwrap_or(i64::MAX),
+                i64::try_from(items).unwrap_or(i64::MAX),
+                enumeration_complete,
+                unfiltered,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET lease_expires_at_ms = ?2, updated_at_ms = ?3
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id.as_str(), now + REFRESH_LEASE_MILLIS, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn update_refresh_attempts(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        attempts: u64,
+    ) -> Result<(), StoreError> {
+        let attempts = i64::try_from(attempts).unwrap_or(i64::MAX);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET request_attempts = ?3
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), attempts],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_runs SET request_attempts = ?2 WHERE run_id = ?1",
+            params![run_id.as_str(), attempts],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_refresh_item(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        key: &str,
+        payload: Option<&str>,
+        disposition: &str,
+        observed_at_ms: Option<i64>,
+        delta: RefreshDelta,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let existed: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM refresh_stage
+                           WHERE run_id = ?1 AND phase = ?2 AND item_key = ?3)",
+            params![run_id.as_str(), phase.as_str(), key],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO refresh_stage(
+                run_id, phase, item_key, payload_json, disposition, observed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id, phase, item_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                disposition = excluded.disposition,
+                observed_at_ms = excluded.observed_at_ms",
+            params![
+                run_id.as_str(),
+                phase.as_str(),
+                key,
+                payload,
+                disposition,
+                observed_at_ms
+            ],
+        )?;
+        if !existed {
+            transaction.execute(
+                "UPDATE refresh_phase_checkpoints SET
+                    proposed_inserts = proposed_inserts + ?3,
+                    proposed_updates = proposed_updates + ?4,
+                    proposed_tombstones = proposed_tombstones + ?5,
+                    applied_inserts = applied_inserts + ?6,
+                    applied_updates = applied_updates + ?7,
+                    applied_tombstones = applied_tombstones + ?8
+                 WHERE run_id = ?1 AND phase = ?2",
+                params![
+                    run_id.as_str(),
+                    phase.as_str(),
+                    i64::try_from(delta.proposed_inserts).unwrap_or(i64::MAX),
+                    i64::try_from(delta.proposed_updates).unwrap_or(i64::MAX),
+                    i64::try_from(delta.proposed_tombstones).unwrap_or(i64::MAX),
+                    i64::try_from(delta.applied_inserts).unwrap_or(i64::MAX),
+                    i64::try_from(delta.applied_updates).unwrap_or(i64::MAX),
+                    i64::try_from(delta.applied_tombstones).unwrap_or(i64::MAX),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn refresh_stage_keys(
+        &self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        tombstones_only: bool,
+    ) -> Result<Vec<String>, StoreError> {
+        let sql = if tombstones_only {
+            "SELECT item_key FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 AND disposition = 'tombstone_candidate'
+             ORDER BY item_key"
+        } else {
+            "SELECT item_key FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 ORDER BY item_key"
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        statement
+            .query_map(params![run_id.as_str(), phase.as_str()], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn refresh_stage_payloads(
+        &self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 AND payload_json IS NOT NULL
+             ORDER BY item_key",
+        )?;
+        statement
+            .query_map(params![run_id.as_str(), phase.as_str()], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn refresh_stage_prefix(
+        &self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_key, payload_json FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 AND item_key LIKE ?3 || '%'
+                   AND payload_json IS NOT NULL ORDER BY item_key",
+        )?;
+        statement
+            .query_map(params![run_id.as_str(), phase.as_str(), prefix], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn refresh_stage_prefix_keys(
+        &self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        self.refresh_stage_prefix(run_id, phase, prefix)
+            .map(|rows| rows.into_iter().map(|row| row.0).collect())
+    }
+
+    pub(crate) fn mark_refresh_stage_prefix_applied(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        prefix: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let (inserts, updates): (i64, i64) = transaction.query_row(
+            "SELECT
+                COALESCE(SUM(disposition = 'insert'), 0),
+                COALESCE(SUM(disposition = 'update'), 0)
+             FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 AND item_key LIKE ?3 || '%'",
+            params![run_id.as_str(), phase.as_str(), prefix],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET
+                applied_inserts = applied_inserts + ?3,
+                applied_updates = applied_updates + ?4
+             WHERE run_id = ?1 AND phase = ?2",
+            params![run_id.as_str(), phase.as_str(), inserts, updates],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_stage SET disposition = 'unchanged'
+             WHERE run_id = ?1 AND phase = ?2 AND item_key LIKE ?3 || '%'",
+            params![run_id.as_str(), phase.as_str(), prefix],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn discard_refresh_stage_prefix(
+        &mut self,
+        run_id: &RefreshRunId,
+        phase: RefreshPhase,
+        prefix: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM refresh_stage
+             WHERE run_id = ?1 AND phase = ?2 AND item_key LIKE ?3 || '%'",
+            params![run_id.as_str(), phase.as_str(), prefix],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_archived_events(&mut self, events: &[Event]) -> Result<usize, StoreError> {
+        let transaction = self.history.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT OR IGNORE INTO event_history(
+                    event_id, realm, event_name, category, device_code, replicant_code,
+                    star_id, location_id, occurred_at, payload_json, appended_at,
+                    applied_at, archived_only, stream_millis, stream_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                           datetime('now'), NULL, 1, ?11, ?12)",
+            )?;
+            for event in events {
+                let stream = parse_event_id(event.id.as_str()).ok();
+                inserted += statement.execute(params![
+                    event.id.as_str(),
+                    event.realm.as_ref().map(realm_key),
+                    event.name.as_str(),
+                    event.category.as_str(),
+                    event.device.as_ref().map(|key| key.id.as_str()),
+                    event.replicant.as_ref().map(|key| key.id.as_str()),
+                    event.star.as_ref().map(|key| key.id.as_str()),
+                    event.location.as_ref().map(|key| key.id.as_str()),
+                    &event.occurred_at,
+                    serde_json::to_string(&event.payload)?,
+                    stream.map(|value| value.0),
+                    stream.map(|value| value.1),
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub(crate) fn finalize_refresh_devices(
+        &mut self,
+        run_id: &RefreshRunId,
+        mode: RefreshMode,
+        seen: &BTreeSet<String>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let (complete, unfiltered, started, approved, expected): (
+            bool,
+            bool,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = self.connection.query_row(
+            "SELECT enumeration_complete, unfiltered, phase_started_at_ms,
+                    approved_at_ms, approval_digest
+             FROM refresh_phase_checkpoints WHERE run_id = ?1 AND phase = 'devices'",
+            [run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        if !complete || !unfiltered {
+            return Err(StoreError::Refresh(
+                "device absence finalizer requires terminal unfiltered proof".into(),
+            ));
+        }
+        let started = started.ok_or_else(|| {
+            StoreError::Refresh("device refresh phase watermark is missing".into())
+        })?;
+        let mut statement = self.connection.prepare(
+            "SELECT device_id, observed_at, observation_json FROM devices
+             WHERE realm = 'live' AND access_scope = 'owned'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut eligible = 0usize;
+        let mut missing = Vec::new();
+        for row in rows {
+            let (id, observed_at, payload) = row?;
+            let observation = serde_json::from_str::<Observation<Device>>(&payload)?;
+            if observation.metadata.reachability == crate::domain::Reachability::Reachable {
+                eligible += 1;
+                if observed_at <= started && !seen.contains(&id) {
+                    missing.push(id);
+                }
+            }
+        }
+        drop(statement);
+        if seen.is_empty() && eligible > 0 {
+            return Err(StoreError::Refresh(
+                "empty device enumeration cannot remove non-empty local state".into(),
+            ));
+        }
+        let digest = refresh_removal_digest("GET /v1/devices?limit=50", started, seen);
+        if expected.as_deref().is_some_and(|value| value != digest) && approved.is_some() {
+            return Err(StoreError::Refresh(
+                "approved device refresh digest became stale".into(),
+            ));
+        }
+        let shrink = if eligible == 0 {
+            0.0
+        } else {
+            missing.len() as f64 / eligible as f64
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET local_count = ?3, upstream_count = ?4,
+                    membership_digest = ?5, approval_digest = ?5,
+                    proposed_tombstones = ?6, updated_at_ms = ?7
+             WHERE run_id = ?1 AND phase = ?2",
+            params![
+                run_id.as_str(),
+                RefreshPhase::Devices.as_str(),
+                i64::try_from(eligible).unwrap_or(i64::MAX),
+                i64::try_from(seen.len()).unwrap_or(i64::MAX),
+                &digest,
+                i64::try_from(missing.len()).unwrap_or(i64::MAX),
+                now
+            ],
+        )?;
+        if mode == RefreshMode::DryRun {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if shrink > 0.20 && approved.is_none() {
+            transaction.execute(
+                "UPDATE refresh_phase_checkpoints SET status = 'awaiting_approval'
+                 WHERE run_id = ?1 AND phase = 'devices'",
+                [run_id.as_str()],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        for id in &missing {
+            transaction.execute(
+                "DELETE FROM devices WHERE realm = 'live' AND device_id = ?1
+                 AND observed_at <= ?2",
+                params![id, started],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence)
+                 VALUES ('live', 'device', ?1, datetime('now'), ?2)",
+                params![id, format!("full-refresh:{run_id}:devices:{digest}")],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET applied_tombstones = ?2
+             WHERE run_id = ?1 AND phase = 'devices'",
+            params![
+                run_id.as_str(),
+                i64::try_from(missing.len()).unwrap_or(i64::MAX)
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn finalize_refresh_stars(
+        &mut self,
+        run_id: &RefreshRunId,
+        mode: RefreshMode,
+        stars: &[Observation<Star>],
+        generated_at: Option<&str>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let (complete, unfiltered, started, approved, expected): (
+            bool,
+            bool,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = self.connection.query_row(
+            "SELECT enumeration_complete, unfiltered, phase_started_at_ms,
+                    approved_at_ms, approval_digest
+             FROM refresh_phase_checkpoints WHERE run_id = ?1 AND phase = 'stars'",
+            [run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        if !complete || !unfiltered {
+            return Err(StoreError::Refresh(
+                "star absence finalizer requires complete response proof".into(),
+            ));
+        }
+        let started = started
+            .ok_or_else(|| StoreError::Refresh("star refresh phase watermark is missing".into()))?;
+        let seen = stars
+            .iter()
+            .map(|star| star.value.key.id.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut statement = self
+            .connection
+            .prepare("SELECT star_id, payload_json FROM stars WHERE realm = 'live'")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut eligible = 0usize;
+        let mut missing = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            eligible += 1;
+            let observation = serde_json::from_str::<Observation<Star>>(&payload)?;
+            if observation.metadata.observed_at.unix_millis() <= started && !seen.contains(&id) {
+                missing.push(id);
+            }
+        }
+        drop(statement);
+        if seen.is_empty() && eligible > 0 {
+            return Err(StoreError::Refresh(
+                "empty star catalogue cannot remove non-empty local state".into(),
+            ));
+        }
+        let digest = refresh_removal_digest("GET /v1/stars", started, &seen);
+        if expected.as_deref().is_some_and(|value| value != digest) && approved.is_some() {
+            return Err(StoreError::Refresh(
+                "approved star refresh digest became stale".into(),
+            ));
+        }
+        let shrink = if eligible == 0 {
+            0.0
+        } else {
+            missing.len() as f64 / eligible as f64
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET local_count = ?3, upstream_count = ?4,
+                    membership_digest = ?5, approval_digest = ?5,
+                    proposed_tombstones = ?6, updated_at_ms = ?7
+             WHERE run_id = ?1 AND phase = ?2",
+            params![
+                run_id.as_str(),
+                RefreshPhase::Stars.as_str(),
+                i64::try_from(eligible).unwrap_or(i64::MAX),
+                i64::try_from(seen.len()).unwrap_or(i64::MAX),
+                &digest,
+                i64::try_from(missing.len()).unwrap_or(i64::MAX),
+                now
+            ],
+        )?;
+        if mode == RefreshMode::DryRun {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if shrink > 0.20 && approved.is_none() {
+            transaction.execute(
+                "UPDATE refresh_phase_checkpoints SET status = 'awaiting_approval'
+                 WHERE run_id = ?1 AND phase = 'stars'",
+                [run_id.as_str()],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        for star in stars {
+            let existing = transaction
+                .query_row(
+                    "SELECT payload_json FROM stars WHERE realm = ?1 AND star_id = ?2",
+                    params![realm_key(&star.value.key.realm), star.value.key.id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|payload| serde_json::from_str::<Observation<Star>>(&payload))
+                .transpose()?;
+            let star = existing
+                .map(|current| merge_catalogue_account_knowledge(star.clone(), current))
+                .unwrap_or_else(|| star.clone());
+            transaction.execute(
+                "INSERT INTO stars(realm, star_id, payload_json) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(realm, star_id) DO UPDATE SET payload_json = excluded.payload_json",
+                params![
+                    realm_key(&star.value.key.realm),
+                    star.value.key.id.as_str(),
+                    serde_json::to_string(&star)?
+                ],
+            )?;
+        }
+        for id in &missing {
+            transaction.execute(
+                "DELETE FROM stars WHERE realm = 'live' AND star_id = ?1",
+                [id],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO tombstones(realm, kind, item_id, removed_at, evidence)
+                 VALUES ('live', 'star', ?1, datetime('now'), ?2)",
+                params![id, format!("full-refresh:{run_id}:stars:{digest}")],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO catalogue_metadata(singleton, generated_at) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET generated_at = excluded.generated_at",
+            [generated_at],
+        )?;
+        transaction.execute(
+            "UPDATE refresh_phase_checkpoints SET applied_tombstones = ?2
+             WHERE run_id = ?1 AND phase = 'stars'",
+            params![
+                run_id.as_str(),
+                i64::try_from(missing.len()).unwrap_or(i64::MAX)
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+const MAX_REFRESH_RATE: u32 = 60;
+
+fn refresh_removal_digest(endpoint: &str, started: i64, seen: &BTreeSet<String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(endpoint.as_bytes());
+    digest.update(started.to_be_bytes());
+    digest.update(b"terminal-unfiltered");
+    for key in seen {
+        digest.update((key.len() as u64).to_be_bytes());
+        digest.update(key.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
 
 fn migrate_device_relationship_observations(
     transaction: &Transaction<'_>,
@@ -2761,6 +3970,29 @@ fn migrate_device_relationship_observations(
         }
     }
     Ok(())
+}
+
+fn merge_catalogue_account_knowledge(
+    mut catalogue: Observation<Star>,
+    current: Observation<Star>,
+) -> Observation<Star> {
+    catalogue.value.knowledge_observed |= current.value.knowledge_observed;
+    catalogue.value.explored = match (catalogue.value.explored, current.value.explored) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    catalogue.value.has_life = match (catalogue.value.has_life, current.value.has_life) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    catalogue.value.has_ward = match (catalogue.value.has_ward, current.value.has_ward) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    catalogue
 }
 
 fn merge_migrated_star_knowledge(
@@ -2799,6 +4031,33 @@ fn merge_migrated_star_knowledge(
     current
 }
 
+fn migrate_refresh_history(history: &mut Connection) -> Result<(), StoreError> {
+    let transaction = history.transaction()?;
+    transaction.execute_batch(HISTORY_REFRESH_SCHEMA)?;
+    let event_ids = {
+        let mut statement = transaction.prepare("SELECT event_id FROM event_history")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    {
+        let mut update = transaction.prepare(
+            "UPDATE event_history SET stream_millis = ?2, stream_sequence = ?3 WHERE event_id = ?1",
+        )?;
+        for event_id in event_ids {
+            if let Ok((milliseconds, sequence)) = parse_event_id(&event_id) {
+                update.execute(params![event_id, milliseconds, sequence])?;
+            }
+        }
+    }
+    transaction.execute(
+        "INSERT INTO history_schema_metadata(key, value) VALUES ('schema_version', '2') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, StoreError> {
     connection
         .query_row(
@@ -2816,6 +4075,7 @@ fn insert_history_event(
     event: &Event,
     appended_at: &str,
 ) -> Result<(), StoreError> {
+    let stream = parse_event_id(event.id.as_str()).ok();
     statement.execute(params![
         event.id.as_str(),
         event.realm.as_ref().map(realm_key),
@@ -2828,6 +4088,8 @@ fn insert_history_event(
         &event.occurred_at,
         serde_json::to_string(&event.payload)?,
         appended_at,
+        stream.map(|value| value.0),
+        stream.map(|value| value.1),
     ])?;
     Ok(())
 }
@@ -2900,35 +4162,31 @@ fn decode_history_event(row: HistoryEventRow) -> Result<Event, StoreError> {
     })
 }
 
-/// Redis stream IDs are `<milliseconds>-<sequence>` decimal pairs.  They are
+/// Parses a Redis stream ID as its numeric `<milliseconds>-<sequence>` pair.
+fn parse_event_id(value: &str) -> Result<(i64, i64), StoreError> {
+    let Some((milliseconds, sequence)) = value.split_once('-') else {
+        return Err(StoreError::InvalidEventId(value.into()));
+    };
+    if sequence.contains('-') {
+        return Err(StoreError::InvalidEventId(value.into()));
+    }
+    let milliseconds = milliseconds
+        .parse()
+        .map_err(|_| StoreError::InvalidEventId(value.into()))?;
+    let sequence = sequence
+        .parse()
+        .map_err(|_| StoreError::InvalidEventId(value.into()))?;
+    Ok((milliseconds, sequence))
+}
+
+/// Redis stream IDs are `<milliseconds>-<sequence>` decimal pairs. They are
 /// ordered numerically; lexical comparison misorders values such as `10-0`
 /// and `9-999`.
 fn compare_event_ids(left: &str, right: &str) -> Result<Ordering, StoreError> {
-    // Equality is format-independent. This matters for synthetic/test cursors and
-    // also avoids rejecting an already-applied opaque cursor merely because no
-    // ordering comparison is actually required. Distinct values still require
-    // the production Redis stream-ID shape below.
     if left == right {
         return Ok(Ordering::Equal);
     }
-
-    fn parse(value: &str) -> Result<(u64, u64), StoreError> {
-        let Some((milliseconds, sequence)) = value.split_once('-') else {
-            return Err(StoreError::InvalidEventId(value.into()));
-        };
-        if sequence.contains('-') {
-            return Err(StoreError::InvalidEventId(value.into()));
-        }
-        let milliseconds = milliseconds
-            .parse()
-            .map_err(|_| StoreError::InvalidEventId(value.into()))?;
-        let sequence = sequence
-            .parse()
-            .map_err(|_| StoreError::InvalidEventId(value.into()))?;
-        Ok((milliseconds, sequence))
-    }
-
-    Ok(parse(left)?.cmp(&parse(right)?))
+    Ok(parse_event_id(left)?.cmp(&parse_event_id(right)?))
 }
 
 /// Advances the applied account cursor only when `cursor` is numerically newer
@@ -3273,7 +4531,7 @@ fn access_key(access: &crate::domain::AccessScope) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -3479,14 +4737,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (7);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (8);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 7,
-                supported: 6
+                found: 8,
+                supported: 7
             })
         ));
         fs::remove_file(path).expect("remove test database");
@@ -4031,15 +5289,25 @@ mod tests {
     fn full_device_reconciliation_cancels_removed_device_work() {
         let mut store = Store::open_memory().expect("open memory store");
         store
-            .persist_devices(&[device(Realm::Live, "d1")])
-            .expect("seed device");
+            .persist_devices(&[
+                device(Realm::Live, "d1"),
+                device(Realm::Live, "d2"),
+                device(Realm::Live, "d3"),
+                device(Realm::Live, "d4"),
+                device(Realm::Live, "d5"),
+            ])
+            .expect("seed devices");
         store
             .enqueue_reconciliation("device:d1", &Realm::Live, "device", &json!({"id": "d1"}))
             .expect("queue reconciliation");
+        let present = ["d2", "d3", "d4", "d5"]
+            .into_iter()
+            .map(|id| DeviceKey::live(DeviceId::new(id)))
+            .collect();
 
         store
-            .reconcile_owned_devices(&BTreeSet::new())
-            .expect("reconcile missing device");
+            .reconcile_owned_devices(&present)
+            .expect("reconcile under-threshold missing device");
 
         assert_eq!(reconciliation_count(&store, "device:d1"), 0);
     }

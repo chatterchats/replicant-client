@@ -330,24 +330,23 @@ impl StateEngine {
             .expect("galaxy snapshot lock poisoned")
             .catalogue
             .clone();
-        let stars = stars
-            .into_iter()
-            .map(|incoming| {
-                if let Some(current) = existing.get(&incoming.value.key).cloned() {
-                    match merge_star(current, incoming) {
-                        MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
-                    }
-                } else {
-                    incoming
+        let mut catalogue = existing.clone();
+        for incoming in stars {
+            let merged = if let Some(current) = catalogue.remove(&incoming.value.key) {
+                match merge_star(current, incoming) {
+                    MergeOutcome::Replaced(value) | MergeOutcome::Retained(value, _) => value,
                 }
-            })
-            .collect::<Vec<_>>();
-        let galaxy_changed = stars.len() != existing.len()
-            || stars.iter().any(|star| {
-                existing
-                    .get(&star.value.key)
-                    .is_none_or(|current| current.value != star.value)
-            });
+            } else {
+                incoming
+            };
+            catalogue.insert(merged.value.key.clone(), merged);
+        }
+        let stars = catalogue.values().cloned().collect::<Vec<_>>();
+        let galaxy_changed = catalogue.iter().any(|(key, star)| {
+            existing
+                .get(key)
+                .is_none_or(|current| current.value != star.value)
+        });
         self.store
             .lock()
             .as_mut()
@@ -356,10 +355,7 @@ impl StateEngine {
         let mut galaxy = (*self.galaxy.read().expect("galaxy snapshot lock poisoned"))
             .as_ref()
             .clone();
-        galaxy.catalogue = stars
-            .into_iter()
-            .map(|star| (star.value.key.clone(), star))
-            .collect();
+        galaxy.catalogue = catalogue;
         galaxy.generated_at = generated_at;
         *self.galaxy.write().expect("galaxy snapshot lock poisoned") = Arc::new(galaxy);
         let mut snapshot = (*self.snapshot()).clone();
@@ -1242,6 +1238,55 @@ impl StateEngine {
             inventories: previous.inventories.clone(),
             simulations: previous.simulations.clone(),
         }))
+    }
+
+    pub(crate) fn reload_devices_after_refresh(&self) -> Result<(), StoreError> {
+        let devices = self
+            .store
+            .execute_blocking(|store| store.restore_devices())?;
+        let previous = self.snapshot();
+        if devices != previous.devices {
+            self.publish(StateSnapshot {
+                revision: previous.revision + 1,
+                galaxy_revision: previous.galaxy_revision + 1,
+                devices,
+                account: previous.account.clone(),
+                replicants: previous.replicants.clone(),
+                locations: previous.locations.clone(),
+                inventories: previous.inventories.clone(),
+                simulations: previous.simulations.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reload_catalogue_after_refresh(&self) -> Result<(), StoreError> {
+        let (catalogue, generated_at) = self
+            .store
+            .execute_blocking(|store| store.restore_catalogue())?;
+        let mut galaxy = self
+            .galaxy
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if galaxy.catalogue != catalogue || galaxy.generated_at != generated_at {
+            *galaxy = Arc::new(GalaxySnapshot {
+                catalogue,
+                generated_at,
+            });
+            drop(galaxy);
+            let previous = self.snapshot();
+            self.publish(StateSnapshot {
+                revision: previous.revision + 1,
+                galaxy_revision: previous.galaxy_revision + 1,
+                devices: previous.devices.clone(),
+                account: previous.account.clone(),
+                replicants: previous.replicants.clone(),
+                locations: previous.locations.clone(),
+                inventories: previous.inventories.clone(),
+                simulations: previous.simulations.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn publish(&self, next: StateSnapshot) -> Arc<StateSnapshot> {

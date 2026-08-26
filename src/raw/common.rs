@@ -16,7 +16,7 @@ pub type JsonObject = serde_json::Map<String, serde_json::Value>;
 /// A 3D galactic coordinate, shared by star, scan, and replicant status
 /// responses.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Position {
     /// X coordinate.
     pub x: f64,

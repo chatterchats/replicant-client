@@ -199,6 +199,12 @@ impl OperationCatalogue {
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))?,
             ),
+            "managed.refresh.status" => {
+                let run_id = parameters.get("run_id").and_then(Value::as_str);
+                crate::refresh_report::managed_refresh_status(client, run_id)
+                    .await
+                    .map_err(|error| CatalogueError::Runtime(error.to_string()))
+            }
             _ => Err(unknown(OperationClass::Report, kind)),
         }
     }
@@ -1376,7 +1382,20 @@ fn descriptors() -> DescriptorCatalog {
                     Some(16.0),
                 ),
             ],
-        }],
+            },
+            ReportDescriptor {
+                kind: operation_kind("managed.refresh.status"),
+                display_name: "Managed refresh status".to_owned(),
+                aliases: strings(&["refresh_status"]),
+                description: "Inspect durable managed-state recovery progress and guarded changes."
+                    .to_owned(),
+                category: "reports".to_owned(),
+                operation_class: OperationClass::Report,
+                risk: MutationRisk::None,
+                applicable_to: Vec::new(),
+                parameters: vec![optional("run_id", "Refresh run ID", ParameterKind::String)],
+            },
+        ],
         actions: vec![
             ActionDescriptor {
                 kind: operation_kind("clear_tags"),

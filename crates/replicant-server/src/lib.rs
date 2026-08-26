@@ -30,7 +30,12 @@ use futures_util::StreamExt;
 use replicant_client::{
     ClientDegradation, ClientStatus, Error as ClientError,
     domain::{AccessScope, Device, Inventory, InventoryOwner, Realm},
-    managed::{Client, OperationStatus as ManagedOperationStatus, SyncDomain},
+    managed::{
+        Client, OperationStatus as ManagedOperationStatus, RefreshMode as ManagedRefreshMode,
+        RefreshPhase as ManagedRefreshPhase, RefreshPhaseState as ManagedRefreshPhaseState,
+        RefreshReadiness as ManagedRefreshReadiness, RefreshRequest as ManagedRefreshRequest,
+        RefreshRunId, RefreshRunState, SyncDomain,
+    },
     raw::{
         accounts::{AccountAchievementListResponse, AccountMeResponse},
         bobnet::DeviceChannelsResponse,
@@ -43,8 +48,8 @@ use replicant_client::{
 use replicant_event_planner::remaining_requirements;
 use replicant_protocol::{
     AccountEventSummary, AccountEventsSnapshot, AccountReplicantSummary, AchievementSummary,
-    ActivityLevel, AutofactoryAvailability, AutofactorySnapshot, AutofactorySummary,
-    AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
+    ActivityLevel, ApproveRefreshRequest, AutofactoryAvailability, AutofactorySnapshot,
+    AutofactorySummary, AutofactoryUtilization, AutomationControlAction, AutomationControlRequest,
     AutomationControlResponse, AutomationStatus, AutomationTrigger as ProtocolTrigger,
     BillCandidateSummary, BillDepartureSummary, BillExpansionSummary, BillFinderRequest,
     BillFinderResponse, BlueprintSummary, BlueprintsSnapshot, BobnetChannelSummary,
@@ -66,12 +71,13 @@ use replicant_protocol::{
     MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
     NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
     OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
+    RefreshDelta, RefreshPhase, RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary,
     RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
     ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
     SettingsSnapshot, SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
-    SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartWorkflowRequest,
-    StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase, SystemSceneSnapshot,
-    TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
+    SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartRefreshRequest,
+    StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase,
+    SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
     TriggerCondition as ProtocolTriggerCondition, TriggerId as ProtocolTriggerId,
     TriggerListResponse, TriggerTarget as ProtocolTriggerTarget, TutorialStepSummary,
     TutorialSummary, TutorialsSnapshot, UpdateTriggerRequest, Versioned, WorkflowActivity,
@@ -528,6 +534,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/refreshes", get(list_refreshes).post(start_refresh))
+        .route("/api/refreshes/{run_id}", get(refresh_detail))
+        .route("/api/refreshes/{run_id}/approve", post(approve_refresh))
+        .route("/api/refreshes/{run_id}/cancel", post(cancel_refresh))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
         .route("/api/inventory", get(inventory))
@@ -640,6 +650,15 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
         .collect::<BTreeMap<_, _>>();
     let mut activity_cursor = state.repository.latest_activity_id().unwrap_or_default();
     let mut managed_phase = sync_phase(&state.client().status());
+    let mut refresh_fingerprint = state
+        .client()
+        .refresh()
+        .list(100)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(refresh_summary)
+        .collect::<Vec<_>>();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -672,6 +691,15 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                 }
                 if stop_bobnet_watch {
                     bobnet = None;
+                }
+                if tick_count % 4 == 0
+                    && let Ok(runs) = state.client().refresh().list(100).await
+                {
+                    let current = runs.iter().map(refresh_summary).collect::<Vec<_>>();
+                    if current != refresh_fingerprint {
+                        refresh_fingerprint = current;
+                        state.invalidate(DomainSlice::Refresh);
+                    }
                 }
                 state.flush_invalidations();
                 let status = state.client().status();
@@ -1228,6 +1256,237 @@ async fn send_live(socket: &mut WebSocket, message: LiveMessage) -> Result<(), (
         .map_err(|_| ())
 }
 
+#[derive(Deserialize)]
+struct RefreshListQuery {
+    limit: Option<usize>,
+}
+
+async fn start_refresh(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StartRefreshRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let budget = request.read_requests_per_minute.unwrap_or(60);
+    if !(1..=60).contains(&budget) {
+        return Err(ApiError::invalid(
+            "refresh read budget must be between 1 and 60 requests per minute",
+        ));
+    }
+    let status = state
+        .client()
+        .refresh()
+        .start(ManagedRefreshRequest {
+            phases: request
+                .phases
+                .into_iter()
+                .map(managed_refresh_phase)
+                .collect(),
+            mode: if request.dry_run {
+                ManagedRefreshMode::DryRun
+            } else {
+                ManagedRefreshMode::Apply
+            },
+            read_requests_per_minute: budget,
+        })
+        .await
+        .map_err(ApiError::refresh_client)?;
+    state.invalidate(DomainSlice::Refresh);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(Versioned::current(refresh_summary(&status))),
+    ))
+}
+
+async fn list_refreshes(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RefreshListQuery>,
+) -> Result<Json<Versioned<Vec<RefreshRunSummary>>>, ApiError> {
+    let runs = state
+        .client()
+        .refresh()
+        .list(query.limit.unwrap_or(20).clamp(1, 100))
+        .await
+        .map_err(ApiError::refresh_client)?;
+    Ok(Json(Versioned::current(
+        runs.iter().map(refresh_summary).collect(),
+    )))
+}
+
+async fn refresh_detail(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Versioned<RefreshRunDetail>>, ApiError> {
+    let run_id = run_id
+        .parse::<RefreshRunId>()
+        .map_err(|_| ApiError::invalid("refresh run ID must not be empty"))?;
+    let status = state
+        .client()
+        .refresh()
+        .status(&run_id)
+        .await
+        .map_err(ApiError::refresh_client)?
+        .ok_or_else(ApiError::refresh_not_found)?;
+    Ok(Json(Versioned::current(refresh_detail_value(&status))))
+}
+
+async fn approve_refresh(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Json(request): Json<ApproveRefreshRequest>,
+) -> Result<Json<Versioned<RefreshRunSummary>>, ApiError> {
+    let run_id = run_id
+        .parse::<RefreshRunId>()
+        .map_err(|_| ApiError::invalid("refresh run ID must not be empty"))?;
+    let status = state
+        .client()
+        .refresh()
+        .approve(
+            &run_id,
+            managed_refresh_phase(request.phase),
+            &request.digest,
+        )
+        .await
+        .map_err(ApiError::refresh_conflict)?;
+    state.invalidate(DomainSlice::Refresh);
+    Ok(Json(Versioned::current(refresh_summary(&status))))
+}
+
+async fn cancel_refresh(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Versioned<RefreshRunSummary>>, ApiError> {
+    let run_id = run_id
+        .parse::<RefreshRunId>()
+        .map_err(|_| ApiError::invalid("refresh run ID must not be empty"))?;
+    let status = state
+        .client()
+        .refresh()
+        .cancel(&run_id)
+        .await
+        .map_err(ApiError::refresh_client)?;
+    state.invalidate(DomainSlice::Refresh);
+    Ok(Json(Versioned::current(refresh_summary(&status))))
+}
+
+fn managed_refresh_phase(phase: RefreshPhase) -> ManagedRefreshPhase {
+    match phase {
+        RefreshPhase::Account => ManagedRefreshPhase::Account,
+        RefreshPhase::Devices => ManagedRefreshPhase::Devices,
+        RefreshPhase::Replicants => ManagedRefreshPhase::Replicants,
+        RefreshPhase::Stars => ManagedRefreshPhase::Stars,
+        RefreshPhase::Systems => ManagedRefreshPhase::Systems,
+        RefreshPhase::Bodies => ManagedRefreshPhase::Bodies,
+        RefreshPhase::Events => ManagedRefreshPhase::Events,
+        RefreshPhase::Messages => ManagedRefreshPhase::Messages,
+        RefreshPhase::Locations => ManagedRefreshPhase::Locations,
+        RefreshPhase::Inventory => ManagedRefreshPhase::Inventory,
+        RefreshPhase::Simulations => ManagedRefreshPhase::Simulations,
+    }
+}
+
+fn protocol_refresh_phase(phase: ManagedRefreshPhase) -> RefreshPhase {
+    match phase {
+        ManagedRefreshPhase::Account => RefreshPhase::Account,
+        ManagedRefreshPhase::Devices => RefreshPhase::Devices,
+        ManagedRefreshPhase::Replicants => RefreshPhase::Replicants,
+        ManagedRefreshPhase::Stars => RefreshPhase::Stars,
+        ManagedRefreshPhase::Systems => RefreshPhase::Systems,
+        ManagedRefreshPhase::Bodies => RefreshPhase::Bodies,
+        ManagedRefreshPhase::Events => RefreshPhase::Events,
+        ManagedRefreshPhase::Messages => RefreshPhase::Messages,
+        ManagedRefreshPhase::Locations => RefreshPhase::Locations,
+        ManagedRefreshPhase::Inventory => RefreshPhase::Inventory,
+        ManagedRefreshPhase::Simulations => RefreshPhase::Simulations,
+    }
+}
+
+fn refresh_summary(status: &replicant_client::managed::RefreshRunStatus) -> RefreshRunSummary {
+    RefreshRunSummary {
+        run_id: status.run_id.to_string(),
+        mode: match status.mode {
+            ManagedRefreshMode::Apply => "apply",
+            ManagedRefreshMode::DryRun => "dry_run",
+        }
+        .to_owned(),
+        status: refresh_run_state(status.status).to_owned(),
+        readiness: match status.readiness {
+            ManagedRefreshReadiness::Unavailable => "unavailable",
+            ManagedRefreshReadiness::RestBaseline => "rest_baseline",
+            ManagedRefreshReadiness::Complete => "complete",
+        }
+        .to_owned(),
+        current_phase: status.current_phase.map(protocol_refresh_phase),
+        read_requests_per_minute: status.read_requests_per_minute,
+        request_attempts: status.request_attempts,
+        delta: protocol_refresh_delta(status.delta),
+        updated_at: status.updated_at_ms,
+    }
+}
+
+fn refresh_detail_value(status: &replicant_client::managed::RefreshRunStatus) -> RefreshRunDetail {
+    RefreshRunDetail {
+        summary: refresh_summary(status),
+        requested_phases: status
+            .requested_phases
+            .iter()
+            .copied()
+            .map(protocol_refresh_phase)
+            .collect(),
+        phases: status
+            .phases
+            .iter()
+            .map(|phase| RefreshPhaseSummary {
+                phase: protocol_refresh_phase(phase.phase),
+                status: refresh_phase_state(phase.status).to_owned(),
+                pages: phase.pages,
+                items: phase.items,
+                request_attempts: phase.request_attempts,
+                delta: protocol_refresh_delta(phase.delta),
+                retry_not_before: phase.retry_not_before_ms,
+                approval_digest: phase.approval_digest.clone(),
+                failure_kind: phase.failure_kind.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn protocol_refresh_delta(delta: replicant_client::managed::RefreshDelta) -> RefreshDelta {
+    RefreshDelta {
+        proposed_inserts: delta.proposed_inserts,
+        proposed_updates: delta.proposed_updates,
+        proposed_tombstones: delta.proposed_tombstones,
+        applied_inserts: delta.applied_inserts,
+        applied_updates: delta.applied_updates,
+        applied_tombstones: delta.applied_tombstones,
+    }
+}
+
+fn refresh_run_state(state: RefreshRunState) -> &'static str {
+    match state {
+        RefreshRunState::Queued => "queued",
+        RefreshRunState::Running => "running",
+        RefreshRunState::BackingOff => "backing_off",
+        RefreshRunState::AwaitingApproval => "awaiting_approval",
+        RefreshRunState::Blocked => "blocked",
+        RefreshRunState::Completed => "completed",
+        RefreshRunState::CompletedDryRun => "completed_dry_run",
+        RefreshRunState::Cancelled => "cancelled",
+        RefreshRunState::Failed => "failed",
+    }
+}
+
+fn refresh_phase_state(state: ManagedRefreshPhaseState) -> &'static str {
+    match state {
+        ManagedRefreshPhaseState::Pending => "pending",
+        ManagedRefreshPhaseState::Running => "running",
+        ManagedRefreshPhaseState::BackingOff => "backing_off",
+        ManagedRefreshPhaseState::AwaitingApproval => "awaiting_approval",
+        ManagedRefreshPhaseState::Blocked => "blocked",
+        ManagedRefreshPhaseState::Complete => "complete",
+        ManagedRefreshPhaseState::Cancelled => "cancelled",
+        ManagedRefreshPhaseState::Failed => "failed",
+    }
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> Json<Versioned<DaemonHealth>> {
     let status = state.client().status();
     Json(Versioned::current(DaemonHealth {
@@ -1257,6 +1516,25 @@ async fn snapshot(
         .repository
         .list_triggers()
         .map_err(ApiError::repository)?;
+    let refresh_runs = state
+        .client()
+        .refresh()
+        .list(100)
+        .await
+        .map_err(ApiError::refresh_client)?;
+    let mut terminal = 0usize;
+    let refreshes = refresh_runs
+        .iter()
+        .filter(|run| {
+            if run.status.terminal() {
+                terminal += 1;
+                terminal <= 20
+            } else {
+                true
+            }
+        })
+        .map(refresh_summary)
+        .collect();
     Ok(Json(Versioned::current(RuntimeSnapshot {
         metadata: state.snapshot_metadata()?,
         sync: RuntimeSyncStatus {
@@ -1273,6 +1551,7 @@ async fn snapshot(
         requirements,
         notifications: operational_notifications(&instances, &triggers, &status),
         slice_revisions: state.slice_revisions(),
+        refreshes,
     })))
 }
 
@@ -6500,6 +6779,40 @@ impl ApiError {
         }
     }
 
+    fn refresh_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "refresh_not_found",
+            message: "refresh run not found",
+        }
+    }
+
+    fn refresh_client(error: ClientError) -> Self {
+        if error.to_string().contains("unknown refresh run") {
+            return Self::refresh_not_found();
+        }
+        if matches!(error, ClientError::Configuration { .. }) {
+            return Self::invalid("invalid refresh request");
+        }
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "refresh_unavailable",
+            message: "managed refresh is unavailable",
+        }
+    }
+
+    fn refresh_conflict(error: ClientError) -> Self {
+        if error.to_string().contains("unknown refresh run") {
+            Self::refresh_not_found()
+        } else {
+            Self {
+                status: StatusCode::CONFLICT,
+                code: "refresh_approval_conflict",
+                message: "refresh phase status or approval digest does not match",
+            }
+        }
+    }
+
     fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -6751,6 +7064,98 @@ mod tests {
         )
         .expect("app state");
         (router(state), client)
+    }
+
+    #[tokio::test]
+    async fn refresh_routes_expose_durable_progress() {
+        let (app, client, _) = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/refreshes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "phases":["account"],
+                            "dry_run":true,
+                            "read_requests_per_minute":30
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let started: Versioned<RefreshRunSummary> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(started.payload.status, "queued");
+        assert_eq!(started.payload.read_requests_per_minute, 30);
+        let run_id = started.payload.run_id;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/refreshes?limit=500")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/refreshes/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/refreshes/{run_id}/approve"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"phase":"account","digest":"deadbeef"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/api/snapshot").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let snapshot: Versioned<RuntimeSnapshot> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot.payload.refreshes.len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::post(format!("/api/refreshes/{run_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            client
+                .refresh()
+                .status(&run_id.parse().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        client.close().await.unwrap();
     }
 
     #[tokio::test]

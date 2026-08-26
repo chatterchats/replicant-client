@@ -1,12 +1,127 @@
 {
-  "version": 1,
-  "full_plan": [
-    {"domain":"account","depends_on":[],"endpoint":"GET /v1/accounts/me","bound":"one request","absence_reconciliation":"never"},
-    {"domain":"devices","depends_on":["account"],"endpoint":"GET /v1/devices","bound":"100 cursor pages","absence_reconciliation":"only final unfiltered page"},
-    {"domain":"replicants","depends_on":["devices"],"endpoint":"GET /v1/replicants/{code}","bound":"owned codes discovered from durable state","absence_reconciliation":"never"},
-    {"domain":"locations","depends_on":["devices","replicants"],"endpoint":"GET /v1/locations/{designation}","bound":"locations discovered from durable state","absence_reconciliation":"never"},
-    {"domain":"inventory","depends_on":["locations"],"endpoint":"GET /v1/inventory","bound":"100 cursor pages","absence_reconciliation":"never"},
-    {"domain":"simulations","depends_on":["account"],"endpoint":"GET /v1/accounts/simulations","bound":"one complete history response","absence_reconciliation":"never"}
+  "version": 2,
+  "rest_plan": [
+    "account",
+    "devices",
+    "replicants",
+    "locations",
+    "inventory",
+    "simulations"
   ],
-  "readiness": {"complete":"all requested domains commit", "rest_baseline":"essential account and devices commit but another requested domain does not", "unavailable":"an essential domain does not commit", "event_continuity":"separate from REST readiness"}
+  "full_plan": [
+    "account",
+    "devices",
+    "replicants",
+    "stars",
+    "systems",
+    "bodies",
+    "events",
+    "messages",
+    "locations",
+    "inventory",
+    "simulations"
+  ],
+  "domains": {
+    "account": {
+      "depends_on": [],
+      "endpoints": ["GET /v1/accounts/me"],
+      "bound": "one request",
+      "checkpoint": "pending or committed",
+      "absence_reconciliation": "never"
+    },
+    "devices": {
+      "depends_on": ["account"],
+      "endpoints": ["GET /v1/devices"],
+      "bound": "terminal unfiltered cursor traversal",
+      "checkpoint": "next cursor, pages, seen count, and phase watermark",
+      "absence_reconciliation": "terminal_unfiltered_cursor_with_guards"
+    },
+    "replicants": {
+      "depends_on": ["devices"],
+      "endpoints": ["GET /v1/replicants/{replicant_code}"],
+      "bound": "owned codes from completed device census and durable private rows",
+      "checkpoint": "sorted code digest and next index",
+      "absence_reconciliation": "never"
+    },
+    "stars": {
+      "depends_on": ["account"],
+      "endpoints": ["GET /v1/stars"],
+      "bound": "one complete response with matching total",
+      "checkpoint": "generated_at, declared total, unique count, and membership digest",
+      "absence_reconciliation": "complete_single_response_with_total_and_guards"
+    },
+    "systems": {
+      "depends_on": ["replicants", "stars"],
+      "endpoints": [
+        "GET /v1/replicants/{replicant_code}/stars",
+        "GET /v1/replicants/{replicant_code}/stars/{star_designation}",
+        "GET /v1/locations/{designation}"
+      ],
+      "bound": "complete account star census and every explored system root",
+      "checkpoint": "candidate Replicant digest, census page, unresolved star index, and system index",
+      "absence_reconciliation": "never"
+    },
+    "bodies": {
+      "depends_on": ["systems"],
+      "endpoints": ["GET /v1/locations/{designation}"],
+      "bound": "recursively discovered bodies in proven fully surveyed systems",
+      "checkpoint": "system index, body index, remaining queue, and queue digest",
+      "absence_reconciliation": "never"
+    },
+    "events": {
+      "depends_on": ["account"],
+      "endpoints": ["GET /v1/events"],
+      "bound": "epoch through fixed phase-start upper bound",
+      "checkpoint": "fixed before bound, next cursor, pages, and events",
+      "absence_reconciliation": "never"
+    },
+    "messages": {
+      "depends_on": ["account"],
+      "endpoints": ["GET /v1/messages"],
+      "bound": "terminal unfiltered cursor traversal",
+      "checkpoint": "next cursor, pages, messages, and unread count",
+      "absence_reconciliation": "never"
+    },
+    "locations": {
+      "depends_on": ["devices", "replicants"],
+      "endpoints": [
+        "GET /v1/locations",
+        "GET /v1/locations/{designation}"
+      ],
+      "bound": "overview and union of durable, staged, and event-derived designations",
+      "checkpoint": "overview flag, designation digest, and next index",
+      "absence_reconciliation": "never"
+    },
+    "inventory": {
+      "depends_on": ["locations"],
+      "endpoints": ["GET /v1/inventory"],
+      "bound": "terminal cursor traversal at limit 50",
+      "checkpoint": "next cursor, pages, and items",
+      "absence_reconciliation": "never"
+    },
+    "simulations": {
+      "depends_on": ["account"],
+      "endpoints": ["GET /v1/accounts/simulations"],
+      "bound": "one complete history response",
+      "checkpoint": "pending or committed",
+      "absence_reconciliation": "never"
+    }
+  },
+  "deletion_safety": {
+    "empty_nonempty_abort": true,
+    "shrink_approval_percent": 20,
+    "newer_observation_wins": true,
+    "tombstone_evidence_prefix": "full-refresh"
+  },
+  "rate_budget": {
+    "default_gets_per_minute": 60,
+    "maximum_gets_per_minute": 60,
+    "yield_to_foreground": true
+  },
+  "readiness": {
+    "complete": "all requested phases and dependencies commit",
+    "rest_baseline": "account and devices apply but another requested phase remains",
+    "unavailable": "account or devices have not applied",
+    "event_continuity": "history backfill bound and live catch-up are reported separately"
+  }
 }

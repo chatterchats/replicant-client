@@ -33,6 +33,7 @@ const snapshot: RuntimeSnapshot = {
   workflows: [],
   requirements: [],
   notifications: [],
+  refreshes: [],
   slice_revisions: {},
 };
 const entities: EntityIndexSnapshot = {

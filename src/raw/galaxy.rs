@@ -14,7 +14,7 @@ use crate::raw::{Client, Position, RawResponse, RequestSafety};
 
 /// One star as listed near a given location.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 pub struct StarItem {
     /// Display color.
     pub color: Option<String>,

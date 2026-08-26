@@ -944,7 +944,7 @@ impl SyncClient {
 
     async fn sync_inventory(&self) -> std::result::Result<SyncOutcome, SyncDomainError> {
         let mut query = raw::inventory::AccountInventoryQuery {
-            limit: Some(100),
+            limit: Some(50),
             ..Default::default()
         };
         let mut pages = 0;

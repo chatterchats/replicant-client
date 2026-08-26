@@ -5550,6 +5550,7 @@ mod tests {
             system_tags: Vec::new(),
             system: Some("BETA-STAR".to_owned()),
             parent: None,
+            custom_name: None,
             survey_progress: replicant_client::domain::LocationSurveyProgress::default(),
             environment: replicant_client::domain::LocationEnvironment::default(),
             unknown: BTreeMap::from([("belt".to_owned(), serde_json::json!({"density": "dense"}))]),

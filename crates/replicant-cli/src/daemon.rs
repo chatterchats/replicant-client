@@ -1,7 +1,8 @@
 use std::{env, io};
 
 use replicant_protocol::{
-    DaemonHealth, DescriptorCatalog, ErrorResponse, RunOperationRequest, RunOperationResponse,
+    ApproveRefreshRequest, DaemonHealth, DescriptorCatalog, ErrorResponse, RefreshRunDetail,
+    RefreshRunSummary, RunOperationRequest, RunOperationResponse, StartRefreshRequest,
     StartWorkflowRequest, StartWorkflowResponse, Versioned, WorkflowControlResponse,
     WorkflowDetail, WorkflowListResponse,
 };
@@ -68,6 +69,35 @@ impl DaemonClient {
             .await
     }
 
+    pub(crate) async fn start_refresh(
+        &self,
+        request: &StartRefreshRequest,
+    ) -> crate::AnyResult<RefreshRunSummary> {
+        self.post("/api/refreshes", Some(request)).await
+    }
+
+    pub(crate) async fn refreshes(&self) -> crate::AnyResult<Vec<RefreshRunSummary>> {
+        self.get("/api/refreshes").await
+    }
+
+    pub(crate) async fn refresh(&self, id: &str) -> crate::AnyResult<RefreshRunDetail> {
+        self.get(&format!("/api/refreshes/{id}")).await
+    }
+
+    pub(crate) async fn approve_refresh(
+        &self,
+        id: &str,
+        request: &ApproveRefreshRequest,
+    ) -> crate::AnyResult<RefreshRunSummary> {
+        self.post(&format!("/api/refreshes/{id}/approve"), Some(request))
+            .await
+    }
+
+    pub(crate) async fn cancel_refresh(&self, id: &str) -> crate::AnyResult<RefreshRunSummary> {
+        self.post::<(), _>(&format!("/api/refreshes/{id}/cancel"), None)
+            .await
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str) -> crate::AnyResult<T> {
         self.decode(self.http.get(self.endpoint(path)).send().await?)
             .await
@@ -127,5 +157,86 @@ mod tests {
             client.endpoint("/api/workflows/abc/pause"),
             "http://127.0.0.1:9000/api/workflows/abc/pause"
         );
+    }
+    #[tokio::test]
+    async fn refresh_commands_map_to_daemon_routes() {
+        use replicant_protocol::{RefreshDelta, RefreshPhase, RefreshRunDetail, RefreshRunSummary};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_json, method, path},
+        };
+
+        let server = MockServer::start().await;
+        let summary = RefreshRunSummary {
+            run_id: "run-1".to_owned(),
+            mode: "dry_run".to_owned(),
+            status: "queued".to_owned(),
+            readiness: "unavailable".to_owned(),
+            current_phase: None,
+            read_requests_per_minute: 30,
+            request_attempts: 0,
+            delta: RefreshDelta::default(),
+            updated_at: 1,
+        };
+        let start_request = StartRefreshRequest {
+            phases: vec![RefreshPhase::Account],
+            dry_run: true,
+            read_requests_per_minute: Some(30),
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/refreshes"))
+            .and(body_json(&start_request))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(Versioned::current(summary.clone())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/refreshes"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Versioned::current(vec![summary.clone()])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/refreshes/run-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Versioned::current(
+                RefreshRunDetail {
+                    summary: summary.clone(),
+                    requested_phases: vec![RefreshPhase::Account],
+                    phases: Vec::new(),
+                },
+            )))
+            .mount(&server)
+            .await;
+        let approval = ApproveRefreshRequest {
+            phase: RefreshPhase::Account,
+            digest: "deadbeef".to_owned(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/refreshes/run-1/approve"))
+            .and(body_json(&approval))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Versioned::current(summary.clone())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/refreshes/run-1/cancel"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Versioned::current(summary.clone())),
+            )
+            .mount(&server)
+            .await;
+
+        let client = DaemonClient::new(server.uri());
+        assert_eq!(client.start_refresh(&start_request).await.unwrap(), summary);
+        assert_eq!(client.refreshes().await.unwrap(), vec![summary.clone()]);
+        assert_eq!(client.refresh("run-1").await.unwrap().summary, summary);
+        assert_eq!(
+            client.approve_refresh("run-1", &approval).await.unwrap(),
+            summary
+        );
+        assert_eq!(client.cancel_refresh("run-1").await.unwrap(), summary);
     }
 }

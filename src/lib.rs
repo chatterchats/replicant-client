@@ -63,6 +63,7 @@ pub mod managed {
     #[allow(missing_docs)] // Gateway implementation details are re-exported below.
     mod gateways;
     mod operation;
+    mod refresh;
     mod simulations;
     mod state;
     mod store;
@@ -111,6 +112,11 @@ pub mod managed {
         MessagesGateway, Operation, OperationOutcome, OperationStatus, OperationWatch,
         OperationsGateway,
     };
+    pub use refresh::{
+        RefreshClient, RefreshDelta, RefreshMode, RefreshPhase, RefreshPhaseState,
+        RefreshPhaseStatus, RefreshReadiness, RefreshRequest, RefreshRunId, RefreshRunState,
+        RefreshRunStatus,
+    };
     pub use simulations::{SimulationQuery, SimulationsGateway};
     pub use state::{GalaxyRevisionWatch, StateGateway, StateRevisionWatch};
     pub use sync::{
@@ -133,13 +139,16 @@ pub use managed::{
     LocationHydrationReport, LocationPredicateDiagnostic, LocationPredicateOutcome, LocationQuery,
     LocationQueryDiagnostics, LocationsGateway, MessagesGateway, MiningController, MiningDirective,
     Operation, OperationOutcome, OperationStatus, OperationWatch, OperationsGateway, Readiness,
-    ReadinessComponent, ReconciliationPolicy, RelayHistoryQuery, ReplicantHandle, ReplicantQuery,
-    ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery, SimulationsGateway, StartupPolicy,
-    StateGateway, StateRevisionWatch, SurveyController, SurveyDirective, SyncCancellation,
-    SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,
-    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
-    TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
-    TutorialsGateway, default_data_directory, default_database_path, default_history_database_path,
+    ReadinessComponent, ReconciliationPolicy, RefreshClient, RefreshDelta, RefreshMode,
+    RefreshPhase, RefreshPhaseState, RefreshPhaseStatus, RefreshReadiness, RefreshRequest,
+    RefreshRunId, RefreshRunState, RefreshRunStatus, RelayHistoryQuery, ReplicantHandle,
+    ReplicantQuery, ReplicantStarSyncReport, ReplicantsGateway, SimulationQuery,
+    SimulationsGateway, StartupPolicy, StateGateway, StateRevisionWatch, SurveyController,
+    SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure,
+    SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
+    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
+    TravelPreview, TravelVia, TutorialsGateway, default_data_directory, default_database_path,
+    default_history_database_path,
 };
 
 #[cfg(feature = "raw")]

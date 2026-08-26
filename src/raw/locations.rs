@@ -67,7 +67,7 @@ where
 /// the sanitized `ILPHARD-3` response are modeled here. Remaining fields are
 /// retained for forward compatibility.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct PlanetaryBody {
     /// Whether this planet or moon has been scanned.
     pub scanned: Option<bool>,
@@ -99,7 +99,7 @@ pub struct PlanetaryBody {
 /// open-shaped per the contract; only the scalars it actually types are
 /// modeled directly.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Location {
     /// Location events currently active here.
     pub active_location_events: Option<Vec<JsonObject>>,

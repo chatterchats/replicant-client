@@ -265,7 +265,7 @@ impl GalaxyGateway {
                     replicant_code,
                     &raw::galaxy::StarListQuery {
                         page: Some(page),
-                        per_page: Some(100),
+                        per_page: Some(50),
                     },
                 )
                 .await?;

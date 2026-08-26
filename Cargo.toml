@@ -71,7 +71,7 @@ events = ["raw", "dep:eventsource-stream", "dep:tokio-stream", "reqwest/stream"]
 
 # SQLite-backed durable state, synchronization, durable operations, and the
 # managed `Client`, on top of `events`.
-managed = ["events", "dep:rusqlite", "shared-rate-limit"]
+managed = ["events", "dep:rusqlite", "dep:sha2", "shared-rate-limit"]
 
 # Cross-process SQLite rate-limit coordination. Enabled by managed clients by default,
 # and available to raw-only users explicitly without forcing managed state.
@@ -92,11 +92,12 @@ secrecy = { version = "0.10", features = ["serde"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tracing = { version = "0.1", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
+sha2 = { version = "0.10", optional = true }
 url = { version = "2.5", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 

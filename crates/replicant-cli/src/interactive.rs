@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     env,
     io::{self, Write},
+    path::PathBuf,
 };
 
 use replicant_runtime::{config::ManagedClientConfig, reports::entity_index, start_managed_client};

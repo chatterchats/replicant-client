@@ -46,6 +46,7 @@ export type DomainSlice =
   | "leaderboards"
   | "workflows"
   | "operations"
+  | "refresh"
   | "director";
 
 export interface DaemonHealth {
@@ -59,6 +60,69 @@ export interface RuntimeSyncStatus {
   revision: number;
   last_event_at_ms: number | null;
   detail: string | null;
+}
+
+export type RefreshPhase =
+  | "account"
+  | "devices"
+  | "replicants"
+  | "stars"
+  | "systems"
+  | "bodies"
+  | "events"
+  | "messages"
+  | "locations"
+  | "inventory"
+  | "simulations";
+
+export interface StartRefreshRequest {
+  phases: RefreshPhase[];
+  dry_run: boolean;
+  read_requests_per_minute: number | null;
+}
+
+export interface ApproveRefreshRequest {
+  phase: RefreshPhase;
+  digest: string;
+}
+
+export interface RefreshDelta {
+  proposed_inserts: number;
+  proposed_updates: number;
+  proposed_tombstones: number;
+  applied_inserts: number;
+  applied_updates: number;
+  applied_tombstones: number;
+}
+
+export interface RefreshPhaseSummary {
+  phase: RefreshPhase;
+  status: string;
+  pages: number;
+  items: number;
+  request_attempts: number;
+  delta: RefreshDelta;
+  retry_not_before: number | null;
+  approval_digest: string | null;
+  failure_kind: string | null;
+}
+
+export interface RefreshRunSummary {
+  run_id: string;
+  mode: "apply" | "dry_run";
+  status: string;
+  readiness: "unavailable" | "rest_baseline" | "complete";
+  current_phase: RefreshPhase | null;
+  read_requests_per_minute: number;
+  request_attempts: number;
+  delta: RefreshDelta;
+  updated_at: number;
+}
+
+export interface RefreshRunDetail {
+  summary: RefreshRunSummary;
+  requested_phases: RefreshPhase[];
+  phases: RefreshPhaseSummary[];
 }
 
 export interface AutomationStatus {
@@ -1092,6 +1156,7 @@ export interface RuntimeSnapshot {
   notifications: Notification[];
   /** Revision each domain slice had reached when the snapshot was produced. */
   slice_revisions: Partial<Record<DomainSlice, number>>;
+  refreshes: RefreshRunSummary[];
 }
 
 export interface RequirementSummary {
@@ -1402,7 +1467,21 @@ const domainSlices = [
   "leaderboards",
   "workflows",
   "operations",
+  "refresh",
   "director",
+] as const;
+const refreshPhases = [
+  "account",
+  "devices",
+  "replicants",
+  "stars",
+  "systems",
+  "bodies",
+  "events",
+  "messages",
+  "locations",
+  "inventory",
+  "simulations",
 ] as const;
 const inventoryOwnerKinds = ["account", "replicant", "location"] as const;
 const apiTokenSources = ["environment", "secret_file", "unset"] as const;
@@ -1428,6 +1507,48 @@ function sync(value: unknown): RuntimeSyncStatus {
         ? null
         : number(item.last_event_at_ms, "last event time"),
     detail: nullableString(item.detail, "sync detail"),
+  };
+}
+
+function refreshDelta(value: unknown): RefreshDelta {
+  const item = record(value, "refresh delta");
+  return {
+    proposed_inserts: number(item.proposed_inserts, "proposed inserts"),
+    proposed_updates: number(item.proposed_updates, "proposed updates"),
+    proposed_tombstones: number(
+      item.proposed_tombstones,
+      "proposed tombstones",
+    ),
+    applied_inserts: number(item.applied_inserts, "applied inserts"),
+    applied_updates: number(item.applied_updates, "applied updates"),
+    applied_tombstones: number(item.applied_tombstones, "applied tombstones"),
+  };
+}
+
+function refreshRunSummary(value: unknown): RefreshRunSummary {
+  const item = record(value, "refresh run");
+  if (typeof item.run_id !== "string" || typeof item.status !== "string")
+    throw new Error("Invalid refresh run identity");
+  return {
+    run_id: item.run_id,
+    mode: oneOf(item.mode, ["apply", "dry_run"] as const, "refresh mode"),
+    status: item.status,
+    readiness: oneOf(
+      item.readiness,
+      ["unavailable", "rest_baseline", "complete"] as const,
+      "refresh readiness",
+    ),
+    current_phase:
+      item.current_phase === null
+        ? null
+        : oneOf(item.current_phase, refreshPhases, "refresh current phase"),
+    read_requests_per_minute: number(
+      item.read_requests_per_minute,
+      "refresh read budget",
+    ),
+    request_attempts: number(item.request_attempts, "refresh attempts"),
+    delta: refreshDelta(item.delta),
+    updated_at: number(item.updated_at, "refresh update time"),
   };
 }
 
@@ -3554,11 +3675,15 @@ export function parseSnapshotResponse(
     const notifications = item.notifications ?? [];
     if (!Array.isArray(notifications))
       throw new Error("Invalid snapshot notifications");
+    const refreshes = item.refreshes ?? [];
+    if (!Array.isArray(refreshes))
+      throw new Error("Invalid snapshot refreshes");
     return {
       metadata: metadata(item.metadata),
       sync: sync(item.sync),
       automation: automation(item.automation),
       workflows: item.workflows.map(workflow),
+      refreshes: refreshes.map(refreshRunSummary),
       notifications: notifications.map(notification),
       slice_revisions: Object.fromEntries(
         Object.entries(

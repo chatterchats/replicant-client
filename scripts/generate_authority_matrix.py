@@ -2,6 +2,7 @@
 """Generate Phase 3's checked-in authority matrix from the operation inventory."""
 
 import json
+import hashlib
 from pathlib import Path
 
 from reference_snapshot import latest_reference_snapshot
@@ -12,6 +13,8 @@ inventory = json.loads((ROOT / "policy/operations.json").read_text())
 documented_deltas = json.loads(
     (ROOT / "policy/documented-operation-deltas.json").read_text()
 )
+sync_policy_bytes = (ROOT / "policy/sync-domains.json").read_bytes()
+sync_policy = json.loads(sync_policy_bytes)
 
 OVERRIDES = {
     ("GET", "/v1/accounts/me"): ("entity_snapshot", "complete_entity", "never"),
@@ -61,8 +64,9 @@ for operation in [*inventory["operations"], *documented_deltas["operations"]]:
 operations.sort(key=lambda entry: (entry["path"], entry["method"]))
 
 (ROOT / "policy/authority-matrix.json").write_text(json.dumps({
-    "version": 1,
+    "version": 2,
     "sync_domain_policy": "policy/sync-domains.json",
+    "sync_domain_policy_sha256": hashlib.sha256(sync_policy_bytes).hexdigest(),
     "contract": f"Verified Replicant Space {SNAPSHOT.version} OpenAPI corpus",
     "operations": operations,
 }, indent=2) + "\n")

@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "event_projection_version": 1,
   "migration": "migrations/0001_initial.sql",
   "primary_migrations": [
@@ -8,7 +8,8 @@
     "migrations/0003_reconciliation_leader.sql",
     "migrations/0004_history_split.sql",
     "migrations/0005_message_metadata.sql",
-    "migrations/0006_event_projection_metadata.sql"
+    "migrations/0006_event_projection_metadata.sql",
+    "migrations/0007_refresh.sql"
   ],
   "observation_time": "unix_milliseconds (INTEGER)",
   "sqlite_durability": "primary/history: WAL for file databases; busy_timeout=15000ms; synchronous=NORMAL; history uses incremental auto-vacuum",
@@ -57,12 +58,17 @@
     "reconciliation_runs",
     "freshness",
     "tombstones",
-    "event_projection_metadata"
+    "event_projection_metadata",
+    "refresh_runs",
+    "refresh_phase_checkpoints",
+    "refresh_stage"
   ],
   "required_indexes": [
     "devices_realm_type_status",
     "devices_realm_location",
-    "devices_realm_access"
+    "devices_realm_access",
+    "refresh_runs_work",
+    "refresh_stage_disposition"
   ],
   "history_database": "replicant-history.sqlite (derived sibling of the managed database); event_history is long-lived history/telemetry storage",
   "legacy_migrated_tables": [
@@ -71,7 +77,8 @@
   ],
   "history_migrations": [
     "migrations/history/0001_initial.sql",
-    "migrations/history/0002_indexes.sql"
+    "migrations/history/0002_indexes.sql",
+    "migrations/history/0003_refresh_archive.sql"
   ],
   "history_required_tables": [
     "history_schema_metadata",
@@ -81,6 +88,14 @@
     "event_history_occurred_at",
     "event_history_name_time",
     "event_history_device_time",
-    "event_history_staged"
+    "event_history_staged",
+    "event_history_stream_order"
+  ]
+  ,
+  "history_schema_version": 2,
+  "history_required_columns": [
+    "archived_only",
+    "stream_millis",
+    "stream_sequence"
   ]
 }

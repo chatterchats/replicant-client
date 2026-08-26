@@ -385,6 +385,7 @@ mod tests {
             system_tags: Vec::new(),
             system: None,
             parent: None,
+            custom_name: None,
             survey_progress: Default::default(),
             environment: LocationEnvironment::default(),
             unknown: BTreeMap::from([(
