@@ -7,7 +7,7 @@
 //! mirrors that faithfully with [`JsonObject`] instead of inventing shapes
 //! the corrected docs/OpenAPI do not define.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use reqwest::Method;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -180,6 +180,72 @@ pub struct Location {
     /// Verified and future top-level fields not yet modeled by this DTO.
     #[serde(flatten)]
     pub unknown: JsonObject,
+}
+
+impl Location {
+    /// Returns every response field not consumed by the normalized domain
+    /// projection.
+    ///
+    /// Modeled values take precedence over colliding flattened fields. Typed
+    /// planet and moon members are removed because the domain projection
+    /// stores them in its normalized survey and environment fields.
+    #[must_use]
+    pub fn open_fields(&self) -> BTreeMap<String, serde_json::Value> {
+        const CONSUMED_FIELDS: &[&str] = &[
+            "location",
+            "location_type",
+            "scanned",
+            "system_scanned",
+            "system_tags",
+            "system",
+            "parent",
+            "planets_total",
+            "planets_scanned",
+            "moons_total",
+            "moons_scanned",
+            "moons_total_estimated",
+        ];
+        const CONSUMED_BODY_FIELDS: &[&str] = &[
+            "scanned",
+            "atmosphere",
+            "in_habitable_zone",
+            "life_stage",
+            "magnetic_field",
+            "axial_tilt_deg",
+            "surface_gravity",
+            "surface_temp_c",
+        ];
+
+        let mut serializable = self.clone();
+        let unknown = core::mem::take(&mut serializable.unknown);
+        let Ok(serde_json::Value::Object(mut fields)) = serde_json::to_value(serializable) else {
+            debug_assert!(false, "raw location must serialize as a JSON object");
+            return BTreeMap::new();
+        };
+
+        fields.retain(|_, value| !value.is_null());
+        for (key, value) in unknown {
+            fields.entry(key).or_insert(value);
+        }
+        for field in CONSUMED_FIELDS {
+            fields.remove(*field);
+        }
+        for key in ["planet", "moon"] {
+            let empty = if let Some(serde_json::Value::Object(body)) = fields.get_mut(key) {
+                for field in CONSUMED_BODY_FIELDS {
+                    body.remove(*field);
+                }
+                body.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                fields.remove(key);
+            }
+        }
+
+        fields.into_iter().collect()
+    }
 }
 
 /// Request body for `POST /v1/locations/{designation}/contribute`.

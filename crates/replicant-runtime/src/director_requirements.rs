@@ -75,6 +75,16 @@ impl DirectorRequirement {
         }
     }
 
+    /// Returns the scheduler resource edge evidenced by this prerequisite.
+    #[must_use]
+    pub const fn scheduler_resource(&self) -> &'static str {
+        match self {
+            Self::Blueprint { .. } | Self::WorkerCapacity { .. } => "devices",
+            Self::Logistics { .. } => "resource_flow",
+            Self::Connectivity { .. } => "reachability",
+        }
+    }
+
     /// Returns a deterministic identity used for durable deduplication.
     pub fn identity(&self) -> Result<String, ApplicationError> {
         Ok(match self {

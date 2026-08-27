@@ -73,6 +73,10 @@ use replicant_route_planner::{
     NetworkNode, PlannerError, Position, RelayAvailability, RelayNetworkPlan, RelayNetworkRequest,
     Star as PlannerStar, plan_relay_network_with_ranges,
 };
+use replicant_workflow::{
+    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec,
+    WorkItemTransition, WorkflowId, WorkflowKind, WorkflowRepository,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -108,6 +112,24 @@ const RELAY_PREREQUISITE_TAG_PREFIX: &str = "relay-p:";
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
 /// Result type returned by the reusable relay workflow.
 pub type AnyResult<T> = Result<T, AnyError>;
+#[derive(Debug, thiserror::Error)]
+#[error("relay coverage became live for stop {stop_index}")]
+struct RelayCoverageAlreadyLive {
+    stop_index: usize,
+}
+
+/// Returns the stop index carried by an immediate live-coverage preflight.
+#[must_use]
+pub fn relay_coverage_satisfied_stop(error: &(dyn StdError + 'static)) -> Option<usize> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<RelayCoverageAlreadyLive>() {
+            return Some(error.stop_index);
+        }
+        current = error.source();
+    }
+    None
+}
 
 fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
     io::Error::new(kind, message.into()).into()
@@ -491,6 +513,123 @@ pub struct RelayExecutionState {
     #[serde(default)]
     dsr_carrier_code: Option<String>,
     returned_to_hub: bool,
+}
+
+/// Materializes incomplete legacy relay stops as independently assignable work items.
+pub fn relay_work_item_specs(
+    workflow_id: WorkflowId,
+    state: &RelayExecutionState,
+    region: &str,
+) -> Result<Vec<WorkItemSpec>, replicant_workflow::RepositoryError> {
+    let kind = WorkflowKind::new("relay.stop")?;
+    state
+        .stops
+        .iter()
+        .enumerate()
+        .filter(|(_, stop)| !stop.completed)
+        .map(|(index, stop)| {
+            Ok(WorkItemSpec {
+                workflow_id,
+                dedupe_key: format!("relay.stop:{}:{}", stop.system, stop.location),
+                kind: kind.clone(),
+                sort_key: format!("{index:08}:{}", stop.system),
+                payload_json: serde_json::json!({
+                    "system": stop.system,
+                    "location": stop.location,
+                    "device_type": stop.device_type,
+                    "action": stop.action,
+                }),
+                preconditions_json: serde_json::json!([{
+                    "kind": "relay.coverage_missing",
+                    "parameters": {
+                        "destination": stop.system,
+                        "minimum_range_ly": state.max_hop_ly,
+                    }
+                }]),
+                requirements_json: serde_json::to_value([
+                    ResourceRequirement {
+                        key: "worker".into(),
+                        kind: "replicant".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "carrier".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["racing_vessel".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "stow".into(),
+                        kind: "stow".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: u64::try_from(state.planned_transport_capacity.max(1))
+                            .unwrap_or(u64::MAX),
+                    },
+                ])?,
+                deadline_at_ms: None,
+            })
+        })
+        .collect()
+}
+
+/// Revalidates live relay coverage and skips newly satisfied stop items.
+pub async fn revalidate_relay_work_items(
+    client: &Client,
+    repository: &WorkflowRepository,
+    workflow_id: WorkflowId,
+    state: &RelayExecutionState,
+    now_ms: i64,
+) -> Result<usize, AnyError> {
+    let targets = state
+        .stops
+        .iter()
+        .filter(|stop| !stop.completed)
+        .map(|stop| stop.system.clone())
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let reachable =
+        ftl_network_reachable_systems(client, &state.start_system, &targets, state.max_hop_ly)
+            .await?;
+    skip_relay_covered_items(repository, workflow_id, &reachable, now_ms)
+}
+
+fn skip_relay_covered_items(
+    repository: &WorkflowRepository,
+    workflow_id: WorkflowId,
+    reachable: &BTreeSet<String>,
+    now_ms: i64,
+) -> Result<usize, AnyError> {
+    let mut skipped = 0;
+    for item in repository.list_work_items(workflow_id)? {
+        if item.state.status.is_terminal() {
+            continue;
+        }
+        let Some(system) = item.spec.payload_json.get("system").and_then(Value::as_str) else {
+            continue;
+        };
+        if reachable.contains(system) {
+            repository.transition_work_item(
+                item.id,
+                item.state.revision,
+                WorkItemTransition::Skipped {
+                    reason: "relay coverage became live before deployment".into(),
+                    result_json: None,
+                },
+                now_ms,
+            )?;
+            skipped += 1;
+        }
+    }
+    Ok(skipped)
 }
 
 type MissionPlan = RelayExecutionState;
@@ -1687,6 +1826,332 @@ fn stop_requires_attachment_carrier(stop: &RelayStop) -> bool {
 
 fn stop_uses_vessel_stow(stop: &RelayStop) -> bool {
     stop.action == StopAction::DeployAndActivate && !stop_requires_attachment_carrier(stop)
+}
+
+/// One carrier's capacity-derived relay deployment trips.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayWorkerLane {
+    /// Exact carrier identity.
+    pub carrier: String,
+    /// Relay designations assigned to each sequential trip.
+    pub trips: Vec<Vec<String>>,
+}
+
+/// Elastic relay lanes plus shared tail work left for the first free lane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ElasticRelayAssignment {
+    /// Initially assigned worker/carrier lanes.
+    pub lanes: Vec<RelayWorkerLane>,
+    /// Shared tail relay designations that remain unassigned.
+    pub pending_tail: Vec<String>,
+}
+
+/// Shards relay placements using actual free vessel capacities.
+#[must_use]
+pub fn elastic_relay_assignment(
+    relays: &[String],
+    carriers: &[(String, usize)],
+) -> ElasticRelayAssignment {
+    let mut carriers = carriers
+        .iter()
+        .filter(|(_, capacity)| *capacity != 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    carriers.sort_by(|left, right| left.0.cmp(&right.0));
+    if carriers.len() == 1 {
+        let (carrier, capacity) = &carriers[0];
+        return ElasticRelayAssignment {
+            lanes: vec![RelayWorkerLane {
+                carrier: carrier.clone(),
+                trips: relays.chunks(*capacity).map(<[String]>::to_vec).collect(),
+            }],
+            pending_tail: Vec::new(),
+        };
+    }
+    let mut cursor = 0;
+    let mut lanes = carriers
+        .iter()
+        .map(|(carrier, _)| RelayWorkerLane {
+            carrier: carrier.clone(),
+            trips: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..2 {
+        for (index, (_, capacity)) in carriers.iter().enumerate() {
+            if cursor >= relays.len() {
+                break;
+            }
+            let end = cursor.saturating_add(*capacity).min(relays.len());
+            lanes[index].trips.push(relays[cursor..end].to_vec());
+            cursor = end;
+        }
+    }
+    ElasticRelayAssignment {
+        lanes,
+        pending_tail: relays[cursor..].to_vec(),
+    }
+}
+/// Executes one capacity-derived relay trip with broker-selected identities.
+///
+/// The mature relay planner and mutation helpers remain authoritative. This adapter
+/// isolates a lane's stops in a mission-shaped checkpoint, preserving the selected
+/// supply strategy, restocks, print state, deployment, activation, topology checks,
+/// and return-home boundaries without retaining the legacy mission identities.
+pub async fn execute_relay_trip<F>(
+    client: &Client,
+    state: &RelayExecutionState,
+    stop_indices: &[usize],
+    allocations: &AllocationSet,
+    wait_timeout: Duration,
+    mut checkpoint: F,
+) -> AnyResult<RelayExecutionState>
+where
+    F: FnMut(RelayExecutionState) -> AnyResult<()>,
+{
+    if stop_indices.is_empty() {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "relay trip requires at least one stop",
+        ));
+    }
+    let selected = stop_indices.iter().copied().collect::<BTreeSet<_>>();
+    if selected.len() != stop_indices.len()
+        || selected.iter().any(|index| *index >= state.stops.len())
+    {
+        return Err(app_error(
+            io::ErrorKind::InvalidInput,
+            "relay trip contains duplicate or out-of-range stop indices",
+        ));
+    }
+    let worker = relay_allocation_identity(allocations, "worker", "replicant")?;
+    let carrier = relay_allocation_identity(allocations, "carrier", "device")?;
+    let selected_systems = selected
+        .iter()
+        .map(|index| state.stops[*index].system.clone())
+        .collect::<BTreeSet<_>>();
+    let selected_relays = selected
+        .iter()
+        .filter_map(|index| state.stops[*index].relay_code.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut lane = state.clone();
+    lane.replicant_code = worker.clone();
+    lane.vessel_code = carrier.clone();
+    lane.dsr_carrier_code = selected
+        .iter()
+        .any(|index| stop_requires_attachment_carrier(&state.stops[*index]))
+        .then_some(carrier.clone());
+    lane.returned_to_hub = false;
+    for (index, stop) in lane.stops.iter_mut().enumerate() {
+        if !selected.contains(&index) {
+            stop.completed = true;
+        }
+    }
+    lane.print_jobs
+        .retain(|job| selected_systems.contains(&job.system));
+    lane.hub_stock_relays
+        .retain(|code| selected_relays.contains(code));
+    if let Some(supply) = &mut lane.supply {
+        supply
+            .initial_relay_stop_indices
+            .retain(|index| selected.contains(index));
+        supply.restocks.retain_mut(|restock| {
+            restock
+                .relay_stop_indices
+                .retain(|index| selected.contains(index));
+            restock.carrier_code.clone_from(&carrier);
+            !restock.relay_stop_indices.is_empty()
+        });
+        if let Some(mut selected_carrier) = supply.carriers.first().cloned() {
+            selected_carrier.code.clone_from(&carrier);
+            selected_carrier.restock_indices = (0..supply.restocks.len()).collect();
+            supply.carriers = vec![selected_carrier];
+        }
+    }
+
+    let suffix = selected
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("-");
+    let plan_path = env::temp_dir().join(format!(
+        "replicant-relay-trip-{}-{suffix}.json",
+        lane.mission_id
+    ));
+    let config = Config {
+        command: Command::Run,
+        database: PathBuf::new(),
+        replicant: worker,
+        hub: lane.hub_location.clone(),
+        plan_path: plan_path.clone(),
+        max_hop_ly: lane.max_hop_ly,
+        replace_plan: false,
+        reuse_account_relays: false,
+        ignore_printers: BTreeSet::new(),
+        supply_strategy: RequestedSupplyStrategy::Auto,
+        wait_timeout,
+        queue_capacity_timeout: WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT,
+        targets: selected_systems.into_iter().collect(),
+        verbose: false,
+        log_file: None,
+    };
+    save_plan(&plan_path, &lane)?;
+    checkpoint(lane.clone())?;
+
+    let result = {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let execution =
+            WORKFLOW_CHECKPOINTS.scope(sender, execute_plan(client, &config, &mut lane));
+        tokio::pin!(execution);
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                Some(state) = receiver.recv() => checkpoint(*state)?,
+            }
+        };
+        while let Ok(state) = receiver.try_recv() {
+            checkpoint(*state)?;
+        }
+        result
+    };
+    let _ = fs::remove_file(&plan_path);
+    result?;
+    checkpoint(lane.clone())?;
+    Ok(lane)
+}
+
+/// Locates the legacy stop represented by one durable relay item payload.
+#[must_use]
+pub fn relay_item_stop_index(
+    state: &RelayExecutionState,
+    system: &str,
+    location: &str,
+) -> Option<usize> {
+    state
+        .stops
+        .iter()
+        .position(|stop| stop.system == system && stop.location == location)
+}
+
+/// Returns the historical worker identity used only to resolve migration evidence.
+#[must_use]
+pub fn relay_checkpoint_worker(state: &RelayExecutionState) -> &str {
+    &state.replicant_code
+}
+/// Returns whether one stop is terminal in the supplied lane checkpoint.
+#[must_use]
+pub fn relay_stop_completed(state: &RelayExecutionState, stop_index: usize) -> bool {
+    state
+        .stops
+        .get(stop_index)
+        .is_some_and(|stop| stop.completed)
+}
+/// Returns the checkpoint's planned per-trip stow reservation.
+#[must_use]
+pub fn relay_planned_transport_capacity(state: &RelayExecutionState) -> usize {
+    usize::try_from(state.planned_transport_capacity.max(1)).unwrap_or(usize::MAX)
+}
+
+/// Merges one completed lane checkpoint into the workflow-owned mission state.
+pub fn merge_relay_trip_state(
+    state: &mut RelayExecutionState,
+    lane: &RelayExecutionState,
+    stop_indices: &[usize],
+) {
+    let systems = stop_indices
+        .iter()
+        .filter_map(|index| lane.stops.get(*index).map(|stop| stop.system.clone()))
+        .collect::<BTreeSet<_>>();
+    for index in stop_indices {
+        if let (Some(target), Some(source)) = (state.stops.get_mut(*index), lane.stops.get(*index))
+        {
+            target.clone_from(source);
+        }
+    }
+    for source in lane
+        .print_jobs
+        .iter()
+        .filter(|job| systems.contains(&job.system))
+    {
+        if let Some(target) = state.print_jobs.iter_mut().find(|job| {
+            job.system == source.system
+                && job.device_type == source.device_type
+                && job.site_tag == source.site_tag
+        }) {
+            target.clone_from(source);
+        }
+    }
+    let new_stock = lane
+        .hub_stock_relays
+        .iter()
+        .filter(|code| !state.hub_stock_relays.contains(code))
+        .cloned()
+        .collect::<Vec<_>>();
+    state.hub_stock_relays.extend(new_stock);
+    if let Some(lane_supply) = &lane.supply {
+        if let Some(supply) = &mut state.supply {
+            for source in &lane_supply.restocks {
+                if let Some(target) = supply
+                    .restocks
+                    .iter_mut()
+                    .find(|restock| restock.boundary_stop_index == source.boundary_stop_index)
+                {
+                    let completed = target.completed || source.completed;
+                    target.clone_from(source);
+                    target.completed = completed;
+                } else {
+                    supply.restocks.push(source.clone());
+                }
+            }
+            for source in &lane_supply.carriers {
+                if let Some(target) = supply
+                    .carriers
+                    .iter_mut()
+                    .find(|carrier| carrier.code == source.code)
+                {
+                    let dispatched = target.dispatched || source.dispatched;
+                    let returned_home = target.returned_home || source.returned_home;
+                    target.clone_from(source);
+                    target.dispatched = dispatched;
+                    target.returned_home = returned_home;
+                } else {
+                    supply.carriers.push(source.clone());
+                }
+            }
+        } else {
+            state.supply = Some(lane_supply.clone());
+        }
+    }
+    if lane.dsr_carrier_code.is_some() {
+        state.dsr_carrier_code.clone_from(&lane.dsr_carrier_code);
+    }
+    state.returned_to_hub = lane.returned_to_hub && state.stops.iter().all(|stop| stop.completed);
+}
+
+fn relay_allocation_identity(
+    allocations: &AllocationSet,
+    requirement: &str,
+    expected: &str,
+) -> AnyResult<String> {
+    let allocation = allocations
+        .by_requirement
+        .get(requirement)
+        .and_then(|values| values.first())
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("relay item allocation omitted {requirement}"),
+            )
+        })?;
+    match (&allocation.resource, expected) {
+        (ResourceKey::Replicant(code), "replicant") | (ResourceKey::Device(code), "device") => {
+            Ok(code.clone())
+        }
+        _ => Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("relay item allocation {requirement} has the wrong resource kind"),
+        )),
+    }
 }
 
 fn deployment_batches(
@@ -5336,6 +5801,7 @@ async fn execute_stop(
         relay = %relay_code,
         "deployment replicant is in position for relay stop"
     );
+    ensure_relay_stop_still_missing(client, plan, index).await?;
     if let Some(carrier_code) = dsr_carrier.as_deref() {
         info!(
             relay = %relay_code,
@@ -5374,10 +5840,12 @@ async fn execute_stop(
         }
     }
 
+    ensure_relay_stop_still_missing(client, plan, index).await?;
     ensure_relay_unfurled(client, config, relay_code).await?;
     // This authoritative read confirms unfurling before activation ordering.
     let snapshot = client.devices().get(relay_code).await?.snapshot().await?;
     if device_status(&snapshot) != Some(RELAYING) {
+        ensure_relay_stop_still_missing(client, plan, index).await?;
         info!(
             relay = %relay_code,
             system = %stop.system,
@@ -5412,6 +5880,24 @@ async fn execute_stop(
         send_dsr_carrier_home(client, plan, carrier_code).await?;
     }
     info!(system = %stop.system, relay = relay_code, "relay stop verified");
+    Ok(())
+}
+
+async fn ensure_relay_stop_still_missing(
+    client: &Client,
+    plan: &MissionPlan,
+    stop_index: usize,
+) -> AnyResult<()> {
+    let stop = plan.stops.get(stop_index).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("relay stop index {stop_index} is outside the mission"),
+        )
+    })?;
+    if ftl_network_reaches_system(client, &plan.start_system, &stop.system, plan.max_hop_ly).await?
+    {
+        return Err(Box::new(RelayCoverageAlreadyLive { stop_index }));
+    }
     Ok(())
 }
 
@@ -6361,11 +6847,39 @@ pub async fn ftl_network_reaches_system(
     conventional_range_ly: f64,
 ) -> AnyResult<bool> {
     let targets = BTreeSet::from([target.to_owned()]);
+
     Ok(
         ftl_network_reachable_systems(client, start, &targets, conventional_range_ly)
             .await?
             .contains(target),
     )
+}
+/// Builds and reconciles a relay mission without submitting mission mutations.
+///
+/// `worker` is a broker-selected planning observation used only to derive the
+/// existing route, hosted-vessel capacity, and print plan. Durable item attempts
+/// may subsequently use any eligible broker allocation.
+pub async fn prepare_relay_workflow(
+    client: &Client,
+    request: &RelayExpansionRequest,
+    worker: &str,
+) -> AnyResult<RelayExecutionState> {
+    let mut request = request.clone();
+    request.replicant = worker.to_owned();
+    let mut config = expansion_config(&request, WORKFLOW_QUEUE_CAPACITY_WAIT_TIMEOUT);
+    config.command = Command::Plan;
+    let _lock = MissionLock::acquire(&request.mission_file)?;
+    run(client, &config).await
+}
+
+/// Builds the public relay report from a workflow-owned terminal checkpoint.
+#[must_use]
+pub fn relay_expansion_report(state: RelayExecutionState) -> RelayExpansionReport {
+    RelayExpansionReport {
+        targets: state.targets.clone(),
+        stops: state.stops.len(),
+        state,
+    }
 }
 
 fn relay_mesh_reachable_systems(
@@ -6462,7 +6976,7 @@ pub fn relay_workflow_request(arguments: Vec<String>) -> AnyResult<RelayExpansio
 }
 
 /// Summary returned after a reusable relay expansion completes.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RelayExpansionReport {
     /// Requested target systems.
     pub targets: Vec<String>,
@@ -6571,11 +7085,12 @@ pub fn restore_relay_checkpoint(path: &Path, checkpoint: &RelayExecutionState) -
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
     use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use replicant_workflow::WorkItemStatus;
     use wiremock::{
         Mock, MockServer, Request, ResponseTemplate,
         matchers::{method, path, path_regex},
@@ -6688,6 +7203,206 @@ mod tests {
             .mount(server)
             .await;
         client.devices().get(code).await.expect("seed device");
+    }
+
+    async fn seed_relay_worker(
+        server: &MockServer,
+        client: &Client,
+        worker: &str,
+        vessel: &str,
+        stow_capacity: i64,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/replicants/{worker}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": worker,
+                "hosted_device_code": vessel,
+                "location": "ANTAR-1-L4",
+                "status": "active"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .replicants()
+            .get_owned(worker)
+            .await
+            .expect("seed Replicant");
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{vessel}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": vessel,
+                "device_type": "racing_vessel",
+                "location": "ANTAR-1-L4",
+                "status": "active",
+                "stow_capacity": stow_capacity,
+                "stow_used": 0
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client.devices().get(vessel).await.expect("seed vessel");
+    }
+
+    struct FixtureRelayTripExecutor {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        first_wave: tokio::sync::Barrier,
+        synchronize_first_wave: bool,
+        fail_call: Option<usize>,
+        workers: Mutex<BTreeSet<String>>,
+        successful_trip_sizes: Mutex<Vec<usize>>,
+    }
+
+    impl FixtureRelayTripExecutor {
+        fn two_lanes_with_tail_replacement() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                first_wave: tokio::sync::Barrier::new(2),
+                synchronize_first_wave: true,
+                fail_call: Some(4),
+                workers: Mutex::new(BTreeSet::new()),
+                successful_trip_sizes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn single_lane() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                first_wave: tokio::sync::Barrier::new(1),
+                synchronize_first_wave: false,
+                fail_call: None,
+                workers: Mutex::new(BTreeSet::new()),
+                successful_trip_sizes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::workflows::RelayTripExecutor for FixtureRelayTripExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a Client,
+            state: &'a RelayExecutionState,
+            stop_indices: &'a [usize],
+            allocations: &'a AllocationSet,
+            _wait_timeout: Duration,
+            checkpoints: tokio::sync::mpsc::UnboundedSender<RelayExecutionState>,
+        ) -> crate::workflows::RelayTripFuture<'a> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let worker = relay_allocation_identity(allocations, "worker", "replicant");
+            let carrier = relay_allocation_identity(allocations, "carrier", "device");
+            let mut lane = state.clone();
+            let indices = stop_indices.to_vec();
+            Box::pin(async move {
+                let worker = worker?;
+                let carrier = carrier?;
+                self.workers.lock().expect("workers").insert(worker);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                if self.synchronize_first_wave && call < 2 {
+                    self.first_wave.wait().await;
+                }
+                tokio::task::yield_now().await;
+                if self.fail_call == Some(call) {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    return Err(permanent_classified_error(
+                        FailureClass::DeviceTargetMissing,
+                        io::ErrorKind::NotFound,
+                        format!("allocated carrier {carrier} returned HTTP 404"),
+                    ));
+                }
+                for index in &indices {
+                    lane.stops[*index].completed = true;
+                }
+                if let Some(supply) = &mut lane.supply {
+                    for restock in &mut supply.restocks {
+                        if restock
+                            .relay_stop_indices
+                            .iter()
+                            .any(|index| indices.contains(index))
+                        {
+                            restock.completed = true;
+                        }
+                    }
+                    for carrier in &mut supply.carriers {
+                        carrier.returned_home = true;
+                    }
+                }
+                lane.returned_to_hub = true;
+                checkpoints
+                    .send(lane.clone())
+                    .map_err(|_| app_error(io::ErrorKind::BrokenPipe, "checkpoint receiver"))?;
+                self.successful_trip_sizes
+                    .lock()
+                    .expect("trip sizes")
+                    .push(indices.len());
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(lane)
+            })
+        }
+    }
+
+    fn pooled_relay_execution_state(planned_capacity: i64) -> RelayExecutionState {
+        let mut state = execution_state();
+        let template = state.stops[0].clone();
+        let print_template = state.print_jobs[0].clone();
+        let mut completed = template.clone();
+        completed.system = "DONE".into();
+        completed.location = "DONE-1-L4".into();
+        completed.completed = true;
+        state.stops = vec![completed];
+        state.targets.clear();
+        state.print_jobs.clear();
+        state.hub_stock_relays.clear();
+        state.planned_transport_capacity = planned_capacity;
+        for index in 1..=17 {
+            let mut stop = template.clone();
+            stop.system = format!("TARGET-{index:02}");
+            stop.location = format!("TARGET-{index:02}-1-L4");
+            stop.parent_system = "ROOT".into();
+            if index <= 4 {
+                stop.action = StopAction::DeployAndActivate;
+                let relay_code = format!("STOCK-{index:02}");
+                stop.relay_code = Some(relay_code.clone());
+                state.hub_stock_relays.push(relay_code.clone());
+                let mut job = print_template.clone();
+                job.system = stop.system.clone();
+                job.relay_code = Some(relay_code);
+                job.submitted = true;
+                state.print_jobs.push(job);
+            } else {
+                stop.action = StopAction::ActivateExisting;
+                stop.relay_code = Some(format!("RELAY-{index:02}"));
+            }
+            stop.completed = false;
+            state.targets.push(stop.system.clone());
+            state.stops.push(stop);
+        }
+        state.supply = Some(RelaySupplyPlan {
+            strategy: SupplyStrategy::Staged,
+            initial_relay_stop_indices: vec![1, 2, 3, 4],
+            restocks: vec![RelayRestock {
+                boundary_stop_index: 4,
+                location: "ROOT-1-L4".into(),
+                relay_stop_indices: vec![1, 2, 3, 4],
+                carrier_code: "VESSEL-A".into(),
+                completed: false,
+            }],
+            carriers: vec![RelaySupplyCarrier {
+                code: "VESSEL-A".into(),
+                device_type: "racing_vessel".into(),
+                attach_capacity: planned_capacity,
+                restock_indices: vec![0],
+                dispatched: false,
+                returned_home: false,
+            }],
+        });
+        state
     }
 
     #[tokio::test]
@@ -7819,5 +8534,531 @@ mod tests {
         let groups = pending_print_groups(&jobs, "6523AC61");
 
         assert_eq!(groups, vec![vec![1], vec![0]]);
+    }
+    #[test]
+    fn relay_assignment_two_four_slot_lanes_leave_shared_tail() {
+        let relays = (1..=17)
+            .map(|index| format!("RELAY-{index:02}"))
+            .collect::<Vec<_>>();
+        let assignment =
+            elastic_relay_assignment(&relays, &[("VESSEL-B".into(), 4), ("VESSEL-A".into(), 4)]);
+        assert_eq!(assignment.lanes.len(), 2);
+        assert_eq!(
+            assignment
+                .lanes
+                .iter()
+                .map(|lane| lane.trips.iter().map(Vec::len).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![4, 4], vec![4, 4]]
+        );
+        assert_eq!(assignment.pending_tail, ["RELAY-17"]);
+    }
+
+    #[test]
+    fn relay_assignment_one_nine_slot_lane_uses_nine_then_eight() {
+        let relays = (1..=17)
+            .map(|index| format!("RELAY-{index:02}"))
+            .collect::<Vec<_>>();
+        let assignment = elastic_relay_assignment(&relays, &[("HEAVEN-1".into(), 9)]);
+        assert_eq!(
+            assignment.lanes[0]
+                .trips
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![9, 8]
+        );
+        assert!(assignment.pending_tail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn relay_assignment_registered_executor_runs_capacity_lanes_and_replaces_tail_carrier() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let mut stars = vec![serde_json::json!({
+            "designation": "ROOT",
+            "region": "Alpha",
+            "position": { "x": 0.0, "y": 0.0, "z": 0.0 }
+        })];
+        stars.extend((1..=17).map(|index| {
+            serde_json::json!({
+                "designation": format!("TARGET-{index:02}"),
+                "region": "Alpha",
+                "position": { "x": index as f64 * 100.0, "y": 0.0, "z": 0.0 }
+            })
+        }));
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-26T00:00:00Z",
+                "total": stars.len(),
+                "stars": stars
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed catalogue");
+        seed_relay_worker(&server, &client, "REP-A", "VESSEL-A", 4).await;
+        seed_relay_worker(&server, &client, "REP-B", "VESSEL-B", 4).await;
+
+        let state = pooled_relay_execution_state(4);
+
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        for worker in ["REP-A", "REP-B"] {
+            repository
+                .put_document(
+                    "director.replicant",
+                    worker,
+                    &serde_json::json!({ "region": "Alpha" }),
+                )
+                .expect("Director region");
+        }
+        let workflow = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::workflows::relay_workflow_kind(),
+                schema_version: 2,
+                config: crate::workflows::RelayWorkflowConfig {
+                    hub: "ROOT-1-L4".into(),
+                    region: Some("Alpha".into()),
+                    targets: state.targets.clone(),
+                    mission_file: env::temp_dir().join("relay-pooled-fixture.json"),
+                    max_hop_ly: DEFAULT_MAX_HOP_LY,
+                    wait_timeout_seconds: 1,
+                    wait_timeout_nanoseconds: 0,
+                    unavailable_autofactories: BTreeSet::new(),
+                },
+                checkpoint: crate::workflows::RelayWorkflowCheckpoint {
+                    state: Some(state),
+                    region: Some("Alpha".into()),
+                    completed_steps: BTreeSet::from(["planned".into()]),
+                },
+                current_step: Some("planned".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let executor = Arc::new(FixtureRelayTripExecutor::two_lanes_with_tail_replacement());
+        let mut registry = replicant_workflow::WorkflowRegistry::new();
+        registry
+            .register(Arc::new(
+                crate::workflows::RelayWorkflowFactory::with_trip_executor(executor.clone()),
+            ))
+            .expect("register relay workflow");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..100 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workflow = repository
+            .read(workflow.id)
+            .expect("read workflow")
+            .expect("workflow");
+        let items = repository.list_work_items(workflow.id).expect("items");
+        let item_states = items
+            .iter()
+            .map(|item| (&item.state.status, item.state.last_error.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workflow.status,
+            replicant_workflow::WorkflowStatus::Succeeded,
+            "relay workflow failed: {:?}; items: {item_states:?}",
+            workflow.last_error
+        );
+        assert_eq!(items.len(), 17, "completed legacy stop must not reopen");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.state.status == WorkItemStatus::Succeeded)
+        );
+        let report: RelayExpansionReport = workflow
+            .result()
+            .expect("decode relay report")
+            .expect("relay report");
+        assert_eq!(report.state.print_jobs.len(), 4);
+        let supply = report.state.supply.as_ref().expect("supply checkpoint");
+        assert!(supply.restocks.iter().all(|restock| restock.completed));
+        assert!(supply.carriers.iter().all(|carrier| carrier.returned_home));
+        assert!(report.state.returned_to_hub);
+        assert_eq!(executor.peak.load(Ordering::SeqCst), 2);
+        assert_eq!(executor.workers.lock().expect("workers").len(), 2);
+        let mut sizes = executor
+            .successful_trip_sizes
+            .lock()
+            .expect("trip sizes")
+            .clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [1, 4, 4, 4, 4]);
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            6,
+            "tail carrier failure must replace and resume the same checkpoint"
+        );
+        let attempts = items
+            .iter()
+            .map(|item| {
+                repository
+                    .list_work_item_attempts(item.id)
+                    .expect("attempts")
+                    .len()
+            })
+            .sum::<usize>();
+        assert_eq!(attempts, 17);
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn relay_assignment_registered_heaven_lane_executes_nine_then_eight() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let mut stars = vec![serde_json::json!({
+            "designation": "ROOT",
+            "region": "Alpha",
+            "position": { "x": 0.0, "y": 0.0, "z": 0.0 }
+        })];
+        stars.extend((1..=17).map(|index| {
+            serde_json::json!({
+                "designation": format!("TARGET-{index:02}"),
+                "region": "Alpha",
+                "position": { "x": index as f64 * 100.0, "y": 0.0, "z": 0.0 }
+            })
+        }));
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-26T00:00:00Z",
+                "total": stars.len(),
+                "stars": stars
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed catalogue");
+        seed_relay_worker(&server, &client, "REP-HEAVEN", "HEAVEN-1", 9).await;
+
+        let state = pooled_relay_execution_state(9);
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        repository
+            .put_document(
+                "director.replicant",
+                "REP-HEAVEN",
+                &serde_json::json!({ "region": "Alpha" }),
+            )
+            .expect("Director region");
+        let workflow = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::workflows::relay_workflow_kind(),
+                schema_version: 2,
+                config: crate::workflows::RelayWorkflowConfig {
+                    hub: "ROOT-1-L4".into(),
+                    region: Some("Alpha".into()),
+                    targets: state.targets.clone(),
+                    mission_file: env::temp_dir().join("relay-heaven-fixture.json"),
+                    max_hop_ly: DEFAULT_MAX_HOP_LY,
+                    wait_timeout_seconds: 1,
+                    wait_timeout_nanoseconds: 0,
+                    unavailable_autofactories: BTreeSet::new(),
+                },
+                checkpoint: crate::workflows::RelayWorkflowCheckpoint {
+                    state: Some(state),
+                    region: Some("Alpha".into()),
+                    completed_steps: BTreeSet::from(["planned".into()]),
+                },
+                current_step: Some("planned".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let executor = Arc::new(FixtureRelayTripExecutor::single_lane());
+        let mut registry = replicant_workflow::WorkflowRegistry::new();
+        registry
+            .register(Arc::new(
+                crate::workflows::RelayWorkflowFactory::with_trip_executor(executor.clone()),
+            ))
+            .expect("register relay workflow");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..100 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workflow = repository
+            .read(workflow.id)
+            .expect("read workflow")
+            .expect("workflow");
+        assert_eq!(
+            workflow.status,
+            replicant_workflow::WorkflowStatus::Succeeded,
+            "{:?}",
+            workflow.last_error
+        );
+        assert_eq!(
+            *executor.successful_trip_sizes.lock().expect("trip sizes"),
+            [9, 8]
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            repository
+                .list_work_items(workflow.id)
+                .expect("items")
+                .len(),
+            17
+        );
+        client.close().await.expect("close client");
+    }
+    #[test]
+    fn relay_assignment_legacy_checkpoint_materializes_only_incomplete_stops() {
+        let mut state = execution_state();
+        let workflow_id = WorkflowId::new();
+        let specs =
+            relay_work_item_specs(workflow_id, &state, "Alpha").expect("materialize relay items");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].dedupe_key, "relay.stop:TARGET:TARGET-1-L4");
+        assert_eq!(
+            specs[0].preconditions_json[0]["kind"],
+            "relay.coverage_missing"
+        );
+        state.stops[0].completed = true;
+        assert!(
+            relay_work_item_specs(workflow_id, &state, "Alpha")
+                .expect("materialize completed state")
+                .is_empty()
+        );
+    }
+    #[test]
+    fn relay_assignment_coverage_skip_accepts_every_nonterminal_item_state() {
+        for source in [
+            WorkItemStatus::Pending,
+            WorkItemStatus::Assigned,
+            WorkItemStatus::Running,
+            WorkItemStatus::Waiting,
+        ] {
+            let repository = WorkflowRepository::open_in_memory().expect("repository");
+            let workflow = repository
+                .create(replicant_workflow::NewWorkflow {
+                    kind: WorkflowKind::new("relay.expansion").expect("kind"),
+                    schema_version: 2,
+                    config: serde_json::json!({}),
+                    checkpoint: serde_json::json!({}),
+                    current_step: None,
+                    parent_id: None,
+                })
+                .expect("workflow");
+            let state = execution_state();
+            let pending = repository
+                .reconcile_work_items(
+                    workflow.id,
+                    &relay_work_item_specs(workflow.id, &state, "Alpha").expect("specs"),
+                    0,
+                )
+                .expect("reconcile")
+                .remove(0);
+            let item = match source {
+                WorkItemStatus::Pending => pending,
+                WorkItemStatus::Assigned | WorkItemStatus::Running => {
+                    let assigned = repository
+                        .claim_next_work_item(workflow.id, 1)
+                        .expect("claim")
+                        .expect("item");
+                    if source == WorkItemStatus::Running {
+                        repository
+                            .start_work_item(
+                                assigned.id,
+                                assigned.state.revision,
+                                "R-1",
+                                "grant",
+                                2,
+                            )
+                            .expect("start")
+                    } else {
+                        assigned
+                    }
+                }
+                WorkItemStatus::Waiting => repository
+                    .transition_work_item(
+                        pending.id,
+                        pending.state.revision,
+                        WorkItemTransition::Waiting {
+                            checkpoint_json: None,
+                            reason: "coverage unavailable".into(),
+                            retry_at_ms: None,
+                        },
+                        1,
+                    )
+                    .expect("wait"),
+                terminal => panic!("unexpected terminal source {terminal:?}"),
+            };
+            assert_eq!(
+                skip_relay_covered_items(
+                    &repository,
+                    workflow.id,
+                    &BTreeSet::from(["TARGET".into()]),
+                    3,
+                )
+                .expect("skip covered"),
+                1,
+                "{source:?}"
+            );
+            let skipped = repository
+                .read_work_item(item.id)
+                .expect("read")
+                .expect("item");
+            assert_eq!(skipped.state.status, WorkItemStatus::Skipped, "{source:?}");
+            if source == WorkItemStatus::Running {
+                let attempts = repository
+                    .list_work_item_attempts(item.id)
+                    .expect("attempts");
+                assert_eq!(
+                    attempts[0].outcome,
+                    Some(replicant_workflow::WorkItemAttemptOutcome::Succeeded)
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn relay_assignment_live_network_path_skips_without_deploy_mutation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-26T00:00:00Z",
+                "total": 2,
+                "stars": [
+                    {
+                        "designation": "ANTAR",
+                        "region": "alpha",
+                        "position": { "x": 0.0, "y": 0.0, "z": 0.0 }
+                    },
+                    {
+                        "designation": "TARGET",
+                        "region": "alpha",
+                        "position": { "x": 1.0, "y": 0.0, "z": 0.0 }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed catalogue");
+        seed_relay_device(&server, &client, "HUB-LIVE", SYSTEM_HUB, &[]).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/HUB-TARGET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "HUB-TARGET",
+                "device_type": SYSTEM_HUB,
+                "location": "TARGET-1-L4",
+                "status": "active"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .devices()
+            .get("HUB-TARGET")
+            .await
+            .expect("seed target hub");
+
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let mut state = execution_state();
+        state.start_system = "ANTAR".into();
+        let workflow = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::workflows::relay_workflow_kind(),
+                schema_version: 2,
+                config: crate::workflows::RelayWorkflowConfig {
+                    hub: "ANTAR-1-L4".into(),
+                    region: Some("Alpha".into()),
+                    targets: vec!["TARGET".into()],
+                    mission_file: env::temp_dir().join("relay-live-coverage.json"),
+                    max_hop_ly: 7.499,
+                    wait_timeout_seconds: 1,
+                    wait_timeout_nanoseconds: 0,
+                    unavailable_autofactories: BTreeSet::new(),
+                },
+                checkpoint: crate::workflows::RelayWorkflowCheckpoint {
+                    state: Some(state),
+                    region: Some("Alpha".into()),
+                    completed_steps: BTreeSet::new(),
+                },
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("workflow");
+        let mut registry = replicant_workflow::WorkflowRegistry::new();
+        registry
+            .register(Arc::new(crate::workflows::RelayWorkflowFactory::new()))
+            .expect("register relay workflow");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..20 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .is_some_and(|workflow| {
+                    workflow.status == replicant_workflow::WorkflowStatus::Succeeded
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .expect("workflow")
+                .status,
+            replicant_workflow::WorkflowStatus::Succeeded
+        );
+        assert_eq!(
+            repository.list_work_items(workflow.id).expect("items")[0]
+                .state
+                .status,
+            WorkItemStatus::Skipped
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "coverage revalidation must not submit a deployment mutation"
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
     }
 }

@@ -3,6 +3,7 @@ use std::{
     env,
     error::Error as StdError,
     fs::{self, File, OpenOptions},
+    hash::{Hash, Hasher},
     io::{self, BufRead, BufWriter, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -19,7 +20,10 @@ use replicant_event_planner::{
     OpenEventFields, PlanningContext, Recommendation, ResourceMap, mission_tag, plan_event,
     role_tag,
 };
-use replicant_workflow::WorkflowRepository;
+use replicant_workflow::{
+    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowId,
+    WorkflowKind, WorkflowRepository,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -38,7 +42,7 @@ const DEFAULT_PLAN_PATH: &str = "event-mission.json";
 const EVENT_MISSION_TAG_PREFIX: &str = "evt-m:";
 const AUTOFACTORY: &str = "autofactory";
 
-type AnyError = Box<dyn StdError + Send + Sync + 'static>;
+pub(crate) type AnyError = Box<dyn StdError + Send + Sync + 'static>;
 type AnyResult<T> = Result<T, AnyError>;
 
 fn app_error(kind: io::ErrorKind, message: impl Into<String>) -> AnyError {
@@ -456,6 +460,7 @@ struct EventMissionPlan {
     selected_replicant: String,
     home_location: String,
     #[serde(default)]
+    criteria: Vec<CriterionAssessment>,
     event_scope: EventScope,
     event: EventDefinition,
     selected_criterion: CriterionAssessment,
@@ -530,6 +535,7 @@ pub async fn plan_event_mission(
     let context = build_context(client, &event, &earned, &request.home).await?;
     let event_plan = plan_event(event, &context)?;
     let selected_criterion = select_criterion(&event_plan, request.criterion.as_deref(), false)?;
+    let criteria = event_plan.criteria.clone();
     let mission_id = uuid::Uuid::new_v4().simple().to_string();
     let plan = EventMissionPlan {
         version: PLAN_VERSION,
@@ -541,6 +547,7 @@ pub async fn plan_event_mission(
         event_scope,
         event: event_plan.event,
         selected_criterion,
+        criteria,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
         claimed_devices: Vec::new(),
         execution: executor::ExecutionState::default(),
@@ -804,6 +811,364 @@ pub enum EventExecutionState {
         /// Non-fatal campaign warnings.
         warnings: Vec<String>,
     },
+}
+
+/// One dependency-ordered durable event campaign stage.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventItemStage {
+    /// Manufacture and stage criterion assets.
+    Stage,
+    /// Deliver staged criterion assets.
+    Delivery,
+    /// Resolve the live criterion and recover rewards.
+    Resolve,
+    /// Return assets and release mission claims.
+    Return,
+}
+
+impl EventItemStage {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Delivery => "delivery",
+            Self::Resolve => "resolve",
+            Self::Return => "return",
+        }
+    }
+}
+
+fn event_item_hash(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn event_stage_requirements(
+    stage: EventItemStage,
+    assessment: &CriterionAssessment,
+    region: &str,
+    home: &str,
+) -> Vec<ResourceRequirement> {
+    let mut requirements = vec![ResourceRequirement {
+        key: "worker".into(),
+        kind: "replicant".into(),
+        capabilities: Vec::new(),
+        scope: RequirementScope::Region(region.to_owned()),
+        count: 1,
+        quantity: 1,
+    }];
+    if stage == EventItemStage::Stage {
+        requirements.extend(assessment.manufacturing_resources.iter().filter_map(
+            |(resource, quantity)| {
+                let quantity = u64::try_from(*quantity).ok()?;
+                (quantity > 0).then(|| ResourceRequirement {
+                    key: format!("material:{resource}"),
+                    kind: "material".into(),
+                    capabilities: vec![resource.clone()],
+                    scope: RequirementScope::Location(home.to_owned()),
+                    count: 1,
+                    quantity,
+                })
+            },
+        ));
+        if !assessment.print_schedule.batches.is_empty() {
+            requirements.push(ResourceRequirement {
+                key: "autofactory".into(),
+                kind: "autofactory".into(),
+                capabilities: Vec::new(),
+                scope: RequirementScope::Location(home.to_owned()),
+                count: 1,
+                quantity: 1,
+            });
+        }
+        requirements.extend(assessment.remaining_devices.iter().filter_map(|device| {
+            u32::try_from(device.count)
+                .ok()
+                .map(|count| ResourceRequirement {
+                    key: format!("device:{}", device.device_type),
+                    kind: "device".into(),
+                    capabilities: vec![device.device_type.clone()],
+                    scope: RequirementScope::Region(region.to_owned()),
+                    count,
+                    quantity: 1,
+                })
+        }));
+    }
+    if matches!(stage, EventItemStage::Delivery | EventItemStage::Return) {
+        let transports = assessment
+            .cargo
+            .transports
+            .iter()
+            .chain(&assessment.carriers.transports)
+            .filter(|transport| !transport.must_print)
+            .count();
+        if transports > 0 {
+            requirements.push(ResourceRequirement {
+                key: "carriers".into(),
+                kind: "device".into(),
+                capabilities: vec!["cargo_freighter".into()],
+                scope: RequirementScope::Region(region.to_owned()),
+                count: u32::try_from(transports).unwrap_or(u32::MAX),
+                quantity: 1,
+            });
+            requirements.push(ResourceRequirement {
+                key: "stow".into(),
+                kind: "stow".into(),
+                capabilities: Vec::new(),
+                scope: RequirementScope::Region(region.to_owned()),
+                count: 1,
+                quantity: u64::try_from(assessment.remaining_devices.len()).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    requirements
+}
+
+/// Converts archived campaign missions into dependency-linked durable work items.
+pub fn event_campaign_work_item_specs(
+    workflow_id: WorkflowId,
+    archive: &EventCampaignArchive,
+    region: &str,
+) -> Result<Vec<WorkItemSpec>, replicant_workflow::RepositoryError> {
+    let mut specs = Vec::new();
+    for (mission_index, (path, mission_json)) in archive.mission_json.iter().enumerate() {
+        let mission: EventMissionPlan = serde_json::from_str(mission_json)?;
+        let event = mission.event.designation.clone();
+        let criteria = if mission.criteria.is_empty() {
+            vec![mission.selected_criterion.clone()]
+        } else {
+            mission.criteria.clone()
+        };
+        for (criterion_index, assessment) in criteria.into_iter().enumerate() {
+            let criterion = assessment.criterion_name.clone();
+            let selected = criterion == mission.selected_criterion.criterion_name;
+            let mut criterion_mission = mission.clone();
+            criterion_mission.selected_criterion = assessment.clone();
+            let criterion_mission_json = serde_json::to_string(&criterion_mission)?;
+            for (stage_index, stage) in [
+                EventItemStage::Stage,
+                EventItemStage::Delivery,
+                EventItemStage::Resolve,
+                EventItemStage::Return,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let stage_key = stage.key();
+                let dependency = match stage {
+                    EventItemStage::Stage => None,
+                    EventItemStage::Delivery => Some("stage"),
+                    EventItemStage::Resolve => Some("delivery"),
+                    EventItemStage::Return => Some("resolve"),
+                };
+                let legacy_complete = selected
+                    && match stage {
+                        EventItemStage::Stage => !matches!(
+                            mission.phase,
+                            MissionPhase::Planned
+                                | MissionPhase::ClaimingTransports
+                                | MissionPhase::Manufacturing
+                                | MissionPhase::PreparingFleet
+                        ),
+                        EventItemStage::Delivery => matches!(
+                            mission.phase,
+                            MissionPhase::ReadyToResolve
+                                | MissionPhase::Resolving
+                                | MissionPhase::CollectingRewards
+                                | MissionPhase::Returning
+                                | MissionPhase::CleaningUp
+                                | MissionPhase::Completed
+                                | MissionPhase::CompletedWithWarnings
+                        ),
+                        EventItemStage::Resolve => matches!(
+                            mission.phase,
+                            MissionPhase::Returning
+                                | MissionPhase::CleaningUp
+                                | MissionPhase::Completed
+                                | MissionPhase::CompletedWithWarnings
+                        ),
+                        EventItemStage::Return => mission.phase.is_terminal(),
+                    };
+                let requirements =
+                    event_stage_requirements(stage, &assessment, region, &mission.home_location);
+                specs.push(WorkItemSpec {
+                    workflow_id,
+                    dedupe_key: format!("event:{event}:{criterion}:{stage_key}"),
+                    kind: WorkflowKind::new(format!("event.{stage_key}"))?,
+                    sort_key: format!(
+                        "{stage_index}:{mission_index:08}:{criterion_index:08}:{event}:{criterion}"
+                    ),
+                    payload_json: serde_json::json!({
+                        "event": event,
+                        "criterion": criterion,
+                        "selected": selected,
+                        "stage": stage,
+                        "mission_path": path,
+                        "mission_json": criterion_mission_json,
+                        "legacy_complete": legacy_complete,
+                    }),
+                    preconditions_json: {
+                        let mut preconditions = dependency.map_or_else(Vec::new, |dependency| {
+                            vec![serde_json::json!({
+                                "kind": "work_item.succeeded",
+                                "parameters": {
+                                    "dedupe_key": format!(
+                                        "event:{event}:{criterion}:{dependency}"
+                                    )
+                                }
+                            })]
+                        });
+                        if stage == EventItemStage::Resolve {
+                            preconditions.push(serde_json::json!({
+                                "kind": "event.criterion_ready",
+                                "parameters": {"event": event, "criterion": criterion}
+                            }));
+                        }
+                        if stage == EventItemStage::Return {
+                            preconditions.push(serde_json::json!({
+                                "kind": "event.reward_evidence",
+                                "parameters": {"event": event, "criterion": criterion}
+                            }));
+                        }
+                        Value::Array(preconditions)
+                    },
+                    requirements_json: serde_json::to_value(requirements)?,
+                    deadline_at_ms: None,
+                });
+            }
+        }
+    }
+    Ok(specs)
+}
+
+/// Executes one event stage against an allocated worker and archived mission checkpoint.
+pub async fn execute_event_item(
+    client: &Client,
+    mission_json: &str,
+    stage: EventItemStage,
+    allocations: &AllocationSet,
+    wait_timeout: Duration,
+) -> AnyResult<String> {
+    let worker = allocations
+        .iter()
+        .find_map(|allocation| match &allocation.resource {
+            ResourceKey::Replicant(code) => Some(code.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "event item omitted worker"))?;
+    let mut plan: EventMissionPlan = serde_json::from_str(mission_json)?;
+    plan.selected_replicant = worker;
+    let criterion_hash = event_item_hash(&plan.selected_criterion.criterion_name);
+    let plan_path = env::temp_dir().join(format!(
+        "replicant-event-item-{}-{}-{criterion_hash:016x}.json",
+        plan.mission_id,
+        stage.key()
+    ));
+    save_plan(&plan_path, &plan)?;
+    let request = EventExecutionRequest {
+        plan_file: plan_path.clone(),
+        wait_timeout,
+    };
+    let config = execution_config(&request);
+    match stage {
+        EventItemStage::Stage => {
+            let _ = executor::prestage_campaign_mission(
+                client,
+                &config,
+                &mut plan,
+                &executor::CampaignReplanReservations::default(),
+            )
+            .await?;
+        }
+        EventItemStage::Delivery => {
+            executor::confirm_campaign_resources_staged(client, &config, &mut plan).await?;
+        }
+        EventItemStage::Resolve => {
+            executor::resolve_prestaged_campaign_mission(
+                client,
+                &config,
+                &mut plan,
+                &executor::CampaignReplanReservations::default(),
+            )
+            .await?;
+        }
+
+        EventItemStage::Return => {
+            executor::finish_resolved_campaign_mission(client, &config, &mut plan).await?;
+        }
+    }
+    save_plan(&plan_path, &plan)?;
+    let result = fs::read_to_string(&plan_path)?;
+    let _ = fs::remove_file(plan_path);
+    Ok(result)
+}
+
+/// Collects at most `max_quantity` live parent-inventory units with allocated freighters.
+pub(crate) async fn haul_allocated_resources(
+    client: &Client,
+    freighters: &[String],
+    origin: &str,
+    home: &str,
+    max_quantity: u64,
+    wait_timeout: Duration,
+) -> AnyResult<(ResourceMap, bool)> {
+    client.sync().domain(SyncDomain::Inventory).await?;
+    let inventory = client.state().inventories()?.into_iter().find(|inventory| {
+        inventory
+            .location
+            .as_ref()
+            .is_some_and(|location| location.id.as_str() == origin)
+    });
+    let mut remaining_capacity = i64::try_from(max_quantity).unwrap_or(i64::MAX);
+    let mut manifest = ResourceMap::new();
+    if let Some(inventory) = inventory {
+        for item in inventory.items {
+            if remaining_capacity <= 0 {
+                break;
+            }
+            let quantity = item.quantity.max(0).min(remaining_capacity);
+            if quantity > 0 {
+                manifest.insert(item.resource, quantity);
+                remaining_capacity -= quantity;
+            }
+        }
+    }
+    if manifest.is_empty() {
+        return Ok((manifest, true));
+    }
+    let freighter = freighters
+        .first()
+        .ok_or_else(|| app_error(io::ErrorKind::WouldBlock, "salvage haul omitted freighter"))?;
+    let request = EventExecutionRequest {
+        plan_file: PathBuf::new(),
+        wait_timeout,
+    };
+    let config = execution_config(&request);
+    executor::travel_fleet_to(
+        client,
+        &config,
+        std::slice::from_ref(freighter),
+        None,
+        origin,
+    )
+    .await?;
+    executor::collect_resources(client, &config, freighter, &manifest).await?;
+    executor::travel_fleet_to(client, &config, std::slice::from_ref(freighter), None, home).await?;
+    executor::deposit_resources(client, &config, freighter, None).await?;
+    client.sync().domain(SyncDomain::Inventory).await?;
+    let remaining = client
+        .state()
+        .inventories()?
+        .into_iter()
+        .find(|inventory| {
+            inventory
+                .location
+                .as_ref()
+                .is_some_and(|location| location.id.as_str() == origin)
+        })
+        .is_some_and(|inventory| inventory.items.iter().any(|item| item.quantity > 0));
+    Ok((manifest, !remaining))
 }
 
 struct MissionLock {
@@ -1113,6 +1478,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         config.criterion.as_deref(),
         config.command == Command::Interactive || config.criterion.is_none(),
     )?;
+    let criteria = event_plan.criteria.clone();
     let mission_id = uuid::Uuid::new_v4().simple().to_string();
     let plan = EventMissionPlan {
         version: PLAN_VERSION,
@@ -1124,6 +1490,7 @@ async fn run(client: &Client, config: &Config) -> AnyResult<()> {
         event_scope: event_scope.clone(),
         event: event_plan.event.clone(),
         selected_criterion,
+        criteria,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
         claimed_devices: Vec::new(),
         execution: executor::ExecutionState::default(),
@@ -2224,6 +2591,100 @@ fn show_status(config: &Config) -> AnyResult<()> {
         }
     }
     Ok(())
+}
+#[cfg(test)]
+pub(crate) fn event_campaign_pool_fixture_archive(
+    mission_paths: &[PathBuf],
+) -> EventCampaignArchive {
+    let missions = mission_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let event = format!("EVENT-{}", index + 1);
+            let criteria = ["criterion-a", "criterion-b"]
+                .into_iter()
+                .map(|name| CriterionAssessment {
+                    criterion_name: name.into(),
+                    remaining_resources: ResourceMap::new(),
+                    remaining_devices: vec![replicant_event_planner::DeviceRequirement {
+                        device_type: "survey_drone".into(),
+                        count: 1,
+                    }],
+                    reused_devices: Vec::new(),
+                    print_devices: Vec::new(),
+                    manufacturing_resources: ResourceMap::new(),
+                    print_schedule: replicant_event_planner::PrintSchedule::default(),
+                    cargo: replicant_event_planner::TransportPlan::default(),
+                    carriers: replicant_event_planner::TransportPlan::default(),
+                    beacon: replicant_event_planner::BeaconPlan {
+                        action: replicant_event_planner::BeaconAction::AlreadyActive,
+                        device_code: None,
+                        transport_slots: 0,
+                        warning: None,
+                    },
+                    feasible: true,
+                    blockers: Vec::new(),
+                    recommendations: BTreeSet::new(),
+                    warnings: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let mission = EventMissionPlan {
+                version: PLAN_VERSION,
+                mission_id: format!("mission-{}", index + 1),
+                mission_tag: mission_tag(&event),
+                phase: MissionPhase::Planned,
+                selected_replicant: "LEGACY".into(),
+                home_location: "ROOT-1-L4".into(),
+                criteria: criteria.clone(),
+                event_scope: EventScope::Region {
+                    region: "alpha".into(),
+                },
+                event: EventDefinition {
+                    designation: event.clone(),
+                    location: "ROOT-1-L4".into(),
+                    title: event.clone(),
+                    description: None,
+                    event_type: None,
+                    tier: None,
+                    status: Some("active".into()),
+                    criteria: Vec::new(),
+                    progress: None,
+                    rewards: replicant_event_planner::EventRewards::default(),
+                },
+                selected_criterion: criteria[0].clone(),
+                grants_unearned_achievement: false,
+                claimed_devices: Vec::new(),
+                execution: executor::ExecutionState::default(),
+            };
+            (
+                path.to_string_lossy().into_owned(),
+                serde_json::to_string(&mission).expect("fixture mission"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    EventCampaignArchive {
+        campaign_json: serde_json::json!({
+            "version": 1,
+            "kind": "all_events_campaign",
+            "campaign_id": "event-pool",
+            "selected_replicant": "LEGACY",
+            "home_location": "ROOT-1-L4",
+            "event_scope": {"kind": "region", "region": "alpha"},
+            "planning_window": 4,
+            "missions": mission_paths.iter().enumerate().map(|(index, path)| {
+                serde_json::json!({
+                    "event_designation": format!("EVENT-{}", index + 1),
+                    "event_title": format!("EVENT-{}", index + 1),
+                    "mission_path": path
+                })
+            }).collect::<Vec<_>>(),
+            "deferred_events": [],
+            "blocked_events": [],
+            "warnings": []
+        })
+        .to_string(),
+        mission_json: missions,
+    }
 }
 
 #[cfg(test)]

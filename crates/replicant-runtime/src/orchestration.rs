@@ -23,8 +23,8 @@ use replicant_client::{
 };
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
-    DirectorRegionSummary, DirectorReplicantAssignment, DirectorSnapshot, DirectorWorkforceSummary,
-    SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
+    DirectorRegionSummary, DirectorReplicantAssignment, DirectorSnapshot, DirectorUrgencyFact,
+    DirectorWorkforceSummary, SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::{
@@ -98,7 +98,6 @@ const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
 const PRIORITY_FTL_EXPANSION: u32 = 650;
 const PRIORITY_CATALOGUE: u32 = 500;
-const PRIORITY_MINING: u32 = 450;
 const PRIORITY_CATALOGUE_BLUEPRINT: u32 = 400;
 
 /// Durable Automation Director settings.
@@ -460,6 +459,7 @@ pub fn cached_director_snapshot(
                             .to_owned(),
                     ),
                 },
+                urgency: Vec::new(),
             }
     };
 
@@ -1058,7 +1058,7 @@ pub async fn reconcile_director(
     )?);
 
     let worker_demand = requirements.worker_demand_by_region();
-    let pending_worker_demand = worker_demand.values().sum::<usize>();
+    let mut pending_worker_demand = worker_demand.values().sum::<usize>();
     let mut workforce_states = load_workforce_states(&repository)?;
     let scale_recommendations = reconcile_workforce(
         &repository,
@@ -1072,8 +1072,24 @@ pub async fn reconcile_director(
         automatic,
         now,
     )?;
-
     let total = workers.len();
+    let broker = crate::assignment::ResourceBroker::with_managed_client(
+        repository.clone(),
+        (*client).clone(),
+    );
+    let allocation_candidates = broker.discover_candidates()?;
+    let schedule = crate::scheduler::repository_schedule(
+        &repository,
+        &allocation_candidates,
+        u32::try_from(total).unwrap_or(u32::MAX),
+        now,
+    )?;
+    let unmet_scheduler_floors = schedule
+        .iter()
+        .filter(|decision| decision.action == crate::scheduler::ScheduleAction::GrowWorkforce)
+        .count();
+    pending_worker_demand = pending_worker_demand.saturating_add(unmet_scheduler_floors);
+    repository.put_document("automation.scheduler", "latest", &schedule)?;
     let busy_count = workers
         .iter()
         .filter(|worker| worker.busy_workflow.is_some())
@@ -1084,7 +1100,7 @@ pub async fn reconcile_director(
     } else {
         idle as f64 / total as f64
     };
-    let scale_up_recommended = !scale_recommendations.is_empty();
+    let scale_up_recommended = !scale_recommendations.is_empty() || unmet_scheduler_floors != 0;
     let scale_reason = scale_recommendations.first().cloned().or_else(|| {
         (pending_worker_demand > 0).then(|| format!(
             "{pending_worker_demand} regional assignment(s) are worker-blocked; waiting for the grow-only scale policy"
@@ -1156,6 +1172,34 @@ pub async fn reconcile_director(
             scale_up_recommended,
             scale_reason,
         },
+        urgency: schedule
+            .into_iter()
+            .map(|decision| DirectorUrgencyFact {
+                automation: decision.automation,
+                campaign: decision.campaign,
+                item: decision.item,
+                buffer: decision.buffer,
+                burn_rate_per_hour: decision.burn_rate_per_hour,
+                deadline_at_ms: decision.deadline_at_ms,
+                lateness_cost: serde_json::to_value(decision.lateness_cost).unwrap_or(Value::Null),
+                loss_over_one_hour: decision.loss_over_one_hour,
+                floor: decision.floor,
+                ceiling: decision.ceiling,
+                current_grants: decision.current_grants,
+                target_grants: decision.target_grants,
+                urgency: decision.urgency,
+                hysteresis_ratio: decision.hysteresis_ratio,
+                action: match decision.action {
+                    crate::scheduler::ScheduleAction::Hold => "hold",
+                    crate::scheduler::ScheduleAction::Grant => "grant",
+                    crate::scheduler::ScheduleAction::Reclaim => "reclaim",
+                    crate::scheduler::ScheduleAction::GrowWorkforce => "grow_workforce",
+                    crate::scheduler::ScheduleAction::Idle => "idle",
+                }
+                .into(),
+                reasons: decision.reasons,
+            })
+            .collect(),
     };
     repository.put_document(SNAPSHOT_NS, SNAPSHOT_KEY, &snapshot)?;
     tracing::debug!(
@@ -3075,17 +3119,17 @@ fn reconcile_event_completion(
             "Batch-plan and execute {} active event(s) with {worker}",
             events.len()
         ));
-        if context.automatic {
-            let home = region
+        if context.automatic
+            && let Some(home) = region
                 .hub_location
                 .clone()
-                .or_else(|| region.hub_system.clone());
+                .or_else(|| region.hub_system.clone())
+        {
             let workflow =
                 context
                     .repository
                     .create(new_event_campaign_workflow(EventCampaignIntent {
                         region: region.region.clone(),
-                        replicant: Some(worker.clone()),
                         home,
                     }))?;
             tracing::info!(
@@ -3344,9 +3388,9 @@ fn reconcile_enhance_catalogue(
 fn reconcile_discover_belts(
     context: &GoalReconcileContext<'_>,
     region: &RegionView,
-    workers: &[WorkerView],
-    reserved: &mut BTreeSet<String>,
-    requirements: &mut DirectorRequirementGraph,
+    _workers: &[WorkerView],
+    _reserved: &mut BTreeSet<String>,
+    _requirements: &mut DirectorRequirementGraph,
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
     catalogue_positions: &BTreeMap<String, GalacticPosition>,
@@ -3361,7 +3405,7 @@ fn reconcile_discover_belts(
     let covered = region.known_systems.intersection(&searched).count();
     let active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
-    let mut blocker = None;
+    let blocker = None;
     let next_action;
     let status = if !enabled {
         next_action =
@@ -3376,10 +3420,11 @@ fn reconcile_discover_belts(
     } else if recently_launched {
         next_action = Some("Wait briefly before retrying the next belt-search batch".to_owned());
         DirectorGoalStatus::Waiting
-    } else if let Some(worker) = select_idle_worker(workers, &region.region, reserved, false) {
+    } else {
         next_action = Some(format!(
-            "Search {} unscanned regional system(s) for belts with {worker}",
-            targets.len()
+            "Schedule {} unscanned regional system(s) across the {} worker pool",
+            targets.len(),
+            region.region
         ));
         if context.automatic {
             let workflow = context
@@ -3387,32 +3432,13 @@ fn reconcile_discover_belts(
                 .create(new_belt_search_campaign_workflow(
                     BeltSearchCampaignIntent {
                         systems: targets,
-                        replicant: Some(worker.clone()),
+                        region: region.region.clone(),
                     },
                 ))?;
             runtime.active_workflows = vec![workflow.id];
             runtime.last_launch_at_ms = Some(context.now);
-            reserved.insert(worker);
         }
         DirectorGoalStatus::Active
-    } else {
-        let reason = format!(
-            "{} has unscanned systems but no idle regional Replicant",
-            region.region
-        );
-        requirements.raise(
-            DirectorRequirement::WorkerCapacity {
-                region: region.region.clone(),
-                count: 1,
-                affinity: Some("survey".to_owned()),
-            },
-            &id,
-            reason.clone(),
-            PRIORITY_CATALOGUE,
-        )?;
-        blocker = Some(reason);
-        next_action = Some("Free a regional worker or grow the regional workforce".to_owned());
-        DirectorGoalStatus::Blocked
     };
     save_goal_runtime(context.repository, &id, &runtime)?;
     Ok(DirectorGoalSummary {
@@ -3457,7 +3483,6 @@ fn belt_search_targets_from_hub(
         });
         by_distance.then_with(|| left.cmp(right))
     });
-    targets.truncate(MINING_BATCH_SIZE);
     targets
 }
 
@@ -3487,7 +3512,7 @@ fn belt_searched_systems(
 fn reconcile_expand_mining(
     repository: &WorkflowRepository,
     region: &RegionView,
-    workers: &[WorkerView],
+    _workers: &[WorkerView],
     workflows: &[WorkflowInstance],
     devices: &[Device],
     locations: &[Location],
@@ -3495,8 +3520,8 @@ fn reconcile_expand_mining(
     system_regions: &BTreeMap<String, String>,
     controls: &GoalControls,
     automatic: bool,
-    reserved: &mut BTreeSet<String>,
-    requirements: &mut DirectorRequirementGraph,
+    _reserved: &mut BTreeSet<String>,
+    _requirements: &mut DirectorRequirementGraph,
     now: i64,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandMiningOps;
@@ -3540,7 +3565,7 @@ fn reconcile_expand_mining(
         .saturating_sub(belt_systems.difference(&staffed_systems).count());
     let active = nonterminal_ids(&runtime, workflows);
     let recently_launched = launch_is_recent(&runtime, now, DEFAULT_RETRY_COOLDOWN_MS);
-    let mut blocker = None;
+    let blocker = None;
     let mut next_action = None;
     let status = if !enabled {
         DirectorGoalStatus::Waiting
@@ -3558,9 +3583,9 @@ fn reconcile_expand_mining(
         next_action =
             Some("Wait for FTL relay coverage to reach a discovered belt system".to_owned());
         DirectorGoalStatus::Waiting
-    } else if let Some(worker) = select_idle_worker(workers, &region.region, reserved, false) {
+    } else {
         next_action = Some(format!(
-            "Expand mining into {} known belt system(s) as one batch",
+            "Expand mining into {} known belt system(s) as one regional campaign",
             targets.len()
         ));
         if automatic
@@ -3572,39 +3597,19 @@ fn reconcile_expand_mining(
             let workflow =
                 repository.create(new_mining_campaign_workflow(MiningCampaignIntent {
                     systems: targets,
-                    replicant: Some(worker.clone()),
-                    hub: Some(hub),
+                    region: region.region.clone(),
+                    hub,
                     max_concurrency: 4,
                 }))?;
             tracing::info!(
                 workflow_id = %workflow.id,
                 region = %region.region,
-                replicant = %worker,
                 "Director launched regional mining campaign"
             );
             runtime.active_workflows = vec![workflow.id];
             runtime.last_launch_at_ms = Some(now);
-            reserved.insert(worker);
         }
         DirectorGoalStatus::Active
-    } else {
-        let reason = format!(
-            "{} has unstaffed known belts but no idle regional Replicant",
-            region.region
-        );
-        requirements.raise(
-            DirectorRequirement::WorkerCapacity {
-                region: region.region.clone(),
-                count: 1,
-                affinity: Some("mining".to_owned()),
-            },
-            &id,
-            reason.clone(),
-            PRIORITY_MINING,
-        )?;
-        blocker = Some(reason);
-        next_action = Some("Free a regional worker or grow the regional workforce".to_owned());
-        DirectorGoalStatus::Blocked
     };
     save_goal_runtime(repository, &id, &runtime)?;
     Ok(DirectorGoalSummary {
@@ -6275,8 +6280,7 @@ mod tests {
         let failed = repository
             .create(new_event_campaign_workflow(EventCampaignIntent {
                 region: "alpha".to_owned(),
-                replicant: Some("CHAT-1".to_owned()),
-                home: Some("ALPHA-HUB".to_owned()),
+                home: "ALPHA-HUB".to_owned(),
             }))
             .expect("create failed campaign");
         let events = vec!["ALPHA-EVENT-1".to_owned()];
@@ -6497,8 +6501,7 @@ mod tests {
             let failed = repository
                 .create(new_event_campaign_workflow(EventCampaignIntent {
                     region: "alpha".to_owned(),
-                    replicant: Some("CHAT-1".to_owned()),
-                    home: Some("ALPHA-HUB".to_owned()),
+                    home: "ALPHA-HUB".to_owned(),
                 }))
                 .expect("create failed campaign");
             let events = vec!["ALPHA-EVENT-1".to_owned()];

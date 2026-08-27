@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     ops::{Deref, DerefMut},
     path::Path,
@@ -7,17 +8,20 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::{
+    AllocationCandidate, AllocationId, AllocationSet, AllocationState, AutomationPolicy,
+    AutomationTrigger, CampaignCounts, CampaignItemResult, CampaignOutcome, CampaignResult,
+    ClaimAcquireOutcome, FiniteExecution, FiniteExecutionClass, FiniteExecutionStatus, NewTrigger,
+    NewWorkflow, ReplacementOutcome, RequirementScope, ResourceAllocation, ResourceClaim,
+    ResourceKey, ResourceRequirement, TriggerId, TriggerState, WorkItem, WorkItemAttempt,
+    WorkItemAttemptOutcome, WorkItemId, WorkItemSpec, WorkItemState, WorkItemStatus,
+    WorkItemTransition, WorkflowActivity, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
+    WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
-
-use crate::{
-    AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
-    FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
-    ResourceKey, TriggerId, TriggerState, WorkflowActivity, WorkflowFailureDisposition, WorkflowId,
-    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
-};
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/0002_activity.sql");
@@ -34,7 +38,10 @@ const FINITE_EXECUTION_CANCELLED_SCHEMA: &str =
     include_str!("../migrations/0010_finite_execution_cancelled.sql");
 const WORKFLOW_FAILURE_DISPOSITION_SCHEMA: &str =
     include_str!("../migrations/0011_workflow_failure_disposition.sql");
-const CURRENT_DATABASE_SCHEMA: i64 = 11;
+const WORK_ITEMS_SCHEMA: &str = include_str!("../migrations/0012_work_items.sql");
+const RESOURCE_ALLOCATIONS_SCHEMA: &str =
+    include_str!("../migrations/0013_resource_allocations.sql");
+const CURRENT_DATABASE_SCHEMA: i64 = 13;
 
 /// Runtime workflow persistence failures.
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +76,26 @@ pub enum RepositoryError {
     /// A malformed negative revision was found in SQLite.
     #[error("invalid persisted workflow revision {0}")]
     InvalidStoredRevision(i64),
+    /// A malformed work-item ID was found in SQLite.
+    #[error("invalid persisted work item ID {0:?}")]
+    InvalidStoredWorkItemId(String),
+    /// A malformed work-item lifecycle status was found in SQLite.
+    #[error("invalid persisted work item status {0:?}")]
+    InvalidStoredWorkItemStatus(String),
+    /// A malformed work-item attempt outcome was found in SQLite.
+    #[error("invalid persisted work item attempt outcome {0:?}")]
+    InvalidStoredWorkItemAttemptOutcome(String),
+    /// A malformed negative work-item revision was found in SQLite.
+    #[error("invalid persisted work item revision {0}")]
+    InvalidStoredWorkItemRevision(i64),
+    /// A malformed negative or overflowing work-item count was found in SQLite.
+    #[error("invalid persisted work item {field} count {value}")]
+    InvalidStoredWorkItemCount {
+        /// Name of the malformed count column.
+        field: &'static str,
+        /// Signed value read from SQLite.
+        value: i64,
+    },
     /// Workflow schema versions start at one.
     #[error("workflow schema version must be greater than zero")]
     InvalidWorkflowSchemaVersion,
@@ -89,6 +116,49 @@ pub enum RepositoryError {
     /// No workflow has the requested ID.
     #[error("workflow {0} was not found")]
     NotFound(WorkflowId),
+    /// No work item has the requested ID.
+    #[error("work item {0} was not found")]
+    WorkItemNotFound(WorkItemId),
+    /// A terminal workflow cannot own new or changed work items.
+    #[error("terminal workflow {0} cannot own work items")]
+    TerminalWorkItemOwner(WorkflowId),
+    /// A campaign deduplication key was reused with a different immutable specification.
+    #[error(
+        "workflow {workflow_id} work item {dedupe_key:?} conflicts with its stored specification"
+    )]
+    WorkItemSpecConflict {
+        /// Owning workflow.
+        workflow_id: WorkflowId,
+        /// Conflicting campaign-local deduplication key.
+        dedupe_key: String,
+    },
+    /// Another writer updated this work item first.
+    #[error("work item {id} revision changed; expected {expected}")]
+    ConcurrentWorkItemUpdate {
+        /// Work-item ID.
+        id: WorkItemId,
+        /// Revision supplied by the caller.
+        expected: u64,
+    },
+    /// The requested work-item lifecycle transition is not valid.
+    #[error("invalid work item transition from {from:?} to {to:?}")]
+    InvalidWorkItemTransition {
+        /// Persisted status.
+        from: WorkItemStatus,
+        /// Requested status.
+        to: WorkItemStatus,
+    },
+    /// Available candidate capacity cannot satisfy one requirement.
+    #[error("resource requirement {requirement_key:?} is short by {missing_count} candidates")]
+    AllocationShortage {
+        /// Stable requirement key.
+        requirement_key: String,
+        /// Number of additional pool members required.
+        missing_count: u32,
+    },
+    /// A work-item assignment identifier was empty.
+    #[error("invalid work item assignment: {0}")]
+    InvalidWorkItemAssignment(&'static str),
     /// A terminal workflow cannot acquire new resources.
     #[error("terminal workflow {workflow_id} cannot acquire resources")]
     TerminalClaimOwner {
@@ -332,6 +402,20 @@ impl WorkflowRepository {
             transaction.execute_batch(WORKFLOW_FAILURE_DISPOSITION_SCHEMA)?;
             transaction.execute(
                 "INSERT INTO runtime_schema_migrations (version) VALUES (11)",
+                [],
+            )?;
+        }
+        if found < 12 {
+            transaction.execute_batch(WORK_ITEMS_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (12)",
+                [],
+            )?;
+        }
+        if found < 13 {
+            transaction.execute_batch(RESOURCE_ALLOCATIONS_SCHEMA)?;
+            transaction.execute(
+                "INSERT INTO runtime_schema_migrations (version) VALUES (13)",
                 [],
             )?;
         }
@@ -1207,6 +1291,823 @@ impl WorkflowRepository {
         .collect()
     }
 
+    /// Reconciles the immutable desired work-item set for one campaign.
+    pub fn reconcile_work_items(
+        &self,
+        workflow_id: WorkflowId,
+        desired: &[WorkItemSpec],
+        now_ms: i64,
+    ) -> Result<Vec<WorkItem>, RepositoryError> {
+        let mut desired_by_key = BTreeMap::new();
+        for spec in desired {
+            let conflict = spec.workflow_id != workflow_id
+                || desired_by_key
+                    .get(&spec.dedupe_key)
+                    .is_some_and(|existing| *existing != *spec);
+            if conflict {
+                return Err(RepositoryError::WorkItemSpecConflict {
+                    workflow_id,
+                    dedupe_key: spec.dedupe_key.clone(),
+                });
+            }
+            desired_by_key
+                .entry(spec.dedupe_key.clone())
+                .or_insert_with(|| spec.clone());
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner =
+            read_in(&transaction, workflow_id)?.ok_or(RepositoryError::NotFound(workflow_id))?;
+        if owner.status.is_terminal() {
+            return Err(RepositoryError::TerminalWorkItemOwner(workflow_id));
+        }
+
+        for spec in desired_by_key.values() {
+            let existing = read_work_item_by_key_in(&transaction, workflow_id, &spec.dedupe_key)?;
+            if let Some(existing) = existing {
+                if existing.spec != *spec {
+                    return Err(RepositoryError::WorkItemSpecConflict {
+                        workflow_id,
+                        dedupe_key: spec.dedupe_key.clone(),
+                    });
+                }
+                continue;
+            }
+            let id = WorkItemId::new();
+            transaction.execute(
+                "INSERT INTO workflow_work_items (
+                    id, workflow_id, dedupe_key, kind, sort_key, payload_json,
+                    preconditions_json, requirements_json, deadline_at_ms, status,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?10)",
+                params![
+                    id.to_string(),
+                    workflow_id.to_string(),
+                    spec.dedupe_key,
+                    spec.kind.as_str(),
+                    spec.sort_key,
+                    serde_json::to_string(&spec.payload_json)?,
+                    serde_json::to_string(&spec.preconditions_json)?,
+                    serde_json::to_string(&spec.requirements_json)?,
+                    spec.deadline_at_ms,
+                    now_ms,
+                ],
+            )?;
+        }
+        let items = list_work_items_in(&transaction, workflow_id)?;
+        transaction.commit()?;
+        Ok(items)
+    }
+
+    /// Reads one persisted work item.
+    pub fn read_work_item(&self, id: WorkItemId) -> Result<Option<WorkItem>, RepositoryError> {
+        let connection = self.connection()?;
+        read_work_item_in(&connection, id)
+    }
+
+    /// Lists one campaign's work items in deterministic scheduler order.
+    pub fn list_work_items(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Vec<WorkItem>, RepositoryError> {
+        let connection = self.connection()?;
+        list_work_items_in(&connection, workflow_id)
+    }
+
+    /// Lists all execution attempts for one work item by ordinal.
+    pub fn list_work_item_attempts(
+        &self,
+        item_id: WorkItemId,
+    ) -> Result<Vec<WorkItemAttempt>, RepositoryError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {WORK_ITEM_ATTEMPT_COLUMNS}
+             FROM workflow_work_item_attempts
+             WHERE item_id = ?1
+             ORDER BY attempt_ordinal"
+        ))?;
+        let rows = statement.query_map([item_id.to_string()], row_to_attempt)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// Atomically claims the first eligible pending or due waiting work item.
+    pub fn claim_next_work_item(
+        &self,
+        workflow_id: WorkflowId,
+        now_ms: i64,
+    ) -> Result<Option<WorkItem>, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner =
+            read_in(&transaction, workflow_id)?.ok_or(RepositoryError::NotFound(workflow_id))?;
+        if owner.status.is_terminal() {
+            return Err(RepositoryError::TerminalWorkItemOwner(workflow_id));
+        }
+        let id = transaction
+            .query_row(
+                "SELECT id FROM workflow_work_items
+                 WHERE workflow_id = ?1
+                   AND (
+                     (status = 'pending'
+                       AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?2))
+                     OR (status = 'waiting'
+                       AND next_attempt_at_ms IS NOT NULL
+                       AND next_attempt_at_ms <= ?2)
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM json_each(workflow_work_items.preconditions_json) AS dependency
+                     WHERE json_extract(dependency.value, '$.kind') = 'work_item.succeeded'
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM workflow_work_items AS prerequisite
+                         WHERE prerequisite.workflow_id = workflow_work_items.workflow_id
+                           AND prerequisite.dedupe_key =
+                               json_extract(dependency.value, '$.parameters.dedupe_key')
+                           AND prerequisite.status IN ('succeeded', 'skipped')
+                       )
+                   )
+                 ORDER BY sort_key, dedupe_key, id
+                 LIMIT 1",
+                params![workflow_id.to_string(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let id = parse_work_item_id(id)?;
+        transaction.execute(
+            "UPDATE workflow_work_items
+             SET status = 'assigned', next_attempt_at_ms = NULL,
+                 updated_at_ms = ?2, revision = revision + 1
+             WHERE id = ?1",
+            params![id.to_string(), now_ms],
+        )?;
+        let claimed =
+            read_work_item_in(&transaction, id)?.ok_or(RepositoryError::WorkItemNotFound(id))?;
+        transaction.commit()?;
+        Ok(Some(claimed))
+    }
+
+    /// Starts an assigned work item and opens its next attempt interval.
+    pub fn start_work_item(
+        &self,
+        id: WorkItemId,
+        expected_revision: u64,
+        worker_identity: &str,
+        assignment_id: &str,
+        started_at_ms: i64,
+    ) -> Result<WorkItem, RepositoryError> {
+        if assignment_id.is_empty() {
+            return Err(RepositoryError::InvalidWorkItemAssignment(
+                "assignment_id must not be empty",
+            ));
+        }
+        if worker_identity.is_empty() {
+            return Err(RepositoryError::InvalidWorkItemAssignment(
+                "worker_identity must not be empty",
+            ));
+        }
+        let expected = work_item_revision_to_sql(expected_revision)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            read_work_item_in(&transaction, id)?.ok_or(RepositoryError::WorkItemNotFound(id))?;
+        verify_work_item_revision(&current, expected_revision)?;
+        if current.state.status != WorkItemStatus::Assigned {
+            return Err(RepositoryError::InvalidWorkItemTransition {
+                from: current.state.status,
+                to: WorkItemStatus::Running,
+            });
+        }
+        let attempt_ordinal = current.state.attempt_count.checked_add(1).ok_or(
+            RepositoryError::InvalidStoredWorkItemCount {
+                field: "attempt",
+                value: i64::from(current.state.attempt_count),
+            },
+        )?;
+        transaction.execute(
+            "INSERT INTO workflow_work_item_attempts (
+                item_id, attempt_ordinal, assignment_id, worker_identity, started_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                i64::from(attempt_ordinal),
+                assignment_id,
+                worker_identity,
+                started_at_ms,
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE workflow_work_items
+             SET status = 'running', attempt_count = ?1, ever_started = 1,
+                 updated_at_ms = ?2, revision = revision + 1
+             WHERE id = ?3 AND revision = ?4",
+            params![
+                i64::from(attempt_ordinal),
+                started_at_ms,
+                id.to_string(),
+                expected
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::ConcurrentWorkItemUpdate {
+                id,
+                expected: expected_revision,
+            });
+        }
+        let started =
+            read_work_item_in(&transaction, id)?.ok_or(RepositoryError::WorkItemNotFound(id))?;
+        transaction.commit()?;
+        Ok(started)
+    }
+
+    /// Applies one optimistic, atomic work-item state transition.
+    pub fn transition_work_item(
+        &self,
+        id: WorkItemId,
+        expected_revision: u64,
+        transition: WorkItemTransition,
+        now_ms: i64,
+    ) -> Result<WorkItem, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            read_work_item_in(&transaction, id)?.ok_or(RepositoryError::WorkItemNotFound(id))?;
+        verify_work_item_revision(&current, expected_revision)?;
+        transition_work_item_in(&transaction, &current, transition, now_ms)?;
+        let updated =
+            read_work_item_in(&transaction, id)?.ok_or(RepositoryError::WorkItemNotFound(id))?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Aggregates a terminal campaign result, or returns `None` while work remains.
+    pub fn aggregate_campaign_result(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<CampaignResult>, RepositoryError> {
+        let items = self.list_work_items(workflow_id)?;
+        if items.iter().any(|item| !item.state.status.is_terminal()) {
+            return Ok(None);
+        }
+        let mut counts = CampaignCounts {
+            total: u32::try_from(items.len()).map_err(|_| {
+                RepositoryError::InvalidStoredWorkItemCount {
+                    field: "total",
+                    value: i64::MAX,
+                }
+            })?,
+            ..CampaignCounts::default()
+        };
+        for item in &items {
+            match item.state.status {
+                WorkItemStatus::Pending => counts.pending += 1,
+                WorkItemStatus::Assigned => counts.assigned += 1,
+                WorkItemStatus::Running => counts.running += 1,
+                WorkItemStatus::Waiting => counts.waiting += 1,
+                WorkItemStatus::Succeeded => counts.succeeded += 1,
+                WorkItemStatus::Skipped => counts.skipped += 1,
+                WorkItemStatus::Failed => counts.failed += 1,
+                WorkItemStatus::Abandoned => counts.abandoned += 1,
+            }
+        }
+        let any_started = items.iter().any(|item| item.state.ever_started);
+        let has_terminal_failure = counts.failed != 0 || counts.abandoned != 0;
+        let outcome = if counts.succeeded != 0 && has_terminal_failure {
+            CampaignOutcome::PartialSuccess
+        } else if counts.succeeded != 0 {
+            CampaignOutcome::AllSucceeded
+        } else if !any_started {
+            CampaignOutcome::NothingCouldStart
+        } else {
+            CampaignOutcome::NoSuccess
+        };
+        let item_results = items
+            .into_iter()
+            .map(|item| CampaignItemResult {
+                item_id: item.id,
+                dedupe_key: item.spec.dedupe_key,
+                status: item.state.status,
+                result_json: item.state.result_json,
+                error: item.state.last_error,
+            })
+            .collect();
+        Ok(Some(CampaignResult {
+            outcome,
+            counts,
+            items: item_results,
+        }))
+    }
+
+    /// Reclaims assigned or running items left orphaned by restart or resume.
+    pub fn reconcile_orphaned_work_items(
+        &self,
+        workflow_id: Option<WorkflowId>,
+        now_ms: i64,
+    ) -> Result<usize, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_id = workflow_id.map(|id| id.to_string());
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT item.id, item.status
+                 FROM workflow_work_items item
+                 JOIN workflow_instances workflow ON workflow.id = item.workflow_id
+                 WHERE item.status IN ('assigned', 'running')
+                   AND (
+                     workflow.status IN ('queued', 'running', 'waiting', 'reconciling')
+                     OR (?1 IS NOT NULL AND workflow.status = 'paused')
+                   )
+                   AND (?1 IS NULL OR item.workflow_id = ?1)
+                 ORDER BY item.id",
+            )?;
+            statement
+                .query_map([owner_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, status) in &rows {
+            let id = parse_work_item_id(id.clone())?;
+            let status = parse_work_item_status(status.clone())?;
+            if status == WorkItemStatus::Running {
+                close_open_attempt(
+                    &transaction,
+                    id,
+                    WorkItemAttemptOutcome::Reclaimed,
+                    None,
+                    now_ms,
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM workflow_resource_claims
+                 WHERE EXISTS (
+                   SELECT 1 FROM workflow_resource_allocations allocation
+                   JOIN workflow_work_items item ON item.id = allocation.item_id
+                   WHERE allocation.item_id = ?1
+                     AND allocation.state = 'active'
+                     AND item.workflow_id = workflow_resource_claims.workflow_id
+                     AND allocation.resource_namespace =
+                         workflow_resource_claims.resource_namespace
+                     AND allocation.resource_key = workflow_resource_claims.resource_key
+                 )",
+                [id.to_string()],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_resource_allocations
+                 SET state = 'released', updated_at_ms = ?2
+                 WHERE item_id = ?1 AND state = 'active'",
+                params![id.to_string(), now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_assignments
+                 SET state = 'released', reclaim_requested_at_ms = NULL, updated_at_ms = ?2
+                 WHERE item_id = ?1 AND state != 'released'",
+                params![id.to_string(), now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_work_items
+                 SET status = 'pending', next_attempt_at_ms = NULL,
+                     updated_at_ms = ?2, revision = revision + 1
+                 WHERE id = ?1",
+                params![id.to_string(), now_ms],
+            )?;
+        }
+        let reclaimed = rows.len();
+        transaction.commit()?;
+        Ok(reclaimed)
+    }
+
+    /// Atomically observes candidates and allocates every stored item requirement.
+    pub fn allocate_requirements(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+    ) -> Result<AllocationSet, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = read_work_item_in(&transaction, item_id)?
+            .ok_or(RepositoryError::WorkItemNotFound(item_id))?;
+        verify_work_item_revision(&item, expected_revision)?;
+        let owner = read_in(&transaction, item.spec.workflow_id)?
+            .ok_or(RepositoryError::NotFound(item.spec.workflow_id))?;
+        if owner.status.is_terminal() || item.state.status.is_terminal() {
+            return Err(RepositoryError::TerminalWorkItemOwner(
+                item.spec.workflow_id,
+            ));
+        }
+        let requirements: Vec<ResourceRequirement> =
+            serde_json::from_value(item.spec.requirements_json.clone())?;
+        let mut allocation_set = list_active_allocations_in(&transaction, item_id)?;
+
+        let mut ordered_candidates = candidates.to_vec();
+        ordered_candidates.sort_by(|left, right| {
+            resource_sort_key(&left.resource).cmp(&resource_sort_key(&right.resource))
+        });
+        for candidate in &ordered_candidates {
+            let pool_key = serde_json::to_string(&candidate.resource)?;
+            let (namespace, key) = candidate.resource.persisted_parts()?;
+            let revision = i64::try_from(candidate.observed_revision)
+                .map_err(|_| RepositoryError::RevisionOutOfRange(candidate.observed_revision))?;
+            let quantity = i64::try_from(candidate.available_quantity).map_err(|_| {
+                RepositoryError::InvalidStoredWorkItemCount {
+                    field: "available quantity",
+                    value: i64::MAX,
+                }
+            })?;
+            transaction.execute(
+                "INSERT INTO workflow_resource_pools (
+                    pool_key, resource_namespace, resource_key, kind, capabilities_json,
+                    location_json, available_quantity, observed_revision, observed_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(pool_key) DO UPDATE SET
+                    kind = excluded.kind,
+                    capabilities_json = excluded.capabilities_json,
+                    location_json = excluded.location_json,
+                    available_quantity = excluded.available_quantity,
+                    observed_revision = excluded.observed_revision,
+                    observed_at_ms = excluded.observed_at_ms
+                 WHERE excluded.observed_revision > workflow_resource_pools.observed_revision",
+                params![
+                    pool_key,
+                    namespace,
+                    key,
+                    candidate.kind,
+                    serde_json::to_string(&candidate.capabilities)?,
+                    candidate
+                        .location
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    quantity,
+                    revision,
+                    candidate.observed_at_ms,
+                ],
+            )?;
+        }
+
+        for requirement in requirements {
+            let mut selected = allocation_set
+                .by_requirement
+                .remove(&requirement.key)
+                .unwrap_or_default();
+            for candidate in &ordered_candidates {
+                if selected.len() >= usize::try_from(requirement.count).unwrap_or(usize::MAX)
+                    || !candidate_matches_requirement(candidate, &requirement)
+                {
+                    continue;
+                }
+                let pool_key = serde_json::to_string(&candidate.resource)?;
+                let active_quantity: i64 = transaction.query_row(
+                    "SELECT COALESCE(SUM(quantity), 0)
+                     FROM workflow_resource_allocations
+                     WHERE pool_key = ?1 AND state = 'active'",
+                    [&pool_key],
+                    |row| row.get(0),
+                )?;
+                let available_quantity: i64 = transaction.query_row(
+                    "SELECT available_quantity FROM workflow_resource_pools WHERE pool_key = ?1",
+                    [&pool_key],
+                    |row| row.get(0),
+                )?;
+                let requested_quantity = i64::try_from(requirement.quantity).map_err(|_| {
+                    RepositoryError::InvalidStoredWorkItemCount {
+                        field: "required quantity",
+                        value: i64::MAX,
+                    }
+                })?;
+                if available_quantity.saturating_sub(active_quantity) < requested_quantity {
+                    continue;
+                }
+                let (namespace, key) = candidate.resource.persisted_parts()?;
+                if is_exclusive_namespace(&namespace) {
+                    let claim_owner = transaction
+                        .query_row(
+                            "SELECT workflow_id FROM workflow_resource_claims
+                             WHERE resource_namespace = ?1 AND resource_key = ?2",
+                            params![namespace, key],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    if claim_owner
+                        .as_deref()
+                        .is_some_and(|owner| owner != item.spec.workflow_id.to_string())
+                    {
+                        continue;
+                    }
+                }
+                let allocation = ResourceAllocation {
+                    id: AllocationId::new(),
+                    requirement_key: requirement.key.clone(),
+                    resource: candidate.resource.clone(),
+                    quantity: requirement.quantity,
+                    state: AllocationState::Active,
+                };
+                transaction.execute(
+                    "INSERT INTO workflow_resource_allocations (
+                        id, item_id, requirement_key, pool_key, resource_namespace,
+                        resource_key, quantity, state, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
+                    params![
+                        allocation.id.to_string(),
+                        item_id.to_string(),
+                        requirement.key,
+                        pool_key,
+                        namespace,
+                        key,
+                        requested_quantity,
+                        candidate.observed_at_ms,
+                    ],
+                )?;
+                if is_exclusive_namespace(&namespace) {
+                    transaction.execute(
+                        "INSERT INTO workflow_resource_claims (
+                            resource_namespace, resource_key, workflow_id, acquired_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?4)
+                         ON CONFLICT(resource_namespace, resource_key) DO UPDATE SET
+                            updated_at = excluded.updated_at
+                         WHERE workflow_resource_claims.workflow_id = excluded.workflow_id",
+                        params![
+                            namespace,
+                            key,
+                            item.spec.workflow_id.to_string(),
+                            candidate.observed_at_ms,
+                        ],
+                    )?;
+                }
+                selected.push(allocation);
+            }
+            let selected_count = u32::try_from(selected.len()).unwrap_or(u32::MAX);
+            if selected_count < requirement.count {
+                return Err(RepositoryError::AllocationShortage {
+                    requirement_key: requirement.key,
+                    missing_count: requirement.count - selected_count,
+                });
+            }
+            allocation_set
+                .by_requirement
+                .insert(requirement.key, selected);
+        }
+        transaction.commit()?;
+        Ok(allocation_set)
+    }
+
+    /// Marks one missing allocation dead and atomically attempts a replacement.
+    pub fn replace_dead_allocation(
+        &self,
+        item_id: WorkItemId,
+        allocation_id: AllocationId,
+        candidates: &[AllocationCandidate],
+        now_ms: i64,
+    ) -> Result<ReplacementOutcome, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = read_work_item_in(&transaction, item_id)?
+            .ok_or(RepositoryError::WorkItemNotFound(item_id))?;
+        let (requirement_key, dead_namespace, dead_key, quantity) = transaction
+            .query_row(
+                "SELECT requirement_key, resource_namespace, resource_key, quantity
+                 FROM workflow_resource_allocations
+                 WHERE id = ?1 AND item_id = ?2 AND state = 'active'",
+                params![allocation_id.to_string(), item_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(RepositoryError::WorkItemNotFound(item_id))?;
+        let requirement: ResourceRequirement = serde_json::from_value::<Vec<ResourceRequirement>>(
+            item.spec.requirements_json.clone(),
+        )?
+        .into_iter()
+        .find(|requirement| requirement.key == requirement_key)
+        .ok_or_else(|| RepositoryError::AllocationShortage {
+            requirement_key: requirement_key.clone(),
+            missing_count: 1,
+        })?;
+        transaction.execute(
+            "UPDATE workflow_resource_allocations
+             SET state = 'dead', updated_at_ms = ?2 WHERE id = ?1",
+            params![allocation_id.to_string(), now_ms],
+        )?;
+        if is_exclusive_namespace(&dead_namespace) {
+            transaction.execute(
+                "DELETE FROM workflow_resource_claims
+                 WHERE resource_namespace = ?1 AND resource_key = ?2 AND workflow_id = ?3",
+                params![dead_namespace, dead_key, item.spec.workflow_id.to_string()],
+            )?;
+        }
+
+        let mut eligible_owned = false;
+        let mut ordered = candidates.to_vec();
+        ordered.sort_by(|left, right| {
+            resource_sort_key(&left.resource).cmp(&resource_sort_key(&right.resource))
+        });
+        for candidate in ordered {
+            if !candidate_matches_kind_capabilities(&candidate, &requirement) {
+                continue;
+            }
+            eligible_owned = true;
+            if !candidate_matches_scope(&candidate, &requirement.scope) {
+                continue;
+            }
+            let (namespace, key) = candidate.resource.persisted_parts()?;
+            if namespace == dead_namespace && key == dead_key {
+                continue;
+            }
+            eligible_owned = true;
+            let pool_key = serde_json::to_string(&candidate.resource)?;
+            let active_quantity: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(quantity), 0)
+                 FROM workflow_resource_allocations
+                 WHERE pool_key = ?1 AND state = 'active'",
+                [&pool_key],
+                |row| row.get(0),
+            )?;
+            let available = i64::try_from(candidate.available_quantity).unwrap_or(i64::MAX);
+            if available.saturating_sub(active_quantity) < quantity {
+                continue;
+            }
+            if is_exclusive_namespace(&namespace) {
+                let claim_owner = transaction
+                    .query_row(
+                        "SELECT workflow_id FROM workflow_resource_claims
+                         WHERE resource_namespace = ?1 AND resource_key = ?2",
+                        params![namespace, key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if claim_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != item.spec.workflow_id.to_string())
+                {
+                    continue;
+                }
+            }
+            let revision = i64::try_from(candidate.observed_revision)
+                .map_err(|_| RepositoryError::RevisionOutOfRange(candidate.observed_revision))?;
+            transaction.execute(
+                "INSERT INTO workflow_resource_pools (
+                    pool_key, resource_namespace, resource_key, kind, capabilities_json,
+                    location_json, available_quantity, observed_revision, observed_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(pool_key) DO UPDATE SET
+                    available_quantity = excluded.available_quantity,
+                    observed_revision = excluded.observed_revision,
+                    observed_at_ms = excluded.observed_at_ms
+                 WHERE excluded.observed_revision > workflow_resource_pools.observed_revision",
+                params![
+                    pool_key,
+                    namespace,
+                    key,
+                    candidate.kind,
+                    serde_json::to_string(&candidate.capabilities)?,
+                    candidate
+                        .location
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    available,
+                    revision,
+                    candidate.observed_at_ms,
+                ],
+            )?;
+            let replacement = ResourceAllocation {
+                id: AllocationId::new(),
+                requirement_key: requirement_key.clone(),
+                resource: candidate.resource.clone(),
+                quantity: u64::try_from(quantity).map_err(|_| {
+                    RepositoryError::InvalidStoredWorkItemCount {
+                        field: "allocation quantity",
+                        value: quantity,
+                    }
+                })?,
+                state: AllocationState::Active,
+            };
+            transaction.execute(
+                "INSERT INTO workflow_resource_allocations (
+                    id, item_id, requirement_key, pool_key, resource_namespace,
+                    resource_key, quantity, state, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
+                params![
+                    replacement.id.to_string(),
+                    item_id.to_string(),
+                    requirement_key,
+                    pool_key,
+                    namespace,
+                    key,
+                    quantity,
+                    now_ms,
+                ],
+            )?;
+            if is_exclusive_namespace(&namespace) {
+                transaction.execute(
+                    "INSERT INTO workflow_resource_claims (
+                        resource_namespace, resource_key, workflow_id, acquired_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![namespace, key, item.spec.workflow_id.to_string(), now_ms],
+                )?;
+            }
+            transaction.commit()?;
+            return Ok(ReplacementOutcome::Replaced(replacement));
+        }
+        let outcome = if eligible_owned {
+            ReplacementOutcome::Waiting
+        } else {
+            transition_work_item_in(
+                &transaction,
+                &item,
+                WorkItemTransition::Failed {
+                    error: "ReplacementUnavailable".into(),
+                    result_json: None,
+                },
+                now_ms,
+            )?;
+            ReplacementOutcome::Unavailable
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Persists one active worker assignment for an assigned item.
+    pub fn assign_work_item(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        assignment_id: &str,
+        worker: &ResourceKey,
+        now_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        if assignment_id.is_empty() {
+            return Err(RepositoryError::InvalidWorkItemAssignment(
+                "assignment_id must not be empty",
+            ));
+        }
+        let (namespace, key) = worker.persisted_parts()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let item = read_work_item_in(&transaction, item_id)?
+            .ok_or(RepositoryError::WorkItemNotFound(item_id))?;
+        verify_work_item_revision(&item, expected_revision)?;
+        if item.state.status != WorkItemStatus::Assigned {
+            return Err(invalid_work_item_transition(
+                &item,
+                WorkItemStatus::Assigned,
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO workflow_assignments (
+                id, item_id, worker_namespace, worker_key, state, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
+            params![assignment_id, item_id.to_string(), namespace, key, now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Requests cooperative reclaim at the executor's next safe boundary.
+    pub fn request_work_item_reclaim(
+        &self,
+        item_id: WorkItemId,
+        now_ms: i64,
+    ) -> Result<bool, RepositoryError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE workflow_assignments
+             SET state = 'reclaim_requested', reclaim_requested_at_ms = ?2, updated_at_ms = ?2
+             WHERE item_id = ?1 AND state = 'active'",
+            params![item_id.to_string(), now_ms],
+        )? != 0;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Returns whether cooperative reclaim is requested for this item.
+    pub fn work_item_reclaim_requested(
+        &self,
+        item_id: WorkItemId,
+    ) -> Result<bool, RepositoryError> {
+        Ok(self.connection()?.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM workflow_assignments
+                WHERE item_id = ?1 AND state = 'reclaim_requested'
+             )",
+            [item_id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Removes claims whose owner is missing or terminal after a restart.
     pub fn reconcile_claims(&self) -> Result<usize, RepositoryError> {
         let mut connection = self.connection()?;
@@ -1324,6 +2225,58 @@ impl WorkflowRepository {
                 failure_disposition,
             ],
         )?;
+        if state.status.is_terminal() {
+            transaction.execute(
+                "UPDATE workflow_work_item_attempts
+                 SET ended_at_ms = ?2, outcome = 'cancelled'
+                 WHERE ended_at_ms IS NULL
+                   AND item_id IN (
+                     SELECT id FROM workflow_work_items WHERE workflow_id = ?1
+                   )",
+                params![id.to_string(), now],
+            )?;
+            transaction.execute(
+                "DELETE FROM workflow_resource_claims
+                 WHERE workflow_id = ?1
+                   AND EXISTS (
+                     SELECT 1 FROM workflow_resource_allocations allocation
+                     JOIN workflow_work_items item ON item.id = allocation.item_id
+                     WHERE item.workflow_id = ?1
+                       AND allocation.state = 'active'
+                       AND allocation.resource_namespace =
+                           workflow_resource_claims.resource_namespace
+                       AND allocation.resource_key = workflow_resource_claims.resource_key
+                   )",
+                [id.to_string()],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_resource_allocations
+                 SET state = 'released', updated_at_ms = ?2
+                 WHERE state = 'active'
+                   AND item_id IN (
+                     SELECT id FROM workflow_work_items WHERE workflow_id = ?1
+                   )",
+                params![id.to_string(), now],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_assignments
+                 SET state = 'released', reclaim_requested_at_ms = NULL, updated_at_ms = ?2
+                 WHERE state != 'released'
+                   AND item_id IN (
+                     SELECT id FROM workflow_work_items WHERE workflow_id = ?1
+                   )",
+                params![id.to_string(), now],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_work_items
+                 SET status = 'abandoned', next_attempt_at_ms = NULL,
+                     consecutive_failure_count = 0, updated_at_ms = ?2,
+                     revision = revision + 1
+                 WHERE workflow_id = ?1
+                   AND status NOT IN ('succeeded', 'skipped', 'failed', 'abandoned')",
+                params![id.to_string(), now],
+            )?;
+        }
         let updated = read_in(&transaction, id)?.ok_or(RepositoryError::NotFound(id))?;
         transaction.commit()?;
         Ok(updated)
@@ -1382,6 +2335,617 @@ const SUMMARY_COLUMNS: &str = "id, kind, status, revision, current_step, updated
 const TRIGGER_COLUMNS: &str = "id, name, condition_json, target_json, enabled, created_at, \
                                updated_at, last_fired_at, next_run_at, last_error, \
                                event_cursor, revision";
+
+const WORK_ITEM_COLUMNS: &str = "id, workflow_id, dedupe_key, kind, sort_key, payload_json, \
+    preconditions_json, requirements_json, deadline_at_ms, status, checkpoint_json, result_json, \
+    last_error, attempt_count, consecutive_failure_count, next_attempt_at_ms, ever_started, \
+    created_at_ms, updated_at_ms, revision";
+
+const WORK_ITEM_ATTEMPT_COLUMNS: &str = "item_id, assignment_id, worker_identity, attempt_ordinal, \
+    started_at_ms, ended_at_ms, outcome, error";
+
+fn read_work_item_in(
+    connection: &Connection,
+    id: WorkItemId,
+) -> Result<Option<WorkItem>, RepositoryError> {
+    connection
+        .query_row(
+            &format!("SELECT {WORK_ITEM_COLUMNS} FROM workflow_work_items WHERE id = ?1"),
+            [id.to_string()],
+            row_to_work_item,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn read_work_item_by_key_in(
+    connection: &Connection,
+    workflow_id: WorkflowId,
+    dedupe_key: &str,
+) -> Result<Option<WorkItem>, RepositoryError> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {WORK_ITEM_COLUMNS} FROM workflow_work_items
+                 WHERE workflow_id = ?1 AND dedupe_key = ?2"
+            ),
+            params![workflow_id.to_string(), dedupe_key],
+            row_to_work_item,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn list_work_items_in(
+    connection: &Connection,
+    workflow_id: WorkflowId,
+) -> Result<Vec<WorkItem>, RepositoryError> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {WORK_ITEM_COLUMNS} FROM workflow_work_items
+         WHERE workflow_id = ?1
+         ORDER BY sort_key, dedupe_key, id"
+    ))?;
+    let rows = statement.query_map([workflow_id.to_string()], row_to_work_item)?;
+    rows.map(|row| row.map_err(Into::into)).collect()
+}
+
+fn row_to_work_item(row: &rusqlite::Row<'_>) -> Result<WorkItem, rusqlite::Error> {
+    let id = parse_work_item_id(row.get(0)?).map_err(to_sql_conversion_error)?;
+    let workflow_id = parse_id(row.get(1)?)?;
+    let kind = WorkflowKind::new(row.get::<_, String>(3)?).map_err(to_sql_conversion_error)?;
+    let attempt_count = parse_work_item_count("attempt", row.get(13)?)?;
+    let consecutive_failure_count = parse_work_item_count("consecutive failure", row.get(14)?)?;
+    let revision = row.get::<_, i64>(19)?;
+    let checkpoint_json = row
+        .get::<_, Option<String>>(10)?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let result_json = row
+        .get::<_, Option<String>>(11)?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(WorkItem {
+        id,
+        spec: WorkItemSpec {
+            workflow_id,
+            dedupe_key: row.get(2)?,
+            kind,
+            sort_key: row.get(4)?,
+            payload_json: parse_work_item_json(row, 5)?,
+            preconditions_json: parse_work_item_json(row, 6)?,
+            requirements_json: parse_work_item_json(row, 7)?,
+            deadline_at_ms: row.get(8)?,
+        },
+        state: WorkItemState {
+            status: parse_work_item_status(row.get(9)?).map_err(to_sql_conversion_error)?,
+            checkpoint_json,
+            result_json,
+            last_error: row.get(12)?,
+            attempt_count,
+            consecutive_failure_count,
+            next_attempt_at_ms: row.get(15)?,
+            ever_started: row.get(16)?,
+            created_at_ms: row.get(17)?,
+            updated_at_ms: row.get(18)?,
+            revision: u64::try_from(revision).map_err(|_| {
+                to_sql_conversion_error(RepositoryError::InvalidStoredWorkItemRevision(revision))
+            })?,
+        },
+    })
+}
+
+fn row_to_attempt(row: &rusqlite::Row<'_>) -> Result<WorkItemAttempt, rusqlite::Error> {
+    let item_id = parse_work_item_id(row.get(0)?).map_err(to_sql_conversion_error)?;
+    let outcome = row
+        .get::<_, Option<String>>(6)?
+        .map(parse_work_item_attempt_outcome)
+        .transpose()
+        .map_err(to_sql_conversion_error)?;
+    Ok(WorkItemAttempt {
+        item_id,
+        assignment_id: row.get(1)?,
+        worker_identity: row.get(2)?,
+        attempt_ordinal: parse_work_item_count("attempt ordinal", row.get(3)?)?,
+        started_at_ms: row.get(4)?,
+        ended_at_ms: row.get(5)?,
+        outcome,
+        error: row.get(7)?,
+    })
+}
+
+fn parse_work_item_json(row: &rusqlite::Row<'_>, index: usize) -> Result<Value, rusqlite::Error> {
+    serde_json::from_str(&row.get::<_, String>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn list_active_allocations_in(
+    connection: &Connection,
+    item_id: WorkItemId,
+) -> Result<AllocationSet, RepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT id, requirement_key, resource_namespace, resource_key, quantity, state
+         FROM workflow_resource_allocations
+         WHERE item_id = ?1 AND state = 'active'
+         ORDER BY requirement_key, resource_namespace, resource_key, id",
+    )?;
+    let rows = statement
+        .query_map([item_id.to_string()], |row| {
+            let id = row.get::<_, String>(0)?;
+            let quantity = row.get::<_, i64>(4)?;
+            Ok((
+                id,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                quantity,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut set = AllocationSet::default();
+    for (id, requirement_key, namespace, key, quantity) in rows {
+        let allocation = ResourceAllocation {
+            id: AllocationId::from_str(&id)
+                .map_err(|_| RepositoryError::InvalidStoredWorkItemId(id))?,
+            requirement_key: requirement_key.clone(),
+            resource: resource_key(namespace, key),
+            quantity: u64::try_from(quantity).map_err(|_| {
+                RepositoryError::InvalidStoredWorkItemCount {
+                    field: "allocation quantity",
+                    value: quantity,
+                }
+            })?,
+            state: AllocationState::Active,
+        };
+        set.by_requirement
+            .entry(requirement_key)
+            .or_default()
+            .push(allocation);
+    }
+    Ok(set)
+}
+
+fn resource_sort_key(resource: &ResourceKey) -> String {
+    serde_json::to_string(resource).unwrap_or_default()
+}
+
+fn candidate_matches_requirement(
+    candidate: &AllocationCandidate,
+    requirement: &ResourceRequirement,
+) -> bool {
+    candidate_matches_kind_capabilities(candidate, requirement)
+        && candidate_matches_scope(candidate, &requirement.scope)
+}
+
+fn candidate_matches_kind_capabilities(
+    candidate: &AllocationCandidate,
+    requirement: &ResourceRequirement,
+) -> bool {
+    candidate.kind == requirement.kind
+        && requirement
+            .capabilities
+            .iter()
+            .all(|required| candidate.capabilities.contains(required))
+}
+
+fn candidate_matches_scope(candidate: &AllocationCandidate, scope: &RequirementScope) -> bool {
+    match scope {
+        RequirementScope::Anywhere => true,
+        RequirementScope::Region(region) => {
+            candidate
+                .location
+                .as_ref()
+                .and_then(|location| location.region.as_ref())
+                == Some(region)
+        }
+        RequirementScope::System(system) => {
+            candidate
+                .location
+                .as_ref()
+                .and_then(|location| location.system.as_ref())
+                == Some(system)
+        }
+        RequirementScope::Location(designation) => {
+            candidate
+                .location
+                .as_ref()
+                .and_then(|location| location.designation.as_ref())
+                == Some(designation)
+        }
+        RequirementScope::WithinLy { origin, range_ly } => {
+            range_ly.is_finite()
+                && *range_ly >= 0.0
+                && candidate
+                    .location
+                    .as_ref()
+                    .and_then(|location| location.distances_ly.get(origin))
+                    .is_some_and(|distance| {
+                        distance.is_finite() && *distance >= 0.0 && distance <= range_ly
+                    })
+        }
+    }
+}
+
+fn is_exclusive_namespace(namespace: &str) -> bool {
+    matches!(namespace, "replicant" | "device" | "autofactory")
+}
+
+fn parse_work_item_id(value: String) -> Result<WorkItemId, RepositoryError> {
+    WorkItemId::from_str(&value).map_err(|_| RepositoryError::InvalidStoredWorkItemId(value))
+}
+
+fn parse_work_item_status(value: String) -> Result<WorkItemStatus, RepositoryError> {
+    match value.as_str() {
+        "pending" => Ok(WorkItemStatus::Pending),
+        "assigned" => Ok(WorkItemStatus::Assigned),
+        "running" => Ok(WorkItemStatus::Running),
+        "waiting" => Ok(WorkItemStatus::Waiting),
+        "succeeded" => Ok(WorkItemStatus::Succeeded),
+        "skipped" => Ok(WorkItemStatus::Skipped),
+        "failed" => Ok(WorkItemStatus::Failed),
+        "abandoned" => Ok(WorkItemStatus::Abandoned),
+        _ => Err(RepositoryError::InvalidStoredWorkItemStatus(value)),
+    }
+}
+
+fn parse_work_item_attempt_outcome(
+    value: String,
+) -> Result<WorkItemAttemptOutcome, RepositoryError> {
+    match value.as_str() {
+        "succeeded" => Ok(WorkItemAttemptOutcome::Succeeded),
+        "failed" => Ok(WorkItemAttemptOutcome::Failed),
+        "reclaimed" => Ok(WorkItemAttemptOutcome::Reclaimed),
+        "cancelled" => Ok(WorkItemAttemptOutcome::Cancelled),
+        _ => Err(RepositoryError::InvalidStoredWorkItemAttemptOutcome(value)),
+    }
+}
+
+fn parse_work_item_count(field: &'static str, value: i64) -> Result<u32, rusqlite::Error> {
+    u32::try_from(value).map_err(|_| {
+        to_sql_conversion_error(RepositoryError::InvalidStoredWorkItemCount { field, value })
+    })
+}
+
+fn work_item_revision_to_sql(revision: u64) -> Result<i64, RepositoryError> {
+    i64::try_from(revision).map_err(|_| RepositoryError::RevisionOutOfRange(revision))
+}
+
+fn verify_work_item_revision(
+    item: &WorkItem,
+    expected_revision: u64,
+) -> Result<(), RepositoryError> {
+    if item.state.revision == expected_revision {
+        Ok(())
+    } else {
+        Err(RepositoryError::ConcurrentWorkItemUpdate {
+            id: item.id,
+            expected: expected_revision,
+        })
+    }
+}
+
+fn invalid_work_item_transition(item: &WorkItem, to: WorkItemStatus) -> RepositoryError {
+    RepositoryError::InvalidWorkItemTransition {
+        from: item.state.status,
+        to,
+    }
+}
+
+fn transition_work_item_in(
+    transaction: &rusqlite::Transaction<'_>,
+    current: &WorkItem,
+    transition: WorkItemTransition,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    if current.state.status.is_terminal() {
+        return Err(invalid_work_item_transition(current, current.state.status));
+    }
+    let mut status = current.state.status;
+    let mut checkpoint = current.state.checkpoint_json.clone();
+    let mut result = current.state.result_json.clone();
+    let mut last_error = current.state.last_error.clone();
+    let mut consecutive_failures = current.state.consecutive_failure_count;
+    let next_attempt_at_ms: Option<i64>;
+    let mut attempt_close: Option<(WorkItemAttemptOutcome, Option<String>)> = None;
+    let mut release_allocations = false;
+
+    match transition {
+        WorkItemTransition::CheckpointCommitted { checkpoint_json } => {
+            if current.state.status != WorkItemStatus::Running {
+                return Err(invalid_work_item_transition(
+                    current,
+                    WorkItemStatus::Running,
+                ));
+            }
+            checkpoint = Some(checkpoint_json);
+            consecutive_failures = 0;
+            last_error = None;
+            next_attempt_at_ms = None;
+        }
+        WorkItemTransition::Waiting {
+            checkpoint_json,
+            reason,
+            retry_at_ms,
+        } => {
+            if !matches!(
+                current.state.status,
+                WorkItemStatus::Pending
+                    | WorkItemStatus::Assigned
+                    | WorkItemStatus::Running
+                    | WorkItemStatus::Waiting
+            ) {
+                return Err(invalid_work_item_transition(
+                    current,
+                    WorkItemStatus::Waiting,
+                ));
+            }
+            if current.state.status == WorkItemStatus::Running {
+                attempt_close = Some((WorkItemAttemptOutcome::Reclaimed, None));
+            }
+            status = WorkItemStatus::Waiting;
+            checkpoint = checkpoint_json.or(checkpoint);
+            last_error = Some(reason);
+            next_attempt_at_ms = retry_at_ms;
+        }
+        WorkItemTransition::RetryableFailure {
+            checkpoint_json,
+            error,
+        } => {
+            if current.state.status != WorkItemStatus::Running {
+                return Err(invalid_work_item_transition(
+                    current,
+                    WorkItemStatus::Pending,
+                ));
+            }
+            status = WorkItemStatus::Pending;
+            checkpoint = checkpoint_json.or(checkpoint);
+            last_error = Some(error.clone());
+            consecutive_failures = consecutive_failures.checked_add(1).ok_or(
+                RepositoryError::InvalidStoredWorkItemCount {
+                    field: "consecutive failure",
+                    value: i64::from(consecutive_failures),
+                },
+            )?;
+            let delay = work_item_retry_delay_ms(
+                current.id,
+                current.state.attempt_count,
+                consecutive_failures,
+            );
+            next_attempt_at_ms = Some(now_ms.saturating_add(delay));
+            attempt_close = Some((WorkItemAttemptOutcome::Failed, Some(error)));
+        }
+        WorkItemTransition::Succeeded {
+            checkpoint_json,
+            result_json,
+        } => {
+            if current.state.status != WorkItemStatus::Running {
+                return Err(invalid_work_item_transition(
+                    current,
+                    WorkItemStatus::Succeeded,
+                ));
+            }
+            status = WorkItemStatus::Succeeded;
+            checkpoint = checkpoint_json.or(checkpoint);
+            result = result_json;
+            last_error = None;
+            consecutive_failures = 0;
+            next_attempt_at_ms = None;
+            attempt_close = Some((WorkItemAttemptOutcome::Succeeded, None));
+        }
+        WorkItemTransition::Skipped {
+            reason,
+            result_json,
+        } => {
+            if current.state.status == WorkItemStatus::Running {
+                attempt_close = Some((WorkItemAttemptOutcome::Succeeded, None));
+            }
+            status = WorkItemStatus::Skipped;
+            result = result_json;
+            last_error = Some(reason);
+            consecutive_failures = 0;
+            next_attempt_at_ms = None;
+        }
+        WorkItemTransition::Failed { error, result_json } => {
+            if current.state.status == WorkItemStatus::Running {
+                attempt_close = Some((WorkItemAttemptOutcome::Failed, Some(error.clone())));
+            }
+            status = WorkItemStatus::Failed;
+            result = result_json;
+            last_error = Some(error);
+            consecutive_failures = 0;
+            next_attempt_at_ms = None;
+        }
+        WorkItemTransition::Abandoned { reason } => {
+            if current.state.status == WorkItemStatus::Running {
+                attempt_close = Some((WorkItemAttemptOutcome::Cancelled, None));
+            }
+            status = WorkItemStatus::Abandoned;
+            last_error = Some(reason);
+            consecutive_failures = 0;
+            next_attempt_at_ms = None;
+        }
+        WorkItemTransition::Reclaimed { checkpoint_json } => {
+            if !matches!(
+                current.state.status,
+                WorkItemStatus::Assigned | WorkItemStatus::Running
+            ) {
+                return Err(invalid_work_item_transition(
+                    current,
+                    WorkItemStatus::Pending,
+                ));
+            }
+            if current.state.status == WorkItemStatus::Running {
+                attempt_close = Some((WorkItemAttemptOutcome::Reclaimed, None));
+            }
+            status = WorkItemStatus::Pending;
+            checkpoint = checkpoint_json.or(checkpoint);
+            next_attempt_at_ms = None;
+            release_allocations = true;
+        }
+    }
+
+    if let Some((outcome, error)) = attempt_close {
+        close_open_attempt(transaction, current.id, outcome, error.as_deref(), now_ms)?;
+    }
+    if status.is_terminal() {
+        transaction.execute(
+            "DELETE FROM workflow_resource_claims
+             WHERE workflow_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM workflow_resource_allocations allocation
+                 WHERE allocation.item_id = ?2
+                   AND allocation.state = 'active'
+                   AND allocation.resource_namespace =
+                       workflow_resource_claims.resource_namespace
+                   AND allocation.resource_key = workflow_resource_claims.resource_key
+               )",
+            params![current.spec.workflow_id.to_string(), current.id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE workflow_resource_allocations
+             SET state = 'released', updated_at_ms = ?2
+             WHERE item_id = ?1 AND state = 'active'",
+            params![current.id.to_string(), now_ms],
+        )?;
+    } else if release_allocations {
+        transaction.execute(
+            "DELETE FROM workflow_resource_claims
+             WHERE workflow_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM workflow_assignments assignment
+                 WHERE assignment.item_id = ?2
+                   AND assignment.state != 'released'
+                   AND assignment.worker_namespace =
+                       workflow_resource_claims.resource_namespace
+                   AND assignment.worker_key = workflow_resource_claims.resource_key
+               )",
+            params![current.spec.workflow_id.to_string(), current.id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE workflow_resource_allocations
+             SET state = 'released', updated_at_ms = ?2
+             WHERE item_id = ?1 AND state = 'active'
+               AND EXISTS (
+                 SELECT 1 FROM workflow_assignments assignment
+                 WHERE assignment.item_id = ?1
+                   AND assignment.state != 'released'
+                   AND assignment.worker_namespace =
+                       workflow_resource_allocations.resource_namespace
+                   AND assignment.worker_key = workflow_resource_allocations.resource_key
+               )",
+            params![current.id.to_string(), now_ms],
+        )?;
+    }
+    if status.is_terminal() || release_allocations {
+        transaction.execute(
+            "UPDATE workflow_assignments
+             SET state = 'released', reclaim_requested_at_ms = NULL, updated_at_ms = ?2
+             WHERE item_id = ?1 AND state != 'released'",
+            params![current.id.to_string(), now_ms],
+        )?;
+    }
+    let expected_revision = work_item_revision_to_sql(current.state.revision)?;
+    let changed = transaction.execute(
+        "UPDATE workflow_work_items
+         SET status = ?1, checkpoint_json = ?2, result_json = ?3, last_error = ?4,
+             consecutive_failure_count = ?5, next_attempt_at_ms = ?6,
+             updated_at_ms = ?7, revision = revision + 1
+         WHERE id = ?8 AND revision = ?9",
+        params![
+            status.as_str(),
+            checkpoint.as_ref().map(serde_json::to_string).transpose()?,
+            result.as_ref().map(serde_json::to_string).transpose()?,
+            last_error,
+            i64::from(consecutive_failures),
+            next_attempt_at_ms,
+            now_ms,
+            current.id.to_string(),
+            expected_revision,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(RepositoryError::ConcurrentWorkItemUpdate {
+            id: current.id,
+            expected: current.state.revision,
+        });
+    }
+    Ok(())
+}
+
+fn close_open_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    item_id: WorkItemId,
+    outcome: WorkItemAttemptOutcome,
+    error: Option<&str>,
+    ended_at_ms: i64,
+) -> Result<(), RepositoryError> {
+    let changed = transaction.execute(
+        "UPDATE workflow_work_item_attempts
+         SET ended_at_ms = ?1, outcome = ?2, error = ?3
+         WHERE item_id = ?4 AND ended_at_ms IS NULL",
+        params![ended_at_ms, outcome.as_str(), error, item_id.to_string()],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(RepositoryError::InvalidWorkItemAssignment(
+            "running item must have exactly one open attempt",
+        ))
+    }
+}
+
+fn work_item_retry_delay_ms(
+    item_id: WorkItemId,
+    attempt_ordinal: u32,
+    consecutive_failure_count: u32,
+) -> i64 {
+    const BASE_MS: u64 = 300_000;
+    const CAP_MS: u64 = 21_600_000;
+    let exponent = consecutive_failure_count.saturating_sub(1);
+    let unjittered = if exponent >= 7 {
+        CAP_MS
+    } else {
+        BASE_MS.saturating_mul(1_u64 << exponent).min(CAP_MS)
+    };
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in item_id
+        .as_bytes()
+        .iter()
+        .chain(attempt_ordinal.to_le_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let jitter_basis_points = i64::try_from(hash % 2_001).unwrap_or(0) - 1_000;
+    let factor = u64::try_from(10_000 + jitter_basis_points).unwrap_or(10_000);
+    let jittered = u64::try_from(
+        u128::from(unjittered)
+            .saturating_mul(u128::from(factor))
+            .checked_div(10_000)
+            .unwrap_or(u128::from(CAP_MS)),
+    )
+    .unwrap_or(CAP_MS)
+    .min(CAP_MS);
+    i64::try_from(jittered).unwrap_or(i64::MAX)
+}
 
 fn read_trigger_in(
     connection: &Connection,

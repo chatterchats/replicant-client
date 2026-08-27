@@ -6,6 +6,48 @@ use tracing::{trace, warn};
 use super::*;
 use crate::{events::GameEvent, raw};
 
+const LOCATION_PROMOTED_FIELDS: &[&str] = &[
+    "location",
+    "location_type",
+    "moons_scanned",
+    "moons_total",
+    "moons_total_estimated",
+    "parent",
+    "planets_scanned",
+    "planets_total",
+    "scanned",
+    "system",
+    "system_scanned",
+    "system_tags",
+];
+
+const LOCATION_PASSTHROUGH_FIELDS: &[&str] = &[
+    "active_location_events",
+    "asteroid_belt",
+    "belt",
+    "devices",
+    "entry_point",
+    "estimated_travel_time",
+    "inventory",
+    "kuiper",
+    "lagrange",
+    "life_detected",
+    "location_event",
+    "megastructure",
+    "mining_bonus_pct",
+    "moon",
+    "moons",
+    "object",
+    "oort",
+    "outer_system",
+    "planet",
+    "planets",
+    "resource_sites",
+    "shops",
+    "star",
+    "system_objects",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NormalizeError {
@@ -599,211 +641,12 @@ pub fn directory_profile(
     })
 }
 
-const LOCATION_PROMOTED_FIELDS: &[&str] = &[
-    "location",
-    "location_type",
-    "scanned",
-    "system_scanned",
-    "system_tags",
-    "system",
-    "parent",
-    "planets_total",
-    "planets_scanned",
-    "moons_total",
-    "moons_scanned",
-    "moons_total_estimated",
-];
-
-const LOCATION_PASSTHROUGH_FIELDS: &[&str] = &[
-    "active_location_events",
-    "asteroid_belt",
-    "belt",
-    "devices",
-    "entry_point",
-    "estimated_travel_time",
-    "inventory",
-    "kuiper",
-    "lagrange",
-    "life_detected",
-    "location_event",
-    "megastructure",
-    "mining_bonus_pct",
-    "moon",
-    "moons",
-    "object",
-    "oort",
-    "outer_system",
-    "planet",
-    "planets",
-    "resource_sites",
-    "shops",
-    "star",
-    "system_objects",
-];
-
-fn insert_present(map: &mut BTreeMap<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value {
-        map.insert(key.to_owned(), value);
-    }
-}
-
-fn json_object_array(values: &[raw::JsonObject]) -> Value {
-    Value::Array(values.iter().cloned().map(Value::Object).collect())
-}
-
-fn planetary_body_value(body: &raw::locations::PlanetaryBody) -> Value {
-    let mut fields = body.unknown.clone().into_iter().collect::<BTreeMap<_, _>>();
-    insert_present(&mut fields, "scanned", body.scanned.map(Value::from));
-    insert_present(
-        &mut fields,
-        "atmosphere",
-        body.atmosphere.clone().map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "in_habitable_zone",
-        body.in_habitable_zone.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "life_stage",
-        body.life_stage.clone().map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "magnetic_field",
-        body.magnetic_field.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "axial_tilt_deg",
-        body.axial_tilt_deg.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "surface_gravity",
-        body.surface_gravity.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "surface_temp_c",
-        body.surface_temp_c.map(Value::from),
-    );
-    Value::Object(fields.into_iter().collect())
-}
-
-fn location_passthrough(raw: &raw::locations::Location) -> BTreeMap<String, Value> {
-    debug_assert_eq!(LOCATION_PROMOTED_FIELDS.len(), 12);
-    debug_assert_eq!(LOCATION_PASSTHROUGH_FIELDS.len(), 24);
-    let mut fields = raw.unknown.clone().into_iter().collect::<BTreeMap<_, _>>();
-    insert_present(
-        &mut fields,
-        "active_location_events",
-        raw.active_location_events.as_deref().map(json_object_array),
-    );
-    insert_present(
-        &mut fields,
-        "asteroid_belt",
-        raw.asteroid_belt.clone().map(Value::Object),
-    );
-    insert_present(&mut fields, "belt", raw.belt.clone().map(Value::Object));
-    insert_present(
-        &mut fields,
-        "devices",
-        raw.devices.as_deref().map(json_object_array),
-    );
-    insert_present(
-        &mut fields,
-        "entry_point",
-        raw.entry_point.clone().map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "estimated_travel_time",
-        raw.estimated_travel_time.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "inventory",
-        raw.inventory.as_deref().map(json_object_array),
-    );
-    insert_present(&mut fields, "kuiper", raw.kuiper.clone().map(Value::Object));
-    insert_present(
-        &mut fields,
-        "lagrange",
-        raw.lagrange.clone().map(Value::Object),
-    );
-    insert_present(
-        &mut fields,
-        "life_detected",
-        raw.life_detected.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "location_event",
-        raw.location_event.clone().map(Value::Object),
-    );
-    insert_present(
-        &mut fields,
-        "megastructure",
-        raw.megastructure.clone().map(Value::Object),
-    );
-    insert_present(
-        &mut fields,
-        "mining_bonus_pct",
-        raw.mining_bonus_pct.map(Value::from),
-    );
-    insert_present(
-        &mut fields,
-        "moon",
-        raw.moon.as_ref().map(planetary_body_value),
-    );
-    insert_present(
-        &mut fields,
-        "moons",
-        raw.moons.as_deref().map(json_object_array),
-    );
-    insert_present(&mut fields, "object", raw.object.clone().map(Value::Object));
-    insert_present(&mut fields, "oort", raw.oort.clone().map(Value::Object));
-    insert_present(
-        &mut fields,
-        "outer_system",
-        raw.outer_system.clone().map(Value::Object),
-    );
-    insert_present(
-        &mut fields,
-        "planet",
-        raw.planet.as_ref().map(planetary_body_value),
-    );
-    insert_present(
-        &mut fields,
-        "planets",
-        raw.planets.as_deref().map(json_object_array),
-    );
-    insert_present(
-        &mut fields,
-        "resource_sites",
-        raw.resource_sites.as_deref().map(json_object_array),
-    );
-    insert_present(
-        &mut fields,
-        "shops",
-        raw.shops.as_deref().map(json_object_array),
-    );
-    insert_present(&mut fields, "star", raw.star.clone().map(Value::Object));
-    insert_present(
-        &mut fields,
-        "system_objects",
-        raw.system_objects.as_deref().map(json_object_array),
-    );
-    fields
-}
-
 pub fn location_detail(
     raw: &raw::locations::Location,
     realm: Realm,
     observed_at: impl Into<ObservationTime>,
 ) -> Result<Observation<Location>, NormalizeError> {
+    debug_assert!(!LOCATION_PROMOTED_FIELDS.is_empty() && !LOCATION_PASSTHROUGH_FIELDS.is_empty());
     let body = match raw.location_type.as_deref() {
         Some("planet") => raw.planet.as_ref(),
         Some("moon") => raw.moon.as_ref(),
@@ -818,7 +661,7 @@ pub fn location_detail(
         .or_else(|| body.and_then(|body| body.scanned))
         .or_else(|| survey_environment_evidence.then_some(true));
     let surveyed = scanned == Some(true);
-    let unknown = location_passthrough(raw);
+    let unknown = raw.open_fields();
     let value = Location {
         key: WorldKey::in_realm(
             realm.clone(),
@@ -1329,18 +1172,42 @@ mod location_tests {
 
         let observation = location_detail(&raw, Realm::Live, ObservationTime::now())
             .expect("complete location fixture should normalize");
-        for field in LOCATION_PASSTHROUGH_FIELDS {
-            assert!(
-                observation.value.unknown.contains_key(*field),
-                "passthrough field {field} was dropped"
-            );
-        }
-        for field in LOCATION_PROMOTED_FIELDS {
-            assert!(
-                !observation.value.unknown.contains_key(*field),
-                "promoted field {field} was duplicated"
-            );
-        }
+        let expected = [
+            "active_location_events",
+            "asteroid_belt",
+            "belt",
+            "devices",
+            "entry_point",
+            "estimated_travel_time",
+            "inventory",
+            "kuiper",
+            "lagrange",
+            "life_detected",
+            "location_event",
+            "megastructure",
+            "mining_bonus_pct",
+            "moon",
+            "moons",
+            "object",
+            "oort",
+            "outer_system",
+            "planet",
+            "planets",
+            "resource_sites",
+            "shops",
+            "star",
+            "system_objects",
+            "future_top_level",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let actual = observation
+            .value
+            .unknown
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
         assert_eq!(observation.value.unknown["planet"]["future_planet"], "kept");
         assert_eq!(observation.value.unknown["moon"]["future_moon"], "kept");
         assert_eq!(observation.value.unknown["future_top_level"]["kept"], true);

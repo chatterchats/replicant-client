@@ -2122,16 +2122,14 @@ async fn survey_missions(
                     .checkpoint::<SurveyWorkflowCheckpoint>()
                     .map_err(ApiError::repository)?;
                 let plan = checkpoint.state.as_ref().map(summarize_plan);
-                let controller = plan
-                    .as_ref()
-                    .and_then(|plan| plan.controller.clone())
-                    .or_else(|| config.options.controller.clone());
+                let controller = plan.as_ref().and_then(|plan| plan.controller.clone());
                 let drones = plan
                     .as_ref()
                     .map(|plan| plan.drones.clone())
-                    .or_else(|| config.options.drones.clone())
                     .unwrap_or_default();
-                fleet_codes.insert(config.options.vessel.clone());
+                if let Some(vessel) = plan.as_ref().map(|plan| plan.vessel.clone()) {
+                    fleet_codes.insert(vessel);
+                }
                 fleet_codes.extend(controller.iter().cloned());
                 fleet_codes.extend(drones.iter().cloned());
                 missions.push(SurveyMissionSummary {
@@ -2139,15 +2137,15 @@ async fn survey_missions(
                     replicant: plan
                         .as_ref()
                         .map(|plan| plan.replicant.clone())
-                        .unwrap_or_else(|| config.options.replicant.clone()),
+                        .unwrap_or_else(|| "unassigned".to_owned()),
                     vessel: plan
                         .as_ref()
                         .map(|plan| plan.vessel.clone())
-                        .unwrap_or_else(|| config.options.vessel.clone()),
+                        .unwrap_or_else(|| "unassigned".to_owned()),
                     center: plan
                         .as_ref()
                         .map(|plan| plan.center.clone())
-                        .unwrap_or_else(|| config.options.center.clone()),
+                        .unwrap_or_else(|| config.center.clone()),
                     phase: plan
                         .as_ref()
                         .map(|plan| plan.phase.clone())
@@ -2397,9 +2395,9 @@ fn relay_snapshot(
                 let status = checkpoint.state.as_ref().map(|state| state.status());
                 expansions.push(RelayExpansionSummary {
                     workflow: summary(workflow),
-                    replicant: config.request.replicant,
-                    hub: config.request.hub,
-                    targets: config.request.targets.clone(),
+                    replicant: "unassigned".to_owned(),
+                    hub: config.hub,
+                    targets: config.targets.clone(),
                     phase: status
                         .as_ref()
                         .and_then(|status| wire_value(Some(&status.phase)))
@@ -2410,7 +2408,7 @@ fn relay_snapshot(
                     next_system: status
                         .as_ref()
                         .and_then(|status| status.next_system.clone())
-                        .or_else(|| config.request.targets.first().cloned()),
+                        .or_else(|| config.targets.first().cloned()),
                     pending_relays: status.map(|status| status.pending_relays),
                 });
             }
@@ -5164,7 +5162,7 @@ async fn run_report(
     let started_at = now_millis()?;
     let result = state
         .catalogue
-        .run_report(state.client(), &kind, request.parameters)
+        .run_report(state.client(), &state.repository, &kind, request.parameters)
         .await;
     operation_response(
         &state,
@@ -6725,6 +6723,17 @@ mod finite_result_tests {
         assert_eq!(status, StoredFiniteExecutionStatus::Succeeded);
         assert_eq!(result_links(&result).len(), 3);
     }
+    #[test]
+    fn automation_schedule_report_is_exposed_by_server_catalogue() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        assert!(
+            catalogue
+                .descriptors()
+                .reports
+                .iter()
+                .any(|descriptor| descriptor.kind.0 == "automation_schedule")
+        );
+    }
 }
 
 fn present_activity(message: &str) -> (ActivityLevel, Option<String>, String) {
@@ -8256,8 +8265,8 @@ mod tests {
         let (_, client, state) = test_app().await;
         let workflow = state
             .repository
-            .create(new_relay_workflow(RelayWorkflowConfig {
-                request: RelayExpansionRequest {
+            .create(new_relay_workflow(RelayWorkflowConfig::from_request(
+                RelayExpansionRequest {
                     replicant: "R-1".to_owned(),
                     hub: "SOL-1".to_owned(),
                     targets: vec!["VEGA".to_owned()],
@@ -8266,7 +8275,7 @@ mod tests {
                     wait_timeout: Duration::from_secs(1),
                     unavailable_autofactories: Default::default(),
                 },
-            }))
+            )))
             .expect("relay workflow");
         let mut deployed = projected_device("RELAY-1");
         deployed.device_type = Some("ftl_relay".to_owned());
@@ -8381,8 +8390,8 @@ mod tests {
         let (app, client, state) = test_app().await;
         let workflow = state
             .repository
-            .create(new_survey_workflow(SurveyWorkflowConfig {
-                options: SurveyOptions {
+            .create(new_survey_workflow(SurveyWorkflowConfig::from_options(
+                SurveyOptions {
                     mode: SurveyMode::Run,
                     replicant: "R-1".to_owned(),
                     vessel: "V-1".to_owned(),
@@ -8404,7 +8413,8 @@ mod tests {
                     maintenance_resume_pct: 95.0,
                     maintenance_check_interval: Duration::from_secs(1),
                 },
-            }))
+                "Alpha".to_owned(),
+            )))
             .expect("survey workflow");
         let response = app
             .oneshot(
@@ -8420,7 +8430,7 @@ mod tests {
             workflow.id.to_string()
         );
         assert_eq!(value["payload"]["missions"][0]["center"], "SOL");
-        assert_eq!(value["payload"]["missions"][0]["controller"], "SC-1");
+        assert_eq!(value["payload"]["missions"][0]["controller"], Value::Null);
         client.close().await.expect("close client");
     }
 

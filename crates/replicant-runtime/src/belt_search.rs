@@ -208,45 +208,16 @@ pub async fn execute_belt_search(
     let auto_route = route_plan.is_some();
     let mut stops = Vec::new();
     for system in &systems {
-        let already_explored = system_is_explored(client, &replicant_code, system).await?;
-        let scanned_now = if already_explored {
-            if auto_route {
-                // Auto routes are anchored at the requested start and must stay
-                // physically faithful to the planned order. Known systems are
-                // therefore visited when present in the route, but never rescanned.
-                travel_to_system(client, &replicant_code, system, request.wait_timeout).await?;
-                info!(
-                    replicant = %replicant_code,
-                    system,
-                    "belt-search route stop is already explored; visited without duplicate scan"
-                );
-            } else {
-                info!(
-                    replicant = %replicant_code,
-                    system,
-                    "belt-search system is already explored; skipping travel and duplicate scan"
-                );
-            }
-            false
-        } else {
-            travel_to_system(client, &replicant_code, system, request.wait_timeout).await?;
-            scan_system(client, &replicant_code, system).await?;
-            true
-        };
-        let location = client.locations().get(system).await?;
-        let mut belts = belts_from_location(system, &location);
-        belts.sort_by(|left, right| {
-            right
-                .density_rank()
-                .cmp(&left.density_rank())
-                .then_with(|| left.designation.cmp(&right.designation))
-        });
-
-        stops.push(BeltSearchStop {
-            system: system.clone(),
-            scanned: scanned_now,
-            belts,
-        });
+        stops.push(
+            execute_belt_search_system(
+                client,
+                &replicant_code,
+                system,
+                request.wait_timeout,
+                auto_route,
+            )
+            .await?,
+        );
     }
     Ok(BeltSearchResult {
         replicant_code,
@@ -254,6 +225,51 @@ pub async fn execute_belt_search(
         route: route_plan,
         systems,
         stops,
+    })
+}
+
+/// Executes one idempotent travel/scan/report unit for a resolved Replicant.
+pub async fn execute_belt_search_system(
+    client: &Client,
+    replicant_code: &str,
+    system: &str,
+    wait_timeout: Duration,
+    visit_when_explored: bool,
+) -> crate::ActionResult<BeltSearchStop> {
+    let already_explored = system_is_explored(client, replicant_code, system).await?;
+    let scanned_now = if already_explored {
+        if visit_when_explored {
+            travel_to_system(client, replicant_code, system, wait_timeout).await?;
+            info!(
+                replicant = %replicant_code,
+                system,
+                "belt-search route stop is already explored; visited without duplicate scan"
+            );
+        } else {
+            info!(
+                replicant = %replicant_code,
+                system,
+                "belt-search system is already explored; skipping travel and duplicate scan"
+            );
+        }
+        false
+    } else {
+        travel_to_system(client, replicant_code, system, wait_timeout).await?;
+        scan_system(client, replicant_code, system).await?;
+        true
+    };
+    let location = client.locations().get(system).await?;
+    let mut belts = belts_from_location(system, &location);
+    belts.sort_by(|left, right| {
+        right
+            .density_rank()
+            .cmp(&left.density_rank())
+            .then_with(|| left.designation.cmp(&right.designation))
+    });
+    Ok(BeltSearchStop {
+        system: system.to_owned(),
+        scanned: scanned_now,
+        belts,
     })
 }
 
@@ -539,7 +555,7 @@ async fn resolve_owned_replicant(
     }
 }
 
-async fn travel_to_system(
+pub(crate) async fn travel_to_system(
     client: &Client,
     replicant_code: &str,
     destination: &str,
@@ -663,7 +679,8 @@ async fn travel_to_system(
     }
 }
 
-async fn system_is_explored(
+/// Returns authoritative explored state for one Replicant and system.
+pub async fn system_is_explored(
     client: &Client,
     replicant_code: &str,
     system: &str,

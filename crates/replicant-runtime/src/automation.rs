@@ -26,9 +26,10 @@ use replicant_transport::{
     execute_delivery, plan_delivery, validate_resource_pickups,
 };
 use replicant_workflow::{
-    BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError, RepositoryError,
-    ResourceKey, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
-    WorkflowRegistry, WorkflowStatus,
+    AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError,
+    RepositoryError, RequirementScope, ResourceKey, ResourceRequirement, WorkItem, WorkItemSpec,
+    WorkItemTransition, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
+    WorkflowKind, WorkflowMigration, WorkflowRegistry, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,16 +39,16 @@ use crate::bootstrap::{
 };
 
 use crate::{
-    belt_search::{BeltSearchRequest, execute_belt_search},
+    belt_search::{execute_belt_search_system, system_is_explored, travel_to_system},
     event::{
-        EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest,
+        EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest, EventItemStage,
         EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
-        event_campaign_target_systems, event_mission_target_system, execute_event_campaign,
-        execute_event_mission, plan_event_campaign, plan_event_mission, prestage_event_mission,
-        reconcile_event_stock, restore_event_campaign,
+        event_campaign_target_systems, event_campaign_work_item_specs, event_mission_target_system,
+        execute_event_item, execute_event_mission, haul_allocated_resources, plan_event_campaign,
+        plan_event_mission, prestage_event_mission, reconcile_event_stock, restore_event_campaign,
     },
     failure::{FailureClass, failure_class, failure_class_from_message, failure_disposition},
-    mining::{MiningExpansionRequest, execute_expansion},
+    mining::{MiningExpansionRequest, MiningMission, execute_expansion},
     observatory::auto_prospect,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
@@ -58,6 +59,10 @@ use crate::{
         restore_survey_checkpoint,
     },
     trade::{TradeBundle, shop_trades},
+    workflows::{
+        ManagedMiningItemExecutor, MiningWorkflowCheckpoint, MiningWorkflowConfig,
+        execute_mining_pool_config,
+    },
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -86,6 +91,11 @@ pub fn belt_search_campaign_workflow_kind() -> WorkflowKind {
 /// Intent-native workflow that salvages one site to depletion.
 pub fn salvage_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("salvage.site").expect("static workflow kind is valid")
+}
+
+/// Regional recovery campaign for remotely discovered salvage sites.
+pub fn salvage_recovery_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("salvage.recovery").expect("static workflow kind is valid")
 }
 
 /// Intent-native workflow that deploys one mining installation.
@@ -161,6 +171,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(ScanTourWorkflowFactory::new()))?;
     registry.register(Arc::new(BeltSearchCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(SalvageWorkflowFactory::new()))?;
+    registry.register(Arc::new(SalvageRecoveryWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
@@ -244,16 +255,16 @@ pub struct ScanTourCheckpoint {
 pub struct BeltSearchCampaignIntent {
     /// Exact systems to visit and inspect.
     pub systems: Vec<String>,
-    /// Optional regional Replicant to pin.
-    #[serde(default)]
-    pub replicant: Option<String>,
+    /// Canonical operating region whose worker pool may execute the items.
+    pub region: String,
 }
 
 /// Restart-safe fast belt-search checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BeltSearchCampaignCheckpoint {
-    /// Resolved Replicant retained across retries.
-    pub replicant: Option<String>,
+    /// Original version-one checkpoint retained as migration evidence.
+    #[serde(default)]
+    pub legacy_checkpoint: Option<Value>,
 }
 
 /// Restart-safe controller workflow checkpoint.
@@ -285,6 +296,36 @@ pub struct SalvageIntent {
     pub recall: bool,
 }
 
+/// Identity-free regional salvage recovery intent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SalvageRecoveryIntent {
+    /// Director region containing eligible discovered sites.
+    pub region: String,
+    /// Home location for recovered resources and idle capacity.
+    pub home: String,
+}
+
+/// One authoritative salvage discovery retained after depletion/ledger filtering.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SalvageSiteRecord {
+    /// Exact site designation used by `GatherSalvage`.
+    pub designation: String,
+    /// Parent body/location used for travel.
+    pub location: String,
+    /// Declared resource quantities, when supplied by the event.
+    #[serde(default)]
+    pub resources: BTreeMap<String, i64>,
+    /// Remote event cursor used for newest-wins reconciliation.
+    pub event_id: String,
+}
+
+/// Durable salvage campaign checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SalvageRecoveryCheckpoint {
+    /// Last authoritative worklist, keyed by site designation.
+    pub sites: BTreeMap<String, SalvageSiteRecord>,
+}
+
 /// Goal-level input for deploying one mining installation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MiningDeployIntent {
@@ -298,20 +339,29 @@ pub struct MiningDeployIntent {
     pub hub: Option<String>,
 }
 
-/// Goal-level input for a batch mining expansion.
+/// Goal-level input for a regional broker-allocated mining expansion.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MiningCampaignIntent {
     /// Target systems selected by the regional campaign planner.
     pub systems: Vec<String>,
-    /// Optional regional Replicant to pin.
-    #[serde(default)]
-    pub replicant: Option<String>,
-    /// Optional regional manufacturing hub.
-    #[serde(default)]
-    pub hub: Option<String>,
-    /// Maximum concurrently dispatched site workers.
+    /// Director region whose worker pool may execute the campaign.
+    pub region: String,
+    /// Regional manufacturing hub.
+    pub hub: String,
+    /// Scheduler ceiling for simultaneously runnable items.
     #[serde(default = "default_mining_concurrency")]
     pub max_concurrency: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyMiningCampaignIntent {
+    systems: Vec<String>,
+    #[serde(default)]
+    replicant: Option<String>,
+    #[serde(default)]
+    hub: Option<String>,
+    #[serde(default = "default_mining_concurrency")]
+    max_concurrency: usize,
 }
 
 /// Restart-safe mining deployment checkpoint.
@@ -324,6 +374,19 @@ pub struct MiningDeployCheckpoint {
     /// Last serialized legacy mining mission state.
     pub plan_json: Option<String>,
     /// Whether execution entered the reusable mining executor.
+    pub started: bool,
+}
+
+/// Schema-version-two mining campaign checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MiningCampaignCheckpoint {
+    /// Last merged mission state.
+    #[serde(default)]
+    pub mission: Option<MiningMission>,
+    /// Legacy actor used only for region evidence resolution.
+    #[serde(default)]
+    pub migration_worker: Option<String>,
+    /// Whether pooled execution began.
     pub started: bool,
 }
 
@@ -650,18 +713,22 @@ pub struct EventTourCheckpoint {
     /// Final serialized plan snapshot.
     pub plan_json: Option<String>,
 }
-
 /// Regional event-completion campaign intent.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EventCampaignIntent {
     /// Catalogue region whose active events should be planned as one campaign.
     pub region: String,
-    /// Optional regional replicant to pin.
+    /// Regional manufacturing and staging home.
+    pub home: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyEventCampaignIntent {
+    region: String,
     #[serde(default)]
-    pub replicant: Option<String>,
-    /// Optional regional manufacturing/staging home.
+    replicant: Option<String>,
     #[serde(default)]
-    pub home: Option<String>,
+    home: Option<String>,
 }
 
 /// Durable regional event campaign checkpoint.
@@ -794,11 +861,68 @@ workflow_factory!(
     ScanTourWorkflow,
     scan_tour_workflow_kind
 );
-workflow_factory!(
-    BeltSearchCampaignWorkflowFactory,
-    BeltSearchCampaignWorkflow,
-    belt_search_campaign_workflow_kind
-);
+
+/// Schema-versioned factory for pooled belt-search campaigns.
+pub struct BeltSearchCampaignWorkflowFactory(WorkflowKind);
+
+impl BeltSearchCampaignWorkflowFactory {
+    /// Creates the stable pooled campaign factory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(belt_search_campaign_workflow_kind())
+    }
+}
+
+impl Default for BeltSearchCampaignWorkflowFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkflowFactory for BeltSearchCampaignWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.0
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        2
+    }
+
+    fn supports_schema_version(&self, version: u32) -> bool {
+        matches!(version, 1 | 2)
+    }
+
+    fn migrate(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<Option<WorkflowMigration>, String> {
+        if instance.schema_version == 2 {
+            return Ok(None);
+        }
+        let config = instance
+            .config::<Value>()
+            .map_err(|error| error.to_string())?;
+        let systems = config
+            .get("systems")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let region = config
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new()));
+        let checkpoint = instance
+            .checkpoint::<Value>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(WorkflowMigration::new(
+            serde_json::json!({ "systems": systems, "region": region }),
+            serde_json::json!({ "legacy_checkpoint": checkpoint }),
+        )))
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(BeltSearchCampaignWorkflow))
+    }
+}
 workflow_factory!(
     SalvageWorkflowFactory,
     SalvageWorkflow,
@@ -809,10 +933,86 @@ workflow_factory!(
     MiningDeployWorkflow,
     mining_deploy_workflow_kind
 );
+/// Factory for schema-version-two pooled regional mining campaigns.
+pub struct MiningCampaignWorkflowFactory {
+    kind: WorkflowKind,
+    item_executor: Arc<dyn crate::workflows::MiningItemExecutor>,
+}
+
+impl MiningCampaignWorkflowFactory {
+    fn new() -> Self {
+        Self {
+            kind: mining_campaign_workflow_kind(),
+            item_executor: Arc::new(ManagedMiningItemExecutor),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_item_executor(
+        item_executor: Arc<dyn crate::workflows::MiningItemExecutor>,
+    ) -> Self {
+        Self {
+            kind: mining_campaign_workflow_kind(),
+            item_executor,
+        }
+    }
+}
+
+impl WorkflowFactory for MiningCampaignWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        2
+    }
+
+    fn supports_schema_version(&self, version: u32) -> bool {
+        matches!(version, 1 | 2)
+    }
+
+    fn migrate(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<Option<WorkflowMigration>, String> {
+        if instance.schema_version == 2 {
+            return Ok(None);
+        }
+        let legacy: LegacyMiningCampaignIntent = instance.config().map_err(string_error)?;
+        let checkpoint: MiningDeployCheckpoint = instance.checkpoint().map_err(string_error)?;
+        let mission = checkpoint
+            .plan_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(string_error)?;
+        let config = MiningCampaignIntent {
+            systems: legacy.systems,
+            region: String::new(),
+            hub: checkpoint.hub.or(legacy.hub).unwrap_or_default(),
+            max_concurrency: legacy.max_concurrency,
+        };
+        let checkpoint = MiningCampaignCheckpoint {
+            mission,
+            migration_worker: checkpoint.replicant.or(legacy.replicant),
+            started: checkpoint.started,
+        };
+        Ok(Some(WorkflowMigration::new(
+            serde_json::to_value(config).map_err(string_error)?,
+            serde_json::to_value(checkpoint).map_err(string_error)?,
+        )))
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(MiningCampaignWorkflow {
+            item_executor: self.item_executor.clone(),
+        }))
+    }
+}
 workflow_factory!(
-    MiningCampaignWorkflowFactory,
-    MiningCampaignWorkflow,
-    mining_campaign_workflow_kind
+    SalvageRecoveryWorkflowFactory,
+    SalvageRecoveryWorkflow,
+    salvage_recovery_workflow_kind
 );
 workflow_factory!(
     LogisticsWorkflowFactory,
@@ -849,11 +1049,111 @@ workflow_factory!(
     EventTourWorkflow,
     event_tour_workflow_kind
 );
-workflow_factory!(
-    EventCampaignWorkflowFactory,
-    EventCampaignWorkflow,
-    event_campaign_workflow_kind
-);
+pub(crate) type EventItemFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<String, crate::event::AnyError>> + Send + 'a>>;
+
+pub(crate) trait EventItemExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        client: &'a Client,
+        mission_json: &'a str,
+        stage: EventItemStage,
+        allocations: &'a AllocationSet,
+        wait_timeout: Duration,
+    ) -> EventItemFuture<'a>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("allocated event resource for requirement {requirement} is missing")]
+pub(crate) struct EventMissingAllocationError {
+    pub(crate) requirement: String,
+    pub(crate) allocation_id: replicant_workflow::AllocationId,
+}
+
+pub(crate) struct ManagedEventItemExecutor;
+
+impl EventItemExecutor for ManagedEventItemExecutor {
+    fn execute<'a>(
+        &'a self,
+        client: &'a Client,
+        mission_json: &'a str,
+        stage: EventItemStage,
+        allocations: &'a AllocationSet,
+        wait_timeout: Duration,
+    ) -> EventItemFuture<'a> {
+        Box::pin(execute_event_item(
+            client,
+            mission_json,
+            stage,
+            allocations,
+            wait_timeout,
+        ))
+    }
+}
+
+/// Factory for pooled regional event campaigns.
+pub struct EventCampaignWorkflowFactory {
+    kind: WorkflowKind,
+    item_executor: Arc<dyn EventItemExecutor>,
+}
+
+impl EventCampaignWorkflowFactory {
+    fn new() -> Self {
+        Self {
+            kind: event_campaign_workflow_kind(),
+            item_executor: Arc::new(ManagedEventItemExecutor),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_item_executor(item_executor: Arc<dyn EventItemExecutor>) -> Self {
+        Self {
+            kind: event_campaign_workflow_kind(),
+            item_executor,
+        }
+    }
+}
+
+impl WorkflowFactory for EventCampaignWorkflowFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        2
+    }
+
+    fn supports_schema_version(&self, version: u32) -> bool {
+        matches!(version, 1 | 2)
+    }
+
+    fn migrate(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<Option<WorkflowMigration>, String> {
+        if instance.schema_version == 2 {
+            return Ok(None);
+        }
+        let legacy: LegacyEventCampaignIntent = instance.config().map_err(string_error)?;
+        let mut checkpoint: EventCampaignCheckpoint =
+            instance.checkpoint().map_err(string_error)?;
+        checkpoint.replicant = checkpoint.replicant.or(legacy.replicant);
+        let config = EventCampaignIntent {
+            region: legacy.region,
+            home: checkpoint.home.clone().or(legacy.home).unwrap_or_default(),
+        };
+        Ok(Some(WorkflowMigration::new(
+            serde_json::to_value(config).map_err(string_error)?,
+            serde_json::to_value(checkpoint).map_err(string_error)?,
+        )))
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(EventCampaignWorkflow {
+            item_executor: self.item_executor.clone(),
+        }))
+    }
+}
 workflow_factory!(
     ObservatoryWorkflowFactory,
     ObservatoryWorkflow,
@@ -1034,6 +1334,7 @@ impl WorkflowExecutor for ScanTourWorkflow {
             let options = SurveyOptions {
                 mode: SurveyMode::Run,
                 replicant,
+
                 vessel,
                 center: intent.center,
                 radius_ly: intent.radius_ly,
@@ -1070,6 +1371,661 @@ impl WorkflowExecutor for ScanTourWorkflow {
             match result {
                 Ok(summary) => context.mark_succeeded(Some(summary)).map_err(string_error),
                 Err(error) => Err(error.to_string()),
+            }
+        })
+    }
+}
+/// Reconciles newest-wins salvage discovery history against depletion and completion authority.
+pub fn salvage_recovery_ledger(
+    discovered: &[replicant_client::domain::Event],
+    depleted: &[replicant_client::domain::Event],
+    completed: &BTreeSet<String>,
+    location_regions: &BTreeMap<String, String>,
+    region: &str,
+) -> BTreeMap<String, SalvageSiteRecord> {
+    let depleted = depleted
+        .iter()
+        .filter_map(|event| {
+            event
+                .payload
+                .get("designation")
+                .or_else(|| event.payload.get("site"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut sites = BTreeMap::new();
+    for event in discovered {
+        let Some(designation) = event
+            .payload
+            .get("designation")
+            .or_else(|| event.payload.get("site"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(location) = event.payload.get("location").and_then(Value::as_str) else {
+            continue;
+        };
+        if location_regions.get(location).map(String::as_str) != Some(region) {
+            continue;
+        }
+        let resources = event
+            .payload
+            .get("resources")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|resources| resources.iter())
+            .filter_map(|(resource, quantity)| {
+                quantity
+                    .as_i64()
+                    .map(|quantity| (resource.clone(), quantity))
+            })
+            .collect();
+        sites.insert(
+            designation.to_owned(),
+            SalvageSiteRecord {
+                designation: designation.to_owned(),
+                location: location.to_owned(),
+                resources,
+                event_id: event.id.as_str().to_owned(),
+            },
+        );
+    }
+    sites.retain(|designation, _| {
+        !depleted.contains(designation) && !completed.contains(designation)
+    });
+    sites
+}
+
+fn salvage_recovery_item_specs(
+    workflow_id: WorkflowId,
+    sites: &BTreeMap<String, SalvageSiteRecord>,
+    region: &str,
+    home: &str,
+    capacities: &[(String, u64)],
+) -> Result<Vec<WorkItemSpec>, RepositoryError> {
+    let kind = WorkflowKind::new("salvage.site")?;
+    let mut specs = Vec::new();
+    for (site_index, site) in sites.values().enumerate() {
+        let quantity = site
+            .resources
+            .values()
+            .filter_map(|quantity| u64::try_from(*quantity).ok())
+            .sum::<u64>()
+            .max(1);
+        let mut shards = salvage_capacity_shards(quantity, capacities);
+        if shards.is_empty() {
+            shards.push((String::new(), 1));
+        }
+        for (trip_index, (carrier_hint, trip_quantity)) in shards.into_iter().enumerate() {
+            specs.push(WorkItemSpec {
+                workflow_id,
+                dedupe_key: format!("salvage.site:{}:trip:{trip_index}", site.designation),
+                kind: kind.clone(),
+                sort_key: format!("{site_index:08}:{trip_index:08}:{}", site.designation),
+                payload_json: serde_json::json!({
+                    "designation": site.designation,
+                    "location": site.location,
+                    "resources": site.resources,
+                    "home": home,
+                    "trip_quantity": trip_quantity,
+                    "carrier_hint": carrier_hint,
+                }),
+                preconditions_json: serde_json::json!([{
+                    "kind": "salvage.not_depleted",
+                    "parameters": {"designation": site.designation}
+                }]),
+                requirements_json: serde_json::to_value([
+                    ResourceRequirement {
+                        key: "worker".into(),
+                        kind: "replicant".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "controller".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["ami_mining_controller".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "drones".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["mining_drone".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "freighters".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["cargo_freighter".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "stow".into(),
+                        kind: "stow".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: trip_quantity,
+                    },
+                ])?,
+                deadline_at_ms: None,
+            });
+        }
+    }
+    Ok(specs)
+}
+
+/// Deterministically shards a salvage quantity across actual free freighter capacities.
+pub fn salvage_capacity_shards(
+    mut quantity: u64,
+    capacities: &[(String, u64)],
+) -> Vec<(String, u64)> {
+    let mut capacities = capacities
+        .iter()
+        .filter(|(_, capacity)| *capacity > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    capacities.sort();
+    let mut shards = Vec::new();
+    while quantity > 0 && !capacities.is_empty() {
+        let before = quantity;
+        for (carrier, capacity) in &capacities {
+            if quantity == 0 {
+                break;
+            }
+            let assigned = quantity.min(*capacity);
+            shards.push((carrier.clone(), assigned));
+            quantity -= assigned;
+        }
+        if quantity == before {
+            break;
+        }
+    }
+    shards
+}
+
+fn salvage_freighter_capacities(
+    candidates: &[replicant_workflow::AllocationCandidate],
+) -> Vec<(String, u64)> {
+    let stow = candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.resource {
+            ResourceKey::Namespaced { namespace, key } if namespace == "stow" => {
+                Some((key.clone(), candidate.available_quantity))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut capacities = candidates
+        .iter()
+        .filter_map(|candidate| match &candidate.resource {
+            ResourceKey::Device(code)
+                if candidate
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "cargo_freighter") =>
+            {
+                Some((code.clone(), stow.get(code).copied().unwrap_or(0)))
+            }
+            _ => None,
+        })
+        .filter(|(_, capacity)| *capacity > 0)
+        .collect::<Vec<_>>();
+    capacities.sort();
+    capacities
+}
+
+async fn wait_salvage_recovery_completion(
+    client: &Client,
+    controller: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut observed_active = false;
+    let mut idle_observations = 0_u8;
+    loop {
+        let device = client
+            .devices()
+            .get(controller)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        let active = device
+            .active_directive
+            .as_ref()
+            .and_then(|directive| directive.status.as_deref())
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"));
+        if active {
+            observed_active = true;
+            idle_observations = 0;
+        } else {
+            idle_observations = idle_observations.saturating_add(1);
+            if observed_active || idle_observations >= 2 {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "salvage controller {controller} did not complete before timeout"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+struct SalvageRecoveryWorkflow;
+impl WorkflowExecutor for SalvageRecoveryWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: SalvageRecoveryIntent = context.config().map_err(string_error)?;
+            let client = managed_client(context)?;
+            let repository = context.repository_handle();
+            let discovered = client
+                .events()
+                .full_history_named("salvage.discovered")
+                .await
+                .map_err(string_error)?;
+            let depleted = client
+                .events()
+                .full_history_named("salvage.depleted")
+                .await
+                .map_err(string_error)?;
+            let completed = repository
+                .list_documents("salvage.site_state")
+                .map_err(string_error)?
+                .into_iter()
+                .map(|(designation, _, _)| designation)
+                .collect::<BTreeSet<_>>();
+            let catalogue = client
+                .galaxy()
+                .catalogue()
+                .into_iter()
+                .filter_map(|star| star.region.map(|region| (star.key.id.to_string(), region)))
+                .collect::<BTreeMap<_, _>>();
+            let mut location_regions = BTreeMap::new();
+            for location in discovered
+                .iter()
+                .filter_map(|event| event.payload.get("location").and_then(Value::as_str))
+            {
+                if location_regions.contains_key(location) {
+                    continue;
+                }
+                let system = resolve_location_system(&client, location).await?;
+                if let Some(region) = catalogue.get(&system) {
+                    location_regions.insert(location.to_owned(), region.clone());
+                }
+            }
+            let sites = salvage_recovery_ledger(
+                &discovered,
+                &depleted,
+                &completed,
+                &location_regions,
+                &intent.region,
+            );
+            repository
+                .put_document(
+                    "automation.scheduler.salvage",
+                    &context.id().to_string(),
+                    &serde_json::json!({
+                        "discovery_count": discovered.len(),
+                        "depleted_count": depleted.len(),
+                        "ledger_count": completed.len(),
+                        "worklist_count": sites.len(),
+                    }),
+                )
+                .map_err(string_error)?;
+            let mut checkpoint = SalvageRecoveryCheckpoint {
+                sites: sites.clone(),
+            };
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            let broker = crate::assignment::ResourceBroker::with_managed_client(
+                repository.clone(),
+                client.clone(),
+            );
+            let observed_candidates = crate::workflows::regional_relay_candidates(
+                repository.as_ref(),
+                &client,
+                broker.discover_candidates().map_err(string_error)?,
+                &intent.region,
+            )?;
+            let capacities = salvage_freighter_capacities(&observed_candidates);
+            repository
+                .reconcile_work_items(
+                    context.id(),
+                    &salvage_recovery_item_specs(
+                        context.id(),
+                        &sites,
+                        &intent.region,
+                        &intent.home,
+                        &capacities,
+                    )
+                    .map_err(string_error)?,
+                    unix_millis(),
+                )
+                .map_err(string_error)?;
+            context
+                .advance_to("recovering", &checkpoint)
+                .map_err(string_error)?;
+            let broker = crate::assignment::ResourceBroker::with_managed_client(
+                repository.clone(),
+                client.clone(),
+            );
+            'items: loop {
+                let candidates = crate::workflows::regional_relay_candidates(
+                    repository.as_ref(),
+                    &client,
+                    broker.discover_candidates().map_err(string_error)?,
+                    &intent.region,
+                )?;
+                let Some(assigned) = repository
+                    .claim_next_work_item(context.id(), unix_millis())
+                    .map_err(string_error)?
+                else {
+                    break;
+                };
+                let mut allocations =
+                    match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
+                        Ok(allocations) => allocations,
+                        Err(_) => {
+                            repository
+                                .transition_work_item(
+                                    assigned.id,
+                                    assigned.state.revision,
+                                    WorkItemTransition::Reclaimed {
+                                        checkpoint_json: assigned.state.checkpoint_json.clone(),
+                                    },
+                                    unix_millis(),
+                                )
+                                .map_err(string_error)?;
+                            break;
+                        }
+                    };
+                let worker = allocation_worker(&allocations)
+                    .ok_or_else(|| "salvage allocation omitted worker".to_owned())?;
+                let assignment_id = format!("salvage:{}:{worker}", assigned.id);
+                let location = assigned.spec.payload_json["location"]
+                    .as_str()
+                    .ok_or_else(|| "salvage item omitted parent location".to_owned())?;
+                let designation = assigned.spec.payload_json["designation"]
+                    .as_str()
+                    .ok_or_else(|| "salvage item omitted designation".to_owned())?;
+                let completed_live = repository
+                    .read_document("salvage.site_state", designation)
+                    .map_err(string_error)?
+                    .is_some();
+                let depleted_live = client
+                    .events()
+                    .full_history_named("salvage.depleted")
+                    .await
+                    .map_err(string_error)?
+                    .iter()
+                    .any(|event| {
+                        event
+                            .payload
+                            .get("designation")
+                            .or_else(|| event.payload.get("site"))
+                            .and_then(Value::as_str)
+                            == Some(designation)
+                    });
+                if completed_live || depleted_live {
+                    repository
+                        .transition_work_item(
+                            assigned.id,
+                            assigned.state.revision,
+                            WorkItemTransition::Skipped {
+                                reason: "salvage site already depleted or completed".into(),
+                                result_json: Some(serde_json::json!({
+                                    "designation": designation,
+                                    "location": location,
+                                })),
+                            },
+                            unix_millis(),
+                        )
+                        .map_err(string_error)?;
+                    continue;
+                }
+                repository
+                    .assign_work_item(
+                        assigned.id,
+                        assigned.state.revision,
+                        &assignment_id,
+                        &ResourceKey::Replicant(worker.clone()),
+                        unix_millis(),
+                    )
+                    .map_err(string_error)?;
+                let started = repository
+                    .start_work_item(
+                        assigned.id,
+                        assigned.state.revision,
+                        &worker,
+                        &assignment_id,
+                        unix_millis(),
+                    )
+                    .map_err(string_error)?;
+                let location = started.spec.payload_json["location"]
+                    .as_str()
+                    .ok_or_else(|| "salvage item omitted parent location".to_owned())?;
+                let designation = started.spec.payload_json["designation"]
+                    .as_str()
+                    .ok_or_else(|| "salvage item omitted designation".to_owned())?;
+                travel_to_system(
+                    &client,
+                    &worker,
+                    location,
+                    Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                )
+                .await
+                .map_err(string_error)?;
+                let controller = allocations
+                    .by_requirement
+                    .get("controller")
+                    .and_then(|allocations| allocations.first())
+                    .and_then(|allocation| match &allocation.resource {
+                        ResourceKey::Device(code) => Some(code.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| "salvage allocation omitted mining controller".to_owned())?;
+                let mining = client
+                    .devices()
+                    .get(&controller)
+                    .await
+                    .map_err(string_error)?
+                    .as_mining_controller()
+                    .map_err(string_error)?;
+                let operation = mining
+                    .set_directive(MiningDirective::GatherSalvage {
+                        location: designation.to_owned(),
+                        recall: true,
+                    })
+                    .await
+                    .map_err(string_error)?;
+                await_success(&operation).await?;
+                let operation = mining.launch().await.map_err(string_error)?;
+                await_success(&operation).await?;
+                wait_salvage_recovery_completion(
+                    &client,
+                    &controller,
+                    Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                )
+                .await?;
+                let trip_quantity = started.spec.payload_json["trip_quantity"]
+                    .as_u64()
+                    .ok_or_else(|| "salvage item omitted trip quantity".to_owned())?;
+                let (hauled, site_complete) = loop {
+                    let freighter_allocations = allocations
+                        .by_requirement
+                        .get("freighters")
+                        .ok_or_else(|| "salvage allocation omitted freighter".to_owned())?;
+                    let freighters = freighter_allocations
+                        .iter()
+                        .filter_map(|allocation| match &allocation.resource {
+                            ResourceKey::Device(code) => Some(code.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    match haul_allocated_resources(
+                        &client,
+                        &freighters,
+                        location,
+                        &intent.home,
+                        trip_quantity,
+                        Duration::from_secs(DEFAULT_WAIT_SECONDS),
+                    )
+                    .await
+                    {
+                        Ok(result) => break result,
+                        Err(error)
+                            if failure_class(error.as_ref())
+                                == Some(FailureClass::DeviceTargetMissing) =>
+                        {
+                            let allocation_id = freighter_allocations
+                                .first()
+                                .map(|allocation| allocation.id)
+                                .ok_or_else(|| "salvage allocation omitted freighter".to_owned())?;
+                            match broker
+                                .replace_dead_allocation_from(
+                                    started.id,
+                                    allocation_id,
+                                    &candidates,
+                                )
+                                .map_err(string_error)?
+                            {
+                                replicant_workflow::ReplacementOutcome::Replaced(replacement) => {
+                                    let allocation = allocations
+                                        .by_requirement
+                                        .get_mut("freighters")
+                                        .and_then(|allocations| {
+                                            allocations
+                                                .iter_mut()
+                                                .find(|allocation| allocation.id == allocation_id)
+                                        })
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "salvage allocation {allocation_id} disappeared"
+                                            )
+                                        })?;
+                                    *allocation = replacement;
+                                }
+                                replicant_workflow::ReplacementOutcome::Waiting => {
+                                    repository
+                                        .transition_work_item(
+                                            started.id,
+                                            started.state.revision,
+                                            WorkItemTransition::Waiting {
+                                                checkpoint_json: Some(serde_json::json!({
+                                                    "directive_launched": true,
+                                                    "designation": designation,
+                                                    "location": location,
+                                                })),
+                                                reason: error.to_string(),
+                                                retry_at_ms: Some(
+                                                    unix_millis().saturating_add(300_000),
+                                                ),
+                                            },
+                                            unix_millis(),
+                                        )
+                                        .map_err(string_error)?;
+                                    continue 'items;
+                                }
+                                replicant_workflow::ReplacementOutcome::Unavailable => {
+                                    continue 'items;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            repository
+                                .transition_work_item(
+                                    started.id,
+                                    started.state.revision,
+                                    WorkItemTransition::Waiting {
+                                        checkpoint_json: Some(serde_json::json!({
+                                            "directive_launched": true,
+                                            "designation": designation,
+                                            "location": location,
+                                        })),
+                                        reason: error.to_string(),
+                                        retry_at_ms: Some(unix_millis().saturating_add(300_000)),
+                                    },
+                                    unix_millis(),
+                                )
+                                .map_err(string_error)?;
+                            continue 'items;
+                        }
+                    }
+                };
+                if site_complete {
+                    repository
+                        .put_document(
+                            "salvage.site_state",
+                            designation,
+                            &serde_json::json!({
+                                "completed": true,
+                                "location": location,
+                                "completed_at_ms": unix_millis(),
+                            }),
+                        )
+                        .map_err(string_error)?;
+                }
+                repository
+                    .transition_work_item(
+                        started.id,
+                        started.state.revision,
+                        WorkItemTransition::Succeeded {
+                            checkpoint_json: Some(serde_json::json!({
+                                "directive_launched": true,
+                                "location": location,
+                                "designation": designation,
+                            })),
+                            result_json: Some(serde_json::json!({
+                                "designation": designation,
+                                "location": location,
+                                "trip_quantity": trip_quantity,
+                                "hauled": hauled,
+                                "site_complete": site_complete,
+                            })),
+                        },
+                        unix_millis(),
+                    )
+                    .map_err(string_error)?;
+                if site_complete {
+                    checkpoint.sites.remove(designation);
+                }
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+            match repository
+                .aggregate_campaign_result(context.id())
+                .map_err(string_error)?
+            {
+                Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
+                    context.mark_succeeded(Some(result)).map_err(string_error)
+                }
+                Some(result) => context
+                    .mark_failed_with_result(
+                        "salvage recovery completed without a successful site",
+                        result,
+                        replicant_workflow::WorkflowFailureDisposition::Permanent,
+                    )
+                    .map_err(string_error),
+                None if sites.is_empty() => context
+                    .mark_succeeded(Some(serde_json::json!({"sites": 0})))
+                    .map_err(string_error),
+                None => context.mark_waiting().map_err(string_error),
             }
         })
     }
@@ -1220,62 +2176,394 @@ struct BeltSearchCampaignWorkflow;
 impl WorkflowExecutor for BeltSearchCampaignWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         Box::pin(async move {
-            let intent: BeltSearchCampaignIntent = context.config().map_err(string_error)?;
-            if intent.systems.is_empty() {
-                return context
-                    .mark_succeeded(Some(serde_json::json!({"systems": []})))
-                    .map_err(string_error);
-            }
-            let client = managed_client(context)?;
-            let mut checkpoint: BeltSearchCampaignCheckpoint =
+            let mut intent: BeltSearchCampaignIntent = context.config().map_err(string_error)?;
+            let checkpoint: BeltSearchCampaignCheckpoint =
                 context.checkpoint().map_err(string_error)?;
-            let replicant = match checkpoint.replicant.clone() {
-                Some(replicant) => replicant,
-                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            let client = managed_client(context)?;
+            let repository = context.repository_handle();
+            let Some(region) =
+                resolve_belt_campaign_region(repository.as_ref(), &intent, &checkpoint)
+                    .map_err(string_error)?
+            else {
+                return context.mark_waiting().map_err(string_error);
             };
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
-            for system in &intent.systems {
-                claim_target(context, "belt-search-target", system)?;
-            }
-            checkpoint.replicant = Some(replicant.clone());
+            intent.region = region;
+            let specs = belt_search_item_specs(context.id(), &intent).map_err(string_error)?;
+            repository
+                .reconcile_work_items(context.id(), &specs, unix_millis())
+                .map_err(string_error)?;
             context
-                .advance_to("searching_for_belts", &checkpoint)
+                .advance_to(
+                    "searching_for_belts",
+                    &BeltSearchCampaignCheckpoint::default(),
+                )
                 .map_err(string_error)?;
 
-            let system_limit = intent.systems.len();
-            let request = BeltSearchRequest {
-                replicant,
-                systems: intent.systems,
-                route_start: None,
-                radius_ly: None,
-                system_limit,
-                include_explored: true,
-                plan_only: false,
-                wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
-            };
-            let execution = execute_belt_search(&client, &request);
-            tokio::pin!(execution);
-            let mut control_interval = tokio::time::interval(Duration::from_secs(2));
-            let result = loop {
-                tokio::select! {
-                    result = &mut execution => break result.map_err(string_error)?,
-                    _ = control_interval.tick() => match context.control_request().map_err(string_error)? {
-                        replicant_workflow::ControlRequest::Continue => {}
-                        replicant_workflow::ControlRequest::Pause
-                        | replicant_workflow::ControlRequest::Cancel => return Ok(()),
-                    },
+            loop {
+                let broker = crate::assignment::ResourceBroker::with_managed_client(
+                    repository.clone(),
+                    client.clone(),
+                );
+                let mut candidates = broker.discover_candidates().map_err(string_error)?;
+                let assignments = repository
+                    .list_documents("director.replicant")
+                    .map_err(string_error)?
+                    .into_iter()
+                    .filter_map(|(worker, value, _)| {
+                        (value.get("region").and_then(Value::as_str)
+                            == Some(intent.region.as_str()))
+                        .then_some(worker)
+                    })
+                    .collect::<BTreeSet<_>>();
+                candidates.retain(|candidate| {
+                    matches!(
+                        &candidate.resource,
+                        ResourceKey::Replicant(worker) if assignments.contains(worker)
+                    )
+                });
+                for candidate in &mut candidates {
+                    if let Some(location) = &mut candidate.location {
+                        location.region = Some(intent.region.clone());
+                    } else {
+                        candidate.location = Some(replicant_workflow::AllocationLocation {
+                            region: Some(intent.region.clone()),
+                            ..replicant_workflow::AllocationLocation::default()
+                        });
+                    }
                 }
-            };
-            context
-                .mark_succeeded(Some(serde_json::to_value(result).map_err(string_error)?))
-                .map_err(string_error)
+                let mut running = Vec::new();
+                while running.len() < candidates.len() {
+                    let Some(assigned) = repository
+                        .claim_next_work_item(context.id(), unix_millis())
+                        .map_err(string_error)?
+                    else {
+                        break;
+                    };
+                    let allocations =
+                        match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
+                            Ok(allocations) => allocations,
+                            Err(error) => {
+                                repository
+                                    .transition_work_item(
+                                        assigned.id,
+                                        assigned.state.revision,
+                                        WorkItemTransition::Waiting {
+                                            checkpoint_json: None,
+                                            reason: error.to_string(),
+                                            retry_at_ms: Some(
+                                                unix_millis().saturating_add(300_000),
+                                            ),
+                                        },
+                                        unix_millis(),
+                                    )
+                                    .map_err(string_error)?;
+                                continue;
+                            }
+                        };
+                    let worker = allocation_worker(&allocations)
+                        .ok_or_else(|| "belt item allocation omitted its Replicant".to_owned())?;
+                    let started = repository
+                        .start_work_item(
+                            assigned.id,
+                            assigned.state.revision,
+                            &worker,
+                            &format!("belt:{}:{worker}", assigned.id),
+                            unix_millis(),
+                        )
+                        .map_err(string_error)?;
+                    let system = started
+                        .spec
+                        .payload_json
+                        .get("system")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "belt item payload omitted system".to_owned())?
+                        .to_owned();
+                    running.push(run_belt_item(
+                        repository.clone(),
+                        client.clone(),
+                        started,
+                        worker,
+                        system,
+                    ));
+                }
+                if running.is_empty() {
+                    break;
+                }
+                futures::future::join_all(running)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+
+            match repository
+                .aggregate_campaign_result(context.id())
+                .map_err(string_error)?
+            {
+                Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
+                    context.mark_succeeded(Some(result)).map_err(string_error)
+                }
+                Some(result) => context
+                    .mark_failed_with_result(
+                        "belt-search campaign completed without a successful item",
+                        result,
+                        replicant_workflow::WorkflowFailureDisposition::Permanent,
+                    )
+                    .map_err(string_error),
+                None => context.mark_waiting().map_err(string_error),
+            }
         })
     }
 }
 
-struct MiningCampaignWorkflow;
+/// Fixed-window execution metrics for a pooled belt-search campaign.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BeltSearchPoolMetrics {
+    /// Sum of clipped active item minutes divided by wall-clock minutes.
+    pub effective_parallelism: f64,
+    /// Maximum overlapping attempt intervals.
+    pub peak_overlap: usize,
+    /// Distinct workers observed in attempt history.
+    pub unique_workers: usize,
+    /// Attempts closed as safely reclaimed.
+    pub reclaim_count: usize,
+    /// Terminal and nonterminal item counts keyed by snake-case status.
+    pub item_outcomes: BTreeMap<String, usize>,
+    /// Terminal campaign outcome, when all work is complete.
+    pub campaign_outcome: Option<replicant_workflow::CampaignOutcome>,
+}
+
+/// Derives exact attempt-interval metrics for one wall-clock window.
+pub fn belt_search_pool_metrics(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+    window_start_ms: i64,
+    window_end_ms: i64,
+) -> Result<BeltSearchPoolMetrics, RepositoryError> {
+    let items = repository.list_work_items(workflow_id)?;
+    let mut active_ms = 0_i64;
+    let mut events = Vec::new();
+    let mut workers = BTreeSet::new();
+    let mut reclaim_count = 0;
+    let mut item_outcomes = BTreeMap::new();
+    for item in &items {
+        let status = match item.state.status {
+            replicant_workflow::WorkItemStatus::Pending => "pending",
+            replicant_workflow::WorkItemStatus::Assigned => "assigned",
+            replicant_workflow::WorkItemStatus::Running => "running",
+            replicant_workflow::WorkItemStatus::Waiting => "waiting",
+            replicant_workflow::WorkItemStatus::Succeeded => "succeeded",
+            replicant_workflow::WorkItemStatus::Skipped => "skipped",
+            replicant_workflow::WorkItemStatus::Failed => "failed",
+            replicant_workflow::WorkItemStatus::Abandoned => "abandoned",
+        };
+        *item_outcomes.entry(status.to_owned()).or_default() += 1;
+        for attempt in repository.list_work_item_attempts(item.id)? {
+            workers.insert(attempt.worker_identity);
+            if attempt.outcome == Some(replicant_workflow::WorkItemAttemptOutcome::Reclaimed) {
+                reclaim_count += 1;
+            }
+            let start = attempt.started_at_ms.max(window_start_ms);
+            let end = attempt
+                .ended_at_ms
+                .unwrap_or(window_end_ms)
+                .min(window_end_ms);
+            if end > start {
+                active_ms = active_ms.saturating_add(end - start);
+                events.push((start, 1_i32));
+                events.push((end, -1_i32));
+            }
+        }
+    }
+    events.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut overlap = 0_i32;
+    let mut peak_overlap = 0_i32;
+    for (_, delta) in events {
+        overlap += delta;
+        peak_overlap = peak_overlap.max(overlap);
+    }
+    let wall_ms = window_end_ms.saturating_sub(window_start_ms);
+    let effective_parallelism = if wall_ms > 0 {
+        active_ms as f64 / wall_ms as f64
+    } else {
+        0.0
+    };
+    Ok(BeltSearchPoolMetrics {
+        effective_parallelism,
+        peak_overlap: usize::try_from(peak_overlap).unwrap_or(0),
+        unique_workers: workers.len(),
+
+        reclaim_count,
+        item_outcomes,
+        campaign_outcome: repository
+            .aggregate_campaign_result(workflow_id)?
+            .map(|result| result.outcome),
+    })
+}
+fn resolve_belt_campaign_region(
+    repository: &replicant_workflow::WorkflowRepository,
+    intent: &BeltSearchCampaignIntent,
+    checkpoint: &BeltSearchCampaignCheckpoint,
+) -> Result<Option<String>, RepositoryError> {
+    if !intent.region.trim().is_empty() {
+        return Ok(Some(intent.region.clone()));
+    }
+    let legacy_worker = checkpoint
+        .legacy_checkpoint
+        .as_ref()
+        .and_then(|value| value.get("replicant"))
+        .and_then(Value::as_str);
+    let Some(legacy_worker) = legacy_worker else {
+        return Ok(None);
+    };
+    Ok(repository
+        .read_document("director.replicant", legacy_worker)?
+        .and_then(|(value, _)| {
+            value
+                .get("region")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }))
+}
+
+fn belt_search_item_specs(
+    workflow_id: WorkflowId,
+    intent: &BeltSearchCampaignIntent,
+) -> Result<Vec<WorkItemSpec>, RepositoryError> {
+    let kind = WorkflowKind::new("belt.system")?;
+    let mut seen = BTreeSet::new();
+    let mut specs = Vec::new();
+    for (index, system) in intent.systems.iter().enumerate() {
+        if !seen.insert(system.clone()) {
+            continue;
+        }
+        specs.push(WorkItemSpec {
+            workflow_id,
+            dedupe_key: format!("belt.system:{system}"),
+            kind: kind.clone(),
+            sort_key: format!("{index:08}:{system}"),
+            payload_json: serde_json::json!({ "system": system }),
+            preconditions_json: serde_json::json!([{
+                "kind": "system.unexplored",
+                "parameters": { "system": system }
+            }]),
+            requirements_json: serde_json::json!([{
+                "key": "worker",
+                "kind": "replicant",
+                "capabilities": [],
+                "scope": {
+                    "kind": "region",
+                    "value": intent.region
+                },
+                "count": 1,
+                "quantity": 1
+            }]),
+            deadline_at_ms: None,
+        });
+    }
+    Ok(specs)
+}
+
+fn allocation_worker(allocations: &AllocationSet) -> Option<String> {
+    allocations
+        .iter()
+        .find_map(|allocation| match &allocation.resource {
+            ResourceKey::Replicant(worker) => Some(worker.clone()),
+            _ => None,
+        })
+}
+
+async fn run_belt_item(
+    repository: Arc<replicant_workflow::WorkflowRepository>,
+    client: Client,
+    item: WorkItem,
+    worker: String,
+    system: String,
+) -> Result<(), String> {
+    if system_is_explored(&client, &worker, &system)
+        .await
+        .map_err(string_error)?
+    {
+        repository
+            .transition_work_item(
+                item.id,
+                item.state.revision,
+                WorkItemTransition::Skipped {
+                    reason: "system already explored".into(),
+                    result_json: None,
+                },
+                unix_millis(),
+            )
+            .map_err(string_error)?;
+        return Ok(());
+    }
+    match execute_belt_search_system(
+        &client,
+        &worker,
+        &system,
+        Duration::from_secs(DEFAULT_WAIT_SECONDS),
+        false,
+    )
+    .await
+    {
+        Ok(stop) => repository
+            .transition_work_item(
+                item.id,
+                item.state.revision,
+                WorkItemTransition::Succeeded {
+                    checkpoint_json: None,
+                    result_json: Some(serde_json::to_value(stop).map_err(string_error)?),
+                },
+                unix_millis(),
+            )
+            .map(|_| ())
+            .map_err(string_error),
+        Err(error) => repository
+            .transition_work_item(
+                item.id,
+                item.state.revision,
+                belt_item_failure_transition(error.as_ref()),
+                unix_millis(),
+            )
+            .map(|_| ())
+            .map_err(string_error),
+    }
+}
+
+fn belt_item_failure_transition(error: &(dyn std::error::Error + 'static)) -> WorkItemTransition {
+    let message = error.to_string();
+    let mut current = Some(error);
+    let mut structured_missing = false;
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<replicant_client::Error>()
+            .is_some_and(|error| error.status() == Some(404))
+        {
+            structured_missing = true;
+            break;
+        }
+        current = source.source();
+    }
+    if structured_missing
+        || failure_disposition(error) == replicant_workflow::WorkflowFailureDisposition::Permanent
+    {
+        WorkItemTransition::Failed {
+            error: message,
+            result_json: None,
+        }
+    } else {
+        WorkItemTransition::RetryableFailure {
+            checkpoint_json: None,
+            error: message,
+        }
+    }
+}
+
+struct MiningCampaignWorkflow {
+    item_executor: Arc<dyn crate::workflows::MiningItemExecutor>,
+}
 impl WorkflowExecutor for MiningCampaignWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        let item_executor = self.item_executor.clone();
         Box::pin(async move {
             let intent: MiningCampaignIntent = context.config().map_err(string_error)?;
             if intent.systems.is_empty() {
@@ -1283,67 +2571,31 @@ impl WorkflowExecutor for MiningCampaignWorkflow {
                     .mark_succeeded(Some(serde_json::json!({"systems": []})))
                     .map_err(string_error);
             }
-            let client = managed_client(context)?;
-            let mut checkpoint: MiningDeployCheckpoint =
+            let checkpoint: MiningCampaignCheckpoint =
                 context.checkpoint().map_err(string_error)?;
-            let replicant = match checkpoint.replicant.clone() {
-                Some(value) => value,
-                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+            let hub = if intent.hub.is_empty() {
+                resolve_home(&managed_client(context)?, None).await?
+            } else {
+                intent.hub
             };
-            let hub = match checkpoint.hub.clone() {
-                Some(value) => value,
-                None => resolve_home(&client, intent.hub.as_deref()).await?,
-            };
-            checkpoint.replicant = Some(replicant.clone());
-            checkpoint.hub = Some(hub.clone());
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
-            for system in &intent.systems {
-                claim_target(context, "mining-target", system)?;
-            }
-            claim_target(context, "location", &hub)?;
-            let plan_file = scratch_file(context.id(), "mining-campaign.json")?;
-            materialize_json(&plan_file, checkpoint.plan_json.as_deref())?;
-            checkpoint.started = true;
-            context
-                .advance_to("expanding", &checkpoint)
-                .map_err(string_error)?;
-            let request = MiningExpansionRequest {
-                systems: intent.systems,
-                replicant,
-                hub,
-                mission_file: plan_file.clone(),
-                wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
-                max_concurrency: intent.max_concurrency.max(1),
-            };
-            let execution = execute_expansion(&client, &request);
-            tokio::pin!(execution);
-            let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
-            let result = loop {
-                tokio::select! {
-                    result = &mut execution => break result,
-                    _ = checkpoint_interval.tick() => {
-                        match context.control_request().map_err(string_error)? {
-                            replicant_workflow::ControlRequest::Continue => {}
-                            replicant_workflow::ControlRequest::Pause
-                            | replicant_workflow::ControlRequest::Cancel => return Ok(()),
-                        }
-                        if plan_file.exists() {
-                            checkpoint.plan_json = Some(read_json(&plan_file)?);
-                            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
-                        }
-                    }
-                }
-            };
-            if plan_file.exists() {
-                checkpoint.plan_json = Some(read_json(&plan_file)?);
-                context
-                    .persist_checkpoint(&checkpoint)
-                    .map_err(string_error)?;
-            }
-            match result {
-                Ok(report) => context.mark_succeeded(Some(report)).map_err(string_error),
-                Err(error) => Err(error.to_string()),
-            }
+            execute_mining_pool_config(
+                context,
+                item_executor,
+                MiningWorkflowConfig {
+                    systems: intent.systems,
+                    region: intent.region,
+                    hub,
+                    mission_file: scratch_file(context.id(), "mining-campaign.json")?,
+                    wait_timeout_seconds: DEFAULT_WAIT_SECONDS,
+                    max_concurrency: intent.max_concurrency.max(1),
+                },
+                MiningWorkflowCheckpoint {
+                    mission: checkpoint.mission,
+                    migration_worker: checkpoint.migration_worker,
+                    started: checkpoint.started,
+                },
+            )
+            .await
         })
     }
 }
@@ -2675,9 +3927,12 @@ impl WorkflowExecutor for EventTourWorkflow {
     }
 }
 
-struct EventCampaignWorkflow;
+struct EventCampaignWorkflow {
+    item_executor: Arc<dyn EventItemExecutor>,
+}
 impl WorkflowExecutor for EventCampaignWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        let item_executor = self.item_executor.clone();
         Box::pin(async move {
             let intent: EventCampaignIntent = context.config().map_err(string_error)?;
             let client = managed_client(context)?;
@@ -2686,11 +3941,12 @@ impl WorkflowExecutor for EventCampaignWorkflow {
             claim_target(context, "event-campaign", &intent.region)?;
             let replicant = match checkpoint.replicant.clone() {
                 Some(value) => value,
-                None => resolve_replicant(&client, intent.replicant.as_deref()).await?,
+                None => resolve_replicant(&client, None).await?,
             };
             let home = match checkpoint.home.clone() {
                 Some(value) => value,
-                None => resolve_home(&client, intent.home.as_deref()).await?,
+                None if !intent.home.is_empty() => intent.home.clone(),
+                None => resolve_home(&client, None).await?,
             };
             checkpoint.replicant = Some(replicant.clone());
             checkpoint.home = Some(home.clone());
@@ -2765,74 +4021,340 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                 break;
             }
 
-            // Connectivity expansion is allowed to use the configured event
-            // worker. Claim it only after relay dependencies are satisfied so
-            // the child workflow does not collide with its parent claim. The
-            // explicit workflow config still keeps the worker Director-busy.
-            claim(context, ResourceKey::Replicant(replicant.clone()))?;
+            let repository = context.repository_handle();
+            let archive = checkpoint
+                .archive
+                .as_ref()
+                .ok_or_else(|| "event campaign planning produced no archive".to_owned())?;
+            let reconciled = repository
+                .reconcile_work_items(
+                    context.id(),
+                    &event_campaign_work_item_specs(context.id(), archive, &intent.region)
+                        .map_err(string_error)?,
+                    unix_millis(),
+                )
+                .map_err(string_error)?;
+            for item in reconciled {
+                let complete = item.spec.payload_json["legacy_complete"].as_bool() == Some(true);
+                if !item.state.status.is_terminal() && complete {
+                    repository
+                        .transition_work_item(
+                            item.id,
+                            item.state.revision,
+                            WorkItemTransition::Skipped {
+                                reason: "completed in migrated event checkpoint".into(),
+                                result_json: Some(item.spec.payload_json.clone()),
+                            },
+                            unix_millis(),
+                        )
+                        .map_err(string_error)?;
+                }
+            }
             context
                 .advance_to("executing", &checkpoint)
                 .map_err(string_error)?;
-            let execution_request = EventExecutionRequest::new(
-                plan_file.clone(),
-                Duration::from_secs(DEFAULT_WAIT_SECONDS),
-            );
-            let execution = execute_event_campaign(&client, &execution_request);
-            tokio::pin!(execution);
-            let mut checkpoint_interval = tokio::time::interval(Duration::from_secs(2));
-            let state = loop {
-                tokio::select! {
-                    result = &mut execution => match result {
-                        Ok(state) => break state,
-                        Err(error) => {
-                            if persist_retryable_event_campaign_failure(
-                                context,
-                                &mut checkpoint,
-                                &plan_file,
-                                error.as_ref(),
-                            )? {
-                                return Ok(());
-                            }
-                            let message = error.to_string();
-                            if failure_disposition(error.as_ref())
-                                == replicant_workflow::WorkflowFailureDisposition::Permanent
-                            {
-                                if let Ok(archive) = archive_event_campaign(&plan_file) {
-                                    checkpoint.archive = Some(archive);
-                                }
-                                context
-                                    .persist_checkpoint(&checkpoint)
+            loop {
+                let broker = crate::assignment::ResourceBroker::with_managed_client(
+                    repository.clone(),
+                    client.clone(),
+                );
+                let candidates = crate::workflows::regional_relay_candidates(
+                    repository.as_ref(),
+                    &client,
+                    broker.discover_candidates().map_err(string_error)?,
+                    &intent.region,
+                )?;
+                let mut running = Vec::new();
+                while running.len() < candidates.len().max(1) {
+                    let Some(assigned) = repository
+                        .claim_next_work_item(context.id(), unix_millis())
+                        .map_err(string_error)?
+                    else {
+                        break;
+                    };
+                    let allocations =
+                        match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
+                            Ok(allocations) => allocations,
+                            Err(_) => {
+                                repository
+                                    .transition_work_item(
+                                        assigned.id,
+                                        assigned.state.revision,
+                                        WorkItemTransition::Reclaimed {
+                                            checkpoint_json: assigned.state.checkpoint_json.clone(),
+                                        },
+                                        unix_millis(),
+                                    )
                                     .map_err(string_error)?;
-                                context
-                                    .mark_failed_permanently(message)
-                                    .map_err(string_error)?;
-                                return Ok(());
+                                break;
                             }
-                            return Err(string_error(error));
-                        }
-                    },
-                    _ = checkpoint_interval.tick() => {
-                        match context.control_request().map_err(string_error)? {
-                            replicant_workflow::ControlRequest::Continue => {}
-                            replicant_workflow::ControlRequest::Pause
-                            | replicant_workflow::ControlRequest::Cancel => return Ok(()),
-                        }
-                        if let Ok(archive) = archive_event_campaign(&plan_file) {
-                            checkpoint.archive = Some(archive);
-                            context.persist_checkpoint(&checkpoint).map_err(string_error)?;
-                        }
-                    }
+                        };
+                    let worker = allocation_worker(&allocations)
+                        .ok_or_else(|| "event item allocation omitted worker".to_owned())?;
+                    let assignment_id = format!("event:{}:{worker}", assigned.id);
+                    repository
+                        .assign_work_item(
+                            assigned.id,
+                            assigned.state.revision,
+                            &assignment_id,
+                            &ResourceKey::Replicant(worker.clone()),
+                            unix_millis(),
+                        )
+                        .map_err(string_error)?;
+                    let started = repository
+                        .start_work_item(
+                            assigned.id,
+                            assigned.state.revision,
+                            &worker,
+                            &assignment_id,
+                            unix_millis(),
+                        )
+                        .map_err(string_error)?;
+                    let mission_json = event_item_input_checkpoint(repository.as_ref(), &started)?;
+                    running.push(run_event_campaign_item(
+                        repository.clone(),
+                        client.clone(),
+                        item_executor.clone(),
+                        broker.clone(),
+                        EventItemRun {
+                            replacement_candidates: candidates.clone(),
+                            item: started,
+                            allocations,
+                            mission_json,
+                        },
+                    ));
                 }
-            };
-            checkpoint.archive = Some(archive_event_campaign(&plan_file).map_err(string_error)?);
-            context
-                .persist_checkpoint(&checkpoint)
-                .map_err(string_error)?;
-            context.mark_succeeded(Some(state)).map_err(string_error)
+                if running.is_empty() {
+                    break;
+                }
+                for result in futures::future::join_all(running).await {
+                    let (mission_path, mission_json) = result?;
+                    if let Some(archive) = checkpoint.archive.as_mut() {
+                        archive.mission_json.insert(mission_path, mission_json);
+                    }
+                    context
+                        .persist_checkpoint(&checkpoint)
+                        .map_err(string_error)?;
+                }
+            }
+            match repository
+                .aggregate_campaign_result(context.id())
+                .map_err(string_error)?
+            {
+                Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
+                    context.mark_succeeded(Some(result)).map_err(string_error)
+                }
+                Some(result) => context
+                    .mark_failed_with_result(
+                        "event campaign completed without a successful criterion",
+                        result,
+                        replicant_workflow::WorkflowFailureDisposition::Permanent,
+                    )
+                    .map_err(string_error),
+                None => context.mark_waiting().map_err(string_error),
+            }
         })
     }
 }
 
+pub(crate) fn event_item_input_checkpoint(
+    repository: &replicant_workflow::WorkflowRepository,
+    item: &WorkItem,
+) -> Result<String, String> {
+    if let Some(checkpoint) = item.state.checkpoint_json.as_ref().and_then(Value::as_str) {
+        return Ok(checkpoint.to_owned());
+    }
+    if let Some(dependency) = item
+        .spec
+        .preconditions_json
+        .as_array()
+        .and_then(|dependencies| dependencies.first())
+        .and_then(|dependency| dependency["parameters"]["dedupe_key"].as_str())
+        && let Some(checkpoint) = repository
+            .list_work_items(item.spec.workflow_id)
+            .map_err(string_error)?
+            .into_iter()
+            .find(|candidate| candidate.spec.dedupe_key == dependency)
+            .and_then(|candidate| candidate.state.checkpoint_json)
+            .and_then(|checkpoint| checkpoint.as_str().map(str::to_owned))
+    {
+        return Ok(checkpoint);
+    }
+    item.spec.payload_json["mission_json"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "event item payload omitted mission_json".to_owned())
+}
+
+pub(crate) struct EventItemRun {
+    pub(crate) replacement_candidates: Vec<replicant_workflow::AllocationCandidate>,
+    pub(crate) item: WorkItem,
+    pub(crate) allocations: AllocationSet,
+    pub(crate) mission_json: String,
+}
+
+pub(crate) async fn run_event_campaign_item(
+    repository: Arc<replicant_workflow::WorkflowRepository>,
+    client: Client,
+    item_executor: Arc<dyn EventItemExecutor>,
+    broker: crate::assignment::ResourceBroker,
+    run: EventItemRun,
+) -> Result<(String, String), String> {
+    let EventItemRun {
+        replacement_candidates,
+        item,
+        mut allocations,
+        mission_json,
+    } = run;
+    let stage: EventItemStage =
+        serde_json::from_value(item.spec.payload_json["stage"].clone()).map_err(string_error)?;
+    let mission_path = item.spec.payload_json["mission_path"]
+        .as_str()
+        .ok_or_else(|| "event item payload omitted mission_path".to_owned())?
+        .to_owned();
+    loop {
+        match item_executor
+            .execute(
+                &client,
+                &mission_json,
+                stage,
+                &allocations,
+                Duration::from_secs(DEFAULT_WAIT_SECONDS),
+            )
+            .await
+        {
+            Ok(checkpoint) => {
+                repository
+                    .transition_work_item(
+                        item.id,
+                        item.state.revision,
+                        WorkItemTransition::Succeeded {
+                            checkpoint_json: Some(Value::String(checkpoint.clone())),
+                            result_json: Some(serde_json::json!({
+                                "event": item.spec.payload_json["event"],
+                                "criterion": item.spec.payload_json["criterion"],
+                                "stage": stage,
+                            })),
+                        },
+                        unix_millis(),
+                    )
+                    .map_err(string_error)?;
+                return Ok((mission_path, checkpoint));
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<EventMissingAllocationError>()
+                    .is_some()
+                    || failure_class(error.as_ref()) == Some(FailureClass::DeviceTargetMissing) =>
+            {
+                let typed_missing = error
+                    .downcast_ref::<EventMissingAllocationError>()
+                    .map(|error| (error.requirement.clone(), error.allocation_id));
+                if let Some((requirement, allocation_id)) = match typed_missing {
+                    Some(missing) => Some(missing),
+                    None => missing_event_allocation(&client, &allocations).await?,
+                } {
+                    match broker
+                        .replace_dead_allocation_from(
+                            item.id,
+                            allocation_id,
+                            &replacement_candidates,
+                        )
+                        .map_err(string_error)?
+                    {
+                        replicant_workflow::ReplacementOutcome::Replaced(replacement) => {
+                            let allocation = allocations
+                                .by_requirement
+                                .get_mut(&requirement)
+                                .and_then(|allocations| {
+                                    allocations
+                                        .iter_mut()
+                                        .find(|allocation| allocation.id == allocation_id)
+                                })
+                                .ok_or_else(|| {
+                                    format!("event allocation {allocation_id} disappeared")
+                                })?;
+                            *allocation = replacement;
+                            continue;
+                        }
+                        replicant_workflow::ReplacementOutcome::Waiting => {
+                            repository
+                                .transition_work_item(
+                                    item.id,
+                                    item.state.revision,
+                                    WorkItemTransition::Waiting {
+                                        checkpoint_json: Some(Value::String(mission_json.clone())),
+                                        reason: error.to_string(),
+                                        retry_at_ms: Some(unix_millis().saturating_add(300_000)),
+                                    },
+                                    unix_millis(),
+                                )
+                                .map_err(string_error)?;
+                            return Ok((mission_path, mission_json));
+                        }
+                        replicant_workflow::ReplacementOutcome::Unavailable => {
+                            return Ok((mission_path, mission_json));
+                        }
+                    }
+                }
+                repository
+                    .transition_work_item(
+                        item.id,
+                        item.state.revision,
+                        WorkItemTransition::Waiting {
+                            checkpoint_json: Some(Value::String(mission_json.clone())),
+                            reason: error.to_string(),
+                            retry_at_ms: Some(unix_millis().saturating_add(300_000)),
+                        },
+                        unix_millis(),
+                    )
+                    .map_err(string_error)?;
+                return Ok((mission_path, mission_json));
+            }
+            Err(error) => {
+                let transition = if failure_disposition(error.as_ref())
+                    == replicant_workflow::WorkflowFailureDisposition::Permanent
+                {
+                    WorkItemTransition::Failed {
+                        error: error.to_string(),
+                        result_json: None,
+                    }
+                } else {
+                    WorkItemTransition::Waiting {
+                        checkpoint_json: Some(Value::String(mission_json.clone())),
+                        reason: error.to_string(),
+                        retry_at_ms: Some(unix_millis().saturating_add(300_000)),
+                    }
+                };
+                repository
+                    .transition_work_item(item.id, item.state.revision, transition, unix_millis())
+                    .map_err(string_error)?;
+                return Ok((mission_path, mission_json));
+            }
+        }
+    }
+}
+
+async fn missing_event_allocation(
+    client: &Client,
+    allocations: &AllocationSet,
+) -> Result<Option<(String, replicant_workflow::AllocationId)>, String> {
+    for (requirement, values) in &allocations.by_requirement {
+        for allocation in values {
+            let ResourceKey::Device(code) = &allocation.resource else {
+                continue;
+            };
+            if let Err(error) = client.devices().get(code).await
+                && crate::failure::device_fetch_is_missing(&error)
+            {
+                return Ok(Some((requirement.clone(), allocation.id)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
 fn persist_retryable_event_campaign_failure(
     context: &mut WorkflowContext,
     checkpoint: &mut EventCampaignCheckpoint,
@@ -2869,6 +4391,7 @@ fn persist_retryable_event_campaign_failure(
     Ok(true)
 }
 
+#[cfg(test)]
 fn retryable_event_campaign_failure(error: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
         failure_class(error),
@@ -2882,6 +4405,8 @@ fn retryable_event_campaign_failure(error: &(dyn std::error::Error + 'static)) -
         )
     )
 }
+
+#[cfg(test)]
 fn event_campaign_wait_step(error: &(dyn std::error::Error + 'static)) -> &'static str {
     match failure_class(error) {
         Some(FailureClass::EventInputsUnavailable) => "waiting_for_event_inputs",
@@ -2891,6 +4416,7 @@ fn event_campaign_wait_step(error: &(dyn std::error::Error + 'static)) -> &'stat
     }
 }
 
+#[cfg(test)]
 fn event_campaign_failure_requires_replan(error: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
         failure_class(error),
@@ -3437,11 +4963,14 @@ pub fn new_scan_tour_workflow(
 pub fn new_belt_search_campaign_workflow(
     intent: BeltSearchCampaignIntent,
 ) -> NewWorkflow<BeltSearchCampaignIntent, BeltSearchCampaignCheckpoint> {
-    queued_workflow(
-        belt_search_campaign_workflow_kind(),
-        intent,
-        BeltSearchCampaignCheckpoint::default(),
-    )
+    NewWorkflow {
+        kind: belt_search_campaign_workflow_kind(),
+        schema_version: 2,
+        config: intent,
+        checkpoint: BeltSearchCampaignCheckpoint::default(),
+        current_step: None,
+        parent_id: None,
+    }
 }
 
 /// Creates a queued salvage workflow.
@@ -3452,6 +4981,17 @@ pub fn new_salvage_workflow(
         salvage_workflow_kind(),
         intent,
         ControllerWorkflowCheckpoint::default(),
+    )
+}
+
+/// Creates a queued regional salvage recovery campaign.
+pub fn new_salvage_recovery_workflow(
+    intent: SalvageRecoveryIntent,
+) -> NewWorkflow<SalvageRecoveryIntent, SalvageRecoveryCheckpoint> {
+    queued_workflow(
+        salvage_recovery_workflow_kind(),
+        intent,
+        SalvageRecoveryCheckpoint::default(),
     )
 }
 
@@ -7732,6 +9272,15 @@ fn read_json(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(string_error)
 }
 
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -7740,11 +9289,456 @@ mod tests {
     use replicant_workflow::WorkflowRepository;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        matchers::{method, path, query_param, query_param_is_missing},
     };
 
     use super::*;
     use crate::failure::ClassifiedError;
+
+    struct FixtureEventItemExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        missing_injected: std::sync::atomic::AtomicBool,
+        first_wave: tokio::sync::Barrier,
+        order: std::sync::Mutex<Vec<EventItemStage>>,
+    }
+
+    impl FixtureEventItemExecutor {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                active: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                missing_injected: std::sync::atomic::AtomicBool::new(false),
+                first_wave: tokio::sync::Barrier::new(2),
+                order: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EventItemExecutor for FixtureEventItemExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a Client,
+            mission_json: &'a str,
+            stage: EventItemStage,
+            allocations: &'a AllocationSet,
+            _wait_timeout: Duration,
+        ) -> EventItemFuture<'a> {
+            let missing_allocation = allocations
+                .by_requirement
+                .get("device:survey_drone")
+                .and_then(|allocations| allocations.first())
+                .map(|allocation| allocation.id);
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let active = self
+                    .active
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.peak
+                    .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                if call <= 2 {
+                    self.first_wave.wait().await;
+                }
+                if stage == EventItemStage::Stage
+                    && !self
+                        .missing_injected
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.active
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(Box::new(EventMissingAllocationError {
+                        requirement: "device:survey_drone".into(),
+                        allocation_id: missing_allocation.expect("event device allocation"),
+                    }) as crate::event::AnyError);
+                }
+                self.order.lock().expect("event order").push(stage);
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(mission_json.to_owned())
+            })
+        }
+    }
+
+    async fn seed_event_pool_worker(server: &MockServer, client: &Client, worker: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/replicants/{worker}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": worker,
+                "location": "ROOT-1-L4",
+                "status": "active"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .replicants()
+            .get_owned(worker)
+            .await
+            .expect("seed event worker");
+    }
+
+    async fn seed_event_pool_device(
+        server: &MockServer,
+        client: &Client,
+        worker: &str,
+        code: &str,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/devices/{code}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": code,
+                "device_type": "survey_drone",
+                "replicant_code": worker,
+                "location": "ROOT-1-L4",
+                "status": "idle"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client.devices().get(code).await.expect("seed event device");
+    }
+
+    #[tokio::test]
+    async fn event_campaign_pool_registered_schema_one_workflow_orders_all_criteria() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-26T00:00:00Z",
+                "total": 1,
+                "stars": [{
+                    "designation": "ROOT",
+                    "region": "alpha",
+                    "position": {"x": 0.0, "y": 0.0, "z": 0.0}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("seed event catalogue");
+        seed_event_pool_worker(&server, &client, "REP-A").await;
+        seed_event_pool_worker(&server, &client, "REP-B").await;
+        seed_event_pool_device(&server, &client, "REP-A", "DRONE-A").await;
+        seed_event_pool_device(&server, &client, "REP-B", "DRONE-B").await;
+        seed_event_pool_device(&server, &client, "REP-A", "DRONE-SPARE").await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        for worker in ["LEGACY", "REP-A", "REP-B"] {
+            repository
+                .put_document(
+                    "director.replicant",
+                    worker,
+                    &serde_json::json!({"region": "alpha"}),
+                )
+                .expect("Director region");
+        }
+        let paths = [
+            std::env::temp_dir().join("event-pool-one.json"),
+            std::env::temp_dir().join("event-pool-two.json"),
+        ];
+        let archive = crate::event::event_campaign_pool_fixture_archive(&paths);
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: event_campaign_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "region": "alpha",
+                    "replicant": "LEGACY",
+                    "home": "ROOT-1-L4"
+                }),
+                checkpoint: EventCampaignCheckpoint {
+                    replicant: Some("LEGACY".into()),
+                    home: Some("ROOT-1-L4".into()),
+                    archive: Some(archive),
+                    connectivity_workflows: BTreeMap::new(),
+                    replan_after_connectivity: false,
+                },
+                current_step: Some("executing".into()),
+                parent_id: None,
+            })
+            .expect("legacy event campaign");
+        let executor = Arc::new(FixtureEventItemExecutor::new());
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(Arc::new(EventCampaignWorkflowFactory::with_item_executor(
+                executor.clone(),
+            )))
+            .expect("register event campaign");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..200 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workflow = repository
+            .read(workflow.id)
+            .expect("workflow")
+            .expect("workflow exists");
+        assert_eq!(workflow.schema_version, 2);
+        let items = repository.list_work_items(workflow.id).expect("items");
+        assert_eq!(
+            workflow.status,
+            WorkflowStatus::Succeeded,
+            "error={:?}, items={items:#?}",
+            workflow.last_error
+        );
+        assert_eq!(
+            items.len(),
+            16,
+            "two events times two criteria times four stages"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| item.state.status == replicant_workflow::WorkItemStatus::Succeeded)
+        );
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            17,
+            "one structured missing device retries in place"
+        );
+        let replaced = items
+            .iter()
+            .find(|item| {
+                item.spec.kind.as_str() == "event.stage" && item.state.checkpoint_json.is_some()
+            })
+            .expect("replaced event stage");
+        assert_eq!(
+            repository
+                .list_work_item_attempts(replaced.id)
+                .expect("event attempts")
+                .len(),
+            1
+        );
+        assert_eq!(executor.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let stages_ordered = {
+            let order = executor.order.lock().expect("event order");
+            let first_delivery = order
+                .iter()
+                .position(|stage| *stage == EventItemStage::Delivery)
+                .expect("delivery stage");
+            order[..first_delivery]
+                .iter()
+                .all(|stage| *stage == EventItemStage::Stage)
+        };
+        assert!(stages_ordered);
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.with_extension("lock").exists())
+        );
+        let calls = executor.calls.load(std::sync::atomic::Ordering::SeqCst);
+        drop(supervisor);
+        let mut restarted_registry = WorkflowRegistry::new();
+        restarted_registry
+            .register(Arc::new(EventCampaignWorkflowFactory::with_item_executor(
+                executor.clone(),
+            )))
+            .expect("register restarted event campaign");
+        let restarted = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository,
+            Arc::new(restarted_registry),
+            client.clone(),
+        );
+        restarted.tick().await.expect("restart tick");
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls,
+            "restart reuses terminal items and archived assets"
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn salvage_recovery_history_remote_pages_are_authoritative_and_region_filtered() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let mut discoveries = (0..462)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("{index:04}-0"),
+                    "version": 1,
+                    "category": "salvage",
+                    "event": "salvage.discovered",
+                    "created_at": "2026-08-26T00:00:00Z",
+                    "payload": {
+                        "designation": format!("SITE-{index}"),
+                        "location": if index == 4 {"BETA-1-L4"} else {"ROOT-1-L4"},
+                        "resources": {"structural": index + 1}
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        discoveries.push(serde_json::json!({
+            "id": "9999-0",
+            "version": 1,
+            "category": "salvage",
+            "event": "salvage.discovered",
+            "created_at": "2026-08-27T00:00:00Z",
+            "payload": {
+                "designation": "SITE-3",
+                "location": "ROOT-1-L4",
+                "resources": {"structural": 999}
+            }
+        }));
+        let page_count = discoveries.len().div_ceil(100);
+        for (page_index, page) in discoveries.chunks(100).enumerate() {
+            let cursor = (page_index != 0).then(|| format!("cursor-{page_index}"));
+            let next_cursor =
+                (page_index + 1 < page_count).then(|| format!("cursor-{}", page_index + 1));
+            let mut mock = Mock::given(method("GET"))
+                .and(path("/v1/events"))
+                .and(query_param("filtered", "false"))
+                .and(query_param("event", "salvage.discovered"))
+                .and(query_param("limit", "100"));
+            mock = if let Some(cursor) = cursor {
+                mock.and(query_param("cursor", cursor))
+            } else {
+                mock.and(query_param_is_missing("cursor"))
+            };
+            mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": page,
+                "next_cursor": next_cursor
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("filtered", "false"))
+            .and(query_param("event", "salvage.depleted"))
+            .and(query_param("limit", "100"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{
+                    "id": "5000-0",
+                    "version": 1,
+                    "category": "salvage",
+                    "event": "salvage.depleted",
+                    "created_at": "2026-08-27T00:00:01Z",
+                    "payload": {"designation": "SITE-1"}
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let discovered = client
+            .events()
+            .full_history_named("salvage.discovered")
+            .await
+            .expect("full discovery history");
+        let depleted = client
+            .events()
+            .full_history_named("salvage.depleted")
+            .await
+            .expect("full depletion history");
+        assert_eq!(discovered.len(), 463);
+        assert_eq!(discovered.first().expect("first").id.as_str(), "0000-0");
+        assert_eq!(discovered.last().expect("last").id.as_str(), "9999-0");
+        let ledger = salvage_recovery_ledger(
+            &discovered,
+            &depleted,
+            &BTreeSet::from(["SITE-2".into()]),
+            &BTreeMap::from([
+                ("ROOT-1-L4".into(), "alpha".into()),
+                ("BETA-1-L4".into(), "beta".into()),
+            ]),
+            "alpha",
+        );
+        assert_eq!(ledger.len(), 459);
+        assert_eq!(ledger["SITE-3"].resources["structural"], 999);
+        assert!(!ledger.contains_key("SITE-1"));
+        assert!(!ledger.contains_key("SITE-2"));
+        assert!(!ledger.contains_key("SITE-4"));
+        let capacity_site = BTreeMap::from([(
+            "CAPACITY-SITE".into(),
+            SalvageSiteRecord {
+                designation: "CAPACITY-SITE".into(),
+                location: "ROOT-1-L4".into(),
+                resources: BTreeMap::from([("structural".into(), 17)]),
+                event_id: "capacity-1".into(),
+            },
+        )]);
+        let capacity_specs = salvage_recovery_item_specs(
+            WorkflowId::new(),
+            &capacity_site,
+            "alpha",
+            "ROOT-1-L4",
+            &[("F-4".into(), 4), ("F-9".into(), 9)],
+        )
+        .expect("capacity items");
+        assert_eq!(
+            capacity_specs
+                .iter()
+                .map(|spec| spec.payload_json["trip_quantity"]
+                    .as_u64()
+                    .expect("quantity"))
+                .collect::<Vec<_>>(),
+            [4, 9, 4]
+        );
+        for spec in &capacity_specs {
+            let requirements: Vec<ResourceRequirement> =
+                serde_json::from_value(spec.requirements_json.clone()).expect("requirements");
+            let stow = requirements
+                .iter()
+                .find(|requirement| requirement.key == "stow")
+                .expect("stow requirement");
+            assert_eq!(
+                stow.quantity,
+                spec.payload_json["trip_quantity"]
+                    .as_u64()
+                    .expect("quantity")
+            );
+        }
+        let specs =
+            salvage_recovery_item_specs(WorkflowId::new(), &ledger, "alpha", "ROOT-1-L4", &[])
+                .expect("salvage items");
+        assert_eq!(specs.len(), 459);
+        assert_eq!(specs[0].payload_json["location"], "ROOT-1-L4");
+        assert_ne!(
+            specs[0].payload_json["designation"],
+            specs[0].payload_json["location"]
+        );
+        assert_eq!(
+            salvage_capacity_shards(17, &[("F-4".into(), 4), ("F-9".into(), 9)]),
+            [("F-4".into(), 4), ("F-9".into(), 9), ("F-4".into(), 4),]
+        );
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("event", "salvage.repeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [],
+                "next_cursor": "same"
+            })))
+            .mount(&server)
+            .await;
+        let repeated = client
+            .events()
+            .full_history_named("salvage.repeat")
+            .await
+            .expect_err("repeated cursor must fail");
+        assert!(repeated.to_string().contains("cursor repeated"));
+        client.close().await.expect("close client");
+    }
 
     async fn test_client_at(server: &MockServer) -> Client {
         Client::builder()
@@ -7755,6 +9749,60 @@ mod tests {
             .start()
             .await
             .expect("start test client")
+    }
+    #[tokio::test]
+    async fn salvage_recovery_history_registered_empty_campaign_executes_through_supervisor() {
+        let server = MockServer::start().await;
+        for event_name in ["salvage.discovered", "salvage.depleted"] {
+            Mock::given(method("GET"))
+                .and(path("/v1/events"))
+                .and(query_param("event", event_name))
+                .and(query_param("filtered", "false"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "events": [],
+                    "next_cursor": null
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = test_client_at(&server).await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let workflow = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ROOT-1-L4".into(),
+            }))
+            .expect("salvage recovery workflow");
+        let mut registry = WorkflowRegistry::new();
+        super::register(&mut registry).expect("register runtime workflows");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..20 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workflow = repository
+            .read(workflow.id)
+            .expect("workflow")
+            .expect("workflow exists");
+        assert_eq!(
+            workflow.status,
+            WorkflowStatus::Succeeded,
+            "{:?}",
+            workflow.last_error
+        );
+        client.close().await.expect("close client");
     }
 
     fn inventory_response(quantity: i64, next_cursor: Option<&str>) -> ResponseTemplate {
@@ -7791,7 +9839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_device_snapshots_use_one_bulk_refresh() {
+    async fn guarded_empty_device_refresh_preserves_cached_snapshots() {
         let server = MockServer::start().await;
         mount_device_list(&server, &["DEVICE-B", "DEVICE-A"]).await;
         let client = test_client_at(&server).await;
@@ -7804,19 +9852,16 @@ mod tests {
 
         server.reset().await;
         mount_device_list(&server, &[]).await;
-        client
+        let error = client
             .devices()
             .refresh_many()
             .collect()
             .await
-            .expect("remove cached devices");
-
-        server.reset().await;
-        mount_device_list(&server, &["DEVICE-B", "DEVICE-A"]).await;
+            .expect_err("empty enumeration requires guarded approval");
+        assert!(error.to_string().contains("empty device enumeration"));
         let snapshots = device_snapshots(&client, stale_handles)
             .await
-            .expect("bulk fallback");
-
+            .expect("guard retains cached snapshots");
         assert_eq!(
             snapshots
                 .iter()
@@ -7824,7 +9869,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["DEVICE-A", "DEVICE-B"]
         );
-        server.verify().await;
         client.close().await.expect("close client");
     }
 
@@ -7857,21 +9901,22 @@ mod tests {
         );
 
         server.reset().await;
-        mount_device_list(&server, &["DEVICE-B"]).await;
+        mount_device_list(&server, &["DEVICE-A", "DEVICE-B"]).await;
         client
             .devices()
             .refresh_many()
             .collect()
             .await
-            .expect("mutate device projection");
+            .expect("expand device projection");
         census.invalidate();
 
-        assert_eq!(
-            census.snapshots(&client).await.expect("fresh census")[0]
-                .key
-                .id
-                .as_str(),
-            "DEVICE-B"
+        assert!(
+            census
+                .snapshots(&client)
+                .await
+                .expect("fresh census")
+                .iter()
+                .any(|device| device.key.id.as_str() == "DEVICE-B")
         );
         server.verify().await;
         client.close().await.expect("close client");
@@ -8228,7 +10273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_routes_persist_waiting_checkpoints_without_new_rows() {
+    async fn event_campaign_pool_failure_routes_persist_waiting_checkpoints_without_new_rows() {
         let repository =
             std::sync::Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
         let kind = WorkflowKind::new("test.failure-routing").expect("valid kind");
@@ -8373,7 +10418,7 @@ mod tests {
     }
 
     #[test]
-    fn event_campaign_failure_routing() {
+    fn event_campaign_pool_failure_routing() {
         let control = ClassifiedError::new(
             FailureClass::EventControlUnavailable,
             io::ErrorKind::WouldBlock,
@@ -8767,5 +10812,261 @@ mod tests {
         );
 
         assert!(retryable_connectivity_dependency_failure(&error));
+    }
+    #[test]
+    fn belt_search_pool_materializes_unique_unpinned_items() {
+        let intent = BeltSearchCampaignIntent {
+            systems: (0..24)
+                .map(|index| format!("SYSTEM-{index:02}"))
+                .chain(["SYSTEM-00".to_owned()])
+                .collect(),
+            region: "Alpha".into(),
+        };
+        let specs = belt_search_item_specs(WorkflowId::new(), &intent).expect("materialize items");
+        assert_eq!(specs.len(), 24);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.requirements_json[0]["scope"]["value"] == "Alpha")
+        );
+        assert!(
+            serde_json::to_value(intent)
+                .expect("serialize intent")
+                .get("replicant")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn belt_search_pool_factory_migrates_version_one_configuration() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let legacy = repository
+            .create(NewWorkflow {
+                kind: belt_search_campaign_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "systems": ["SOL", "ALPHA"],
+                    "replicant": "R-1"
+                }),
+                checkpoint: serde_json::json!({ "replicant": "R-1" }),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("create legacy campaign");
+        let factory = BeltSearchCampaignWorkflowFactory::new();
+        assert!(factory.supports_schema_version(1));
+        let migration = factory
+            .migrate(&legacy)
+            .expect("migrate legacy")
+            .expect("migration exists");
+        assert_eq!(
+            migration.config()["systems"],
+            serde_json::json!(["SOL", "ALPHA"])
+        );
+        assert_eq!(migration.config()["region"], "");
+        assert!(migration.config().get("replicant").is_none());
+        assert_eq!(
+            migration.checkpoint()["legacy_checkpoint"]["replicant"],
+            "R-1"
+        );
+        repository
+            .put_document(
+                "director.replicant",
+                "R-1",
+                &serde_json::json!({ "region": "Alpha" }),
+            )
+            .expect("persist legacy worker region");
+        let migrated_intent: BeltSearchCampaignIntent =
+            serde_json::from_value(migration.config().clone()).expect("decode migrated intent");
+        let migrated_checkpoint: BeltSearchCampaignCheckpoint =
+            serde_json::from_value(migration.checkpoint().clone())
+                .expect("decode migrated checkpoint");
+        assert_eq!(
+            resolve_belt_campaign_region(&repository, &migrated_intent, &migrated_checkpoint,)
+                .expect("resolve migrated region")
+                .as_deref(),
+            Some("Alpha")
+        );
+        assert_eq!(
+            new_belt_search_campaign_workflow(BeltSearchCampaignIntent {
+                systems: vec!["SOL".into()],
+                region: "Alpha".into(),
+            })
+            .schema_version,
+            2
+        );
+    }
+
+    #[test]
+    fn belt_search_pool_metrics_use_exact_intervals_and_partial_outcome() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let intent = BeltSearchCampaignIntent {
+            systems: vec!["A".into(), "B".into()],
+            region: "Alpha".into(),
+        };
+        let campaign = repository
+            .create(new_belt_search_campaign_workflow(intent.clone()))
+            .expect("create campaign");
+        let specs = belt_search_item_specs(campaign.id, &intent).expect("materialize specs");
+        repository
+            .reconcile_work_items(campaign.id, &specs, 0)
+            .expect("reconcile items");
+        let first = repository
+            .claim_next_work_item(campaign.id, 0)
+            .expect("claim first")
+            .expect("first item");
+        let second = repository
+            .claim_next_work_item(campaign.id, 0)
+            .expect("claim second")
+            .expect("second item");
+        let first = repository
+            .start_work_item(first.id, first.state.revision, "R-1", "first", 0)
+            .expect("start first");
+        let second = repository
+            .start_work_item(second.id, second.state.revision, "R-2", "second", 500)
+            .expect("start second");
+        repository
+            .transition_work_item(
+                first.id,
+                first.state.revision,
+                WorkItemTransition::Succeeded {
+                    checkpoint_json: None,
+                    result_json: Some(serde_json::json!({ "system": "A" })),
+                },
+                1_500,
+            )
+            .expect("succeed first");
+        repository
+            .transition_work_item(
+                second.id,
+                second.state.revision,
+                WorkItemTransition::Failed {
+                    error: "permanent fixture".into(),
+                    result_json: None,
+                },
+                2_000,
+            )
+            .expect("fail second");
+        let metrics =
+            belt_search_pool_metrics(&repository, campaign.id, 0, 2_000).expect("metrics");
+        assert_eq!(metrics.effective_parallelism, 1.5);
+        assert_eq!(metrics.peak_overlap, 2);
+        assert_eq!(metrics.unique_workers, 2);
+        assert_eq!(
+            metrics.campaign_outcome,
+            Some(replicant_workflow::CampaignOutcome::PartialSuccess)
+        );
+    }
+
+    #[test]
+    fn belt_search_pool_assigns_four_workers_and_isolates_outcomes() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let intent = BeltSearchCampaignIntent {
+            systems: (0..24).map(|index| format!("SYSTEM-{index:02}")).collect(),
+            region: "Alpha".into(),
+        };
+        let campaign = repository
+            .create(new_belt_search_campaign_workflow(intent.clone()))
+            .expect("create campaign");
+        repository
+            .reconcile_work_items(
+                campaign.id,
+                &belt_search_item_specs(campaign.id, &intent).expect("specs"),
+                0,
+            )
+            .expect("reconcile");
+        let candidates = (0..4)
+            .map(|index| replicant_workflow::AllocationCandidate {
+                resource: ResourceKey::Replicant(format!("R-{index}")),
+                kind: "replicant".into(),
+                capabilities: Vec::new(),
+                location: Some(replicant_workflow::AllocationLocation {
+                    region: Some("Alpha".into()),
+                    ..replicant_workflow::AllocationLocation::default()
+                }),
+                available_quantity: 1,
+                observed_revision: 1,
+                observed_at_ms: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut running = Vec::new();
+        for index in 0..4 {
+            let assigned = repository
+                .claim_next_work_item(campaign.id, 0)
+                .expect("claim")
+                .expect("item");
+            let allocations = repository
+                .allocate_requirements(assigned.id, assigned.state.revision, &candidates)
+                .expect("allocate");
+            let worker = allocation_worker(&allocations).expect("worker");
+            running.push(
+                repository
+                    .start_work_item(
+                        assigned.id,
+                        assigned.state.revision,
+                        &worker,
+                        &format!("grant-{index}"),
+                        i64::from(index),
+                    )
+                    .expect("start"),
+            );
+        }
+        let worker_count = running
+            .iter()
+            .flat_map(|item| {
+                repository
+                    .list_work_item_attempts(item.id)
+                    .expect("attempts")
+            })
+            .map(|attempt| attempt.worker_identity)
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(worker_count, 4);
+        let transitions = [
+            WorkItemTransition::Skipped {
+                reason: "system already explored".into(),
+                result_json: None,
+            },
+            WorkItemTransition::Reclaimed {
+                checkpoint_json: Some(serde_json::json!({ "safe": true })),
+            },
+            belt_item_failure_transition(&crate::failure::ClassifiedError::permanent(
+                FailureClass::DeviceTargetMissing,
+                std::io::ErrorKind::NotFound,
+                "structured missing worker fixture",
+            )),
+            WorkItemTransition::Succeeded {
+                checkpoint_json: None,
+                result_json: Some(serde_json::json!({ "system": "SYSTEM-03" })),
+            },
+        ];
+        for (index, transition) in transitions.into_iter().enumerate() {
+            repository
+                .transition_work_item(
+                    running[index].id,
+                    running[index].state.revision,
+                    transition,
+                    10 + i64::try_from(index).expect("index fits"),
+                )
+                .expect("transition item");
+        }
+        assert_eq!(
+            repository
+                .read_work_item(running[1].id)
+                .expect("read reclaimed")
+                .expect("item exists")
+                .state
+                .status,
+            replicant_workflow::WorkItemStatus::Pending
+        );
+        assert_eq!(
+            repository
+                .read_work_item(running[3].id)
+                .expect("read sibling")
+                .expect("item exists")
+                .state
+                .status,
+            replicant_workflow::WorkItemStatus::Succeeded
+        );
     }
 }

@@ -221,6 +221,25 @@ export interface DirectorWorkforceSummary {
   scale_reason: string | null;
 }
 
+export interface DirectorUrgencyFact {
+  automation: string;
+  campaign: string;
+  item: string | null;
+  buffer: number | null;
+  burn_rate_per_hour: number | null;
+  deadline_at_ms: number | null;
+  lateness_cost: Record<string, unknown>;
+  loss_over_one_hour: number;
+  floor: number;
+  ceiling: number;
+  current_grants: number;
+  target_grants: number;
+  urgency: number;
+  hysteresis_ratio: number | null;
+  action: string;
+  reasons: string[];
+}
+
 export interface DirectorSnapshot {
   metadata: SnapshotMetadata;
   mode: DirectorMode;
@@ -229,6 +248,7 @@ export interface DirectorSnapshot {
   replicants: DirectorReplicantAssignment[];
   requirements: DirectorRequirementSummary[];
   workforce: DirectorWorkforceSummary;
+  urgency?: DirectorUrgencyFact[];
 }
 
 export interface SnapshotMetadata {

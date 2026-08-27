@@ -405,6 +405,43 @@ pub struct DirectorWorkforceSummary {
     pub scale_reason: Option<String>,
 }
 
+/// Additive derived-urgency facts emitted by the Automation Director.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectorUrgencyFact {
+    /// Stable automation key.
+    pub automation: String,
+    /// Stable campaign identity.
+    pub campaign: String,
+    /// Head pending item considered by the scheduler.
+    pub item: Option<String>,
+    /// Observed buffer, when available.
+    pub buffer: Option<f64>,
+    /// Observed hourly burn, when available.
+    pub burn_rate_per_hour: Option<f64>,
+    /// Derived or explicit deadline.
+    pub deadline_at_ms: Option<i64>,
+    /// Declared lateness-cost model.
+    pub lateness_cost: Value,
+    /// One-hour loss used in urgency comparison.
+    pub loss_over_one_hour: f64,
+    /// Enabled runnable floor.
+    pub floor: u32,
+    /// Runnable and eligible ceiling.
+    pub ceiling: u32,
+    /// Current durable grants.
+    pub current_grants: u32,
+    /// Scheduler target grants.
+    pub target_grants: u32,
+    /// Derived urgency score.
+    pub urgency: f64,
+    /// Recipient/donor urgency ratio when reclaim hysteresis applies.
+    pub hysteresis_ratio: Option<f64>,
+    /// Selected action string.
+    pub action: String,
+    /// Deterministic explanation reasons.
+    pub reasons: Vec<String>,
+}
+
 /// Complete Automation Director projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectorSnapshot {
@@ -423,6 +460,9 @@ pub struct DirectorSnapshot {
     pub requirements: Vec<DirectorRequirementSummary>,
     /// Empire-wide workforce pressure.
     pub workforce: DirectorWorkforceSummary,
+    /// Derived urgency and assignment facts for migrated campaigns.
+    #[serde(default)]
+    pub urgency: Vec<DirectorUrgencyFact>,
 }
 
 /// Updates the Director operating mode.

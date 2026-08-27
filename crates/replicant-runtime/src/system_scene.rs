@@ -400,14 +400,14 @@ fn workflow_markers(workflows: &[WorkflowInstance], system: &str) -> Vec<SystemW
                 "survey.route" => workflow
                     .config::<SurveyWorkflowConfig>()
                     .ok()
-                    .and_then(|config| (config.options.center == system).then_some(system)),
+                    .and_then(|config| (config.center == system).then_some(system)),
                 "relay.expansion" => {
                     workflow
                         .config::<RelayWorkflowConfig>()
                         .ok()
                         .and_then(|config| {
-                            (config.request.hub.starts_with(system)
-                                || config.request.targets.iter().any(|target| target == system))
+                            (config.hub.starts_with(system)
+                                || config.targets.iter().any(|target| target == system))
                             .then_some(system)
                         })
                 }

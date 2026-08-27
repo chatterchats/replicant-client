@@ -61,7 +61,7 @@
   "notes": [
     "Versioned reference snapshots live under reference/replicant-space-X-Y-Z; scripts/reference_snapshot.py selects the highest semantic version as the current contract.",
     "Crawler-internal .source-html and .crawl-cache.json artifacts are not contract content. manifest.json and openapi.json are retained in handoff ZIPs and verified by scripts/contract_policy_check.py.",
-    "Replicant Space 2.5.2 keeps 75 paths, 89 operations, 160 schemas, and 87 rendered pages. The schema set is unchanged; WebhookInfoSchema adds nullable blocked_until and MessageSettingsSchema only reorders an enum."
+    "Replicant Space 2.5.2 keeps 75 paths, 89 operations, 160 schemas, and 87 rendered pages. The schema set is unchanged; WebhookInfoSchema adds nullable blocked_until and MessageSettingsSchema only reorders an enum. The print.completed event adds compacted, system.object_detected adds impact_eta, and AMI Mining Controllers reactively re-evaluate after new-site discovery and resource depletion."
   ],
   "documentation_version": "2.5.2",
   "documentation_crawled_at": "2026-08-25T15:34:33.019856+00:00",

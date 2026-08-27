@@ -5,12 +5,18 @@
 //! independent upstream event connections. Events only wake a workflow—the
 //! managed durable state predicate remains the source of truth.
 
+mod allocation;
 mod model;
 mod registry;
 mod repository;
 mod supervisor;
 mod telemetry;
+mod work;
 
+pub use allocation::{
+    AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, AllocationState,
+    ReplacementOutcome, RequirementScope, ResourceAllocation, ResourceRequirement,
+};
 pub use model::{
     AutomationPolicy, AutomationTrigger, ClaimAcquireOutcome, FiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
@@ -25,3 +31,8 @@ pub use supervisor::{
     WorkflowSupervisor, WorkflowWaitError,
 };
 pub use telemetry::{WorkflowTelemetrySample, WorkflowTelemetrySink};
+pub use work::{
+    CampaignCounts, CampaignItemResult, CampaignOutcome, CampaignResult, WorkItem, WorkItemAttempt,
+    WorkItemAttemptOutcome, WorkItemId, WorkItemSpec, WorkItemState, WorkItemStatus,
+    WorkItemTransition,
+};

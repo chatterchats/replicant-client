@@ -86,6 +86,10 @@ use replicant_client::{
     Client, Device, DeviceType, Error as ClientError, Event, Operation, OperationStatus, Realm,
     SurveyDirective, SyncDomain, domain::GalacticPosition, managed::GalaxyGateway, raw,
 };
+use replicant_workflow::{
+    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowId,
+    WorkflowKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -280,7 +284,7 @@ fn required_device<'a>(
 const PLAN_VERSION: u32 = 3;
 const LEGACY_PLAN_VERSION: u32 = 1;
 const PRE_MAINTENANCE_PLAN_VERSION: u32 = 2;
-const DRONE_COUNT: usize = 3;
+pub(crate) const DRONE_COUNT: usize = 3;
 const DEFAULT_MAINTENANCE_INTERVAL: usize = 40;
 const DEFAULT_MAINTENANCE_THRESHOLD_PCT: f64 = 25.0;
 const DEFAULT_MAINTENANCE_RESUME_PCT: f64 = 95.0;
@@ -546,6 +550,245 @@ impl SurveyExecutionState {
             .collect();
         (&self.replicant, &self.vessel, devices)
     }
+}
+
+/// Materializes each unfinished route stop as independently assignable survey work.
+pub fn survey_work_item_specs(
+    workflow_id: WorkflowId,
+    state: &SurveyExecutionState,
+    region: &str,
+) -> Result<Vec<WorkItemSpec>, replicant_workflow::RepositoryError> {
+    let kind = WorkflowKind::new("survey.stop")?;
+    state
+        .route
+        .iter()
+        .enumerate()
+        .map(|(index, stop)| {
+            Ok(WorkItemSpec {
+                workflow_id,
+                dedupe_key: format!("survey.stop:{}", stop.star),
+                kind: kind.clone(),
+                sort_key: format!("{index:08}:{}", stop.star),
+                payload_json: serde_json::json!({
+                    "star": stop.star,
+                    "entry_point": stop.entry_point,
+                    "survey_required": stop.survey_required,
+                    "legacy_complete": index < state.next_index,
+                }),
+                preconditions_json: serde_json::json!([{
+                    "kind": "survey.incomplete",
+                    "parameters": { "star": stop.star }
+                }]),
+                requirements_json: serde_json::to_value([
+                    ResourceRequirement {
+                        key: "worker".into(),
+                        kind: "replicant".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "vessel".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["racing_vessel".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "controller".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["survey_controller".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "drones".into(),
+                        kind: "device".into(),
+                        capabilities: vec!["survey_drone".into()],
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: u32::try_from(DRONE_COUNT).unwrap_or(u32::MAX),
+                        quantity: 1,
+                    },
+                    ResourceRequirement {
+                        key: "stow".into(),
+                        kind: "stow".into(),
+                        capabilities: Vec::new(),
+                        scope: RequirementScope::Region(region.to_owned()),
+                        count: 1,
+                        quantity: u64::try_from(DRONE_COUNT + 1).unwrap_or(u64::MAX),
+                    },
+                ])?,
+                deadline_at_ms: None,
+            })
+        })
+        .collect()
+}
+
+/// Executes one route stop using the exact bundle returned by the resource broker.
+pub async fn execute_survey_item<F>(
+    client: &Client,
+    state: &SurveyExecutionState,
+    route_index: usize,
+    allocations: &AllocationSet,
+    travel_timeout: Duration,
+    survey_timeout: Duration,
+    mut checkpoint: F,
+) -> AnyResult<SurveyExecutionState>
+where
+    F: FnMut(SurveyExecutionState) -> AnyResult<()>,
+{
+    let worker = survey_allocation_identity(allocations, "worker", "replicant")?;
+    let vessel = survey_allocation_identity(allocations, "vessel", "device")?;
+    let controller = survey_allocation_identity(allocations, "controller", "device")?;
+    let drones = survey_allocation_identities(allocations, "drones", "device")?;
+    let stop = state.route.get(route_index).cloned().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidInput,
+            format!("survey route index {route_index} is outside the checkpoint"),
+        )
+    })?;
+    let mut lane = state.clone();
+    lane.replicant.clone_from(&worker);
+    lane.vessel.clone_from(&vessel);
+    lane.controller = Some(controller.clone());
+    lane.drones.clone_from(&drones);
+    lane.fleet_prepared = false;
+    lane.route = vec![stop];
+    lane.next_index = 0;
+    lane.phase = RunPhase::PreparingFleet;
+    let plan_path = std::env::temp_dir().join(format!(
+        "replicant-survey-item-{}-{route_index}.json",
+        lane.created_unix_seconds
+    ));
+    save_plan(&plan_path, &lane)?;
+    let options = SurveyOptions {
+        mode: SurveyMode::Run,
+        replicant: worker,
+        vessel,
+        center: lane.center.clone(),
+        radius_ly: lane.radius_ly,
+        system_limit: 1,
+        target_systems: Some(vec![lane.route[0].star.clone()]),
+        star_detail_concurrency: 1,
+        mission_file: plan_path.clone(),
+        controller: Some(controller),
+        drones: Some(drones),
+        replace_plan: false,
+        include_explored: true,
+        travel_timeout,
+        survey_timeout,
+        maintenance_home: lane.maintenance_home.clone(),
+        maintenance_interval: lane.maintenance_interval,
+        maintenance_threshold_pct: lane.maintenance_threshold_pct,
+        maintenance_resume_pct: lane.maintenance_resume_pct,
+        maintenance_check_interval: Duration::from_secs(lane.maintenance_check_seconds),
+    };
+    let result = execute_survey_workflow(client, &options, &mut checkpoint).await;
+    let final_state = fs::read(&plan_path)
+        .map_err(AnyError::from)
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(AnyError::from));
+    let _ = fs::remove_file(plan_path);
+    result?;
+    let final_state: SurveyExecutionState = final_state?;
+    checkpoint(final_state.clone())?;
+    Ok(final_state)
+}
+
+/// Builds and reconciles a survey route without executing its stops.
+pub async fn prepare_survey_workflow(
+    client: &Client,
+    options: &SurveyOptions,
+) -> AnyResult<SurveyExecutionState> {
+    let mut options = options.clone();
+    options.mode = SurveyMode::Plan;
+    execute_survey_route(client, &options).await?;
+    let mut state: SurveyExecutionState =
+        serde_json::from_slice(&fs::read(&options.mission_file)?)?;
+    state.migrate()?;
+    state.normalize_progress();
+    Ok(state)
+}
+
+/// Returns the historical planning identities used only for migration evidence.
+#[must_use]
+pub fn survey_checkpoint_identities(state: &SurveyExecutionState) -> (&str, &str) {
+    (&state.replicant, &state.vessel)
+}
+
+/// Returns whether the isolated stop checkpoint completed.
+#[must_use]
+pub fn survey_item_completed(state: &SurveyExecutionState) -> bool {
+    state.next_index >= state.route.len() && state.phase == RunPhase::Complete
+}
+
+/// Locates a durable item payload in the workflow-owned route checkpoint.
+#[must_use]
+pub fn survey_item_route_index(state: &SurveyExecutionState, star: &str) -> Option<usize> {
+    state.route.iter().position(|stop| stop.star == star)
+}
+
+/// Merges one terminal stop checkpoint without regressing sibling progress.
+pub fn merge_survey_item_state(
+    state: &mut SurveyExecutionState,
+    lane: &SurveyExecutionState,
+    route_index: usize,
+) {
+    if let (Some(target), Some(source)) = (state.route.get_mut(route_index), lane.route.first()) {
+        target.clone_from(source);
+    }
+    while state.next_index < state.route.len() {
+        let stop = &state.route[state.next_index];
+        if !stop.system_scan_done || (stop.survey_required && !stop.survey_done) {
+            break;
+        }
+        state.next_index += 1;
+    }
+    state.phase = if state.next_index == state.route.len() {
+        RunPhase::Complete
+    } else {
+        RunPhase::Ready
+    };
+}
+
+fn survey_allocation_identity(
+    allocations: &AllocationSet,
+    requirement: &str,
+    expected: &str,
+) -> AnyResult<String> {
+    survey_allocation_identities(allocations, requirement, expected)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "empty survey allocation"))
+}
+
+fn survey_allocation_identities(
+    allocations: &AllocationSet,
+    requirement: &str,
+    expected: &str,
+) -> AnyResult<Vec<String>> {
+    allocations
+        .by_requirement
+        .get(requirement)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("survey item allocation omitted {requirement}"),
+            )
+        })?
+        .iter()
+        .map(|allocation| match (&allocation.resource, expected) {
+            (ResourceKey::Replicant(code), "replicant") | (ResourceKey::Device(code), "device") => {
+                Ok(code.clone())
+            }
+            _ => Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!("survey allocation {requirement} has the wrong resource kind"),
+            )),
+        })
+        .collect()
 }
 
 struct MissionLock {
@@ -4926,6 +5169,10 @@ mod tests {
     use replicant_client::{
         DeviceId, DeviceKey, SecretString, StarId, StartupPolicy, domain::StarKey, raw::Url,
     };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     use wiremock::{
         Mock, MockServer, Request, ResponseTemplate,
         matchers::{method, path, path_regex},
@@ -4940,6 +5187,140 @@ mod tests {
             .start()
             .await
             .expect("start test client")
+    }
+
+    async fn seed_survey_bundle(
+        server: &MockServer,
+        client: &Client,
+        worker: &str,
+        vessel: &str,
+        controller: &str,
+        drone_count: usize,
+        stow_capacity: i64,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/replicants/{worker}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": worker,
+                "hosted_device_code": vessel,
+                "location": "ROOT-1-L4",
+                "status": "active"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        client
+            .replicants()
+            .get_owned(worker)
+            .await
+            .expect("seed worker");
+        let mut devices = vec![
+            (vessel.to_owned(), "racing_vessel".to_owned()),
+            (controller.to_owned(), "survey_controller".to_owned()),
+        ];
+        devices.extend(
+            (1..=drone_count)
+                .map(|index| (format!("{worker}-DRONE-{index}"), "survey_drone".into())),
+        );
+        for (code, device_type) in devices {
+            let mut body = serde_json::json!({
+                "device_code": code,
+                "device_type": device_type,
+                "replicant_code": worker,
+                "location": "ROOT-1-L4",
+                "status": "idle"
+            });
+            if code == vessel {
+                body["stow_capacity"] = stow_capacity.into();
+                body["stow_used"] = 0.into();
+            }
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/devices/{code}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(server)
+                .await;
+            client.devices().get(&code).await.expect("seed device");
+        }
+    }
+
+    struct FixtureSurveyItemExecutor {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        first_wave: tokio::sync::Barrier,
+        workers: Mutex<BTreeSet<String>>,
+        drone_counts: Mutex<Vec<usize>>,
+        maintenance_recovered: AtomicBool,
+    }
+
+    impl FixtureSurveyItemExecutor {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                first_wave: tokio::sync::Barrier::new(2),
+                workers: Mutex::new(BTreeSet::new()),
+                drone_counts: Mutex::new(Vec::new()),
+                maintenance_recovered: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::workflows::SurveyItemExecutor for FixtureSurveyItemExecutor {
+        fn execute<'a>(
+            &'a self,
+            _client: &'a Client,
+            state: &'a SurveyExecutionState,
+            route_index: usize,
+            allocations: &'a AllocationSet,
+            _timeouts: (Duration, Duration),
+            checkpoints: tokio::sync::mpsc::UnboundedSender<SurveyExecutionState>,
+        ) -> crate::workflows::SurveyItemFuture<'a> {
+            let mut lane = state.clone();
+            let stop = lane.route[route_index].clone();
+            lane.route = vec![stop];
+            lane.next_index = 0;
+            let worker = allocations
+                .by_requirement
+                .get("worker")
+                .and_then(|values| values.first())
+                .and_then(|allocation| match &allocation.resource {
+                    ResourceKey::Replicant(code) => Some(code.clone()),
+                    _ => None,
+                });
+            let drone_count = allocations.by_requirement.get("drones").map_or(0, Vec::len);
+            Box::pin(async move {
+                let worker =
+                    worker.ok_or_else(|| app_error(io::ErrorKind::InvalidData, "worker"))?;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.workers.lock().expect("workers").insert(worker);
+                self.drone_counts
+                    .lock()
+                    .expect("drone counts")
+                    .push(drone_count);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                self.first_wave.wait().await;
+                if lane.route[0].star == "PENDING-2" {
+                    lane.phase = RunPhase::MaintenanceRepairing;
+                    checkpoints
+                        .send(lane.clone())
+                        .map_err(|_| app_error(io::ErrorKind::BrokenPipe, "checkpoint"))?;
+                    self.maintenance_recovered.store(true, Ordering::SeqCst);
+                }
+                lane.route[0].system_scan_done = true;
+                lane.route[0].survey_done = true;
+                lane.next_index = 1;
+                lane.phase = RunPhase::Complete;
+                checkpoints
+                    .send(lane.clone())
+                    .map_err(|_| app_error(io::ErrorKind::BrokenPipe, "checkpoint"))?;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(lane)
+            })
+        }
     }
 
     fn missing_stars(count: usize) -> Vec<String> {
@@ -5915,5 +6296,324 @@ mod tests {
             .filter(|status| survey_directive_needs_recall(Some(status)))
             .count();
         assert_eq!(unsafe_withdraws, 1);
+    }
+    fn survey_pool_state() -> SurveyExecutionState {
+        serde_json::from_value(serde_json::json!({
+            "version": PLAN_VERSION,
+            "created_unix_seconds": 1,
+            "replicant": "LEGACY-REP",
+            "vessel": "LEGACY-VESSEL",
+            "center": "ROOT",
+            "radius_ly": 10.0,
+            "system_limit": 2,
+            "include_explored": false,
+            "maintenance_home": "ROOT",
+            "maintenance_interval": 40,
+            "maintenance_threshold_pct": 25.0,
+            "maintenance_resume_pct": 95.0,
+            "maintenance_check_seconds": 60,
+            "last_maintenance_index": 0,
+            "controller": "CTRL-1",
+            "drones": ["DRONE-1", "DRONE-2", "DRONE-3"],
+            "fleet_prepared": true,
+            "route": [
+                {
+                    "star": "DONE",
+                    "entry_point": "DONE-1-L4",
+                    "distance_from_center_ly": 1.0,
+                    "leg_distance_ly": 1.0,
+                    "survey_required": true,
+                    "system_scan_done": true,
+                    "survey_done": true
+                },
+                {
+                    "star": "PENDING",
+                    "entry_point": "PENDING-1-L4",
+                    "distance_from_center_ly": 2.0,
+                    "leg_distance_ly": 1.0,
+                    "survey_required": true,
+                    "system_scan_done": false,
+                    "survey_done": false
+                }
+            ],
+            "next_index": 1,
+            "phase": "ready"
+        }))
+        .expect("survey state")
+    }
+
+    #[test]
+    fn survey_pool_migration_materializes_completed_and_pending_stop_evidence() {
+        let state = survey_pool_state();
+        let specs = survey_work_item_specs(WorkflowId::new(), &state, "Alpha").expect("specs");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].payload_json["legacy_complete"], true);
+        assert_eq!(specs[1].payload_json["legacy_complete"], false);
+        let requirements: Vec<ResourceRequirement> =
+            serde_json::from_value(specs[1].requirements_json.clone()).expect("requirements");
+        assert_eq!(
+            requirements
+                .iter()
+                .find(|requirement| requirement.key == "drones")
+                .expect("drone requirement")
+                .count,
+            3
+        );
+        assert!(requirements.iter().all(|requirement| {
+            requirement.scope == RequirementScope::Region("Alpha".to_owned())
+        }));
+    }
+
+    #[test]
+    fn survey_pool_merge_preserves_completed_sibling_and_finishes_route() {
+        let mut state = survey_pool_state();
+        let mut lane = state.clone();
+        lane.route = vec![state.route[1].clone()];
+        lane.route[0].system_scan_done = true;
+        lane.route[0].survey_done = true;
+        lane.next_index = 1;
+        lane.phase = RunPhase::Complete;
+        merge_survey_item_state(&mut state, &lane, 1);
+        assert_eq!(state.next_index, 2);
+        assert_eq!(state.phase, RunPhase::Complete);
+        assert!(state.route[0].survey_done);
+        assert!(state.route[1].survey_done);
+    }
+    #[test]
+    fn survey_pool_schema_one_migration_preserves_progress_and_drops_identities() {
+        use replicant_workflow::WorkflowFactory;
+
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let state = survey_pool_state();
+        let options = SurveyOptions {
+            mode: SurveyMode::Run,
+            replicant: "LEGACY-REP".into(),
+            vessel: "LEGACY-VESSEL".into(),
+            center: "ROOT".into(),
+            radius_ly: 10.0,
+            system_limit: 3,
+            target_systems: Some(vec!["DONE".into(), "PENDING".into()]),
+            star_detail_concurrency: 2,
+            mission_file: PathBuf::from("legacy-survey.json"),
+            controller: Some("CTRL-1".into()),
+            drones: Some(vec!["D-1".into(), "D-2".into(), "D-3".into()]),
+            replace_plan: false,
+            include_explored: false,
+            travel_timeout: Duration::new(60, 123),
+            survey_timeout: Duration::new(90, 456),
+            maintenance_home: "ROOT".into(),
+            maintenance_interval: 40,
+            maintenance_threshold_pct: 25.0,
+            maintenance_resume_pct: 95.0,
+            maintenance_check_interval: Duration::from_secs(60),
+        };
+        let legacy = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::workflows::survey_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({ "options": options }),
+                checkpoint: crate::workflows::SurveyWorkflowCheckpoint {
+                    state: Some(state.clone()),
+                    completed_steps: BTreeSet::from(["surveying".into()]),
+                    migration_worker: None,
+                },
+                current_step: Some("surveying".into()),
+                parent_id: None,
+            })
+            .expect("legacy workflow");
+        let factory = crate::workflows::SurveyWorkflowFactory::new();
+        let migration = factory
+            .migrate(&legacy)
+            .expect("migration")
+            .expect("schema-one migration");
+        let config: crate::workflows::SurveyWorkflowConfig =
+            serde_json::from_value(migration.config().clone()).expect("config");
+        assert!(config.region.is_empty());
+        assert!(migration.config().get("replicant").is_none());
+        assert!(migration.config().get("vessel").is_none());
+        assert!(migration.config().get("controller").is_none());
+        assert!(migration.config().get("drones").is_none());
+        assert_eq!(config.travel_timeout, Duration::new(60, 123));
+        assert_eq!(config.survey_timeout, Duration::new(90, 456));
+        let checkpoint: crate::workflows::SurveyWorkflowCheckpoint =
+            serde_json::from_value(migration.checkpoint().clone()).expect("checkpoint");
+        assert_eq!(checkpoint.migration_worker.as_deref(), Some("LEGACY-REP"));
+        assert_eq!(
+            serde_json::to_value(summarize_plan(checkpoint.state.as_ref().expect("state")))
+                .expect("migrated summary"),
+            serde_json::to_value(summarize_plan(&state)).expect("legacy summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn survey_pool_registered_workflow_overlaps_bundles_and_resumes_maintenance() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        seed_survey_bundle(&server, &client, "REP-A", "VESSEL-A", "CTRL-A", 3, 4).await;
+        seed_survey_bundle(&server, &client, "REP-B", "VESSEL-B", "CTRL-B", 4, 5).await;
+
+        let mut state = survey_pool_state();
+        let mut second = state.route[1].clone();
+        second.star = "PENDING-2".into();
+        second.entry_point = Some("PENDING-2-1-L4".into());
+        state.route.push(second);
+        state.system_limit = 3;
+        let database_path = std::env::temp_dir().join(format!(
+            "survey-pool-restart-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let repository = Arc::new(
+            replicant_workflow::WorkflowRepository::open(&database_path).expect("repository"),
+        );
+        for worker in ["LEGACY-REP", "REP-A", "REP-B"] {
+            repository
+                .put_document(
+                    "director.replicant",
+                    worker,
+                    &serde_json::json!({ "region": "Alpha" }),
+                )
+                .expect("Director region");
+        }
+        let workflow = repository
+            .create(replicant_workflow::NewWorkflow {
+                kind: crate::workflows::survey_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "options": SurveyOptions {
+                        mode: SurveyMode::Run,
+                        replicant: "LEGACY-REP".into(),
+                        vessel: "LEGACY-VESSEL".into(),
+                        center: "ROOT".into(),
+                        radius_ly: 10.0,
+                        system_limit: 3,
+                        target_systems: Some(vec![
+                            "DONE".into(),
+                            "PENDING".into(),
+                            "PENDING-2".into(),
+                        ]),
+                        star_detail_concurrency: 2,
+                        mission_file: std::env::temp_dir().join("survey-pool-fixture.json"),
+                        controller: Some("LEGACY-CTRL".into()),
+                        drones: Some(vec!["LEGACY-D1".into(), "LEGACY-D2".into(), "LEGACY-D3".into()]),
+                        replace_plan: false,
+                        include_explored: false,
+                        travel_timeout: Duration::from_secs(1),
+                        survey_timeout: Duration::from_secs(1),
+                        maintenance_home: "ROOT".into(),
+                        maintenance_interval: 40,
+                        maintenance_threshold_pct: 25.0,
+                        maintenance_resume_pct: 95.0,
+                        maintenance_check_interval: Duration::from_secs(1),
+                    }
+                }),
+                checkpoint: crate::workflows::SurveyWorkflowCheckpoint {
+                    state: Some(state),
+                    completed_steps: BTreeSet::from(["surveying".into()]),
+                    migration_worker: None,
+                },
+                current_step: Some("surveying".into()),
+                parent_id: None,
+            })
+            .expect("schema-one workflow");
+        let executor = Arc::new(FixtureSurveyItemExecutor::new());
+        let mut registry = replicant_workflow::WorkflowRegistry::new();
+        registry
+            .register(Arc::new(
+                crate::workflows::SurveyWorkflowFactory::with_item_executor(executor.clone()),
+            ))
+            .expect("register survey workflow");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..100 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workflow = repository
+            .read(workflow.id)
+            .expect("read workflow")
+            .expect("workflow");
+        assert_eq!(
+            workflow.status,
+            replicant_workflow::WorkflowStatus::Succeeded,
+            "{:?}",
+            workflow.last_error
+        );
+        let items = repository.list_work_items(workflow.id).expect("items");
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.state.status == replicant_workflow::WorkItemStatus::Skipped)
+                .count(),
+            1,
+            "the completed body must not execute"
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(executor.peak.load(Ordering::SeqCst), 2);
+        assert_eq!(executor.workers.lock().expect("workers").len(), 2);
+        assert_eq!(
+            *executor.drone_counts.lock().expect("drone counts"),
+            [3, 4],
+            "allocated fleet capacity must determine each survey shard"
+        );
+        assert!(executor.maintenance_recovered.load(Ordering::SeqCst));
+        let summary = workflow
+            .result::<Value>()
+            .expect("summary")
+            .expect("summary value");
+        assert_eq!(summary["completed_stops"], 3);
+        assert_eq!(summary["total_stops"], 3);
+        let calls = executor.calls.load(Ordering::SeqCst);
+        drop(supervisor);
+        drop(repository);
+        let repository = Arc::new(
+            replicant_workflow::WorkflowRepository::open(&database_path)
+                .expect("reopen workflow repository"),
+        );
+        let mut restarted_registry = replicant_workflow::WorkflowRegistry::new();
+        restarted_registry
+            .register(Arc::new(
+                crate::workflows::SurveyWorkflowFactory::with_item_executor(executor.clone()),
+            ))
+            .expect("register restarted survey workflow");
+        let restarted_supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository,
+            Arc::new(restarted_registry),
+            client.clone(),
+        );
+        for _ in 0..3 {
+            restarted_supervisor
+                .tick()
+                .await
+                .expect("post-restart supervisor tick");
+        }
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            calls,
+            "reopening the workflow database must not rescan completed bodies"
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "completed bodies and injected item execution submit no travel/scan mutation"
+        );
+        client.close().await.expect("close client");
     }
 }

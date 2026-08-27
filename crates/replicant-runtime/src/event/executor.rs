@@ -4101,7 +4101,7 @@ async fn travel_replicant_to(
     .await
 }
 
-async fn travel_fleet_to(
+pub(crate) async fn travel_fleet_to(
     client: &Client,
     config: &Config,
     devices: &[String],
@@ -4171,7 +4171,7 @@ fn finish_all(results: Vec<AnyResult<()>>) -> AnyResult<()> {
     Ok(())
 }
 
-async fn collect_resources(
+pub(crate) async fn collect_resources(
     client: &Client,
     config: &Config,
     code: &str,
@@ -4210,7 +4210,7 @@ async fn deposit_all(client: &Client, config: &Config, code: &str) -> AnyResult<
     deposit_resources(client, config, code, None).await
 }
 
-async fn deposit_resources(
+pub(crate) async fn deposit_resources(
     client: &Client,
     config: &Config,
     code: &str,

@@ -12,7 +12,11 @@
 use replicant_client::Client;
 use std::error::Error;
 
+/// Durable work-item resource discovery and allocation.
+pub mod assignment;
 mod failure;
+/// Derived-urgency and elastic worker scheduling.
+pub mod scheduler;
 
 /// Error returned by an application report or action.
 pub type ApplicationError = Box<dyn Error + Send + Sync + 'static>;

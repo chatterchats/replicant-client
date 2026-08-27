@@ -18,6 +18,10 @@ use replicant_mining_planner::{
     site_tag,
 };
 use replicant_printing::managed::discover_factories;
+use replicant_workflow::{
+    AllocationSet, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowId,
+    WorkflowKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
@@ -313,6 +317,458 @@ impl MiningMission {
                     .sum(),
             ),
         }
+    }
+}
+
+/// Materializes mining sites, routes, and shared manufacturing as durable work items.
+pub fn mining_work_item_specs(
+    workflow_id: WorkflowId,
+    mission: &MiningMission,
+    region: &str,
+) -> Result<Vec<WorkItemSpec>, replicant_workflow::RepositoryError> {
+    let mut specs = Vec::new();
+    let site_kind = WorkflowKind::new("mining.site")?;
+    for (index, site) in mission.sites.iter().enumerate() {
+        specs.push(WorkItemSpec {
+            workflow_id,
+            dedupe_key: format!("mining.site:{}", site.belt),
+            kind: site_kind.clone(),
+            sort_key: format!("1:{index:08}:{}", site.belt),
+            payload_json: serde_json::json!({
+                "type": "site",
+                "index": index,
+                "system": site.system,
+                "belt": site.belt,
+                "legacy_complete": site.phase == SitePhase::Operational,
+            }),
+            preconditions_json: serde_json::json!([{
+                "kind": "mining.site_incomplete",
+                "parameters": { "belt": site.belt }
+            }]),
+            requirements_json: serde_json::to_value(mining_site_item_requirements(region))?,
+            deadline_at_ms: None,
+        });
+    }
+    let route_kind = WorkflowKind::new("mining.route")?;
+    for (index, route) in mission.routes.iter().enumerate() {
+        specs.push(WorkItemSpec {
+            workflow_id,
+            dedupe_key: format!("mining.route:{}:{}", route.belt, mission.hub_location),
+            kind: route_kind.clone(),
+            sort_key: format!("2:{index:08}:{}", route.belt),
+            payload_json: serde_json::json!({
+                "type": "route",
+                "index": index,
+                "system": route.system,
+                "belt": route.belt,
+                "legacy_complete": route.phase == RoutePhase::Active,
+            }),
+            preconditions_json: serde_json::json!([{
+                "kind": "mining.route_inactive",
+                "parameters": { "belt": route.belt, "hub": mission.hub_location }
+            }]),
+            requirements_json: serde_json::to_value(mining_route_item_requirements(region))?,
+            deadline_at_ms: None,
+        });
+    }
+    if !mission.print_batches.is_empty() {
+        let stage_kind = WorkflowKind::new("mining.stage")?;
+        let mut requirements = vec![
+            ResourceRequirement {
+                key: "worker".into(),
+                kind: "replicant".into(),
+                capabilities: Vec::new(),
+                scope: RequirementScope::Region(region.to_owned()),
+                count: 1,
+                quantity: 1,
+            },
+            ResourceRequirement {
+                key: "autofactory".into(),
+                kind: "autofactory".into(),
+                capabilities: Vec::new(),
+                scope: RequirementScope::Location(mission.hub_location.clone()),
+                count: 1,
+                quantity: 1,
+            },
+        ];
+        requirements.extend(mission.total_material_cost.iter().filter_map(
+            |(resource, quantity)| {
+                let quantity = u64::try_from(*quantity).ok()?;
+                (quantity != 0).then(|| ResourceRequirement {
+                    key: format!("material:{resource}"),
+                    kind: "material".into(),
+                    capabilities: vec![resource.clone()],
+                    scope: RequirementScope::Location(mission.hub_location.clone()),
+                    count: 1,
+                    quantity,
+                })
+            },
+        ));
+        specs.push(WorkItemSpec {
+            workflow_id,
+            dedupe_key: "mining.stage:manufacturing".into(),
+            kind: stage_kind,
+            sort_key: "0:manufacturing".into(),
+            payload_json: serde_json::json!({
+                "type": "stage",
+                "index": 0,
+                "legacy_complete": mission.print_batches.iter().all(|batch| {
+                    usize::try_from(batch.quantity)
+                        .is_ok_and(|quantity| batch.produced_codes.len() >= quantity)
+                }),
+            }),
+            preconditions_json: serde_json::json!([]),
+            requirements_json: serde_json::to_value(requirements)?,
+            deadline_at_ms: None,
+        });
+    }
+    Ok(specs)
+}
+
+fn mining_site_item_requirements(region: &str) -> Vec<ResourceRequirement> {
+    let scope = || RequirementScope::Region(region.to_owned());
+    vec![
+        ResourceRequirement {
+            key: "worker".into(),
+            kind: "replicant".into(),
+            capabilities: Vec::new(),
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "mining_controller".into(),
+            kind: "device".into(),
+            capabilities: vec![MINING_CONTROLLER.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "mining_drones".into(),
+            kind: "device".into(),
+            capabilities: vec![MINING_DRONE.into()],
+            scope: scope(),
+            count: 4,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "survey_controller".into(),
+            kind: "device".into(),
+            capabilities: vec![SURVEY_CONTROLLER.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "survey_drones".into(),
+            kind: "device".into(),
+            capabilities: vec![SURVEY_DRONE.into()],
+            scope: scope(),
+            count: 2,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "maintenance_drone".into(),
+            kind: "device".into(),
+            capabilities: vec![MAINTENANCE_DRONE.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "carrier".into(),
+            kind: "device".into(),
+            capabilities: vec![CARGO_FREIGHTER.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "stow".into(),
+            kind: "stow".into(),
+            capabilities: Vec::new(),
+            scope: scope(),
+            count: 1,
+            quantity: 9,
+        },
+    ]
+}
+
+fn mining_route_item_requirements(region: &str) -> Vec<ResourceRequirement> {
+    let scope = || RequirementScope::Region(region.to_owned());
+    vec![
+        ResourceRequirement {
+            key: "worker".into(),
+            kind: "replicant".into(),
+            capabilities: Vec::new(),
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "transport_controller".into(),
+            kind: "device".into(),
+            capabilities: vec![TRANSPORT_CONTROLLER.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "freighter".into(),
+            kind: "device".into(),
+            capabilities: vec![CARGO_FREIGHTER.into()],
+            scope: scope(),
+            count: 1,
+            quantity: 1,
+        },
+        ResourceRequirement {
+            key: "stow".into(),
+            kind: "stow".into(),
+            capabilities: Vec::new(),
+            scope: scope(),
+            count: 1,
+            quantity: 2,
+        },
+    ]
+}
+
+/// Executes one isolated mining site, route, or manufacturing stage.
+pub async fn execute_mining_item(
+    client: &Client,
+    mission: &MiningMission,
+    item_type: &str,
+    index: usize,
+    allocations: &AllocationSet,
+    wait_timeout: Duration,
+) -> AnyResult<MiningMission> {
+    let worker = mining_allocated_identity(allocations, "worker", "replicant")?;
+    let mut lane = mission.clone();
+    lane.selected_replicant.clone_from(&worker);
+    match item_type {
+        "site" => {
+            let mut site = lane.sites.get(index).cloned().ok_or_else(|| {
+                app_error(io::ErrorKind::InvalidInput, "mining site index is invalid")
+            })?;
+            site.assets.mining_controller = Some(mining_allocated_identity(
+                allocations,
+                "mining_controller",
+                "device",
+            )?);
+            site.assets.mining_drones =
+                mining_allocated_identities(allocations, "mining_drones", "device")?;
+            site.assets.survey_controller = Some(mining_allocated_identity(
+                allocations,
+                "survey_controller",
+                "device",
+            )?);
+            site.assets.survey_drones =
+                mining_allocated_identities(allocations, "survey_drones", "device")?;
+            site.assets.maintenance_drone = Some(mining_allocated_identity(
+                allocations,
+                "maintenance_drone",
+                "device",
+            )?);
+            site.carrier = Some(mining_allocated_identity(allocations, "carrier", "device")?);
+            mining_validate_stow_owner(allocations, "carrier")?;
+            lane.sites = vec![site];
+            lane.routes.clear();
+            lane.print_batches
+                .retain(|batch| batch.purpose == PrintPurpose::Site);
+        }
+        "route" => {
+            let mut route = lane.routes.get(index).cloned().ok_or_else(|| {
+                app_error(io::ErrorKind::InvalidInput, "mining route index is invalid")
+            })?;
+            route.controller = Some(mining_allocated_identity(
+                allocations,
+                "transport_controller",
+                "device",
+            )?);
+            route.freighter = Some(mining_allocated_identity(
+                allocations,
+                "freighter",
+                "device",
+            )?);
+            mining_validate_stow_owner(allocations, "freighter")?;
+            lane.routes = vec![route];
+            lane.sites.clear();
+            lane.print_batches
+                .retain(|batch| batch.purpose == PrintPurpose::Route);
+        }
+        "stage" => {
+            let _ = mining_allocated_identity(allocations, "autofactory", "autofactory")?;
+            for (resource, quantity) in &mission.total_material_cost {
+                if *quantity > 0 {
+                    let key = format!("material:{resource}");
+                    let allocated = allocations
+                        .by_requirement
+                        .get(&key)
+                        .into_iter()
+                        .flatten()
+                        .map(|allocation| allocation.quantity)
+                        .sum::<u64>();
+                    if allocated < u64::try_from(*quantity).unwrap_or(u64::MAX) {
+                        return Err(app_error(
+                            io::ErrorKind::WouldBlock,
+                            format!("mining stage allocation omitted material {resource}"),
+                        ));
+                    }
+                }
+            }
+            lane.sites.clear();
+            lane.routes.clear();
+        }
+        _ => {
+            return Err(app_error(
+                io::ErrorKind::InvalidInput,
+                format!("unknown mining item type {item_type}"),
+            ));
+        }
+    }
+    let plan_path = std::env::temp_dir().join(format!(
+        "replicant-mining-item-{}-{item_type}-{index}.json",
+        lane.mission_id
+    ));
+    save_plan(&plan_path, &lane)?;
+    let request = MiningExpansionRequest {
+        systems: lane
+            .sites
+            .iter()
+            .map(|site| site.system.clone())
+            .chain(lane.routes.iter().map(|route| route.system.clone()))
+            .collect(),
+        replicant: worker,
+        hub: lane.hub_location.clone(),
+        mission_file: plan_path.clone(),
+        wait_timeout,
+        max_concurrency: 1,
+    };
+    let result = execute_expansion(client, &request).await;
+    let final_state = load_expansion(&plan_path);
+    let _ = fs::remove_file(plan_path);
+    result?;
+    final_state
+}
+
+fn mining_allocated_identity(
+    allocations: &AllocationSet,
+    requirement: &str,
+    expected: &str,
+) -> AnyResult<String> {
+    mining_allocated_identities(allocations, requirement, expected)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "empty mining allocation"))
+}
+
+fn mining_allocated_identities(
+    allocations: &AllocationSet,
+    requirement: &str,
+    expected: &str,
+) -> AnyResult<Vec<String>> {
+    allocations
+        .by_requirement
+        .get(requirement)
+        .ok_or_else(|| {
+            app_error(
+                io::ErrorKind::InvalidData,
+                format!("mining item allocation omitted {requirement}"),
+            )
+        })?
+        .iter()
+        .map(|allocation| match (&allocation.resource, expected) {
+            (ResourceKey::Replicant(code), "replicant")
+            | (ResourceKey::Device(code), "device")
+            | (ResourceKey::Autofactory(code), "autofactory") => Ok(code.clone()),
+            _ => Err(app_error(
+                io::ErrorKind::InvalidData,
+                format!("mining allocation {requirement} has the wrong resource kind"),
+            )),
+        })
+        .collect()
+}
+
+fn mining_validate_stow_owner(
+    allocations: &AllocationSet,
+    device_requirement: &str,
+) -> AnyResult<()> {
+    let device = mining_allocated_identity(allocations, device_requirement, "device")?;
+    let matching = allocations
+        .by_requirement
+        .get("stow")
+        .into_iter()
+        .flatten()
+        .any(|allocation| {
+            matches!(
+                &allocation.resource,
+                ResourceKey::Namespaced { namespace, key }
+                    if namespace == "stow" && key == &device
+            )
+        });
+    if !matching {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("mining item stow allocation does not belong to {device}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Merges one terminal mining item checkpoint into campaign state.
+pub fn merge_mining_item_state(
+    mission: &mut MiningMission,
+    lane: &MiningMission,
+    item_type: &str,
+    index: usize,
+) {
+    match item_type {
+        "site" => {
+            if let (Some(target), Some(source)) = (mission.sites.get_mut(index), lane.sites.first())
+            {
+                target.clone_from(source);
+            }
+        }
+        "route" => {
+            if let (Some(target), Some(source)) =
+                (mission.routes.get_mut(index), lane.routes.first())
+            {
+                target.clone_from(source);
+            }
+        }
+        "stage" => mission.print_batches.clone_from(&lane.print_batches),
+        _ => {}
+    }
+    if mission
+        .sites
+        .iter()
+        .all(|site| site.phase == SitePhase::Operational)
+        && mission
+            .routes
+            .iter()
+            .all(|route| route.phase == RoutePhase::Active)
+    {
+        mission.phase = MissionPhase::Completed;
+    }
+}
+
+/// Returns whether an isolated mining item reached its domain terminal state.
+#[must_use]
+pub fn mining_item_completed(mission: &MiningMission, item_type: &str) -> bool {
+    match item_type {
+        "site" => mission
+            .sites
+            .first()
+            .is_some_and(|site| site.phase == SitePhase::Operational),
+        "route" => mission
+            .routes
+            .first()
+            .is_some_and(|route| route.phase == RoutePhase::Active),
+        "stage" => mission.print_batches.iter().all(|batch| {
+            usize::try_from(batch.quantity)
+                .is_ok_and(|quantity| batch.produced_codes.len() >= quantity)
+        }),
+        _ => false,
     }
 }
 

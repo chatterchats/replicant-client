@@ -1,0 +1,318 @@
+use std::sync::Arc;
+
+use replicant_client::{Client, domain::InventoryOwner};
+use replicant_workflow::{
+    AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, ReplacementOutcome,
+    RepositoryError, ResourceKey, WorkItemId, WorkflowRepository,
+};
+
+/// Runtime failure while assigning resources to durable work.
+#[derive(Debug, thiserror::Error)]
+pub enum AssignmentError {
+    /// Durable allocation failed.
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+    /// Managed candidate discovery failed.
+    #[error(transparent)]
+    Managed(#[from] replicant_client::Error),
+}
+
+/// Runtime adapter between managed candidate discovery and atomic workflow allocation.
+#[derive(Clone)]
+pub struct ResourceBroker {
+    repository: Arc<WorkflowRepository>,
+    client: Option<Client>,
+}
+
+impl ResourceBroker {
+    /// Creates a broker for explicitly supplied candidate observations.
+    #[must_use]
+    pub fn new(repository: Arc<WorkflowRepository>) -> Self {
+        Self {
+            repository,
+            client: None,
+        }
+    }
+
+    /// Creates a broker that discovers candidates from one managed client snapshot.
+    #[must_use]
+    pub fn with_managed_client(repository: Arc<WorkflowRepository>, client: Client) -> Self {
+        Self {
+            repository,
+            client: Some(client),
+        }
+    }
+
+    /// Discovers exclusive, inventory, and stow pools from committed managed state.
+    pub fn discover_candidates(&self) -> Result<Vec<AllocationCandidate>, AssignmentError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or(replicant_client::Error::Closed)?;
+        let state = client.state();
+        let revision = state.revision()?;
+        let observed_at_ms = unix_millis();
+        let mut candidates = Vec::new();
+        for replicant in state.owned_replicants()? {
+            candidates.push(AllocationCandidate {
+                resource: ResourceKey::Replicant(replicant.key.id.to_string()),
+                kind: "replicant".into(),
+                capabilities: Vec::new(),
+                location: replicant.location.map(|location| AllocationLocation {
+                    designation: Some(location.id.to_string()),
+                    ..AllocationLocation::default()
+                }),
+                available_quantity: 1,
+                observed_revision: revision,
+                observed_at_ms,
+            });
+        }
+        for device in state.owned_devices()? {
+            let device_code = device.key.id.to_string();
+            let mut capabilities = json_string_values(&device.features);
+            if let Some(device_type) = &device.device_type {
+                capabilities.extend(json_string_values(std::slice::from_ref(device_type)));
+            }
+            capabilities.sort();
+            capabilities.dedup();
+            let location = device.location.as_ref().map(|location| AllocationLocation {
+                designation: Some(location.id.to_string()),
+                ..AllocationLocation::default()
+            });
+            candidates.push(AllocationCandidate {
+                resource: ResourceKey::Device(device_code.clone()),
+                kind: "device".into(),
+                capabilities: capabilities.clone(),
+                location: location.clone(),
+                available_quantity: 1,
+                observed_revision: revision,
+                observed_at_ms,
+            });
+            if device.device_type.as_ref().is_some_and(|kind| {
+                json_string_values(std::slice::from_ref(kind))
+                    .iter()
+                    .any(|value| value == "autofactory")
+            }) {
+                candidates.push(AllocationCandidate {
+                    resource: ResourceKey::Autofactory(device_code.clone()),
+                    kind: "autofactory".into(),
+                    capabilities: capabilities.clone(),
+                    location: location.clone(),
+                    available_quantity: 1,
+                    observed_revision: revision,
+                    observed_at_ms,
+                });
+            }
+            let free_stow = device
+                .stow_capacity
+                .unwrap_or(0)
+                .saturating_sub(device.stow_used.unwrap_or(0));
+            if free_stow > 0 {
+                candidates.push(AllocationCandidate {
+                    resource: ResourceKey::Namespaced {
+                        namespace: "stow".into(),
+                        key: device_code,
+                    },
+                    kind: "stow".into(),
+                    capabilities: Vec::new(),
+                    location,
+                    available_quantity: u64::try_from(free_stow).unwrap_or(0),
+                    observed_revision: revision,
+                    observed_at_ms,
+                });
+            }
+        }
+        for inventory in state.inventories()? {
+            let owner = match inventory.owner {
+                InventoryOwner::Account(id) => format!("account:{id}"),
+                InventoryOwner::Replicant(key) => format!("replicant:{}", key.id),
+                InventoryOwner::Location(key) => format!("location:{}", key.id),
+                _ => continue,
+            };
+            let location = inventory.location.map(|location| AllocationLocation {
+                designation: Some(location.id.to_string()),
+                ..AllocationLocation::default()
+            });
+            for item in inventory.items {
+                if item.quantity <= 0 {
+                    continue;
+                }
+                candidates.push(AllocationCandidate {
+                    resource: ResourceKey::Namespaced {
+                        namespace: "inventory".into(),
+                        key: format!("{owner}:{}", item.resource),
+                    },
+                    kind: "material".into(),
+                    capabilities: vec![item.resource],
+                    location: location.clone(),
+                    available_quantity: u64::try_from(item.quantity).unwrap_or(0),
+                    observed_revision: revision,
+                    observed_at_ms,
+                });
+            }
+        }
+        candidates.sort_by_key(|candidate| {
+            serde_json::to_string(&candidate.resource).unwrap_or_default()
+        });
+        Ok(candidates)
+    }
+
+    /// Discovers candidates and allocates them in one broker call.
+    pub fn allocate_discovered(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+    ) -> Result<AllocationSet, AssignmentError> {
+        let candidates = self.discover_candidates()?;
+        self.allocate(item_id, expected_revision, &candidates)
+    }
+
+    /// Atomically allocates a caller's managed-state candidate observation.
+    ///
+    /// Executor adapters discover candidates from one managed snapshot, including
+    /// precomputed range facts, then pass the entire observation here. Identity,
+    /// quantity, stale-observation, and legacy exact-claim exclusion are enforced
+    /// by the repository's single immediate transaction.
+    pub fn allocate(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+    ) -> Result<AllocationSet, AssignmentError> {
+        self.repository
+            .allocate_requirements(item_id, expected_revision, candidates)
+            .map_err(Into::into)
+    }
+    /// Replaces a resource proven permanently missing using current managed candidates.
+    pub fn replace_dead_allocation(
+        &self,
+        item_id: WorkItemId,
+        allocation_id: AllocationId,
+    ) -> Result<ReplacementOutcome, AssignmentError> {
+        let candidates = self.discover_candidates()?;
+        self.repository
+            .replace_dead_allocation(item_id, allocation_id, &candidates, unix_millis())
+            .map_err(Into::into)
+    }
+
+    /// Replaces a missing allocation from caller-annotated current candidates.
+    ///
+    /// Campaign adapters use this form when requirement scope facts such as
+    /// Director region membership are not intrinsic managed-state fields.
+    pub fn replace_dead_allocation_from(
+        &self,
+        item_id: WorkItemId,
+        allocation_id: AllocationId,
+        candidates: &[AllocationCandidate],
+    ) -> Result<ReplacementOutcome, AssignmentError> {
+        self.repository
+            .replace_dead_allocation(item_id, allocation_id, candidates, unix_millis())
+            .map_err(Into::into)
+    }
+}
+
+fn json_string_values<T: serde::Serialize>(values: &[T]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| serde_json::to_value(value).ok())
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use replicant_workflow::{
+        NewWorkflow, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowKind,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn broker_allocates_capability_and_range_matched_candidate() {
+        let repository =
+            Arc::new(WorkflowRepository::open_in_memory().expect("open workflow repository"));
+        let campaign = repository
+            .create(NewWorkflow {
+                kind: WorkflowKind::new("test.broker").expect("valid campaign kind"),
+                schema_version: 1,
+                config: json!({}),
+                checkpoint: json!({}),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("create campaign");
+        let requirements = vec![ResourceRequirement {
+            key: "worker".into(),
+            kind: "replicant".into(),
+            capabilities: vec!["survey".into()],
+            scope: RequirementScope::WithinLy {
+                origin: "SOL".into(),
+                range_ly: 5.0,
+            },
+            count: 1,
+            quantity: 1,
+        }];
+        let item = repository
+            .reconcile_work_items(
+                campaign.id,
+                &[WorkItemSpec {
+                    workflow_id: campaign.id,
+                    dedupe_key: "item".into(),
+                    kind: WorkflowKind::new("test.broker-item").expect("valid item kind"),
+                    sort_key: "item".into(),
+                    payload_json: json!({}),
+                    preconditions_json: json!([]),
+                    requirements_json: serde_json::to_value(requirements)
+                        .expect("encode requirements"),
+                    deadline_at_ms: None,
+                }],
+                1,
+            )
+            .expect("reconcile item")
+            .remove(0);
+        let candidates = [
+            AllocationCandidate {
+                resource: ResourceKey::Replicant("OUT-OF-RANGE".into()),
+                kind: "replicant".into(),
+                capabilities: vec!["survey".into()],
+                location: Some(replicant_workflow::AllocationLocation {
+                    distances_ly: [("SOL".into(), 8.0)].into(),
+                    ..replicant_workflow::AllocationLocation::default()
+                }),
+                available_quantity: 1,
+                observed_revision: 1,
+                observed_at_ms: 10,
+            },
+            AllocationCandidate {
+                resource: ResourceKey::Replicant("IN-RANGE".into()),
+                kind: "replicant".into(),
+                capabilities: vec!["survey".into()],
+                location: Some(replicant_workflow::AllocationLocation {
+                    distances_ly: [("SOL".into(), 4.0)].into(),
+                    ..replicant_workflow::AllocationLocation::default()
+                }),
+                available_quantity: 1,
+                observed_revision: 1,
+                observed_at_ms: 10,
+            },
+        ];
+
+        let allocations = ResourceBroker::new(repository)
+            .allocate(item.id, item.state.revision, &candidates)
+            .expect("allocate matched candidate");
+        assert_eq!(
+            allocations.by_requirement["worker"][0].resource,
+            ResourceKey::Replicant("IN-RANGE".into())
+        );
+    }
+}

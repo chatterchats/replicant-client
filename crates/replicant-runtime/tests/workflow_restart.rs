@@ -2,13 +2,10 @@
 
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
+use replicant_runtime::relay::RelayExpansionRequest;
 use replicant_runtime::workflows::{
     RelayWorkflowCheckpoint, RelayWorkflowConfig, SurveyWorkflowCheckpoint, SurveyWorkflowConfig,
     new_relay_workflow, new_survey_workflow,
-};
-use replicant_runtime::{
-    relay::RelayExpansionRequest,
-    survey::{SurveyMode, SurveyOptions},
 };
 use replicant_workflow::{WorkflowRepository, WorkflowState, WorkflowStatus};
 use uuid::Uuid;
@@ -26,33 +23,27 @@ fn survey_and_relay_checkpoints_resume_without_repeating_completed_steps() {
     let repository = WorkflowRepository::open(&path).expect("open workflow repository");
     let survey = repository
         .create(new_survey_workflow(SurveyWorkflowConfig {
-            options: SurveyOptions {
-                mode: SurveyMode::Run,
-                replicant: "REP-1".to_owned(),
-                vessel: "VESSEL-1".to_owned(),
-                center: "ROOT".to_owned(),
-                radius_ly: 1.0,
-                system_limit: 1,
-                target_systems: None,
-                star_detail_concurrency: 1,
-                mission_file: path.with_extension("survey.json"),
-                controller: None,
-                drones: None,
-                replace_plan: false,
-                include_explored: false,
-                travel_timeout: std::time::Duration::from_secs(1),
-                survey_timeout: std::time::Duration::from_secs(1),
-                maintenance_home: "ROOT".to_owned(),
-                maintenance_interval: 1,
-                maintenance_threshold_pct: 25.0,
-                maintenance_resume_pct: 95.0,
-                maintenance_check_interval: std::time::Duration::from_secs(1),
-            },
+            region: "Alpha".to_owned(),
+            center: "ROOT".to_owned(),
+            radius_ly: 1.0,
+            system_limit: 1,
+            target_systems: None,
+            star_detail_concurrency: 1,
+            mission_file: path.with_extension("survey.json"),
+            replace_plan: false,
+            include_explored: false,
+            travel_timeout: std::time::Duration::from_secs(1),
+            survey_timeout: std::time::Duration::from_secs(1),
+            maintenance_home: "ROOT".to_owned(),
+            maintenance_interval: 1,
+            maintenance_threshold_pct: 25.0,
+            maintenance_resume_pct: 95.0,
+            maintenance_check_interval: std::time::Duration::from_secs(1),
         }))
         .expect("create survey workflow");
     let relay = repository
-        .create(new_relay_workflow(RelayWorkflowConfig {
-            request: RelayExpansionRequest {
+        .create(new_relay_workflow(RelayWorkflowConfig::from_request(
+            RelayExpansionRequest {
                 replicant: "REP-2".to_owned(),
                 hub: "ROOT-L1".to_owned(),
                 targets: vec!["TARGET".to_owned()],
@@ -61,11 +52,12 @@ fn survey_and_relay_checkpoints_resume_without_repeating_completed_steps() {
                 wait_timeout: std::time::Duration::from_secs(1),
                 unavailable_autofactories: Default::default(),
             },
-        }))
+        )))
         .expect("create relay workflow");
 
     let survey_checkpoint = SurveyWorkflowCheckpoint {
         state: None,
+        migration_worker: None,
         completed_steps: BTreeSet::from(["preparing_fleet".to_owned(), "traveling".to_owned()]),
     };
     repository
@@ -83,6 +75,7 @@ fn survey_and_relay_checkpoints_resume_without_repeating_completed_steps() {
         .expect("checkpoint survey");
     let relay_checkpoint = RelayWorkflowCheckpoint {
         state: None,
+        region: None,
         completed_steps: BTreeSet::from(["awaiting_relays".to_owned()]),
     };
     repository

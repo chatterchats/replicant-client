@@ -18,6 +18,18 @@ impl WorkflowMigration {
     pub const fn new(config: Value, checkpoint: Value) -> Self {
         Self { config, checkpoint }
     }
+
+    /// Returns the complete migrated configuration payload.
+    #[must_use]
+    pub const fn config(&self) -> &Value {
+        &self.config
+    }
+
+    /// Returns the complete migrated checkpoint payload.
+    #[must_use]
+    pub const fn checkpoint(&self) -> &Value {
+        &self.checkpoint
+    }
 }
 
 /// Factory metadata required to load a persisted workflow kind.

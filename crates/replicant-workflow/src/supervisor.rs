@@ -16,8 +16,9 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
     ClaimAcquireOutcome, NewWorkflow, RepositoryError, ResourceClaim, ResourceKey, WaitIntent,
-    WaitOutcome, WaitSignal, WorkflowId, WorkflowInstance, WorkflowRegistry, WorkflowRepository,
-    WorkflowState, WorkflowStatus, WorkflowTelemetrySample, WorkflowTelemetrySink,
+    WaitOutcome, WaitSignal, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
+    WorkflowRegistry, WorkflowRepository, WorkflowState, WorkflowStatus, WorkflowTelemetrySample,
+    WorkflowTelemetrySink,
 };
 
 // Workflows that explicitly return `Waiting` without a durable `WaitIntent` are
@@ -111,6 +112,12 @@ impl WorkflowContext {
     #[must_use]
     pub fn repository(&self) -> &WorkflowRepository {
         &self.repository
+    }
+
+    /// Clones the authoritative repository handle for concurrent item workers.
+    #[must_use]
+    pub fn repository_handle(&self) -> Arc<WorkflowRepository> {
+        self.repository.clone()
     }
 
     /// Persists a child workflow owned by this orchestration.
@@ -367,19 +374,31 @@ impl WorkflowContext {
 
     /// Marks this invocation as failed, retaining its checkpoint and releasing its claims.
     pub fn mark_failed(&mut self, error: impl Into<String>) -> Result<(), RepositoryError> {
-        let error = error.into();
-        let checkpoint = self.checkpoint_value()?;
         let result = self.result_value()?;
-        self.instance = self.repository.update(
+        self.mark_failed_with_result(error, result, WorkflowFailureDisposition::Retryable)
+    }
+
+    /// Marks this invocation as failed with a structured terminal result.
+    pub fn mark_failed_with_result<R: Serialize>(
+        &mut self,
+        error: impl Into<String>,
+        result: R,
+        disposition: WorkflowFailureDisposition,
+    ) -> Result<(), RepositoryError> {
+        let result = serde_json::to_value(result)?;
+        let result = (!result.is_null()).then_some(result);
+        let checkpoint = self.checkpoint_value()?;
+        self.instance = self.repository.update_with_failure_disposition(
             self.instance.id,
             self.instance.revision,
             WorkflowState {
                 status: WorkflowStatus::Failed,
                 current_step: self.instance.current_step.clone(),
                 checkpoint,
-                last_error: Some(error),
+                last_error: Some(error.into()),
                 result,
             },
+            disposition,
         )?;
         self.release_all_claims()?;
         Ok(())
@@ -392,23 +411,8 @@ impl WorkflowContext {
         &mut self,
         error: impl Into<String>,
     ) -> Result<(), RepositoryError> {
-        let error = error.into();
-        let checkpoint = self.checkpoint_value()?;
         let result = self.result_value()?;
-        self.instance = self.repository.update_with_failure_disposition(
-            self.instance.id,
-            self.instance.revision,
-            WorkflowState {
-                status: WorkflowStatus::Failed,
-                current_step: self.instance.current_step.clone(),
-                checkpoint,
-                last_error: Some(error),
-                result,
-            },
-            crate::WorkflowFailureDisposition::Permanent,
-        )?;
-        self.release_all_claims()?;
-        Ok(())
+        self.mark_failed_with_result(error, result, WorkflowFailureDisposition::Permanent)
     }
 
     /// Refreshes state and reports a cooperative pause or cancel request.
@@ -435,7 +439,7 @@ impl WorkflowContext {
             return;
         };
         sink.record(WorkflowTelemetrySample {
-            observed_at_ms: telemetry_now_millis(),
+            observed_at_ms: now_millis(),
             workflow_id: self.instance.id.to_string(),
             workflow_kind: self.instance.kind.as_str().to_owned(),
             metric,
@@ -514,7 +518,7 @@ pub struct WorkflowSupervisor {
     tick_lock: tokio::sync::Mutex<()>,
     client: Option<Client>,
     telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
-    claims_reconciled: AtomicBool,
+    startup_reconciled: AtomicBool,
 }
 
 #[derive(Default)]
@@ -534,7 +538,7 @@ impl WorkflowSupervisor {
             tick_lock: tokio::sync::Mutex::new(()),
             client: None,
             telemetry: None,
-            claims_reconciled: AtomicBool::new(false),
+            startup_reconciled: AtomicBool::new(false),
         }
     }
 
@@ -557,10 +561,13 @@ impl WorkflowSupervisor {
         self
     }
 
-    /// Reconciles stale claims once, reaps tasks, and starts runnable instances.
+    /// Reconciles stale durable state once, reaps tasks, and starts runnable instances.
     pub async fn tick(&self) -> Result<(), SupervisorError> {
         let _tick = self.tick_lock.lock().await;
-        let instances = if !self.claims_reconciled.load(Ordering::Acquire) {
+        let instances = if !self.startup_reconciled.load(Ordering::Acquire) {
+            let reclaimed_items = self
+                .repository
+                .reconcile_orphaned_work_items(None, now_millis())?;
             let released_claims = self.repository.reconcile_claims()?;
             let instances = self.repository.list()?;
             let resumable = instances
@@ -588,10 +595,11 @@ impl WorkflowSupervisor {
                 resumable,
                 paused,
                 terminal,
+                reclaimed_items,
                 released_claims,
                 "workflow startup reconciliation complete"
             );
-            self.claims_reconciled.store(true, Ordering::Release);
+            self.startup_reconciled.store(true, Ordering::Release);
             Some(instances)
         } else {
             None
@@ -670,6 +678,8 @@ impl WorkflowSupervisor {
             kind = %instance.kind,
             "workflow resume requested"
         );
+        self.repository
+            .reconcile_orphaned_work_items(Some(id), now_millis())?;
         self.transition(instance, WorkflowStatus::Reconciling)?;
         Ok(())
     }
@@ -844,7 +854,7 @@ impl WorkflowSupervisor {
         tracing::info!(workflow_id = %id, kind = %kind, "workflow executor starting");
         if let Some(sink) = self.telemetry.as_ref() {
             sink.record(WorkflowTelemetrySample {
-                observed_at_ms: telemetry_now_millis(),
+                observed_at_ms: now_millis(),
                 workflow_id: id.to_string(),
                 workflow_kind: kind.as_str().to_owned(),
                 metric: "executor_started",
@@ -882,7 +892,7 @@ impl WorkflowSupervisor {
             }
             if let Some(sink) = telemetry.as_ref() {
                 sink.record(WorkflowTelemetrySample {
-                    observed_at_ms: telemetry_now_millis(),
+                    observed_at_ms: now_millis(),
                     workflow_id: id.to_string(),
                     workflow_kind: kind.as_str().to_owned(),
                     metric: "executor_finished",
@@ -1016,7 +1026,7 @@ fn wait_event_matches(intent: &WaitIntent, event: &replicant_client::domain::Eve
         }
 }
 
-fn telemetry_now_millis() -> i64 {
+fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

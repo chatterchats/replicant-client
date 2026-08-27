@@ -74,8 +74,8 @@ fn workflow_targets(workflows: &[WorkflowInstance]) -> Vec<Target> {
                 .map(|config| Target {
                     workflow_id: WorkflowId(workflow.id.to_string()),
                     workflow_kind: OperationKind(workflow.kind.to_string()),
-                    anchor: config.options.center.clone(),
-                    systems: vec![config.options.center],
+                    anchor: config.center.clone(),
+                    systems: vec![config.center],
                 }),
             "relay.expansion" => {
                 workflow
@@ -84,8 +84,8 @@ fn workflow_targets(workflows: &[WorkflowInstance]) -> Vec<Target> {
                     .map(|config| Target {
                         workflow_id: WorkflowId(workflow.id.to_string()),
                         workflow_kind: OperationKind(workflow.kind.to_string()),
-                        anchor: config.request.hub,
-                        systems: config.request.targets,
+                        anchor: config.hub,
+                        systems: config.targets,
                     })
             }
             _ => None,

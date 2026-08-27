@@ -312,6 +312,57 @@ impl EventsGateway {
         EventHistoryQuery::new(self.client.clone())
     }
 
+    /// Fetches the complete unfiltered remote history for one exact event name.
+    pub async fn full_history_named(&self, event_name: &str) -> Result<Vec<Event>> {
+        self.client.ensure_open()?;
+        let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut events = Vec::new();
+        loop {
+            let response = self
+                .client
+                .managed_raw()
+                .events()
+                .list(&EventLogQuery {
+                    cursor: cursor.clone(),
+                    limit: Some(100),
+                    filtered: Some(false),
+                    event: Some(event_name.to_owned()),
+                    ..EventLogQuery::default()
+                })
+                .await?;
+            events.extend(
+                response
+                    .value
+                    .events
+                    .iter()
+                    .filter(|event| event.event == event_name)
+                    .map(|event| {
+                        domain::account_event(
+                            event,
+                            Some(Realm::Live),
+                            domain::ObservationTime::now(),
+                        )
+                        .value
+                    }),
+            );
+            let Some(next) = response.value.next_cursor else {
+                break;
+            };
+            if next == cursor.as_deref().unwrap_or_default() || !seen_cursors.insert(next.clone()) {
+                return Err(Error::Decode {
+                    message: format!(
+                        "remote event history cursor repeated while reading {event_name}: {next}"
+                    ),
+                    status: Some(200),
+                    source: None,
+                });
+            }
+            cursor = Some(next);
+        }
+        Ok(events)
+    }
+
     /// Subscribes to deduplicated events learned from unfiltered log
     /// catch-up and filtered SSE delivery. Local-only: it never itself
     /// issues a network request.

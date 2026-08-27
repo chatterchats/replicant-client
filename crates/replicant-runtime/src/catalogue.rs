@@ -31,22 +31,20 @@ use crate::{
     },
     automation::{
         EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
-        SalvageIntent, ScanIntent, ScanTourIntent, TradeFulfillmentIntent,
+        SalvageIntent, SalvageRecoveryIntent, ScanIntent, ScanTourIntent, TradeFulfillmentIntent,
         event_delivery_workflow_kind, event_tour_workflow_kind, exploration_workflow_kind,
         logistics_workflow_kind, mining_deploy_workflow_kind, new_event_delivery_workflow,
         new_event_tour_workflow, new_exploration_workflow, new_logistics_workflow,
-        new_mining_deploy_workflow, new_observatory_workflow, new_salvage_workflow,
-        new_scan_belt_workflow, new_scan_system_workflow, new_scan_tour_workflow,
-        new_trade_fulfillment_workflow, observatory_workflow_kind, salvage_workflow_kind,
-        scan_belt_workflow_kind, scan_system_workflow_kind, scan_tour_workflow_kind,
-        trade_fulfillment_workflow_kind,
+        new_mining_deploy_workflow, new_observatory_workflow, new_salvage_recovery_workflow,
+        new_salvage_workflow, new_scan_belt_workflow, new_scan_system_workflow,
+        new_scan_tour_workflow, new_trade_fulfillment_workflow, observatory_workflow_kind,
+        salvage_recovery_workflow_kind, salvage_workflow_kind, scan_belt_workflow_kind,
+        scan_system_workflow_kind, scan_tour_workflow_kind, trade_fulfillment_workflow_kind,
     },
     belt_search::{BeltSearchRequest, execute_belt_search},
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
     observatory::auto_prospect,
-    relay::RelayExpansionRequest,
     reports::nearby_belt_report,
-    survey::{SurveyMode, SurveyOptions},
     workflows::{
         EventWorkflowConfig, MiningWorkflowConfig, RelayWorkflowConfig, RequirementWorkflowConfig,
         SurveyWorkflowConfig, event_workflow_kind, mining_workflow_kind, new_event_workflow,
@@ -186,6 +184,7 @@ impl OperationCatalogue {
     pub async fn run_report(
         &self,
         client: &Client,
+        repository: &WorkflowRepository,
         kind: &str,
         parameters: BTreeMap<String, Value>,
     ) -> Result<Value, CatalogueError> {
@@ -204,6 +203,9 @@ impl OperationCatalogue {
                 crate::refresh_report::managed_refresh_status(client, run_id)
                     .await
                     .map_err(|error| CatalogueError::Runtime(error.to_string()))
+            }
+            "automation_schedule" => {
+                crate::scheduler::automation_schedule_report(repository).map_err(Into::into)
             }
             _ => Err(unknown(OperationClass::Report, kind)),
         }
@@ -866,6 +868,12 @@ impl OperationCatalogue {
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
+            "salvage.recovery" => {
+                let mut workflow =
+                    new_salvage_recovery_workflow(decode::<SalvageRecoveryIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
             "mining.deploy" => {
                 let mut workflow =
                     new_mining_deploy_workflow(decode::<MiningDeployIntent>(parameters)?);
@@ -907,17 +915,13 @@ impl OperationCatalogue {
             }
             "survey.route" => {
                 let parameters: SurveyStart = decode(parameters)?;
-                let mut workflow = new_survey_workflow(SurveyWorkflowConfig {
-                    options: parameters.into_options(),
-                });
+                let mut workflow = new_survey_workflow(parameters.into_config());
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
             "relay.expansion" => {
                 let parameters: RelayStart = decode(parameters)?;
-                let mut workflow = new_relay_workflow(RelayWorkflowConfig {
-                    request: parameters.into_request(),
-                });
+                let mut workflow = new_relay_workflow(parameters.into_config());
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
@@ -925,7 +929,7 @@ impl OperationCatalogue {
                 let parameters: MiningStart = decode(parameters)?;
                 let mut workflow = new_mining_workflow(MiningWorkflowConfig {
                     systems: csv(parameters.systems_csv),
-                    replicant: parameters.replicant,
+                    region: parameters.region,
                     hub: parameters.hub,
                     mission_file: parameters.mission_file,
                     wait_timeout_seconds: parameters.wait_timeout_seconds,
@@ -939,7 +943,7 @@ impl OperationCatalogue {
                 let mut workflow = new_event_workflow(EventWorkflowConfig {
                     event: parameters.event,
                     criterion: parameters.criterion,
-                    replicant: parameters.replicant,
+                    region: parameters.region,
                     home: parameters.home,
                     plan_file: parameters.plan_file,
                     replace_plan: parameters.replace_plan,
@@ -1394,6 +1398,18 @@ fn descriptors() -> DescriptorCatalog {
                 risk: MutationRisk::None,
                 applicable_to: Vec::new(),
                 parameters: vec![optional("run_id", "Refresh run ID", ParameterKind::String)],
+            },
+            ReportDescriptor {
+                kind: operation_kind("automation_schedule"),
+                display_name: "Automation schedule".to_owned(),
+                aliases: strings(&["schedule"]),
+                description: "Explain derived urgency, floors, ceilings, grants, and reclaim decisions."
+                    .to_owned(),
+                category: "automation".to_owned(),
+                operation_class: OperationClass::Report,
+                risk: MutationRisk::None,
+                applicable_to: Vec::new(),
+                parameters: Vec::new(),
             },
         ],
         actions: vec![
@@ -2517,6 +2533,23 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             supported_triggers: all_trigger_kinds(),
         },
         WorkflowDescriptor {
+            kind: operation_kind(salvage_recovery_workflow_kind().as_str()),
+            display_name: "Recover regional salvage".to_owned(),
+            aliases: strings(&["salvage_recovery"]),
+            description:
+                "Recover remotely discovered, non-depleted salvage sites with brokered regional capacity."
+                    .to_owned(),
+            category: "mining".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::Location],
+            parameters: vec![
+                required("region", "Campaign region", ParameterKind::String),
+                required("home", "Recovery home", ParameterKind::Location),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
             kind: operation_kind(mining_deploy_workflow_kind().as_str()),
             display_name: "Deploy mining operation".to_owned(),
             aliases: strings(&["mining_deploy"]),
@@ -3371,10 +3404,7 @@ struct HubRenameAction {
 
 #[derive(Deserialize)]
 struct SurveyStart {
-    #[serde(default = "default_survey_mode")]
-    mode: SurveyMode,
-    replicant: String,
-    vessel: String,
+    region: String,
     center: String,
     #[serde(default = "default_radius")]
     radius_ly: f64,
@@ -3383,10 +3413,6 @@ struct SurveyStart {
     #[serde(default = "default_concurrency")]
     star_detail_concurrency: usize,
     mission_file: PathBuf,
-    #[serde(default)]
-    controller: Option<String>,
-    #[serde(default)]
-    drones_csv: Option<String>,
     #[serde(default)]
     replace_plan: bool,
     #[serde(default)]
@@ -3407,19 +3433,15 @@ struct SurveyStart {
 }
 
 impl SurveyStart {
-    fn into_options(self) -> SurveyOptions {
-        SurveyOptions {
-            mode: self.mode,
-            replicant: self.replicant,
-            vessel: self.vessel,
+    fn into_config(self) -> SurveyWorkflowConfig {
+        SurveyWorkflowConfig {
+            region: self.region,
             center: self.center,
             radius_ly: self.radius_ly,
             system_limit: self.system_limit,
             target_systems: None,
             star_detail_concurrency: self.star_detail_concurrency,
             mission_file: self.mission_file,
-            controller: self.controller,
-            drones: self.drones_csv.map(csv),
             replace_plan: self.replace_plan,
             include_explored: self.include_explored,
             travel_timeout: Duration::from_secs(self.travel_timeout_seconds),
@@ -3435,7 +3457,7 @@ impl SurveyStart {
 
 #[derive(Deserialize)]
 struct RelayStart {
-    replicant: String,
+    region: String,
     hub: String,
     targets_csv: String,
     mission_file: PathBuf,
@@ -3447,7 +3469,7 @@ struct RelayStart {
 
 #[derive(Deserialize)]
 struct MiningStart {
-    replicant: String,
+    region: String,
     hub: String,
     systems_csv: String,
     mission_file: PathBuf,
@@ -3463,10 +3485,8 @@ struct EventStart {
     event: Option<String>,
     #[serde(default)]
     criterion: Option<String>,
-    #[serde(default)]
-    replicant: Option<String>,
-    #[serde(default)]
-    home: Option<String>,
+    region: String,
+    home: String,
     plan_file: PathBuf,
     #[serde(default)]
     replace_plan: bool,
@@ -3496,15 +3516,16 @@ struct RequirementStart {
 }
 
 impl RelayStart {
-    fn into_request(self) -> RelayExpansionRequest {
-        RelayExpansionRequest {
-            replicant: self.replicant,
+    fn into_config(self) -> RelayWorkflowConfig {
+        RelayWorkflowConfig {
             hub: self.hub,
+            region: Some(self.region),
             targets: csv(self.targets_csv),
             mission_file: self.mission_file,
             max_hop_ly: self.max_hop_ly,
-            wait_timeout: Duration::from_secs(self.wait_timeout_seconds),
-            unavailable_autofactories: Default::default(),
+            wait_timeout_seconds: self.wait_timeout_seconds,
+            wait_timeout_nanoseconds: 0,
+            unavailable_autofactories: BTreeSet::new(),
         }
     }
 }
@@ -3529,9 +3550,6 @@ fn csv(value: String) -> Vec<String> {
         .collect()
 }
 
-fn default_survey_mode() -> SurveyMode {
-    SurveyMode::Run
-}
 fn default_radius() -> f64 {
     10.0
 }
@@ -4210,5 +4228,24 @@ mod tests {
                 .expect("valid bootstrap action");
             assert_eq!(parameters["wait_timeout_seconds"], 21_600);
         }
+    }
+    #[test]
+    fn automation_schedule_report_descriptor_is_registered() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let descriptor = catalogue
+            .descriptors()
+            .reports
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "automation_schedule")
+            .expect("schedule descriptor");
+        assert_eq!(descriptor.operation_class, OperationClass::Report);
+        assert_eq!(descriptor.risk, MutationRisk::None);
+        catalogue
+            .validate_invocation(
+                OperationClass::Report,
+                "automation_schedule",
+                BTreeMap::new(),
+            )
+            .expect("validate schedule report");
     }
 }

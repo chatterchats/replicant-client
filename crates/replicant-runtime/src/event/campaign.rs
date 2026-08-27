@@ -372,7 +372,8 @@ async fn plan_campaign_event(
         event_mission_tag: Some(stable_mission_tag.clone()),
     };
     let event_plan = plan_event(event, &context)?;
-    let Some(selected_criterion) = best_criterion(&event_plan.criteria).cloned() else {
+    let criteria = event_plan.criteria.clone();
+    let Some(selected_criterion) = best_criterion(&criteria).cloned() else {
         let reasons = event_plan
             .criteria
             .iter()
@@ -407,6 +408,7 @@ async fn plan_campaign_event(
         event_scope: campaign.event_scope.clone(),
         event: event_plan.event,
         selected_criterion,
+        criteria,
         grants_unearned_achievement: event_plan.grants_unearned_achievement,
         claimed_devices: Vec::<ClaimedDevice>::new(),
         execution: executor::ExecutionState::default(),
