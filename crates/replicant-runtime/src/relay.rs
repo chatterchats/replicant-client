@@ -7427,7 +7427,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use replicant_client::{SecretString, StartupPolicy, managed::EventStreamOptions, raw::Url};
     use replicant_workflow::WorkItemStatus;
     use wiremock::{
         Mock, MockServer, Request, ResponseTemplate,
@@ -8400,6 +8400,70 @@ mod tests {
     async fn restart_after_detach_checkpoint_stows_once_without_reissuing_detach() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/v1/accounts/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"email": "relay@test.invalid"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [
+                    {
+                        "device_code": "RELAY-1",
+                        "device_type": FTL_RELAY,
+                        "location": "ROOT",
+                        "status": "active",
+                        "available_commands": ["stow"]
+                    },
+                    {
+                        "device_code": "VESSEL-1",
+                        "device_type": "racing_vessel",
+                        "location": "ROOT-1-L4",
+                        "status": "active",
+                        "stow_capacity": 1,
+                        "stow_used": 0
+                    }
+                ],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(": initial connection\n\n"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_delay(Duration::from_millis(500))
+                    .set_body_string(
+                        "id: 2-0\nevent: device.stowed\ndata: {\"id\":\"2-0\",\"version\":1,\"category\":\"device\",\"event\":\"device.stowed\",\"replicant_code\":null,\"device_code\":\"RELAY-1\",\"device_type\":\"ftl_relay\",\"star\":null,\"location\":\"ROOT\",\"payload\":{\"stowed_in_device_code\":\"VESSEL-1\"},\"created_at\":\"2026-08-28T10:00:00Z\"}\n\n",
+                    ),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/v1/devices/RELAY-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "device_code": "RELAY-1",
@@ -8408,7 +8472,19 @@ mod tests {
                 "status": "active",
                 "available_commands": ["stow"]
             })))
-            .expect(1)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "RELAY-1",
+                "device_type": FTL_RELAY,
+                "status": "active",
+                "stowed_in_device_code": "VESSEL-1"
+            })))
+            .with_priority(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -8421,31 +8497,27 @@ mod tests {
                 "stow_capacity": 1,
                 "stow_used": 0
             })))
-            .expect(1)
             .mount(&server)
             .await;
-        let client = test_client_at(&server).await;
-        client.devices().get("RELAY-1").await.expect("seed relay");
-        client.devices().get("VESSEL-1").await.expect("seed vessel");
-        server.reset().await;
-
         Mock::given(method("POST"))
-            .and(path("/v1/devices/RELAY-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/devices/RELAY-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "device_code": "RELAY-1",
-                "device_type": FTL_RELAY,
-                "status": "active",
-                "stowed_in_device_code": "VESSEL-1"
-            })))
-            .mount(&server)
-            .await;
 
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(StartupPolicy::Essential)
+            .event_stream_options(
+                EventStreamOptions::default()
+                    .log_poll_interval(Duration::from_secs(60))
+                    .reconnect_backoff(Duration::from_millis(5), Duration::from_millis(5)),
+            )
+            .start()
+            .await
+            .expect("start event-backed test client");
         let mut plan = execution_state();
         plan.stops[0].relay_code = Some("RELAY-1".into());
         let mut boundary = plan.stops[0].clone();
@@ -8469,43 +8541,17 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         save_plan(&path, &plan).expect("persist detach checkpoint before crash");
-        let plan = load_plan(&path).expect("restart from detach checkpoint");
-        let restock = &plan.supply.as_ref().expect("supply").restocks[0];
+        let mut plan = load_plan(&path).expect("restart from detach checkpoint");
+        let mut config = test_config();
+        config.wait_timeout = Duration::from_secs(2);
 
-        let relay = projected_device(&client, "RELAY-1")
+        detach_restock_payload(&client, &config, &mut plan, 0)
             .await
-            .expect("cached detached relay")
-            .snapshot()
+            .expect("resume skips already checkpointed detach");
+        let restock = plan.supply.as_ref().expect("supply").restocks[0].clone();
+        stow_restock_payload(&client, &config, &plan, &restock)
             .await
-            .expect("detached relay projection");
-        assert_eq!(
-            restock_relay_decision(&plan, restock, &plan.stops[0], "RELAY-1", &relay),
-            RestockRelayDecision::Stow
-        );
-        let operation = projected_device(&client, "RELAY-1")
-            .await
-            .expect("cached detached relay")
-            .stow(Some(plan.vessel_code.clone()))
-            .await
-            .expect("submit resumed stow");
-        ensure_operation_accepted(&operation)
-            .await
-            .expect("stow submission accepted");
-        let stowed = client
-            .devices()
-            .refresh("RELAY-1")
-            .await
-            .expect("refresh stowed relay")
-            .snapshot()
-            .await
-            .expect("stowed relay projection");
-        assert!(
-            stowed
-                .relationships
-                .stowed_in
-                .as_ref()
-                .is_some_and(|container| container.id.as_str() == plan.vessel_code)
-        );
+            .expect("resume runs the pending stow exactly once");
 
         let requests = server.received_requests().await.expect("record requests");
         let commands = requests
