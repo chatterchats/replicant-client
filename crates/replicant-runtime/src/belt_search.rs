@@ -857,18 +857,63 @@ fn travel_poll_interval(eta_seconds: Option<i64>) -> Duration {
     }
 }
 
+/// Structured rejection from a durable belt-search operation.
+#[derive(Debug)]
+pub(crate) struct BeltOperationRejection {
+    status: Option<u16>,
+    message: Option<String>,
+    operation_status: OperationStatus,
+}
+
+impl BeltOperationRejection {
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+impl std::fmt::Display for BeltOperationRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "belt operation ended as {:?}",
+            self.operation_status
+        )?;
+        if let Some(status) = self.status {
+            write!(formatter, " (HTTP {status})")?;
+        }
+        if let Some(message) = &self.message {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BeltOperationRejection {}
+
 async fn ensure_operation_accepted(operation: &Operation) -> crate::ActionResult<()> {
     let outcome = operation.outcome().await?;
     if matches!(
         outcome.status,
         OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed
     ) {
-        return Err(app_error(format!(
-            "operation {} ended as {:?}: {:?}",
-            operation.id(),
-            outcome.status,
-            outcome.response
-        )));
+        let message = outcome.server_error().map(str::to_owned).or_else(|| {
+            outcome
+                .response
+                .as_ref()
+                .and_then(|response| response.get("server"))
+                .and_then(|server| server.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        return Err(Box::new(BeltOperationRejection {
+            status: outcome.http_status(),
+            message,
+            operation_status: outcome.status,
+        }));
     }
     Ok(())
 }

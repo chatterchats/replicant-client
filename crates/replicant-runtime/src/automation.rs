@@ -39,7 +39,7 @@ use crate::bootstrap::{
 };
 
 use crate::{
-    belt_search::{execute_belt_search_system, system_is_explored, travel_to_system},
+    belt_search::{BeltOperationRejection, execute_belt_search_system, travel_to_system},
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest, EventItemStage,
         EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
@@ -2189,6 +2189,8 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
             };
             intent.region = region;
             let specs = belt_search_item_specs(context.id(), &intent).map_err(string_error)?;
+            let specs = belt_specs_for_reconciliation(repository.as_ref(), context.id(), specs)
+                .map_err(string_error)?;
             repository
                 .reconcile_work_items(context.id(), &specs, unix_millis())
                 .map_err(string_error)?;
@@ -2199,6 +2201,7 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                 )
                 .map_err(string_error)?;
 
+            let mut excluded_workers = BTreeSet::new();
             loop {
                 let broker = crate::assignment::ResourceBroker::with_managed_client(
                     repository.clone(),
@@ -2216,10 +2219,13 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                     })
                     .collect::<BTreeSet<_>>();
                 candidates.retain(|candidate| {
-                    matches!(
-                        &candidate.resource,
-                        ResourceKey::Replicant(worker) if assignments.contains(worker)
-                    )
+                    belt_worker_candidate(candidate)
+                        && matches!(
+                            &candidate.resource,
+                            ResourceKey::Replicant(worker)
+                                if assignments.contains(worker)
+                                    && !excluded_workers.contains(worker)
+                        )
                 });
                 for candidate in &mut candidates {
                     if let Some(location) = &mut candidate.location {
@@ -2289,10 +2295,15 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                 if running.is_empty() {
                     break;
                 }
-                futures::future::join_all(running)
+                for worker in futures::future::join_all(running)
                     .await
                     .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                {
+                    excluded_workers.insert(worker);
+                }
             }
 
             match repository
@@ -2425,6 +2436,49 @@ fn resolve_belt_campaign_region(
         }))
 }
 
+const BELT_SCAN_CAPABILITIES: [&str; 2] = ["census", "system_scan"];
+
+fn belt_worker_candidate(candidate: &replicant_workflow::AllocationCandidate) -> bool {
+    BELT_SCAN_CAPABILITIES.iter().all(|required| {
+        candidate
+            .capabilities
+            .iter()
+            .any(|capability| capability == required)
+    })
+}
+
+fn belt_specs_for_reconciliation(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+    mut desired: Vec<WorkItemSpec>,
+) -> Result<Vec<WorkItemSpec>, RepositoryError> {
+    for existing in repository.list_work_items(workflow_id)? {
+        let Some(spec) = desired
+            .iter_mut()
+            .find(|spec| spec.dedupe_key == existing.spec.dedupe_key)
+        else {
+            continue;
+        };
+        let legacy_requirements =
+            existing
+                .spec
+                .requirements_json
+                .as_array()
+                .is_some_and(|requirements| {
+                    requirements.len() == 1
+                        && requirements[0]["capabilities"]
+                            .as_array()
+                            .is_some_and(Vec::is_empty)
+                });
+        let mut upgraded = existing.spec.clone();
+        upgraded.requirements_json = spec.requirements_json.clone();
+        if legacy_requirements && upgraded == *spec {
+            *spec = existing.spec;
+        }
+    }
+    Ok(desired)
+}
+
 fn belt_search_item_specs(
     workflow_id: WorkflowId,
     intent: &BeltSearchCampaignIntent,
@@ -2449,7 +2503,7 @@ fn belt_search_item_specs(
             requirements_json: serde_json::json!([{
                 "key": "worker",
                 "kind": "replicant",
-                "capabilities": [],
+                "capabilities": ["census", "system_scan"],
                 "scope": {
                     "kind": "region",
                     "value": intent.region
@@ -2478,24 +2532,7 @@ async fn run_belt_item(
     item: WorkItem,
     worker: String,
     system: String,
-) -> Result<(), String> {
-    if system_is_explored(&client, &worker, &system)
-        .await
-        .map_err(string_error)?
-    {
-        repository
-            .transition_work_item(
-                item.id,
-                item.state.revision,
-                WorkItemTransition::Skipped {
-                    reason: "system already explored".into(),
-                    result_json: None,
-                },
-                unix_millis(),
-            )
-            .map_err(string_error)?;
-        return Ok(());
-    }
+) -> Result<Option<String>, String> {
     match execute_belt_search_system(
         &client,
         &worker,
@@ -2505,32 +2542,96 @@ async fn run_belt_item(
     )
     .await
     {
-        Ok(stop) => repository
-            .transition_work_item(
-                item.id,
-                item.state.revision,
+        Ok(stop) => {
+            let transition = if stop.scanned {
                 WorkItemTransition::Succeeded {
                     checkpoint_json: None,
                     result_json: Some(serde_json::to_value(stop).map_err(string_error)?),
-                },
-                unix_millis(),
-            )
-            .map(|_| ())
-            .map_err(string_error),
-        Err(error) => repository
-            .transition_work_item(
-                item.id,
-                item.state.revision,
-                belt_item_failure_transition(error.as_ref()),
-                unix_millis(),
-            )
-            .map(|_| ())
-            .map_err(string_error),
+                }
+            } else {
+                WorkItemTransition::Skipped {
+                    reason: "system already explored".into(),
+                    result_json: None,
+                }
+            };
+            repository
+                .transition_work_item(item.id, item.state.revision, transition, unix_millis())
+                .map(|_| None)
+                .map_err(string_error)
+        }
+        Err(error) => {
+            let capability_mismatch = belt_capability_mismatch(error.as_ref());
+            let transition = belt_item_failure_transition_with_checkpoint(
+                error.as_ref(),
+                item.state.checkpoint_json,
+            );
+            repository
+                .transition_work_item(item.id, item.state.revision, transition, unix_millis())
+                .map_err(string_error)?;
+            Ok(capability_mismatch.then_some(worker))
+        }
     }
 }
 
-fn belt_item_failure_transition(error: &(dyn std::error::Error + 'static)) -> WorkItemTransition {
+fn belt_capability_mismatch(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<replicant_client::Error>()
+            && error.status() == Some(400)
+            && error.details().is_some_and(|details| {
+                [
+                    details.message.as_deref(),
+                    details.field_errors.as_deref(),
+                    details.body_excerpt.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(known_belt_capability_message)
+            })
+        {
+            return true;
+        }
+        if let Some(rejection) = source.downcast_ref::<BeltOperationRejection>()
+            && rejection.status() == Some(400)
+            && rejection
+                .message()
+                .is_some_and(known_belt_capability_message)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+fn known_belt_capability_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase().replace('-', "_");
+    [
+        "does not have census capability",
+        "does not have the census capability",
+        "doesn't have census capability",
+        "does not have system_scan capability",
+        "does not have the system_scan capability",
+        "doesn't have system_scan capability",
+        "does not support census",
+        "does not support system_scan",
+        "census capability is not available",
+        "system_scan capability is not available",
+        "missing census capability",
+        "missing system_scan capability",
+    ]
+    .iter()
+    .any(|fragment| message.contains(fragment))
+}
+
+fn belt_item_failure_transition_with_checkpoint(
+    error: &(dyn std::error::Error + 'static),
+    checkpoint_json: Option<Value>,
+) -> WorkItemTransition {
     let message = error.to_string();
+    if belt_capability_mismatch(error) {
+        return WorkItemTransition::Reclaimed { checkpoint_json };
+    }
     let mut current = Some(error);
     let mut structured_missing = false;
     while let Some(source) = current {
@@ -2556,6 +2657,10 @@ fn belt_item_failure_transition(error: &(dyn std::error::Error + 'static)) -> Wo
             error: message,
         }
     }
+}
+#[cfg(test)]
+fn belt_item_failure_transition(error: &(dyn std::error::Error + 'static)) -> WorkItemTransition {
+    belt_item_failure_transition_with_checkpoint(error, None)
 }
 
 struct MiningCampaignWorkflow {
@@ -10827,7 +10932,28 @@ mod tests {
         assert!(
             specs
                 .iter()
+                .all(|spec| spec.requirements_json[0]["capabilities"]
+                    == serde_json::json!(["census", "system_scan"]))
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.requirements_json[0]["scope"]["kind"] == "region")
+        );
+        assert!(
+            specs
+                .iter()
                 .all(|spec| spec.requirements_json[0]["scope"]["value"] == "Alpha")
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.requirements_json[0]["count"] == 1)
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.requirements_json[0]["quantity"] == 1)
         );
         assert!(
             serde_json::to_value(intent)
@@ -10835,6 +10961,55 @@ mod tests {
                 .get("replicant")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn belt_worker_requires_both_scan_capabilities() {
+        let candidate = |capabilities: &[&str]| replicant_workflow::AllocationCandidate {
+            resource: ResourceKey::Replicant("R-1".into()),
+            kind: "replicant".into(),
+            capabilities: capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            location: None,
+            available_quantity: 1,
+            observed_revision: 1,
+            observed_at_ms: 0,
+        };
+
+        assert!(!belt_worker_candidate(&candidate(&[])));
+        assert!(!belt_worker_candidate(&candidate(&["census"])));
+        assert!(!belt_worker_candidate(&candidate(&["system_scan"])));
+        assert!(belt_worker_candidate(&candidate(&[
+            "census",
+            "system_scan"
+        ])));
+    }
+
+    #[test]
+    fn belt_reconciliation_preserves_legacy_item_specs() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let intent = BeltSearchCampaignIntent {
+            systems: vec!["SOL".into()],
+            region: "Alpha".into(),
+        };
+        let campaign = repository
+            .create(new_belt_search_campaign_workflow(intent.clone()))
+            .expect("create campaign");
+        let mut legacy = belt_search_item_specs(campaign.id, &intent).expect("legacy specs");
+        legacy[0].requirements_json[0]["capabilities"] = serde_json::json!([]);
+        repository
+            .reconcile_work_items(campaign.id, &legacy, 0)
+            .expect("persist legacy item");
+
+        let desired = belt_search_item_specs(campaign.id, &intent).expect("current specs");
+        let compatible = belt_specs_for_reconciliation(&repository, campaign.id, desired)
+            .expect("compatibility");
+        assert_eq!(compatible, legacy);
+        repository
+            .reconcile_work_items(campaign.id, &compatible, 1)
+            .expect("legacy item remains usable");
     }
 
     #[test]
@@ -10979,7 +11154,7 @@ mod tests {
             .map(|index| replicant_workflow::AllocationCandidate {
                 resource: ResourceKey::Replicant(format!("R-{index}")),
                 kind: "replicant".into(),
-                capabilities: Vec::new(),
+                capabilities: vec!["census".into(), "system_scan".into()],
                 location: Some(replicant_workflow::AllocationLocation {
                     region: Some("Alpha".into()),
                     ..replicant_workflow::AllocationLocation::default()
@@ -11059,6 +11234,14 @@ mod tests {
                 .status,
             replicant_workflow::WorkItemStatus::Pending
         );
+        let reclaimed = repository
+            .claim_next_work_item(campaign.id, 20)
+            .expect("claim reclaimed item")
+            .expect("reclaimed item is pending");
+        let allocations = repository
+            .allocate_requirements(reclaimed.id, reclaimed.state.revision, &candidates)
+            .expect("reclaimed item can allocate released worker");
+        assert!(allocation_worker(&allocations).is_some());
         assert_eq!(
             repository
                 .read_work_item(running[3].id)
@@ -11068,5 +11251,128 @@ mod tests {
                 .status,
             replicant_workflow::WorkItemStatus::Succeeded
         );
+    }
+    #[test]
+    fn belt_capability_mismatch_reclaims_with_checkpoint_but_arbitrary_400_retries() {
+        let mut mismatch_details = replicant_client::ErrorDetails::default();
+        mismatch_details.message = Some("device does not support system-scan".into());
+        let mismatch = replicant_client::Error::Contract {
+            status: 400,
+            details: Box::new(mismatch_details),
+        };
+        assert!(belt_capability_mismatch(&mismatch));
+        assert_eq!(
+            belt_item_failure_transition_with_checkpoint(
+                &mismatch,
+                Some(serde_json::json!({"safe": true}))
+            ),
+            WorkItemTransition::Reclaimed {
+                checkpoint_json: Some(serde_json::json!({"safe": true}))
+            }
+        );
+
+        let mut arbitrary_details = replicant_client::ErrorDetails::default();
+        arbitrary_details.message = Some("invalid belt search destination".into());
+        let arbitrary = replicant_client::Error::Contract {
+            status: 400,
+            details: Box::new(arbitrary_details),
+        };
+        assert!(!belt_capability_mismatch(&arbitrary));
+        assert!(matches!(
+            belt_item_failure_transition(&arbitrary),
+            WorkItemTransition::RetryableFailure { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn census_capability_400_reclaims_once_and_releases_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/R-1/stars/SOL"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "Device does not have census capability"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let intent = BeltSearchCampaignIntent {
+            systems: vec!["SOL".into()],
+            region: "Alpha".into(),
+        };
+        let campaign = repository
+            .create(new_belt_search_campaign_workflow(intent.clone()))
+            .expect("create campaign");
+        repository
+            .reconcile_work_items(
+                campaign.id,
+                &belt_search_item_specs(campaign.id, &intent).expect("specs"),
+                0,
+            )
+            .expect("reconcile");
+        let item = repository
+            .claim_next_work_item(campaign.id, 0)
+            .expect("claim item")
+            .expect("item available");
+        let candidate = |worker: &str| replicant_workflow::AllocationCandidate {
+            resource: ResourceKey::Replicant(worker.into()),
+            kind: "replicant".into(),
+            capabilities: vec!["census".into(), "system_scan".into()],
+            location: Some(replicant_workflow::AllocationLocation {
+                region: Some("Alpha".into()),
+                ..replicant_workflow::AllocationLocation::default()
+            }),
+            available_quantity: 1,
+            observed_revision: 1,
+            observed_at_ms: 0,
+        };
+        let allocations = repository
+            .allocate_requirements(item.id, item.state.revision, &[candidate("R-1")])
+            .expect("allocate stale worker");
+        let worker = allocation_worker(&allocations).expect("worker");
+        let running = repository
+            .start_work_item(item.id, item.state.revision, &worker, "grant-1", 1)
+            .expect("start item");
+        let running = repository
+            .transition_work_item(
+                running.id,
+                running.state.revision,
+                WorkItemTransition::CheckpointCommitted {
+                    checkpoint_json: serde_json::json!({"safe": true}),
+                },
+                2,
+            )
+            .expect("checkpoint item");
+
+        assert_eq!(
+            run_belt_item(
+                repository.clone(),
+                client.clone(),
+                running,
+                worker,
+                "SOL".into(),
+            )
+            .await
+            .expect("capability mismatch stays item-local"),
+            Some("R-1".into())
+        );
+        let reclaimed = repository
+            .read_work_item(item.id)
+            .expect("read item")
+            .expect("item exists");
+        assert_eq!(
+            reclaimed.state.status,
+            replicant_workflow::WorkItemStatus::Pending
+        );
+        assert_eq!(
+            reclaimed.state.checkpoint_json,
+            Some(serde_json::json!({"safe": true}))
+        );
+        let reassigned = repository
+            .allocate_requirements(reclaimed.id, reclaimed.state.revision, &[candidate("R-2")])
+            .expect("released item accepts replacement worker");
+        assert_eq!(allocation_worker(&reassigned).as_deref(), Some("R-2"));
+        client.close().await.expect("close client");
     }
 }

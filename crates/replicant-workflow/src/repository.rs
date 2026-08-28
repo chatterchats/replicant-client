@@ -2830,27 +2830,19 @@ fn transition_work_item_in(
             "DELETE FROM workflow_resource_claims
              WHERE workflow_id = ?1
                AND EXISTS (
-                 SELECT 1 FROM workflow_assignments assignment
-                 WHERE assignment.item_id = ?2
-                   AND assignment.state != 'released'
-                   AND assignment.worker_namespace =
+                 SELECT 1 FROM workflow_resource_allocations allocation
+                 WHERE allocation.item_id = ?2
+                   AND allocation.state = 'active'
+                   AND allocation.resource_namespace =
                        workflow_resource_claims.resource_namespace
-                   AND assignment.worker_key = workflow_resource_claims.resource_key
+                   AND allocation.resource_key = workflow_resource_claims.resource_key
                )",
             params![current.spec.workflow_id.to_string(), current.id.to_string()],
         )?;
         transaction.execute(
             "UPDATE workflow_resource_allocations
              SET state = 'released', updated_at_ms = ?2
-             WHERE item_id = ?1 AND state = 'active'
-               AND EXISTS (
-                 SELECT 1 FROM workflow_assignments assignment
-                 WHERE assignment.item_id = ?1
-                   AND assignment.state != 'released'
-                   AND assignment.worker_namespace =
-                       workflow_resource_allocations.resource_namespace
-                   AND assignment.worker_key = workflow_resource_allocations.resource_key
-               )",
+             WHERE item_id = ?1 AND state = 'active'",
             params![current.id.to_string(), now_ms],
         )?;
     }

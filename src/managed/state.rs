@@ -22,6 +22,20 @@ use super::store::{
     ReconciliationWork, StoreError, StoreHandle,
 };
 
+/// One internally consistent view of committed managed projections.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ManagedStateSnapshot {
+    /// Managed-state revision represented by this snapshot.
+    pub revision: u64,
+    /// Devices owned by the authenticated account.
+    pub owned_devices: Vec<Device>,
+    /// Replicants owned by the authenticated account.
+    pub owned_replicants: Vec<Replicant>,
+    /// Current durable inventory projections.
+    pub inventories: Vec<Inventory>,
+}
+
 /// Local-only managed-state revision gateway.
 #[derive(Clone, Debug)]
 pub struct StateGateway {
@@ -37,6 +51,32 @@ impl StateGateway {
     pub fn revision(&self) -> crate::Result<u64> {
         self.client.ensure_open()?;
         Ok(self.client.managed_state().snapshot().revision())
+    }
+
+    /// Returns related committed projections from one atomic in-memory snapshot.
+    pub fn snapshot(&self) -> crate::Result<ManagedStateSnapshot> {
+        self.client.ensure_open()?;
+        let snapshot = self.client.managed_state().snapshot();
+        Ok(ManagedStateSnapshot {
+            revision: snapshot.revision(),
+            owned_devices: snapshot
+                .devices
+                .values()
+                .filter(|observation| observation.value.access == AccessScope::Owned)
+                .map(|observation| observation.value.clone())
+                .collect(),
+            owned_replicants: snapshot
+                .replicants
+                .values()
+                .filter(|observation| observation.value.access == AccessScope::Owned)
+                .map(|observation| observation.value.clone())
+                .collect(),
+            inventories: snapshot
+                .inventories
+                .values()
+                .map(|observation| observation.value.clone())
+                .collect(),
+        })
     }
 
     /// Returns the revision of projections used by the galaxy scene.

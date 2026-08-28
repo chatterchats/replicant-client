@@ -1,6 +1,9 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use replicant_client::{Client, domain::InventoryOwner};
+use replicant_client::{
+    Client, ManagedStateSnapshot,
+    domain::{Device, DeviceKey, InventoryOwner, Replicant},
+};
 use replicant_workflow::{
     AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, ReplacementOutcome,
     RepositoryError, ResourceKey, WorkItemId, WorkflowRepository,
@@ -49,15 +52,21 @@ impl ResourceBroker {
             .client
             .as_ref()
             .ok_or(replicant_client::Error::Closed)?;
-        let state = client.state();
-        let revision = state.revision()?;
+        let ManagedStateSnapshot {
+            revision,
+            owned_devices: devices,
+            owned_replicants,
+            inventories,
+            ..
+        } = client.state().snapshot()?;
         let observed_at_ms = unix_millis();
+        let hosted_capabilities = hosted_device_capabilities(&devices);
         let mut candidates = Vec::new();
-        for replicant in state.owned_replicants()? {
+        for replicant in owned_replicants {
             candidates.push(AllocationCandidate {
                 resource: ResourceKey::Replicant(replicant.key.id.to_string()),
                 kind: "replicant".into(),
-                capabilities: Vec::new(),
+                capabilities: capabilities_for_replicant(&replicant, &hosted_capabilities),
                 location: replicant.location.map(|location| AllocationLocation {
                     designation: Some(location.id.to_string()),
                     ..AllocationLocation::default()
@@ -67,7 +76,7 @@ impl ResourceBroker {
                 observed_at_ms,
             });
         }
-        for device in state.owned_devices()? {
+        for device in devices {
             let device_code = device.key.id.to_string();
             let mut capabilities = json_string_values(&device.features);
             if let Some(device_type) = &device.device_type {
@@ -122,7 +131,7 @@ impl ResourceBroker {
                 });
             }
         }
-        for inventory in state.inventories()? {
+        for inventory in inventories {
             let owner = match inventory.owner {
                 InventoryOwner::Account(id) => format!("account:{id}"),
                 InventoryOwner::Replicant(key) => format!("replicant:{}", key.id),
@@ -219,6 +228,31 @@ fn json_string_values<T: serde::Serialize>(values: &[T]) -> Vec<String> {
         .collect()
 }
 
+fn hosted_device_capabilities(devices: &[Device]) -> BTreeMap<DeviceKey, Vec<String>> {
+    devices
+        .iter()
+        .map(|device| {
+            let mut capabilities = json_string_values(&device.features);
+            capabilities.extend(json_string_values(&device.available_commands));
+            capabilities.sort();
+            capabilities.dedup();
+            (device.key.clone(), capabilities)
+        })
+        .collect()
+}
+
+fn capabilities_for_replicant(
+    replicant: &Replicant,
+    hosted_capabilities: &BTreeMap<DeviceKey, Vec<String>>,
+) -> Vec<String> {
+    replicant
+        .hosted_device
+        .as_ref()
+        .and_then(|host| hosted_capabilities.get(host))
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -230,12 +264,108 @@ fn unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use replicant_client::domain::{
+        AccessScope, DeviceCommand, DeviceFeature, DeviceKey, DeviceRelationships, ReplicantKey,
+    };
     use replicant_workflow::{
         NewWorkflow, RequirementScope, ResourceKey, ResourceRequirement, WorkItemSpec, WorkflowKind,
     };
     use serde_json::json;
 
     use super::*;
+
+    fn managed_device(
+        code: &str,
+        features: &[&str],
+        available_commands: &[&str],
+    ) -> replicant_client::domain::Device {
+        replicant_client::domain::Device {
+            key: DeviceKey::live(code.into()),
+            device_type: None,
+            status: None,
+            location: None,
+            features: features
+                .iter()
+                .map(|feature| DeviceFeature::from(*feature))
+                .collect(),
+            available_commands: available_commands
+                .iter()
+                .map(|command| DeviceCommand::from(*command))
+                .collect(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: DeviceRelationships::default(),
+            cargo: Default::default(),
+            cargo_capacity: None,
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: None,
+            access: AccessScope::Owned,
+        }
+    }
+
+    fn managed_replicant(hosted_device: Option<&str>) -> replicant_client::domain::Replicant {
+        replicant_client::domain::Replicant {
+            key: ReplicantKey::live("R-1".into()),
+            name: None,
+            is_npc: None,
+            status: None,
+            location: None,
+            hosted_device: hosted_device.map(|code| DeviceKey::live(code.into())),
+            travel: None,
+            private: None,
+            access: AccessScope::Owned,
+        }
+    }
+
+    fn projected_capabilities(
+        replicant: &replicant_client::domain::Replicant,
+        devices: &[replicant_client::domain::Device],
+    ) -> Vec<String> {
+        let hosted_capabilities = hosted_device_capabilities(devices);
+        capabilities_for_replicant(replicant, &hosted_capabilities)
+    }
+
+    #[test]
+    fn replicant_without_host_has_no_projected_capabilities() {
+        let replicant = managed_replicant(None);
+        let devices = [managed_device("HOST-1", &["scanning"], &["activate"])];
+
+        assert!(projected_capabilities(&replicant, &devices).is_empty());
+    }
+
+    #[test]
+    fn replicant_inherits_sorted_deduplicated_host_features_and_commands() {
+        let replicant = managed_replicant(Some("HOST-1"));
+        let devices = [managed_device(
+            "HOST-1",
+            &["travel", "scanning"],
+            &["travel", "activate"],
+        )];
+
+        assert_eq!(
+            projected_capabilities(&replicant, &devices),
+            vec![
+                "activate".to_owned(),
+                "scanning".to_owned(),
+                "travel".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_host_key_has_no_projected_capabilities() {
+        let replicant = managed_replicant(Some("STALE-HOST"));
+        let devices = [managed_device("CURRENT-HOST", &["scanning"], &["activate"])];
+
+        assert!(projected_capabilities(&replicant, &devices).is_empty());
+    }
 
     #[test]
     fn broker_allocates_capability_and_range_matched_candidate() {
