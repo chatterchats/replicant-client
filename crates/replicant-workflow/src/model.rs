@@ -355,6 +355,9 @@ pub struct WaitIntent {
     pub description: String,
     /// Optional exact managed event name used as wake-up evidence.
     pub event_name: Option<String>,
+    /// Optional exact managed event names used as alternative wake-up evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_names: Vec<String>,
     /// Optional device code narrowing event evidence.
     pub device_code: Option<String>,
     /// Optional device codes narrowing event evidence to any listed device.
@@ -376,6 +379,7 @@ impl WaitIntent {
         Self {
             description: description.into(),
             event_name: None,
+            event_names: Vec::new(),
             device_code: None,
             device_codes: Vec::new(),
             cursor: None,
@@ -388,6 +392,14 @@ impl WaitIntent {
     #[must_use]
     pub fn for_event(mut self, event_name: impl Into<String>) -> Self {
         self.event_name = Some(event_name.into());
+        self.event_names.clear();
+        self
+    }
+    /// Adds any of the exact managed event names as wake-up evidence.
+    #[must_use]
+    pub fn for_events(mut self, event_names: impl IntoIterator<Item = String>) -> Self {
+        self.event_name = None;
+        self.event_names = event_names.into_iter().collect();
         self
     }
 

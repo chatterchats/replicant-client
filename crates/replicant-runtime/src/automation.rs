@@ -26,10 +26,11 @@ use replicant_transport::{
     execute_delivery, plan_delivery, validate_resource_pickups,
 };
 use replicant_workflow::{
-    AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow, RegistryError,
-    RepositoryError, RequirementScope, ResourceKey, ResourceRequirement, WorkItem, WorkItemSpec,
-    WorkItemTransition, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
-    WorkflowKind, WorkflowMigration, WorkflowRegistry, WorkflowStatus,
+    AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, ControlRequest, NewWorkflow,
+    RegistryError, RepositoryError, RequirementScope, ResourceKey, ResourceRequirement, WaitIntent,
+    WaitOutcome, WaitSignal, WorkItem, WorkItemSpec, WorkItemStatus, WorkItemTransition,
+    WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
+    WorkflowMigration, WorkflowRegistry, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,7 +53,8 @@ use crate::{
     observatory::auto_prospect,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
-        ftl_network_reachable_systems, restore_relay_checkpoint,
+        ftl_network_reachable_systems, relay_failure_is_topology_impossible,
+        relay_topology_signature, restore_relay_checkpoint,
     },
     survey::{
         SurveyExecutionState, SurveyMode, SurveyOptions, execute_survey_workflow,
@@ -67,6 +69,38 @@ use crate::{
 
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_WAIT_SECONDS: u64 = 21_600;
+const IDLE_CAMPAIGN_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+const EVENT_DEPENDENCY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
+const EVENT_CONNECTIVITY_RETRY_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const CAMPAIGN_RESOURCE_EVENT_NAMES: [&str; 11] = [
+    "device.attached",
+    "device.changed_owner",
+    "device.compacted",
+    "device.compacting",
+    "device.decommissioned",
+    "device.deployed",
+    "device.detached",
+    "device.stowed",
+    "device.unfurled",
+    "device.unfurling",
+    "replicant.transferred",
+];
+const EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES: [&str; 14] = [
+    "device.attached",
+    "device.changed_owner",
+    "device.compacted",
+    "device.compacting",
+    "device.decommissioned",
+    "device.deployed",
+    "device.detached",
+    "device.stowed",
+    "device.unfurled",
+    "device.unfurling",
+    "event.completed",
+    "print.completed",
+    "relay.activated",
+    "replicant.transferred",
+];
 
 /// Intent-native workflow that fully surveys one system with an AMI survey controller.
 pub fn scan_system_workflow_kind() -> WorkflowKind {
@@ -655,6 +689,11 @@ pub struct ExplorationIntent {
     pub hub: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ExplorationTopologyBlocker {
+    signature: String,
+}
+
 /// Authoritative exploration checkpoint. The old relay mission file is only an ephemeral adapter.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ExplorationWorkflowCheckpoint {
@@ -666,6 +705,8 @@ pub struct ExplorationWorkflowCheckpoint {
     pub state: Option<RelayExecutionState>,
     #[serde(default)]
     failure_class: Option<FailureClass>,
+    #[serde(default)]
+    topology_blocker: Option<ExplorationTopologyBlocker>,
 }
 
 /// Goal-level event input shared by delivery and tour workflows.
@@ -2181,11 +2222,24 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                 context.checkpoint().map_err(string_error)?;
             let client = managed_client(context)?;
             let repository = context.repository_handle();
-            let Some(region) =
-                resolve_belt_campaign_region(repository.as_ref(), &intent, &checkpoint)
-                    .map_err(string_error)?
-            else {
-                return context.mark_waiting().map_err(string_error);
+            let region = loop {
+                if let Some(region) =
+                    resolve_belt_campaign_region(repository.as_ref(), &intent, &checkpoint)
+                        .map_err(string_error)?
+                {
+                    break region;
+                }
+                if !wait_for_campaign_work(
+                    context,
+                    "belt campaign is waiting for its durable regional assignment",
+                    &CAMPAIGN_RESOURCE_EVENT_NAMES,
+                    None,
+                    IDLE_CAMPAIGN_RETRY_INTERVAL,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             };
             intent.region = region;
             let specs = belt_search_item_specs(context.id(), &intent).map_err(string_error)?;
@@ -2201,52 +2255,56 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                 )
                 .map_err(string_error)?;
 
-            let mut excluded_workers = BTreeSet::new();
             loop {
-                let broker = crate::assignment::ResourceBroker::with_managed_client(
-                    repository.clone(),
-                    client.clone(),
-                );
-                let mut candidates = broker.discover_candidates().map_err(string_error)?;
-                let assignments = repository
-                    .list_documents("director.replicant")
-                    .map_err(string_error)?
-                    .into_iter()
-                    .filter_map(|(worker, value, _)| {
-                        (value.get("region").and_then(Value::as_str)
-                            == Some(intent.region.as_str()))
-                        .then_some(worker)
-                    })
-                    .collect::<BTreeSet<_>>();
-                candidates.retain(|candidate| {
-                    belt_worker_candidate(candidate)
-                        && matches!(
-                            &candidate.resource,
-                            ResourceKey::Replicant(worker)
-                                if assignments.contains(worker)
-                                    && !excluded_workers.contains(worker)
-                        )
-                });
-                for candidate in &mut candidates {
-                    if let Some(location) = &mut candidate.location {
-                        location.region = Some(intent.region.clone());
-                    } else {
-                        candidate.location = Some(replicant_workflow::AllocationLocation {
-                            region: Some(intent.region.clone()),
-                            ..replicant_workflow::AllocationLocation::default()
-                        });
-                    }
-                }
-                let mut running = Vec::new();
-                while running.len() < candidates.len() {
-                    let Some(assigned) = repository
-                        .claim_next_work_item(context.id(), unix_millis())
+                let mut excluded_workers = BTreeSet::new();
+                loop {
+                    let broker = crate::assignment::ResourceBroker::with_managed_client(
+                        repository.clone(),
+                        client.clone(),
+                    );
+                    let mut candidates = broker.discover_candidates().map_err(string_error)?;
+                    let assignments = repository
+                        .list_documents("director.replicant")
                         .map_err(string_error)?
-                    else {
-                        break;
-                    };
-                    let allocations =
-                        match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
+                        .into_iter()
+                        .filter_map(|(worker, value, _)| {
+                            (value.get("region").and_then(Value::as_str)
+                                == Some(intent.region.as_str()))
+                            .then_some(worker)
+                        })
+                        .collect::<BTreeSet<_>>();
+                    candidates.retain(|candidate| {
+                        belt_worker_candidate(candidate)
+                            && matches!(
+                                &candidate.resource,
+                                ResourceKey::Replicant(worker)
+                                    if assignments.contains(worker)
+                                        && !excluded_workers.contains(worker)
+                            )
+                    });
+                    for candidate in &mut candidates {
+                        if let Some(location) = &mut candidate.location {
+                            location.region = Some(intent.region.clone());
+                        } else {
+                            candidate.location = Some(replicant_workflow::AllocationLocation {
+                                region: Some(intent.region.clone()),
+                                ..replicant_workflow::AllocationLocation::default()
+                            });
+                        }
+                    }
+                    let mut running = Vec::new();
+                    while running.len() < candidates.len() {
+                        let Some(assigned) = repository
+                            .claim_next_work_item(context.id(), unix_millis())
+                            .map_err(string_error)?
+                        else {
+                            break;
+                        };
+                        let allocations = match broker.allocate(
+                            assigned.id,
+                            assigned.state.revision,
+                            &candidates,
+                        ) {
                             Ok(allocations) => allocations,
                             Err(error) => {
                                 repository
@@ -2266,61 +2324,86 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                                 continue;
                             }
                         };
-                    let worker = allocation_worker(&allocations)
-                        .ok_or_else(|| "belt item allocation omitted its Replicant".to_owned())?;
-                    let started = repository
-                        .start_work_item(
-                            assigned.id,
-                            assigned.state.revision,
-                            &worker,
-                            &format!("belt:{}:{worker}", assigned.id),
-                            unix_millis(),
+                        let worker = allocation_worker(&allocations).ok_or_else(|| {
+                            "belt item allocation omitted its Replicant".to_owned()
+                        })?;
+                        let started = repository
+                            .start_work_item(
+                                assigned.id,
+                                assigned.state.revision,
+                                &worker,
+                                &format!("belt:{}:{worker}", assigned.id),
+                                unix_millis(),
+                            )
+                            .map_err(string_error)?;
+                        let system = started
+                            .spec
+                            .payload_json
+                            .get("system")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "belt item payload omitted system".to_owned())?
+                            .to_owned();
+                        running.push(run_belt_item(
+                            repository.clone(),
+                            client.clone(),
+                            started,
+                            worker,
+                            system,
+                        ));
+                    }
+                    if running.is_empty() {
+                        break;
+                    }
+                    for worker in futures::future::join_all(running)
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .flatten()
+                    {
+                        excluded_workers.insert(worker);
+                    }
+                }
+
+                match repository
+                    .aggregate_campaign_result(context.id())
+                    .map_err(string_error)?
+                {
+                    Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
+                        return context.mark_succeeded(Some(result)).map_err(string_error);
+                    }
+                    Some(result) => {
+                        return context
+                            .mark_failed_with_result(
+                                "belt-search campaign completed without a successful item",
+                                result,
+                                replicant_workflow::WorkflowFailureDisposition::Permanent,
+                            )
+                            .map_err(string_error);
+                    }
+                    None => {
+                        let deadline = campaign_retry_deadline(
+                            repository.as_ref(),
+                            context.id(),
+                            unix_millis().saturating_add(
+                                i64::try_from(IDLE_CAMPAIGN_RETRY_INTERVAL.as_millis())
+                                    .unwrap_or(i64::MAX),
+                            ),
                         )
                         .map_err(string_error)?;
-                    let system = started
-                        .spec
-                        .payload_json
-                        .get("system")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "belt item payload omitted system".to_owned())?
-                        .to_owned();
-                    running.push(run_belt_item(
-                        repository.clone(),
-                        client.clone(),
-                        started,
-                        worker,
-                        system,
-                    ));
+                        if !wait_for_campaign_work(
+                            context,
+                            "belt campaign is waiting for a scan-capable regional Replicant or item retry",
+                            &CAMPAIGN_RESOURCE_EVENT_NAMES,
+                            Some(deadline),
+                            IDLE_CAMPAIGN_RETRY_INTERVAL,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
                 }
-                if running.is_empty() {
-                    break;
-                }
-                for worker in futures::future::join_all(running)
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                {
-                    excluded_workers.insert(worker);
-                }
-            }
-
-            match repository
-                .aggregate_campaign_result(context.id())
-                .map_err(string_error)?
-            {
-                Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
-                    context.mark_succeeded(Some(result)).map_err(string_error)
-                }
-                Some(result) => context
-                    .mark_failed_with_result(
-                        "belt-search campaign completed without a successful item",
-                        result,
-                        replicant_workflow::WorkflowFailureDisposition::Permanent,
-                    )
-                    .map_err(string_error),
-                None => context.mark_waiting().map_err(string_error),
             }
         })
     }
@@ -3717,9 +3800,6 @@ impl WorkflowExecutor for ExplorationWorkflow {
             } else {
                 clear_scratch_file(&plan_file)?;
             }
-            context
-                .advance_to("exploring", &checkpoint)
-                .map_err(string_error)?;
             let request = RelayExpansionRequest {
                 replicant,
                 hub,
@@ -3729,6 +3809,33 @@ impl WorkflowExecutor for ExplorationWorkflow {
                 wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
                 unavailable_autofactories,
             };
+            let planning_signature = if checkpoint.state.is_none() {
+                match relay_topology_signature(&client, &request).await {
+                    Ok(signature) => Some(signature),
+                    Err(error) => {
+                        tracing::debug!(
+                            workflow_id = %context.id(),
+                            target = %intent.target,
+                            error = %error,
+                            "could not snapshot relay topology; preserving ordinary planner retry behavior"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(signature) = planning_signature.as_deref()
+                && !prepare_topology_replan(&mut checkpoint, signature)
+            {
+                context
+                    .advance_to("awaiting_relay_prerequisites", &checkpoint)
+                    .map_err(string_error)?;
+                return context.mark_waiting().map_err(string_error);
+            }
+            context
+                .advance_to("exploring", &checkpoint)
+                .map_err(string_error)?;
             let result = execute_relay_workflow(&client, &request, |state| {
                 let (replicant, devices, factories) = state.resources();
                 claim_relay_resource(context, ResourceKey::Replicant(replicant.to_owned()))?;
@@ -3777,17 +3884,29 @@ impl WorkflowExecutor for ExplorationWorkflow {
                             .advance_to("awaiting_available_resources", &checkpoint)
                             .map_err(string_error)?;
                         context.mark_waiting().map_err(string_error)
-                    } else if retryable_connectivity_dependency_failure(error.as_ref()) {
+                    } else if relay_failure_is_topology_impossible(error.as_ref())
+                        && let Some(signature) = planning_signature
+                    {
+                        let wait_reason = message.clone();
+                        checkpoint.failure_class = class;
+                        checkpoint.topology_blocker =
+                            Some(ExplorationTopologyBlocker { signature });
                         tracing::warn!(
                             workflow_id = %context.id(),
                             target = %intent.target,
-                            error = %message,
+                            error = %wait_reason,
+                            "relay expansion topology is disconnected for the current planning inputs; waiting for those inputs to change"
+                        );
+                        wait_for_exploration_relay_prerequisites(context, &checkpoint, wait_reason)
+                    } else if retryable_connectivity_dependency_failure(error.as_ref()) {
+                        let wait_reason = message.clone();
+                        tracing::warn!(
+                            workflow_id = %context.id(),
+                            target = %intent.target,
+                            error = %wait_reason,
                             "relay expansion is blocked on a recoverable prerequisite; waiting to retry"
                         );
-                        context
-                            .advance_to("awaiting_relay_prerequisites", &checkpoint)
-                            .map_err(string_error)?;
-                        context.mark_waiting().map_err(string_error)
+                        wait_for_exploration_relay_prerequisites(context, &checkpoint, wait_reason)
                     } else {
                         checkpoint.failure_class = class;
                         context
@@ -4105,7 +4224,11 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                 )
                 .await?
                 {
-                    return Ok(());
+                    if context.control_request().map_err(string_error)? != ControlRequest::Continue
+                    {
+                        return Ok(());
+                    }
+                    continue;
                 }
 
                 if checkpoint.replan_after_connectivity {
@@ -4159,26 +4282,30 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                 .advance_to("executing", &checkpoint)
                 .map_err(string_error)?;
             loop {
-                let broker = crate::assignment::ResourceBroker::with_managed_client(
-                    repository.clone(),
-                    client.clone(),
-                );
-                let candidates = crate::workflows::regional_relay_candidates(
-                    repository.as_ref(),
-                    &client,
-                    broker.discover_candidates().map_err(string_error)?,
-                    &intent.region,
-                )?;
-                let mut running = Vec::new();
-                while running.len() < candidates.len().max(1) {
-                    let Some(assigned) = repository
-                        .claim_next_work_item(context.id(), unix_millis())
-                        .map_err(string_error)?
-                    else {
-                        break;
-                    };
-                    let allocations =
-                        match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
+                loop {
+                    let broker = crate::assignment::ResourceBroker::with_managed_client(
+                        repository.clone(),
+                        client.clone(),
+                    );
+                    let candidates = crate::workflows::regional_relay_candidates(
+                        repository.as_ref(),
+                        &client,
+                        broker.discover_candidates().map_err(string_error)?,
+                        &intent.region,
+                    )?;
+                    let mut running = Vec::new();
+                    while running.len() < candidates.len().max(1) {
+                        let Some(assigned) = repository
+                            .claim_next_work_item(context.id(), unix_millis())
+                            .map_err(string_error)?
+                        else {
+                            break;
+                        };
+                        let allocations = match broker.allocate(
+                            assigned.id,
+                            assigned.state.revision,
+                            &candidates,
+                        ) {
                             Ok(allocations) => allocations,
                             Err(_) => {
                                 repository
@@ -4194,69 +4321,94 @@ impl WorkflowExecutor for EventCampaignWorkflow {
                                 break;
                             }
                         };
-                    let worker = allocation_worker(&allocations)
-                        .ok_or_else(|| "event item allocation omitted worker".to_owned())?;
-                    let assignment_id = format!("event:{}:{worker}", assigned.id);
-                    repository
-                        .assign_work_item(
-                            assigned.id,
-                            assigned.state.revision,
-                            &assignment_id,
-                            &ResourceKey::Replicant(worker.clone()),
-                            unix_millis(),
-                        )
-                        .map_err(string_error)?;
-                    let started = repository
-                        .start_work_item(
-                            assigned.id,
-                            assigned.state.revision,
-                            &worker,
-                            &assignment_id,
-                            unix_millis(),
-                        )
-                        .map_err(string_error)?;
-                    let mission_json = event_item_input_checkpoint(repository.as_ref(), &started)?;
-                    running.push(run_event_campaign_item(
-                        repository.clone(),
-                        client.clone(),
-                        item_executor.clone(),
-                        broker.clone(),
-                        EventItemRun {
-                            replacement_candidates: candidates.clone(),
-                            item: started,
-                            allocations,
-                            mission_json,
-                        },
-                    ));
-                }
-                if running.is_empty() {
-                    break;
-                }
-                for result in futures::future::join_all(running).await {
-                    let (mission_path, mission_json) = result?;
-                    if let Some(archive) = checkpoint.archive.as_mut() {
-                        archive.mission_json.insert(mission_path, mission_json);
+                        let worker = allocation_worker(&allocations)
+                            .ok_or_else(|| "event item allocation omitted worker".to_owned())?;
+                        let assignment_id = format!("event:{}:{worker}", assigned.id);
+                        repository
+                            .assign_work_item(
+                                assigned.id,
+                                assigned.state.revision,
+                                &assignment_id,
+                                &ResourceKey::Replicant(worker.clone()),
+                                unix_millis(),
+                            )
+                            .map_err(string_error)?;
+                        let started = repository
+                            .start_work_item(
+                                assigned.id,
+                                assigned.state.revision,
+                                &worker,
+                                &assignment_id,
+                                unix_millis(),
+                            )
+                            .map_err(string_error)?;
+                        let mission_json =
+                            event_item_input_checkpoint(repository.as_ref(), &started)?;
+                        running.push(run_event_campaign_item(
+                            repository.clone(),
+                            client.clone(),
+                            item_executor.clone(),
+                            broker.clone(),
+                            EventItemRun {
+                                replacement_candidates: candidates.clone(),
+                                item: started,
+                                allocations,
+                                mission_json,
+                            },
+                        ));
                     }
-                    context
-                        .persist_checkpoint(&checkpoint)
+                    if running.is_empty() {
+                        break;
+                    }
+                    for result in futures::future::join_all(running).await {
+                        let (mission_path, mission_json) = result?;
+                        if let Some(archive) = checkpoint.archive.as_mut() {
+                            archive.mission_json.insert(mission_path, mission_json);
+                        }
+                        context
+                            .persist_checkpoint(&checkpoint)
+                            .map_err(string_error)?;
+                    }
+                }
+                match repository
+                    .aggregate_campaign_result(context.id())
+                    .map_err(string_error)?
+                {
+                    Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
+                        return context.mark_succeeded(Some(result)).map_err(string_error);
+                    }
+                    Some(result) => {
+                        return context
+                            .mark_failed_with_result(
+                                "event campaign completed without a successful criterion",
+                                result,
+                                replicant_workflow::WorkflowFailureDisposition::Permanent,
+                            )
+                            .map_err(string_error);
+                    }
+                    None => {
+                        let deadline = campaign_retry_deadline(
+                            repository.as_ref(),
+                            context.id(),
+                            unix_millis().saturating_add(
+                                i64::try_from(IDLE_CAMPAIGN_RETRY_INTERVAL.as_millis())
+                                    .unwrap_or(i64::MAX),
+                            ),
+                        )
                         .map_err(string_error)?;
+                        if !wait_for_campaign_work(
+                            context,
+                            "event campaign is waiting for durable item dependencies or resource availability",
+                            &EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES,
+                            Some(deadline),
+                            IDLE_CAMPAIGN_RETRY_INTERVAL,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                    }
                 }
-            }
-            match repository
-                .aggregate_campaign_result(context.id())
-                .map_err(string_error)?
-            {
-                Some(result) if result.workflow_status() == WorkflowStatus::Succeeded => {
-                    context.mark_succeeded(Some(result)).map_err(string_error)
-                }
-                Some(result) => context
-                    .mark_failed_with_result(
-                        "event campaign completed without a successful criterion",
-                        result,
-                        replicant_workflow::WorkflowFailureDisposition::Permanent,
-                    )
-                    .map_err(string_error),
-                None => context.mark_waiting().map_err(string_error),
             }
         })
     }
@@ -4555,7 +4707,19 @@ async fn ensure_event_campaign_connectivity(
         context
             .advance_to("awaiting_ftl_connectivity", checkpoint)
             .map_err(string_error)?;
-        context.mark_waiting().map_err(string_error)?;
+        let deadline = event_connectivity_retry_deadline(
+            context.repository(),
+            &checkpoint.connectivity_workflows,
+        )
+        .map_err(string_error)?;
+        wait_for_campaign_work(
+            context,
+            "event campaign is waiting for a durable FTL connectivity dependency",
+            &EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES,
+            deadline,
+            EVENT_DEPENDENCY_RECONCILIATION_INTERVAL,
+        )
+        .await?;
     }
     Ok(ready)
 }
@@ -4616,12 +4780,14 @@ pub(crate) async fn reconcile_event_connectivity(
                         )
                     )
                 {
-                    const CONNECTIVITY_RETRY_COOLDOWN_MS: i64 = 30 * 60 * 1_000;
+                    let retry_cooldown_ms =
+                        i64::try_from(EVENT_CONNECTIVITY_RETRY_COOLDOWN.as_millis())
+                            .unwrap_or(i64::MAX);
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
                         .unwrap_or_default();
-                    if now.saturating_sub(workflow.updated_at) < CONNECTIVITY_RETRY_COOLDOWN_MS {
+                    if now.saturating_sub(workflow.updated_at) < retry_cooldown_ms {
                         tracing::debug!(
                             workflow_id = %context.id(),
                             connectivity_workflow_id = %workflow_id,
@@ -4728,6 +4894,7 @@ fn persist_stale_exploration_replan(
         "relay topology changed underneath the saved plan; discarding it and replanning"
     );
     checkpoint.state = None;
+    checkpoint.topology_blocker = None;
     clear_scratch_file(plan_file)?;
     context
         .advance_to("replanning_relay_coverage", checkpoint)
@@ -4745,6 +4912,21 @@ fn stale_relay_plan_failure(error: &(dyn std::error::Error + 'static)) -> bool {
 fn resource_claim_contention(error: &(dyn std::error::Error + 'static)) -> bool {
     failure_class(error) == Some(FailureClass::ResourceClaimContention)
 }
+fn prepare_topology_replan(
+    checkpoint: &mut ExplorationWorkflowCheckpoint,
+    current_signature: &str,
+) -> bool {
+    if checkpoint
+        .topology_blocker
+        .as_ref()
+        .is_some_and(|blocker| blocker.signature == current_signature)
+    {
+        return false;
+    }
+    checkpoint.topology_blocker = None;
+    checkpoint.failure_class = None;
+    true
+}
 
 fn retryable_connectivity_dependency_failure(error: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
@@ -4755,6 +4937,33 @@ fn retryable_connectivity_dependency_failure(error: &(dyn std::error::Error + 's
                 | FailureClass::TransientUpstream
         )
     )
+}
+
+fn wait_for_exploration_relay_prerequisites(
+    context: &mut WorkflowContext,
+    checkpoint: &ExplorationWorkflowCheckpoint,
+    reason: impl Into<String>,
+) -> Result<(), String> {
+    record_exploration_wait_reason(context, reason)?;
+    context
+        .advance_to("awaiting_relay_prerequisites", checkpoint)
+        .map_err(string_error)?;
+    context.mark_waiting().map_err(string_error)
+}
+
+fn record_exploration_wait_reason(
+    context: &WorkflowContext,
+    reason: impl Into<String>,
+) -> Result<(), String> {
+    context
+        .emit_activity(
+            serde_json::to_string(&crate::workflows::WorkflowActivityEvent::WaitReason {
+                step: "awaiting_relay_prerequisites".to_owned(),
+                reason: reason.into(),
+            })
+            .map_err(string_error)?,
+        )
+        .map_err(string_error)
 }
 
 fn active_connectivity_workflow(
@@ -9376,6 +9585,91 @@ fn clear_scratch_file(path: &Path) -> Result<(), String> {
 fn read_json(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(string_error)
 }
+fn event_connectivity_retry_deadline(
+    repository: &replicant_workflow::WorkflowRepository,
+    dependencies: &BTreeMap<String, WorkflowId>,
+) -> Result<Option<i64>, RepositoryError> {
+    let cooldown_ms =
+        i64::try_from(EVENT_CONNECTIVITY_RETRY_COOLDOWN.as_millis()).unwrap_or(i64::MAX);
+    dependencies
+        .values()
+        .try_fold(None, |earliest: Option<i64>, workflow_id| {
+            let deadline = repository
+                .read(*workflow_id)?
+                .filter(|workflow| workflow.status == WorkflowStatus::Failed)
+                .map(|workflow| workflow.updated_at.saturating_add(cooldown_ms));
+            Ok(match (earliest, deadline) {
+                (Some(earliest), Some(deadline)) => Some(earliest.min(deadline)),
+                (None, Some(deadline)) => Some(deadline),
+                (earliest, None) => earliest,
+            })
+        })
+}
+
+fn campaign_retry_deadline(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+    fallback_deadline_ms: i64,
+) -> Result<i64, RepositoryError> {
+    Ok(repository
+        .list_work_items(workflow_id)?
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.state.status,
+                WorkItemStatus::Pending | WorkItemStatus::Waiting
+            )
+        })
+        .filter_map(|item| item.state.next_attempt_at_ms)
+        .min()
+        .unwrap_or(fallback_deadline_ms))
+}
+
+fn campaign_wait_intent(
+    description: &str,
+    event_names: &[&str],
+    deadline_ms: Option<i64>,
+    poll_interval: Duration,
+) -> WaitIntent {
+    let intent = WaitIntent::state(description)
+        .for_events(event_names.iter().map(|name| (*name).to_owned()))
+        .polling_every(poll_interval);
+    match deadline_ms {
+        Some(deadline_ms) => intent.until(deadline_ms),
+        None => intent,
+    }
+}
+
+fn campaign_wait_signal_is_actionable(signal: WaitSignal) -> bool {
+    matches!(
+        signal,
+        WaitSignal::History
+            | WaitSignal::Event
+            | WaitSignal::StateRevision
+            | WaitSignal::Poll
+            | WaitSignal::WatcherGap
+    )
+}
+
+async fn wait_for_campaign_work(
+    context: &mut WorkflowContext,
+    description: &str,
+    event_names: &[&str],
+    deadline_ms: Option<i64>,
+    poll_interval: Duration,
+) -> Result<bool, String> {
+    let intent = campaign_wait_intent(description, event_names, deadline_ms, poll_interval);
+    let outcome = context
+        .wait_until(intent, |_client, signal| {
+            std::future::ready(Ok(campaign_wait_signal_is_actionable(signal)))
+        })
+        .await
+        .map_err(string_error)?;
+    Ok(matches!(
+        outcome,
+        WaitOutcome::Satisfied | WaitOutcome::Deadline
+    ))
+}
 
 fn unix_millis() -> i64 {
     SystemTime::now()
@@ -10212,6 +10506,7 @@ mod tests {
             }]
         );
     }
+
     #[derive(Clone, Deserialize, Serialize)]
     enum FailureRoutingFixture {
         EventInputs,
@@ -10219,6 +10514,7 @@ mod tests {
         EventExecutorContention,
         EventDeviceMissing,
         ExplorationDeviceMissing,
+        ExplorationRelayPrerequisite,
     }
 
     struct FailureRoutingFactory {
@@ -10302,7 +10598,10 @@ mod tests {
                                     &error,
                                 )?
                             }
-                            FailureRoutingFixture::ExplorationDeviceMissing => unreachable!(),
+                            FailureRoutingFixture::ExplorationDeviceMissing
+                            | FailureRoutingFixture::ExplorationRelayPrerequisite => {
+                                unreachable!()
+                            }
                         };
                         if handled {
                             Ok(())
@@ -10329,6 +10628,23 @@ mod tests {
                         } else {
                             Err("exploration failure fixture was not routed".to_owned())
                         }
+                    }
+                    FailureRoutingFixture::ExplorationRelayPrerequisite => {
+                        let checkpoint: ExplorationWorkflowCheckpoint =
+                            context.checkpoint().map_err(string_error)?;
+                        let error = ClassifiedError::new(
+                            FailureClass::ManufacturingCapacity,
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting for next relay deployment load: ALPHA, BETA",
+                        );
+                        if !retryable_connectivity_dependency_failure(&error) {
+                            return Err("manufacturing prerequisite was not retryable".to_owned());
+                        }
+                        wait_for_exploration_relay_prerequisites(
+                            context,
+                            &checkpoint,
+                            error.to_string(),
+                        )
                     }
                 }
             })
@@ -10419,6 +10735,17 @@ mod tests {
                 .expect("exploration checkpoint"),
                 "replanning_relay_coverage",
             ),
+            (
+                FailureRoutingFixture::ExplorationRelayPrerequisite,
+                serde_json::to_value(ExplorationWorkflowCheckpoint {
+                    replicant: Some("REP-1".into()),
+                    hub: Some("ROOT-1-L4".into()),
+                    state: Some(relay_execution_fixture()),
+                    ..ExplorationWorkflowCheckpoint::default()
+                })
+                .expect("exploration prerequisite checkpoint"),
+                "awaiting_relay_prerequisites",
+            ),
         ];
         let mut ids = Vec::new();
         for (fixture, checkpoint, expected_step) in fixtures {
@@ -10483,6 +10810,30 @@ mod tests {
                     !scratch_file(id, "failure-routing.json")
                         .expect("scratch path")
                         .exists()
+                );
+            } else if expected_step == "awaiting_relay_prerequisites" {
+                let checkpoint: ExplorationWorkflowCheckpoint =
+                    workflow.checkpoint().expect("exploration checkpoint");
+                let state = checkpoint.state.expect("retained relay plan");
+                let encoded = serde_json::to_value(state).expect("retained relay plan JSON");
+                assert_eq!(encoded["mission_id"], "relay-test");
+                assert_eq!(encoded["stops"][0]["system"], "TARGET");
+                let reason = "timed out waiting for next relay deployment load: ALPHA, BETA";
+                assert!(
+                    repository
+                        .activity(id)
+                        .expect("workflow activity")
+                        .iter()
+                        .any(|activity| {
+                            serde_json::from_str::<crate::workflows::WorkflowActivityEvent>(
+                                &activity.message,
+                            )
+                            .ok()
+                                == Some(crate::workflows::WorkflowActivityEvent::WaitReason {
+                                    step: "awaiting_relay_prerequisites".to_owned(),
+                                    reason: reason.to_owned(),
+                                })
+                        })
                 );
             } else {
                 let checkpoint: EventCampaignCheckpoint =
@@ -10612,7 +10963,19 @@ mod tests {
             io::ErrorKind::NotFound,
             "completely reworded relay prerequisite",
         );
+        let manufacturing = ClassifiedError::new(
+            FailureClass::ManufacturingCapacity,
+            io::ErrorKind::TimedOut,
+            "timed out waiting for next relay deployment load: ALPHA, BETA",
+        );
+        assert!(retryable_connectivity_dependency_failure(&manufacturing));
+        assert_eq!(
+            failure_disposition(&manufacturing),
+            replicant_workflow::WorkflowFailureDisposition::Retryable
+        );
         assert!(retryable_connectivity_dependency_failure(&route));
+        assert!(relay_failure_is_topology_impossible(&route));
+        assert!(!relay_failure_is_topology_impossible(&manufacturing));
         assert!(retryable_connectivity_dependency_failure(&local));
         assert!(retryable_connectivity_dependency_failure(
             &replicant_client::Error::Closed
@@ -10623,6 +10986,60 @@ mod tests {
         assert!(!retryable_connectivity_dependency_failure(
             &io::Error::other("relay checkpoint is malformed")
         ));
+    }
+    #[test]
+    fn unchanged_topology_blocker_suppresses_planner_until_signature_changes() {
+        let mut checkpoint: ExplorationWorkflowCheckpoint =
+            serde_json::from_value(serde_json::json!({
+                "replicant": "REP-1",
+                "hub": "ROOT-1-L4"
+            }))
+            .expect("legacy exploration checkpoint");
+        let mut planner_calls = 0;
+
+        if prepare_topology_replan(&mut checkpoint, "relay-topology-v1:catalogue-a-range-a") {
+            planner_calls += 1;
+        }
+        assert_eq!(
+            planner_calls, 1,
+            "legacy checkpoint performs one safe replan"
+        );
+
+        checkpoint.topology_blocker = Some(ExplorationTopologyBlocker {
+            signature: "relay-topology-v1:catalogue-a-range-a".to_owned(),
+        });
+        for _ in 0..3 {
+            if prepare_topology_replan(&mut checkpoint, "relay-topology-v1:catalogue-a-range-a") {
+                planner_calls += 1;
+            }
+        }
+        assert_eq!(
+            planner_calls, 1,
+            "supervisor wakes do not rerun the planner"
+        );
+
+        if prepare_topology_replan(&mut checkpoint, "relay-topology-v1:catalogue-b-range-a") {
+            planner_calls += 1;
+        }
+        assert_eq!(planner_calls, 2, "changed topology invalidates the blocker");
+        assert!(checkpoint.topology_blocker.is_none());
+
+        checkpoint.topology_blocker = Some(ExplorationTopologyBlocker {
+            signature: "relay-topology-v1:catalogue-b-range-a".to_owned(),
+        });
+        if prepare_topology_replan(&mut checkpoint, "relay-topology-v1:catalogue-b-range-b") {
+            planner_calls += 1;
+            checkpoint.state = Some(relay_execution_fixture());
+        }
+        assert_eq!(
+            planner_calls, 3,
+            "changed usable range invalidates the blocker"
+        );
+        assert!(checkpoint.topology_blocker.is_none());
+        assert!(
+            checkpoint.state.is_some(),
+            "new connectivity can persist a live plan after invalidation"
+        );
     }
 
     #[test]
@@ -10987,6 +11404,136 @@ mod tests {
         ])));
     }
 
+    #[test]
+    fn campaign_retry_deadline_uses_earliest_waiting_item() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let intent = BeltSearchCampaignIntent {
+            systems: vec!["SOL".into(), "ALPHA".into()],
+            region: "Alpha".into(),
+        };
+        let campaign = repository
+            .create(new_belt_search_campaign_workflow(intent.clone()))
+            .expect("create campaign");
+        repository
+            .reconcile_work_items(
+                campaign.id,
+                &belt_search_item_specs(campaign.id, &intent).expect("specs"),
+                0,
+            )
+            .expect("reconcile items");
+        for retry_at_ms in [120_000, 60_000] {
+            let item = repository
+                .claim_next_work_item(campaign.id, 0)
+                .expect("claim item")
+                .expect("item remains");
+            repository
+                .transition_work_item(
+                    item.id,
+                    item.state.revision,
+                    WorkItemTransition::Waiting {
+                        checkpoint_json: None,
+                        reason: "fixture resource contention".into(),
+                        retry_at_ms: Some(retry_at_ms),
+                    },
+                    0,
+                )
+                .expect("wait item");
+        }
+
+        assert_eq!(
+            campaign_retry_deadline(&repository, campaign.id, 300_000).expect("derive deadline"),
+            60_000
+        );
+    }
+
+    #[test]
+    fn idle_campaign_wait_carries_deadline_and_managed_wake_evidence() {
+        let intent = campaign_wait_intent(
+            "fixture",
+            &CAMPAIGN_RESOURCE_EVENT_NAMES,
+            Some(300_000),
+            IDLE_CAMPAIGN_RETRY_INTERVAL,
+        );
+
+        assert_eq!(intent.deadline_millis, Some(300_000));
+        assert_eq!(intent.poll_interval_millis, Some(300_000));
+        for event_name in [
+            "device.attached",
+            "device.compacted",
+            "device.compacting",
+            "device.unfurled",
+            "device.unfurling",
+            "replicant.transferred",
+        ] {
+            assert!(
+                intent.event_names.iter().any(|name| name == event_name),
+                "missing managed wake event {event_name}"
+            );
+        }
+        assert!(campaign_wait_signal_is_actionable(
+            WaitSignal::StateRevision
+        ));
+        assert!(campaign_wait_signal_is_actionable(WaitSignal::Event));
+        assert!(!campaign_wait_signal_is_actionable(WaitSignal::Initial));
+    }
+
+    #[test]
+    fn event_dependency_wait_uses_child_cooldown_without_five_second_polling() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let child = repository
+            .create(new_exploration_workflow(ExplorationIntent {
+                target: "ALPHA".into(),
+                replicant: Some("R-1".into()),
+                hub: Some("SOL".into()),
+            }))
+            .expect("create dependency");
+        let failed = repository
+            .update(
+                child.id,
+                child.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: Some("awaiting_relay_prerequisites".into()),
+                    checkpoint: child.checkpoint::<Value>().expect("dependency checkpoint"),
+                    last_error: Some("fixture connectivity dependency".into()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("fail dependency");
+        let dependencies = BTreeMap::from([("ALPHA".into(), failed.id)]);
+        let deadline = event_connectivity_retry_deadline(&repository, &dependencies)
+            .expect("derive dependency deadline");
+        let expected = failed.updated_at.saturating_add(
+            i64::try_from(EVENT_CONNECTIVITY_RETRY_COOLDOWN.as_millis()).unwrap_or(i64::MAX),
+        );
+        let intent = campaign_wait_intent(
+            "fixture dependency",
+            &EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES,
+            deadline,
+            EVENT_DEPENDENCY_RECONCILIATION_INTERVAL,
+        );
+
+        assert_eq!(intent.deadline_millis, Some(expected));
+        assert_eq!(intent.poll_interval_millis, Some(60_000));
+        for event_name in ["device.compacted", "device.compacting", "device.unfurling"] {
+            assert!(
+                intent.event_names.iter().any(|name| name == event_name),
+                "missing managed wake event {event_name}"
+            );
+        }
+        assert!(
+            intent
+                .event_names
+                .iter()
+                .any(|name| name == "print.completed")
+        );
+        assert!(
+            intent
+                .event_names
+                .iter()
+                .any(|name| name == "relay.activated")
+        );
+    }
     #[test]
     fn belt_reconciliation_preserves_legacy_item_specs() {
         let repository = WorkflowRepository::open_in_memory().expect("open repository");

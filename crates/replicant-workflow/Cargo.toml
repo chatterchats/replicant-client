@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
+wiremock = "0.6"
 
 [lints.rust]
 missing_docs = "warn"

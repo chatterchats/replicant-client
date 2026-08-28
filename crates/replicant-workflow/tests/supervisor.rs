@@ -1,10 +1,14 @@
 //! Durable supervisor lifecycle integration tests.
 
-use std::sync::{
-    Arc, Barrier,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
+use replicant_client::{SecretString, StartupPolicy, managed::EventStreamOptions, raw::Url};
 use replicant_workflow::{
     AutomationPolicy, BoxWorkflowFuture, ControlRequest, NewWorkflow, ResourceKey, WaitIntent,
     WaitOutcome, WaitSignal, WorkflowContext, WorkflowExecutor, WorkflowFactory,
@@ -13,6 +17,10 @@ use replicant_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Config {
@@ -925,6 +933,55 @@ impl WorkflowExecutor for WaitingWorkflow {
     }
 }
 
+struct ManagedEventWaitingFactory {
+    kind: WorkflowKind,
+    executions: Arc<AtomicUsize>,
+}
+
+impl WorkflowFactory for ManagedEventWaitingFactory {
+    fn kind(&self) -> &WorkflowKind {
+        &self.kind
+    }
+
+    fn current_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
+        Some(Box::new(ManagedEventWaitingWorkflow {
+            executions: self.executions.clone(),
+        }))
+    }
+}
+
+struct ManagedEventWaitingWorkflow {
+    executions: Arc<AtomicUsize>,
+}
+
+impl WorkflowExecutor for ManagedEventWaitingWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            let outcome = context
+                .wait_until(
+                    WaitIntent::state("managed campaign dependency changed")
+                        .for_events(["device.attached".to_owned(), "print.completed".to_owned()])
+                        .polling_every(Duration::from_secs(60))
+                        .until(unix_millis() + 60_000),
+                    |_, signal| std::future::ready(Ok(signal == WaitSignal::Event)),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if outcome == WaitOutcome::Satisfied {
+                context
+                    .mark_succeeded(Some(true))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
+    }
+}
+
 async fn managed_client() -> replicant_client::managed::Client {
     replicant_client::managed::Client::builder()
         .authentication_token(replicant_client::raw::SecretString::from("test".to_owned()))
@@ -1010,6 +1067,134 @@ fn unix_millis() -> i64 {
             .as_millis(),
     )
     .expect("timestamp fits")
+}
+
+#[tokio::test]
+async fn wait_wakes_on_one_of_multiple_managed_events_before_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/accounts/me"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"email": "a@b.test"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "devices": [],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "events": [],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/events/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(": initial connection\n\n"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/events/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(Duration::from_millis(100))
+                .set_body_string(
+                    "id: 2-0\nevent: print.completed\ndata: {\"id\":\"2-0\",\"version\":1,\"category\":\"print\",\"event\":\"print.completed\",\"replicant_code\":null,\"device_code\":\"FACTORY-1\",\"device_type\":\"autofactory\",\"star\":null,\"location\":\"SOL\",\"payload\":{},\"created_at\":\"2026-08-28T10:00:00Z\"}\n\n",
+                ),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let client = replicant_client::managed::Client::builder()
+        .authentication_token(SecretString::from("test".to_owned()))
+        .base_url(Url::parse(&server.uri()).expect("mock URL"))
+        .in_memory()
+        .startup_policy(StartupPolicy::Essential)
+        .event_stream_options(
+            EventStreamOptions::default()
+                .log_poll_interval(Duration::from_secs(60))
+                .reconnect_backoff(Duration::from_millis(5), Duration::from_millis(5)),
+        )
+        .start()
+        .await
+        .expect("start managed event client");
+    let repository = Arc::new(WorkflowRepository::open_in_memory().expect("open repository"));
+    let kind = WorkflowKind::new("test.managed-event-wait").expect("valid kind");
+    let workflow = repository
+        .create(NewWorkflow {
+            kind: kind.clone(),
+            schema_version: 1,
+            config: (),
+            checkpoint: (),
+            current_step: Some("wait".into()),
+            parent_id: None,
+        })
+        .expect("create workflow");
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = WorkflowRegistry::new();
+    registry
+        .register(Arc::new(ManagedEventWaitingFactory {
+            kind,
+            executions: executions.clone(),
+        }))
+        .expect("register workflow");
+    let supervisor = WorkflowSupervisor::with_managed_client(
+        repository.clone(),
+        Arc::new(registry),
+        client.clone(),
+    );
+
+    supervisor.tick().await.expect("start workflow");
+    wait_for_status(
+        &supervisor,
+        &repository,
+        workflow.id,
+        WorkflowStatus::Waiting,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            supervisor.tick().await.expect("reap event wait");
+            if repository
+                .read(workflow.id)
+                .expect("read workflow")
+                .expect("workflow")
+                .status
+                == WorkflowStatus::Succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("matching managed event wakes workflow before its deadline");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repository
+            .read(workflow.id)
+            .expect("read workflow")
+            .expect("workflow")
+            .result::<bool>()
+            .expect("decode result"),
+        Some(true)
+    );
+    client.close().await.expect("close client");
 }
 
 #[tokio::test]

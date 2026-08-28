@@ -387,6 +387,9 @@ pub(super) fn projection_device_movement(
             let carrier = require_device(client, &mut batch, &carrier_key);
             let child = require_device(client, &mut batch, &child_key);
             if let (Some(mut carrier), Some(mut child)) = (carrier, child) {
+                if let Some(location) = carrier.value.location.clone() {
+                    child.value.location = Some(location);
+                }
                 if event.name.as_str() == "device.attached" {
                     if !carrier
                         .value

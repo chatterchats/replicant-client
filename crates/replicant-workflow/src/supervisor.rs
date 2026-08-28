@@ -318,7 +318,9 @@ impl WorkflowContext {
         if let Some(cursor) = &intent.cursor {
             query = query.after(cursor.clone());
         }
-        if let Some(name) = &intent.event_name {
+        if intent.event_names.is_empty()
+            && let Some(name) = &intent.event_name
+        {
             query = query.named(name.clone());
         }
         if let Some(device) = &intent.device_code {
@@ -1006,10 +1008,19 @@ fn resource_kind(resource: &ResourceKey) -> &'static str {
 }
 
 fn wait_event_matches(intent: &WaitIntent, event: &replicant_client::domain::Event) -> bool {
-    intent
-        .event_name
-        .as_deref()
-        .is_none_or(|name| event.name.as_str() == name)
+    let event_name_matches = if intent.event_name.is_none() && intent.event_names.is_empty() {
+        true
+    } else {
+        intent
+            .event_name
+            .as_deref()
+            .is_some_and(|name| event.name.as_str() == name)
+            || intent
+                .event_names
+                .iter()
+                .any(|name| event.name.as_str() == name)
+    };
+    event_name_matches
         && if let Some(device) = intent.device_code.as_deref() {
             event
                 .device

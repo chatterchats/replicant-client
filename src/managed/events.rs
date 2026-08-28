@@ -3222,9 +3222,13 @@ mod tests {
     #[tokio::test]
     async fn device_relationship_events_update_both_sides_atomically() {
         let client = restore_only_client().await;
+        let mut carrier = device("CARRIER");
+        carrier.value.location = Some(domain::LocationKey::live(domain::LocationId::new(
+            "RESTOCK",
+        )));
         client
             .managed_state()
-            .persist_devices(&[device("CARRIER"), device("CHILD")])
+            .persist_devices(&[carrier, device("CHILD")])
             .expect("seed devices");
 
         let mut attached = game_event("1-0", "device.attached", Some("CARRIER"));
@@ -3253,6 +3257,12 @@ mod tests {
             child.value.relationships.attached_to,
             Some(carrier_key.clone())
         );
+        assert_eq!(
+            child.value.location,
+            Some(domain::LocationKey::live(domain::LocationId::new(
+                "RESTOCK"
+            )))
+        );
 
         let mut detached = game_event("2-0", "device.detached", Some("CARRIER"));
         detached
@@ -3269,6 +3279,86 @@ mod tests {
             .expect("child after detach");
         assert!(carrier.value.relationships.attached_devices.is_empty());
         assert_eq!(child.value.relationships.attached_to, None);
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn device_detach_propagates_known_carrier_location_and_clears_relationship() {
+        let client = restore_only_client().await;
+        let mut carrier = device("CARRIER");
+        carrier.value.location = Some(domain::LocationKey::live(domain::LocationId::new(
+            "RESTOCK",
+        )));
+        let carrier_key = carrier.value.key.clone();
+        let child_key = DeviceKey::live(DeviceId::new("CHILD"));
+        carrier
+            .value
+            .relationships
+            .attached_devices
+            .push(child_key.clone());
+        let mut child = device("CHILD");
+        child.value.location = Some(domain::LocationKey::live(domain::LocationId::new(
+            "OLD-LOCATION",
+        )));
+        child.value.relationships.attached_to = Some(carrier_key.clone());
+        client
+            .managed_state()
+            .persist_devices(&[carrier, child])
+            .expect("seed attached devices");
+
+        let mut detached = game_event("2-0", "device.detached", Some("CARRIER"));
+        detached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        apply_event(&client, &detached).expect("apply detach");
+
+        let carrier = client
+            .managed_state()
+            .device(&carrier_key)
+            .expect("carrier after detach");
+        let child = client
+            .managed_state()
+            .device(&child_key)
+            .expect("child after detach");
+        assert!(carrier.value.relationships.attached_devices.is_empty());
+        assert_eq!(child.value.relationships.attached_to, None);
+        assert_eq!(
+            child.value.location,
+            Some(domain::LocationKey::live(domain::LocationId::new(
+                "RESTOCK"
+            )))
+        );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn device_attach_preserves_child_location_when_carrier_location_unknown() {
+        let client = restore_only_client().await;
+        let mut child = device("CHILD");
+        child.value.location = Some(domain::LocationKey::live(domain::LocationId::new(
+            "CHILD-LOCATION",
+        )));
+        client
+            .managed_state()
+            .persist_devices(&[device("CARRIER"), child])
+            .expect("seed devices");
+
+        let mut attached = game_event("3-0", "device.attached", Some("CARRIER"));
+        attached
+            .payload
+            .insert("target_code".to_owned(), serde_json::json!("CHILD"));
+        apply_event(&client, &attached).expect("apply attach");
+
+        let child = client
+            .managed_state()
+            .device(&DeviceKey::live(DeviceId::new("CHILD")))
+            .expect("child after attach");
+        assert_eq!(
+            child.value.location,
+            Some(domain::LocationKey::live(domain::LocationId::new(
+                "CHILD-LOCATION"
+            )))
+        );
         client.close().await.expect("close");
     }
 
