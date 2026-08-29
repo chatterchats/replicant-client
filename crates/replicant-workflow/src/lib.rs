@@ -25,7 +25,7 @@ pub use model::{
     WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowMigration, WorkflowRegistry};
-pub use repository::{RepositoryError, WorkflowRepository};
+pub use repository::{CreateOrReuseWorkflow, RepositoryError, WorkflowRepository};
 pub use supervisor::{
     BoxWorkflowFuture, ControlRequest, SupervisorError, WorkflowContext, WorkflowExecutor,
     WorkflowSupervisor, WorkflowWaitError,

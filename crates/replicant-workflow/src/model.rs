@@ -242,7 +242,7 @@ pub struct FiniteExecution {
 }
 
 /// Stable identifier for a persisted workflow instance.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkflowId(Uuid);
 

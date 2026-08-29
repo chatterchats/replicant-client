@@ -216,6 +216,18 @@ pub struct WorkflowRepository {
     connection: Mutex<Connection>,
 }
 
+/// Result of atomically finding or creating an active workflow.
+///
+/// The returned [`WorkflowInstance`] is either the oldest active instance for
+/// which the caller's compatibility predicate returned `true`, or the newly
+/// inserted queued workflow. [`Self::created`] distinguishes these cases.
+pub struct CreateOrReuseWorkflow {
+    /// The existing compatible or newly created workflow instance.
+    pub instance: WorkflowInstance,
+    /// Whether `instance` was inserted by this operation.
+    pub created: bool,
+}
+
 struct ConnectionGuard<'a> {
     connection: MutexGuard<'a, Connection>,
     acquired_at: Instant,
@@ -751,7 +763,6 @@ impl WorkflowRepository {
             params![namespace, key],
         )? != 0)
     }
-
     /// Creates and returns a queued workflow atomically.
     pub fn create<C: Serialize, P: Serialize>(
         &self,
@@ -760,31 +771,82 @@ impl WorkflowRepository {
         if workflow.schema_version == 0 {
             return Err(RepositoryError::InvalidWorkflowSchemaVersion);
         }
-        let id = WorkflowId::new();
-        let now = now_millis()?;
         let config_json = serde_json::to_string(&workflow.config)?;
         let checkpoint_json = serde_json::to_string(&workflow.checkpoint)?;
+        let id = WorkflowId::new();
+        let now = now_millis()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO workflow_instances (
-                id, kind, schema_version, config_json, checkpoint_json, status,
-                current_step, created_at, updated_at, parent_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7, ?8)",
-            params![
-                id.to_string(),
-                workflow.kind.as_str(),
-                workflow.schema_version,
-                config_json,
-                checkpoint_json,
-                workflow.current_step,
-                now,
-                workflow.parent_id.map(|parent| parent.to_string()),
-            ],
+        let instance = insert_workflow_in(
+            &transaction,
+            &workflow,
+            id,
+            now,
+            config_json,
+            checkpoint_json,
         )?;
-        let instance = read_in(&transaction, id)?.ok_or(RepositoryError::NotFound(id))?;
         transaction.commit()?;
         Ok(instance)
+    }
+
+    /// Atomically reuses the oldest compatible active workflow or creates one.
+    ///
+    /// The proposed workflow is validated and serialized while an immediate
+    /// transaction holds SQLite's write lock. Active rows are visited in
+    /// `(created_at, id)` order, and the first row accepted by `compatible` is
+    /// returned. If no row matches, the proposed workflow is inserted as
+    /// queued work and returned.
+    pub fn create_or_reuse_active<C, P, F>(
+        &self,
+        workflow: NewWorkflow<C, P>,
+        mut compatible: F,
+    ) -> Result<CreateOrReuseWorkflow, RepositoryError>
+    where
+        C: Serialize,
+        P: Serialize,
+        F: FnMut(&WorkflowInstance) -> Result<bool, RepositoryError>,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if workflow.schema_version == 0 {
+            return Err(RepositoryError::InvalidWorkflowSchemaVersion);
+        }
+        let config_json = serde_json::to_string(&workflow.config)?;
+        let checkpoint_json = serde_json::to_string(&workflow.checkpoint)?;
+        let id = WorkflowId::new();
+        let now = now_millis()?;
+        let active = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {COLUMNS} FROM workflow_instances
+                 WHERE status IN ('queued', 'running', 'waiting', 'reconciling', 'paused')
+                 ORDER BY created_at, id"
+            ))?;
+            statement
+                .query_map([], row_to_instance)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for instance in active {
+            if compatible(&instance)? {
+                transaction.commit()?;
+                return Ok(CreateOrReuseWorkflow {
+                    instance,
+                    created: false,
+                });
+            }
+        }
+        let instance = insert_workflow_in(
+            &transaction,
+            &workflow,
+            id,
+            now,
+            config_json,
+            checkpoint_json,
+        )?;
+        transaction.commit()?;
+        Ok(CreateOrReuseWorkflow {
+            instance,
+            created: true,
+        })
     }
 
     /// Reads one workflow instance.
@@ -2988,6 +3050,33 @@ fn row_to_trigger(row: &rusqlite::Row<'_>) -> Result<AutomationTrigger, rusqlite
     })
 }
 
+fn insert_workflow_in<C, P>(
+    transaction: &rusqlite::Transaction<'_>,
+    workflow: &NewWorkflow<C, P>,
+    id: WorkflowId,
+    now: i64,
+    config_json: String,
+    checkpoint_json: String,
+) -> Result<WorkflowInstance, RepositoryError> {
+    transaction.execute(
+        "INSERT INTO workflow_instances (
+            id, kind, schema_version, config_json, checkpoint_json, status,
+            current_step, created_at, updated_at, parent_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7, ?8)",
+        params![
+            id.to_string(),
+            workflow.kind.as_str(),
+            workflow.schema_version,
+            config_json,
+            checkpoint_json,
+            workflow.current_step,
+            now,
+            workflow.parent_id.map(|parent| parent.to_string()),
+        ],
+    )?;
+    read_in(transaction, id)?.ok_or(RepositoryError::NotFound(id))
+}
+
 fn read_in(
     connection: &Connection,
     id: WorkflowId,
@@ -3229,5 +3318,64 @@ mod tests {
 
         assert_eq!(updated.status, WorkflowStatus::Waiting);
         assert_eq!(updated.failure_disposition, None);
+    }
+    fn atomic_test_workflow(marker: &str) -> NewWorkflow<Value, Value> {
+        NewWorkflow {
+            kind: WorkflowKind::new("test.atomic").expect("workflow kind"),
+            schema_version: 1,
+            config: Value::String(marker.to_owned()),
+            checkpoint: Value::Null,
+            current_step: None,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn create_or_reuse_active_is_atomic_across_connections() {
+        let directory = std::env::temp_dir().join(format!("replicant-workflow-{}", Uuid::new_v4()));
+        let path = directory.join("runtime.sqlite");
+        WorkflowRepository::open(&path).expect("initialize repository");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let repository = WorkflowRepository::open(&path).expect("repository");
+                    barrier.wait();
+                    repository
+                        .create_or_reuse_active(
+                            atomic_test_workflow(&index.to_string()),
+                            |instance| Ok(instance.kind.as_str() == "test.atomic"),
+                        )
+                        .expect("create or reuse")
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect::<Vec<_>>();
+        let repository = WorkflowRepository::open(&path).expect("inspect repository");
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+        assert_eq!(results[0].instance.id, results[1].instance.id);
+        assert!(results.iter().filter(|result| result.created).count() == 1);
+        drop(repository);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn create_or_reuse_active_keeps_incompatible_workflows_distinct() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let first = repository
+            .create_or_reuse_active(atomic_test_workflow("first"), |_| Ok(false))
+            .expect("first workflow");
+        let second = repository
+            .create_or_reuse_active(atomic_test_workflow("second"), |_| Ok(false))
+            .expect("second workflow");
+        assert!(first.created);
+        assert!(second.created);
+        assert_ne!(first.instance.id, second.instance.id);
+        assert_eq!(repository.list().expect("workflows").len(), 2);
     }
 }
