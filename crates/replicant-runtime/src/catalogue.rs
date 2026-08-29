@@ -38,11 +38,13 @@ use crate::{
         new_mining_deploy_workflow, new_observatory_workflow, new_salvage_recovery_workflow,
         new_salvage_workflow, new_scan_belt_workflow, new_scan_system_workflow,
         new_scan_tour_workflow, new_trade_fulfillment_workflow, observatory_workflow_kind,
-        salvage_recovery_workflow_kind, salvage_workflow_kind, scan_belt_workflow_kind,
-        scan_system_workflow_kind, scan_tour_workflow_kind, trade_fulfillment_workflow_kind,
+        salvage_recovery_workflow_kind, salvage_recovery_workflow_matches, salvage_workflow_kind,
+        scan_belt_workflow_kind, scan_system_workflow_kind, scan_tour_workflow_kind,
+        trade_fulfillment_workflow_kind,
     },
     belt_search::{BeltSearchRequest, execute_belt_search},
     bootstrap::{BootstrapExecutionRequest, deliver_bootstrap, run_bootstrap, stage_bootstrap},
+    canonical_region,
     observatory::auto_prospect,
     reports::nearby_belt_report,
     workflows::{
@@ -869,10 +871,26 @@ impl OperationCatalogue {
                 Ok(repository.create(workflow)?)
             }
             "salvage.recovery" => {
-                let mut workflow =
-                    new_salvage_recovery_workflow(decode::<SalvageRecoveryIntent>(parameters)?);
+                let mut intent = decode::<SalvageRecoveryIntent>(parameters)?;
+                intent.region = canonical_region(&intent.region);
+                intent.home = intent.home.trim().to_owned();
+                if intent.region.is_empty() {
+                    return Err(CatalogueError::Invalid("region is required".to_owned()));
+                }
+                if intent.home.is_empty() {
+                    return Err(CatalogueError::Invalid("home is required".to_owned()));
+                }
+                let region = intent.region.clone();
+                let mut workflow = new_salvage_recovery_workflow(intent);
                 workflow.parent_id = parent_id;
-                Ok(repository.create(workflow)?)
+                if parent_id.is_some() {
+                    return Ok(repository.create(workflow)?);
+                }
+                Ok(repository
+                    .create_or_reuse_active(workflow, |existing| {
+                        salvage_recovery_workflow_matches(existing, &region)
+                    })?
+                    .instance)
             }
             "mining.deploy" => {
                 let mut workflow =
@@ -4247,5 +4265,107 @@ mod tests {
                 BTreeMap::new(),
             )
             .expect("validate schedule report");
+    }
+    #[test]
+    fn manual_salvage_recovery_reuses_compatible_active_campaign() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let descriptor = catalogue
+            .descriptors()
+            .workflows
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == "salvage.recovery")
+            .expect("salvage recovery descriptor");
+        assert_eq!(descriptor.display_name, "Recover regional salvage");
+        assert!(
+            descriptor
+                .aliases
+                .iter()
+                .any(|alias| alias == "salvage_recovery")
+        );
+        assert!(["region", "home"].into_iter().all(|name| {
+            descriptor
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == name && parameter.required)
+        }));
+
+        let first = catalogue
+            .create_workflow(
+                &repository,
+                "salvage.recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), Value::String(" Alpha ".to_owned())),
+                    ("home".to_owned(), Value::String(" HOME-1 ".to_owned())),
+                ]),
+            )
+            .expect("first campaign");
+        let second = catalogue
+            .create_workflow(
+                &repository,
+                "salvage_recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), Value::String("alpha".to_owned())),
+                    ("home".to_owned(), Value::String("HOME-2".to_owned())),
+                ]),
+            )
+            .expect("reused campaign");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+        let intent = first
+            .config::<SalvageRecoveryIntent>()
+            .expect("salvage intent");
+        assert_eq!(intent.region, "alpha");
+        assert_eq!(intent.home, "HOME-1");
+        let child = catalogue
+            .create_workflow_with_parent(
+                &repository,
+                "salvage.recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), Value::String("alpha".to_owned())),
+                    ("home".to_owned(), Value::String("HOME-3".to_owned())),
+                ]),
+                Some(first.id),
+            )
+            .expect("parented campaign");
+        assert_ne!(child.id, first.id);
+        assert_eq!(child.parent_id, Some(first.id));
+        assert_eq!(repository.list().expect("workflows").len(), 2);
+    }
+
+    #[test]
+    fn manual_salvage_recovery_rejects_blank_normalized_parameters() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let blank_home = catalogue
+            .create_workflow(
+                &repository,
+                "salvage.recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), Value::String("alpha".to_owned())),
+                    ("home".to_owned(), Value::String("  ".to_owned())),
+                ]),
+            )
+            .expect_err("blank home must fail");
+        assert!(matches!(
+            blank_home,
+            CatalogueError::Invalid(message) if message == "home is required"
+        ));
+        let blank_region = catalogue
+            .create_workflow(
+                &repository,
+                "salvage.recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), Value::String("  ".to_owned())),
+                    ("home".to_owned(), Value::String("HOME-1".to_owned())),
+                ]),
+            )
+            .expect_err("blank region must fail");
+        assert!(matches!(
+            blank_region,
+            CatalogueError::Invalid(message) if message == "region is required"
+        ));
+        assert!(repository.list().expect("workflows").is_empty());
     }
 }

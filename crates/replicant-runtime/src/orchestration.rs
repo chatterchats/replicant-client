@@ -27,6 +27,7 @@ use replicant_protocol::{
     DirectorWorkforceSummary, SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
+use replicant_workflow::RepositoryError;
 use replicant_workflow::{
     ResourceKey, WorkflowFailureDisposition, WorkflowId, WorkflowInstance, WorkflowRepository,
     WorkflowStatus,
@@ -39,13 +40,18 @@ use crate::{
     automation::{
         BeltSearchCampaignIntent, BlueprintAcquireIntent, BlueprintShopPurchaseIntent,
         EventCampaignIntent, ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent,
-        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent, ScanTourIntent,
+        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent,
+        SalvageRecoveryHistorySnapshot, SalvageRecoveryIntent, ScanTourIntent,
         blueprint_acquire_workflow_kind, blueprint_source_is_candidate, blueprint_source_location,
-        exploration_workflow_kind, new_belt_search_campaign_workflow,
+        completed_salvage_sites, exploration_workflow_kind, new_belt_search_campaign_workflow,
         new_blueprint_acquire_workflow, new_event_campaign_workflow, new_exploration_workflow,
         new_logistics_manifest_workflow, new_mining_campaign_workflow, new_observatory_workflow,
-        new_region_establish_workflow, new_replicant_provision_workflow, new_scan_tour_workflow,
+        new_region_establish_workflow, new_replicant_provision_workflow,
+        new_salvage_recovery_workflow, new_scan_tour_workflow, recoverable_salvage_sites,
+        salvage_recovery_history_snapshot, salvage_recovery_workflow_kind,
+        salvage_recovery_workflow_matches,
     },
+    canonical_region,
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
     },
@@ -62,6 +68,8 @@ const WORKFORCE_NS: &str = "director.workforce";
 const SNAPSHOT_NS: &str = "director.snapshot";
 const BLUEPRINT_SHOP_NS: &str = "director.blueprint_shop_opportunity";
 const BLUEPRINT_SHOP_CACHE_NS: &str = "director.blueprint_shop_snapshot";
+const SALVAGE_RECOVERY_CACHE_NS: &str = "director.salvage_recovery_snapshot";
+const SALVAGE_RECOVERY_CACHE_KEY: &str = "latest";
 const BLUEPRINT_SHOP_CACHE_KEY: &str = "latest";
 const BLUEPRINT_CATALOGUE_CACHE_NS: &str = "director.blueprint_catalogue";
 const BLUEPRINT_CATALOGUE_CACHE_KEY: &str = "latest";
@@ -86,6 +94,9 @@ const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 pub(crate) const REGION_GATEWAY_HUB_RANGE_LY: f64 = 15.0;
 const EVENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const BLUEPRINT_SHOP_TIMEOUT: Duration = Duration::from_secs(10);
+const SALVAGE_RECOVERY_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
+const SALVAGE_RECOVERY_STALE_FALLBACK_MS: i64 = 10 * 60 * 1000;
+const SALVAGE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const BLUEPRINT_SHOP_CONCURRENCY: usize = 6;
 const BLUEPRINT_SHOP_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
 const BLUEPRINT_SHOP_PARTIAL_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
@@ -102,6 +113,7 @@ const PRIORITY_CATALOGUE_BLUEPRINT: u32 = 400;
 
 /// Durable Automation Director settings.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct DirectorSettings {
     /// Whether planning is off, advisory-only, or automatic.
     pub mode: DirectorMode,
@@ -173,6 +185,10 @@ enum GoalWorkIdentity {
     },
     Exploration {
         target: String,
+    },
+    SalvageRecovery {
+        region: String,
+        sites: BTreeSet<String>,
     },
 }
 
@@ -286,6 +302,12 @@ where
             "hub refresh timestamp must be an integer or legacy device map",
         )),
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SalvageRecoveryCache {
+    refreshed_at_ms: i64,
+    snapshot: SalvageRecoveryHistorySnapshot,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -852,6 +874,46 @@ pub async fn reconcile_director(
             Some(&region.region),
         )
     });
+    let salvage_controls_enabled = established_regions.iter().any(|region| {
+        goal_enabled(
+            &goal_controls,
+            DirectorGoalKind::SalvageRecovery,
+            Some(&region.region),
+        )
+    });
+    let mut salvage_discovery_error = None;
+    let salvage_history = if salvage_controls_enabled {
+        match salvage_recovery_history_for_director(
+            client,
+            repository.as_ref(),
+            now,
+            force_slow_refresh,
+        )
+        .await
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(error = %error, "Director salvage recovery history unavailable");
+                salvage_discovery_error = Some(format!(
+                    "salvage recovery history discovery failed: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let salvage_completed = match completed_salvage_sites(&repository) {
+        Ok(completed) => completed,
+        Err(error) => {
+            let message = format!("salvage recovery completion discovery failed: {error}");
+            tracing::warn!(error = %message, "Director could not load salvage completion documents");
+            if salvage_discovery_error.is_none() {
+                salvage_discovery_error = Some(message);
+            }
+            BTreeSet::new()
+        }
+    };
     let event_designations_by_region = if event_controls_enabled && !established_regions.is_empty()
     {
         match active_events_for_director(
@@ -903,6 +965,13 @@ pub async fn reconcile_director(
             &hub_refresh_errors,
             &location_systems,
             &system_regions,
+        )?);
+        goals.push(reconcile_salvage_recovery(
+            &goal_context,
+            region,
+            salvage_history.as_ref(),
+            &salvage_completed,
+            salvage_discovery_error.as_deref(),
         )?);
         let regional_events = event_designations_by_region
             .get(&region.region)
@@ -1644,6 +1713,81 @@ async fn active_events_for_director(
                 }
             }
             Err(std::io::Error::other(error).into())
+        }
+    }
+}
+
+/// Loads the Director's cached, history-derived salvage observation.
+///
+/// Completion documents are deliberately not part of this cache: callers load
+/// them on every pass so a completed designation cannot be recreated while a
+/// history snapshot is still fresh.
+async fn salvage_recovery_history_for_director(
+    client: &Client,
+    repository: &WorkflowRepository,
+    now: i64,
+    force_refresh: bool,
+) -> Result<SalvageRecoveryHistorySnapshot, String> {
+    let cached = repository
+        .read_document(SALVAGE_RECOVERY_CACHE_NS, SALVAGE_RECOVERY_CACHE_KEY)
+        .map_err(|error| error.to_string())?
+        .map(|(value, _)| serde_json::from_value::<SalvageRecoveryCache>(value))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if let Some(cache) = cached.as_ref() {
+        let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+        if !force_refresh && age_ms <= SALVAGE_RECOVERY_CACHE_TTL_MS {
+            tracing::debug!(
+                event = "director.salvage_recovery.snapshot_cache_hit",
+                age_ms,
+                ttl_ms = SALVAGE_RECOVERY_CACHE_TTL_MS,
+                discovered = cache.snapshot.discovered_count,
+                "Director reused cached salvage recovery history"
+            );
+            return Ok(cache.snapshot.clone());
+        }
+    }
+
+    let refresh = tokio::time::timeout(
+        SALVAGE_RECOVERY_TIMEOUT,
+        salvage_recovery_history_snapshot(client),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "salvage recovery history discovery exceeded {} seconds",
+            SALVAGE_RECOVERY_TIMEOUT.as_secs()
+        )
+    })
+    .and_then(|result| result);
+    match refresh {
+        Ok(snapshot) => {
+            repository
+                .put_document(
+                    SALVAGE_RECOVERY_CACHE_NS,
+                    SALVAGE_RECOVERY_CACHE_KEY,
+                    &SalvageRecoveryCache {
+                        refreshed_at_ms: now,
+                        snapshot: snapshot.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(snapshot)
+        }
+        Err(error) => {
+            if let Some(cache) = cached {
+                let age_ms = now.saturating_sub(cache.refreshed_at_ms);
+                if age_ms <= SALVAGE_RECOVERY_STALE_FALLBACK_MS {
+                    tracing::warn!(
+                        error = %error,
+                        age_ms,
+                        discovered = cache.snapshot.discovered_count,
+                        "Director salvage history refresh failed; using recent cached snapshot"
+                    );
+                    return Ok(cache.snapshot);
+                }
+            }
+            Err(error)
         }
     }
 }
@@ -3057,6 +3201,232 @@ fn summarize_messages(messages: &[String]) -> String {
         summary.push_str(&format!("; +{} more", messages.len() - LIMIT));
     }
     summary
+}
+
+fn matching_salvage_recovery_workflows<'a>(
+    workflows: &'a [WorkflowInstance],
+    region: &str,
+) -> Result<Vec<&'a WorkflowInstance>, RepositoryError> {
+    let mut matches = Vec::new();
+    for workflow in workflows {
+        if salvage_recovery_workflow_matches(workflow, region)? {
+            matches.push(workflow);
+        }
+    }
+    matches.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(matches)
+}
+
+fn reconcile_salvage_recovery(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    history: Option<&SalvageRecoveryHistorySnapshot>,
+    completed: &BTreeSet<String>,
+    discovery_error: Option<&str>,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::SalvageRecovery;
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
+    let id = goal_instance_id(kind, Some(&region.region));
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+
+    if !enabled {
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: Some(region.region.clone()),
+            status: DirectorGoalStatus::Waiting,
+            objective: initial_goal_objective(kind).to_owned(),
+            blocker: None,
+            next_action: Some("Enable Salvage Recovery for this region".to_owned()),
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: Vec::new(),
+            enabled,
+        });
+    }
+
+    prune_runtime_workflows(&mut runtime, context.workflows);
+    let (adopted, compatibility_error) =
+        match matching_salvage_recovery_workflows(context.workflows, &region.region) {
+            Ok(workflows) => (workflows, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "salvage recovery workflow compatibility check failed: {error}"
+                )),
+            ),
+        };
+    let discovery_error = compatibility_error.as_deref().or(discovery_error);
+    let adopted_ids = adopted
+        .iter()
+        .map(|workflow| workflow.id)
+        .collect::<Vec<_>>();
+    runtime.active_workflows = adopted_ids.clone();
+    if runtime.last_launch_at_ms.is_none() {
+        let adopted_launch = adopted.iter().map(|workflow| workflow.created_at).max();
+        let legacy_terminal_launch = context
+            .workflows
+            .iter()
+            .filter(|workflow| {
+                workflow.kind == salvage_recovery_workflow_kind() && workflow.status.is_terminal()
+            })
+            .filter_map(|workflow| {
+                let intent = workflow.config::<SalvageRecoveryIntent>().ok()?;
+                (!intent.home.trim().is_empty()
+                    && canonical_region(&intent.region) == canonical_region(&region.region))
+                .then_some(workflow.created_at)
+            })
+            .max();
+        runtime.last_launch_at_ms = adopted_launch
+            .into_iter()
+            .chain(legacy_terminal_launch)
+            .max();
+    }
+
+    let recoverable = history
+        .map(|snapshot| recoverable_salvage_sites(snapshot, completed, &region.region))
+        .unwrap_or_default();
+    let identity = GoalWorkIdentity::SalvageRecovery {
+        region: region.region.clone(),
+        sites: recoverable.keys().cloned().collect(),
+    };
+    if history.is_some() {
+        if recoverable.is_empty() {
+            runtime.launch_records.clear();
+            runtime.last_launch_at_ms = None;
+        } else {
+            retain_work_identity(&mut runtime, &identity);
+            let adopted_set = adopted_ids.iter().copied().collect::<BTreeSet<_>>();
+            runtime.launch_records.retain(|record| {
+                adopted_set.contains(&record.workflow_id)
+                    || context.workflows.iter().any(|workflow| {
+                        workflow.id == record.workflow_id
+                            && workflow.status.is_terminal()
+                            && workflow.failure_disposition
+                                == Some(WorkflowFailureDisposition::Permanent)
+                    })
+            });
+            for workflow_id in adopted_ids.iter().copied() {
+                if !runtime
+                    .launch_records
+                    .iter()
+                    .any(|record| record.workflow_id == workflow_id)
+                {
+                    runtime.launch_records.push(GoalLaunchRecord {
+                        workflow_id,
+                        identity: identity.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let active = adopted_ids;
+    let status = if !active.is_empty() {
+        DirectorGoalStatus::Active
+    } else if discovery_error.is_some() {
+        DirectorGoalStatus::Blocked
+    } else if recoverable.is_empty() {
+        runtime.launch_records.clear();
+        runtime.last_launch_at_ms = None;
+        DirectorGoalStatus::Satisfied
+    } else if history.is_some()
+        && permanent_failure_for_identity(&runtime, context.workflows, &identity).is_some()
+    {
+        DirectorGoalStatus::Blocked
+    } else if launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS) {
+        DirectorGoalStatus::Waiting
+    } else {
+        let Some(home) = region
+            .hub_location
+            .clone()
+            .or_else(|| region.hub_system.clone())
+        else {
+            let blocker = format!(
+                "{} has no operational regional home for salvage recovery",
+                region.region
+            );
+            save_goal_runtime(context.repository, &id, &runtime)?;
+            return Ok(DirectorGoalSummary {
+                id,
+                kind,
+                region: Some(region.region.clone()),
+                status: DirectorGoalStatus::Blocked,
+                objective: initial_goal_objective(kind).to_owned(),
+                blocker: Some(blocker),
+                next_action: Some(
+                    "Establish a regional System Hub before recovering salvage".to_owned(),
+                ),
+                progress_current: 0,
+                progress_total: recoverable.len() as u64,
+                active_workflows: Vec::new(),
+                enabled,
+            });
+        };
+        if !context.automatic {
+            DirectorGoalStatus::Active
+        } else {
+            let result = context.repository.create_or_reuse_active(
+                new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                    region: region.region.clone(),
+                    home,
+                }),
+                |workflow| salvage_recovery_workflow_matches(workflow, &region.region),
+            )?;
+            runtime.active_workflows = vec![result.instance.id];
+            runtime.last_launch_at_ms = Some(if result.created {
+                context.now
+            } else {
+                result.instance.created_at
+            });
+            record_goal_launch(&mut runtime, result.instance.id, identity.clone());
+            DirectorGoalStatus::Active
+        }
+    };
+    let blocker = if matches!(status, DirectorGoalStatus::Blocked) {
+        discovery_error.map(str::to_owned).or_else(|| {
+            permanent_failure_for_identity(&runtime, context.workflows, &identity)
+                .and_then(|workflow| workflow.last_error.clone())
+        })
+    } else {
+        None
+    };
+    let next_action = match status {
+        DirectorGoalStatus::Satisfied => Some("Wait for newly discovered regional salvage".to_owned()),
+        DirectorGoalStatus::Active if runtime.active_workflows.is_empty() => Some(format!(
+            "Recover {} discovered regional salvage site(s)",
+            recoverable.len()
+        )),
+        DirectorGoalStatus::Active => {
+            Some("Continue the active regional salvage recovery campaign".to_owned())
+        }
+        DirectorGoalStatus::Blocked if discovery_error.is_some() => Some(
+            "Retry salvage history discovery on the next Director pass".to_owned(),
+        ),
+        DirectorGoalStatus::Blocked => Some(
+            "Change the regional salvage designation set before launching replacement campaign work"
+                .to_owned(),
+        ),
+        DirectorGoalStatus::Waiting => Some("Wait briefly before retrying regional salvage recovery".to_owned()),
+    };
+    save_goal_runtime(context.repository, &id, &runtime)?;
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: initial_goal_objective(kind).to_owned(),
+        blocker,
+        next_action,
+        progress_current: 0,
+        progress_total: recoverable.len() as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
 }
 
 fn reconcile_event_completion(
@@ -5048,7 +5418,10 @@ fn goal_enabled(controls: &GoalControls, kind: DirectorGoalKind, region: Option<
 }
 
 fn default_goal_enabled(kind: DirectorGoalKind) -> bool {
-    !matches!(kind, DirectorGoalKind::EstablishBeacons)
+    !matches!(
+        kind,
+        DirectorGoalKind::EstablishBeacons | DirectorGoalKind::SalvageRecovery
+    )
 }
 
 fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
@@ -5062,6 +5435,7 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::EnhanceStarCatalogue => "Survey known regional star systems",
         DirectorGoalKind::DiscoverBelts => "Search known regional systems for asteroid belts",
         DirectorGoalKind::ExpandMiningOps => "Expand useful regional mining infrastructure",
+        DirectorGoalKind::SalvageRecovery => "Recover discovered regional salvage",
         DirectorGoalKind::EventCompletion => "Complete worthwhile active regional events",
         DirectorGoalKind::BlueprintAcquisition => {
             "Learn missing blueprints from known owned-device opportunities"
@@ -5074,13 +5448,14 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
     }
 }
 
-fn all_goal_kinds() -> [DirectorGoalKind; 10] {
+fn all_goal_kinds() -> [DirectorGoalKind; 11] {
     [
         DirectorGoalKind::EstablishRegions,
         DirectorGoalKind::ExpandStarCatalogue,
         DirectorGoalKind::EnhanceStarCatalogue,
         DirectorGoalKind::DiscoverBelts,
         DirectorGoalKind::ExpandMiningOps,
+        DirectorGoalKind::SalvageRecovery,
         DirectorGoalKind::EventCompletion,
         DirectorGoalKind::BlueprintAcquisition,
         DirectorGoalKind::MaintainSystemHubs,
@@ -5098,6 +5473,7 @@ pub fn goal_kind_key(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::EnhanceStarCatalogue => "enhance_star_catalogue",
         DirectorGoalKind::DiscoverBelts => "discover_belts",
         DirectorGoalKind::ExpandMiningOps => "expand_mining_ops",
+        DirectorGoalKind::SalvageRecovery => "salvage_recovery",
         DirectorGoalKind::EventCompletion => "event_completion",
         DirectorGoalKind::BlueprintAcquisition => "blueprint_acquisition",
         DirectorGoalKind::MaintainSystemHubs => "maintain_system_hubs",
@@ -5121,6 +5497,7 @@ pub fn goal_is_regional(kind: DirectorGoalKind) -> bool {
         DirectorGoalKind::EnhanceStarCatalogue
             | DirectorGoalKind::DiscoverBelts
             | DirectorGoalKind::ExpandMiningOps
+            | DirectorGoalKind::SalvageRecovery
             | DirectorGoalKind::EventCompletion
             | DirectorGoalKind::MaintainSystemHubs
             | DirectorGoalKind::ExpandFtlNetwork
@@ -5132,17 +5509,6 @@ fn goal_instance_id(kind: DirectorGoalKind, region: Option<&str>) -> String {
     match region {
         Some(region) => format!("{}:{region}", goal_kind_key(kind)),
         None => goal_kind_key(kind).to_owned(),
-    }
-}
-
-/// Canonicalizes region aliases without constraining future region names.
-#[must_use]
-pub fn canonical_region(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "sol" | "sol-region" | "sol_region" | "solregion" | "sol-zone" | "sol_zone" | "solzone" => {
-            "solzone".to_owned()
-        }
-        other => other.to_owned(),
     }
 }
 
@@ -5164,6 +5530,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::automation::SalvageSiteRecord;
 
     async fn test_client_at(server: &MockServer) -> Client {
         Client::builder()
@@ -5174,6 +5541,64 @@ mod tests {
             .start()
             .await
             .expect("start test client")
+    }
+
+    fn salvage_test_region(home: Option<&str>) -> RegionView {
+        RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: home.map(|_| "ALPHA".to_owned()),
+            hub_location: home.map(str::to_owned),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        }
+    }
+
+    fn salvage_test_snapshot(designations: &[&str]) -> SalvageRecoveryHistorySnapshot {
+        let sites = designations
+            .iter()
+            .map(|designation| {
+                (
+                    (*designation).to_owned(),
+                    SalvageSiteRecord {
+                        designation: (*designation).to_owned(),
+                        location: "ALPHA-BELT-1".to_owned(),
+                        resources: BTreeMap::new(),
+                        event_id: format!("event-{designation}"),
+                    },
+                )
+            })
+            .collect();
+        SalvageRecoveryHistorySnapshot {
+            discovered_count: designations.len(),
+            depleted_count: 0,
+            sites_by_region: BTreeMap::from([("alpha".to_owned(), sites)]),
+        }
+    }
+
+    fn salvage_enabled_controls(enabled: bool) -> GoalControls {
+        let mut controls = GoalControls::default();
+        controls
+            .regional
+            .entry(DirectorGoalKind::SalvageRecovery)
+            .or_default()
+            .insert("alpha".to_owned(), enabled);
+        controls
+    }
+
+    fn salvage_context<'a>(
+        repository: &'a WorkflowRepository,
+        workflows: &'a [WorkflowInstance],
+        controls: &'a GoalControls,
+        automatic: bool,
+        now: i64,
+    ) -> GoalReconcileContext<'a> {
+        GoalReconcileContext {
+            repository,
+            workflows,
+            controls,
+            automatic,
+            now,
+        }
     }
 
     fn test_worker(code: &str, region: &str, location: &str) -> WorkerView {
@@ -6565,6 +6990,856 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn salvage_recovery_goal_defaults_disabled_and_is_regional() {
+        assert!(!default_goal_enabled(DirectorGoalKind::SalvageRecovery));
+        assert!(goal_is_regional(DirectorGoalKind::SalvageRecovery));
+        assert_eq!(
+            goal_kind_key(DirectorGoalKind::SalvageRecovery),
+            "salvage_recovery"
+        );
+        assert_eq!(
+            parse_goal_kind("salvage_recovery"),
+            Some(DirectorGoalKind::SalvageRecovery)
+        );
+        assert_eq!(
+            initial_goal_objective(DirectorGoalKind::SalvageRecovery),
+            "Recover discovered regional salvage"
+        );
+    }
+
+    #[test]
+    fn salvage_recovery_workflow_matching_requires_nonblank_home_and_active_exact_region() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let workflow = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: " SOL ".to_owned(),
+                home: " SOL-HUB ".to_owned(),
+            }))
+            .expect("salvage recovery workflow");
+        assert!(
+            salvage_recovery_workflow_matches(&workflow, "solzone")
+                .expect("match compatible workflow")
+        );
+        assert!(
+            !salvage_recovery_workflow_matches(&workflow, "alpha")
+                .expect("check incompatible region")
+        );
+
+        let whitespace = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".to_owned(),
+                home: " \t".to_owned(),
+            }))
+            .expect("whitespace-home workflow");
+        assert!(
+            !salvage_recovery_workflow_matches(&whitespace, "alpha")
+                .expect("reject whitespace home")
+        );
+    }
+
+    #[test]
+    fn salvage_recovery_goal_disabled_does_not_adopt_or_create() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let workflow = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".to_owned(),
+                home: "ALPHA-HUB".to_owned(),
+            }))
+            .expect("salvage recovery workflow");
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: std::slice::from_ref(&workflow),
+            controls: &controls,
+            automatic: true,
+            now: 10,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: Some("ALPHA-HUB".to_owned()),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        };
+        let summary = reconcile_salvage_recovery(&context, &region, None, &BTreeSet::new(), None)
+            .expect("disabled salvage reconciliation");
+        assert_eq!(summary.status, DirectorGoalStatus::Waiting);
+        assert!(summary.active_workflows.is_empty());
+        assert_eq!(repository.list().expect("workflow rows").len(), 1);
+    }
+
+    #[test]
+    fn salvage_recovery_goal_adopts_all_compatible_manual_campaigns() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let first = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("first campaign");
+        let second = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "ALPHA".into(),
+                home: "OTHER-HUB".into(),
+            }))
+            .expect("second campaign");
+        let workflows = repository.list().expect("workflows");
+        let controls = salvage_enabled_controls(true);
+        let context = salvage_context(&repository, &workflows, &controls, false, 10);
+        let summary = reconcile_salvage_recovery(
+            &context,
+            &salvage_test_region(Some("ALPHA-HUB")),
+            Some(&salvage_test_snapshot(&["SITE-1"])),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("adopt campaigns");
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(summary.active_workflows.len(), 2);
+        assert!(
+            summary
+                .active_workflows
+                .contains(&ProtocolWorkflowId(first.id.to_string()))
+        );
+        assert!(
+            summary
+                .active_workflows
+                .contains(&ProtocolWorkflowId(second.id.to_string()))
+        );
+    }
+
+    #[test]
+    fn salvage_recovery_goal_records_adopted_retry_and_permanent_identity() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let first = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("first campaign");
+        let second = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "OTHER-HUB".into(),
+            }))
+            .expect("second campaign");
+        let controls = salvage_enabled_controls(true);
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let workflows = repository.list().expect("workflows");
+        reconcile_salvage_recovery(
+            &salvage_context(&repository, &workflows, &controls, false, 10),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("adopt campaigns");
+
+        let mut failed = first;
+        failed.status = WorkflowStatus::Failed;
+        failed.failure_disposition = Some(WorkflowFailureDisposition::Permanent);
+        failed.last_error = Some("salvage campaign failed".into());
+        let active_and_failed = [failed.clone(), second.clone()];
+        let active = reconcile_salvage_recovery(
+            &salvage_context(
+                &repository,
+                &active_and_failed,
+                &controls,
+                true,
+                DEFAULT_RETRY_COOLDOWN_MS + 1,
+            ),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("retain permanent identity while peer remains active");
+        assert_eq!(active.status, DirectorGoalStatus::Active);
+
+        let mut succeeded = second;
+        succeeded.status = WorkflowStatus::Succeeded;
+        let terminal = [failed, succeeded];
+        let summary = reconcile_salvage_recovery(
+            &salvage_context(
+                &repository,
+                &terminal,
+                &controls,
+                true,
+                DEFAULT_RETRY_COOLDOWN_MS + 2,
+            ),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("retain permanent terminal identity");
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert_eq!(summary.blocker.as_deref(), Some("salvage campaign failed"));
+    }
+
+    #[test]
+    fn salvage_recovery_goal_treats_unobserved_manual_failure_as_retryable() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let campaign = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("campaign");
+        let failed = repository
+            .update(
+                campaign.id,
+                campaign.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: Some("failed".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: Some("unobserved failure".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("persist failed campaign");
+        assert_eq!(
+            failed.failure_disposition,
+            Some(WorkflowFailureDisposition::Retryable)
+        );
+        let controls = salvage_enabled_controls(true);
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let before_cooldown = salvage_context(
+            &repository,
+            std::slice::from_ref(&failed),
+            &controls,
+            true,
+            failed
+                .created_at
+                .saturating_add(DEFAULT_RETRY_COOLDOWN_MS - 1),
+        );
+        let waiting = reconcile_salvage_recovery(
+            &before_cooldown,
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("wait for unobserved failure cooldown");
+        assert_eq!(waiting.status, DirectorGoalStatus::Waiting);
+        assert_eq!(repository.list().expect("waiting workflows").len(), 1);
+
+        let after_cooldown = salvage_context(
+            &repository,
+            std::slice::from_ref(&failed),
+            &controls,
+            true,
+            failed
+                .created_at
+                .saturating_add(DEFAULT_RETRY_COOLDOWN_MS + 1),
+        );
+        let summary = reconcile_salvage_recovery(
+            &after_cooldown,
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("retry unobserved failure");
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(repository.list().expect("workflows").len(), 2);
+
+        let legacy_repository =
+            WorkflowRepository::open_in_memory().expect("legacy workflow repository");
+        let legacy_campaign = legacy_repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("legacy campaign");
+        let mut legacy_failed = legacy_repository
+            .update(
+                legacy_campaign.id,
+                legacy_campaign.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: Some("failed".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: Some("legacy unobserved failure".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("persist legacy failed campaign");
+        legacy_failed.failure_disposition = None;
+        let legacy_before_cooldown = salvage_context(
+            &legacy_repository,
+            std::slice::from_ref(&legacy_failed),
+            &controls,
+            true,
+            legacy_failed
+                .created_at
+                .saturating_add(DEFAULT_RETRY_COOLDOWN_MS - 1),
+        );
+        let legacy_waiting = reconcile_salvage_recovery(
+            &legacy_before_cooldown,
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("wait for legacy failure cooldown");
+        assert_eq!(legacy_waiting.status, DirectorGoalStatus::Waiting);
+        assert_eq!(
+            legacy_repository
+                .list()
+                .expect("legacy waiting workflows")
+                .len(),
+            1
+        );
+
+        let legacy_after_cooldown = salvage_context(
+            &legacy_repository,
+            std::slice::from_ref(&legacy_failed),
+            &controls,
+            true,
+            legacy_failed
+                .created_at
+                .saturating_add(DEFAULT_RETRY_COOLDOWN_MS + 1),
+        );
+        let legacy_summary = reconcile_salvage_recovery(
+            &legacy_after_cooldown,
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("retry legacy unobserved failure");
+        assert_eq!(legacy_summary.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            legacy_repository
+                .list()
+                .expect("legacy retried workflows")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn salvage_recovery_goal_creates_or_reuses_atomically() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let controls = salvage_enabled_controls(true);
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let first = reconcile_salvage_recovery(
+            &salvage_context(&repository, &[], &controls, true, 10),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("create campaign");
+        let workflows = repository.list().expect("workflows");
+        let second = reconcile_salvage_recovery(
+            &salvage_context(&repository, &workflows, &controls, true, 20),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("reuse campaign");
+        assert_eq!(first.active_workflows, second.active_workflows);
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+    }
+
+    #[test]
+    fn salvage_recovery_goal_disabled_or_advisory_does_not_create() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let disabled_controls = salvage_enabled_controls(false);
+        let disabled = salvage_context(&repository, &[], &disabled_controls, true, 10);
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &disabled,
+                &region,
+                Some(&snapshot),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("disabled reconcile")
+            .status,
+            DirectorGoalStatus::Waiting
+        );
+        let advisory_controls = salvage_enabled_controls(true);
+        let advisory = salvage_context(&repository, &[], &advisory_controls, false, 10);
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &advisory,
+                &region,
+                Some(&snapshot),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("advisory reconcile")
+            .status,
+            DirectorGoalStatus::Active
+        );
+        assert!(repository.list().expect("workflows").is_empty());
+    }
+
+    #[test]
+    fn salvage_recovery_goal_reports_discovery_and_home_blockers() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let controls = salvage_enabled_controls(true);
+        let context = salvage_context(&repository, &[], &controls, true, 10);
+        let summary = reconcile_salvage_recovery(
+            &context,
+            &salvage_test_region(Some("ALPHA-HUB")),
+            None,
+            &BTreeSet::new(),
+            Some("remote history unavailable"),
+        )
+        .expect("discovery blocker");
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert!(
+            summary
+                .blocker
+                .as_deref()
+                .unwrap()
+                .contains("remote history unavailable")
+        );
+        let summary = reconcile_salvage_recovery(
+            &context,
+            &salvage_test_region(None),
+            Some(&salvage_test_snapshot(&["SITE-1"])),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("home blocker");
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            summary.blocker.as_deref(),
+            Some("alpha has no operational regional home for salvage recovery")
+        );
+    }
+
+    #[test]
+    fn salvage_recovery_goal_satisfies_after_completion_and_reopens_for_new_site() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let controls = salvage_enabled_controls(true);
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let initial = salvage_test_snapshot(&["SITE-1"]);
+        let context = salvage_context(&repository, &[], &controls, false, 10);
+        assert_eq!(
+            reconcile_salvage_recovery(&context, &region, Some(&initial), &BTreeSet::new(), None)
+                .expect("initial backlog")
+                .status,
+            DirectorGoalStatus::Active
+        );
+        let completed = BTreeSet::from(["SITE-1".to_owned()]);
+        assert_eq!(
+            reconcile_salvage_recovery(&context, &region, Some(&initial), &completed, None)
+                .expect("completed backlog")
+                .status,
+            DirectorGoalStatus::Satisfied
+        );
+        let reopened = salvage_test_snapshot(&["SITE-1", "SITE-2"]);
+        let summary =
+            reconcile_salvage_recovery(&context, &region, Some(&reopened), &completed, None)
+                .expect("new backlog");
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(summary.progress_total, 1);
+    }
+
+    #[test]
+    fn salvage_recovery_goal_blocks_equivalent_permanent_failure_but_allows_changed_sites() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let campaign = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("campaign");
+        let controls = salvage_enabled_controls(true);
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        reconcile_salvage_recovery(
+            &salvage_context(
+                &repository,
+                &repository.list().expect("workflows"),
+                &controls,
+                false,
+                1,
+            ),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("observe campaign");
+        let mut failed = repository
+            .update(
+                campaign.id,
+                campaign.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: Some("failed".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: Some("permanent".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("persist terminal campaign");
+        failed.failure_disposition = Some(WorkflowFailureDisposition::Permanent);
+        let summary = reconcile_salvage_recovery(
+            &salvage_context(
+                &repository,
+                std::slice::from_ref(&failed),
+                &controls,
+                true,
+                DEFAULT_RETRY_COOLDOWN_MS + 1,
+            ),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("block equivalent");
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        let changed = salvage_test_snapshot(&["SITE-2"]);
+        let summary = reconcile_salvage_recovery(
+            &salvage_context(
+                &repository,
+                std::slice::from_ref(&failed),
+                &controls,
+                true,
+                DEFAULT_RETRY_COOLDOWN_MS + 1,
+            ),
+            &region,
+            Some(&changed),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("allow changed sites");
+        assert_eq!(repository.list().expect("changed campaigns").len(), 2);
+        assert_ne!(
+            summary.active_workflows,
+            vec![ProtocolWorkflowId(campaign.id.to_string())]
+        );
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn salvage_recovery_cache_reuses_snapshot_until_forced_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-28T00:00:00Z",
+                "stars": [{"designation": "ROOT", "region": "alpha"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("event", "salvage.discovered"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{
+                    "id": "2-0", "version": 1, "category": "salvage",
+                    "event": "salvage.discovered", "created_at": "2026-08-28T00:00:00Z",
+                    "payload": {"designation": "SITE-REMOTE", "location": "ROOT-1-L4"}
+                }],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("event", "salvage.depleted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [], "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        repository
+            .put_document(
+                SALVAGE_RECOVERY_CACHE_NS,
+                SALVAGE_RECOVERY_CACHE_KEY,
+                &SalvageRecoveryCache {
+                    refreshed_at_ms: 100,
+                    snapshot: snapshot.clone(),
+                },
+            )
+            .expect("cache snapshot");
+        let cached = salvage_recovery_history_for_director(&client, &repository, 101, false)
+            .await
+            .expect("fresh cache");
+        assert_eq!(cached.discovered_count, snapshot.discovered_count);
+        assert!(
+            cached
+                .sites_by_region
+                .get("alpha")
+                .is_some_and(|sites| sites.contains_key("SITE-1"))
+        );
+        let refreshed = salvage_recovery_history_for_director(&client, &repository, 101, true)
+            .await
+            .expect("forced refresh");
+        assert_eq!(refreshed.discovered_count, 1);
+        assert!(
+            refreshed
+                .sites_by_region
+                .get("alpha")
+                .is_some_and(|sites| sites.contains_key("SITE-REMOTE"))
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn salvage_recovery_prechange_documents_and_manual_campaign_open_unchanged() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        repository
+            .put_document(
+                "director.settings",
+                "singleton",
+                &serde_json::json!({"mode":"advisory"}),
+            )
+            .expect("settings");
+        repository
+            .put_document("legacy.runtime", "keep", &serde_json::json!({"value": 7}))
+            .expect("legacy document");
+        let campaign = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: "ALPHA-HUB".into(),
+            }))
+            .expect("manual campaign");
+        let settings = director_settings(&repository).expect("legacy settings decode");
+        assert_eq!(settings.mode, DirectorMode::Advisory);
+        assert_eq!(settings.idle_target, DEFAULT_IDLE_TARGET);
+        assert_eq!(settings.scale_up_idle_threshold, DEFAULT_SCALE_THRESHOLD);
+        assert_eq!(settings.scale_up_hold_ms, DEFAULT_HOLD_MS);
+        assert_eq!(settings.scale_up_cooldown_ms, DEFAULT_SCALE_COOLDOWN_MS);
+        assert_eq!(settings.prospect_cooldown_ms, DEFAULT_PROSPECT_COOLDOWN_MS);
+        let controls = GoalControls::default();
+        let context = salvage_context(
+            &repository,
+            std::slice::from_ref(&campaign),
+            &controls,
+            true,
+            10,
+        );
+        let summary = reconcile_salvage_recovery(
+            &context,
+            &salvage_test_region(Some("ALPHA-HUB")),
+            None,
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("disabled goal");
+        assert!(!summary.enabled);
+        assert_eq!(repository.list().expect("campaigns").len(), 1);
+        assert_eq!(
+            repository
+                .read_document("legacy.runtime", "keep")
+                .expect("legacy read")
+                .map(|(value, _)| value["value"].as_i64()),
+            Some(Some(7))
+        );
+    }
+
+    #[tokio::test]
+    async fn salvage_recovery_director_lifecycle_is_continuous_and_idempotent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-28T00:00:00Z",
+                "stars": [{"designation": "ROOT", "region": "alpha"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("event", "salvage.discovered"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{
+                    "id": "1-0", "version": 1, "category": "salvage",
+                    "event": "salvage.discovered", "created_at": "2026-08-28T00:00:00Z",
+                    "payload": {"designation": "SITE-REMOTE", "location": "ROOT-1-L4"}
+                }],
+                "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("event", "salvage.depleted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [], "next_cursor": null
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client_at(&server).await;
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let disabled = salvage_enabled_controls(false);
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &salvage_context(&repository, &[], &disabled, true, 1),
+                &region,
+                Some(&salvage_test_snapshot(&["SITE-1"])),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("disabled")
+            .status,
+            DirectorGoalStatus::Waiting
+        );
+        let enabled = salvage_enabled_controls(true);
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &salvage_context(&repository, &[], &enabled, false, 2),
+                &region,
+                Some(&salvage_test_snapshot(&["SITE-1"])),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("advisory")
+            .status,
+            DirectorGoalStatus::Active
+        );
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let catalogue = crate::catalogue::OperationCatalogue::new().expect("catalogue");
+        let manual = catalogue
+            .create_workflow(
+                &repository,
+                "salvage.recovery",
+                BTreeMap::from([
+                    ("region".to_owned(), serde_json::json!("alpha")),
+                    ("home".to_owned(), serde_json::json!("ALPHA-HUB")),
+                ]),
+            )
+            .expect("manual Template campaign");
+        assert_eq!(repository.list().expect("campaigns").len(), 1);
+        let workflows = repository.list().expect("campaigns");
+        let created = reconcile_salvage_recovery(
+            &salvage_context(&repository, &workflows, &enabled, true, 3),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("automatic adoption");
+        assert_eq!(
+            created.active_workflows,
+            vec![ProtocolWorkflowId(manual.id.to_string())]
+        );
+        let repeated = reconcile_salvage_recovery(
+            &salvage_context(&repository, &workflows, &enabled, true, 4),
+            &region,
+            Some(&snapshot),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("idempotent");
+        assert_eq!(created.active_workflows, repeated.active_workflows);
+        assert_eq!(repository.list().expect("campaigns").len(), 1);
+        let completed = BTreeSet::from(["SITE-1".to_owned()]);
+        let no_active = Vec::new();
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &salvage_context(&repository, &no_active, &enabled, false, 5),
+                &region,
+                Some(&snapshot),
+                &completed,
+                None,
+            )
+            .expect("completion")
+            .status,
+            DirectorGoalStatus::Satisfied
+        );
+        let reopened = salvage_test_snapshot(&["SITE-1", "SITE-2"]);
+        assert_eq!(
+            reconcile_salvage_recovery(
+                &salvage_context(&repository, &no_active, &enabled, false, 6),
+                &region,
+                Some(&reopened),
+                &completed,
+                None,
+            )
+            .expect("reopened")
+            .status,
+            DirectorGoalStatus::Active
+        );
+        repository
+            .put_document(
+                SALVAGE_RECOVERY_CACHE_NS,
+                SALVAGE_RECOVERY_CACHE_KEY,
+                &SalvageRecoveryCache {
+                    refreshed_at_ms: 1,
+                    snapshot: salvage_test_snapshot(&["SITE-1"]),
+                },
+            )
+            .expect("seed history cache");
+        let refreshed = salvage_recovery_history_for_director(&client, &repository, 2, true)
+            .await
+            .expect("forced history refresh");
+        assert!(
+            refreshed
+                .sites_by_region
+                .get("alpha")
+                .is_some_and(|sites| sites.contains_key("SITE-REMOTE"))
+        );
+        let refreshed_summary = reconcile_salvage_recovery(
+            &salvage_context(&repository, &no_active, &enabled, false, 7),
+            &region,
+            Some(&refreshed),
+            &completed,
+            None,
+        )
+        .expect("reconcile forced history refresh");
+        assert_eq!(refreshed_summary.status, DirectorGoalStatus::Active);
+        assert_eq!(refreshed_summary.progress_total, 1);
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn salvage_recovery_director_repeated_passes_are_idempotent() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = salvage_test_region(Some("ALPHA-HUB"));
+        let snapshot = salvage_test_snapshot(&["SITE-1"]);
+        let disabled = salvage_enabled_controls(false);
+        for pass in 0_i64..1_440_i64 {
+            let workflows = repository.list().expect("workflows");
+            let summary = reconcile_salvage_recovery(
+                &salvage_context(&repository, &workflows, &disabled, true, pass * 30_000),
+                &region,
+                Some(&snapshot),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("disabled reconcile pass");
+            assert_eq!(summary.status, DirectorGoalStatus::Waiting);
+            assert!(repository.list().expect("workflows").is_empty());
+        }
+        let controls = salvage_enabled_controls(true);
+        for pass in 0_i64..1_440_i64 {
+            let workflows = repository.list().expect("workflows");
+            let summary = reconcile_salvage_recovery(
+                &salvage_context(&repository, &workflows, &controls, true, pass * 30_000),
+                &region,
+                Some(&snapshot),
+                &BTreeSet::new(),
+                None,
+            )
+            .expect("enabled reconcile pass");
+            assert_eq!(summary.status, DirectorGoalStatus::Active);
+        }
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+    }
+
     #[test]
     fn no_scale_down_goal_or_operation_exists() {
         assert!(

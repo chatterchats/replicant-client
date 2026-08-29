@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{config::ManagedClientConfig, start_managed_client};
+use crate::{canonical_region, config::ManagedClientConfig, start_managed_client};
 use replicant_client::{Client, Device, OperationStatus, Replicant, Star, SyncDomain};
 use serde::Serialize;
 use tracing::info;
@@ -542,15 +542,6 @@ fn region_for_location(catalogue: &[Star], location: &str) -> Option<String> {
         .map(canonical_region)
 }
 
-fn canonical_region(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "sol" | "sol-region" | "sol_region" | "solregion" | "sol-zone" | "sol_zone" | "solzone" => {
-            "solzone".to_owned()
-        }
-        value => value.to_owned(),
-    }
-}
-
 async fn resolve_owned_replicant(client: &Client, query: &str) -> crate::AnyResult<Replicant> {
     let handles = client.replicants().find().owned().collect().await?;
     let mut matches = Vec::new();
@@ -803,13 +794,6 @@ mod tests {
             explored: None,
             has_life: None,
             region: region.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn solregion_aliases_normalize_to_solzone() {
-        for alias in ["sol", "SOLREGION", "sol-region", "sol_zone", "solzone"] {
-            assert_eq!(canonical_region(alias), "solzone");
         }
     }
 

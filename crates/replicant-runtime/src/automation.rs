@@ -41,6 +41,7 @@ use crate::bootstrap::{
 
 use crate::{
     belt_search::{BeltOperationRejection, execute_belt_search_system, travel_to_system},
+    canonical_region,
     event::{
         EventCampaignArchive, EventCampaignPlanningRequest, EventExecutionRequest, EventItemStage,
         EventPlanningRequest, EventStockReconcileOptions, archive_event_campaign,
@@ -1416,6 +1417,149 @@ impl WorkflowExecutor for ScanTourWorkflow {
         })
     }
 }
+/// A complete, remote-authoritative salvage observation used by campaigns and
+/// the Automation Director.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct SalvageRecoveryHistorySnapshot {
+    /// Number of discovered events returned by the remote history query.
+    pub(crate) discovered_count: usize,
+    /// Number of depleted events returned by the remote history query.
+    pub(crate) depleted_count: usize,
+    /// Recoverable sites grouped by canonical region.
+    pub(crate) sites_by_region: BTreeMap<String, BTreeMap<String, SalvageSiteRecord>>,
+}
+
+/// Fetches the complete salvage histories and resolves each parent location
+/// against the durable galaxy catalogue exactly once.
+///
+/// The event histories are deliberately the authority here.  In particular,
+/// this must not use the transient resource-site projection, which can omit
+/// historical discoveries and can be ahead of the durable event log.
+pub(crate) async fn salvage_recovery_history_snapshot(
+    client: &Client,
+) -> Result<SalvageRecoveryHistorySnapshot, String> {
+    let mut catalogue = client.galaxy().catalogue();
+    if catalogue.is_empty() {
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .map_err(string_error)?;
+        catalogue = client.galaxy().catalogue();
+    }
+    let catalogue_systems = catalogue
+        .iter()
+        .map(|star| star.key.id.to_string())
+        .collect::<BTreeSet<_>>();
+    let system_regions = catalogue
+        .into_iter()
+        .filter_map(|star| {
+            star.region
+                .map(|region| (star.key.id.to_string(), canonical_region(&region)))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let discovered = client
+        .events()
+        .full_history_named("salvage.discovered")
+        .await
+        .map_err(string_error)?;
+    let depleted = client
+        .events()
+        .full_history_named("salvage.depleted")
+        .await
+        .map_err(string_error)?;
+
+    let mut location_regions = BTreeMap::new();
+    for location in discovered
+        .iter()
+        .filter_map(|event| event.payload.get("location").and_then(Value::as_str))
+    {
+        if location_regions.contains_key(location) {
+            continue;
+        }
+        let system = resolve_location_system_from_catalogue(location, &catalogue_systems)
+            .ok_or_else(|| format!("{location} does not resolve to a known system"))?;
+        if let Some(region) = system_regions.get(&system) {
+            location_regions.insert(location.to_owned(), region.clone());
+        }
+    }
+
+    let observed_regions = location_regions.values().cloned().collect::<BTreeSet<_>>();
+    let mut sites_by_region = BTreeMap::new();
+    let completed = BTreeSet::new();
+    for region in observed_regions {
+        let sites = salvage_recovery_ledger(
+            &discovered,
+            &depleted,
+            &completed,
+            &location_regions,
+            &region,
+        );
+        sites_by_region.insert(region, sites);
+    }
+
+    Ok(SalvageRecoveryHistorySnapshot {
+        discovered_count: discovered.len(),
+        depleted_count: depleted.len(),
+        sites_by_region,
+    })
+}
+
+fn resolve_location_system_from_catalogue(
+    location: &str,
+    catalogue: &BTreeSet<String>,
+) -> Option<String> {
+    catalogue
+        .iter()
+        .map(String::as_str)
+        .filter(|system| designation_in_system(location, system))
+        .max_by_key(|system| system.len())
+        .map(str::to_owned)
+}
+
+/// Returns designations completed by durable salvage-site state documents.
+pub(crate) fn completed_salvage_sites(
+    repository: &replicant_workflow::WorkflowRepository,
+) -> Result<BTreeSet<String>, RepositoryError> {
+    Ok(repository
+        .list_documents("salvage.site_state")?
+        .into_iter()
+        .map(|(designation, _, _)| designation)
+        .collect())
+}
+
+/// Applies live completion authority to one canonical region's cached history.
+pub(crate) fn recoverable_salvage_sites(
+    snapshot: &SalvageRecoveryHistorySnapshot,
+    completed: &BTreeSet<String>,
+    region: &str,
+) -> BTreeMap<String, SalvageSiteRecord> {
+    let region = canonical_region(region);
+    snapshot
+        .sites_by_region
+        .get(&region)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(designation, _)| !completed.contains(designation))
+        .collect()
+}
+
+/// Returns whether a workflow is a compatible active regional salvage
+/// recovery campaign.
+pub(crate) fn salvage_recovery_workflow_matches(
+    workflow: &replicant_workflow::WorkflowInstance,
+    region: &str,
+) -> Result<bool, RepositoryError> {
+    if workflow.kind != salvage_recovery_workflow_kind() || workflow.status.is_terminal() {
+        return Ok(false);
+    }
+    let intent: SalvageRecoveryIntent = workflow.config()?;
+    Ok(!intent.home.trim().is_empty()
+        && canonical_region(&intent.region) == canonical_region(region))
+}
+
 /// Reconciles newest-wins salvage discovery history against depletion and completion authority.
 pub fn salvage_recovery_ledger(
     discovered: &[replicant_client::domain::Event],
@@ -1673,55 +1817,17 @@ impl WorkflowExecutor for SalvageRecoveryWorkflow {
             let intent: SalvageRecoveryIntent = context.config().map_err(string_error)?;
             let client = managed_client(context)?;
             let repository = context.repository_handle();
-            let discovered = client
-                .events()
-                .full_history_named("salvage.discovered")
-                .await
-                .map_err(string_error)?;
-            let depleted = client
-                .events()
-                .full_history_named("salvage.depleted")
-                .await
-                .map_err(string_error)?;
-            let completed = repository
-                .list_documents("salvage.site_state")
-                .map_err(string_error)?
-                .into_iter()
-                .map(|(designation, _, _)| designation)
-                .collect::<BTreeSet<_>>();
-            let catalogue = client
-                .galaxy()
-                .catalogue()
-                .into_iter()
-                .filter_map(|star| star.region.map(|region| (star.key.id.to_string(), region)))
-                .collect::<BTreeMap<_, _>>();
-            let mut location_regions = BTreeMap::new();
-            for location in discovered
-                .iter()
-                .filter_map(|event| event.payload.get("location").and_then(Value::as_str))
-            {
-                if location_regions.contains_key(location) {
-                    continue;
-                }
-                let system = resolve_location_system(&client, location).await?;
-                if let Some(region) = catalogue.get(&system) {
-                    location_regions.insert(location.to_owned(), region.clone());
-                }
-            }
-            let sites = salvage_recovery_ledger(
-                &discovered,
-                &depleted,
-                &completed,
-                &location_regions,
-                &intent.region,
-            );
+            let region = canonical_region(&intent.region);
+            let snapshot = salvage_recovery_history_snapshot(&client).await?;
+            let completed = completed_salvage_sites(repository.as_ref()).map_err(string_error)?;
+            let sites = recoverable_salvage_sites(&snapshot, &completed, &region);
             repository
                 .put_document(
                     "automation.scheduler.salvage",
                     &context.id().to_string(),
                     &serde_json::json!({
-                        "discovery_count": discovered.len(),
-                        "depleted_count": depleted.len(),
+                        "discovery_count": snapshot.discovered_count,
+                        "depleted_count": snapshot.depleted_count,
                         "ledger_count": completed.len(),
                         "worklist_count": sites.len(),
                     }),
@@ -1741,7 +1847,7 @@ impl WorkflowExecutor for SalvageRecoveryWorkflow {
                 repository.as_ref(),
                 &client,
                 broker.discover_candidates().map_err(string_error)?,
-                &intent.region,
+                &region,
             )?;
             let capacities = salvage_freighter_capacities(&observed_candidates);
             repository
@@ -1750,7 +1856,7 @@ impl WorkflowExecutor for SalvageRecoveryWorkflow {
                     &salvage_recovery_item_specs(
                         context.id(),
                         &sites,
-                        &intent.region,
+                        &region,
                         &intent.home,
                         &capacities,
                     )
@@ -1770,7 +1876,7 @@ impl WorkflowExecutor for SalvageRecoveryWorkflow {
                     repository.as_ref(),
                     &client,
                     broker.discover_candidates().map_err(string_error)?,
-                    &intent.region,
+                    &region,
                 )?;
                 let Some(assigned) = repository
                     .claim_next_work_item(context.id(), unix_millis())
@@ -9968,6 +10074,18 @@ mod tests {
     #[tokio::test]
     async fn salvage_recovery_history_remote_pages_are_authoritative_and_region_filtered() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-28T00:00:00Z",
+                "stars": [
+                    {"designation": "ROOT", "region": "alpha"},
+                    {"designation": "BETA", "region": "beta"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = test_client_at(&server).await;
         let mut discoveries = (0..462)
             .map(|index| {
@@ -10040,29 +10158,13 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let discovered = client
-            .events()
-            .full_history_named("salvage.discovered")
+        let snapshot = salvage_recovery_history_snapshot(&client)
             .await
-            .expect("full discovery history");
-        let depleted = client
-            .events()
-            .full_history_named("salvage.depleted")
-            .await
-            .expect("full depletion history");
-        assert_eq!(discovered.len(), 463);
-        assert_eq!(discovered.first().expect("first").id.as_str(), "0000-0");
-        assert_eq!(discovered.last().expect("last").id.as_str(), "9999-0");
-        let ledger = salvage_recovery_ledger(
-            &discovered,
-            &depleted,
-            &BTreeSet::from(["SITE-2".into()]),
-            &BTreeMap::from([
-                ("ROOT-1-L4".into(), "alpha".into()),
-                ("BETA-1-L4".into(), "beta".into()),
-            ]),
-            "alpha",
-        );
+            .expect("salvage history snapshot");
+        assert_eq!(snapshot.discovered_count, 463);
+        assert_eq!(snapshot.depleted_count, 1);
+        let ledger =
+            recoverable_salvage_sites(&snapshot, &BTreeSet::from(["SITE-2".into()]), "alpha");
         assert_eq!(ledger.len(), 459);
         assert_eq!(ledger["SITE-3"].resources["structural"], 999);
         assert!(!ledger.contains_key("SITE-1"));
@@ -10150,8 +10252,149 @@ mod tests {
             .expect("start test client")
     }
     #[tokio::test]
+    async fn salvage_recovery_history_refreshes_empty_catalogue_and_canonicalizes_region() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-28T00:00:00Z",
+                "stars": [
+                    {"designation": "ROOT", "region": "Alpha"},
+                    {"designation": "ORPHAN"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("filtered", "false"))
+            .and(query_param("event", "salvage.discovered"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [
+                    {
+                        "id": "1-0",
+                        "version": 1,
+                        "category": "salvage",
+                        "event": "salvage.discovered",
+                        "created_at": "2026-08-28T00:00:00Z",
+                        "payload": {
+                            "designation": "SITE-A",
+                            "location": "ROOT-1-L4",
+                            "resources": {"structural": 2}
+                        }
+                    },
+                    {
+                        "id": "2-0",
+                        "version": 1,
+                        "category": "salvage",
+                        "event": "salvage.discovered",
+                        "created_at": "2026-08-28T00:00:01Z",
+                        "payload": {
+                            "designation": "SITE-B",
+                            "location": "ROOT-1-L4",
+                            "resources": {"structural": 3}
+                        }
+                    },
+                    {
+                        "id": "2-1",
+                        "version": 1,
+                        "category": "salvage",
+                        "event": "salvage.discovered",
+                        "created_at": "2026-08-28T00:00:02Z",
+                        "payload": {
+                            "designation": "SITE-UNREGIONED",
+                            "location": "ORPHAN-1-L4",
+                            "resources": {"structural": 1}
+                        }
+                    }
+                ],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("filtered", "false"))
+            .and(query_param("event", "salvage.depleted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "events": [{
+                    "id": "3-0",
+                    "version": 1,
+                    "category": "salvage",
+                    "event": "salvage.depleted",
+                    "created_at": "2026-08-28T00:00:02Z",
+                    "payload": {"site": "SITE-A"}
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        assert!(client.galaxy().catalogue().is_empty());
+        let snapshot = salvage_recovery_history_snapshot(&client)
+            .await
+            .expect("salvage history snapshot");
+        assert_eq!(snapshot.discovered_count, 3);
+        assert_eq!(snapshot.depleted_count, 1);
+        let sites = recoverable_salvage_sites(&snapshot, &BTreeSet::new(), "ALPHA");
+        assert_eq!(
+            sites.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["SITE-B"]
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn salvage_recovery_workflow_matches_requires_active_decodable_intent() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let active = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "Alpha".into(),
+                home: "ROOT-1-L4".into(),
+            }))
+            .expect("active salvage recovery");
+        assert!(salvage_recovery_workflow_matches(&active, "alpha").expect("compatible workflow"));
+
+        let whitespace_home = repository
+            .create(new_salvage_recovery_workflow(SalvageRecoveryIntent {
+                region: "alpha".into(),
+                home: " \t".into(),
+            }))
+            .expect("whitespace-home salvage recovery");
+        assert!(
+            !salvage_recovery_workflow_matches(&whitespace_home, "alpha")
+                .expect("whitespace home is incompatible")
+        );
+
+        let malformed = repository
+            .create(NewWorkflow {
+                kind: salvage_recovery_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!("not an intent"),
+                checkpoint: Value::Null,
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("malformed salvage recovery");
+        assert!(salvage_recovery_workflow_matches(&malformed, "alpha").is_err());
+    }
+
+    #[tokio::test]
     async fn salvage_recovery_history_registered_empty_campaign_executes_through_supervisor() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-28T00:00:00Z",
+                "stars": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         for event_name in ["salvage.discovered", "salvage.depleted"] {
             Mock::given(method("GET"))
                 .and(path("/v1/events"))

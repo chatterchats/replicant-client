@@ -149,6 +149,7 @@ export type DirectorGoalKind =
   | "enhance_star_catalogue"
   | "discover_belts"
   | "expand_mining_ops"
+  | "salvage_recovery"
   | "event_completion"
   | "blueprint_acquisition"
   | "maintain_system_hubs"
@@ -4172,6 +4173,7 @@ const directorGoalKinds = [
   "enhance_star_catalogue",
   "discover_belts",
   "expand_mining_ops",
+  "salvage_recovery",
   "event_completion",
   "blueprint_acquisition",
   "maintain_system_hubs",

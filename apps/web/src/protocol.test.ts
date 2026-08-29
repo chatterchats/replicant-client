@@ -419,6 +419,45 @@ describe("parseDirectorResponse", () => {
 
     expect(parsed.payload.goals[0]?.kind).toBe("maintain_system_hubs");
   });
+  it("accepts the Salvage Recovery standing goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 4, generated_at_ms: 20 },
+        mode: "automatic",
+        regions: [],
+        goals: [
+          {
+            id: "salvage_recovery:alpha",
+            kind: "salvage_recovery",
+            region: "alpha",
+            status: "active",
+            objective: "Recover discovered regional salvage",
+            blocker: null,
+            next_action:
+              "Continue the active regional salvage recovery campaign",
+            progress_current: 0,
+            progress_total: 2,
+            active_workflows: ["WF-SALVAGE"],
+            enabled: true,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]?.kind).toBe("salvage_recovery");
+  });
 });
 
 describe("mission projection parsers", () => {

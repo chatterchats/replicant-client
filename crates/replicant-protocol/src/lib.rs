@@ -224,6 +224,8 @@ pub enum DirectorGoalKind {
     DiscoverBelts,
     /// Continually extend mining coverage to useful known belts.
     ExpandMiningOps,
+    /// Recover discovered salvage sites within each established region.
+    SalvageRecovery,
     /// Batch-plan and complete active location events in each region.
     EventCompletion,
     /// Learn missing account-wide blueprints from known acquisition opportunities.
@@ -3261,6 +3263,15 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize protocol DTO");
         let decoded = serde_json::from_str(&json).expect("deserialize protocol DTO");
         assert_eq!(value, &decoded);
+    }
+    #[test]
+    fn director_goal_kind_serializes_salvage_recovery() {
+        let json = serde_json::to_string(&DirectorGoalKind::SalvageRecovery)
+            .expect("serialize Director goal kind");
+        assert_eq!(json, "\"salvage_recovery\"");
+        let decoded: DirectorGoalKind =
+            serde_json::from_str(&json).expect("deserialize Director goal kind");
+        assert_eq!(decoded, DirectorGoalKind::SalvageRecovery);
     }
 
     fn workflow() -> WorkflowSummary {

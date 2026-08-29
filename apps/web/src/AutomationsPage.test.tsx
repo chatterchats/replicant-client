@@ -1,9 +1,20 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { daemonApi } from "./api";
-import { ParameterField, validateParameters } from "./AutomationsPage";
+import {
+  AutomationsPage,
+  ParameterField,
+  validateParameters,
+} from "./AutomationsPage";
 import type { ParameterDescriptor, WorkflowDescriptor } from "./protocol";
+
+vi.mock("./daemon", () => ({
+  useDaemonState: () => ({ invalidated: {} }),
+}));
 
 const validation = {
   minimum: null,
@@ -30,6 +41,7 @@ function parameter(
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("descriptor workflow form", () => {
@@ -172,14 +184,91 @@ describe("Director goal controls", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await daemonApi.setDirectorGoal("enhance_star_catalogue", "alpha", false);
+    await daemonApi.setDirectorGoal("salvage_recovery", "alpha", true);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/director/goals/enhance_star_catalogue",
+      "/api/director/goals/salvage_recovery",
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ region: "alpha", enabled: false }),
+        body: JSON.stringify({ region: "alpha", enabled: true }),
       }),
     );
+  });
+  it("keeps the manual salvage recovery template visible", async () => {
+    vi.useFakeTimers();
+    const descriptors = {
+      reports: [],
+      actions: [],
+      workflows: [
+        {
+          kind: "salvage.recovery",
+          display_name: "Recover regional salvage",
+          aliases: ["salvage_recovery"],
+          description: "Recover discovered salvage in a region.",
+          category: "salvage",
+          operation_class: "workflow",
+          applicable_to: [],
+          parameters: [],
+          risk: "low",
+          supported_triggers: ["manual"],
+        },
+      ],
+    };
+    const director = {
+      metadata: { revision: 2, generated_at_ms: 10 },
+      mode: "automatic",
+      regions: [],
+      goals: [],
+      replicants: [],
+      requirements: [],
+      workforce: {
+        total: 0,
+        busy: 0,
+        idle: 0,
+        idle_ratio: 1,
+        pending_worker_demand: 0,
+        scale_up_recommended: false,
+        scale_reason: null,
+      },
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      const payload = url === "/api/descriptors" ? descriptors : director;
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ protocol_version: 1, payload }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root: Root | undefined;
+    await act(async () => {
+      const mountedRoot = createRoot(container);
+      root = mountedRoot;
+      mountedRoot.render(<AutomationsPage workflows={[]} entities={{}} />);
+      await vi.runAllTimersAsync();
+    });
+
+    const startWorkflow =
+      container.querySelector<HTMLButtonElement>("button.primary");
+    expect(startWorkflow).not.toBeNull();
+    act(() => {
+      startWorkflow?.click();
+    });
+    expect(container.querySelector(".template-list")?.textContent).toContain(
+      "Recover regional salvage",
+    );
+
+    act(() => {
+      root?.unmount();
+    });
+    container.remove();
   });
 });

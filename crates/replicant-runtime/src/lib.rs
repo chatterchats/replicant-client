@@ -32,6 +32,41 @@ pub type ReportResult<T> = Result<T, ApplicationError>;
 
 /// Result of a finite application action.
 pub type ActionResult<T> = Result<T, ApplicationError>;
+/// Canonicalizes region aliases without constraining future region names.
+#[must_use]
+pub fn canonical_region(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "sol" | "sol-region" | "sol_region" | "solregion" | "sol-zone" | "sol_zone" | "solzone" => {
+            "solzone".to_owned()
+        }
+        other => other.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod canonical_region_tests {
+    use super::canonical_region;
+    #[test]
+    fn canonical_region_is_shared_across_runtime_surfaces() {
+        for value in [
+            "sol",
+            "SOL",
+            "sol-region",
+            "sol_region",
+            "solregion",
+            "sol-zone",
+            "sol_zone",
+            "solzone",
+        ] {
+            assert_eq!(canonical_region(value), "solzone");
+        }
+    }
+
+    #[test]
+    fn canonical_region_trims_and_lowercases_unknown_regions() {
+        assert_eq!(canonical_region("  Alpha  "), "alpha");
+    }
+}
 
 pub mod config;
 
