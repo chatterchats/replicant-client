@@ -2638,15 +2638,23 @@ async fn refresh_device_census(
                 continue;
             };
 
-            // Free ordinary relays and DSRs at the manufacturing hub are
-            // fungible stock for expansion. System Hubs remain fixed network
-            // infrastructure and are never silently repurposed as cargo.
-            if (kind == Some(FTL_RELAY) || kind == Some(DEEP_SPACE_RELAY))
-                && location == hub
+            // Free ordinary relays anywhere in the manufacturing hub system
+            // are fungible stock for expansion when they can reposition to
+            // the exact hub before stow. This matters for accumulated idle
+            // relays at Lagrange points in an otherwise-established system.
+            // DSRs remain exact-hub stock because they cannot use the normal
+            // stow/reposition path. System Hubs are fixed infrastructure and
+            // are never silently repurposed as cargo.
+            let ordinary_hub_stock = kind == Some(FTL_RELAY)
+                && device_has_command(device, "stow")
+                && (location == hub
+                    || designation_in_system(location, &hub_system)
+                        && device_has_command(device, "travel"));
+            let dsr_hub_stock = kind == Some(DEEP_SPACE_RELAY) && location == hub;
+            if (ordinary_hub_stock || dsr_hub_stock)
                 && device.relationships.stowed_in.is_none()
                 && device.relationships.attached_to.is_none()
                 && !relay_device_active(device)
-                && (kind == Some(DEEP_SPACE_RELAY) || device_has_command(device, "stow"))
             {
                 if kind == Some(DEEP_SPACE_RELAY) {
                     hub_stock_dsr.push(code.clone());
@@ -4459,11 +4467,24 @@ async fn start_device_travel(client: &Client, code: &str, destination: &str) -> 
         ));
     }
     info!(carrier = %code, destination = %destination, "dispatching relay supply carrier");
+    let via = client
+        .smart_travel()
+        .route_for_device(code, destination)
+        .await?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.intermediate_systems
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
     let operation = handle
         .command(raw::devices::DeviceCommand::Travel {
             destination: destination.to_owned(),
             dry_run: None,
-            via: None,
+            via,
         })
         .await?;
     if let Err(error) = ensure_operation_accepted(&operation).await {
@@ -5964,13 +5985,26 @@ async fn stow_trip_relays(
             continue;
         }
         if location != plan.hub_location {
-            return Err(app_error(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "relay {code} is at {location}; expected hub {} or target system {}",
-                    plan.hub_location, stop.system
-                ),
-            ));
+            let can_reposition_local_stock = stop.device_type == FTL_RELAY
+                && designation_in_system(location, &plan.start_system)
+                && device_has_command(&snapshot, "travel");
+            if !can_reposition_local_stock {
+                return Err(app_error(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "relay {code} is at {location}; expected hub {} or target system {}",
+                        plan.hub_location, stop.system
+                    ),
+                ));
+            }
+            info!(
+                relay = %code,
+                location,
+                hub = %plan.hub_location,
+                "repositioning reusable hub-system relay to the manufacturing hub before stow"
+            );
+            start_device_travel(client, code, &plan.hub_location).await?;
+            wait_device_at_location(client, config, code, &plan.hub_location).await?;
         }
         to_stow.push(code.to_owned());
     }
