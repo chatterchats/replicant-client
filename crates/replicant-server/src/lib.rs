@@ -517,6 +517,15 @@ async fn trace_http_request(request: Request<axum::body::Body>, next: Next) -> R
             elapsed_ms,
             "daemon HTTP request rejected"
         );
+    } else if elapsed_ms >= 5_000 {
+        tracing::warn!(
+            event = "daemon.http_slow",
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            elapsed_ms,
+            "daemon HTTP request exceeded responsiveness threshold"
+        );
     } else {
         tracing::debug!(
             method = %method,
@@ -5962,11 +5971,17 @@ async fn workflow_detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Versioned<WorkflowDetail>>, ApiError> {
-    let instance = read_workflow(&state.repository, &id)?;
-    Ok(Json(Versioned::current(detail(
-        &state.repository,
-        &instance,
-    )?)))
+    let repository = state.repository.clone();
+    let workflow = tokio::task::spawn_blocking(move || {
+        let instance = read_workflow(&repository, &id)?;
+        detail(&repository, &instance)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, "workflow detail blocking task failed");
+        ApiError::internal()
+    })??;
+    Ok(Json(Versioned::current(workflow)))
 }
 
 async fn start_workflow(

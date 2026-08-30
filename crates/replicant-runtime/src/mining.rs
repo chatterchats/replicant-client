@@ -4,7 +4,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use replicant_client::{
@@ -29,6 +30,9 @@ use tracing::info;
 mod executor;
 
 const PLAN_VERSION: u32 = 1;
+const MINING_SYNC_REUSE_WINDOW: Duration = Duration::from_secs(60);
+static MINING_SYNC_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static LAST_MINING_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Error type returned by the reusable mining workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -866,7 +870,11 @@ impl Drop for MissionLock {
     }
 }
 
-async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMission> {
+async fn create_plan(
+    client: &Client,
+    config: &Config,
+    synchronize: bool,
+) -> AnyResult<MiningMission> {
     if config.plan_path.exists() && !config.replace_plan {
         let existing = load_expansion(&config.plan_path)?;
         if !existing.phase.is_terminal() {
@@ -881,11 +889,14 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
         }
     }
 
-    let sync = client.sync().full().await?;
-    info!(readiness = ?sync.readiness, "full managed synchronization completed");
+    if synchronize {
+        synchronize_mining_state(client).await?;
+    } else {
+        info!("planning mining expansion from committed managed state");
+    }
     let selected_replicant = select_replicant(client, config.replicant.as_deref()).await?;
     let systems = config.requested_systems()?;
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let protection = protected_systems(&devices, &client.galaxy().catalogue());
     let blueprints = fetch_blueprints(client).await?;
     let factories = factory_workloads(client, &blueprints, &config.hub).await?;
@@ -1127,19 +1138,53 @@ fn stable_hash(value: &str) -> u64 {
     hash
 }
 
-async fn refresh_device_snapshots(client: &Client) -> AnyResult<Vec<Device>> {
-    let handles = client
-        .devices()
-        .refresh_many()
-        .page_size(50)
-        .collect()
-        .await?;
+pub(crate) async fn device_snapshots(client: &Client) -> AnyResult<Vec<Device>> {
+    let handles = client.devices().find().owned().collect().await?;
     let mut devices = Vec::with_capacity(handles.len());
     for handle in handles {
         devices.push(handle.snapshot().await?);
     }
     devices.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(devices)
+}
+
+pub(crate) async fn authoritative_device_refresh(client: &Client) -> AnyResult<()> {
+    client
+        .devices()
+        .refresh_many()
+        .page_size(50)
+        .collect()
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn synchronize_mining_state(client: &Client) -> AnyResult<()> {
+    let _gate = MINING_SYNC_GATE.lock().await;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| app_error(io::ErrorKind::Other, "system clock is before Unix epoch"))?
+        .as_millis() as u64;
+    let last_ms = LAST_MINING_SYNC_MS.load(Ordering::Acquire);
+    if last_ms != 0
+        && now_ms.saturating_sub(last_ms)
+            < u64::try_from(MINING_SYNC_REUSE_WINDOW.as_millis()).unwrap_or(u64::MAX)
+    {
+        info!(
+            age_ms = now_ms.saturating_sub(last_ms),
+            reuse_window_ms = MINING_SYNC_REUSE_WINDOW.as_millis() as u64,
+            "reusing recent full managed synchronization for mining"
+        );
+        return Ok(());
+    }
+
+    let sync = client.sync().full().await?;
+    let completed_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| app_error(io::ErrorKind::Other, "system clock is before Unix epoch"))?
+        .as_millis() as u64;
+    LAST_MINING_SYNC_MS.store(completed_ms, Ordering::Release);
+    info!(readiness = ?sync.readiness, "full managed synchronization completed for mining");
+    Ok(())
 }
 
 async fn select_replicant(client: &Client, requested: Option<&str>) -> AnyResult<String> {
@@ -1715,7 +1760,30 @@ pub async fn plan_expansion(
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
     };
-    create_plan(client, &config).await
+    create_plan(client, &config, true).await
+}
+
+/// Creates a mining expansion plan from the daemon's committed managed state.
+///
+/// Durable Director workflows use this path because the Director already plans
+/// from the managed projection. Avoiding a second account-wide synchronization
+/// prevents one full sync per regional campaign from stampeding the daemon.
+pub(crate) async fn plan_expansion_from_managed_state(
+    client: &Client,
+    request: &MiningExpansionRequest,
+    replace_existing: bool,
+) -> AnyResult<MiningMission> {
+    validate_request(request)?;
+    let config = Config {
+        systems: request.systems.clone(),
+        replicant: Some(request.replicant.clone()),
+        hub: request.hub.to_ascii_uppercase(),
+        plan_path: request.mission_file.clone(),
+        replace_plan: replace_existing,
+        wait_timeout: request.wait_timeout,
+        max_concurrency: request.max_concurrency,
+    };
+    create_plan(client, &config, false).await
 }
 
 /// Creates or resumes a mining expansion using an already-running managed client.

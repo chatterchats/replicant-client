@@ -29,7 +29,7 @@ use crate::{
     },
     mining::{
         MiningExpansionRequest, MiningMission, execute_mining_item, merge_mining_item_state,
-        mining_item_completed, mining_work_item_specs, plan_expansion,
+        mining_item_completed, mining_work_item_specs, plan_expansion_from_managed_state,
     },
     relay::{
         RelayExecutionState, RelayExpansionRequest, elastic_relay_assignment, execute_relay_trip,
@@ -553,7 +553,7 @@ pub(crate) async fn execute_mining_pool_config(
         let worker = candidate_identity(&candidates, "replicant", None)
             .ok_or_else(|| "mining planning has no regional Replicant".to_owned())?;
         checkpoint.mission = Some(
-            plan_expansion(
+            plan_expansion_from_managed_state(
                 &client,
                 &MiningExpansionRequest {
                     systems: config.systems.clone(),

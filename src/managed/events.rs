@@ -790,32 +790,49 @@ fn apply_event(client: &Client, raw_event: &GameEvent) -> Result<ApplyOutcome> {
 async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver<ApplyRequest>) {
     while let Some(request) = receiver.recv().await {
         let apply_started = Instant::now();
-        let result = weak.upgrade().ok_or(Error::Closed).and_then(|client| {
-            let result = apply_event(&client, &request.event);
-            let outcome = match &result {
-                Ok(ApplyOutcome::Applied) => "applied",
-                Ok(ApplyOutcome::Duplicate) => "duplicate",
-                Err(_) => "failed",
-            };
-            client.record_event_telemetry(EventTelemetrySample {
-                observed_at_ms: telemetry_now_millis(),
-                metric: "event_apply",
-                outcome: outcome.to_owned(),
-                event_name: Some(request.event.event.clone()),
-                event_count: 1,
-                page_count: 0,
-                duration_ms: Some(duration_millis(apply_started.elapsed())),
-            });
-            if result.is_err() {
-                warn!(target: "replicant_client::events", "event application failed; marking continuity degraded");
-                mark_event_continuity_degraded(&client);
-                if schedule_continuity_reconciliation(&client).is_err() {
-                    mark_event_continuity_degraded(&client);
+        let Some(client) = weak.upgrade() else {
+            let _ = request.completed.send(Err(Error::Closed));
+            continue;
+        };
+        let event_name = request.event.event.clone();
+        let apply_client = client.clone();
+        let event = request.event;
+        let result =
+            match tokio::task::spawn_blocking(move || apply_event(&apply_client, &event)).await {
+                Ok(result) => result,
+                Err(error) => {
+                    warn!(
+                        target: "replicant_client::events",
+                        error = %error,
+                        "event applier blocking task failed"
+                    );
+                    Err(Error::Configuration {
+                        message: "event applier blocking task failed".to_owned(),
+                    })
                 }
-            }
-            result.map(|_| ())
+            };
+        let outcome = match &result {
+            Ok(ApplyOutcome::Applied) => "applied",
+            Ok(ApplyOutcome::Duplicate) => "duplicate",
+            Err(_) => "failed",
+        };
+        client.record_event_telemetry(EventTelemetrySample {
+            observed_at_ms: telemetry_now_millis(),
+            metric: "event_apply",
+            outcome: outcome.to_owned(),
+            event_name: Some(event_name),
+            event_count: 1,
+            page_count: 0,
+            duration_ms: Some(duration_millis(apply_started.elapsed())),
         });
-        if request.completed.send(result).is_err() {
+        if result.is_err() {
+            warn!(target: "replicant_client::events", "event application failed; marking continuity degraded");
+            mark_event_continuity_degraded(&client);
+            if schedule_continuity_reconciliation(&client).is_err() {
+                mark_event_continuity_degraded(&client);
+            }
+        }
+        if request.completed.send(result.map(|_| ())).is_err() {
             // The producer stopped awaiting while work was in flight; the
             // durable outcome has already been committed or retained for log
             // replay, so there is no caller left to notify.

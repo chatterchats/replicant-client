@@ -23,11 +23,11 @@ use tracing::{info, warn};
 
 use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
-    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code,
-    device_is_in_system, device_location, device_type, factory_workloads, fetch_blueprints,
-    find_device, format_quantities, has_directive, has_reservation_tag,
-    is_opaque_mining_mission_tag, protected_systems, refresh_device_snapshots, save_plan,
-    site_shortages, stable_hash,
+    SiteAssets, SitePhase, app_error, audit_route, audit_site, authoritative_device_refresh,
+    controller_code, device_is_in_system, device_location, device_snapshots, device_type,
+    factory_workloads, fetch_blueprints, find_device, format_quantities, has_directive,
+    has_reservation_tag, is_opaque_mining_mission_tag, protected_systems, save_plan,
+    site_shortages, stable_hash, synchronize_mining_state,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,6 +81,17 @@ async fn wait_for_mission_event(
     }
 }
 
+async fn refresh_after_fallback_wake(client: &Client, wake: MissionWake) -> AnyResult<()> {
+    if matches!(wake, MissionWake::Poll | MissionWake::Gap) {
+        info!(
+            wake = ?wake,
+            "refreshing authoritative device state after mining event-stream fallback"
+        );
+        authoritative_device_refresh(client).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute(
     client: &Client,
     config: &Config,
@@ -90,8 +101,7 @@ pub(crate) async fn execute(
         return Ok(());
     }
 
-    let sync = client.sync().full().await?;
-    info!(readiness = ?sync.readiness, "full managed synchronization completed");
+    synchronize_mining_state(client).await?;
     migrate_legacy_mission_devices(client, mission).await?;
     save_plan(&config.plan_path, mission)?;
     reconcile(client, config, mission).await?;
@@ -150,7 +160,7 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
 
 async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission) -> AnyResult<()> {
     reconcile_print_batches(client, mission).await?;
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let protection = protected_systems(&devices, &client.galaxy().catalogue());
     for site in &mut mission.sites {
         let audit = audit_site(
@@ -292,7 +302,7 @@ async fn reconcile_print_batches(client: &Client, mission: &mut MiningMission) -
         .collect::<BTreeSet<_>>();
     migrate_legacy_mission_devices(client, mission).await?;
     let aliases = mission_tag_aliases(mission);
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let mut produced = BTreeMap::<String, Vec<String>>::new();
     for snapshot in devices
         .iter()
@@ -705,12 +715,13 @@ async fn wait_for_print_outputs(
                 ),
             ));
         }
-        wait_for_mission_event(
+        let wake = wait_for_mission_event(
             &mut watch,
             deadline,
             &["print.completed", "device.print_completed"],
         )
         .await?;
+        refresh_after_fallback_wake(client, wake).await?;
     }
 }
 
@@ -793,7 +804,7 @@ async fn allocate_available_site_assets(
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<usize> {
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let mut used = mission
         .sites
         .iter()
@@ -1046,7 +1057,8 @@ async fn deploy_sites(
                 format!("timed out deploying mining sites: {pending}"),
             ));
         }
-        wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        refresh_after_fallback_wake(client, wake).await?;
     }
 }
 
@@ -1055,7 +1067,7 @@ async fn dispatch_ready_sites(
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let in_flight = mission
         .sites
         .iter()
@@ -1328,7 +1340,7 @@ async fn configure_site(
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut watch = client.events().watch().await?;
     loop {
-        let devices = refresh_device_snapshots(client).await?;
+        let devices = device_snapshots(client).await?;
         let protection = protected_systems(&devices, &client.galaxy().catalogue());
         if audit_site(
             &devices,
@@ -1349,7 +1361,8 @@ async fn configure_site(
                 ),
             ));
         }
-        wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        refresh_after_fallback_wake(client, wake).await?;
     }
     info!(system = %site.system, belt = %site.belt, "mining site operational");
     mission.sites[index].phase = SitePhase::Operational;
@@ -1358,7 +1371,7 @@ async fn configure_site(
 }
 
 async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> AnyResult<()> {
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let protection = protected_systems(&devices, &client.galaxy().catalogue());
     if protection.contains(&site.system) {
         return Ok(());
@@ -1398,7 +1411,7 @@ async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> A
 }
 
 async fn ensure_adoption(client: &Client, controller: &str, devices: &[String]) -> AnyResult<()> {
-    let snapshots = refresh_device_snapshots(client).await?;
+    let snapshots = device_snapshots(client).await?;
     let missing = devices
         .iter()
         .filter(|code| {
@@ -1426,7 +1439,7 @@ async fn allocate_route_assets(
     config: &Config,
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let mut used = mission
         .sites
         .iter()
@@ -1551,7 +1564,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut watch = client.events().watch().await?;
     loop {
-        let devices = refresh_device_snapshots(client).await?;
+        let devices = device_snapshots(client).await?;
         if audit_route(&devices, &route.system, &route.belt, hub).active {
             break;
         }
@@ -1561,7 +1574,8 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
                 format!("ferry route for {} did not verify as active", route.system),
             ));
         }
-        wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
+        refresh_after_fallback_wake(client, wake).await?;
     }
     info!(
         system = %route.system,
@@ -1622,7 +1636,8 @@ async fn return_and_release_carriers(
                 format!("timed out waiting for {pending} Surge Carrier(s) to return"),
             ));
         }
-        wait_for_mission_event(&mut watch, deadline, &["travel.arrived"]).await?;
+        let wake = wait_for_mission_event(&mut watch, deadline, &["travel.arrived"]).await?;
+        refresh_after_fallback_wake(client, wake).await?;
     }
 }
 
@@ -1639,7 +1654,7 @@ async fn migrate_legacy_mission_devices(
     if mission.legacy_mission_tags.is_empty() {
         return Ok(0);
     }
-    let devices = refresh_device_snapshots(client).await?;
+    let devices = device_snapshots(client).await?;
     let mut migrated = 0usize;
     for device in devices {
         let removable = device

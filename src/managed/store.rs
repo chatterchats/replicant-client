@@ -257,16 +257,33 @@ impl StoreHandle {
                             let queue_wait = queued_at.elapsed();
                             let execute_started = Instant::now();
                             command(&mut store);
-                            debug!(
-                                target: "replicant_client::store",
-                                event = "store.command_completed",
-                                command_id = id,
-                                operation_type,
-                                queue_wait_ms = queue_wait.as_millis() as u64,
-                                execute_ms = execute_started.elapsed().as_millis() as u64,
-                                elapsed_ms = queued_at.elapsed().as_millis() as u64,
-                                "SQLite store command completed"
-                            );
+                            let execute = execute_started.elapsed();
+                            let elapsed = queued_at.elapsed();
+                            if queue_wait >= Duration::from_secs(1)
+                                || execute >= Duration::from_secs(1)
+                            {
+                                warn!(
+                                    target: "replicant_client::store",
+                                    event = "store.command_slow",
+                                    command_id = id,
+                                    operation_type,
+                                    queue_wait_ms = queue_wait.as_millis() as u64,
+                                    execute_ms = execute.as_millis() as u64,
+                                    elapsed_ms = elapsed.as_millis() as u64,
+                                    "SQLite store command exceeded responsiveness threshold"
+                                );
+                            } else {
+                                debug!(
+                                    target: "replicant_client::store",
+                                    event = "store.command_completed",
+                                    command_id = id,
+                                    operation_type,
+                                    queue_wait_ms = queue_wait.as_millis() as u64,
+                                    execute_ms = execute.as_millis() as u64,
+                                    elapsed_ms = elapsed.as_millis() as u64,
+                                    "SQLite store command completed"
+                                );
+                            }
                         }
                         StoreCommand::Close(response) => {
                             let close_started = Instant::now();

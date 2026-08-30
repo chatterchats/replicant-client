@@ -250,11 +250,20 @@ impl DerefMut for ConnectionGuard<'_> {
 
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
-        tracing::debug!(
-            wait_micros = self.wait_micros,
-            held_micros = u64::try_from(self.acquired_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-            "workflow repository connection released"
-        );
+        let held_micros = u64::try_from(self.acquired_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if self.wait_micros >= 1_000_000 || held_micros >= 1_000_000 {
+            tracing::warn!(
+                wait_micros = self.wait_micros,
+                held_micros,
+                "workflow repository connection exceeded responsiveness threshold"
+            );
+        } else {
+            tracing::debug!(
+                wait_micros = self.wait_micros,
+                held_micros,
+                "workflow repository connection released"
+            );
+        }
     }
 }
 

@@ -1088,11 +1088,14 @@ function targetSummary(
   detail: WorkflowDetail | undefined,
   descriptor: WorkflowDescriptor | undefined,
   detailError?: string,
+  deferred = false,
 ) {
   if (!detail)
     return detailError
       ? `Details unavailable: ${detailError}`
-      : "Loading targets…";
+      : deferred
+        ? "Select for details"
+        : "Loading targets…";
   const targetNames = new Set(
     descriptor?.parameters
       .filter((item) =>
@@ -1161,7 +1164,7 @@ function WorkflowRow({
         </span>
         <span>
           <small>Targets / resources</small>
-          {targetSummary(detail, descriptor, detailError)}
+          {targetSummary(detail, descriptor, detailError, !active && !selected)}
         </span>
         <span>
           <small>{detail?.error ? "Error" : "Wait reason"}</small>
@@ -1733,13 +1736,16 @@ export function AutomationsPage({
     ],
     [created, workflows],
   );
-  const workflowIds = useMemo(
+  const activeWorkflowRevisions = useMemo(
     () =>
-      currentWorkflows
-        .map((workflow) => workflow.id)
-        .sort((left, right) => left.localeCompare(right))
-        .join("|"),
-    [currentWorkflows],
+      tab === "Active"
+        ? currentWorkflows
+            .filter((workflow) => activeStatuses.includes(workflow.status))
+            .map((workflow) => `${workflow.id}:${String(workflow.revision)}`)
+            .sort((left, right) => left.localeCompare(right))
+            .join("|")
+        : "",
+    [currentWorkflows, tab],
   );
   const selectedWorkflowRevision = currentWorkflows.find(
     (workflow) => workflow.id === selectedId,
@@ -1778,33 +1784,59 @@ export function AutomationsPage({
   }, []);
 
   useEffect(() => {
-    if (!workflowIds) return;
+    if (!activeWorkflowRevisions) return;
     const controller = new AbortController();
-    for (const workflowId of workflowIds.split("|")) {
-      void daemonApi
-        .workflow(workflowId, controller.signal)
-        .then((detail) => {
+    const pending = activeWorkflowRevisions
+      .split("|")
+      .map((entry) => {
+        const separator = entry.lastIndexOf(":");
+        return {
+          id: entry.slice(0, separator),
+          revision: Number(entry.slice(separator + 1)),
+        };
+      })
+      .filter(({ id, revision }) => details[id]?.summary.revision !== revision);
+    let cursor = 0;
+
+    const loadNext = async () => {
+      while (cursor < pending.length) {
+        const target = pending[cursor];
+        cursor += 1;
+        if (!target) return;
+        try {
+          const detail = await daemonApi.workflow(target.id, controller.signal);
           if (controller.signal.aborted) return;
-          setDetails((current) => ({ ...current, [workflowId]: detail }));
+          setDetails((current) => ({ ...current, [target.id]: detail }));
           setDetailErrors((current) => {
-            if (!(workflowId in current)) return current;
+            if (!(target.id in current)) return current;
             return Object.fromEntries(
-              Object.entries(current).filter(([key]) => key !== workflowId),
+              Object.entries(current).filter(([key]) => key !== target.id),
             );
           });
-        })
-        .catch((reason: unknown) => {
+        } catch (reason: unknown) {
           if (controller.signal.aborted) return;
           setDetailErrors((current) => ({
             ...current,
-            [workflowId]: String(reason),
+            [target.id]: String(reason),
           }));
-        });
-    }
+        }
+      }
+    };
+
+    // Workflow detail is a local SQLite read. Keep a small concurrency ceiling
+    // so opening Automations cannot flood the daemon when thousands of
+    // historical workflows are retained.
+    const workers = Array.from({ length: Math.min(4, pending.length) }, () =>
+      loadNext(),
+    );
+    void Promise.all(workers);
     return () => {
       controller.abort();
     };
-  }, [workflowIds]);
+    // `details` is deliberately read as the cache at effect start. Re-running
+    // for every completed request would cancel the remaining bounded queue.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorkflowRevisions]);
 
   useEffect(() => {
     if (!selectedId) {
