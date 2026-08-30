@@ -3143,7 +3143,7 @@ mod tests {
         changed_owner
             .payload
             .insert("to_replicant".to_owned(), serde_json::json!("R2"));
-        for event in [attached, detached, stowed, deployed, changed_owner] {
+        for event in [attached, detached] {
             apply_event(&client, &event).expect("apply complete lifecycle event");
             assert!(
                 client
@@ -3153,6 +3153,30 @@ mod tests {
                     .is_none()
             );
         }
+        apply_event(&client, &stowed).expect("apply complete stow event");
+        let carrier = client
+            .managed_state()
+            .device(&DeviceKey::live("CARRIER".into()))
+            .expect("carrier after stow");
+        assert_eq!(carrier.value.stow_used, Some(1));
+        assert_eq!(carrier.value.relationships.stowed_devices.len(), 1);
+
+        apply_event(&client, &deployed).expect("apply complete deploy event");
+        let carrier = client
+            .managed_state()
+            .device(&DeviceKey::live("CARRIER".into()))
+            .expect("carrier after deploy");
+        assert_eq!(carrier.value.stow_used, Some(0));
+        assert!(carrier.value.relationships.stowed_devices.is_empty());
+
+        apply_event(&client, &changed_owner).expect("apply complete owner event");
+        assert!(
+            client
+                .managed_state()
+                .claim_reconciliation_work()
+                .expect("claim avoided work")
+                .is_none()
+        );
 
         let mut missing_attached = game_event("6-0", "device.attached", Some("CARRIER"));
         missing_attached

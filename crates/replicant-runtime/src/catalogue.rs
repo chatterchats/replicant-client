@@ -430,7 +430,7 @@ impl OperationCatalogue {
                     .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
                     .map(|plan| {
                         Value::Array(
-                            plan.intermediate_systems
+                            plan.explicit_waypoints_for(&input.destination)
                                 .into_iter()
                                 .map(Value::String)
                                 .collect(),
@@ -2336,7 +2336,7 @@ async fn create_device_lifecycle_operation(
                 .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
                 .map(|plan| {
                     Value::Array(
-                        plan.intermediate_systems
+                        plan.explicit_waypoints_for(destination)
                             .into_iter()
                             .map(Value::String)
                             .collect(),

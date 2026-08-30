@@ -2382,7 +2382,7 @@ async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyRe
         )
     })?;
     let capacity = vessel.stow_capacity;
-    let used = vessel.stow_used.unwrap_or(0);
+    let used = vessel.effective_stow_used();
     let mut missing = Vec::new();
 
     for code in &codes {

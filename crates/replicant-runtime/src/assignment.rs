@@ -112,10 +112,7 @@ impl ResourceBroker {
                     observed_at_ms,
                 });
             }
-            let free_stow = device
-                .stow_capacity
-                .unwrap_or(0)
-                .saturating_sub(device.stow_used.unwrap_or(0));
+            let free_stow = device.free_stow_capacity();
             if free_stow > 0 {
                 candidates.push(AllocationCandidate {
                     resource: ResourceKey::Namespaced {

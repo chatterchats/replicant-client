@@ -6515,11 +6515,7 @@ async fn trade_replicant_stow_free(client: &Client, replicant: &str) -> Result<i
         .snapshot()
         .await
         .map_err(string_error)?;
-    Ok(vessel
-        .stow_capacity
-        .unwrap_or_default()
-        .saturating_sub(vessel.stow_used.unwrap_or_default())
-        .max(0))
+    Ok(vessel.free_stow_capacity())
 }
 
 fn trade_transport_codes(checkpoint: &TradeFulfillmentCheckpoint) -> Vec<String> {
@@ -6759,7 +6755,7 @@ async fn ensure_trade_device_at(
         .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
         .map(|plan| {
             Value::Array(
-                plan.intermediate_systems
+                plan.explicit_waypoints_for(destination)
                     .into_iter()
                     .map(Value::String)
                     .collect(),

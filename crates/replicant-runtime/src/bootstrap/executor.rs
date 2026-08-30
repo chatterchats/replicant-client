@@ -1828,7 +1828,7 @@ async fn recover_legacy_quick_survey_fleet(
         return Ok(());
     }
     if let Some(capacity) = vessel.stow_capacity {
-        let used = vessel.stow_used.unwrap_or(0);
+        let used = vessel.effective_stow_used();
         let required = i64::try_from(recoverable.len())?;
         if used + required > capacity {
             return Err(app_error(
@@ -2992,7 +2992,7 @@ async fn start_device_travel_matching(
         .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
         .map(|plan| {
             Value::Array(
-                plan.intermediate_systems
+                plan.explicit_waypoints_for(destination)
                     .into_iter()
                     .map(Value::String)
                     .collect(),

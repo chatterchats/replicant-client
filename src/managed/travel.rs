@@ -134,9 +134,9 @@ impl TravelBuilder {
             .filter(|plan| !plan.intermediate_systems.is_empty())
             .map(|plan| {
                 Value::Array(
-                    plan.intermediate_systems
-                        .iter()
-                        .map(|system| Value::String(system.clone()))
+                    plan.explicit_waypoints_for(destination)
+                        .into_iter()
+                        .map(Value::String)
                         .collect(),
                 )
             })
@@ -337,6 +337,59 @@ mod tests {
 
         TravelBuilder::new(client.clone(), "R1".to_owned())
             .to("D")
+            .preview()
+            .await
+            .expect("smart preview");
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn smart_hub_route_to_remote_body_appends_destination_star_waypoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/replicants/R1/travel"))
+            .and(body_json(serde_json::json!({
+                "destination": "D-2-L4",
+                "dry_run": true,
+                "via": ["B", "D"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "preview", "total_time_seconds": 285.0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        client
+            .managed_state()
+            .replace_catalogue(
+                vec![
+                    star("A", 0.0, false),
+                    star("B", 2.0, true),
+                    star("D", 10.0, false),
+                ],
+                Some("2026-08-29T00:00:00Z".into()),
+            )
+            .expect("seed catalogue");
+        client
+            .managed_state()
+            .persist_replicant(observation(Replicant {
+                key: ReplicantKey::live("R1".into()),
+                name: None,
+                is_npc: Some(false),
+                status: None,
+                location: Some(LocationKey::live("A-1".into())),
+                hosted_device: None,
+                travel: None,
+                private: None,
+                access: AccessScope::Owned,
+            }))
+            .expect("seed replicant");
+
+        TravelBuilder::new(client.clone(), "R1".to_owned())
+            .to("D-2-L4")
             .preview()
             .await
             .expect("smart preview");

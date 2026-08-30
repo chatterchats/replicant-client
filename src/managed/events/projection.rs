@@ -436,14 +436,18 @@ pub(super) fn projection_device_movement(
             let child = require_device(client, &mut batch, &child_key);
             let carrier = require_device(client, &mut batch, &carrier_key);
             if let (Some(mut child), Some(mut carrier)) = (child, carrier) {
+                let related_before =
+                    i64::try_from(carrier.value.relationships.stowed_devices.len())
+                        .unwrap_or(i64::MAX);
+                let projected_used = carrier.value.stow_used.unwrap_or_default().max(related_before);
                 if event.name.as_str() == "device.stowed" {
                     child.value.relationships.stowed_in = Some(carrier_key.clone());
-                    if !carrier
+                    let already_stowed = carrier
                         .value
                         .relationships
                         .stowed_devices
-                        .contains(&child_key)
-                    {
+                        .contains(&child_key);
+                    if !already_stowed {
                         carrier
                             .value
                             .relationships
@@ -451,6 +455,11 @@ pub(super) fn projection_device_movement(
                             .push(child_key.clone());
                         carrier.value.relationships.stowed_devices.sort();
                     }
+                    carrier.value.stow_used = Some(if already_stowed {
+                        projected_used
+                    } else {
+                        projected_used.saturating_add(1)
+                    });
                 } else {
                     child.value.relationships.stowed_in = None;
                     carrier
@@ -458,6 +467,11 @@ pub(super) fn projection_device_movement(
                         .relationships
                         .stowed_devices
                         .retain(|key| key != &child_key);
+                    let related_after =
+                        i64::try_from(carrier.value.relationships.stowed_devices.len())
+                            .unwrap_or(i64::MAX);
+                    carrier.value.stow_used =
+                        Some(projected_used.saturating_sub(1).max(related_after));
                 }
                 child.metadata = metadata(event);
                 carrier.metadata = metadata(event);

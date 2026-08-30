@@ -3846,7 +3846,7 @@ async fn start_device_travel_to(client: &Client, code: &str, destination: &str) 
             .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
             .map(|plan| {
                 Value::Array(
-                    plan.intermediate_systems
+                    plan.explicit_waypoints_for(destination)
                         .into_iter()
                         .map(Value::String)
                         .collect(),

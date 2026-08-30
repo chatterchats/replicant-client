@@ -6095,10 +6095,7 @@ fn select_idle_ftl_worker(
             let vessel = devices
                 .iter()
                 .find(|device| device.key.id.as_str() == vessel_code)?;
-            let free_stow = vessel
-                .stow_capacity
-                .unwrap_or_default()
-                .saturating_sub(vessel.stow_used.unwrap_or_default());
+            let free_stow = vessel.free_stow_capacity();
             (free_stow > 0).then_some((worker, free_stow))
         })
         .min_by(|(left, left_free), (right, right_free)| {
@@ -6716,7 +6713,14 @@ mod tests {
         let mut full_vessel = test_hub_device();
         full_vessel.key = replicant_client::DeviceKey::live("VESSEL-FULL".into());
         full_vessel.stow_capacity = Some(4);
-        full_vessel.stow_used = Some(4);
+        full_vessel.stow_used = Some(0);
+        full_vessel.relationships.stowed_devices = (0..4)
+            .map(|index| {
+                replicant_client::DeviceKey::live(replicant_client::DeviceId::new(format!(
+                    "PAYLOAD-{index}"
+                )))
+            })
+            .collect();
         let mut free_vessel = test_hub_device();
         free_vessel.key = replicant_client::DeviceKey::live("VESSEL-FREE".into());
         free_vessel.stow_capacity = Some(4);

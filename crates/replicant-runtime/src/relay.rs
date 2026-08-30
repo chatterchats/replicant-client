@@ -144,6 +144,21 @@ async fn projected_device(client: &Client, code: &str) -> AnyResult<DeviceHandle
     })
 }
 
+async fn authoritative_transport_device(client: &Client, code: &str) -> AnyResult<Device> {
+    let device = client.devices().refresh(code).await?.snapshot().await?;
+    let relationship_used =
+        i64::try_from(device.relationships.stowed_devices.len()).unwrap_or(i64::MAX);
+    if device.stow_used.is_some_and(|reported| reported < relationship_used) {
+        warn!(
+            vessel = %code,
+            reported_stow_used = ?device.stow_used,
+            relationship_stow_used = relationship_used,
+            "authoritative vessel refresh found stow usage below its explicit stowed-device list"
+        );
+    }
+    Ok(device)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Plan,
@@ -1635,24 +1650,20 @@ async fn create_plan(
         .collect::<Vec<_>>();
 
     // Device census populated the selected vessel projection.
-    let vessel = projected_device(client, vessel_code)
-        .await?
-        .snapshot()
-        .await?;
-    let free_slots = vessel
-        .stow_capacity
-        .unwrap_or(0)
-        .saturating_sub(vessel.stow_used.unwrap_or(0));
+    let vessel = authoritative_transport_device(client, vessel_code).await?;
+    let free_slots = vessel.free_stow_capacity();
+    let vessel_stowed = vessel
+        .relationships
+        .stowed_devices
+        .iter()
+        .map(|device| device.id.as_str())
+        .collect::<BTreeSet<_>>();
     let already_stowed = used_hub_stock
         .iter()
         .filter(|code| {
             census.devices.get(*code).is_some_and(|device| {
                 device_type(device) != Some(DEEP_SPACE_RELAY)
-                    && device
-                        .relationships
-                        .stowed_in
-                        .as_ref()
-                        .is_some_and(|container| container.id.as_str() == vessel_code)
+                    && vessel_stowed.contains(code.as_str())
             })
         })
         .count();
@@ -2557,19 +2568,43 @@ async fn refresh_device_census(
     // full account device traversal here was especially expensive when several
     // durable frontiers resumed together after restart. If one cached handle is
     // stale/missing, refresh only that device rather than the whole fleet.
+    let authoritative_vessel = if client.devices().cached(vessel_code).is_some() {
+        Some(authoritative_transport_device(client, vessel_code).await?)
+    } else {
+        None
+    };
+    let vessel_stowed = authoritative_vessel
+        .as_ref()
+        .map(|vessel| {
+            vessel
+                .relationships
+                .stowed_devices
+                .iter()
+                .map(|device| device.id.as_str().to_owned())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let handles = client.devices().find().owned().collect().await?;
     let mut devices = BTreeMap::new();
     for handle in handles {
         let code = handle.id().as_str().to_owned();
-        let snapshot = match handle.snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                warn!(
-                    device = %code,
-                    error = %error,
-                    "relay census found an incomplete managed device snapshot; refreshing only that device"
-                );
-                client.devices().refresh(&code).await?.snapshot().await?
+        let snapshot = if code == vessel_code {
+            if let Some(vessel) = authoritative_vessel.clone() {
+                vessel
+            } else {
+                handle.snapshot().await?
+            }
+        } else {
+            match handle.snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    warn!(
+                        device = %code,
+                        error = %error,
+                        "relay census found an incomplete managed device snapshot; refreshing only that device"
+                    );
+                    client.devices().refresh(&code).await?.snapshot().await?
+                }
             }
         };
         devices.insert(code, snapshot);
@@ -2618,11 +2653,12 @@ async fn refresh_device_census(
             || kind == Some(SYSTEM_HUB)
             || kind == Some(DEEP_SPACE_RELAY);
         if relay_capable {
-            let stowed_in_transport = device
-                .relationships
-                .stowed_in
-                .as_ref()
-                .is_some_and(|container| container.id.as_str() == vessel_code);
+            let stowed_in_transport = vessel_stowed.contains(code)
+                || device
+                    .relationships
+                    .stowed_in
+                    .as_ref()
+                    .is_some_and(|container| container.id.as_str() == vessel_code);
 
             // Relays already aboard the selected transport remain usable
             // mission stock even though a stowed device deliberately has no
@@ -3857,54 +3893,25 @@ fn trip_deploy_count(stops: &[RelayStop], indices: &[usize]) -> usize {
 }
 
 async fn current_transport_capacity(client: &Client, plan: &MissionPlan) -> AnyResult<usize> {
-    // Capacity planning reads the live mission-vessel projection.
-    let vessel = projected_device(client, &plan.vessel_code)
-        .await?
-        .snapshot()
-        .await?;
-    let free = vessel
-        .stow_capacity
-        .unwrap_or(0)
-        .saturating_sub(vessel.stow_used.unwrap_or(0));
+    // A full mission restart can follow cancelled workflows that left payload
+    // aboard the vessel. Refresh this one transport authoritatively so both
+    // scalar capacity and the explicit stowed-device list reflect game truth.
+    let vessel = authoritative_transport_device(client, &plan.vessel_code).await?;
+    let free = vessel.free_stow_capacity();
+    let vessel_stowed = vessel
+        .relationships
+        .stowed_devices
+        .iter()
+        .map(|device| device.id.as_str())
+        .collect::<BTreeSet<_>>();
 
-    let mut stowed_mission_relays = 0usize;
-    let mission_codes = plan
+    let stowed_mission_relays = plan
         .stops
         .iter()
         .filter(|stop| stop_uses_vessel_stow(stop) && !stop.completed)
         .filter_map(|stop| stop.relay_code.as_deref())
-        .collect::<BTreeSet<_>>();
-    let handles = if mission_codes
-        .iter()
-        .all(|code| client.devices().cached(code).is_some())
-    {
-        mission_codes
-            .iter()
-            .filter_map(|code| client.devices().cached(code))
-            .collect()
-    } else {
-        client
-            .devices()
-            .refresh_many()
-            .with_tag(relay_system_mission_tag(&plan.start_system))
-            .page_size(50)
-            .collect()
-            .await?
-    };
-    for handle in handles {
-        if !mission_codes.contains(handle.id().as_str()) {
-            continue;
-        }
-        let snapshot = handle.snapshot().await?;
-        if snapshot
-            .relationships
-            .stowed_in
-            .as_ref()
-            .is_some_and(|container| container.id.as_str() == plan.vessel_code.as_str())
-        {
-            stowed_mission_relays += 1;
-        }
-    }
+        .filter(|code| vessel_stowed.contains(*code))
+        .count();
 
     let total = free.saturating_add(i64::try_from(stowed_mission_relays)?);
     Ok(usize::try_from(total)?)
@@ -4474,7 +4481,7 @@ async fn start_device_travel(client: &Client, code: &str, destination: &str) -> 
         .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
         .map(|plan| {
             Value::Array(
-                plan.intermediate_systems
+                plan.explicit_waypoints_for(destination)
                     .into_iter()
                     .map(Value::String)
                     .collect(),
@@ -5238,6 +5245,16 @@ async fn stow_restock_payload(
     plan: &MissionPlan,
     restock: &RelayRestock,
 ) -> AnyResult<()> {
+    // A cancelled predecessor may already have loaded some or all of this
+    // restock. Parent-side vessel relationships are the authoritative
+    // preflight for avoiding duplicate stow commands.
+    let vessel = authoritative_transport_device(client, &plan.vessel_code).await?;
+    let vessel_stowed = vessel
+        .relationships
+        .stowed_devices
+        .iter()
+        .map(|device| device.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     let mut to_stow = Vec::new();
     let mut already_stowed = 0usize;
     for index in &restock.relay_stop_indices {
@@ -5256,6 +5273,13 @@ async fn stow_restock_payload(
                 format!("stop {} has no assigned relay", stop.system),
             )
         })?;
+        if vessel_stowed.contains(code) {
+            already_stowed += 1;
+            // Repair a lagging child-side projection without attempting to
+            // stow a device the parent already reports in its hold.
+            let _ = client.devices().refresh(code).await?;
+            continue;
+        }
         // Restock relay placement is maintained by stow events.
         let device = projected_device(client, code).await?.snapshot().await?;
         match restock_relay_decision(plan, restock, stop, code, &device) {
@@ -5287,15 +5311,7 @@ async fn stow_restock_payload(
             }
         }
     }
-    // Vessel capacity is part of the managed mission projection.
-    let vessel = projected_device(client, &plan.vessel_code)
-        .await?
-        .snapshot()
-        .await?;
-    let free = vessel
-        .stow_capacity
-        .unwrap_or(0)
-        .saturating_sub(vessel.stow_used.unwrap_or(0));
+    let free = vessel.free_stow_capacity();
     if i64::try_from(to_stow.len())? > free {
         return Err(app_error(
             io::ErrorKind::Other,
@@ -5943,6 +5959,16 @@ async fn stow_trip_relays(
     plan: &MissionPlan,
     indices: &[usize],
 ) -> AnyResult<()> {
+    // A cancelled predecessor can leave mission payload aboard the selected
+    // transport. Refresh the parent first and use its explicit child list as
+    // authoritative evidence before deciding that another stow is required.
+    let vessel = authoritative_transport_device(client, &plan.vessel_code).await?;
+    let vessel_stowed = vessel
+        .relationships
+        .stowed_devices
+        .iter()
+        .map(|device| device.id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     let mut to_stow = Vec::new();
     for index in indices {
         let stop = &plan.stops[*index];
@@ -5955,7 +5981,13 @@ async fn stow_trip_relays(
                 format!("stop {} has no assigned relay", stop.system),
             )
         })?;
-        // Trip relay placement is maintained by managed stow events.
+        // Parent-side relationship evidence survives cancelled workflow
+        // checkpoints and is enough to avoid trying to stow the same relay
+        // twice. Refresh the child only to repair its local projection.
+        if vessel_stowed.contains(code) {
+            let _ = client.devices().refresh(code).await?;
+            continue;
+        }
         let snapshot = projected_device(client, code).await?.snapshot().await?;
         if snapshot
             .relationships
@@ -6013,15 +6045,11 @@ async fn stow_trip_relays(
         return Ok(());
     }
     travel_to(client, config, &plan.replicant_code, &plan.hub_location).await?;
-    // Mission-vessel capacity is maintained by managed stow events.
-    let vessel = projected_device(client, &plan.vessel_code)
-        .await?
-        .snapshot()
-        .await?;
-    let free = vessel
-        .stow_capacity
-        .unwrap_or(0)
-        .saturating_sub(vessel.stow_used.unwrap_or(0));
+    // Recheck immediately before issuing stow commands. Repositioning relays or
+    // waiting for the replicant to reach the hub can take long enough for a
+    // cancelled/resumed workflow to have changed the vessel contents.
+    let vessel = authoritative_transport_device(client, &plan.vessel_code).await?;
+    let free = vessel.free_stow_capacity();
     if i64::try_from(to_stow.len())? > free {
         return Err(app_error(
             io::ErrorKind::Other,
@@ -7901,7 +7929,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_capacity_bulk_refreshes_missing_relay_projections_once() {
+    async fn transport_capacity_uses_parent_stow_relationship_without_account_refresh() {
         let server = MockServer::start().await;
         let client = test_client_at(&server).await;
         Mock::given(method("GET"))
@@ -7912,27 +7940,17 @@ mod tests {
                 "location": "ROOT-1-L4",
                 "status": "active",
                 "stow_capacity": 2,
-                "stow_used": 0
+                // Deliberately stale-low: the explicit parent relationship is
+                // the stronger evidence that one slot is already occupied.
+                "stow_used": 0,
+                "stowed_devices": [
+                    {"device_code": "RELAY-1", "device_type": FTL_RELAY}
+                ]
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         client.devices().get("VESSEL-1").await.expect("seed vessel");
-
-        let mission_tag = relay_system_mission_tag("ROOT");
-        Mock::given(method("GET"))
-            .and(path("/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "devices": [
-                    {"device_code": "RELAY-1", "device_type": FTL_RELAY, "tags": [mission_tag], "stowed_in_device_code": "VESSEL-1"},
-                    {"device_code": "RELAY-2", "device_type": FTL_RELAY, "tags": [mission_tag]},
-                    {"device_code": "RELAY-3", "device_type": FTL_RELAY, "tags": [mission_tag]}
-                ],
-                "next_cursor": null
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
 
         let mut plan = execution_state();
         plan.stops[0].relay_code = Some("RELAY-1".to_owned());
@@ -7943,24 +7961,77 @@ mod tests {
             plan.stops.push(stop);
         }
 
+        // One physical slot remains free and RELAY-1 is already aboard, so the
+        // mission can carry two of its planned relays without double-counting
+        // the stale scalar as two empty slots.
         assert_eq!(
             current_transport_capacity(&client, &plan)
                 .await
                 .expect("transport capacity"),
-            3
+            2
         );
         let requests = server.received_requests().await.expect("recorded requests");
-        assert_eq!(
+        assert!(
             requests
                 .iter()
-                .filter(|request| request.url.path() == "/v1/devices")
-                .count(),
-            1
+                .all(|request| request.url.path() != "/v1/devices")
         );
         assert!(
             requests
                 .iter()
                 .all(|request| { !request.url.path().starts_with("/v1/devices/RELAY-") })
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn trip_stow_recovers_parent_side_payload_left_by_cancelled_workflow() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/VESSEL-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "VESSEL-1",
+                "device_type": "racing_vessel",
+                "location": "ROOT-1-L4",
+                "status": "active",
+                "stow_capacity": 1,
+                "stow_used": 0,
+                "stowed_devices": [
+                    {"device_code": "RELAY-1", "device_type": FTL_RELAY}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Simulate the child projection lagging behind the parent after a
+        // cancelled predecessor: the relay itself does not yet report
+        // stowed_in_device_code even though the vessel says it is aboard.
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/RELAY-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "RELAY-1",
+                "device_type": FTL_RELAY,
+                "status": "inactive",
+                "available_commands": ["stow"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        let mut plan = execution_state();
+        plan.stops[0].relay_code = Some("RELAY-1".into());
+
+        stow_trip_relays(&client, &test_config(), &plan, &[0])
+            .await
+            .expect("already-stowed relay is adopted without another stow");
+
+        let requests = server.received_requests().await.expect("record requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() != "POST")
         );
         server.verify().await;
         client.close().await.expect("close client");

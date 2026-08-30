@@ -159,6 +159,27 @@ impl Device {
         self.relationships.stowed_in.as_ref() == Some(vessel)
     }
 
+    /// Returns stow usage without trusting a stale scalar projection over the
+    /// explicitly projected stowed-device relationships.
+    ///
+    /// SSE lifecycle events can update the relationship list between full
+    /// device refreshes. Taking the larger value prevents automation from
+    /// overestimating free capacity during that window.
+    #[must_use]
+    pub fn effective_stow_used(&self) -> i64 {
+        let related = i64::try_from(self.relationships.stowed_devices.len()).unwrap_or(i64::MAX);
+        self.stow_used.unwrap_or_default().max(related)
+    }
+
+    /// Returns conservatively available device-stow slots.
+    #[must_use]
+    pub fn free_stow_capacity(&self) -> i64 {
+        self.stow_capacity
+            .unwrap_or_default()
+            .saturating_sub(self.effective_stow_used())
+            .max(0)
+    }
+
     #[must_use]
     pub fn is_traveling(&self) -> bool {
         self.travel.is_some()

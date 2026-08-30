@@ -143,6 +143,45 @@ pub struct SmartTravelPlan {
     pub is_direct: bool,
 }
 
+impl SmartTravelPlan {
+    /// Converts the selected system route into the explicit waypoint sequence
+    /// accepted by the travel API for `destination`.
+    ///
+    /// The route planner intentionally keeps the destination system out of
+    /// `intermediate_systems`. That is sufficient when the final destination
+    /// is the star designation itself, but an explicit `via` route ending at
+    /// a planet/belt/Lagrange point in another system must include that final
+    /// star as the last interstellar waypoint. Otherwise the server is asked
+    /// to travel directly from the last hub to a body in a different system.
+    #[must_use]
+    pub fn explicit_waypoints_for(&self, destination: &str) -> Vec<String> {
+        let mut waypoints = self.intermediate_systems.clone();
+        let Some(origin_system) = self.systems.first() else {
+            return waypoints;
+        };
+        let Some(destination_system) = self.systems.last() else {
+            return waypoints;
+        };
+        if origin_system.eq_ignore_ascii_case(destination_system)
+            || destination.eq_ignore_ascii_case(destination_system)
+        {
+            return waypoints;
+        }
+
+        let is_local_destination = destination
+            .strip_prefix(destination_system)
+            .is_some_and(|suffix| suffix.starts_with('-'));
+        if is_local_destination
+            && !waypoints
+                .last()
+                .is_some_and(|waypoint| waypoint.eq_ignore_ascii_case(destination_system))
+        {
+            waypoints.push(destination_system.clone());
+        }
+        waypoints
+    }
+}
+
 /// Pure bounded route planner over global catalogue hubs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmartTravelPlanner;
@@ -565,6 +604,28 @@ mod tests {
             .expect("direct plan");
         assert!(direct.is_direct);
         assert_eq!(direct.systems, ["A", "D"]);
+    }
+
+    #[test]
+    fn explicit_waypoints_append_terminal_star_for_remote_local_destination() {
+        let origin = star("A", 0.0, false);
+        let destination = star("D", 10.0, false);
+        let hub = star("B", 2.0, true);
+        let plan = SmartTravelPlanner::default()
+            .plan(&origin, &destination, &[hub], TravelProfile::standard())
+            .expect("valid plan");
+
+        assert_eq!(plan.explicit_waypoints_for("D"), ["B"]);
+        assert_eq!(
+            plan.explicit_waypoints_for("D-2-L4"),
+            ["B", "D"],
+            "an explicit hub route to a body must enter the destination system first"
+        );
+
+        let direct = SmartTravelPlanner::default()
+            .plan(&origin, &destination, &[], TravelProfile::standard())
+            .expect("direct plan");
+        assert_eq!(direct.explicit_waypoints_for("D-2-L4"), ["D"]);
     }
 
     #[test]
