@@ -52,9 +52,11 @@ CREATE TABLE IF NOT EXISTS api_request_attempt (
     path TEXT NOT NULL,
     route_key TEXT NOT NULL,
     rate_limit_bucket TEXT NOT NULL,
+    priority TEXT NOT NULL,
     attempt INTEGER NOT NULL,
     status_code INTEGER,
     outcome TEXT NOT NULL,
+    error_kind TEXT,
     response_bytes INTEGER,
     rate_limit_wait_ms INTEGER NOT NULL,
     request_prepare_ms INTEGER,
@@ -63,6 +65,9 @@ CREATE TABLE IF NOT EXISTS api_request_attempt (
     body_read_ms INTEGER,
     decode_ms INTEGER,
     elapsed_ms INTEGER NOT NULL,
+    logical_elapsed_ms INTEGER NOT NULL,
+    retry_backoff_ms INTEGER NOT NULL,
+    outbound_in_flight INTEGER NOT NULL,
     rate_limit_limit INTEGER,
     rate_limit_remaining INTEGER,
     rate_limit_reset_epoch_seconds INTEGER,
@@ -459,9 +464,10 @@ fn open_database(path: &Path) -> Result<Connection, TelemetryError> {
         "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
     )?;
     connection.execute_batch(SCHEMA)?;
+    migrate_api_attempt(&connection)?;
     migrate_api_rollup(&connection)?;
     connection.execute(
-        "INSERT INTO telemetry_meta(key, value) VALUES ('schema_version', '2') \
+        "INSERT INTO telemetry_meta(key, value) VALUES ('schema_version', '4') \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -476,6 +482,41 @@ fn open_database(path: &Path) -> Result<Connection, TelemetryError> {
         [],
     )?;
     Ok(connection)
+}
+
+fn migrate_api_attempt(connection: &Connection) -> rusqlite::Result<()> {
+    for (column, statement) in [
+        (
+            "priority",
+            "ALTER TABLE api_request_attempt ADD COLUMN priority TEXT NOT NULL DEFAULT 'foreground'",
+        ),
+        (
+            "error_kind",
+            "ALTER TABLE api_request_attempt ADD COLUMN error_kind TEXT",
+        ),
+        (
+            "logical_elapsed_ms",
+            "ALTER TABLE api_request_attempt ADD COLUMN logical_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "retry_backoff_ms",
+            "ALTER TABLE api_request_attempt ADD COLUMN retry_backoff_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "outbound_in_flight",
+            "ALTER TABLE api_request_attempt ADD COLUMN outbound_in_flight INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('api_request_attempt') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            connection.execute_batch(statement)?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_api_rollup(connection: &Connection) -> rusqlite::Result<()> {
@@ -697,11 +738,12 @@ fn insert_api_sample(
     transaction.execute(
         "INSERT INTO api_request_attempt(\
             observed_at_ms, local_request_id, server_request_id, method, path, route_key,\
-            rate_limit_bucket, attempt, status_code, outcome, response_bytes, rate_limit_wait_ms,\
-            request_prepare_ms, time_to_headers_ms, metadata_ms, body_read_ms, decode_ms, elapsed_ms,\
+            rate_limit_bucket, priority, attempt, status_code, outcome, error_kind, response_bytes,\
+            rate_limit_wait_ms, request_prepare_ms, time_to_headers_ms, metadata_ms, body_read_ms,\
+            decode_ms, elapsed_ms, logical_elapsed_ms, retry_backoff_ms, outbound_in_flight,\
             rate_limit_limit, rate_limit_remaining, rate_limit_reset_epoch_seconds, retry_after_ms\
          ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22\
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27\
          )",
         params![
             sample.observed_at_ms,
@@ -711,9 +753,11 @@ fn insert_api_sample(
             sample.path,
             sample.route_key,
             sample.rate_limit_bucket,
+            sample.priority,
             sample.attempt,
             sample.status_code,
             sample.outcome.as_str(),
+            sample.error_kind,
             sqlite_optional_u64(sample.response_bytes),
             sqlite_u64(sample.timings.rate_limit_wait_ms),
             sqlite_optional_u64(sample.timings.request_prepare_ms),
@@ -722,6 +766,9 @@ fn insert_api_sample(
             sqlite_optional_u64(sample.timings.body_read_ms),
             sqlite_optional_u64(sample.timings.decode_ms),
             sqlite_u64(sample.timings.elapsed_ms),
+            sqlite_u64(sample.logical_elapsed_ms),
+            sqlite_u64(sample.retry_backoff_ms),
+            sqlite_u64(sample.outbound_in_flight),
             sample.rate_limit.limit,
             sample.rate_limit.remaining,
             sqlite_optional_u64(sample.rate_limit.reset_epoch_seconds),
@@ -1191,10 +1238,15 @@ mod tests {
             path: "v1/devices/D1".to_owned(),
             route_key: "v1/devices/{device}".to_owned(),
             rate_limit_bucket: "read".to_owned(),
+            priority: "background".to_owned(),
             attempt: 2,
             status_code: Some(429),
             outcome: ApiAttemptOutcome::HttpError,
+            error_kind: Some("http_status".to_owned()),
             response_bytes: Some(123),
+            logical_elapsed_ms: 614,
+            retry_backoff_ms: 500,
+            outbound_in_flight: 3,
             timings: ApiAttemptTimings {
                 rate_limit_wait_ms: 10,
                 request_prepare_ms: Some(1),
@@ -1247,6 +1299,22 @@ mod tests {
                 row.get(0)
             })
             .expect("raw count");
+        let persisted_context: (String, Option<String>, i64, i64, i64) = connection
+            .query_row(
+                "SELECT priority, error_kind, logical_elapsed_ms, retry_backoff_ms, \
+                 outbound_in_flight FROM api_request_attempt",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("request context");
         let rollup_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM api_request_rollup", [], |row| {
                 row.get(0)
@@ -1284,6 +1352,16 @@ mod tests {
             )
             .expect("logical request count");
         assert_eq!(raw_count, 1);
+        assert_eq!(
+            persisted_context,
+            (
+                "background".to_owned(),
+                Some("http_status".to_owned()),
+                614,
+                500,
+                3,
+            )
+        );
         assert_eq!(rollup_count, 4);
         assert_eq!(retry_count, 1);
         assert_eq!(logical_count, 0);

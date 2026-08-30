@@ -93,14 +93,24 @@ pub struct ApiAttemptTelemetry {
     pub route_key: String,
     /// Stable rate-limit bucket label.
     pub rate_limit_bucket: String,
+    /// Scheduling priority used while waiting for a local permit.
+    pub priority: String,
     /// One-based attempt number within the logical request.
     pub attempt: u32,
     /// HTTP status when response headers were received.
     pub status_code: Option<u16>,
     /// Terminal outcome for this physical attempt.
     pub outcome: ApiAttemptOutcome,
+    /// Stable local classification for a terminal error, when applicable.
+    pub error_kind: Option<String>,
     /// Response body size when a body was read.
     pub response_bytes: Option<u64>,
+    /// Time since the logical request began, including earlier retries and backoff.
+    pub logical_elapsed_ms: u64,
+    /// Cumulative retry sleep completed before this attempt.
+    pub retry_backoff_ms: u64,
+    /// Number of physical attempts executing when this attempt started.
+    pub outbound_in_flight: u64,
     /// Captured request timings.
     pub timings: ApiAttemptTimings,
     /// Captured server rate-limit metadata.

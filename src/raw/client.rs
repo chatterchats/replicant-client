@@ -7,7 +7,10 @@
 
 use std::{
     fmt,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -108,6 +111,10 @@ struct RequestAttempt<'a> {
     body: Option<Vec<u8>>,
     response_body_limit: usize,
     rate_limit_wait: Duration,
+    logical_started: Instant,
+    retry_backoff: Duration,
+    priority: RequestPriority,
+    outbound_in_flight: u64,
 }
 
 /// Bounded-backoff retry policy applied to safe reads.
@@ -427,6 +434,7 @@ impl ClientBuilder {
                 rate_limits: RateLimitCoordinator::new(),
                 config: self.config,
                 telemetry: self.telemetry,
+                outbound_in_flight: AtomicU64::new(0),
             }),
             priority: RequestPriority::default(),
             refresh_budget: None,
@@ -467,6 +475,24 @@ pub(crate) struct ClientInner {
     pub(crate) rate_limits: RateLimitCoordinator,
     pub(crate) config: ClientConfig,
     pub(crate) telemetry: Option<Arc<dyn ApiTelemetrySink>>,
+    pub(crate) outbound_in_flight: AtomicU64,
+}
+
+struct OutboundAttemptGuard<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl<'a> OutboundAttemptGuard<'a> {
+    fn enter(counter: &'a AtomicU64) -> (Self, u64) {
+        let in_flight = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        (Self { counter }, in_flight)
+    }
+}
+
+impl Drop for OutboundAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -630,6 +656,8 @@ impl Client {
         let permit_started = Instant::now();
         self.inner.rate_limits.acquire(RateLimitBucket::Sse).await;
         let permit_wait = permit_started.elapsed();
+        let (_outbound_guard, outbound_in_flight) =
+            OutboundAttemptGuard::enter(&self.inner.outbound_in_flight);
         let attempt_started = Instant::now();
         let mut timings = AttemptProgress::default();
         let request = RequestAttempt {
@@ -642,6 +670,10 @@ impl Client {
             body: None,
             response_body_limit: self.inner.config.max_response_body_bytes,
             rate_limit_wait: permit_wait,
+            logical_started: overall_started,
+            retry_backoff: Duration::ZERO,
+            priority: self.priority,
+            outbound_in_flight,
         };
 
         let prepare_started = Instant::now();
@@ -653,6 +685,7 @@ impl Client {
                     &request,
                     None,
                     ApiAttemptOutcome::PrepareError,
+                    Some("configuration"),
                     None,
                     timings.with_elapsed(permit_wait, attempt_started.elapsed()),
                 );
@@ -670,6 +703,7 @@ impl Client {
                     &request,
                     None,
                     ApiAttemptOutcome::TransportError,
+                    Some(reqwest_error_kind(&error)),
                     None,
                     timings.with_elapsed(permit_wait, attempt_started.elapsed()),
                 );
@@ -703,6 +737,7 @@ impl Client {
                 Some(&metadata),
                 ApiAttemptOutcome::Success,
                 None,
+                None,
                 timings.with_elapsed(permit_wait, attempt_started.elapsed()),
             );
             return Ok(response);
@@ -717,6 +752,7 @@ impl Client {
                     &request,
                     Some(&metadata),
                     ApiAttemptOutcome::BodyError,
+                    Some(api_error_kind(&error)),
                     None,
                     timings.with_elapsed(permit_wait, attempt_started.elapsed()),
                 );
@@ -743,6 +779,11 @@ impl Client {
             &request,
             Some(&metadata),
             ApiAttemptOutcome::HttpError,
+            Some(if metadata.status == StatusCode::TOO_MANY_REQUESTS {
+                "rate_limited"
+            } else {
+                "http_status"
+            }),
             Some(bytes.len()),
             timings.with_elapsed(permit_wait, attempt_started.elapsed()),
         );
@@ -762,6 +803,7 @@ impl Client {
         let bucket = bucket_for(&method, path);
         let overall_started = Instant::now();
         let mut attempts: u32 = 0;
+        let mut retry_backoff = Duration::ZERO;
         loop {
             let permit_started = Instant::now();
             self.inner
@@ -769,6 +811,8 @@ impl Client {
                 .acquire_with_refresh(bucket, self.priority, self.refresh_budget.as_ref())
                 .await;
             let permit_wait = permit_started.elapsed();
+            let (outbound_guard, outbound_in_flight) =
+                OutboundAttemptGuard::enter(&self.inner.outbound_in_flight);
             attempts += 1;
             let attempt_started = Instant::now();
             if self.inner.config.emit_tracing {
@@ -799,9 +843,14 @@ impl Client {
                     body: body.clone(),
                     response_body_limit,
                     rate_limit_wait: permit_wait,
+                    logical_started: overall_started,
+                    retry_backoff,
+                    priority: self.priority,
+                    outbound_in_flight,
                 })
                 .await;
             let attempt_elapsed = attempt_started.elapsed();
+            drop(outbound_guard);
             match result {
                 Ok(response) => {
                     if self.inner.config.emit_tracing {
@@ -815,6 +864,9 @@ impl Client {
                             attempt = attempts,
                             status = response.metadata.status.as_u16(),
                             attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            permit_wait_ms = duration_millis(permit_wait),
+                            logical_elapsed_ms = duration_millis(overall_started.elapsed()),
+                            retry_backoff_ms = duration_millis(retry_backoff),
                             elapsed_ms = overall_started.elapsed().as_millis() as u64,
                             "raw HTTP request completed"
                         );
@@ -824,6 +876,7 @@ impl Client {
                 Err(error) if self.should_retry(&error, safety, attempts) => {
                     let delay =
                         retry_delay(&self.inner.config.retry, attempts, error.retry_after());
+                    retry_backoff = retry_backoff.saturating_add(delay);
                     if self.inner.config.emit_tracing {
                         warn!(
                             target: "replicant_client::raw::http",
@@ -833,6 +886,9 @@ impl Client {
                             local_request_id = %request_id,
                             attempt = attempts,
                             attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            permit_wait_ms = duration_millis(permit_wait),
+                            logical_elapsed_ms = duration_millis(overall_started.elapsed()),
+                            retry_backoff_ms = duration_millis(retry_backoff),
                             elapsed_ms = overall_started.elapsed().as_millis() as u64,
                             delay_ms = delay.as_millis() as u64,
                             error = %error,
@@ -851,6 +907,10 @@ impl Client {
                             local_request_id = %request_id,
                             attempt = attempts,
                             attempt_elapsed_ms = attempt_elapsed.as_millis() as u64,
+                            permit_wait_ms = duration_millis(permit_wait),
+                            logical_elapsed_ms = duration_millis(overall_started.elapsed()),
+                            retry_backoff_ms = duration_millis(retry_backoff),
+                            error_kind = api_error_kind(&error),
                             elapsed_ms = overall_started.elapsed().as_millis() as u64,
                             error = %error,
                             ambiguous = error.is_ambiguous_transport_failure(),
@@ -892,6 +952,7 @@ impl Client {
                     &request,
                     None,
                     ApiAttemptOutcome::PrepareError,
+                    Some("configuration"),
                     None,
                     timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
                 );
@@ -915,6 +976,7 @@ impl Client {
                     &request,
                     None,
                     ApiAttemptOutcome::TransportError,
+                    Some(reqwest_error_kind(&error)),
                     None,
                     timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
                 );
@@ -940,6 +1002,7 @@ impl Client {
                     &request,
                     Some(&metadata),
                     ApiAttemptOutcome::BodyError,
+                    Some(api_error_kind(&error)),
                     None,
                     timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
                 );
@@ -972,6 +1035,11 @@ impl Client {
                 &request,
                 Some(&metadata),
                 ApiAttemptOutcome::HttpError,
+                Some(if metadata.status == StatusCode::TOO_MANY_REQUESTS {
+                    "rate_limited"
+                } else {
+                    "http_status"
+                }),
                 Some(bytes.len()),
                 timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
             );
@@ -987,6 +1055,7 @@ impl Client {
                     &request,
                     Some(&metadata),
                     ApiAttemptOutcome::DecodeError,
+                    Some("decode"),
                     Some(bytes.len()),
                     timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
                 );
@@ -1023,6 +1092,7 @@ impl Client {
             &request,
             Some(&metadata),
             ApiAttemptOutcome::Success,
+            None,
             Some(bytes.len()),
             timings.with_elapsed(request.rate_limit_wait, total_started.elapsed()),
         );
@@ -1034,13 +1104,53 @@ impl Client {
         request: &RequestAttempt<'_>,
         metadata: Option<&ResponseMetadata>,
         outcome: ApiAttemptOutcome,
+        error_kind: Option<&'static str>,
         response_bytes: Option<usize>,
         timings: ApiAttemptTimings,
     ) {
+        let route_key = normalize_route_key(request.path);
+        let attempt_elapsed_ms = timings
+            .elapsed_ms
+            .saturating_sub(timings.rate_limit_wait_ms);
+        let logical_elapsed_ms = duration_millis(request.logical_started.elapsed());
+        let retry_backoff_ms = duration_millis(request.retry_backoff);
+        let priority = match request.priority {
+            RequestPriority::Foreground => "foreground",
+            RequestPriority::Background => "background",
+        };
+        if self.inner.config.emit_tracing {
+            debug!(
+                target: "replicant_client::raw::http",
+                event = "http.outbound.completed",
+                method = %request.method,
+                endpoint = %route_key,
+                local_request_id = %request.request_id,
+                server_request_id = metadata
+                    .and_then(|metadata| metadata.request_id.as_deref())
+                    .unwrap_or(""),
+                attempt = request.attempt,
+                status = ?metadata.map(|metadata| metadata.status.as_u16()),
+                outcome = outcome.as_str(),
+                error_kind = error_kind.unwrap_or(""),
+                ?request.bucket,
+                priority = ?request.priority,
+                queue_wait_ms = timings.rate_limit_wait_ms,
+                permit_wait_ms = timings.rate_limit_wait_ms,
+                request_prepare_ms = ?timings.request_prepare_ms,
+                time_to_headers_ms = ?timings.time_to_headers_ms,
+                body_read_ms = ?timings.body_read_ms,
+                decode_ms = ?timings.decode_ms,
+                attempt_ms = attempt_elapsed_ms,
+                logical_elapsed_ms,
+                retry_backoff_ms,
+                outbound_in_flight = request.outbound_in_flight,
+                response_bytes = ?response_bytes,
+                "outbound HTTP attempt completed"
+            );
+        }
         let Some(sink) = self.inner.telemetry.as_ref() else {
             return;
         };
-        let route_key = normalize_route_key(request.path);
         let concrete_path = request.path.split('?').next().unwrap_or(request.path);
         let stored_path = if route_key.contains("{token}") {
             route_key.as_str()
@@ -1058,10 +1168,15 @@ impl Client {
             path: stored_path.to_owned(),
             route_key,
             rate_limit_bucket: rate_limit_bucket_label(request.bucket).to_owned(),
+            priority: priority.to_owned(),
             attempt: request.attempt,
             status_code: metadata.map(|metadata| metadata.status.as_u16()),
             outcome,
+            error_kind: error_kind.map(ToOwned::to_owned),
             response_bytes: response_bytes.map(|bytes| bytes.try_into().unwrap_or(u64::MAX)),
+            logical_elapsed_ms,
+            retry_backoff_ms,
+            outbound_in_flight: request.outbound_in_flight,
             timings,
             rate_limit,
         });
@@ -1215,6 +1330,47 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        if error.is_connect() {
+            "connect_timeout"
+        } else if error.is_body() {
+            "body_timeout"
+        } else {
+            "request_timeout"
+        }
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn api_error_kind(error: &Error) -> &'static str {
+    match error {
+        Error::Transport {
+            source: Some(source),
+            ..
+        } => source
+            .downcast_ref::<reqwest::Error>()
+            .map_or("transport", reqwest_error_kind),
+        Error::Transport { source: None, .. } => "transport",
+        Error::Configuration { .. } => "configuration",
+        Error::Authentication { .. } => "authentication",
+        Error::RateLimited { .. } => "rate_limited",
+        Error::Decode { .. } => "decode",
+        Error::Contract { .. } => "http_status",
+        Error::Persistence { .. } => "persistence",
+        Error::AccountStoreMismatch { .. } => "account_store_mismatch",
+        Error::Operation { .. } => "operation",
+        Error::Closed => "closed",
+    }
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> Error {
@@ -1434,6 +1590,16 @@ fn retry_delay(policy: &RetryPolicy, attempt: u32, server: Option<Duration>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct Capture(StdMutex<Vec<ApiAttemptTelemetry>>);
+
+    impl ApiTelemetrySink for Capture {
+        fn record(&self, sample: ApiAttemptTelemetry) {
+            self.0.lock().expect("capture lock").push(sample);
+        }
+    }
 
     #[test]
     fn base_url_rejects_credentials_and_query() {
@@ -1540,21 +1706,10 @@ mod tests {
 
     #[tokio::test]
     async fn telemetry_sink_receives_physical_http_attempts() {
-        use std::sync::Mutex as StdMutex;
-
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
         };
-
-        #[derive(Default)]
-        struct Capture(StdMutex<Vec<ApiAttemptTelemetry>>);
-
-        impl ApiTelemetrySink for Capture {
-            fn record(&self, sample: ApiAttemptTelemetry) {
-                self.0.lock().expect("capture lock").push(sample);
-            }
-        }
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1583,6 +1738,232 @@ mod tests {
         assert_eq!(samples[0].route_key, "v1/health");
         assert_eq!(samples[0].outcome, ApiAttemptOutcome::HttpError);
         assert_eq!(samples[0].attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_response_has_a_distinct_error_class() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({"error": "slow down"})),
+            )
+            .mount(&server)
+            .await;
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client");
+
+        let error = client.health().await.expect_err("429 should fail");
+        assert_eq!(error.status(), Some(429));
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].status_code, Some(429));
+        assert_eq!(samples[0].error_kind.as_deref(), Some("rate_limited"));
+        assert_eq!(samples[0].rate_limit.retry_after_ms, Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn retry_telemetry_separates_attempts_backoff_and_logical_elapsed() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use wiremock::{
+            Mock, MockServer, Request, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = calls.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(move |_request: &Request| {
+                if responder_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                        .set_body_json(serde_json::json!({"error": "maintenance"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .retry_policy(RetryPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(30),
+                max_backoff: Duration::from_millis(30),
+                jitter: Duration::ZERO,
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client")
+            .with_priority(RequestPriority::Background);
+
+        client.health().await.expect("retry succeeds");
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].local_request_id, samples[1].local_request_id);
+        assert_eq!(samples[0].attempt, 1);
+        assert_eq!(samples[0].retry_backoff_ms, 0);
+        assert_eq!(samples[0].error_kind.as_deref(), Some("http_status"));
+        assert_eq!(samples[1].attempt, 2);
+        assert_eq!(samples[1].error_kind, None);
+        assert!(samples[1].retry_backoff_ms >= 30);
+        assert!(samples[1].logical_elapsed_ms >= samples[1].retry_backoff_ms);
+        assert_eq!(samples[1].priority, "background");
+        assert_eq!(samples[1].outbound_in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn timeout_telemetry_attributes_delay_to_the_physical_attempt() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .mount(&server)
+            .await;
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .request_timeout(Duration::from_millis(25))
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client");
+
+        client.health().await.expect_err("request should time out");
+        assert_eq!(client.inner.outbound_in_flight.load(Ordering::Relaxed), 0);
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].outcome, ApiAttemptOutcome::TransportError);
+        assert_eq!(samples[0].error_kind.as_deref(), Some("request_timeout"));
+        assert_eq!(samples[0].status_code, None);
+        assert!(samples[0].timings.time_to_headers_ms.unwrap_or_default() >= 20);
+        assert!(samples[0].logical_elapsed_ms >= 20);
+        assert_eq!(samples[0].retry_backoff_ms, 0);
+    }
+    #[tokio::test]
+    async fn connection_refusal_is_classified_and_releases_the_gauge() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+        let address = listener.local_addr().expect("local address");
+        drop(listener);
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&format!("http://{address}/")).expect("local URL"))
+            .connect_timeout(Duration::from_millis(100))
+            .request_timeout(Duration::from_millis(200))
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client");
+
+        client
+            .health()
+            .await
+            .expect_err("closed local port should refuse the connection");
+        assert_eq!(client.inner.outbound_in_flight.load(Ordering::Relaxed), 0);
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].outcome, ApiAttemptOutcome::TransportError);
+        assert_eq!(samples[0].error_kind.as_deref(), Some("connect"));
+    }
+
+    #[tokio::test]
+    async fn healthy_burst_reports_concurrency_and_releases_the_gauge() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(40))
+                    .set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .mount(&server)
+            .await;
+        let capture = Arc::new(Capture::default());
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            })
+            .api_telemetry_sink(capture.clone())
+            .build()
+            .expect("client");
+        client
+            .rate_limits()
+            .set_policy(
+                RateLimitBucket::Read,
+                crate::raw::rate_limit::RateLimitPolicy {
+                    capacity: 8,
+                    refill_every: Duration::from_secs(1),
+                },
+            )
+            .await;
+
+        let (a, b, c, d) = tokio::join!(
+            client.health(),
+            client.health(),
+            client.health(),
+            client.health()
+        );
+        a.expect("request a");
+        b.expect("request b");
+        c.expect("request c");
+        d.expect("request d");
+        assert_eq!(client.inner.outbound_in_flight.load(Ordering::Relaxed), 0);
+        let samples = capture.0.lock().expect("capture lock");
+        assert_eq!(samples.len(), 4);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.outcome == ApiAttemptOutcome::Success)
+        );
+        assert!(
+            samples
+                .iter()
+                .map(|sample| sample.outbound_in_flight)
+                .max()
+                .unwrap_or_default()
+                >= 2
+        );
     }
 
     #[test]
