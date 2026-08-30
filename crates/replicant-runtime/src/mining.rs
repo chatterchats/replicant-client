@@ -560,11 +560,13 @@ pub async fn execute_mining_item(
                 )?);
             }
             if missing.contains_key(MINING_DRONE) {
-                site.assets.mining_drones.extend(mining_allocated_identities(
-                    allocations,
-                    "mining_drones",
-                    "device",
-                )?);
+                site.assets
+                    .mining_drones
+                    .extend(mining_allocated_identities(
+                        allocations,
+                        "mining_drones",
+                        "device",
+                    )?);
                 site.assets.mining_drones.sort();
                 site.assets.mining_drones.dedup();
             }
@@ -576,11 +578,13 @@ pub async fn execute_mining_item(
                 )?);
             }
             if missing.contains_key(SURVEY_DRONE) {
-                site.assets.survey_drones.extend(mining_allocated_identities(
-                    allocations,
-                    "survey_drones",
-                    "device",
-                )?);
+                site.assets
+                    .survey_drones
+                    .extend(mining_allocated_identities(
+                        allocations,
+                        "survey_drones",
+                        "device",
+                    )?);
                 site.assets.survey_drones.sort();
                 site.assets.survey_drones.dedup();
             }
@@ -1179,11 +1183,7 @@ struct SelectedBelt {
     density: String,
 }
 
-async fn select_belt(
-    client: &Client,
-    system: &str,
-    devices: &[Device],
-) -> AnyResult<SelectedBelt> {
+async fn select_belt(client: &Client, system: &str, devices: &[Device]) -> AnyResult<SelectedBelt> {
     let location = client.locations().get(system).await?;
     let mut belts = belts_from_location(&location);
     belts.sort_by(|left, right| {

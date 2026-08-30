@@ -3123,7 +3123,6 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
     }
 }
 
-
 async fn release_mining_reservation_tags(
     client: &Client,
     device_codes: &[String],

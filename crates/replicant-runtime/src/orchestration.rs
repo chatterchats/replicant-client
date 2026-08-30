@@ -22,8 +22,8 @@ use replicant_client::{
     raw::RequestPriority,
 };
 use replicant_protocol::{
-    DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
-    DirectorMiningPolicySummary, DirectorRegionSummary, DirectorReplicantAssignment,
+    DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMiningPolicySummary,
+    DirectorMode, DirectorRegionStatus, DirectorRegionSummary, DirectorReplicantAssignment,
     DirectorSnapshot, DirectorUrgencyFact, DirectorWorkforceSummary, SnapshotMetadata,
     WorkflowId as ProtocolWorkflowId,
 };
@@ -4102,7 +4102,8 @@ fn reconcile_expand_mining(
     let next_action;
 
     let status = if !enabled {
-        next_action = Some("Enable this standing goal to reconcile regional mining sites".to_owned());
+        next_action =
+            Some("Enable this standing goal to reconcile regional mining sites".to_owned());
         DirectorGoalStatus::Waiting
     } else if !active.is_empty() {
         next_action = Some(
@@ -4127,8 +4128,8 @@ fn reconcile_expand_mining(
                 // be quiesced before the system protection is removed.
                 pre_deactivate_device_codes.push(relocation.ward_code.clone());
             }
-            let workflow = repository.create(new_logistics_manifest_workflow(
-                LogisticsManifestIntent {
+            let workflow =
+                repository.create(new_logistics_manifest_workflow(LogisticsManifestIntent {
                     origin: relocation.origin.clone(),
                     destination: relocation.target_belt.clone(),
                     resources: ResourceMap::new(),
@@ -4145,8 +4146,7 @@ fn reconcile_expand_mining(
                         &relocation.ward_code,
                         &relocation.target_system,
                     ),
-                },
-            ))?;
+                }))?;
             tracing::info!(
                 workflow_id = %workflow.id,
                 region = %region.region,
@@ -4355,7 +4355,11 @@ fn selected_mining_ward_systems(
             .copied()
             .unwrap_or_default()
             .cmp(&belt_density.get(left).copied().unwrap_or_default())
-            .then_with(|| managed_systems.contains(right).cmp(&managed_systems.contains(left)))
+            .then_with(|| {
+                managed_systems
+                    .contains(right)
+                    .cmp(&managed_systems.contains(left))
+            })
             .then_with(|| left.cmp(right))
     });
     candidates
@@ -4495,9 +4499,11 @@ fn plan_mining_ward_relocations(
     let mut donors = donor_systems
         .iter()
         .flat_map(|system| {
-            wards.get(system).into_iter().flatten().map(move |(code, origin)| {
-                (system.clone(), code.clone(), origin.clone())
-            })
+            wards
+                .get(system)
+                .into_iter()
+                .flatten()
+                .map(move |(code, origin)| (system.clone(), code.clone(), origin.clone()))
         })
         .collect::<Vec<_>>();
     donors.sort_by(|left, right| {
@@ -4611,12 +4617,7 @@ fn known_belt_designations(
     choices
         .into_iter()
         .map(|(system, mut belts)| {
-            belts.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| left.1.cmp(&right.1))
-            });
+            belts.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
             belts.dedup_by(|left, right| left.1 == right.1);
             (
                 system,
@@ -6923,9 +6924,8 @@ mod tests {
         let mut mining_controller = test_hub_device();
         mining_controller.key = replicant_client::DeviceKey::live("MC-MOD-B".into());
         mining_controller.device_type = Some(DeviceType::MiningController);
-        mining_controller.location = Some(replicant_client::LocationKey::live(
-            "MOD-B-BELT-1".into(),
-        ));
+        mining_controller.location =
+            Some(replicant_client::LocationKey::live("MOD-B-BELT-1".into()));
         let mut survey_controller = mining_controller.clone();
         survey_controller.key = replicant_client::DeviceKey::live("SC-MOD-B".into());
         survey_controller.device_type = Some(DeviceType::SurveyController);
@@ -6934,10 +6934,7 @@ mod tests {
         let managed = BTreeSet::from(["MOD-B".to_owned()]);
         let selected = BTreeSet::from(["DENSE-C".to_owned()]);
         let relays = BTreeSet::from(["DENSE-C".to_owned(), "MOD-B".to_owned()]);
-        let density = BTreeMap::from([
-            ("DENSE-C".to_owned(), 3),
-            ("MOD-B".to_owned(), 2),
-        ]);
+        let density = BTreeMap::from([("DENSE-C".to_owned(), 3), ("MOD-B".to_owned(), 2)]);
         let belts = BTreeMap::from([
             ("DENSE-C".to_owned(), vec!["DENSE-C-BELT-1".to_owned()]),
             ("MOD-B".to_owned(), vec!["MOD-B-BELT-1".to_owned()]),
@@ -6986,10 +6983,7 @@ mod tests {
             ("HUB".to_owned(), 3),
             ("MOD".to_owned(), 2),
         ]);
-        let belts = BTreeMap::from([(
-            "DENSE".to_owned(),
-            vec!["DENSE-BELT-1".to_owned()],
-        )]);
+        let belts = BTreeMap::from([("DENSE".to_owned(), vec!["DENSE-BELT-1".to_owned()])]);
         let locations = BTreeMap::from([
             ("HUB-L4".to_owned(), "HUB".to_owned()),
             ("MOD-L4".to_owned(), "MOD".to_owned()),
@@ -7026,10 +7020,7 @@ mod tests {
             selected_ward_systems: &BTreeSet::from(["DENSE".to_owned()]),
             relay_systems: &BTreeSet::from(["MOD".to_owned()]),
             hub_systems: &BTreeSet::new(),
-            belt_density: &BTreeMap::from([
-                ("DENSE".to_owned(), 3),
-                ("MOD".to_owned(), 2),
-            ]),
+            belt_density: &BTreeMap::from([("DENSE".to_owned(), 3), ("MOD".to_owned(), 2)]),
             belt_designations: &BTreeMap::from([(
                 "DENSE".to_owned(),
                 vec!["DENSE-BELT-1".to_owned()],

@@ -59,11 +59,10 @@ use replicant_protocol::{
     DeviceLogsSnapshot, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
     DirectorMiningPolicyRequest, DirectorModeRequest, DirectorReplicantRegionRequest,
     DirectorSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
-    DirectoryReplicantSummary,
-    DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityInspectorDetail,
-    EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
-    EventCriterionSummary, EventRequirementKind, EventRequirementSummary, EventRewardItem,
-    EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
+    DirectoryReplicantSummary, DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot,
+    EntityInspectorDetail, EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary,
+    ErrorResponse, EventCriterionSummary, EventRequirementKind, EventRequirementSummary,
+    EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
     InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
@@ -6059,7 +6058,9 @@ async fn update_director_mining_policy(
         payload.map_err(|_| ApiError::invalid("invalid Director mining policy request"))?;
     let region = region.trim();
     if region.is_empty() {
-        return Err(ApiError::invalid("Director mining policy requires a region"));
+        return Err(ApiError::invalid(
+            "Director mining policy requires a region",
+        ));
     }
     tracing::info!(
         region,
