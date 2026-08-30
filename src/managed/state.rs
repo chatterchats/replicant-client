@@ -215,6 +215,12 @@ struct GalaxySnapshot {
     generated_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct MessageProjectionSnapshot {
+    messages: Arc<Vec<Observation<Message>>>,
+    metadata: MessageMetadata,
+}
+
 impl StateSnapshot {
     pub(crate) fn revision(&self) -> u64 {
         self.revision
@@ -234,6 +240,7 @@ pub(crate) struct StateEngine {
     snapshot: RwLock<Arc<StateSnapshot>>,
     snapshots: watch::Sender<Arc<StateSnapshot>>,
     galaxy: RwLock<Arc<GalaxySnapshot>>,
+    messages: RwLock<Arc<MessageProjectionSnapshot>>,
 }
 
 impl StateEngine {
@@ -247,18 +254,29 @@ impl StateEngine {
 
     pub(crate) fn from_store(store: StoreHandle) -> Result<Self, StoreError> {
         let restore_started = Instant::now();
-        let (devices, account, replicants, locations, inventories, simulations, catalogue) = store
-            .execute_blocking(|opened| {
-                Ok((
-                    opened.restore_devices()?,
-                    opened.restore_account()?,
-                    opened.restore_replicants()?,
-                    opened.restore_locations()?,
-                    opened.restore_inventories()?,
-                    opened.restore_simulations()?,
-                    opened.restore_catalogue()?,
-                ))
-            })?;
+        let (
+            devices,
+            account,
+            replicants,
+            locations,
+            inventories,
+            simulations,
+            catalogue,
+            messages,
+            message_metadata,
+        ) = store.execute_blocking(|opened| {
+            Ok((
+                opened.restore_devices()?,
+                opened.restore_account()?,
+                opened.restore_replicants()?,
+                opened.restore_locations()?,
+                opened.restore_inventories()?,
+                opened.restore_simulations()?,
+                opened.restore_catalogue()?,
+                opened.restore_messages()?,
+                opened.message_metadata()?,
+            ))
+        })?;
         let snapshot = Arc::new(StateSnapshot {
             revision: 0,
             galaxy_revision: 0,
@@ -290,6 +308,10 @@ impl StateEngine {
             galaxy: RwLock::new(Arc::new(GalaxySnapshot {
                 catalogue: catalogue.0,
                 generated_at: catalogue.1,
+            })),
+            messages: RwLock::new(Arc::new(MessageProjectionSnapshot {
+                messages: Arc::new(messages),
+                metadata: message_metadata,
             })),
         })
     }
@@ -495,8 +517,14 @@ impl StateEngine {
     pub(crate) fn messages(
         &self,
     ) -> Result<(Vec<Observation<Message>>, MessageMetadata), StoreError> {
-        let store = self.store.lock();
-        Ok((store.restore_messages()?, store.message_metadata()?))
+        let projection = self
+            .messages
+            .read()
+            .expect("message projection lock poisoned");
+        Ok((
+            projection.messages.as_ref().clone(),
+            projection.metadata.clone(),
+        ))
     }
 
     pub(crate) fn resource_sites(&self) -> Result<Vec<Observation<ResourceSite>>, StoreError> {
@@ -515,14 +543,73 @@ impl StateEngine {
         &self,
         messages: &[Observation<Message>],
     ) -> Result<(), StoreError> {
-        self.store.lock().persist_messages(messages)
+        let restored = {
+            let mut store = self.store.lock();
+            store.persist_messages(messages)?;
+            store.restore_messages()?
+        };
+        let mut projection = self
+            .messages
+            .write()
+            .expect("message projection lock poisoned");
+        let mut updated = projection.as_ref().clone();
+        updated.messages = Arc::new(restored);
+        *projection = Arc::new(updated);
+        Ok(())
+    }
+    pub(crate) fn commit_messages_and_metadata(
+        &self,
+        messages: &[Observation<Message>],
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        let (messages, metadata) = {
+            let mut store = self.store.lock();
+            store.commit_messages_and_metadata(messages, metadata)?;
+            (store.restore_messages()?, store.message_metadata()?)
+        };
+        *self
+            .messages
+            .write()
+            .expect("message projection lock poisoned") = Arc::new(MessageProjectionSnapshot {
+            messages: Arc::new(messages),
+            metadata,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn persist_message_error(&self, error: &str) -> Result<(), StoreError> {
+        let metadata = {
+            let mut store = self.store.lock();
+            store.persist_message_error(error)?;
+            store.message_metadata()?
+        };
+        let mut projection = self
+            .messages
+            .write()
+            .expect("message projection lock poisoned");
+        let mut updated = projection.as_ref().clone();
+        updated.metadata = metadata;
+        *projection = Arc::new(updated);
+        Ok(())
     }
 
     pub(crate) fn persist_message_metadata(
         &self,
         metadata: MessageMetadata,
     ) -> Result<(), StoreError> {
-        self.store.lock().persist_message_metadata(metadata)
+        {
+            let mut store = self.store.lock();
+            store.persist_message_metadata(metadata)?;
+        }
+        let metadata = self.store.lock().message_metadata()?;
+        let mut projection = self
+            .messages
+            .write()
+            .expect("message projection lock poisoned");
+        let mut updated = projection.as_ref().clone();
+        updated.metadata = metadata;
+        *projection = Arc::new(updated);
+        Ok(())
     }
 
     pub(crate) fn persist_account(&self, account: Observation<Account>) -> Result<(), StoreError> {

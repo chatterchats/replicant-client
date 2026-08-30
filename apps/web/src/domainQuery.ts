@@ -111,7 +111,12 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   fetcher: (signal: AbortSignal) => Promise<T>;
   isEmpty: (value: T) => boolean;
 }): DomainQueryResult<T> {
-  const invalidated = useDaemonState().invalidated;
+  const daemon = useDaemonState();
+  const invalidated = daemon.invalidated;
+  const queryEnabled =
+    daemon.connection === "connected" &&
+    daemon.revision !== null &&
+    daemon.error === null;
   const invalidation = domainInvalidationKey(slice, invalidated);
   const sliceLabel = sliceName(slice);
   const fetcherRef = useRef(fetcher);
@@ -135,6 +140,7 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   const hasAutomaticallyRequestedRef = useRef(false);
 
   useEffect(() => {
+    if (!queryEnabled) return;
     const subscription = sharedQueryCache.subscribe(
       cacheKey,
       async (signal) => {
@@ -201,9 +207,10 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
       if (subscriptionRef.current === subscription)
         subscriptionRef.current = null;
     };
-  }, [cacheKey, sliceLabel]);
+  }, [cacheKey, queryEnabled, sliceLabel]);
 
   useEffect(() => {
+    if (!queryEnabled) return;
     if (automaticTimerRef.current !== null) return;
     const delay = hasAutomaticallyRequestedRef.current
       ? AUTO_INVALIDATION_DELAY_MS
@@ -219,15 +226,16 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
         automaticTimerRef.current = null;
       }
     };
-  }, [invalidation]);
+  }, [invalidation, queryEnabled]);
 
   const refresh = useCallback(() => {
+    if (!queryEnabled) return Promise.resolve();
     if (automaticTimerRef.current !== null) {
       clearTimeout(automaticTimerRef.current);
       automaticTimerRef.current = null;
     }
     hasAutomaticallyRequestedRef.current = true;
     return subscriptionRef.current?.refresh() ?? Promise.resolve();
-  }, []);
+  }, [queryEnabled]);
   return { ...result, refresh };
 }

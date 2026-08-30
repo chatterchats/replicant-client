@@ -50,12 +50,30 @@ export function MessagesPage({
     fetcher: (signal) => daemonApi.messages(signal),
     isEmpty: empty,
   });
+  const [refreshingMessages, setRefreshingMessages] = useState(false);
+  const refreshMessages = async () => {
+    setRefreshingMessages(true);
+    try {
+      await daemonApi.refreshMessages();
+    } finally {
+      try {
+        await query.refresh();
+      } finally {
+        setRefreshingMessages(false);
+      }
+    }
+  };
   useEffect(() => {
     if (typeof query.data?.unread_count === "number")
       onUnreadCountChange?.(query.data.unread_count);
   }, [onUnreadCountChange, query.data?.unread_count]);
   return (
-    <MessagesContent {...query} onUnreadCountChange={onUnreadCountChange} />
+    <MessagesContent
+      {...query}
+      refreshing={query.refreshing || refreshingMessages}
+      refreshMessages={refreshMessages}
+      onUnreadCountChange={onUnreadCountChange}
+    />
   );
 }
 
@@ -65,6 +83,7 @@ export function MessagesContent({
   error,
   refreshing,
   refresh,
+  refreshMessages,
   onUnreadCountChange,
 }: {
   data?: MessagesSnapshot;
@@ -72,6 +91,7 @@ export function MessagesContent({
   error: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
+  refreshMessages?: () => Promise<void>;
   onUnreadCountChange?: (count: number) => void;
 }) {
   const [search, setSearch] = useState("");
@@ -113,6 +133,8 @@ export function MessagesContent({
       return next;
     });
   }, [data?.inbox]);
+  const refreshFailed = typeof data?.freshness.last_error === "string";
+  const cachedProjectionStale = data?.freshness.stale === true;
 
   const markRead = async (markAll: boolean) => {
     const ids = markAll ? [] : [...selectedIds];
@@ -152,10 +174,20 @@ export function MessagesContent({
             Account notifications, mission notices, and system messages.
           </p>
         </div>
-        <button disabled={refreshing} onClick={() => void refresh()}>
+        <button
+          disabled={refreshing}
+          onClick={() => void (refreshMessages ?? refresh)()}
+        >
           {refreshing ? "Refreshing…" : "Refresh"}
         </button>
       </header>
+      {(refreshFailed || cachedProjectionStale) && (
+        <p className="inline-warning">
+          {refreshFailed
+            ? "Showing cached messages; refresh failed"
+            : "Showing cached messages; refresh recommended"}
+        </p>
+      )}
       {error && <p className="inline-warning">Refresh failed: {error}</p>}
       {markReadError && (
         <p className="inline-warning">Mark read failed: {markReadError}</p>

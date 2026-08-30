@@ -881,6 +881,10 @@ pub struct MessageInbox {
     pub unread_count: Option<i64>,
     /// Last successful full pagination pass.
     pub refreshed_at: Option<ObservationTime>,
+    /// Monotonically increasing durable inbox revision.
+    pub revision: u64,
+    /// Last bounded refresh failure, if any.
+    pub last_error: Option<String>,
 }
 
 const MESSAGE_PAGE_SIZE: i64 = 100;
@@ -907,6 +911,8 @@ impl MessagesGateway {
             last_cursor: metadata.last_cursor,
             unread_count: metadata.unread_count,
             refreshed_at: metadata.refreshed_at,
+            revision: metadata.revision,
+            last_error: metadata.last_error,
         })
     }
 
@@ -924,7 +930,8 @@ impl MessagesGateway {
         self.refresh().await
     }
 
-    /// Explicitly refreshes every new inbox page and commits each message row.
+    /// Explicitly refreshes every new inbox page and commits the complete
+    /// staged result only after pagination succeeds.
     pub async fn refresh(&self) -> Result<MessageInbox> {
         self.client.ensure_open()?;
         let mut metadata = self
@@ -934,6 +941,7 @@ impl MessagesGateway {
             .map_err(persistence_error)?
             .1;
         let mut cursor = metadata.last_cursor;
+        let mut staged_messages = Vec::new();
         loop {
             let response = self
                 .client
@@ -959,10 +967,7 @@ impl MessagesGateway {
                 .map(|message| domain::message(message, observed_at))
                 .collect::<Vec<_>>();
             let page_last_id = messages.last().and_then(|message| message.value.id);
-            self.client
-                .managed_state()
-                .persist_messages(&messages)
-                .map_err(persistence_error)?;
+            staged_messages.extend(messages);
             metadata.last_cursor = next_cursor.or(page_last_id).or(metadata.last_cursor);
 
             let Some(next) = next_cursor else {
@@ -978,15 +983,28 @@ impl MessagesGateway {
             cursor = Some(next);
         }
         metadata.refreshed_at = Some(ObservationTime::now());
+        metadata.last_error = None;
         self.client
             .managed_state()
-            .persist_message_metadata(metadata)
+            .commit_messages_and_metadata(&staged_messages, metadata)
+            .map_err(persistence_error)?;
+        self.cached()
+    }
+
+    /// Records a bounded refresh error without changing committed messages or
+    /// their cursor, unread count, refresh timestamp, or revision.
+    pub fn record_refresh_failure(&self, message: &str) -> Result<MessageInbox> {
+        self.client.ensure_open()?;
+        self.client
+            .managed_state()
+            .persist_message_error(message)
             .map_err(persistence_error)?;
         self.cached()
     }
 
     /// Applies a confirmed read mutation to the durable projection.
     pub fn mark_cached_read(&self, ids: &[i64], mark_all: bool) -> Result<MessageInbox> {
+        self.client.ensure_open()?;
         let (messages, mut metadata) = self
             .client
             .managed_state()
@@ -1014,11 +1032,7 @@ impl MessagesGateway {
         };
         self.client
             .managed_state()
-            .persist_messages(&changed)
-            .map_err(persistence_error)?;
-        self.client
-            .managed_state()
-            .persist_message_metadata(metadata)
+            .commit_messages_and_metadata(&changed, metadata)
             .map_err(persistence_error)?;
         self.cached()
     }

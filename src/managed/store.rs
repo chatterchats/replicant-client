@@ -52,7 +52,9 @@ const HISTORY_INDEX_SCHEMA: &str = include_str!("../../migrations/history/0002_i
 const HISTORY_REFRESH_SCHEMA: &str =
     include_str!("../../migrations/history/0003_refresh_archive.sql");
 const REFRESH_SCHEMA: &str = include_str!("../../migrations/0007_refresh.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const MESSAGE_METADATA_REVISION_SCHEMA: &str =
+    include_str!("../../migrations/0008_message_metadata_revision.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 2;
 const REFRESH_LEASE_MILLIS: i64 = 300_000;
 const OPERATION_TERMINAL_RETENTION_DAYS: i64 = 30;
@@ -120,11 +122,13 @@ const STORE_QUEUE_CAPACITY: usize = 64;
 type CloseResponse = oneshot::Receiver<Result<(), StoreError>>;
 type CatalogueRows = (BTreeMap<StarKey, Observation<Star>>, Option<String>);
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MessageMetadata {
     pub(crate) last_cursor: Option<i64>,
     pub(crate) unread_count: Option<i64>,
     pub(crate) refreshed_at: Option<ObservationTime>,
+    pub(crate) revision: u64,
+    pub(crate) last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +536,20 @@ impl StoreProxy {
         let values = values.to_vec();
         self.0
             .execute_blocking(move |s| s.persist_messages(&values))
+    }
+    pub(crate) fn commit_messages_and_metadata(
+        &mut self,
+        messages: &[Observation<Message>],
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        let messages = messages.to_vec();
+        self.0
+            .execute_blocking(move |s| s.commit_messages_and_metadata(&messages, metadata))
+    }
+    pub(crate) fn persist_message_error(&mut self, error: &str) -> Result<(), StoreError> {
+        let error = error.to_owned();
+        self.0
+            .execute_blocking(move |s| s.persist_message_error(&error))
     }
     pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
         self.0.execute_blocking(|store| store.restore_messages())
@@ -1038,6 +1056,20 @@ impl Store {
             )?;
             transaction.commit()?;
             version = 7;
+        }
+        if version == 7 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(MESSAGE_METADATA_REVISION_SCHEMA)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = 8 WHERE version = 7",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '8') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
+            version = 8;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
@@ -2427,6 +2459,28 @@ impl Store {
         Ok(inventories)
     }
 
+    pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM messages")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut messages = rows
+            .map(|row| {
+                row.map_err(StoreError::from).and_then(|value| {
+                    serde_json::from_str::<Observation<Message>>(&value).map_err(StoreError::from)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.sort_by(|left, right| {
+            right
+                .value
+                .created_at
+                .cmp(&left.value.created_at)
+                .then_with(|| right.value.id.cmp(&left.value.id))
+        });
+        Ok(messages)
+    }
+
     pub(crate) fn persist_messages(
         &mut self,
         messages: &[Observation<Message>],
@@ -2450,27 +2504,116 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+    pub(crate) fn commit_messages_and_metadata(
+        &mut self,
+        messages: &[Observation<Message>],
+        mut metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM message_metadata WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .max(0) as u64;
+        let mut preserved_read_ids = BTreeSet::new();
+        let mut statement = transaction.prepare(
+            "INSERT INTO messages(message_id, payload_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET payload_json = excluded.payload_json",
+        )?;
+        for message in messages {
+            let key = match message.value.id {
+                Some(id) => id.to_string(),
+                None => format!("anonymous:{}", serde_json::to_string(&message.value)?),
+            };
+            let mut merged = message.clone();
+            if let Some(existing) = transaction
+                .query_row(
+                    "SELECT payload_json FROM messages WHERE message_id = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                let existing = serde_json::from_str::<Observation<Message>>(&existing)?;
+                if existing.value.is_read == Some(true) && merged.value.is_read != Some(true) {
+                    if merged.value.is_read == Some(false) {
+                        preserved_read_ids.insert(key.clone());
+                    }
+                    merged.value.is_read = Some(true);
+                }
+            }
+            statement.execute(params![key, serde_json::to_string(&merged)?])?;
+        }
+        drop(statement);
+        if let Some(unread_count) = metadata.unread_count {
+            metadata.unread_count = Some(
+                unread_count
+                    .saturating_sub(i64::try_from(preserved_read_ids.len()).unwrap_or(i64::MAX)),
+            );
+        }
+        metadata.revision = current_revision.saturating_add(1);
+        transaction.execute(
+            "INSERT INTO message_metadata(singleton, last_cursor, unread_count, refreshed_at, revision, last_error) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(singleton) DO UPDATE SET last_cursor = excluded.last_cursor, unread_count = excluded.unread_count, refreshed_at = excluded.refreshed_at, revision = excluded.revision, last_error = excluded.last_error",
+            params![
+                metadata.last_cursor,
+                metadata.unread_count,
+                metadata.refreshed_at.map(ObservationTime::unix_millis),
+                i64::try_from(metadata.revision).unwrap_or(i64::MAX),
+                metadata.last_error,
+            ],
+        )?;
+        Self::commit(transaction, fail_commit)
+    }
 
-    pub(crate) fn restore_messages(&self) -> Result<Vec<Observation<Message>>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT payload_json FROM messages")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut messages = rows
-            .map(|row| {
-                row.map_err(StoreError::from).and_then(|value| {
-                    serde_json::from_str::<Observation<Message>>(&value).map_err(StoreError::from)
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        messages.sort_by(|left, right| {
-            right
-                .value
-                .created_at
-                .cmp(&left.value.created_at)
-                .then_with(|| right.value.id.cmp(&left.value.id))
-        });
-        Ok(messages)
+    pub(crate) fn persist_message_error(&mut self, error: &str) -> Result<(), StoreError> {
+        let bounded = error.chars().take(512).collect::<String>();
+        self.connection.execute(
+            "INSERT INTO message_metadata(singleton, last_error) VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET last_error = excluded.last_error",
+            params![bounded],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT last_cursor, unread_count, refreshed_at, revision, last_error FROM message_metadata WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(MessageMetadata {
+                        last_cursor: row.get(0)?,
+                        unread_count: row.get(1)?,
+                        refreshed_at: row
+                            .get::<_, Option<i64>>(2)?
+                            .map(ObservationTime::from_unix_millis),
+                        revision: row.get::<_, i64>(3)?.max(0) as u64,
+                        last_error: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn persist_message_metadata(
+        &mut self,
+        metadata: MessageMetadata,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO message_metadata(singleton, last_cursor, unread_count, refreshed_at, revision, last_error) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(singleton) DO UPDATE SET last_cursor = excluded.last_cursor, unread_count = excluded.unread_count, refreshed_at = excluded.refreshed_at, revision = MAX(message_metadata.revision, excluded.revision), last_error = excluded.last_error",
+            params![
+                metadata.last_cursor,
+                metadata.unread_count,
+                metadata.refreshed_at.map(ObservationTime::unix_millis),
+                i64::try_from(metadata.revision).unwrap_or(i64::MAX),
+                metadata.last_error,
+            ],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn restore_resource_sites(
@@ -2517,41 +2660,6 @@ impl Store {
             })
         })
         .collect()
-    }
-
-    pub(crate) fn message_metadata(&self) -> Result<MessageMetadata, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT last_cursor, unread_count, refreshed_at FROM message_metadata WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok(MessageMetadata {
-                        last_cursor: row.get(0)?,
-                        unread_count: row.get(1)?,
-                        refreshed_at: row
-                            .get::<_, Option<i64>>(2)?
-                            .map(ObservationTime::from_unix_millis),
-                    })
-                },
-            )
-            .optional()
-            .map(Option::unwrap_or_default)
-            .map_err(StoreError::from)
-    }
-
-    pub(crate) fn persist_message_metadata(
-        &mut self,
-        metadata: MessageMetadata,
-    ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO message_metadata(singleton, last_cursor, unread_count, refreshed_at) VALUES (1, ?1, ?2, ?3) ON CONFLICT(singleton) DO UPDATE SET last_cursor = excluded.last_cursor, unread_count = excluded.unread_count, refreshed_at = excluded.refreshed_at",
-            params![
-                metadata.last_cursor,
-                metadata.unread_count,
-                metadata.refreshed_at.map(ObservationTime::unix_millis)
-            ],
-        )?;
-        Ok(())
     }
 
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
@@ -4887,14 +4995,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (8);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (9);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 8,
-                supported: 7
+                found: 9,
+                supported: 8
             })
         ));
         fs::remove_file(path).expect("remove test database");

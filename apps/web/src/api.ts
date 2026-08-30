@@ -107,13 +107,36 @@ function responseHeader(response: Response, name: string): string | null {
   );
 }
 
+/**
+ * Convert an nginx timing header from seconds to rounded milliseconds.
+ *
+ * Nginx joins values for each upstream attempt with commas when a request is
+ * retried. Summing those attempts preserves the complete upstream duration;
+ * selecting only the last value would hide time spent on failed attempts.
+ * Any missing, placeholder, or malformed attempt makes the field unavailable
+ * rather than reporting a misleading partial duration.
+ */
 export function proxyTimingMs(
   response: Response,
   header: string,
 ): number | null {
   const value = responseHeader(response, header);
-  if (!value || value === "-") return null;
-  const seconds = Number.parseFloat(value.split(",").at(-1)?.trim() ?? "");
+  if (value === null) return null;
+  const attempts = value.split(",").map((attempt) => attempt.trim());
+  if (
+    attempts.length === 0 ||
+    attempts.some(
+      (attempt) =>
+        attempt === "" ||
+        attempt === "-" ||
+        !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(attempt),
+    )
+  )
+    return null;
+  const seconds = attempts.reduce((total, attempt) => {
+    const parsed = Number(attempt);
+    return Number.isFinite(parsed) && parsed >= 0 ? total + parsed : Number.NaN;
+  }, 0);
   return Number.isFinite(seconds) ? Math.round(seconds * 1_000) : null;
 }
 
@@ -180,6 +203,14 @@ function daemonResponseFields(
     responseHeader(response, "Content-Length") ?? "",
     10,
   );
+  // Content-Length is authoritative when exposed. Resource Timing provides a
+  // useful browser-side fallback for responses served with chunked encoding.
+  const measurableBytes =
+    Number.isFinite(contentLength) && contentLength >= 0
+      ? Math.round(contentLength)
+      : (browserTiming.encoded_bytes ??
+        browserTiming.transfer_bytes ??
+        browserTiming.decoded_bytes);
   return {
     method,
     path: safeDaemonPath(path),
@@ -194,12 +225,13 @@ function daemonResponseFields(
         : Math.round(
             Math.max(0, elapsedMs - browserTiming.browser_response_end_ms),
           ),
-    bytes: Number.isFinite(contentLength) ? contentLength : null,
     ...browserTiming,
+    bytes: measurableBytes,
     proxy_request_id: responseHeader(response, "X-Replicant-Request-Id"),
-    proxy_request_ms:
-      proxyTimingMs(response, "X-Replicant-Upstream-Request-Time") ??
-      proxyTimingMs(response, "X-Replicant-Request-Time"),
+    // nginx exposes its request-time snapshot when response headers are
+    // emitted. It is not the finalized access-log duration, so consumers
+    // must treat it as a boundary observation rather than full request time.
+    proxy_request_ms: proxyTimingMs(response, "X-Replicant-Request-Time"),
     proxy_connect_ms: proxyTimingMs(
       response,
       "X-Replicant-Upstream-Connect-Time",
@@ -208,6 +240,10 @@ function daemonResponseFields(
       response,
       "X-Replicant-Upstream-Header-Time",
     ),
+    // Ordinary response headers are emitted before nginx has seen the final
+    // upstream body byte, so the finalized response duration belongs only to
+    // the correlated access log. A browser-visible value is therefore null
+    // unless another proxy supplies this header at a safe boundary.
     proxy_response_ms: proxyTimingMs(
       response,
       "X-Replicant-Upstream-Response-Time",
@@ -657,6 +693,9 @@ export const daemonApi = {
   },
   async messages(signal?: AbortSignal) {
     return parseMessagesResponse(await get("/api/messages", signal)).payload;
+  },
+  async refreshMessages() {
+    return parseMessagesResponse(await post("/api/messages/refresh")).payload;
   },
   async markMessagesRead(options: { ids?: number[]; markAll?: boolean }) {
     return parseMessagesResponse(

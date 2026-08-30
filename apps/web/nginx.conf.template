@@ -49,6 +49,7 @@ server {
         # Keep these diagnostics authoritative at the proxy boundary and
         # prevent duplicate values if an upstream response echoes them.
         proxy_hide_header X-Replicant-Request-Id;
+        proxy_hide_header X-Replicant-Request-Time;
         proxy_hide_header X-Replicant-Upstream-Connect-Time;
         proxy_hide_header X-Replicant-Upstream-Header-Time;
         proxy_hide_header X-Replicant-Upstream-Response-Time;
@@ -60,9 +61,12 @@ server {
         proxy_read_timeout 120s;
 
         # These same-origin diagnostics let the browser correlate its elapsed
-        # fetch time with what nginx spent waiting on replicantd. Values are
-        # nginx seconds and are converted to milliseconds by the frontend.
+        # fetch time with what nginx had measured when it emitted upstream
+        # response headers. Values are nginx seconds and are converted to
+        # milliseconds by the frontend. Request time is only a header-emission
+        # snapshot; the access log remains authoritative for the full request.
         add_header X-Replicant-Request-Id $request_id always;
+        add_header X-Replicant-Request-Time $request_time always;
         add_header X-Replicant-Upstream-Connect-Time $upstream_connect_time always;
         add_header X-Replicant-Upstream-Header-Time $upstream_header_time always;
         add_header X-Replicant-Handler-Time $upstream_http_x_replicant_handler_time always;

@@ -21,9 +21,14 @@ type Subscriber<T> = { listener: QueryListener<T> };
 
 type RequestState = {
   controller: AbortController;
-  targetRevision: string;
+  initialDataRevision: number;
   promise: Promise<void>;
+  /** A refresh always queues another request, even when the first succeeds. */
   forceFollowUp: boolean;
+  /** Whether that queued refresh should report an explicit start. */
+  forceFollowUpExplicit: boolean;
+  /** Newest invalidation observed while this request was active. */
+  invalidatedRevision?: string;
 };
 
 type Entry = {
@@ -35,15 +40,35 @@ type Entry = {
   subscribers: Set<Subscriber<ProjectionValue>>;
 };
 
+function revisionComponents(revision: string): number[] {
+  return revision.split(":").map((value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+  });
+}
+
 function revisionScore(revision: string): number {
-  return revision
-    .split(":")
-    .reduce((maximum, value) => Math.max(maximum, Number(value) || 0), 0);
+  return revisionComponents(revision).reduce(
+    (maximum, value) => Math.max(maximum, value),
+    0,
+  );
 }
 
 function revisionIsNewer(next: string, previous: string): boolean {
-  if (next === previous) return false;
-  return revisionScore(next) >= revisionScore(previous);
+  const nextValues = revisionComponents(next);
+  const previousValues = revisionComponents(previous);
+  return nextValues.some(
+    (value, index) => value > (previousValues[index] ?? 0),
+  );
+}
+
+function mergeRevision(current: string, next: string): string {
+  const currentValues = revisionComponents(current);
+  const nextValues = revisionComponents(next);
+  const length = Math.max(currentValues.length, nextValues.length);
+  return Array.from({ length }, (_, index) =>
+    String(Math.max(currentValues[index] ?? 0, nextValues[index] ?? 0)),
+  ).join(":");
 }
 
 function isFresh(data: ProjectionValue | undefined, revision: string): boolean {
@@ -77,9 +102,19 @@ export function createQueryCache(): QueryCache {
     explicit: boolean,
     force: boolean,
   ): Promise<void> => {
-    if (entry.request) {
-      if (force) entry.request.forceFollowUp = true;
-      return entry.request.promise;
+    const current = entry.request;
+    if (current) {
+      if (force) {
+        current.forceFollowUp = true;
+        current.forceFollowUpExplicit ||= explicit;
+        if (explicit) {
+          return current.promise.then(() => {
+            const followUp = entry.request;
+            return followUp ? followUp.promise : Promise.resolve();
+          });
+        }
+      }
+      return current.promise;
     }
     if (!force && isFresh(entry.data, entry.latestRevision))
       return Promise.resolve();
@@ -87,22 +122,40 @@ export function createQueryCache(): QueryCache {
     const controller = new AbortController();
     const request: RequestState = {
       controller,
-      targetRevision: entry.latestRevision,
+      initialDataRevision: entry.data?.metadata.revision ?? -Infinity,
       promise: Promise.resolve(),
       forceFollowUp: false,
+      forceFollowUpExplicit: false,
     };
-    let staleResult = false;
     entry.request = request;
     notify(entry, { type: "start", explicit });
-    request.promise = entry
-      .fetcher(controller.signal)
+    if (entry.request !== request || controller.signal.aborted) {
+      request.promise = Promise.resolve();
+      return request.promise;
+    }
+
+    let fetchPromise: Promise<ProjectionValue>;
+    try {
+      // Promise.resolve turns a synchronous throw into the same settled path
+      // as an asynchronous rejection, so failures cannot strand entry.request.
+      fetchPromise = Promise.resolve(entry.fetcher(controller.signal));
+    } catch (error: unknown) {
+      fetchPromise = Promise.reject(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    request.promise = fetchPromise
       .then((data) => {
         if (controller.signal.aborted || entry.request !== request) return;
-        if (data.metadata.revision < revisionScore(entry.latestRevision)) {
-          staleResult = true;
-          // Keep the previous snapshot visible, but ensure the newest revision
-          // gets one trailing request after this stale response settles.
-          notify(entry, { type: "coalesced" });
+
+        const requestedRevision = revisionScore(entry.latestRevision);
+        const cachedRevision = entry.data?.metadata.revision ?? -Infinity;
+        if (
+          data.metadata.revision < requestedRevision ||
+          data.metadata.revision < cachedRevision
+        ) {
+          recordQueryEvent("stale_discarded", { query: entry.key });
           return;
         }
         entry.data = data;
@@ -110,32 +163,43 @@ export function createQueryCache(): QueryCache {
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted || entry.request !== request) return;
-        if (revisionIsNewer(entry.latestRevision, request.targetRevision)) {
-          staleResult = true;
-          notify(entry, { type: "coalesced" });
+        const cacheAdvanced =
+          (entry.data?.metadata.revision ?? -Infinity) >
+          request.initialDataRevision;
+        if (
+          request.invalidatedRevision !== undefined ||
+          (cacheAdvanced && isFresh(entry.data, entry.latestRevision))
+        )
           return;
-        }
         notify(entry, { type: "error", error });
       })
       .finally(() => {
         if (entry.request !== request) return;
         entry.request = undefined;
+
+        const hasSubscribers = entry.subscribers.size > 0;
+        const invalidationNeedsFollowUp =
+          request.invalidatedRevision !== undefined &&
+          !isFresh(entry.data, entry.latestRevision);
         const needsFollowUp =
-          entry.subscribers.size > 0 && (request.forceFollowUp || staleResult);
-        if (needsFollowUp) void run(entry, false, true);
+          hasSubscribers &&
+          (request.forceFollowUp || invalidationNeedsFollowUp);
+        if (needsFollowUp)
+          void run(entry, request.forceFollowUpExplicit, request.forceFollowUp);
       });
     return request.promise;
   };
 
   const update = (entry: Entry, revision: string) => {
     if (!revisionIsNewer(revision, entry.latestRevision)) return;
-    entry.latestRevision = revision;
+    entry.latestRevision = mergeRevision(entry.latestRevision, revision);
     if (entry.request) {
+      entry.request.invalidatedRevision = entry.latestRevision;
       recordQueryEvent("coalesced_invalidation", { query: entry.key });
       notify(entry, { type: "coalesced" });
       return;
     }
-    void run(entry, false, false);
+    if (entry.subscribers.size > 0) void run(entry, false, false);
   };
 
   return {
@@ -157,6 +221,7 @@ export function createQueryCache(): QueryCache {
       } else {
         entry.fetcher = fetcher;
       }
+
       const subscriber: Subscriber<ProjectionValue> = {
         listener: (event) => {
           listener(event as QueryCacheEvent<T>);
@@ -172,9 +237,8 @@ export function createQueryCache(): QueryCache {
           cached: true,
         });
       }
-      if (entry.request) {
-        recordQueryEvent("joined_request", { query: key });
-      }
+      if (entry.request) recordQueryEvent("joined_request", { query: key });
+
       update(entry, revision);
       if (!entry.request && !isFresh(entry.data, entry.latestRevision))
         void run(entry, false, false);
@@ -193,12 +257,15 @@ export function createQueryCache(): QueryCache {
           if (!active) return;
           active = false;
           entry.subscribers.delete(subscriber);
-          if (entry.subscribers.size === 0 && entry.request) {
-            recordQueryEvent("cancelled_request", { query: key });
-            const request = entry.request;
-            entry.request = undefined;
-            request.controller.abort();
-          }
+          if (entry.subscribers.size !== 0 || !entry.request) return;
+
+          recordQueryEvent("cancelled_request", { query: key });
+          const request = entry.request;
+          // Detach before aborting. A new subscriber must not join work that
+          // has already been abandoned, and the old promise cannot mutate a
+          // newer request because of the identity check in its callbacks.
+          entry.request = undefined;
+          request.controller.abort();
         },
       } satisfies QueryCacheSubscription;
     },
@@ -227,8 +294,11 @@ export function createQueryCache(): QueryCache {
       ) {
         entry.data = data;
       }
-      if (revisionIsNewer(revision, entry.latestRevision))
-        entry.latestRevision = revision;
+      if (revisionIsNewer(revision, entry.latestRevision)) {
+        entry.latestRevision = mergeRevision(entry.latestRevision, revision);
+        if (entry.request && !isFresh(entry.data, entry.latestRevision))
+          entry.request.invalidatedRevision = entry.latestRevision;
+      }
     },
     clear() {
       for (const entry of entries.values()) entry.request?.controller.abort();

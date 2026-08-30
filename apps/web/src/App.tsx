@@ -239,6 +239,8 @@ export function App() {
       ),
     [dismissedNotificationIds, rawNotifications],
   );
+  const daemonReady =
+    connection === "connected" && revision !== null && daemon.error === null;
 
   useEffect(() => {
     recordWebEvent("info", "frontend.page_view", "frontend page activated", {
@@ -247,6 +249,7 @@ export function App() {
   }, [shell.page]);
 
   useEffect(() => {
+    if (!daemonReady) return;
     const controller = new AbortController();
     void daemonApi
       .descriptors(controller.signal)
@@ -255,7 +258,7 @@ export function App() {
     return () => {
       controller.abort();
     };
-  }, []);
+  }, [daemonReady]);
 
   useEffect(() => {
     if (revision === null) return;
@@ -269,7 +272,7 @@ export function App() {
   }, [rawNotifications, revision]);
 
   useEffect(() => {
-    if (connection !== "connected") return;
+    if (!daemonReady) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let controller: AbortController | undefined;
@@ -299,7 +302,7 @@ export function App() {
       controller?.abort();
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [connection]);
+  }, [daemonReady]);
 
   // Page and selection are mirrored into the location hash so a refresh keeps
   // the current view and every page is linkable.

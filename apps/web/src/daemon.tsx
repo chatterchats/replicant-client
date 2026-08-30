@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 
+import { createBootstrapBackoff } from "./bootstrapBackoff";
 import { daemonApi, daemonToken, daemonUrl } from "./api";
 import { sharedQueryCache, type QueryCacheSubscription } from "./queryCache";
 import { recordWebEvent } from "./telemetry";
@@ -40,6 +41,7 @@ export const NOTIFICATION_LIMIT = 200;
 export interface DaemonState {
   connection: ConnectionState;
   revision: number | null;
+  entityRevision: number;
   galaxyRevision: number;
   syncing: boolean;
   health: DaemonHealth | null;
@@ -73,6 +75,7 @@ export type DaemonAction =
 export const initialDaemonState: DaemonState = {
   connection: "connecting",
   revision: null,
+  entityRevision: 0,
   galaxyRevision: 0,
   syncing: true,
   health: null,
@@ -94,6 +97,18 @@ export const initialDaemonState: DaemonState = {
 
 function key(kind: string, id: string) {
   return `${kind}:${id}`;
+}
+
+function workflowEntity(workflow: WorkflowSummary): EntitySummary {
+  return {
+    entity: { kind: "workflow", id: workflow.id },
+    label: workflow.kind,
+    secondary_label: workflow.id,
+    system: null,
+    location: null,
+    entity_type: null,
+    status: workflow.status,
+  };
 }
 
 function continuityLost(state: DaemonState, error: string): DaemonState {
@@ -142,21 +157,33 @@ export function daemonReducer(
       return { ...state, connection: "offline", error: action.error };
     case "continuity_lost":
       return continuityLost(state, action.error);
-    case "snapshot":
+    case "snapshot": {
+      if (
+        state.revision !== null &&
+        action.snapshot.metadata.revision < state.revision
+      )
+        return state;
+      const replaceEntities =
+        action.entities.metadata.revision >= state.entityRevision;
       return {
         ...state,
         revision: action.snapshot.metadata.revision,
+        entityRevision: replaceEntities
+          ? action.entities.metadata.revision
+          : state.entityRevision,
         galaxyRevision: action.snapshot.metadata.revision,
         syncing: action.snapshot.sync.phase !== "ready",
         health: action.health,
         sync: action.snapshot.sync,
         automation: action.snapshot.automation,
-        entities: Object.fromEntries(
-          action.entities.entities.map((summary) => [
-            key(summary.entity.kind, summary.entity.id),
-            summary,
-          ]),
-        ),
+        entities: replaceEntities
+          ? Object.fromEntries(
+              action.entities.entities.map((summary) => [
+                key(summary.entity.kind, summary.entity.id),
+                summary,
+              ]),
+            )
+          : state.entities,
         workflows: Object.fromEntries(
           action.snapshot.workflows.map((workflow) => [workflow.id, workflow]),
         ),
@@ -174,9 +201,13 @@ export function daemonReducer(
         needsResnapshot: false,
         error: null,
       };
+    }
     case "entity_index":
+      if (action.entities.metadata.revision < state.entityRevision)
+        return state;
       return {
         ...state,
+        entityRevision: action.entities.metadata.revision,
         entities: Object.fromEntries(
           action.entities.entities.map((summary) => [
             key(summary.entity.kind, summary.entity.id),
@@ -211,6 +242,7 @@ export function daemonReducer(
           const { entity, value } = message.delta.data;
           return {
             ...next,
+            entityRevision: message.revision,
             entities: {
               ...state.entities,
               [key(entity.kind, entity.id)]: value,
@@ -225,7 +257,7 @@ export function daemonReducer(
               ([entry]) => entry !== removed,
             ),
           );
-          return { ...next, entities };
+          return { ...next, entityRevision: message.revision, entities };
         }
         case "domain_invalidated":
           return {
@@ -250,17 +282,24 @@ export function daemonReducer(
           };
         }
         case "workflow_created":
-        case "workflow_updated":
+        case "workflow_updated": {
+          const workflow = message.delta.data;
+          const entity = workflowEntity(workflow);
           return {
             ...next,
+            entityRevision: message.revision,
             galaxyRevision: message.revision,
-            needsResnapshot:
-              message.delta.data.kind === "requirement.fulfillment",
+            needsResnapshot: workflow.kind === "requirement.fulfillment",
+            entities: {
+              ...state.entities,
+              [key(entity.entity.kind, entity.entity.id)]: entity,
+            },
             workflows: {
               ...state.workflows,
-              [message.delta.data.id]: message.delta.data,
+              [workflow.id]: workflow,
             },
           };
+        }
         case "workflow_activity":
           return {
             ...next,
@@ -306,81 +345,218 @@ export function daemonReducer(
   }
 }
 
-export function retryDelay(attempt: number): number {
-  return Math.min(500 * 2 ** Math.min(attempt, 5), 10_000);
+type BootstrapKind = "connect" | "resnapshot";
+
+interface BootstrapTask {
+  controller: AbortController;
+  buffered: LiveMessage[];
+  promise: Promise<void>;
 }
 
 const DaemonContext = createContext<DaemonState | null>(null);
-
-export function socketUrl(
-  location: Pick<Location, "href"> = window.location,
-  daemonOrigin?: string,
-) {
-  const url = new URL(daemonUrl("/ws", daemonOrigin), location.href);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  // Browsers cannot set headers on a WebSocket handshake, so the daemon also
-  // accepts the shared secret as a query parameter.
-  const token = daemonToken();
-  if (token !== undefined) url.searchParams.set("token", token);
-  return url.href;
-}
-
 export function DaemonProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(daemonReducer, initialDaemonState);
   const socketRef = useRef<WebSocket | undefined>(undefined);
   const lastDiagnosticState = useRef<string>("");
   const entityQueryRef = useRef<QueryCacheSubscription | null>(null);
   const entityInvalidationTimerRef = useRef<number | null>(null);
+  const bootstrapRef = useRef<BootstrapTask | null>(null);
+  const resnapshotStartRef = useRef<(() => void) | null>(null);
+  const resnapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const initialized = state.revision !== null;
+  const committedRef = useRef(false);
+  committedRef.current = initialized;
   const entityInitialRevisionRef = useRef("0");
   entityInitialRevisionRef.current = String(
     state.invalidated.entities ?? state.revision ?? 0,
   );
 
   useEffect(() => {
-    const controller = new AbortController();
+    const lifecycleController = new AbortController();
     let socket: WebSocket | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let attempt = 0;
+    let healthTimer: ReturnType<typeof setTimeout> | null = null;
+    let healthController: AbortController | undefined;
+    let healthProbeActive = false;
+    const healthBackoff = createBootstrapBackoff();
 
-    const connect = async () => {
+    const clearHealthTimer = () => {
+      if (healthTimer !== null) {
+        clearTimeout(healthTimer);
+        healthTimer = null;
+      }
+    };
+    const clearResnapshotTimer = () => {
+      if (resnapshotTimerRef.current !== null) {
+        clearTimeout(resnapshotTimerRef.current);
+        resnapshotTimerRef.current = null;
+      }
+    };
+
+    const scheduleHealthProbe = () => {
+      if (
+        lifecycleController.signal.aborted ||
+        healthTimer !== null ||
+        healthProbeActive ||
+        socketRef.current?.readyState === WebSocket.OPEN ||
+        socketRef.current?.readyState === WebSocket.CONNECTING
+      )
+        return;
+      const delayMs = healthBackoff.nextDelayMs();
+      recordWebEvent(
+        "warn",
+        "frontend.daemon_reconnect_scheduled",
+        "daemon health probe scheduled",
+        { attempt: healthBackoff.attempt, delay_ms: delayMs },
+      );
+      healthTimer = setTimeout(() => {
+        healthTimer = null;
+        void probeHealth();
+      }, delayMs);
+    };
+
+    const runBootstrap = (
+      kind: BootstrapKind,
+      started = performance.now(),
+      knownHealth?: DaemonHealth,
+    ): Promise<void> => {
+      const active = bootstrapRef.current;
+      if (active !== null) {
+        if (active.controller.signal.aborted) {
+          return active.promise
+            .catch(() => undefined)
+            .then(() => runBootstrap(kind, started, knownHealth));
+        }
+        return active.promise;
+      }
+
+      const task: BootstrapTask = {
+        controller: new AbortController(),
+        buffered: [],
+        promise: Promise.resolve(),
+      };
+      bootstrapRef.current = task;
+      task.promise = (async () => {
+        const health =
+          knownHealth ?? (await daemonApi.health(task.controller.signal));
+        if (health.status !== "healthy")
+          throw new Error(health.detail ?? `Daemon health is ${health.status}`);
+        const [snapshot, entities] = await Promise.all([
+          daemonApi.snapshot(task.controller.signal),
+          daemonApi.entities(task.controller.signal),
+        ]);
+        if (task.controller.signal.aborted) return;
+        sharedQueryCache.seed(
+          "entities",
+          entities,
+          String(
+            snapshot.slice_revisions.entities ?? entities.metadata.revision,
+          ),
+        );
+        dispatch({ type: "snapshot", snapshot, health, entities });
+        if (kind === "connect") {
+          recordWebEvent(
+            "info",
+            "frontend.daemon_snapshot_loaded",
+            "initial daemon snapshot loaded",
+            {
+              elapsed_ms: Math.round(performance.now() - started),
+              health: health.status,
+              sync_phase: snapshot.sync.phase,
+              revision: snapshot.metadata.revision,
+              workflows: snapshot.workflows.length,
+              entities: entities.entities.length,
+              notifications: snapshot.notifications.length,
+            },
+          );
+        }
+        const replay = task.buffered;
+        task.buffered = [];
+        for (const message of replay) dispatch({ type: "live", message });
+      })().finally(() => {
+        if (bootstrapRef.current === task) bootstrapRef.current = null;
+      });
+      return task.promise;
+    };
+
+    const scheduleResnapshot = () => {
+      if (
+        lifecycleController.signal.aborted ||
+        resnapshotTimerRef.current !== null ||
+        socketRef.current?.readyState !== WebSocket.OPEN
+      )
+        return;
+      const delayMs = healthBackoff.nextDelayMs();
+      recordWebEvent(
+        "warn",
+        "frontend.daemon_resnapshot_scheduled",
+        "daemon resnapshot scheduled",
+        { attempt: healthBackoff.attempt, delay_ms: delayMs },
+      );
+      resnapshotTimerRef.current = setTimeout(() => {
+        resnapshotTimerRef.current = null;
+        resnapshotStartRef.current?.();
+      }, delayMs);
+    };
+
+    const startResnapshot = () => {
+      if (
+        lifecycleController.signal.aborted ||
+        socketRef.current?.readyState !== WebSocket.OPEN
+      )
+        return;
+      void runBootstrap("resnapshot")
+        .then(() => {
+          healthBackoff.reset();
+        })
+        .catch((error: unknown) => {
+          if (lifecycleController.signal.aborted) return;
+          dispatch({ type: "continuity_lost", error: String(error) });
+          scheduleResnapshot();
+        });
+    };
+    resnapshotStartRef.current = startResnapshot;
+
+    const connect = async (health: DaemonHealth) => {
       const started = performance.now();
-      dispatch({ type: "connecting", retry: attempt > 0 });
+      dispatch({ type: "connecting", retry: committedRef.current });
       recordWebEvent(
         "info",
         "frontend.daemon_connecting",
-        attempt > 0 ? "reconnecting to daemon" : "connecting to daemon",
-        { attempt },
+        committedRef.current
+          ? "reconnecting to daemon"
+          : "connecting to daemon",
+        { attempt: healthBackoff.attempt },
       );
+      let nextSocket: WebSocket | undefined;
       try {
-        // The socket is opened *before* the snapshot is fetched, and messages
-        // that arrive meanwhile are buffered and replayed afterwards. Fetching
-        // first left a window where a publish between the snapshot and the
-        // subscription was lost, which the old strict-continuity check then
-        // reported as lost continuity.
-        let buffered: LiveMessage[] | null = [];
-        const deliver = (message: LiveMessage) => {
-          if (buffered) buffered.push(message);
+        const deliver = (source: WebSocket, message: LiveMessage) => {
+          if (socketRef.current !== source) return;
+          const active = bootstrapRef.current;
+          if (active !== null) active.buffered.push(message);
           else dispatch({ type: "live", message });
         };
 
-        socket = new WebSocket(socketUrl());
-        socketRef.current = socket;
-        socket.addEventListener("open", () => {
+        nextSocket = new WebSocket(socketUrl());
+        const activeSocket = nextSocket;
+        socket = nextSocket;
+        socketRef.current = nextSocket;
+        activeSocket.addEventListener("open", () => {
           recordWebEvent(
             "info",
             "frontend.daemon_socket_open",
             "daemon WebSocket connected",
-            { connect_ms: Math.round(performance.now() - started), attempt },
+            { connect_ms: Math.round(performance.now() - started) },
           );
-          attempt = 0;
           dispatch({ type: "connected" });
         });
-        socket.addEventListener("message", (event) => {
+        activeSocket.addEventListener("message", (event) => {
           try {
             if (typeof event.data !== "string")
               throw new Error("Invalid binary live message");
-            deliver(parseLiveMessage(JSON.parse(event.data) as unknown));
+            deliver(
+              activeSocket,
+              parseLiveMessage(JSON.parse(event.data) as unknown),
+            );
           } catch (error) {
             recordWebEvent(
               "error",
@@ -391,7 +567,11 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
             dispatch({ type: "continuity_lost", error: String(error) });
           }
         });
-        socket.addEventListener("close", (event) => {
+        activeSocket.addEventListener("close", (event) => {
+          if (lifecycleController.signal.aborted) return;
+          if (socketRef.current !== activeSocket) return;
+          socketRef.current = undefined;
+          socket = undefined;
           recordWebEvent(
             event.wasClean ? "info" : "warn",
             "frontend.daemon_socket_closed",
@@ -402,130 +582,92 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
               reason: event.reason.slice(0, 300),
             },
           );
-          scheduleReconnect();
+          bootstrapRef.current?.controller.abort();
+          clearResnapshotTimer();
+          healthBackoff.reset();
+          dispatch({ type: "disconnected", error: "Daemon connection closed" });
+          scheduleHealthProbe();
         });
-        socket.addEventListener("error", () => {
+        activeSocket.addEventListener("error", () => {
+          if (socketRef.current !== activeSocket) return;
           recordWebEvent(
             "warn",
             "frontend.daemon_socket_error",
             "daemon WebSocket reported an error",
           );
-          socket?.close();
+          activeSocket.close();
         });
 
-        const [health, snapshot, entities] = await Promise.all([
-          daemonApi.health(controller.signal),
-          daemonApi.snapshot(controller.signal),
-          daemonApi.entities(controller.signal),
-        ]);
-        if (controller.signal.aborted) return;
-        sharedQueryCache.seed(
-          "entities",
-          entities,
-          String(
-            snapshot.slice_revisions.entities ?? entities.metadata.revision,
-          ),
-        );
-        dispatch({ type: "snapshot", snapshot, health, entities });
+        await runBootstrap("connect", started, health);
+      } catch (error) {
+        if (lifecycleController.signal.aborted) return;
+        if (
+          socketRef.current !== nextSocket ||
+          nextSocket?.readyState === WebSocket.CLOSING ||
+          nextSocket?.readyState === WebSocket.CLOSED
+        )
+          return;
         recordWebEvent(
-          health.status === "healthy" ? "info" : "warn",
-          "frontend.daemon_snapshot_loaded",
-          "initial daemon snapshot loaded",
+          "warn",
+          "frontend.daemon_connection_failed",
+          "daemon connection/bootstrap failed",
           {
             elapsed_ms: Math.round(performance.now() - started),
-            health: health.status,
-            sync_phase: snapshot.sync.phase,
-            revision: snapshot.metadata.revision,
-            workflows: snapshot.workflows.length,
-            entities: entities.entities.length,
-            notifications: snapshot.notifications.length,
+            error: String(error).slice(0, 500),
           },
         );
-
-        // Replay anything received while the snapshot was in flight; the
-        // reducer discards messages at or below the snapshot's revision.
-        const replay = buffered;
-        buffered = null;
-        for (const message of replay) dispatch({ type: "live", message });
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          recordWebEvent(
-            "warn",
-            "frontend.daemon_connection_failed",
-            "daemon connection/bootstrap failed",
-            {
-              elapsed_ms: Math.round(performance.now() - started),
-              error: String(error).slice(0, 500),
-            },
-          );
-          dispatch({ type: "disconnected", error: String(error) });
-          scheduleReconnect();
-        }
+        bootstrapRef.current?.controller.abort();
+        socketRef.current = undefined;
+        socket = undefined;
+        nextSocket?.close();
+        dispatch({ type: "disconnected", error: String(error) });
+        scheduleHealthProbe();
       }
     };
 
-    const scheduleReconnect = () => {
-      if (controller.signal.aborted || timer !== undefined) return;
-      dispatch({ type: "disconnected", error: "Daemon connection closed" });
-      const delayMs = retryDelay(attempt);
-      recordWebEvent(
-        "warn",
-        "frontend.daemon_reconnect_scheduled",
-        "daemon reconnect scheduled",
-        { attempt: attempt + 1, delay_ms: delayMs },
-      );
-      timer = setTimeout(() => {
-        timer = undefined;
-        attempt += 1;
-        void connect();
-      }, delayMs);
+    const probeHealth = async () => {
+      if (
+        lifecycleController.signal.aborted ||
+        healthProbeActive ||
+        socketRef.current?.readyState === WebSocket.OPEN ||
+        socketRef.current?.readyState === WebSocket.CONNECTING
+      )
+        return;
+      healthProbeActive = true;
+      const controller = new AbortController();
+      healthController = controller;
+      dispatch({ type: "connecting", retry: committedRef.current });
+      try {
+        const health = await daemonApi.health(controller.signal);
+        lifecycleController.signal.throwIfAborted();
+        if (health.status !== "healthy")
+          throw new Error(health.detail ?? `Daemon health is ${health.status}`);
+        healthBackoff.reset();
+        healthController = undefined;
+        healthProbeActive = false;
+        await connect(health);
+      } catch (error) {
+        healthController = undefined;
+        healthProbeActive = false;
+        if (controller.signal.aborted) return;
+        dispatch({ type: "disconnected", error: String(error) });
+        scheduleHealthProbe();
+      }
     };
 
-    void connect();
+    void probeHealth();
     return () => {
-      controller.abort();
-      if (timer !== undefined) clearTimeout(timer);
+      lifecycleController.abort();
+      clearHealthTimer();
+      healthController?.abort();
+      healthProbeActive = false;
+      bootstrapRef.current?.controller.abort();
+      clearResnapshotTimer();
+      resnapshotStartRef.current = null;
       socket?.close();
       socketRef.current = undefined;
     };
   }, []);
-
-  useEffect(() => {
-    if (!state.needsResnapshot) return;
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const resnapshot = async () => {
-      try {
-        const [health, snapshot, entities] = await Promise.all([
-          daemonApi.health(controller.signal),
-          daemonApi.snapshot(controller.signal),
-          daemonApi.entities(controller.signal),
-        ]);
-        if (controller.signal.aborted) return;
-        sharedQueryCache.seed(
-          "entities",
-          entities,
-          String(
-            snapshot.slice_revisions.entities ?? entities.metadata.revision,
-          ),
-        );
-        dispatch({ type: "snapshot", snapshot, health, entities });
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          dispatch({ type: "continuity_lost", error: String(error) });
-          timer = setTimeout(() => void resnapshot(), 500);
-        }
-      }
-    };
-
-    void resnapshot();
-    return () => {
-      controller.abort();
-      if (timer !== undefined) clearTimeout(timer);
-    };
-  }, [state.needsResnapshot]);
-
   useEffect(() => {
     if (!initialized || entityQueryRef.current !== null) return;
     const subscription = sharedQueryCache.subscribe(
@@ -606,6 +748,19 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   ]);
 
   return <DaemonContext value={state}>{children}</DaemonContext>;
+}
+
+export function socketUrl(
+  location: Pick<Location, "href"> = window.location,
+  daemonOrigin?: string,
+) {
+  const url = new URL(daemonUrl("/ws", daemonOrigin), location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  // Browsers cannot set headers on a WebSocket handshake, so the daemon also
+  // accepts the shared secret as a query parameter.
+  const token = daemonToken();
+  if (token !== undefined) url.searchParams.set("token", token);
+  return url.href;
 }
 
 export function useDaemonState(): DaemonState {

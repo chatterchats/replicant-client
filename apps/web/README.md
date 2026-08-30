@@ -41,6 +41,17 @@ The packaged web service emits two complementary diagnostic streams:
 
 Frontend telemetry is deliberately bounded and batched so diagnostics do not become a second request storm. Request bodies, authentication tokens, and application command payloads are not logged.
 
+At startup and after a disconnect, the UI probes only `/api/health` with
+bounded exponential backoff. Projection reads and the WebSocket bootstrap
+resume once health succeeds; committed projection state remains visible while
+the daemon is unavailable.
+
+Browser request telemetry correlates Resource Timing phases and nginx
+connect/header snapshots with the nginx-generated request ID. Final
+`$request_time` and `$upstream_response_time` values are available in the nginx
+access log only: nginx learns them after ordinary response headers have already
+been sent.
+
 Domain projection reads use a revision-aware shared query cache. Components
 requesting the same logical projection join one in-flight request, retain the
 newest monotonic snapshot across page transitions, and coalesce invalidations

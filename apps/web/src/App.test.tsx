@@ -160,6 +160,8 @@ const messages: MessagesSnapshot = {
   metadata,
   inbox: [],
   unread_count: 0,
+  last_cursor: null,
+  freshness: { last_refresh_at: null, stale: false, last_error: null },
 };
 const bobnet: BobnetSnapshot = {
   metadata,
@@ -317,8 +319,14 @@ class MockWebSocket {
   static readonly CLOSED = 3;
   readyState = MockWebSocket.CONNECTING;
   constructor(public url: string) {}
-  addEventListener() {
-    // Never emits open/message/close; App runs on the initial snapshot only.
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    if (type !== "open") return;
+    queueMicrotask(() => {
+      this.readyState = MockWebSocket.OPEN;
+      const event = new Event("open");
+      if (typeof listener === "function") listener(event);
+      else listener.handleEvent(event);
+    });
   }
   removeEventListener() {}
   close() {}

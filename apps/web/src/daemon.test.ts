@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  daemonReducer,
-  initialDaemonState,
-  retryDelay,
-  socketUrl,
-} from "./daemon";
+import { daemonReducer, initialDaemonState, socketUrl } from "./daemon";
 import type {
   DaemonHealth,
   EntityIndexSnapshot,
@@ -100,6 +95,101 @@ describe("daemonReducer", () => {
     expect(state.entities["replicant:R-1"]?.location).toBe("EARTH");
     expect(state.notifications).toHaveLength(1);
     expect(state.galaxyRevision).toBe(10);
+  });
+
+  it("does not let an older entity index overwrite a pushed entity delta", () => {
+    let state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+    state = daemonReducer(state, {
+      type: "live",
+      message: live(11, {
+        type: "entity_upsert",
+        data: {
+          entity: { kind: "device", id: "D-1" },
+          value: {
+            entity: { kind: "device", id: "D-1" },
+            label: "D-1",
+            secondary_label: "mining_drone",
+            system: "SOL",
+            location: "EARTH",
+            entity_type: "mining_drone",
+            status: "idle",
+          },
+        },
+      }),
+    });
+
+    const unchanged = daemonReducer(state, {
+      type: "entity_index",
+      entities,
+    });
+
+    expect(unchanged).toBe(state);
+    expect(unchanged.entityRevision).toBe(11);
+    expect(unchanged.entities["device:D-1"]?.label).toBe("D-1");
+  });
+
+  it("does not regress state when an older bootstrap finishes late", () => {
+    const state = daemonReducer(initialDaemonState, {
+      type: "snapshot",
+      snapshot,
+      health,
+      entities,
+    });
+
+    const unchanged = daemonReducer(state, {
+      type: "snapshot",
+      snapshot: {
+        ...snapshot,
+        metadata: { ...snapshot.metadata, revision: 9 },
+      },
+      health,
+      entities: {
+        metadata: { ...entities.metadata, revision: 9 },
+        entities: [],
+      },
+    });
+
+    expect(unchanged).toBe(state);
+    expect(unchanged.revision).toBe(10);
+    expect(unchanged.entities["replicant:R-1"]?.label).toBe("R-1");
+  });
+
+  it("applies complete workflow deltas to the entity index", () => {
+    const state = daemonReducer(
+      daemonReducer(initialDaemonState, {
+        type: "snapshot",
+        snapshot,
+        health,
+        entities,
+      }),
+      {
+        type: "live",
+        message: live(11, {
+          type: "workflow_updated",
+          data: {
+            id: "WF-1",
+            kind: "mining.deploy",
+            status: "running",
+            current_step: "deploying",
+            revision: 2,
+            updated_at_ms: 2,
+          },
+        }),
+      },
+    );
+
+    expect(state.workflows["WF-1"]?.status).toBe("running");
+    expect(state.entities["workflow:WF-1"]).toMatchObject({
+      label: "mining.deploy",
+      secondary_label: "WF-1",
+      status: "running",
+    });
+    expect(state.entityRevision).toBe(11);
   });
 
   it("applies invalidations across a revision gap without resnapshotting", () => {
@@ -279,7 +369,7 @@ describe("daemonReducer", () => {
     expect(state.invalidated.trade).toBe(14);
   });
 
-  it("tracks reconnect state with capped backoff", () => {
+  it("tracks reconnect state", () => {
     const offline = daemonReducer(initialDaemonState, {
       type: "disconnected",
       error: "closed",
@@ -289,8 +379,6 @@ describe("daemonReducer", () => {
       retry: true,
     });
     expect(reconnecting.connection).toBe("reconnecting");
-    expect(retryDelay(0)).toBe(500);
-    expect(retryDelay(100)).toBe(10_000);
   });
 
   it("connects a packaged desktop UI to the loopback daemon", () => {

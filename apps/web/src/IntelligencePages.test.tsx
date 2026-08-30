@@ -102,6 +102,8 @@ describe("Intelligence pages", () => {
         },
       ],
       unread_count: 1,
+      last_cursor: null,
+      freshness: { last_refresh_at: null, stale: false, last_error: null },
     };
     const html = renderToStaticMarkup(
       <MessagesContent {...common} data={data} />,

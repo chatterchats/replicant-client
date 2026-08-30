@@ -93,7 +93,7 @@ describe("daemon telemetry timing helpers", () => {
     vi.unstubAllGlobals();
   });
 
-  it("parses nginx timing headers from seconds into rounded milliseconds", () => {
+  it("sums every valid upstream attempt in nginx timing headers", () => {
     const response = responseWithHeaders({
       "X-Replicant-Upstream-Connect-Time": "0.0126",
       "X-Replicant-Upstream-Header-Time": "0.0344, 0.0456",
@@ -103,20 +103,26 @@ describe("daemon telemetry timing helpers", () => {
       13,
     );
     expect(proxyTimingMs(response, "X-Replicant-Upstream-Header-Time")).toBe(
-      46,
+      80,
     );
   });
 
-  it("returns null for absent, placeholder, and invalid nginx timings", () => {
+  it("returns null when an nginx timing attempt is absent or malformed", () => {
     const response = responseWithHeaders({
       absent: "",
       placeholder: "-",
       invalid: "not-a-duration",
+      "invalid-retry": "0.010, nope",
+      "negative-retry": "0.010, -0.002",
+      "empty-retry": "0.010, ",
     });
 
     expect(proxyTimingMs(response, "absent")).toBeNull();
     expect(proxyTimingMs(response, "placeholder")).toBeNull();
     expect(proxyTimingMs(response, "invalid")).toBeNull();
+    expect(proxyTimingMs(response, "invalid-retry")).toBeNull();
+    expect(proxyTimingMs(response, "negative-retry")).toBeNull();
+    expect(proxyTimingMs(response, "empty-retry")).toBeNull();
   });
 
   it("normalizes query-bearing daemon paths without retaining payloads", () => {
@@ -163,6 +169,7 @@ describe("daemon telemetry timing helpers", () => {
       browser_transfer_ms: 30,
       browser_dns_ms: 5,
       browser_connect_ms: 15,
+      browser_tls_ms: null,
       transfer_bytes: 300,
       encoded_bytes: 240,
       decoded_bytes: 480,
@@ -210,6 +217,7 @@ describe("daemon telemetry timing helpers", () => {
       browser_transfer_ms: null,
       browser_dns_ms: null,
       browser_connect_ms: null,
+      browser_tls_ms: null,
       transfer_bytes: null,
       encoded_bytes: null,
       decoded_bytes: null,
@@ -239,9 +247,9 @@ describe("daemon telemetry timing helpers", () => {
     daemonResponse = daemonJsonResponse(healthPayload, 200, {
       "Content-Length": "42",
       "X-Replicant-Request-Id": "req-abc",
-      "X-Replicant-Upstream-Connect-Time": "0.010",
-      "X-Replicant-Upstream-Header-Time": "0.020",
-      "X-Replicant-Upstream-Response-Time": "0.030",
+      "X-Replicant-Request-Time": "0.008",
+      "X-Replicant-Upstream-Connect-Time": "0.010, 0.003",
+      "X-Replicant-Upstream-Header-Time": "0.020, 0.005",
       "X-Replicant-Handler-Time": "0.004",
     });
     now
@@ -279,9 +287,10 @@ describe("daemon telemetry timing helpers", () => {
         browser_transfer_ms: 20,
         bytes: 42,
         proxy_request_id: "req-abc",
-        proxy_connect_ms: 10,
-        proxy_header_ms: 20,
-        proxy_response_ms: 30,
+        proxy_request_ms: 8,
+        proxy_connect_ms: 13,
+        proxy_header_ms: 25,
+        proxy_response_ms: null,
         daemon_handler_ms: 4,
       },
     });

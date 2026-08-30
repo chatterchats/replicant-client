@@ -6,6 +6,7 @@ use std::{
     io::{self, Write},
     path::Path,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use replicant_runtime::{
@@ -17,10 +18,15 @@ use replicant_runtime::{
     telemetry::{RuntimeTelemetrySample, TelemetryService},
 };
 use replicant_server::{
-    AppState, DaemonConfig, router, run_director, run_supervisor, run_trigger_engine,
+    AppState, DaemonConfig, router, run_director, run_message_refresh, run_supervisor,
+    run_trigger_engine,
 };
 use replicant_workflow::WorkflowRepository;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::watch,
+    time::{MissedTickBehavior, interval},
+};
 use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt::MakeWriter, prelude::*};
 
 #[derive(Clone)]
@@ -160,16 +166,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let supervisor = tokio::spawn(run_supervisor(state.clone(), shutdown_rx.clone()));
+    let messages = tokio::spawn(run_message_refresh(state.clone(), shutdown_rx.clone()));
     let triggers = tokio::spawn(run_trigger_engine(state.clone(), shutdown_rx.clone()));
     let director = tokio::spawn(run_director(state.clone(), shutdown_rx.clone()));
+    let runtime_lag = tokio::spawn(run_runtime_lag_probe(shutdown_rx.clone()));
     let signal = tokio::spawn(shutdown_signal(shutdown_tx.clone()));
     let server_result = axum::serve(listener, router(state))
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
         .await;
     let _ = shutdown_tx.send(true);
     supervisor.await?;
+    messages.await?;
     triggers.await?;
     director.await?;
+    runtime_lag.await?;
     signal.abort();
     runtime_telemetry.record(RuntimeTelemetrySample {
         observed_at_ms: unix_millis(),
@@ -255,6 +265,38 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
 }
 
+const RUNTIME_LAG_INTERVAL: Duration = Duration::from_millis(250);
+const RUNTIME_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+
+fn runtime_lag_delay(scheduled_at: Instant, observed_at: Instant) -> Duration {
+    observed_at.saturating_duration_since(scheduled_at)
+}
+
+async fn run_runtime_lag_probe(mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = interval(RUNTIME_LAG_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            scheduled_at = ticker.tick() => {
+                let scheduled_delay = runtime_lag_delay(scheduled_at.into(), Instant::now());
+                if scheduled_delay >= RUNTIME_LAG_WARN_THRESHOLD {
+                    tracing::warn!(
+                        event = "daemon.runtime_lag",
+                        scheduled_delay_ms = scheduled_delay.as_millis(),
+                        "Tokio runtime wake was delayed"
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn shutdown_signal(shutdown: watch::Sender<bool>) {
     #[cfg(unix)]
     {
@@ -280,4 +322,41 @@ async fn shutdown_signal(shutdown: watch::Sender<bool>) {
         tracing::error!(error = %error, "Ctrl-C handler failed");
     }
     let _ = shutdown.send(true);
+}
+#[cfg(test)]
+mod tests {
+    use super::{RUNTIME_LAG_WARN_THRESHOLD, runtime_lag_delay};
+    use std::time::{Duration, Instant};
+    use tokio::sync::watch;
+
+    #[test]
+    fn runtime_lag_delay_detects_a_deliberately_late_wake() {
+        let scheduled_at = Instant::now();
+        let observed_at = scheduled_at + RUNTIME_LAG_WARN_THRESHOLD + Duration::from_millis(1);
+
+        assert_eq!(
+            runtime_lag_delay(scheduled_at, observed_at),
+            RUNTIME_LAG_WARN_THRESHOLD + Duration::from_millis(1)
+        );
+        assert!(runtime_lag_delay(scheduled_at, observed_at) >= RUNTIME_LAG_WARN_THRESHOLD);
+    }
+
+    #[test]
+    fn runtime_lag_delay_clamps_an_early_wake_to_zero() {
+        let scheduled_at = Instant::now() + Duration::from_millis(1);
+        let observed_at = scheduled_at - Duration::from_millis(1);
+
+        assert_eq!(runtime_lag_delay(scheduled_at, observed_at), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn runtime_lag_probe_exits_when_shutdown_is_signaled() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let probe = tokio::spawn(super::run_runtime_lag_probe(shutdown_rx));
+
+        shutdown_tx
+            .send(true)
+            .expect("probe still owns shutdown receiver");
+        probe.await.expect("runtime lag probe should exit cleanly");
+    }
 }

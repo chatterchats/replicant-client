@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -68,14 +68,14 @@ use replicant_protocol::{
     FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus, InboxMessageSummary,
     InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
     InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary, LeaderboardEntrySummary,
-    LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot, MiningInstallationStatus,
-    MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary, NetworkSnapshot, Notification,
-    NotificationLevel, OperationClass, OperationKind, OperationStatus, OperationUpdate,
-    OverviewReplicant, OverviewSnapshot, OverviewTravel, RefreshDelta, RefreshPhase,
-    RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary, RelayExpansionSummary, RelaySnapshot,
-    ReportsSnapshot, ReputationSummary, RequirementSummary, ResultSummary, RunOperationRequest,
-    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SettingsSnapshot,
-    SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
+    LeaderboardsSnapshot, LiveDelta, LiveMessage, MessageFreshness, MessagesSnapshot,
+    MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
+    NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
+    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
+    RefreshDelta, RefreshPhase, RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary,
+    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
+    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
+    SettingsSnapshot, SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
     SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartRefreshRequest,
     StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase,
     SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
@@ -141,6 +141,65 @@ static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const HTTP_REQUEST_ID_HEADER: &str = "x-replicant-request-id";
 const HTTP_HANDLER_TIME_HEADER: &str = "x-replicant-handler-time";
 const MAX_HTTP_REQUEST_ID_LEN: usize = 128;
+
+/// Per-request monotonic checkpoints shared by the boundary middleware.
+///
+/// Axum's `from_fn` middleware does not expose the underlying Tower
+/// `Service::call` synchronously, so `middleware_started` is the earliest
+/// timestamp available here: the first poll of the outer middleware future.
+/// It is intentionally not described as socket accept or write completion.
+struct HttpRequestTiming {
+    middleware_started: Instant,
+    pre_handler_nanos: AtomicU64,
+    handler_nanos: AtomicU64,
+    handler_observed: AtomicBool,
+}
+
+impl HttpRequestTiming {
+    fn new(middleware_started: Instant) -> Self {
+        Self {
+            middleware_started,
+            pre_handler_nanos: AtomicU64::new(0),
+            handler_nanos: AtomicU64::new(0),
+            handler_observed: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_handler_entry(&self) -> Instant {
+        let started = Instant::now();
+        self.pre_handler_nanos.store(
+            duration_nanos(started.saturating_duration_since(self.middleware_started)),
+            Ordering::Relaxed,
+        );
+        started
+    }
+
+    fn mark_handler_complete(&self, started: Instant) {
+        self.handler_nanos
+            .store(duration_nanos(started.elapsed()), Ordering::Relaxed);
+        self.handler_observed.store(true, Ordering::Relaxed);
+    }
+
+    fn pre_handler_ms(&self) -> u128 {
+        nanos_to_millis(self.pre_handler_nanos.load(Ordering::Relaxed))
+    }
+
+    fn handler_ms(&self) -> u128 {
+        nanos_to_millis(self.handler_nanos.load(Ordering::Relaxed))
+    }
+
+    fn handler_observed(&self) -> bool {
+        self.handler_observed.load(Ordering::Relaxed)
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn nanos_to_millis(nanos: u64) -> u128 {
+    u128::from(nanos) / 1_000_000
+}
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -318,6 +377,7 @@ pub struct AppState {
     /// rebuild the identical row set, previously once per request.
     device_rows: tokio::sync::Mutex<Option<(u64, Arc<Vec<DeviceSummary>>)>>,
     message_sync: Mutex<()>,
+    message_refresh: Mutex<()>,
     director_reconcile: Mutex<()>,
     director_wake: Notify,
     runtime_telemetry: Option<Arc<dyn RuntimeTelemetrySink>>,
@@ -344,6 +404,9 @@ impl AppState {
         workflow_telemetry: Option<Arc<dyn WorkflowTelemetrySink>>,
         runtime_telemetry: Option<Arc<dyn RuntimeTelemetrySink>>,
     ) -> Result<Arc<Self>, CatalogueError> {
+        if let Err(error) = repository.delete_document("messages", "inbox") {
+            tracing::warn!(error = %error, "legacy runtime message cache cleanup failed");
+        }
         let catalogue = OperationCatalogue::new()?;
         let mut supervisor = WorkflowSupervisor::with_managed_client(
             repository.clone(),
@@ -367,6 +430,7 @@ impl AppState {
             slice_revisions: StdMutex::new(BTreeMap::new()),
             device_rows: tokio::sync::Mutex::new(None),
             message_sync: Mutex::new(()),
+            message_refresh: Mutex::new(()),
             director_reconcile: Mutex::new(()),
             director_wake: Notify::new(),
             runtime_telemetry,
@@ -536,7 +600,68 @@ fn next_http_request_id() -> String {
     )
 }
 
+/// Records the handler entry/completion boundary inside the request trace.
+///
+/// This middleware runs after authentication and routing middleware. Its
+/// completion timestamp is the point at which the handler has constructed the
+/// response; body writes happen later in Hyper and are intentionally not
+/// attributed here.
+async fn trace_http_handler(request: Request<axum::body::Body>, next: Next) -> Response {
+    let timing = request
+        .extensions()
+        .get::<Arc<HttpRequestTiming>>()
+        .cloned();
+    let request_id = request
+        .headers()
+        .get(HTTP_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_owned();
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned())
+        .unwrap_or_else(|| "<unmatched>".to_owned());
+    let handler_started = timing
+        .as_ref()
+        .map(|timing| timing.mark_handler_entry())
+        .unwrap_or_else(Instant::now);
+
+    tracing::debug!(
+        event = "daemon.http.handler_entry",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        route = %route,
+        "daemon HTTP handler entered"
+    );
+
+    let response = next.run(request).await;
+    if let Some(timing) = timing {
+        timing.mark_handler_complete(handler_started);
+    }
+    let handler_ms = handler_started.elapsed().as_millis();
+    tracing::debug!(
+        event = "daemon.http.handler_complete",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        route = %route,
+        status = response.status().as_u16(),
+        daemon_handler_ms = handler_ms,
+        "daemon HTTP handler completed and response was constructed"
+    );
+    response
+}
+
 async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) -> Response {
+    // `from_fn` has no synchronous Tower `Service::call` hook. This is the
+    // earliest boundary exposed by Axum's middleware API, and does not claim
+    // socket accept/read or response write completion.
+    let started = Instant::now();
+    let timing = Arc::new(HttpRequestTiming::new(started));
     let request_id = request
         .headers()
         .get(HTTP_REQUEST_ID_HEADER)
@@ -548,6 +673,7 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
         HTTP_REQUEST_ID_HEADER,
         header::HeaderValue::from_str(&request_id).expect("sanitized request ID is a valid header"),
     );
+    request.extensions_mut().insert(timing.clone());
 
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -563,51 +689,69 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
         path = %path,
         route = %route,
     );
-    let started = Instant::now();
     tracing::debug!(
         parent: &span,
+        event = "daemon.http.middleware_started",
         request_id = %request_id,
         method = %method,
         path = %path,
         route = %route,
-        "daemon HTTP request started"
+        "daemon HTTP request middleware started"
     );
+
     let mut response = next.run(request).instrument(span).await;
     let status = response.status();
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis();
-    let handler_ms = elapsed_ms;
+    let daemon_pre_handler_ms = timing.pre_handler_ms();
+    let daemon_handler_ms = timing.handler_ms();
+    let daemon_response_constructed_ms = elapsed_ms;
+    let handler_header_duration = if timing.handler_observed() {
+        Duration::from_nanos(timing.handler_nanos.load(Ordering::Relaxed))
+    } else {
+        elapsed
+    };
     response.headers_mut().insert(
         HTTP_REQUEST_ID_HEADER,
         header::HeaderValue::from_str(&request_id).expect("sanitized request ID is a valid header"),
     );
     response.headers_mut().insert(
         HTTP_HANDLER_TIME_HEADER,
-        header::HeaderValue::from_str(&format!("{:.6}", elapsed.as_secs_f64()))
+        header::HeaderValue::from_str(&format!("{:.6}", handler_header_duration.as_secs_f64()))
             .expect("finite handler duration is a valid header"),
     );
 
     let severity = http_trace_severity(status, elapsed_ms);
     match severity {
         HttpTraceSeverity::Error => tracing::error!(
+            event = "daemon.http.response_constructed",
             request_id = %request_id,
             method = %method,
             path = %path,
             route = %route,
             status = status.as_u16(),
             elapsed_ms,
-            handler_ms,
-            "daemon HTTP request failed"
+            handler_ms = daemon_handler_ms,
+            daemon_pre_handler_ms,
+            daemon_handler_ms,
+            daemon_response_constructed_ms,
+            handler_observed = timing.handler_observed(),
+            "daemon HTTP request failed; response was constructed (socket write is unmeasured)"
         ),
         HttpTraceSeverity::Warn => tracing::warn!(
+            event = "daemon.http.response_constructed",
             request_id = %request_id,
             method = %method,
             path = %path,
             route = %route,
             status = status.as_u16(),
             elapsed_ms,
-            handler_ms,
-            "daemon HTTP request rejected"
+            handler_ms = daemon_handler_ms,
+            daemon_pre_handler_ms,
+            daemon_handler_ms,
+            daemon_response_constructed_ms,
+            handler_observed = timing.handler_observed(),
+            "daemon HTTP request rejected; response was constructed (socket write is unmeasured)"
         ),
         HttpTraceSeverity::Slow => tracing::warn!(
             event = "daemon.http_slow",
@@ -617,18 +761,27 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
             route = %route,
             status = status.as_u16(),
             elapsed_ms,
-            handler_ms,
-            "daemon HTTP request exceeded responsiveness threshold"
+            handler_ms = daemon_handler_ms,
+            daemon_pre_handler_ms,
+            daemon_handler_ms,
+            daemon_response_constructed_ms,
+            handler_observed = timing.handler_observed(),
+            "daemon HTTP request exceeded responsiveness threshold; response was constructed (socket write is unmeasured)"
         ),
         HttpTraceSeverity::Debug => tracing::debug!(
+            event = "daemon.http.response_constructed",
             request_id = %request_id,
             method = %method,
             path = %path,
             route = %route,
             status = status.as_u16(),
             elapsed_ms,
-            handler_ms,
-            "daemon HTTP request completed"
+            handler_ms = daemon_handler_ms,
+            daemon_pre_handler_ms,
+            daemon_handler_ms,
+            daemon_response_constructed_ms,
+            handler_observed = timing.handler_observed(),
+            "daemon HTTP request completed; response was constructed (socket write is unmeasured)"
         ),
     }
     response
@@ -690,6 +843,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/trade/bill/find", post(find_bill))
         .route("/api/reports", get(reports))
         .route("/api/messages", get(messages))
+        .route("/api/messages/refresh", post(refresh_messages))
         .route("/api/messages/read", post(mark_messages_read))
         .route("/api/bobnet", get(bobnet))
         .route("/api/network", get(network))
@@ -736,6 +890,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/workflows/{id}/pause", post(pause_workflow))
         .route("/api/workflows/{id}/resume", post(resume_workflow))
         .route("/api/workflows/{id}/cancel", post(cancel_workflow))
+        // Layers execute from last added to first: tracing is outermost,
+        // authentication follows it, and handler timing is nearest routes.
+        .layer(middleware::from_fn(trace_http_handler))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(middleware::from_fn(trace_http_request))
         .layer(
@@ -1269,7 +1426,6 @@ fn publish_workflow_updates(
             if let Some(delta) = delta {
                 state.publish(delta);
                 for slice in [
-                    DomainSlice::Entities,
                     DomainSlice::Workflows,
                     DomainSlice::Overview,
                     DomainSlice::Devices,
@@ -1411,15 +1567,27 @@ async fn start_refresh(
             "refresh read budget must be between 1 and 60 requests per minute",
         ));
     }
+    let phases = request
+        .phases
+        .into_iter()
+        .map(managed_refresh_phase)
+        .collect::<BTreeSet<_>>();
+    let refreshes_messages = phases.is_empty() || phases.contains(&ManagedRefreshPhase::Messages);
+    let _message_refresh_guard = if refreshes_messages {
+        Some(state.message_refresh.lock().await)
+    } else {
+        None
+    };
+    let _message_ordering_guard = if refreshes_messages {
+        Some(state.message_sync.lock().await)
+    } else {
+        None
+    };
     let status = state
         .client()
         .refresh()
         .start(ManagedRefreshRequest {
-            phases: request
-                .phases
-                .into_iter()
-                .map(managed_refresh_phase)
-                .collect(),
+            phases,
             mode: if request.dry_run {
                 ManagedRefreshMode::DryRun
             } else {
@@ -3902,19 +4070,121 @@ fn trace_endpoint_phase(endpoint: &'static str, phase: &'static str, elapsed: Du
 async fn messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
-    let lock_started = Instant::now();
-    let _guard = state.message_sync.lock().await;
-    trace_endpoint_phase("messages", "lock_wait", lock_started.elapsed());
-    let remote_started = Instant::now();
-    let inbox = state.client().messages().list().await.map_err(|error| {
-        tracing::warn!(error = %error, "account message projection refresh failed");
-        ApiError::unavailable()
+    let inbox = state.client().messages().cached().map_err(|error| {
+        tracing::error!(error = %error, "reading committed message projection failed");
+        ApiError::internal()
     })?;
-    trace_endpoint_phase("messages", "remote_refresh", remote_started.elapsed());
-    if let Err(error) = state.repository.delete_document("messages", "inbox") {
-        tracing::warn!(error = %error, "legacy runtime message cache cleanup failed");
+    let stale = message_projection_stale(&inbox);
+    state.record_runtime_telemetry("messages.projection_read", "local", 1, None);
+    tracing::debug!(
+        event = "messages.projection_read",
+        stale,
+        "committed message projection read"
+    );
+    if stale || inbox.last_error.is_some() {
+        state.record_runtime_telemetry("messages.projection_stale_served", "cached", 1, None);
+        tracing::warn!(
+            event = "messages.projection_stale_served",
+            revision = inbox.revision,
+            stale,
+            refresh_failed = inbox.last_error.is_some(),
+            "serving stale or degraded committed message projection"
+        );
     }
     Ok(Json(Versioned::current(messages_snapshot(&state, inbox)?)))
+}
+
+async fn refresh_messages(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
+    let inbox = refresh_message_projection(&state, "explicit").await?;
+    Ok(Json(Versioned::current(messages_snapshot(&state, inbox)?)))
+}
+
+async fn refresh_message_projection(
+    state: &Arc<AppState>,
+    trigger: &'static str,
+) -> Result<replicant_client::managed::MessageInbox, ApiError> {
+    let _refresh_guard = match state.message_refresh.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state.record_runtime_telemetry("messages.refresh_joined", trigger, 1, None);
+            tracing::debug!(
+                event = "messages.refresh_joined",
+                trigger,
+                "joining in-flight message refresh"
+            );
+            let guard = state.message_refresh.lock().await;
+            drop(guard);
+            return state.client().messages().cached().map_err(|error| {
+                tracing::error!(error = %error, "reading joined message refresh result failed");
+                ApiError::internal()
+            });
+        }
+    };
+    let started = Instant::now();
+    state.record_runtime_telemetry("messages.refresh_started", trigger, 1, None);
+    tracing::debug!(
+        event = "messages.refresh_started",
+        trigger,
+        "message projection refresh started"
+    );
+
+    let _ordering_guard = state.message_sync.lock().await;
+    match state.client().messages().refresh().await {
+        Ok(inbox) => {
+            let elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            state.record_runtime_telemetry(
+                "messages.refresh_completed",
+                trigger,
+                1,
+                Some(elapsed_ms),
+            );
+            tracing::info!(
+                event = "messages.refresh_completed",
+                trigger,
+                elapsed_ms,
+                revision = inbox.revision,
+                "message projection refresh completed"
+            );
+            state.invalidate(DomainSlice::Messages);
+            Ok(inbox)
+        }
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            state.record_runtime_telemetry("messages.refresh_failed", trigger, 1, Some(elapsed_ms));
+            tracing::warn!(
+                event = "messages.refresh_failed",
+                trigger,
+                elapsed_ms,
+                error = %error,
+                "message projection refresh failed; retaining committed inbox"
+            );
+            let inbox = state
+                .client()
+                .messages()
+                .record_refresh_failure("Remote message refresh failed")
+                .map_err(|persistence_error| {
+                    tracing::error!(
+                        error = %persistence_error,
+                        "persisting message refresh degradation failed"
+                    );
+                    ApiError::internal()
+                })?;
+            state.invalidate(DomainSlice::Messages);
+            Ok(inbox)
+        }
+    }
+}
+
+fn message_projection_stale(inbox: &replicant_client::managed::MessageInbox) -> bool {
+    const FRESH_FOR: Duration = Duration::from_secs(30);
+    inbox.refreshed_at.is_none_or(|refreshed_at| {
+        replicant_client::domain::ObservationTime::now()
+            .unix_millis()
+            .saturating_sub(refreshed_at.unix_millis())
+            >= FRESH_FOR.as_millis() as i64
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -3996,14 +4266,23 @@ fn messages_snapshot(
     state: &AppState,
     inbox: replicant_client::managed::MessageInbox,
 ) -> Result<MessagesSnapshot, ApiError> {
+    let freshness = MessageFreshness {
+        last_refresh_at: inbox.refreshed_at.map(|time| time.unix_millis()),
+        stale: message_projection_stale(&inbox),
+        last_error: inbox.last_error.clone(),
+    };
+    let mut metadata = state.snapshot_metadata()?;
+    metadata.revision = inbox.revision;
     Ok(MessagesSnapshot {
-        metadata: state.snapshot_metadata()?,
+        metadata,
         inbox: inbox
             .messages
             .into_iter()
             .map(inbox_message_summary)
             .collect(),
         unread_count: inbox.unread_count,
+        last_cursor: inbox.last_cursor,
+        freshness,
     })
 }
 
@@ -6470,6 +6749,32 @@ async fn reconcile_director_background(state: &Arc<AppState>, trigger: &'static 
     }
 }
 
+/// Refreshes the durable inbox at startup and periodically until shutdown.
+pub async fn run_message_refresh(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tracing::info!("message projection background refresh loop started");
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(error) = refresh_message_projection(&state, "interval").await {
+                    tracing::error!(
+                        status = error.status.as_u16(),
+                        code = error.code,
+                        "message projection background refresh could not serve committed state"
+                    );
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    tracing::info!("message projection background refresh loop stopped");
+}
+
 /// Periodically reconciles standing empire goals against managed world state.
 pub async fn run_director(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -7430,7 +7735,40 @@ mod tests {
             response.headers().get(HTTP_REQUEST_ID_HEADER).unwrap(),
             "browser-123"
         );
-        assert!(response.headers().contains_key(HTTP_HANDLER_TIME_HEADER));
+        let handler_time = response
+            .headers()
+            .get(HTTP_HANDLER_TIME_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("numeric handler duration");
+        assert!(handler_time.is_finite());
+
+        let error_response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/not-a-route")
+                    .header(HTTP_REQUEST_ID_HEADER, "error-correlation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("not-found response");
+        assert_eq!(error_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_response
+                .headers()
+                .get(HTTP_REQUEST_ID_HEADER)
+                .unwrap(),
+            "error-correlation"
+        );
+        assert!(
+            error_response
+                .headers()
+                .get(HTTP_HANDLER_TIME_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(f64::is_finite)
+        );
 
         let response = app
             .oneshot(
@@ -8313,8 +8651,7 @@ mod tests {
         let initial = app
             .clone()
             .oneshot(
-                Request::builder()
-                    .uri("/api/messages")
+                Request::post("/api/messages/refresh")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -8342,6 +8679,337 @@ mod tests {
         assert_eq!(response.payload.inbox[1].id, Some(1));
         assert_eq!(response.payload.inbox[1].is_read, Some(true));
         client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn ordinary_message_get_stays_local_during_ten_second_upstream_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 1, "title": "Committed", "is_read": false}],
+                "unread_message_count": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        let refresh = app
+            .clone()
+            .oneshot(
+                Request::post("/api/messages/refresh")
+                    .body(Body::empty())
+                    .expect("refresh request"),
+            )
+            .await
+            .expect("refresh response");
+        assert_eq!(refresh.status(), StatusCode::OK);
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(10))
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::get("/api/messages")
+                    .body(Body::empty())
+                    .expect("messages request"),
+            )
+            .await
+            .expect("messages response");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "committed GET took {elapsed:?}"
+        );
+        let response = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(response).await)
+            .expect("typed message response");
+        assert_eq!(
+            response.payload.inbox[0].title.as_deref(),
+            Some("Committed")
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_the_committed_inbox() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 1, "title": "Committed", "is_read": false}],
+                "unread_message_count": 1
+            })))
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        let seeded = app
+            .clone()
+            .oneshot(
+                Request::post("/api/messages/refresh")
+                    .body(Body::empty())
+                    .expect("seed request"),
+            )
+            .await
+            .expect("seed response");
+        let seeded = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(seeded).await)
+            .expect("seeded message response");
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("cursor", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 2, "title": "Uncommitted", "is_read": false}],
+                "next_cursor": 2,
+                "unread_message_count": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .and(query_param("cursor", "2"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let degraded = app
+            .oneshot(
+                Request::post("/api/messages/refresh")
+                    .body(Body::empty())
+                    .expect("failed refresh request"),
+            )
+            .await
+            .expect("failed refresh response");
+        assert_eq!(degraded.status(), StatusCode::OK);
+        let degraded = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(degraded).await)
+            .expect("degraded message response");
+        assert_eq!(degraded.payload.inbox, seeded.payload.inbox);
+        assert_eq!(degraded.payload.unread_count, seeded.payload.unread_count);
+        assert_eq!(degraded.payload.last_cursor, seeded.payload.last_cursor);
+        assert_eq!(
+            degraded.payload.metadata.revision,
+            seeded.payload.metadata.revision
+        );
+        assert_eq!(
+            degraded.payload.freshness.last_error.as_deref(),
+            Some("Remote message refresh failed")
+        );
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn concurrent_message_refreshes_join_one_upstream_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({"messages": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        let request = || {
+            Request::post("/api/messages/refresh")
+                .body(Body::empty())
+                .expect("refresh request")
+        };
+        let (left, right) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+        assert_eq!(left.expect("first refresh").status(), StatusCode::OK);
+        assert_eq!(right.expect("joined refresh").status(), StatusCode::OK);
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn mark_read_cannot_be_regressed_by_an_overlapping_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 1, "title": "Race", "is_read": false}],
+                "unread_message_count": 1
+            })))
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+        let seeded = app
+            .clone()
+            .oneshot(
+                Request::post("/api/messages/refresh")
+                    .body(Body::empty())
+                    .expect("seed request"),
+            )
+            .await
+            .expect("seed response");
+        assert_eq!(seeded.status(), StatusCode::OK);
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({
+                        "messages": [{"id": 1, "title": "Race", "is_read": false}],
+                        "unread_message_count": 1
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/read"))
+            .and(body_json(serde_json::json!({"ids": [1]})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let refresh_app = app.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_app
+                .oneshot(
+                    Request::post("/api/messages/refresh")
+                        .body(Body::empty())
+                        .expect("refresh request"),
+                )
+                .await
+                .expect("refresh response")
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let marked = app
+            .clone()
+            .oneshot(
+                Request::post("/api/messages/read")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":[1]}"#))
+                    .expect("mark-read request"),
+            )
+            .await
+            .expect("mark-read response");
+        assert_eq!(
+            refresh.await.expect("refresh task").status(),
+            StatusCode::OK
+        );
+        assert_eq!(marked.status(), StatusCode::OK);
+
+        let current = app
+            .oneshot(
+                Request::get("/api/messages")
+                    .body(Body::empty())
+                    .expect("current request"),
+            )
+            .await
+            .expect("current response");
+        let current = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(current).await)
+            .expect("typed message response");
+        assert_eq!(current.payload.inbox[0].is_read, Some(true));
+        assert_eq!(current.payload.unread_count, Some(0));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn startup_serves_existing_durable_messages_without_upstream() {
+        let database = std::env::temp_dir().join(format!(
+            "replicant-messages-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "messages": [{"id": 7, "title": "Durable", "is_read": false}],
+                "unread_message_count": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let first_client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .sqlite(&database)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start first client");
+        let first_state = AppState::new(
+            first_client.clone(),
+            RuntimeConfig::new("test"),
+            Arc::new(WorkflowRepository::open_in_memory().expect("runtime database")),
+            test_daemon_config(),
+        )
+        .expect("first app state");
+        let first_app = router(first_state);
+        let refresh = first_app
+            .oneshot(
+                Request::post("/api/messages/refresh")
+                    .body(Body::empty())
+                    .expect("refresh request"),
+            )
+            .await
+            .expect("refresh response");
+        assert_eq!(refresh.status(), StatusCode::OK);
+        first_client.close().await.expect("close first client");
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_secs(10)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let second_client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .sqlite(&database)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restart client");
+        let second_state = AppState::new(
+            second_client.clone(),
+            RuntimeConfig::new("test"),
+            Arc::new(WorkflowRepository::open_in_memory().expect("runtime database")),
+            test_daemon_config(),
+        )
+        .expect("second app state");
+        let response = router(second_state)
+            .oneshot(
+                Request::get("/api/messages")
+                    .body(Body::empty())
+                    .expect("messages request"),
+            )
+            .await
+            .expect("messages response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = serde_json::from_value::<Versioned<MessagesSnapshot>>(json(response).await)
+            .expect("typed message response");
+        assert_eq!(response.payload.inbox[0].title.as_deref(), Some("Durable"));
+        second_client.close().await.expect("close second client");
+        let _ = std::fs::remove_file(replicant_client::default_history_database_path(&database));
+        let _ = std::fs::remove_file(&database);
     }
 
     #[tokio::test]
@@ -9617,7 +10285,6 @@ mod tests {
             panic!("expected a coalesced domain invalidation");
         };
         for expected in [
-            DomainSlice::Entities,
             DomainSlice::Workflows,
             DomainSlice::Overview,
             DomainSlice::Devices,
@@ -9627,6 +10294,10 @@ mod tests {
         ] {
             assert!(slices.contains_key(&expected), "missing slice {expected:?}");
         }
+        assert!(
+            !slices.contains_key(&DomainSlice::Entities),
+            "complete workflow deltas must not trigger a full entity-index reload"
+        );
         assert!(
             slices
                 .values()

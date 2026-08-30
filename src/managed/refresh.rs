@@ -1665,6 +1665,7 @@ async fn refresh_events(client: &Client, run_id: &RefreshRunId, mode: RefreshMod
 async fn refresh_messages(client: &Client, run_id: &RefreshRunId, mode: RefreshMode) -> Result<()> {
     let saved = load_checkpoint(client, run_id, RefreshPhase::Messages).await?;
     let mut cursor = saved.get("next_cursor").and_then(Value::as_i64);
+    let mut last_cursor = saved.get("last_cursor").and_then(Value::as_i64);
     let mut pages = saved.get("pages").and_then(Value::as_u64).unwrap_or(0);
     let mut items = saved.get("messages").and_then(Value::as_u64).unwrap_or(0);
     let mut unread = saved
@@ -1710,11 +1711,8 @@ async fn refresh_messages(client: &Client, run_id: &RefreshRunId, mode: RefreshM
             )
             .await?;
         }
-        if mode == RefreshMode::Apply {
-            client
-                .managed_state()
-                .persist_messages(&observations)
-                .map_err(super::client::store_error)?;
+        if let Some(page_last_id) = observations.last().and_then(|message| message.value.id) {
+            last_cursor = next.or(Some(page_last_id)).or(last_cursor);
         }
         unread = response.value.unread_message_count.unwrap_or(unread);
         pages += 1;
@@ -1724,20 +1722,34 @@ async fn refresh_messages(client: &Client, run_id: &RefreshRunId, mode: RefreshM
             client,
             run_id,
             RefreshPhase::Messages,
-            json!({"next_cursor":cursor,"pages":pages,"messages":items,"unread_count":unread}),
+            json!({"next_cursor":cursor,"last_cursor":last_cursor,"pages":pages,"messages":items,"unread_count":unread}),
             (pages, items),
             (cursor.is_none(), true),
         )
         .await?;
         if cursor.is_none() {
             if mode == RefreshMode::Apply {
+                let observations = staged_payloads::<
+                    crate::domain::Observation<crate::domain::Message>,
+                >(client, run_id, RefreshPhase::Messages)
+                .await?;
+                let metadata = client
+                    .managed_state()
+                    .messages()
+                    .map_err(super::client::store_error)?
+                    .1;
                 client
                     .managed_state()
-                    .persist_message_metadata(MessageMetadata {
-                        last_cursor: cursor,
-                        unread_count: Some(unread),
-                        refreshed_at: Some(ObservationTime::now()),
-                    })
+                    .commit_messages_and_metadata(
+                        &observations,
+                        MessageMetadata {
+                            last_cursor,
+                            unread_count: Some(unread),
+                            refreshed_at: Some(ObservationTime::now()),
+                            revision: metadata.revision,
+                            last_error: None,
+                        },
+                    )
                     .map_err(super::client::store_error)?;
             }
             return Ok(());

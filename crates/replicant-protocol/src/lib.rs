@@ -1617,6 +1617,17 @@ pub struct BobnetMessageSummary {
     pub created_at: Option<String>,
 }
 
+/// Freshness and degradation metadata for the account notification inbox.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessageFreshness {
+    /// Timestamp of the last successful refresh, in Unix milliseconds.
+    pub last_refresh_at: Option<i64>,
+    /// Whether the cached inbox is stale.
+    pub stale: bool,
+    /// Error from the most recent attempted refresh, when one occurred.
+    pub last_error: Option<String>,
+}
+
 /// Typed account notification inbox projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessagesSnapshot {
@@ -1626,6 +1637,10 @@ pub struct MessagesSnapshot {
     pub inbox: Vec<InboxMessageSummary>,
     /// Account-wide unread count when supplied.
     pub unread_count: Option<i64>,
+    /// Upstream incremental-sync cursor.
+    pub last_cursor: Option<i64>,
+    /// Freshness and degradation state for the durable inbox.
+    pub freshness: MessageFreshness,
 }
 
 /// One owned replicant that can be selected as a BobNet sender.
@@ -3658,6 +3673,12 @@ mod tests {
             metadata: intelligence_metadata.clone(),
             inbox: Vec::new(),
             unread_count: None,
+            last_cursor: Some(12),
+            freshness: MessageFreshness {
+                last_refresh_at: Some(1),
+                stale: false,
+                last_error: None,
+            },
         }));
         round_trip(&Versioned::current(BobnetSnapshot {
             metadata: intelligence_metadata.clone(),

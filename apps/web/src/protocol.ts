@@ -826,10 +826,21 @@ export interface BobnetMessageSummary {
   created_at: string | null;
 }
 
+export interface MessageFreshness {
+  /** Timestamp of the last successful refresh, in Unix milliseconds. */
+  last_refresh_at: number | null;
+  /** Whether the cached inbox is stale. */
+  stale: boolean;
+  /** Error from the most recent attempted refresh, when one occurred. */
+  last_error: string | null;
+}
+
 export interface MessagesSnapshot {
   metadata: SnapshotMetadata;
   inbox: InboxMessageSummary[];
   unread_count: number | null;
+  last_cursor: number | null;
+  freshness: MessageFreshness;
 }
 
 export interface BobnetReplicantSummary {
@@ -3280,6 +3291,23 @@ export function parseReportsResponse(
   });
 }
 
+function messageFreshness(value: unknown): MessageFreshness {
+  if (value === undefined) {
+    return { last_refresh_at: null, stale: false, last_error: null };
+  }
+  const freshness = record(value, "message freshness");
+  if (typeof freshness.stale !== "boolean")
+    throw new Error("Invalid message freshness");
+  return {
+    last_refresh_at: optionalInteger(
+      freshness.last_refresh_at,
+      "message refresh time",
+    ),
+    stale: freshness.stale,
+    last_error: optionalString(freshness.last_error, "message refresh error"),
+  };
+}
+
 export function parseMessagesResponse(
   value: unknown,
 ): Versioned<MessagesSnapshot> {
@@ -3302,6 +3330,8 @@ export function parseMessagesResponse(
         };
       }),
       unread_count: optionalFiniteNumber(snapshot.unread_count, "unread count"),
+      last_cursor: optionalInteger(snapshot.last_cursor, "message cursor"),
+      freshness: messageFreshness(snapshot.freshness),
     };
   });
 }
