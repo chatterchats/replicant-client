@@ -90,6 +90,7 @@ export function GalaxyPage({
   const galaxyRevision = useGalaxyRevision();
   const deviceQuery = useDomainQuery({
     slice: "devices",
+    queryKey: "devices",
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) => snapshot.devices.length === 0,
   });
@@ -106,17 +107,25 @@ export function GalaxyPage({
   const latestRevision = useRef(galaxyRevision);
   const loading = useRef(false);
   const mounted = useRef(true);
+  const sceneController = useRef<AbortController | undefined>(undefined);
 
   useEffect(() => {
+    const controller = new AbortController();
+    sceneController.current = controller;
     mounted.current = true;
     return () => {
       mounted.current = false;
+      controller.abort();
+      if (sceneController.current === controller)
+        sceneController.current = undefined;
     };
   }, []);
 
   useEffect(() => {
     latestRevision.current = galaxyRevision;
     if (loading.current) return;
+    const controller = sceneController.current;
+    if (!controller) return;
     loading.current = true;
     void (async () => {
       try {
@@ -124,7 +133,8 @@ export function GalaxyPage({
         do {
           requestedRevision = latestRevision.current;
           const started = performance.now();
-          const next = await daemonApi.galaxyScene();
+          const next = await daemonApi.galaxyScene(controller.signal);
+          if (controller.signal.aborted || !mounted.current) return;
           recordWebEvent(
             "info",
             "frontend.galaxy_scene_loaded",
@@ -139,20 +149,20 @@ export function GalaxyPage({
               workflow_targets: next.workflow_targets.length,
             },
           );
-          if (!mounted.current) return;
           setScene((current) =>
             current?.revision === next.revision ? current : next,
           );
           setError(undefined);
         } while (latestRevision.current !== requestedRevision);
       } catch (reason: unknown) {
+        if (controller.signal.aborted || !mounted.current) return;
         recordWebEvent(
           "error",
           "frontend.galaxy_scene_failed",
           "galaxy scene projection failed",
           { error: String(reason).slice(0, 500) },
         );
-        if (mounted.current) setError(String(reason));
+        setError(String(reason));
       } finally {
         loading.current = false;
       }
@@ -254,12 +264,13 @@ export function GalaxyPage({
     void daemonApi
       .refreshLocations()
       .catch((reason: unknown) => {
+        if (!mounted.current) return;
         setError(
           reason instanceof Error ? reason.message : "Location refresh failed",
         );
       })
       .finally(() => {
-        setRefreshing(false);
+        if (mounted.current) setRefreshing(false);
       });
   };
 

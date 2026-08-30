@@ -16,6 +16,7 @@ export function ObservatoryPage({
 }) {
   const query = useDomainQuery({
     slice: "devices",
+    queryKey: "devices",
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) =>
       !snapshot.devices.some((device) =>

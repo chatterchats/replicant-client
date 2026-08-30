@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
 import { useDomainQuery } from "./domainQuery";
@@ -735,23 +735,33 @@ function TriggersView({
     (descriptor) =>
       `${descriptor.operation_class}:${descriptor.kind}` === targetKey,
   );
+  const mounted = useRef(true);
+  const triggerController = useRef<AbortController | undefined>(undefined);
 
-  const reload = () =>
-    daemonApi
-      .triggers()
+  const reload = () => {
+    if (!mounted.current) return Promise.resolve();
+    triggerController.current?.abort();
+    const controller = new AbortController();
+    triggerController.current = controller;
+    return daemonApi
+      .triggers(controller.signal)
       .then((items) => {
-        setTriggers(items);
+        if (!controller.signal.aborted) setTriggers(items);
       })
       .catch((reason: unknown) => {
-        setError(String(reason));
+        if (!controller.signal.aborted) setError(String(reason));
       });
+  };
 
   useEffect(() => {
+    mounted.current = true;
     void reload();
     const timer = window.setInterval(() => {
       void reload();
     }, 5000);
     return () => {
+      mounted.current = false;
+      triggerController.current?.abort();
       window.clearInterval(timer);
     };
   }, []);
@@ -1769,6 +1779,7 @@ export function AutomationsPage({
     void daemonApi
       .descriptors(controller.signal)
       .then((catalog) => {
+        if (controller.signal.aborted) return;
         const visibleWorkflows = catalog.workflows.filter(
           (descriptor) => descriptor.category !== "compatibility",
         );
@@ -1776,7 +1787,7 @@ export function AutomationsPage({
         setTriggerDescriptors([...catalog.actions, ...visibleWorkflows]);
       })
       .catch((reason: unknown) => {
-        setError(String(reason));
+        if (!controller.signal.aborted) setError(String(reason));
       });
     return () => {
       controller.abort();

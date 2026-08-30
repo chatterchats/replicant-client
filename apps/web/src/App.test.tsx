@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, relatedDeviceLabel, specializeDeviceCommand } from "./App";
 import type { DescriptorCommand } from "./CommandPalette";
 import { DaemonProvider } from "./daemon";
+import { sharedQueryCache } from "./queryCache";
 import type {
   AccountEventsSnapshot,
   AutofactorySnapshot,
@@ -253,6 +254,15 @@ function systemScene(system: string): SystemSceneSnapshot {
 const mockRefreshLocations = vi.hoisted(() =>
   vi.fn<(system?: string) => Promise<void>>(() => Promise.resolve()),
 );
+const mockEntities = vi.hoisted(() => vi.fn(() => Promise.resolve(entities)));
+const mockDevices = vi.hoisted(() => vi.fn(() => Promise.resolve(devices)));
+const mockMessages = vi.hoisted(() => vi.fn(() => Promise.resolve(messages)));
+const mockGalaxyScene = vi.hoisted(() =>
+  vi.fn((signal?: AbortSignal) => {
+    void signal;
+    return Promise.resolve(galaxyScene);
+  }),
+);
 
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
@@ -261,10 +271,10 @@ vi.mock("./api", async (importOriginal) => {
     daemonApi: {
       health: () => Promise.resolve(health),
       snapshot: () => Promise.resolve(snapshot),
-      entities: () => Promise.resolve(entities),
+      entities: mockEntities,
       descriptors: () => Promise.resolve(descriptors),
       overview: () => Promise.resolve(overview),
-      devices: () => Promise.resolve(devices),
+      devices: mockDevices,
       activity: () => Promise.resolve(activity),
       simulations: () => Promise.resolve(simulations),
       blueprints: () => Promise.resolve(blueprints),
@@ -280,13 +290,13 @@ vi.mock("./api", async (importOriginal) => {
       events: () => Promise.resolve(events),
       trade: () => Promise.resolve(trade),
       reports: () => Promise.resolve(reports),
-      messages: () => Promise.resolve(messages),
+      messages: mockMessages,
       bobnet: () => Promise.resolve(bobnet),
       network: () => Promise.resolve(network),
       standing: () => Promise.resolve(standing),
       leaderboards: () => Promise.resolve(leaderboards),
       settings: () => Promise.resolve(settings),
-      galaxyScene: () => Promise.resolve(galaxyScene),
+      galaxyScene: mockGalaxyScene,
       systemScene: (system: string) => Promise.resolve(systemScene(system)),
       refreshLocations: mockRefreshLocations,
       history: () => Promise.resolve([]),
@@ -359,6 +369,11 @@ describe("App navigation", () => {
   let container: HTMLDivElement;
 
   beforeEach(() => {
+    sharedQueryCache.clear();
+    mockEntities.mockClear();
+    mockDevices.mockClear();
+    mockMessages.mockClear();
+    mockGalaxyScene.mockClear();
     vi.stubGlobal("WebSocket", MockWebSocket);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -405,6 +420,44 @@ describe("App navigation", () => {
       ).toBeTruthy();
       expect(container.textContent).not.toContain(placeholderLede);
     }
+
+    expect(mockEntities).toHaveBeenCalledTimes(1);
+    expect(mockDevices).toHaveBeenCalledTimes(1);
+    expect(mockMessages).toHaveBeenCalledTimes(1);
+    expect(mockGalaxyScene).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a page-owned galaxy request when navigation unmounts the page", async () => {
+    mockGalaxyScene.mockImplementationOnce(
+      () => new Promise<GalaxySceneSnapshot>(() => undefined),
+    );
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <DaemonProvider>
+          <App />
+        </DaemonProvider>,
+      );
+      await flush();
+      await flush();
+    });
+
+    const navigate = async (destination: string) => {
+      const button = Array.from(
+        container.querySelectorAll<HTMLButtonElement>(".sidebar button"),
+      ).find((candidate) => candidate.textContent === destination);
+      await act(async () => {
+        button?.click();
+        await flush();
+      });
+    };
+    await navigate("Galaxy");
+    const signal = mockGalaxyScene.mock.calls[0]?.[0];
+    expect(signal?.aborted).toBe(false);
+
+    await navigate("Overview");
+
+    expect(signal?.aborted).toBe(true);
   });
 
   it("runs full, targeted, and palette location refreshes", async () => {

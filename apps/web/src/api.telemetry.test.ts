@@ -254,7 +254,9 @@ describe("daemon telemetry timing helpers", () => {
     });
     await flushWebTelemetry();
 
-    const events = telemetryEvents(fetchMock);
+    const events = telemetryEvents(fetchMock).filter(
+      ({ event }) => event === "frontend.daemon_http",
+    );
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       level: "info",
@@ -295,7 +297,11 @@ describe("daemon telemetry timing helpers", () => {
     await daemonApi.health();
     await flushWebTelemetry();
 
-    expect(telemetryEvents(fetchMock)).toEqual([
+    expect(
+      telemetryEvents(fetchMock).filter(
+        ({ event }) => event === "frontend.daemon_http",
+      ),
+    ).toEqual([
       expect.objectContaining({
         level: "warn",
         event: "frontend.daemon_http",
@@ -312,10 +318,11 @@ describe("daemon telemetry timing helpers", () => {
     await flushWebTelemetry();
 
     const events = telemetryEvents(fetchMock);
-    expect(
-      events.filter(({ event }) => event === "frontend.daemon_http"),
-    ).toHaveLength(1);
-    expect(events[0]?.fields).toMatchObject({
+    const daemonEvents = events.filter(
+      ({ event }) => event === "frontend.daemon_http",
+    );
+    expect(daemonEvents).toHaveLength(1);
+    expect(daemonEvents[0]?.fields).toMatchObject({
       proxy_request_id: "req-failed",
       status: 503,
     });

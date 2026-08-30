@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
 import type { FiniteExecution, EntityRef, WorkflowSummary } from "./protocol";
@@ -146,12 +146,23 @@ export function HistoryPage({
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [error, setError] = useState<string>();
   const [cancelling, setCancelling] = useState<string>();
+  const mounted = useRef(true);
+  const refreshController = useRef<AbortController | undefined>(undefined);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      refreshController.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     daemonApi
       .history(controller.signal)
-      .then(setExecutions)
+      .then((value) => {
+        if (!controller.signal.aborted) setExecutions(value);
+      })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(String(reason));
       });
@@ -198,13 +209,17 @@ export function HistoryPage({
     setCancelling(execution.id);
     try {
       await daemonApi.cancelAction(execution.id);
-      const updated = await daemonApi.history();
+      if (!mounted.current) return;
+      refreshController.current?.abort();
+      const controller = new AbortController();
+      refreshController.current = controller;
+      const updated = await daemonApi.history(controller.signal);
       setExecutions(updated);
       setSelected(updated.find((item) => item.id === execution.id));
     } catch (reason) {
-      setError(String(reason));
+      if (mounted.current) setError(String(reason));
     } finally {
-      setCancelling(undefined);
+      if (mounted.current) setCancelling(undefined);
     }
   };
 

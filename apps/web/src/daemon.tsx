@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import { daemonApi, daemonToken, daemonUrl } from "./api";
+import { sharedQueryCache, type QueryCacheSubscription } from "./queryCache";
 import { recordWebEvent } from "./telemetry";
 import {
   type AutomationControlAction,
@@ -328,6 +329,13 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(daemonReducer, initialDaemonState);
   const socketRef = useRef<WebSocket | undefined>(undefined);
   const lastDiagnosticState = useRef<string>("");
+  const entityQueryRef = useRef<QueryCacheSubscription | null>(null);
+  const entityInvalidationTimerRef = useRef<number | null>(null);
+  const initialized = state.revision !== null;
+  const entityInitialRevisionRef = useRef("0");
+  entityInitialRevisionRef.current = String(
+    state.invalidated.entities ?? state.revision ?? 0,
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -411,6 +419,13 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
           daemonApi.entities(controller.signal),
         ]);
         if (controller.signal.aborted) return;
+        sharedQueryCache.seed(
+          "entities",
+          entities,
+          String(
+            snapshot.slice_revisions.entities ?? entities.metadata.revision,
+          ),
+        );
         dispatch({ type: "snapshot", snapshot, health, entities });
         recordWebEvent(
           health.status === "healthy" ? "info" : "warn",
@@ -487,8 +502,15 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
           daemonApi.snapshot(controller.signal),
           daemonApi.entities(controller.signal),
         ]);
-        if (!controller.signal.aborted)
-          dispatch({ type: "snapshot", snapshot, health, entities });
+        if (controller.signal.aborted) return;
+        sharedQueryCache.seed(
+          "entities",
+          entities,
+          String(
+            snapshot.slice_revisions.entities ?? entities.metadata.revision,
+          ),
+        );
+        dispatch({ type: "snapshot", snapshot, health, entities });
       } catch (error) {
         if (!controller.signal.aborted) {
           dispatch({ type: "continuity_lost", error: String(error) });
@@ -505,19 +527,40 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, [state.needsResnapshot]);
 
   useEffect(() => {
-    if (state.invalidated.entities === undefined) return;
-    const controller = new AbortController();
-    void daemonApi
-      .entities(controller.signal)
-      .then((entities) => {
-        dispatch({ type: "entity_index", entities });
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted)
-          dispatch({ type: "continuity_lost", error: String(error) });
-      });
+    if (!initialized || entityQueryRef.current !== null) return;
+    const subscription = sharedQueryCache.subscribe(
+      "entities",
+      (signal) => daemonApi.entities(signal),
+      entityInitialRevisionRef.current,
+      (event) => {
+        if (event.type === "success")
+          dispatch({ type: "entity_index", entities: event.data });
+        else if (event.type === "error")
+          dispatch({ type: "continuity_lost", error: String(event.error) });
+      },
+    );
+    entityQueryRef.current = subscription;
     return () => {
-      controller.abort();
+      subscription.unsubscribe();
+      if (entityQueryRef.current === subscription)
+        entityQueryRef.current = null;
+    };
+  }, [initialized]);
+
+  useEffect(() => {
+    const revision = state.invalidated.entities;
+    if (revision === undefined || entityQueryRef.current === null) return;
+    if (entityInvalidationTimerRef.current !== null)
+      clearTimeout(entityInvalidationTimerRef.current);
+    entityInvalidationTimerRef.current = window.setTimeout(() => {
+      entityInvalidationTimerRef.current = null;
+      entityQueryRef.current?.updateRevision(String(revision));
+    }, 1_500);
+    return () => {
+      if (entityInvalidationTimerRef.current !== null) {
+        clearTimeout(entityInvalidationTimerRef.current);
+        entityInvalidationTimerRef.current = null;
+      }
     };
   }, [state.invalidated.entities]);
 
@@ -545,11 +588,17 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         health: state.health?.status ?? null,
         sync_phase: state.sync?.phase ?? null,
         revision: state.revision,
-        detail: (state.sync?.detail ?? state.health?.detail ?? "").slice(0, 500),
+        detail: (state.sync?.detail ?? state.health?.detail ?? "").slice(
+          0,
+          500,
+        ),
       },
     );
   }, [
     state.connection,
+    state.health,
+    state.revision,
+    state.sync,
     state.health?.detail,
     state.health?.status,
     state.sync?.detail,

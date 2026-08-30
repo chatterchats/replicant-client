@@ -94,10 +94,12 @@ pub(crate) struct EventEngine {
     subscribers: broadcast::Sender<Event>,
     applier_sender: tokio::sync::mpsc::Sender<ApplyRequest>,
     applier_receiver: Mutex<Option<tokio::sync::mpsc::Receiver<ApplyRequest>>>,
+    last_apply_lag_ms: AtomicU64,
 }
 
 struct ApplyRequest {
     event: GameEvent,
+    enqueued_at: Instant,
     completed: tokio::sync::oneshot::Sender<Result<()>>,
 }
 
@@ -109,6 +111,7 @@ impl EventEngine {
             subscribers,
             applier_sender,
             applier_receiver: Mutex::new(Some(applier_receiver)),
+            last_apply_lag_ms: AtomicU64::new(0),
         }
     }
 
@@ -123,10 +126,22 @@ impl EventEngine {
     async fn enqueue(&self, event: GameEvent) -> Result<()> {
         let (completed, result) = tokio::sync::oneshot::channel();
         self.applier_sender
-            .send(ApplyRequest { event, completed })
+            .send(ApplyRequest {
+                event,
+                enqueued_at: Instant::now(),
+                completed,
+            })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
+    }
+
+    fn queue_depth(&self) -> usize {
+        APPLIER_QUEUE_CAPACITY.saturating_sub(self.applier_sender.capacity())
+    }
+
+    fn last_apply_lag_ms(&self) -> u64 {
+        self.last_apply_lag_ms.load(AtomicOrdering::Relaxed)
     }
 
     fn start_applier(&self, weak: WeakClient) -> Result<tokio::task::JoinHandle<()>> {
@@ -794,6 +809,11 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
             let _ = request.completed.send(Err(Error::Closed));
             continue;
         };
+        let apply_lag_ms = duration_millis(request.enqueued_at.elapsed());
+        client
+            .managed_events()
+            .last_apply_lag_ms
+            .store(apply_lag_ms, AtomicOrdering::Relaxed);
         let event_name = request.event.event.clone();
         let apply_client = client.clone();
         let event = request.event;
@@ -816,6 +836,15 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
             Ok(ApplyOutcome::Duplicate) => "duplicate",
             Err(_) => "failed",
         };
+        debug!(
+            target: "replicant_client::events",
+            event = "managed_sse.event_applied",
+            outcome,
+            apply_lag_ms,
+            apply_duration_ms = duration_millis(apply_started.elapsed()),
+            queue_depth = client.managed_events().queue_depth(),
+            "managed event application completed"
+        );
         client.record_event_telemetry(EventTelemetrySample {
             observed_at_ms: telemetry_now_millis(),
             metric: "event_apply",
@@ -967,7 +996,7 @@ async fn catch_up_unfiltered(
     let mut total_events = 0u64;
     info!(
         target: "replicant_client::events",
-        event = "events.catchup_started",
+        event = "managed_sse.catchup_started",
         cursor_present = cursor.is_some(),
         max_pages,
         "starting unfiltered event-log catch-up"
@@ -1041,7 +1070,7 @@ async fn catch_up_unfiltered(
                 {
                     info!(
                         target: "replicant_client::events",
-                        event = "events.catchup_completed",
+                        event = "managed_sse.catchup_completed",
                         pages,
                         elapsed_ms = total_started.elapsed().as_millis() as u64,
                         reason = "terminal_cursor",
@@ -1078,7 +1107,7 @@ async fn catch_up_unfiltered(
             None => {
                 info!(
                     target: "replicant_client::events",
-                    event = "events.catchup_completed",
+                    event = "managed_sse.catchup_completed",
                     pages,
                     elapsed_ms = total_started.elapsed().as_millis() as u64,
                     reason = "no_next_cursor",
@@ -1304,6 +1333,96 @@ async fn run_log_poll_loop(weak: WeakClient, interval: Duration, max_pages: usiz
     }
 }
 
+#[derive(Clone, Copy)]
+struct SseFailure {
+    reason: &'static str,
+    io_error_kind: &'static str,
+}
+
+fn reqwest_error_in_chain<'a>(
+    source: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a reqwest::Error> {
+    let mut current = Some(source);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            return Some(error);
+        }
+        current = error.source();
+    }
+    None
+}
+
+fn classify_sse_failure(error: &Error) -> SseFailure {
+    match error {
+        Error::Authentication { .. } => SseFailure {
+            reason: "auth_failure",
+            io_error_kind: "authentication",
+        },
+        Error::Contract { .. } | Error::RateLimited { .. } => SseFailure {
+            reason: "upstream_http",
+            io_error_kind: "http_status",
+        },
+        Error::Decode { .. } => SseFailure {
+            reason: "parser_error",
+            io_error_kind: "decode",
+        },
+        Error::Transport {
+            source: Some(source),
+            ..
+        } => {
+            if let Some(error) = reqwest_error_in_chain(source.as_ref()) {
+                let io_error_kind = if error.is_timeout() {
+                    if error.is_connect() {
+                        "connect_timeout"
+                    } else if error.is_body() {
+                        "body_timeout"
+                    } else {
+                        "request_timeout"
+                    }
+                } else if error.is_connect() {
+                    "connect"
+                } else if error.is_body() {
+                    "body"
+                } else if error.is_request() {
+                    "request"
+                } else {
+                    "transport"
+                };
+                SseFailure {
+                    reason: if error.is_timeout() {
+                        "local_read_timeout"
+                    } else {
+                        "unknown"
+                    },
+                    io_error_kind,
+                }
+            } else {
+                SseFailure {
+                    reason: "unknown",
+                    io_error_kind: "transport",
+                }
+            }
+        }
+        Error::Transport { source: None, .. } => SseFailure {
+            reason: "unknown",
+            io_error_kind: "transport",
+        },
+        Error::Persistence { .. } => SseFailure {
+            reason: "apply_error",
+            io_error_kind: "persistence",
+        },
+        Error::Configuration { .. }
+        | Error::AccountStoreMismatch { .. }
+        | Error::Operation { .. }
+        | Error::Closed => SseFailure {
+            reason: "unknown",
+            io_error_kind: "client",
+        },
+    }
+}
+
+const HEALTHY_SSE_SESSION_MIN: Duration = Duration::from_secs(10);
+
 /// The status to report when the SSE connection is not currently live.
 ///
 /// A connection that has never once been established leaves the client
@@ -1345,9 +1464,9 @@ async fn run_sse_loop(
         let connect_started = Instant::now();
         debug!(
             target: "replicant_client::events",
-            event = "events.sse_connect_started",
-            cursor = cursor.as_deref().unwrap_or(""),
-            backoff_ms = backoff.as_millis() as u64,
+            event = "managed_sse.connecting",
+            cursor_present = cursor.is_some(),
+            backoff_ms = duration_millis(backoff),
             "connecting filtered event stream"
         );
         match raw_client.events().stream(cursor.as_deref()).await {
@@ -1355,13 +1474,14 @@ async fn run_sse_loop(
                 let Some(client) = weak.upgrade() else {
                     return;
                 };
-                debug!(
+                let connect_ms = duration_millis(connect_started.elapsed());
+                info!(
                     target: "replicant_client::events",
-                    event = "events.sse_connected",
-                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    event = "managed_sse.connected",
+                    connect_ms,
+                    cursor_present = cursor.is_some(),
                     "filtered event stream connected"
                 );
-                let connect_ms = duration_millis(connect_started.elapsed());
                 client.record_event_telemetry(EventTelemetrySample {
                     observed_at_ms: telemetry_now_millis(),
                     metric: "sse_connect",
@@ -1375,9 +1495,12 @@ async fn run_sse_loop(
                     readiness.sse_connectivity = ReadinessComponent::Ready;
                 });
                 drop(client);
+
                 let session_started = Instant::now();
+                let mut last_event_at = None;
+                let mut last_event_id = cursor.clone();
                 let mut received_events = 0u64;
-                let disconnect_outcome = loop {
+                let failure = loop {
                     let next = stream.next().await;
                     let Some(client) = weak.upgrade() else {
                         return;
@@ -1385,52 +1508,91 @@ async fn run_sse_loop(
                     match next {
                         Some(Ok(event)) => {
                             received_events = received_events.saturating_add(1);
-                            if client.managed_events().enqueue(event).await.is_err() {
+                            last_event_at = Some(Instant::now());
+                            last_event_id = Some(event.id.clone());
+                            if let Err(error) = client.managed_events().enqueue(event).await {
                                 mark_event_continuity_degraded(&client);
-                                break "apply_error";
+                                break classify_sse_failure(&error);
                             }
                         }
-                        Some(Err(_)) => break "stream_error",
-                        None => break "eof",
+                        Some(Err(error)) => break classify_sse_failure(&error),
+                        None => {
+                            break SseFailure {
+                                reason: "upstream_close",
+                                io_error_kind: "eof",
+                            };
+                        }
                     }
                 };
+                let connection_age_ms = duration_millis(session_started.elapsed());
+                let idle_since_last_event_ms = last_event_at
+                    .map(|last_event_at| duration_millis(last_event_at.elapsed()))
+                    .unwrap_or(connection_age_ms);
                 if let Some(client) = weak.upgrade() {
+                    let queue_depth = client.managed_events().queue_depth();
+                    let apply_lag_ms = client.managed_events().last_apply_lag_ms();
+                    warn!(
+                        target: "replicant_client::events",
+                        event = "managed_sse.disconnected",
+                        connection_age_ms,
+                        idle_since_last_frame_ms = tracing::field::Empty,
+                        idle_since_last_event_ms,
+                        last_event_id = last_event_id.as_deref().unwrap_or(""),
+                        reason = failure.reason,
+                        io_error_kind = failure.io_error_kind,
+                        events_received = received_events,
+                        queue_depth,
+                        apply_lag_ms,
+                        "managed SSE connection disconnected"
+                    );
                     client.record_event_telemetry(EventTelemetrySample {
                         observed_at_ms: telemetry_now_millis(),
                         metric: "sse_disconnect",
-                        outcome: disconnect_outcome.to_owned(),
+                        outcome: failure.reason.to_owned(),
                         event_name: None,
                         event_count: received_events,
                         page_count: 0,
-                        duration_ms: Some(duration_millis(session_started.elapsed())),
+                        duration_ms: Some(connection_age_ms),
                     });
                 }
-                if received_events > 0 {
+                let healthy_interval = min_backoff
+                    .saturating_mul(10)
+                    .max(HEALTHY_SSE_SESSION_MIN);
+                if received_events > 0 || session_started.elapsed() >= healthy_interval {
                     backoff = min_backoff;
-                } else {
-                    debug!(target: "replicant_client::events", "event stream ended without an event");
                 }
             }
             Err(error) => {
                 let connect_ms = duration_millis(connect_started.elapsed());
+                let failure = classify_sse_failure(&error);
                 if let Some(client) = weak.upgrade() {
+                    let queue_depth = client.managed_events().queue_depth();
+                    let apply_lag_ms = client.managed_events().last_apply_lag_ms();
                     client.record_event_telemetry(EventTelemetrySample {
                         observed_at_ms: telemetry_now_millis(),
                         metric: "sse_connect",
-                        outcome: "failed".to_owned(),
+                        outcome: failure.reason.to_owned(),
                         event_name: None,
                         event_count: 0,
                         page_count: 0,
                         duration_ms: Some(connect_ms),
                     });
+                    warn!(
+                        target: "replicant_client::events",
+                        event = "managed_sse.disconnected",
+                        connection_age_ms = 0_u64,
+                        idle_since_last_frame_ms = tracing::field::Empty,
+                        idle_since_last_event_ms = 0_u64,
+                        last_event_id = cursor.as_deref().unwrap_or(""),
+                        reason = failure.reason,
+                        io_error_kind = failure.io_error_kind,
+                        events_received = 0_u64,
+                        queue_depth,
+                        apply_lag_ms,
+                        connect_ms,
+                        "managed SSE connection failed"
+                    );
                 }
-                warn!(
-                    target: "replicant_client::events",
-                    event = "events.sse_connect_failed",
-                    elapsed_ms = connect_ms,
-                    error = %error,
-                    "filtered event stream connection failed"
-                )
             }
         }
 
@@ -1441,6 +1603,12 @@ async fn run_sse_loop(
             readiness.sse_connectivity = ReadinessComponent::Degraded;
         });
         drop(client);
+        info!(
+            target: "replicant_client::events",
+            event = "managed_sse.reconnecting",
+            backoff_ms = duration_millis(backoff),
+            "waiting before managed SSE reconnect"
+        );
         tokio::time::sleep(backoff).await;
         backoff = backoff.saturating_mul(2).min(max_backoff);
     }
@@ -3712,6 +3880,150 @@ mod tests {
                 .event_cursor_is_stale(Duration::from_secs(3600))
                 .expect("staleness check")
         );
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_does_not_inherit_the_ordinary_request_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(75))
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("id: 1-0\ndata: {\"id\":\"1-0\",\"version\":1,\"category\":\"mining\",\"event\":\"mining.started\",\"created_at\":\"2026-07-25T00:00:00Z\"}\n\n"),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // Reproduce the old shared-client policy: reqwest's total timeout
+        // covers the streaming body and is classified as a local read timeout.
+        let legacy_http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .expect("legacy HTTP client");
+        let legacy_client = raw::Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .http_client(legacy_http)
+            .build()
+            .expect("legacy raw client");
+        let legacy_error = match legacy_client.events().stream(None).await {
+            Ok(_) => panic!("legacy total timeout should terminate SSE"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            classify_sse_failure(&legacy_error).reason,
+            "local_read_timeout"
+        );
+
+        let raw_client = raw::Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .request_timeout(Duration::from_millis(25))
+            .build()
+            .expect("raw client");
+
+        let mut stream = timeout(
+            Duration::from_secs(1),
+            raw_client.events().stream(None),
+        )
+        .await
+        .expect("SSE headers are not governed by the ordinary request timeout")
+        .expect("open SSE stream");
+        let event = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("event arrives")
+            .expect("stream item")
+            .expect("valid event");
+        assert_eq!(event.id, "1-0");
+    }
+
+    #[test]
+    fn sse_failures_have_stable_reason_categories() {
+        let parser = classify_sse_failure(&Error::Decode {
+            message: "invalid event".to_owned(),
+            status: Some(200),
+            source: None,
+        });
+        assert_eq!(parser.reason, "parser_error");
+        assert_eq!(parser.io_error_kind, "decode");
+
+        let authentication = classify_sse_failure(&Error::Authentication {
+            details: Box::default(),
+        });
+        assert_eq!(authentication.reason, "auth_failure");
+
+        let upstream_http = classify_sse_failure(&Error::Contract {
+            status: 503,
+            details: Box::default(),
+        });
+        assert_eq!(upstream_http.reason, "upstream_http");
+    }
+
+    #[tokio::test]
+    async fn clean_sse_close_records_an_explicit_disconnect_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(": keepalive\n\n"),
+            )
+            .mount(&server)
+            .await;
+        let telemetry = Arc::new(RecordingTelemetry::default());
+        let client = Client::builder()
+            .event_telemetry_sink(telemetry.clone())
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only telemetry client");
+        let applier = client
+            .managed_events()
+            .start_applier(client.downgrade())
+            .expect("start event applier");
+        client
+            .register_task(applier)
+            .await
+            .expect("register event applier");
+        let raw_client = raw::Client::builder()
+            .authentication_token(SecretString::from("token".to_string()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .build()
+            .expect("raw client");
+        let task = tokio::spawn(run_sse_loop(
+            client.downgrade(),
+            raw_client,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ));
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if telemetry
+                    .samples
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .any(|sample| {
+                        sample.metric == "sse_disconnect"
+                            && sample.outcome == "upstream_close"
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("categorized disconnect telemetry");
+
+        task.abort();
         client.close().await.expect("close");
     }
 

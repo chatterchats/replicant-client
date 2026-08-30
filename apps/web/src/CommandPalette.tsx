@@ -212,6 +212,7 @@ export function CommandPalette({
     void daemonApi
       .blueprints(controller.signal)
       .then((snapshot) => {
+        if (controller.signal.aborted) return;
         setBlueprintTypes(
           snapshot.blueprints.map((blueprint) => blueprint.device_type).sort(),
         );

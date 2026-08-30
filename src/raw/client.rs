@@ -160,7 +160,8 @@ pub struct ClientConfig {
     pub base_url: Url,
     /// Timeout for establishing a connection.
     pub connect_timeout: Duration,
-    /// Timeout for a complete request/response cycle.
+    /// Timeout for a complete ordinary request/response cycle. Long-lived SSE
+    /// streams retain only [`Self::connect_timeout`].
     pub request_timeout: Duration,
     /// User-Agent header sent with every request.
     pub user_agent: String,
@@ -294,8 +295,8 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the complete request timeout.
-    #[must_use]
+    /// Sets the complete timeout for ordinary requests. This does not impose a
+    /// total lifetime on the long-lived SSE response body.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.config.request_timeout = timeout;
         self
@@ -400,9 +401,8 @@ impl ClientBuilder {
         let client = if let Some(client) = self.http_client {
             client
         } else {
-            let builder = reqwest::Client::builder()
-                .connect_timeout(self.config.connect_timeout)
-                .timeout(self.config.request_timeout);
+            let builder =
+                reqwest::Client::builder().connect_timeout(self.config.connect_timeout);
             let builder = match self.config.tls_backend {
                 TlsBackend::Automatic => builder,
                 TlsBackend::Rustls => {
@@ -939,12 +939,15 @@ impl Client {
         let mut timings = AttemptProgress::default();
 
         let prepare_started = Instant::now();
-        let mut prepared = match self.prepare_request(
-            request.method.clone(),
-            request.path,
-            request.authenticated,
-            request.request_id,
-        ) {
+        let mut prepared = match self
+            .prepare_request(
+                request.method.clone(),
+                request.path,
+                request.authenticated,
+                request.request_id,
+            )
+            .map(|request| request.timeout(self.inner.config.request_timeout))
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 timings.request_prepare_ms = Some(duration_millis(prepare_started.elapsed()));

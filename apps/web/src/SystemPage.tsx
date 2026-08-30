@@ -318,6 +318,7 @@ function ClaimsPanel({
 }) {
   const { data, error } = useDomainQuery({
     slice: "devices",
+    queryKey: "devices",
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: (snapshot) =>
       !snapshot.devices.some(

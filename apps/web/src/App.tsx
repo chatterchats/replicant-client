@@ -56,6 +56,7 @@ import { NotificationCenter, NotificationToasts } from "./Notifications";
 import { absoluteTime, relativeTime } from "./time";
 import { recordWebEvent } from "./telemetry";
 import { daemonApi } from "./api";
+import { sharedQueryCache } from "./queryCache";
 import type {
   DescriptorCatalog,
   DeviceSummary,
@@ -276,6 +277,11 @@ export function App() {
       controller = new AbortController();
       try {
         const snapshot = await daemonApi.messages(controller.signal);
+        sharedQueryCache.seed(
+          "messages",
+          snapshot,
+          String(snapshot.metadata.revision),
+        );
         if (!cancelled && typeof snapshot.unread_count === "number")
           setUnreadMessageCount(snapshot.unread_count);
       } catch {

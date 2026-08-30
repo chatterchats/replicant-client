@@ -77,7 +77,9 @@ export async function flushWebTelemetry(): Promise<void> {
   let retry = false;
   const batch = queue.splice(0, MAX_BATCH);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TELEMETRY_TIMEOUT_MS);
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, TELEMETRY_TIMEOUT_MS);
   try {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -90,7 +92,8 @@ export async function flushWebTelemetry(): Promise<void> {
       keepalive: true,
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`telemetry returned ${response.status}`);
+    if (!response.ok)
+      throw new Error(`telemetry returned ${String(response.status)}`);
   } catch {
     // Diagnostics must never make the UI less reliable. Retain only the newest
     // bounded window and retry later when the daemon/proxy is reachable again.
@@ -126,7 +129,6 @@ function navigationTimingFields(): WebTelemetryFields {
 export function installBrowserTelemetry() {
   if (browserTelemetryInstalled || typeof window === "undefined") return;
   browserTelemetryInstalled = true;
-
   recordWebEvent("info", "frontend.session_started", "web session started", {
     user_agent: navigator.userAgent.slice(0, 240),
   });

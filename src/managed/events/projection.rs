@@ -439,7 +439,11 @@ pub(super) fn projection_device_movement(
                 let related_before =
                     i64::try_from(carrier.value.relationships.stowed_devices.len())
                         .unwrap_or(i64::MAX);
-                let projected_used = carrier.value.stow_used.unwrap_or_default().max(related_before);
+                let projected_used = carrier
+                    .value
+                    .stow_used
+                    .unwrap_or_default()
+                    .max(related_before);
                 if event.name.as_str() == "device.stowed" {
                     child.value.relationships.stowed_in = Some(carrier_key.clone());
                     let already_stowed = carrier

@@ -45,6 +45,8 @@ export function MessagesPage({
   onUnreadCountChange?: (count: number) => void;
 } = {}) {
   const query = useDomainQuery({
+    slice: "messages",
+    queryKey: "messages",
     fetcher: (signal) => daemonApi.messages(signal),
     isEmpty: empty,
   });

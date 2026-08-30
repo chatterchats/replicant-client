@@ -148,7 +148,10 @@ async fn authoritative_transport_device(client: &Client, code: &str) -> AnyResul
     let device = client.devices().refresh(code).await?.snapshot().await?;
     let relationship_used =
         i64::try_from(device.relationships.stowed_devices.len()).unwrap_or(i64::MAX);
-    if device.stow_used.is_some_and(|reported| reported < relationship_used) {
+    if device
+        .stow_used
+        .is_some_and(|reported| reported < relationship_used)
+    {
         warn!(
             vessel = %code,
             reported_stow_used = ?device.stow_used,

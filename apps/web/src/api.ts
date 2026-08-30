@@ -58,6 +58,7 @@ import {
   resourceTimingFields,
   type ResourceTimingFields,
 } from "./resourceTiming";
+import { recordQueryRequest, recordQuerySuccess } from "./queryTelemetry";
 
 export function daemonUrl(path: string, origin?: string): string {
   const configuredOrigin = (
@@ -102,7 +103,7 @@ function responseHeader(response: Response, name: string): string | null {
   // Real Fetch responses always have Headers. Keep telemetry optional for
   // lightweight test/native adapters that provide only status/body fields.
   return (
-    (response as Response & { headers?: Headers }).headers?.get(name) ?? null
+    (response as Partial<Pick<Response, "headers">>).headers?.get(name) ?? null
   );
 }
 
@@ -240,6 +241,13 @@ function recordDaemonResponse(
     response.ok ? "daemon request completed" : "daemon request was rejected",
     fields,
   );
+  if (response.ok) {
+    recordQuerySuccess(
+      normalizeDaemonRoute(path),
+      typeof fields.bytes === "number" ? fields.bytes : undefined,
+      completed - started,
+    );
+  }
 }
 
 function recordDaemonFailure(
@@ -328,6 +336,7 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const started = performance.now();
   let response: Response | undefined;
   let headersAt = started;
+  recordQueryRequest(normalizeDaemonRoute(path));
   let recorded = false;
   try {
     response = await fetch(daemonUrl(path), {
@@ -401,6 +410,7 @@ async function send(
   let response: Response | undefined;
   let headersAt = started;
   let recorded = false;
+  recordQueryRequest(normalizeDaemonRoute(path));
   try {
     response = await fetch(daemonUrl(path), {
       method,

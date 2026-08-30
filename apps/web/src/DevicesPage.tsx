@@ -538,6 +538,7 @@ export function DevicesPage({
   const firstRenderLogged = useRef(false);
   const query = useDomainQuery({
     slice: "devices",
+    queryKey: "devices",
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: devicesEmpty,
   });
@@ -710,6 +711,7 @@ export function DevicesContent({
     void daemonApi
       .history(controller.signal)
       .then((history) => {
+        if (controller.signal.aborted) return;
         const execution = history.find((item) => item.id === bulkExecutionId);
         if (!execution) return;
         setBulkRun((current) => {

@@ -41,6 +41,13 @@ The packaged web service emits two complementary diagnostic streams:
 
 Frontend telemetry is deliberately bounded and batched so diagnostics do not become a second request storm. Request bodies, authentication tokens, and application command payloads are not logged.
 
+Domain projection reads use a revision-aware shared query cache. Components
+requesting the same logical projection join one in-flight request, retain the
+newest monotonic snapshot across page transitions, and coalesce invalidations
+that arrive during a request into at most one follow-up read. Page-only
+requests are aborted when their final consumer unmounts. This changes no daemon
+endpoint or response contract.
+
 ## Checks
 
 ```sh

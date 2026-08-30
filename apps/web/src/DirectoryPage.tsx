@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { daemonApi } from "./api";
 import { useDomainQuery } from "./domainQuery";
 import type { DirectoryReplicantDetail } from "./protocol";
@@ -7,18 +7,35 @@ export function DirectoryPage() {
   const [search, setSearch] = useState("");
   const [profile, setProfile] = useState<DirectoryReplicantDetail>();
   const [profileError, setProfileError] = useState<string>();
+  const profileController = useRef<AbortController | undefined>(undefined);
   const query = useDomainQuery({
     slice: "directory",
     fetcher: (signal) => daemonApi.directory(search || undefined, signal),
     isEmpty: (snapshot) => snapshot.replicants.length === 0,
   });
 
+  useEffect(
+    () => () => {
+      profileController.current?.abort();
+    },
+    [],
+  );
+
   const inspect = async (code: string) => {
+    profileController.current?.abort();
+    const controller = new AbortController();
+    profileController.current = controller;
     setProfileError(undefined);
     try {
-      setProfile((await daemonApi.directoryReplicant(code)).replicant);
+      const detail = await daemonApi.directoryReplicant(
+        code,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      setProfile(detail.replicant);
     } catch (error) {
-      setProfileError(error instanceof Error ? error.message : String(error));
+      if (!controller.signal.aborted)
+        setProfileError(error instanceof Error ? error.message : String(error));
     }
   };
 

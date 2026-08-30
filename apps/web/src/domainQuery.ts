@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useDaemonState } from "./daemon";
+import { sharedQueryCache } from "./queryCache";
+import type { QueryCacheSubscription } from "./queryCache";
 import type { DomainSlice, SnapshotMetadata } from "./protocol";
 import { recordWebEvent } from "./telemetry";
 
@@ -16,16 +18,12 @@ export interface DomainQueryResult<T> {
 }
 
 interface RequestRunOptions {
-  /** Whether another request should run after the active request completes. */
   queueIfActive?: boolean;
 }
-
 interface RequestGate {
   run: (options?: RequestRunOptions) => Promise<void>;
   abort: () => void;
 }
-
-/** Coalesce noisy managed-state invalidations without making pages feel stale. */
 const AUTO_INVALIDATION_DELAY_MS = 1_500;
 
 export function createRequestGate<T>(
@@ -38,7 +36,6 @@ export function createRequestGate<T>(
   let controller: AbortController | undefined;
   let queued = false;
   let disposed = false;
-
   const run = (options: RequestRunOptions = {}): Promise<void> => {
     if (disposed) return Promise.resolve();
     if (active) {
@@ -65,7 +62,6 @@ export function createRequestGate<T>(
       });
     return active;
   };
-
   return {
     run,
     abort() {
@@ -85,28 +81,46 @@ export function domainInvalidationKey(
   return slices.map((item) => invalidated[item]).join(":");
 }
 
+function sliceName(
+  slice: DomainSlice | readonly DomainSlice[] | undefined,
+): string {
+  return slice === undefined
+    ? "manual"
+    : typeof slice === "string"
+      ? slice
+      : slice.join(",");
+}
+
+let nextHookQueryIdentity = 1;
+
+function nextDefaultQueryKey(
+  slice: DomainSlice | readonly DomainSlice[] | undefined,
+): string {
+  const identity = nextHookQueryIdentity++;
+  return `${sliceName(slice)}:hook-${String(identity)}`;
+}
+
 export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   slice,
+  queryKey,
   fetcher,
   isEmpty,
 }: {
-  /** Omit for data with no corresponding live invalidation slice; use `refresh()` instead. */
   slice?: DomainSlice | readonly DomainSlice[];
+  queryKey?: string;
   fetcher: (signal: AbortSignal) => Promise<T>;
   isEmpty: (value: T) => boolean;
 }): DomainQueryResult<T> {
   const invalidated = useDaemonState().invalidated;
   const invalidation = domainInvalidationKey(slice, invalidated);
-  const sliceLabel =
-    slice === undefined
-      ? "manual"
-      : typeof slice === "string"
-        ? slice
-        : slice.join(",");
+  const sliceLabel = sliceName(slice);
   const fetcherRef = useRef(fetcher);
   const isEmptyRef = useRef(isEmpty);
+  const defaultKeyRef = useRef<string | null>(null);
   fetcherRef.current = fetcher;
   isEmptyRef.current = isEmpty;
+  defaultKeyRef.current ??= nextDefaultQueryKey(slice);
+  const cacheKey = queryKey ?? defaultKeyRef.current;
   const [result, setResult] = useState<Omit<DomainQueryResult<T>, "refresh">>({
     data: undefined,
     status: "loading",
@@ -114,23 +128,26 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
     refreshing: false,
     metadata: null,
   });
-  const gateRef = useRef<RequestGate | null>(null);
-  const explicitRefreshRef = useRef(false);
+  const subscriptionRef = useRef<QueryCacheSubscription | null>(null);
   const automaticTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const invalidationRef = useRef(invalidation);
+  invalidationRef.current = invalidation;
   const hasAutomaticallyRequestedRef = useRef(false);
-  if (!gateRef.current) {
-    gateRef.current = createRequestGate(
+
+  useEffect(() => {
+    const subscription = sharedQueryCache.subscribe(
+      cacheKey,
       async (signal) => {
-        const started = performance.now();
+        const requestStarted = performance.now();
         try {
           const value = await fetcherRef.current(signal);
           recordWebEvent(
-            "info",
+            "debug",
             "frontend.domain_query",
             "frontend domain projection loaded",
             {
               slice: sliceLabel,
-              elapsed_ms: Math.round(performance.now() - started),
+              elapsed_ms: Math.round(performance.now() - requestStarted),
               revision: value.metadata.revision,
             },
           );
@@ -143,7 +160,7 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
               "frontend domain projection failed",
               {
                 slice: sliceLabel,
-                elapsed_ms: Math.round(performance.now() - started),
+                elapsed_ms: Math.round(performance.now() - requestStarted),
                 error: String(error).slice(0, 500),
               },
             );
@@ -151,71 +168,66 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
           throw error;
         }
       },
-      () => {
-        const explicit = explicitRefreshRef.current;
-        explicitRefreshRef.current = false;
-        setResult((current) => ({
-          ...current,
-          status: current.data === undefined ? "loading" : current.status,
-          error: null,
-          // Background invalidation refreshes keep useful stale data visible
-          // without turning every page's Refresh button into a strobe.
-          refreshing: explicit && current.data !== undefined,
-        }));
-      },
-      (data) => {
-        setResult({
-          data,
-          status: isEmptyRef.current(data) ? "empty" : "loaded",
-          error: null,
-          refreshing: false,
-          metadata: data.metadata,
-        });
-      },
-      (error) => {
-        setResult((current) => ({
-          ...current,
-          status: current.data === undefined ? "error" : current.status,
-          error: String(error),
-          refreshing: false,
-        }));
+      invalidationRef.current,
+      (event) => {
+        if (event.type === "start") {
+          setResult((current) => ({
+            ...current,
+            status: current.data === undefined ? "loading" : current.status,
+            error: null,
+            refreshing: event.explicit && current.data !== undefined,
+          }));
+        } else if (event.type === "success") {
+          setResult({
+            data: event.data,
+            status: isEmptyRef.current(event.data) ? "empty" : "loaded",
+            error: null,
+            refreshing: false,
+            metadata: event.data.metadata,
+          });
+        } else if (event.type === "error") {
+          setResult((current) => ({
+            ...current,
+            status: current.data === undefined ? "error" : current.status,
+            error: String(event.error),
+            refreshing: false,
+          }));
+        }
       },
     );
-  }
-  const gate = gateRef.current;
-  useEffect(
-    () => () => {
-      if (automaticTimerRef.current !== null)
-        clearTimeout(automaticTimerRef.current);
-      gate.abort();
-    },
-    [gate],
-  );
+    subscriptionRef.current = subscription;
+    return () => {
+      subscription.unsubscribe();
+      if (subscriptionRef.current === subscription)
+        subscriptionRef.current = null;
+    };
+  }, [cacheKey, sliceLabel]);
+
   useEffect(() => {
     if (automaticTimerRef.current !== null) return;
-    // The first projection fetch must remain immediate. Only subsequent live
-    // invalidations are debounced/coalesced.
     const delay = hasAutomaticallyRequestedRef.current
       ? AUTO_INVALIDATION_DELAY_MS
       : 0;
     automaticTimerRef.current = setTimeout(() => {
       automaticTimerRef.current = null;
       hasAutomaticallyRequestedRef.current = true;
-      // An in-flight projection is already sampling current managed state, so
-      // do not queue another fetch merely because more revisions arrived while
-      // it was running. A later invalidation will schedule the next refresh.
-      void gate.run({ queueIfActive: false });
+      subscriptionRef.current?.updateRevision(invalidation);
     }, delay);
-  }, [gate, invalidation]);
+    return () => {
+      if (automaticTimerRef.current !== null) {
+        clearTimeout(automaticTimerRef.current);
+        automaticTimerRef.current = null;
+      }
+    };
+  }, [invalidation]);
+
   const refresh = useCallback(() => {
-    // A manual refresh supersedes any pending background invalidation fetch.
     if (automaticTimerRef.current !== null) {
       clearTimeout(automaticTimerRef.current);
       automaticTimerRef.current = null;
     }
     hasAutomaticallyRequestedRef.current = true;
-    explicitRefreshRef.current = true;
-    return gate.run();
-  }, [gate]);
+    return subscriptionRef.current?.refresh() ?? Promise.resolve();
+  }, []);
   return { ...result, refresh };
 }
