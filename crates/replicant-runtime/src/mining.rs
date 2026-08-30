@@ -600,6 +600,8 @@ pub async fn execute_mining_item(
                 )?);
             }
             if missing.contains_key(SYSTEM_WARD) {
+                // Keep the allocated ward reserved for the follow-up delivery.
+                // The nine mining devices can deploy and begin configuring first.
                 site.assets.system_ward = Some(mining_allocated_identity(
                     allocations,
                     "system_ward",
@@ -610,7 +612,8 @@ pub async fn execute_mining_item(
                 site.carrier = Some(mining_allocated_identity(allocations, "carrier", "device")?);
                 mining_validate_stow_owner(allocations, "carrier")?;
             }
-            site.missing.clear();
+            site.missing
+                .retain(|device_type, _| device_type == SYSTEM_WARD);
             lane.sites = vec![site];
             lane.routes.clear();
             lane.print_batches
@@ -895,9 +898,11 @@ async fn create_plan(
         info!("planning mining expansion from committed managed state");
     }
     let selected_replicant = select_replicant(client, config.replicant.as_deref()).await?;
-    let systems = config.requested_systems()?;
+    let mut systems = config.requested_systems()?;
     let devices = device_snapshots(client).await?;
-    let protection = protected_systems(&devices, &client.galaxy().catalogue());
+    let catalogue = client.galaxy().catalogue();
+    sort_systems_by_hub_distance(&mut systems, &config.hub, &catalogue);
+    let protection = protected_systems(&devices, &catalogue);
     let blueprints = fetch_blueprints(client).await?;
     let factories = factory_workloads(client, &blueprints, &config.hub).await?;
 
@@ -1025,6 +1030,47 @@ async fn create_plan(
 
 fn requires_ferry(belt: &str, hub: &str) -> bool {
     belt != hub
+}
+
+fn sort_systems_by_hub_distance(systems: &mut [String], hub: &str, catalogue: &[Star]) {
+    let positions = catalogue
+        .iter()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.as_str(), position))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let hub_position = catalogue
+        .iter()
+        .filter(|star| location_is_in_system(hub, star.key.id.as_str()))
+        .filter_map(|star| star.position)
+        .next();
+    systems.sort_by(|left, right| {
+        let distance = |system: &str| {
+            let position = positions.get(system)?;
+            let hub = hub_position?;
+            Some(
+                (position.x - hub.x).powi(2)
+                    + (position.y - hub.y).powi(2)
+                    + (position.z - hub.z).powi(2),
+            )
+        };
+        match (distance(left), distance(right)) {
+            (Some(left_distance), Some(right_distance)) => left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| left.cmp(right)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+}
+
+fn location_is_in_system(location: &str, system: &str) -> bool {
+    location == system
+        || location
+            .strip_prefix(system)
+            .is_some_and(|suffix| suffix.starts_with('-'))
 }
 
 fn execution_batches(
@@ -1390,12 +1436,7 @@ fn site_shortages(audit: &SiteAudit) -> QuantityMap {
 }
 
 fn device_is_in_system(device: &Device, system: &str) -> bool {
-    device_location(device).is_some_and(|location| {
-        location == system
-            || location
-                .strip_prefix(system)
-                .is_some_and(|suffix| suffix.starts_with('-'))
-    })
+    device_location(device).is_some_and(|location| location_is_in_system(location, system))
 }
 
 pub(crate) fn active_owned_ward_systems(
@@ -1847,7 +1888,7 @@ mod tests {
     use super::*;
     use replicant_client::domain::{
         AccessScope, ActiveDeviceDirective, DeviceDirective, DeviceId, DeviceKey,
-        DeviceRelationships, DeviceStatus,
+        DeviceRelationships, DeviceStatus, GalacticPosition, StarKey,
     };
 
     #[test]
@@ -1890,6 +1931,36 @@ mod tests {
             status: Some("active".into()),
             details: BTreeMap::new(),
         });
+    }
+
+    fn star(name: &str, x: f64, y: f64, z: f64) -> Star {
+        Star {
+            key: StarKey::live(replicant_client::StarId::from(name)),
+            name: None,
+            spectral_type: None,
+            entry_point: None,
+            position: Some(GalacticPosition { x, y, z }),
+            has_hub: None,
+            has_ward: None,
+            knowledge_observed: true,
+            explored: None,
+            has_life: None,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn mining_sites_are_ordered_nearest_to_the_hub() {
+        let catalogue = vec![
+            star("HUB", 0.0, 0.0, 0.0),
+            star("NEAR", 1.0, 1.0, 0.0),
+            star("FAR", 8.0, 0.0, 0.0),
+        ];
+        let mut systems = vec!["UNKNOWN".into(), "FAR".into(), "NEAR".into()];
+
+        sort_systems_by_hub_distance(&mut systems, "HUB-BELT-1", &catalogue);
+
+        assert_eq!(systems, ["NEAR", "FAR", "UNKNOWN"]);
     }
 
     #[test]

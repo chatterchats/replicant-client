@@ -820,9 +820,14 @@ async fn allocate_available_site_assets(
     let mut allocated = 0usize;
     for index in 0..mission.sites.len() {
         let missing = mission.sites[index].missing.clone();
-        if mission.sites[index].phase != SitePhase::Planned
-            || !pool_can_complete_site(&pool, &missing)
-        {
+        let initial_deployment = mission.sites[index].phase == SitePhase::Planned
+            && pool_can_complete_initial_deployment(&pool, &missing);
+        let ward_addition = mission.sites[index].phase == SitePhase::Configuring
+            && missing.len() == 1
+            && missing.contains_key(SYSTEM_WARD)
+            && (mission.sites[index].assets.system_ward.is_some()
+                || pool_can_complete_site(&pool, &missing));
+        if !initial_deployment && !ward_addition {
             continue;
         }
         fill_site_asset(
@@ -857,15 +862,19 @@ async fn allocate_available_site_assets(
             &mut pool,
             &mut used,
         )?;
-        if missing.contains_key(SYSTEM_WARD) {
+        if ward_addition {
             fill_site_asset(
                 &mut mission.sites[index].assets.system_ward,
                 SYSTEM_WARD,
                 &mut pool,
                 &mut used,
             )?;
+            mission.sites[index].missing.remove(SYSTEM_WARD);
+        } else {
+            mission.sites[index]
+                .missing
+                .retain(|device_type, _| device_type == SYSTEM_WARD);
         }
-        mission.sites[index].missing.clear();
         mission.sites[index].phase = SitePhase::Ready;
         allocated += 1;
         save_plan(&config.plan_path, mission)?;
@@ -878,6 +887,19 @@ async fn allocate_available_site_assets(
         tag_site_assets(client, &mission.sites[index]).await?;
     }
     Ok(allocated)
+}
+
+fn pool_can_complete_initial_deployment(
+    pool: &BTreeMap<String, Vec<String>>,
+    missing: &QuantityMap,
+) -> bool {
+    missing
+        .iter()
+        .filter(|(device_type, _)| device_type.as_str() != SYSTEM_WARD)
+        .all(|(device_type, quantity)| {
+            i64::try_from(pool.get(device_type).map_or(0, Vec::len))
+                .is_ok_and(|available| available >= *quantity)
+        })
 }
 
 fn pool_can_complete_site(pool: &BTreeMap<String, Vec<String>>, missing: &QuantityMap) -> bool {
@@ -1027,6 +1049,7 @@ async fn deploy_sites(
     let mut watch = client.events().watch().await?;
     loop {
         reconcile(client, config, mission).await?;
+        allocate_available_site_assets(client, config, mission).await?;
         if mission
             .sites
             .iter()
@@ -1115,10 +1138,13 @@ async fn dispatch_ready_sites(
         .collect::<Vec<_>>();
     let mut deliveries = Vec::new();
     for index in ready {
+        let defer_ward = mission.sites[index].missing.contains_key(SYSTEM_WARD);
+        let ward = mission.sites[index].assets.system_ward.as_deref();
         let payload = mission.sites[index]
             .assets
             .codes()
             .into_iter()
+            .filter(|code| !defer_ward || ward != Some(code.as_str()))
             .filter_map(|code| {
                 let device = find_device(&devices, &code)?;
                 (device_location(device) == Some(mission.hub_location.as_str())).then(|| {
@@ -1227,6 +1253,7 @@ async fn configure_site(
     index: usize,
 ) -> AnyResult<()> {
     let site = mission.sites[index].clone();
+    let mut ward_pending = site.assets.system_ward.is_none();
     for code in site.assets.codes() {
         // Arrival events keep each site asset current in the projection.
         let handle = match client.devices().cached(&code) {
@@ -1240,22 +1267,21 @@ async fn configure_site(
         } else {
             device_location(&snapshot) == Some(site.belt.as_str())
         };
+        if is_ward && !in_place {
+            ward_pending = true;
+            continue;
+        }
         if !in_place {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
-                if is_ward {
-                    format!(
-                        "system ward {code} is not deployed anywhere in {}",
-                        site.system
-                    )
-                } else {
-                    format!("site asset {code} has not arrived at {}", site.belt)
-                },
+                format!("site asset {code} has not arrived at {}", site.belt),
             ));
         }
     }
     tag_site_assets(client, &site).await?;
-    ensure_site_protection(client, &site).await?;
+    if !ward_pending {
+        ensure_site_protection(client, &site).await?;
+    }
     mission.sites[index].phase = SitePhase::Adopting;
     save_plan(&config.plan_path, mission)?;
     let mining_controller =
@@ -1335,6 +1361,12 @@ async fn configure_site(
                 .await?,
         )
         .await?;
+    }
+
+    if ward_pending {
+        mission.sites[index].phase = SitePhase::Configuring;
+        save_plan(&config.plan_path, mission)?;
+        return Ok(());
     }
 
     let deadline = Instant::now() + VERIFY_TIMEOUT;
@@ -1844,7 +1876,7 @@ async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResu
         .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
         .map(|plan| {
             Value::Array(
-                plan.intermediate_systems
+                plan.explicit_waypoints_for(destination)
                     .into_iter()
                     .map(Value::String)
                     .collect(),
@@ -2069,6 +2101,30 @@ mod tests {
         assert!(!pool_can_complete_site(&pool, &missing));
         pool.insert(MAINTENANCE_DRONE.into(), vec!["md".into()]);
         assert!(pool_can_complete_site(&pool, &missing));
+    }
+
+    #[test]
+    fn initial_site_deployment_does_not_wait_for_system_ward() {
+        let mut missing = replicant_mining_planner::mining_site_requirements();
+        missing.insert(SYSTEM_WARD.into(), 1);
+        let mut pool = BTreeMap::<String, Vec<String>>::new();
+        pool.insert(MINING_CONTROLLER.into(), vec!["mc".into()]);
+        pool.insert(
+            MINING_DRONE.into(),
+            ["m1", "m2", "m3", "m4"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        pool.insert(SURVEY_CONTROLLER.into(), vec!["sc".into()]);
+        pool.insert(
+            SURVEY_DRONE.into(),
+            ["s1", "s2"].into_iter().map(str::to_owned).collect(),
+        );
+        pool.insert(MAINTENANCE_DRONE.into(), vec!["md".into()]);
+
+        assert!(pool_can_complete_initial_deployment(&pool, &missing));
+        assert!(!pool_can_complete_site(&pool, &missing));
     }
 
     #[test]
