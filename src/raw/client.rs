@@ -401,8 +401,7 @@ impl ClientBuilder {
         let client = if let Some(client) = self.http_client {
             client
         } else {
-            let builder =
-                reqwest::Client::builder().connect_timeout(self.config.connect_timeout);
+            let builder = reqwest::Client::builder().connect_timeout(self.config.connect_timeout);
             let builder = match self.config.tls_backend {
                 TlsBackend::Automatic => builder,
                 TlsBackend::Rustls => {

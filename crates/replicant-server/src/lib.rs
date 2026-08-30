@@ -816,7 +816,7 @@ pub async fn run_supervisor(state: Arc<AppState>, mut shutdown: watch::Receiver<
                         health: DaemonHealth {
                             status: health_status(&status),
                             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-                            detail: status_detail(&status).map(str::to_owned),
+                            detail: client_status_detail(state.client(), &status),
                         },
                         sync: sync.clone(),
                     });
@@ -1597,7 +1597,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Versioned<DaemonHeal
     Json(Versioned::current(DaemonHealth {
         status: health_status(&status),
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-        detail: status_detail(&status).map(str::to_owned),
+        detail: client_status_detail(state.client(), &status),
     }))
 }
 
@@ -1654,7 +1654,7 @@ async fn snapshot(
         ),
         workflows,
         requirements,
-        notifications: operational_notifications(&instances, &triggers, &status),
+        notifications: operational_notifications(state.client(), &instances, &triggers, &status),
         slice_revisions: state.slice_revisions(),
         refreshes,
     })))
@@ -1752,14 +1752,14 @@ async fn overview(
         DaemonHealth {
             status: health_status(&status),
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
-            detail: status_detail(&status).map(str::to_owned),
+            detail: client_status_detail(state.client(), &status),
         },
         runtime_sync_status(&state, &status),
         automation,
         replicants,
         active_travel,
         workflow_rows,
-        operational_notifications(&workflows, &triggers, &status),
+        operational_notifications(state.client(), &workflows, &triggers, &status),
         recent_activity,
     ))))
 }
@@ -6766,11 +6766,12 @@ fn runtime_sync_status(state: &AppState, status: &ClientStatus) -> RuntimeSyncSt
         phase: sync_phase(status),
         revision: state.client().state().revision().unwrap_or_default(),
         last_event_at_ms: None,
-        detail: status_detail(status).map(str::to_owned),
+        detail: client_status_detail(state.client(), status),
     }
 }
 
 fn operational_notifications(
+    client: &Client,
     workflows: &[WorkflowInstance],
     triggers: &[AutomationTrigger],
     status: &ClientStatus,
@@ -6812,7 +6813,7 @@ fn operational_notifications(
         phase: sync_phase(status),
         revision: 0,
         last_event_at_ms: None,
-        detail: status_detail(status).map(str::to_owned),
+        detail: client_status_detail(client, status),
     };
     if matches!(sync.phase, SyncPhase::Degraded | SyncPhase::Offline) {
         notifications.push(sync_notification(&sync));
@@ -6886,6 +6887,17 @@ fn sync_phase(status: &ClientStatus) -> SyncPhase {
         ClientStatus::Offline | ClientStatus::Closing | ClientStatus::Closed => SyncPhase::Offline,
         _ => SyncPhase::Degraded,
     }
+}
+
+fn client_status_detail(client: &Client, status: &ClientStatus) -> Option<String> {
+    if matches!(status, ClientStatus::Offline)
+        && let Ok(Some(detail)) = client.events().last_disconnect_detail()
+    {
+        return Some(format!(
+            "managed SSE connection is offline: {detail}; durable state and REST synchronization remain available"
+        ));
+    }
+    status_detail(status).map(str::to_owned)
 }
 
 fn status_detail(status: &ClientStatus) -> Option<&'static str> {
@@ -8946,7 +8958,7 @@ mod tests {
             failed.push(workflow);
         }
 
-        let notifications = operational_notifications(&failed, &[], &client.status());
+        let notifications = operational_notifications(&client, &failed, &[], &client.status());
         let blocked = notifications
             .iter()
             .filter(|notification| notification.title == "Blocked resource claim")
@@ -8993,9 +9005,13 @@ mod tests {
             &detail(&state.repository, &failed).unwrap_or_else(|_| panic!("workflow detail")),
         )
         .unwrap();
-        let notifications =
-            serde_json::to_string(&operational_notifications(&[failed], &[], &client.status()))
-                .unwrap();
+        let notifications = serde_json::to_string(&operational_notifications(
+            &client,
+            &[failed],
+            &[],
+            &client.status(),
+        ))
+        .unwrap();
         assert!(!exported.contains("do-not-export"));
         assert!(!exported.contains("also-private"));
         assert!(!notifications.contains("do-not-export"));

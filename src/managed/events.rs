@@ -95,6 +95,7 @@ pub(crate) struct EventEngine {
     applier_sender: tokio::sync::mpsc::Sender<ApplyRequest>,
     applier_receiver: Mutex<Option<tokio::sync::mpsc::Receiver<ApplyRequest>>>,
     last_apply_lag_ms: AtomicU64,
+    last_disconnect_detail: Mutex<Option<String>>,
 }
 
 struct ApplyRequest {
@@ -112,6 +113,7 @@ impl EventEngine {
             applier_sender,
             applier_receiver: Mutex::new(Some(applier_receiver)),
             last_apply_lag_ms: AtomicU64::new(0),
+            last_disconnect_detail: Mutex::new(None),
         }
     }
 
@@ -142,6 +144,20 @@ impl EventEngine {
 
     fn last_apply_lag_ms(&self) -> u64 {
         self.last_apply_lag_ms.load(AtomicOrdering::Relaxed)
+    }
+
+    fn set_disconnect_detail(&self, detail: String) {
+        *self
+            .last_disconnect_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+    }
+
+    fn disconnect_detail(&self) -> Option<String> {
+        self.last_disconnect_detail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn start_applier(&self, weak: WeakClient) -> Result<tokio::task::JoinHandle<()>> {
@@ -306,6 +322,13 @@ impl EventsGateway {
             .managed_state()
             .event_cursor()
             .map_err(persistence_error)
+    }
+
+    /// Returns the sanitized reason for the most recent managed SSE
+    /// disconnect, when one has occurred during this client lifetime.
+    pub fn last_disconnect_detail(&self) -> Result<Option<String>> {
+        self.client.ensure_open()?;
+        Ok(self.client.managed_events().disconnect_detail())
     }
 
     /// Explicitly catches up the unfiltered account event log, durably applying
@@ -809,11 +832,6 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
             let _ = request.completed.send(Err(Error::Closed));
             continue;
         };
-        let apply_lag_ms = duration_millis(request.enqueued_at.elapsed());
-        client
-            .managed_events()
-            .last_apply_lag_ms
-            .store(apply_lag_ms, AtomicOrdering::Relaxed);
         let event_name = request.event.event.clone();
         let apply_client = client.clone();
         let event = request.event;
@@ -831,6 +849,11 @@ async fn run_applier(weak: WeakClient, mut receiver: tokio::sync::mpsc::Receiver
                     })
                 }
             };
+        let apply_lag_ms = duration_millis(request.enqueued_at.elapsed());
+        client
+            .managed_events()
+            .last_apply_lag_ms
+            .store(apply_lag_ms, AtomicOrdering::Relaxed);
         let outcome = match &result {
             Ok(ApplyOutcome::Applied) => "applied",
             Ok(ApplyOutcome::Duplicate) => "duplicate",
@@ -1421,6 +1444,24 @@ fn classify_sse_failure(error: &Error) -> SseFailure {
     }
 }
 
+fn sse_disconnect_detail(failure: SseFailure, connection_age_ms: u64, apply_lag_ms: u64) -> String {
+    let cause = match failure.reason {
+        "upstream_close" => format!("upstream closed after {connection_age_ms}ms"),
+        "local_read_timeout" => {
+            format!("client read timeout fired after {connection_age_ms}ms")
+        }
+        "parser_error" => format!("event parser failed after {connection_age_ms}ms"),
+        "apply_error" => format!("local apply worker failed after {connection_age_ms}ms"),
+        "auth_failure" => "upstream authentication failed".to_owned(),
+        "upstream_http" => "upstream rejected the SSE connection".to_owned(),
+        _ => format!(
+            "SSE transport failed after {connection_age_ms}ms ({})",
+            failure.io_error_kind
+        ),
+    };
+    format!("{cause}; last event apply lag {apply_lag_ms}ms")
+}
+
 const HEALTHY_SSE_SESSION_MIN: Duration = Duration::from_secs(10);
 
 /// The status to report when the SSE connection is not currently live.
@@ -1535,7 +1576,7 @@ async fn run_sse_loop(
                         target: "replicant_client::events",
                         event = "managed_sse.disconnected",
                         connection_age_ms,
-                        idle_since_last_frame_ms = tracing::field::Empty,
+                        idle_since_last_frame_ms = ?Option::<u64>::None,
                         idle_since_last_event_ms,
                         last_event_id = last_event_id.as_deref().unwrap_or(""),
                         reason = failure.reason,
@@ -1554,10 +1595,15 @@ async fn run_sse_loop(
                         page_count: 0,
                         duration_ms: Some(connection_age_ms),
                     });
+                    client
+                        .managed_events()
+                        .set_disconnect_detail(sse_disconnect_detail(
+                            failure,
+                            connection_age_ms,
+                            apply_lag_ms,
+                        ));
                 }
-                let healthy_interval = min_backoff
-                    .saturating_mul(10)
-                    .max(HEALTHY_SSE_SESSION_MIN);
+                let healthy_interval = min_backoff.saturating_mul(10).max(HEALTHY_SSE_SESSION_MIN);
                 if received_events > 0 || session_started.elapsed() >= healthy_interval {
                     backoff = min_backoff;
                 }
@@ -1581,7 +1627,7 @@ async fn run_sse_loop(
                         target: "replicant_client::events",
                         event = "managed_sse.disconnected",
                         connection_age_ms = 0_u64,
-                        idle_since_last_frame_ms = tracing::field::Empty,
+                        idle_since_last_frame_ms = ?Option::<u64>::None,
                         idle_since_last_event_ms = 0_u64,
                         last_event_id = cursor.as_deref().unwrap_or(""),
                         reason = failure.reason,
@@ -1592,6 +1638,9 @@ async fn run_sse_loop(
                         connect_ms,
                         "managed SSE connection failed"
                     );
+                    client
+                        .managed_events()
+                        .set_disconnect_detail(sse_disconnect_detail(failure, 0, apply_lag_ms));
                 }
             }
         }
@@ -3926,13 +3975,10 @@ mod tests {
             .build()
             .expect("raw client");
 
-        let mut stream = timeout(
-            Duration::from_secs(1),
-            raw_client.events().stream(None),
-        )
-        .await
-        .expect("SSE headers are not governed by the ordinary request timeout")
-        .expect("open SSE stream");
+        let mut stream = timeout(Duration::from_secs(1), raw_client.events().stream(None))
+            .await
+            .expect("SSE headers are not governed by the ordinary request timeout")
+            .expect("open SSE stream");
         let event = timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("event arrives")
@@ -4011,8 +4057,7 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .iter()
                     .any(|sample| {
-                        sample.metric == "sse_disconnect"
-                            && sample.outcome == "upstream_close"
+                        sample.metric == "sse_disconnect" && sample.outcome == "upstream_close"
                     })
                 {
                     break;
@@ -4022,6 +4067,13 @@ mod tests {
         })
         .await
         .expect("categorized disconnect telemetry");
+        let detail = client
+            .events()
+            .last_disconnect_detail()
+            .expect("disconnect detail")
+            .expect("recorded disconnect");
+        assert!(detail.starts_with("upstream closed after "));
+        assert!(detail.contains("last event apply lag"));
 
         task.abort();
         client.close().await.expect("close");
