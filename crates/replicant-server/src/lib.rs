@@ -17,7 +17,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        MatchedPath, Path, Query, State, WebSocketUpgrade,
         rejection::JsonRejection,
         ws::{Message, WebSocket},
     },
@@ -65,17 +65,17 @@ use replicant_protocol::{
     EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
     FiniteExecutionStatus as ProtocolFiniteExecutionStatus, FrontendTelemetryBatch,
-    FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus,
-    InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
-    InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
-    LeaderboardEntrySummary, LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot,
-    MiningInstallationStatus, MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary,
-    NetworkSnapshot, Notification, NotificationLevel, OperationClass, OperationKind,
-    OperationStatus, OperationUpdate, OverviewReplicant, OverviewSnapshot, OverviewTravel,
-    RefreshDelta, RefreshPhase, RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary,
-    RelayExpansionSummary, RelaySnapshot, ReportsSnapshot, ReputationSummary, RequirementSummary,
-    ResultSummary, RunOperationRequest, RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus,
-    SettingsSnapshot, SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
+    FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus, InboxMessageSummary,
+    InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind, InventoryQuantity,
+    InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary, LeaderboardEntrySummary,
+    LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot, MiningInstallationStatus,
+    MiningInstallationSummary, MiningSnapshot, NetworkRelaySummary, NetworkSnapshot, Notification,
+    NotificationLevel, OperationClass, OperationKind, OperationStatus, OperationUpdate,
+    OverviewReplicant, OverviewSnapshot, OverviewTravel, RefreshDelta, RefreshPhase,
+    RefreshPhaseSummary, RefreshRunDetail, RefreshRunSummary, RelayExpansionSummary, RelaySnapshot,
+    ReportsSnapshot, ReputationSummary, RequirementSummary, ResultSummary, RunOperationRequest,
+    RunOperationResponse, RuntimeSnapshot, RuntimeSyncStatus, SettingsSnapshot,
+    SimulationInterfaceSummary, SimulationRunSummary, SimulationScenarioSummary,
     SimulationsSnapshot, SnapshotMetadata, StandingSnapshot, StartRefreshRequest,
     StartWorkflowRequest, StartWorkflowResponse, SurveyMissionSummary, SurveySnapshot, SyncPhase,
     SystemSceneSnapshot, TradeControllerSummary, TradeItemSummary, TradeSnapshot, TradeSummary,
@@ -136,6 +136,10 @@ use tower_http::cors::CorsLayer;
 const LIVE_BUFFER: usize = 1024;
 const DIRECTOR_RECONCILE_TIMEOUT: Duration = Duration::from_secs(45);
 static DIRECTOR_RECONCILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const HTTP_REQUEST_ID_HEADER: &str = "x-replicant-request-id";
+const HTTP_HANDLER_TIME_HEADER: &str = "x-replicant-handler-time";
+const MAX_HTTP_REQUEST_ID_LEN: usize = 128;
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -494,47 +498,128 @@ async fn authenticate(
     }
 }
 
-async fn trace_http_request(request: Request<axum::body::Body>, next: Next) -> Response {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpTraceSeverity {
+    Error,
+    Warn,
+    Slow,
+    Debug,
+}
+
+fn http_trace_severity(status: StatusCode, elapsed_ms: u128) -> HttpTraceSeverity {
+    if status.is_server_error() {
+        HttpTraceSeverity::Error
+    } else if status.is_client_error() {
+        HttpTraceSeverity::Warn
+    } else if elapsed_ms >= 5_000 {
+        HttpTraceSeverity::Slow
+    } else {
+        HttpTraceSeverity::Debug
+    }
+}
+
+fn sanitize_http_request_id(value: &str) -> Option<&str> {
+    if value.is_empty() || value.len() > MAX_HTTP_REQUEST_ID_LEN {
+        return None;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+        .then_some(value)
+}
+
+fn next_http_request_id() -> String {
+    format!(
+        "local-{}",
+        HTTP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(HTTP_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(sanitize_http_request_id)
+        .map(str::to_owned)
+        .unwrap_or_else(next_http_request_id);
+    request.headers_mut().insert(
+        HTTP_REQUEST_ID_HEADER,
+        header::HeaderValue::from_str(&request_id).expect("sanitized request ID is a valid header"),
+    );
+
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let matched_route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
     let started = Instant::now();
-    tracing::debug!(method = %method, path = %path, "daemon HTTP request started");
-    let response = next.run(request).await;
+    tracing::debug!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        route = matched_route.as_deref().unwrap_or("<unmatched>"),
+        "daemon HTTP request started"
+    );
+    let mut response = next.run(request).await;
     let status = response.status();
-    let elapsed_ms = started.elapsed().as_millis();
-    if status.is_server_error() {
-        tracing::error!(
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    let handler_ms = elapsed_ms;
+    response.headers_mut().insert(
+        HTTP_REQUEST_ID_HEADER,
+        header::HeaderValue::from_str(&request_id).expect("sanitized request ID is a valid header"),
+    );
+    response.headers_mut().insert(
+        HTTP_HANDLER_TIME_HEADER,
+        header::HeaderValue::from_str(&format!("{:.6}", elapsed.as_secs_f64()))
+            .expect("finite handler duration is a valid header"),
+    );
+
+    let severity = http_trace_severity(status, elapsed_ms);
+    match severity {
+        HttpTraceSeverity::Error => tracing::error!(
+            request_id = %request_id,
             method = %method,
             path = %path,
+            route = matched_route.as_deref().unwrap_or("<unmatched>"),
             status = status.as_u16(),
             elapsed_ms,
+            handler_ms,
             "daemon HTTP request failed"
-        );
-    } else if status.is_client_error() {
-        tracing::warn!(
+        ),
+        HttpTraceSeverity::Warn => tracing::warn!(
+            request_id = %request_id,
             method = %method,
             path = %path,
+            route = matched_route.as_deref().unwrap_or("<unmatched>"),
             status = status.as_u16(),
             elapsed_ms,
+            handler_ms,
             "daemon HTTP request rejected"
-        );
-    } else if elapsed_ms >= 5_000 {
-        tracing::warn!(
+        ),
+        HttpTraceSeverity::Slow => tracing::warn!(
             event = "daemon.http_slow",
+            request_id = %request_id,
             method = %method,
             path = %path,
+            route = matched_route.as_deref().unwrap_or("<unmatched>"),
             status = status.as_u16(),
             elapsed_ms,
+            handler_ms,
             "daemon HTTP request exceeded responsiveness threshold"
-        );
-    } else {
-        tracing::debug!(
+        ),
+        HttpTraceSeverity::Debug => tracing::debug!(
+            request_id = %request_id,
             method = %method,
             path = %path,
+            route = matched_route.as_deref().unwrap_or("<unmatched>"),
             status = status.as_u16(),
             elapsed_ms,
+            handler_ms,
             "daemon HTTP request completed"
-        );
+        ),
     }
     response
 }
@@ -636,6 +721,11 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .allow_headers([
                     axum::http::header::CONTENT_TYPE,
                     axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderName::from_static(HTTP_REQUEST_ID_HEADER),
+                ])
+                .expose_headers([
+                    axum::http::HeaderName::from_static(HTTP_REQUEST_ID_HEADER),
+                    axum::http::HeaderName::from_static(HTTP_HANDLER_TIME_HEADER),
                 ]),
         )
         .with_state(state)
@@ -6838,6 +6928,42 @@ mod frontend_telemetry_tests {
         assert_eq!(frontend_log_text("abcdef", 4), "abcd");
     }
 }
+#[cfg(test)]
+mod http_trace_tests {
+    use super::*;
+
+    #[test]
+    fn request_ids_accept_safe_values_and_replace_malformed_values() {
+        assert_eq!(
+            sanitize_http_request_id("browser-123_~.id"),
+            Some("browser-123_~.id")
+        );
+        assert!(sanitize_http_request_id("").is_none());
+        assert!(sanitize_http_request_id("bad value").is_none());
+        assert!(sanitize_http_request_id("bad\nvalue").is_none());
+        assert!(sanitize_http_request_id(&"x".repeat(MAX_HTTP_REQUEST_ID_LEN + 1)).is_none());
+    }
+
+    #[test]
+    fn request_severity_preserves_error_rejection_and_slow_precedence() {
+        assert_eq!(
+            http_trace_severity(StatusCode::INTERNAL_SERVER_ERROR, 6_000),
+            HttpTraceSeverity::Error
+        );
+        assert_eq!(
+            http_trace_severity(StatusCode::BAD_REQUEST, 6_000),
+            HttpTraceSeverity::Warn
+        );
+        assert_eq!(
+            http_trace_severity(StatusCode::OK, 5_000),
+            HttpTraceSeverity::Slow
+        );
+        assert_eq!(
+            http_trace_severity(StatusCode::OK, 4_999),
+            HttpTraceSeverity::Debug
+        );
+    }
+}
 
 #[cfg(test)]
 mod finite_result_tests {
@@ -7192,6 +7318,43 @@ mod tests {
         )
         .expect("app state");
         (router(state.clone()), client, state)
+    }
+    #[tokio::test]
+    async fn http_trace_propagates_safe_ids_and_replaces_malformed_ids() {
+        let (app, _client, _state) = test_app().await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/health")
+                    .header(HTTP_REQUEST_ID_HEADER, "browser-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(
+            response.headers().get(HTTP_REQUEST_ID_HEADER).unwrap(),
+            "browser-123"
+        );
+        assert!(response.headers().contains_key(HTTP_HANDLER_TIME_HEADER));
+
+        let response = app
+            .oneshot(
+                Request::get("/api/health")
+                    .header(HTTP_REQUEST_ID_HEADER, "not a safe id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("health response");
+        let request_id = response
+            .headers()
+            .get(HTTP_REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("generated request ID");
+        assert!(request_id.starts_with("local-"));
+        assert!(!request_id.contains(' '));
     }
 
     async fn test_app_at(base_url: &str) -> (Router, Client) {

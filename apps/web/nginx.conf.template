@@ -35,6 +35,9 @@ server {
     location /api/ {
         proxy_pass http://replicantd:8080;
         proxy_http_version 1.1;
+        # Nginx owns the correlation ID at this boundary: never trust a
+        # client-supplied value, and pass the generated ID to replicantd.
+        proxy_set_header X-Replicant-Request-Id $request_id;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -43,6 +46,13 @@ server {
         # the page and would need an image rebuild to rotate. Rendered from the
         # environment at container start by the nginx entrypoint's envsubst.
         proxy_set_header Authorization "Bearer ${REPLICANTD_TOKEN}";
+        # Keep these diagnostics authoritative at the proxy boundary and
+        # prevent duplicate values if an upstream response echoes them.
+        proxy_hide_header X-Replicant-Request-Id;
+        proxy_hide_header X-Replicant-Upstream-Connect-Time;
+        proxy_hide_header X-Replicant-Upstream-Header-Time;
+        proxy_hide_header X-Replicant-Upstream-Response-Time;
+        proxy_hide_header X-Replicant-Handler-Time;
         proxy_connect_timeout 5s;
         # Actions are started asynchronously and return immediately, so no
         # request should approach this; it stays generous for large
@@ -55,7 +65,11 @@ server {
         add_header X-Replicant-Request-Id $request_id always;
         add_header X-Replicant-Upstream-Connect-Time $upstream_connect_time always;
         add_header X-Replicant-Upstream-Header-Time $upstream_header_time always;
-        add_header X-Replicant-Upstream-Response-Time $upstream_response_time always;
+        add_header X-Replicant-Handler-Time $upstream_http_x_replicant_handler_time always;
+        # $upstream_response_time is finalized only after the upstream body is
+        # complete, which is after ordinary response headers are sent. Keep it
+        # authoritative in the correlated JSON access log above; do not emit
+        # an empty or pre-finalized response header.
     }
 
     location = /ws {

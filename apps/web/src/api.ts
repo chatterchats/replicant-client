@@ -54,6 +54,10 @@ import {
   recordWebEvent,
   type WebTelemetryFields,
 } from "./telemetry";
+import {
+  resourceTimingFields,
+  type ResourceTimingFields,
+} from "./resourceTiming";
 
 export function daemonUrl(path: string, origin?: string): string {
   const configuredOrigin = (
@@ -94,12 +98,72 @@ function authHeaders(base?: Record<string, string>): Record<string, string> {
     ? (base ?? {})
     : { ...base, Authorization: `Bearer ${token}` };
 }
+function responseHeader(response: Response, name: string): string | null {
+  // Real Fetch responses always have Headers. Keep telemetry optional for
+  // lightweight test/native adapters that provide only status/body fields.
+  return (
+    (response as Response & { headers?: Headers }).headers?.get(name) ?? null
+  );
+}
 
-function proxyTimingMs(response: Response, header: string): number | null {
-  const value = response.headers.get(header);
+export function proxyTimingMs(
+  response: Response,
+  header: string,
+): number | null {
+  const value = responseHeader(response, header);
   if (!value || value === "-") return null;
   const seconds = Number.parseFloat(value.split(",").at(-1)?.trim() ?? "");
   return Number.isFinite(seconds) ? Math.round(seconds * 1_000) : null;
+}
+
+/** Remove query and fragment data before a path is placed in telemetry. */
+function safeDaemonPath(path: string): string {
+  const pathname = path.split(/[?#]/, 1)[0] ?? "";
+  return pathname === "" ? "/" : pathname;
+}
+
+export function normalizeDaemonRoute(path: string): string {
+  const pathname = safeDaemonPath(path).replace(/\/+/g, "/");
+  const dynamicRoutes: ReadonlyArray<[RegExp, string]> = [
+    [/^\/api\/refreshes\/[^/]+\/approve$/, "/api/refreshes/:run_id/approve"],
+    [/^\/api\/refreshes\/[^/]+\/cancel$/, "/api/refreshes/:run_id/cancel"],
+    [/^\/api\/refreshes\/[^/]+$/, "/api/refreshes/:run_id"],
+    [/^\/api\/devices\/[^/]+\/logs$/, "/api/devices/:code/logs"],
+    [/^\/api\/directory\/[^/]+$/, "/api/directory/:code"],
+    [/^\/api\/entities\/[^/]+\/[^/]+$/, "/api/entities/:kind/:id"],
+    [/^\/api\/system-scene\/[^/]+$/, "/api/system-scene/:system"],
+    [/^\/api\/locations\/refresh\/[^/]+$/, "/api/locations/refresh/:system"],
+    [/^\/api\/reports\/[^/]+$/, "/api/reports/:kind"],
+    [/^\/api\/actions\/[^/]+$/, "/api/actions/:kind"],
+    [
+      /^\/api\/action-executions\/[^/]+\/cancel$/,
+      "/api/action-executions/:id/cancel",
+    ],
+    [/^\/api\/triggers\/[^/]+\/fire$/, "/api/triggers/:id/fire"],
+    [/^\/api\/triggers\/[^/]+$/, "/api/triggers/:id"],
+    [/^\/api\/director\/goals\/[^/]+$/, "/api/director/goals/:kind"],
+    [
+      /^\/api\/director\/mining-policies\/[^/]+$/,
+      "/api/director/mining-policies/:region",
+    ],
+    [
+      /^\/api\/director\/replicants\/[^/]+\/region$/,
+      "/api/director/replicants/:code/region",
+    ],
+    [/^\/api\/workflows\/[^/]+\/activity$/, "/api/workflows/:id/activity"],
+    [/^\/api\/workflows\/[^/]+\/pause$/, "/api/workflows/:id/pause"],
+    [/^\/api\/workflows\/[^/]+\/resume$/, "/api/workflows/:id/resume"],
+    [/^\/api\/workflows\/[^/]+\/cancel$/, "/api/workflows/:id/cancel"],
+    [/^\/api\/workflows\/[^/]+$/, "/api/workflows/:id"],
+  ];
+  return (
+    dynamicRoutes.find(([pattern]) => pattern.test(pathname))?.[1] ?? pathname
+  );
+}
+
+function safeErrorReason(reason: unknown): string {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  return (message.split(/[?#]/, 1)[0] ?? "").slice(0, 500);
 }
 
 function daemonResponseFields(
@@ -109,17 +173,32 @@ function daemonResponseFields(
   elapsedMs: number,
   headersMs: number,
   bodyMs: number,
+  browserTiming: ResourceTimingFields,
 ): WebTelemetryFields {
+  const contentLength = Number.parseInt(
+    responseHeader(response, "Content-Length") ?? "",
+    10,
+  );
   return {
     method,
-    path,
+    path: safeDaemonPath(path),
+    route: normalizeDaemonRoute(path),
     status: response.status,
     elapsed_ms: Math.round(elapsedMs),
     headers_ms: Math.round(headersMs),
     body_ms: Math.round(bodyMs),
-    bytes:
-      Number.parseInt(response.headers.get("Content-Length") ?? "", 10) || null,
-    proxy_request_id: response.headers.get("X-Replicant-Request-Id"),
+    browser_body_parse_ms:
+      browserTiming.browser_response_end_ms === null
+        ? null
+        : Math.round(
+            Math.max(0, elapsedMs - browserTiming.browser_response_end_ms),
+          ),
+    bytes: Number.isFinite(contentLength) ? contentLength : null,
+    ...browserTiming,
+    proxy_request_id: responseHeader(response, "X-Replicant-Request-Id"),
+    proxy_request_ms:
+      proxyTimingMs(response, "X-Replicant-Upstream-Request-Time") ??
+      proxyTimingMs(response, "X-Replicant-Request-Time"),
     proxy_connect_ms: proxyTimingMs(
       response,
       "X-Replicant-Upstream-Connect-Time",
@@ -132,6 +211,7 @@ function daemonResponseFields(
       response,
       "X-Replicant-Upstream-Response-Time",
     ),
+    daemon_handler_ms: proxyTimingMs(response, "X-Replicant-Handler-Time"),
   };
 }
 
@@ -139,7 +219,8 @@ function recordDaemonResponse(
   response: Response,
   method: string,
   path: string,
-  elapsedMs: number,
+  started: number,
+  completed: number,
   headersMs: number,
   bodyMs: number,
 ) {
@@ -147,11 +228,12 @@ function recordDaemonResponse(
     response,
     method,
     path,
-    elapsedMs,
+    completed - started,
     headersMs,
     bodyMs,
+    resourceTimingFields(daemonUrl(path), started, completed),
   );
-  const level = !response.ok || elapsedMs >= 5_000 ? "warn" : "info";
+  const level = !response.ok || completed - started >= 5_000 ? "warn" : "info";
   recordWebEvent(
     level,
     "frontend.daemon_http",
@@ -178,16 +260,28 @@ function recordDaemonFailure(
     timedOut ? "daemon request timed out" : "daemon request failed",
     {
       method,
-      path,
+      path: safeDaemonPath(path),
+      route: normalizeDaemonRoute(path),
       elapsed_ms: Math.round(performance.now() - started),
       timed_out: timedOut,
       aborted: signal.aborted,
-      error:
-        reason instanceof Error
-          ? reason.message.slice(0, 500)
-          : String(reason).slice(0, 500),
+      error: safeErrorReason(reason),
     },
   );
+}
+
+function responseErrorMessage(value: unknown, status: number): string {
+  if (value && typeof value === "object" && "payload" in value) {
+    const payload: unknown = value.payload;
+    if (
+      payload &&
+      typeof payload === "object" &&
+      "message" in payload &&
+      typeof payload.message === "string"
+    )
+      return payload.message;
+  }
+  return `replicantd returned ${String(status)}`;
 }
 
 const webMode = (import.meta as unknown as { env: { MODE?: string } }).env.MODE;
@@ -234,6 +328,7 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const started = performance.now();
   let response: Response | undefined;
   let headersAt = started;
+  let recorded = false;
   try {
     response = await fetch(daemonUrl(path), {
       signal: request.signal,
@@ -245,10 +340,12 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
         response,
         "GET",
         path,
-        headersAt - started,
+        started,
+        headersAt,
         headersAt - started,
         0,
       );
+      recorded = true;
       throw new Error(`replicantd returned ${String(response.status)}`);
     }
     const value = (await response.json()) as unknown;
@@ -257,14 +354,27 @@ async function get(path: string, signal?: AbortSignal): Promise<unknown> {
       response,
       "GET",
       path,
-      completed - started,
+      started,
+      completed,
       headersAt - started,
       completed - headersAt,
     );
+    recorded = true;
     return value;
   } catch (reason: unknown) {
     if (response === undefined) {
       recordDaemonFailure("GET", path, started, reason, request.signal);
+    } else if (!recorded) {
+      const completed = performance.now();
+      recordDaemonResponse(
+        response,
+        "GET",
+        path,
+        started,
+        completed,
+        headersAt - started,
+        completed - headersAt,
+      );
     }
     throw reason;
   } finally {
@@ -290,6 +400,7 @@ async function send(
   const started = performance.now();
   let response: Response | undefined;
   let headersAt = started;
+  let recorded = false;
   try {
     response = await fetch(daemonUrl(path), {
       method,
@@ -305,10 +416,12 @@ async function send(
         response,
         method,
         path,
-        headersAt - started,
+        started,
+        headersAt,
         headersAt - started,
         0,
       );
+      recorded = true;
       return null;
     }
     const value = (await response.json()) as unknown;
@@ -317,22 +430,30 @@ async function send(
       response,
       method,
       path,
-      completed - started,
+      started,
+      completed,
       headersAt - started,
       completed - headersAt,
     );
+    recorded = true;
     if (!response.ok) {
-      const payload = (value as { payload?: { message?: unknown } }).payload;
-      throw new Error(
-        typeof payload?.message === "string"
-          ? payload.message
-          : `replicantd returned ${String(response.status)}`,
-      );
+      throw new Error(responseErrorMessage(value, response.status));
     }
     return value;
   } catch (reason: unknown) {
     if (response === undefined) {
       recordDaemonFailure(method, path, started, reason, request.signal);
+    } else if (!recorded) {
+      const completed = performance.now();
+      recordDaemonResponse(
+        response,
+        method,
+        path,
+        started,
+        completed,
+        headersAt - started,
+        completed - headersAt,
+      );
     }
     throw reason;
   } finally {
@@ -418,8 +539,9 @@ export const daemonApi = {
     return parseOverviewResponse(await get("/api/overview", signal)).payload;
   },
   async devices(signal?: AbortSignal) {
-    const payload = parseDevicesResponse(await get("/api/devices", signal))
-      .payload;
+    const payload = parseDevicesResponse(
+      await get("/api/devices", signal),
+    ).payload;
     recordWebEvent(
       "info",
       "frontend.devices_loaded",
