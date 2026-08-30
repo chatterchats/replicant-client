@@ -18,6 +18,9 @@ const MIN_SAVING_SECONDS: u64 = 2;
 pub enum TravelProfile {
     /// Standard propulsion, measured at 30 seconds per light-year.
     Standard,
+    /// Cargo Vessel propulsion. Its documented 40% speed reduction is a
+    /// `0.6×` speed multiplier, equivalent to 50 seconds per light-year.
+    Cargo,
     /// Racing Vessel propulsion, measured at `30 / 1.35` seconds per
     /// light-year.
     Racing,
@@ -30,6 +33,12 @@ impl TravelProfile {
         Self::Standard
     }
 
+    /// Returns the Cargo Vessel propulsion profile.
+    #[must_use]
+    pub const fn cargo() -> Self {
+        Self::Cargo
+    }
+
     /// Returns the Racing Vessel propulsion profile.
     #[must_use]
     pub const fn racing() -> Self {
@@ -38,11 +47,13 @@ impl TravelProfile {
 
     /// Selects a profile from an optional device type.
     ///
-    /// Racing Vessels use the racing profile.  Cargo and every other known or
-    /// unknown device type use the measured standard profile.
+    /// Racing and Cargo Vessels use their documented propulsion modifiers.
+    /// Cargo Freighters and every other known or unknown device type use the
+    /// experimentally measured standard profile.
     #[must_use]
     pub fn for_device_type(device_type: Option<&DeviceType>) -> Self {
         match device_type {
+            Some(DeviceType::CargoVessel) => Self::Cargo,
             Some(DeviceType::RacingVessel) => Self::Racing,
             _ => Self::Standard,
         }
@@ -74,9 +85,10 @@ impl From<&DeviceType> for TravelProfile {
 
 /// Computes the measured, destination-directed duration of one travel leg.
 ///
-/// The baseline is `floor(distance * 30)`.  Racing Vessel timing uses the
-/// exact rational factor `30 / 1.35 = 600 / 27`, and is truncated before any
-/// destination-hub reduction.  A destination hub then applies
+/// The baseline is `floor(distance * 30)`. Cargo Vessel timing uses its
+/// documented `0.6×` speed multiplier, or `30 / 0.6` seconds per light-year.
+/// Racing Vessel timing uses the measured `1.35×` speed multiplier. Each
+/// profile is truncated before a destination hub applies
 /// `floor(pre_surge * 0.75)`, represented exactly as integer `3 / 4`.
 /// Invalid, negative, or non-finite distances return `None`.
 #[must_use]
@@ -91,6 +103,7 @@ pub fn surge_seconds(
 
     let scaled = match profile {
         TravelProfile::Standard => distance_ly * 30.0,
+        TravelProfile::Cargo => distance_ly * 30.0 / 0.6,
         TravelProfile::Racing => distance_ly * 30.0 / 1.35,
     };
     if !scaled.is_finite() {
@@ -482,13 +495,27 @@ mod tests {
     }
 
     #[test]
-    fn device_profiles_keep_cargo_on_measured_baseline() {
+    fn cargo_vessel_uses_documented_speed_reduction_before_hub_assistance() {
+        assert_eq!(
+            surge_seconds(10.0, TravelProfile::cargo(), false),
+            Some(500)
+        );
+        assert_eq!(surge_seconds(10.0, TravelProfile::cargo(), true), Some(375));
+        assert_eq!(surge_seconds(0.03, TravelProfile::cargo(), true), Some(0));
+    }
+
+    #[test]
+    fn device_profiles_distinguish_cargo_vessels_from_freighters() {
         assert_eq!(
             TravelProfile::for_device_type(Some(&DeviceType::RacingVessel)),
             TravelProfile::Racing
         );
         assert_eq!(
             TravelProfile::for_device_type(Some(&DeviceType::CargoVessel)),
+            TravelProfile::Cargo
+        );
+        assert_eq!(
+            TravelProfile::for_device_type(Some(&DeviceType::CargoFreighter)),
             TravelProfile::Standard
         );
         assert_eq!(
@@ -521,6 +548,17 @@ mod tests {
             .expect("valid racing plan");
         assert_eq!(racing.systems, ["A", "B", "D"]);
         assert!(racing.saved_seconds >= MIN_SAVING_SECONDS);
+        let cargo = SmartTravelPlanner::default()
+            .plan(
+                &origin,
+                &destination,
+                &[star("B", 2.0, true)],
+                TravelProfile::cargo(),
+            )
+            .expect("valid cargo plan");
+        assert_eq!(cargo.systems, ["A", "B", "D"]);
+        assert_eq!(cargo.direct_seconds, 500);
+        assert_eq!(cargo.estimated_seconds, 475);
 
         let direct = SmartTravelPlanner::default()
             .plan(&origin, &destination, &[], TravelProfile::standard())
