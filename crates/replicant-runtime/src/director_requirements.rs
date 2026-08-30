@@ -401,6 +401,59 @@ impl DirectorRequirementGraph {
         demand
     }
 
+    /// Returns connectivity prerequisites raised during the current
+    /// reconciliation for one region, keyed by target system. The tuple is the
+    /// durable requirement identity plus its effective requester priority.
+    ///
+    /// This lets the regional FTL resolver consume dependency pressure raised
+    /// by other goals (for example mining) without directly coupling those
+    /// planners to relay workflow creation.
+    #[must_use]
+    pub fn current_connectivity_requirements(
+        &self,
+        region: &str,
+    ) -> BTreeMap<String, (String, u32)> {
+        let mut requirements = BTreeMap::new();
+        for record in self.records.values() {
+            let requested_now = record.requesters.iter().any(|requester| {
+                self.seen_requesters
+                    .contains(&(record.id.clone(), requester.goal_id.clone()))
+            });
+            if !requested_now
+                || !matches!(
+                    record.status,
+                    DirectorRequirementStatus::Pending
+                        | DirectorRequirementStatus::Active
+                        | DirectorRequirementStatus::Blocked
+                )
+            {
+                continue;
+            }
+            let DirectorRequirement::Connectivity {
+                region: requirement_region,
+                target_system,
+            } = &record.requirement
+            else {
+                continue;
+            };
+            if requirement_region != region {
+                continue;
+            }
+            let priority = record
+                .requesters
+                .iter()
+                .filter(|requester| {
+                    self.seen_requesters
+                        .contains(&(record.id.clone(), requester.goal_id.clone()))
+                })
+                .map(|requester| requester.priority)
+                .max()
+                .unwrap_or_default();
+            requirements.insert(target_system.clone(), (record.id.clone(), priority));
+        }
+        requirements
+    }
+
     /// Persists the successful reconciliation and resolves requirements that no
     /// longer have any requesting goal in this pass.
     pub fn persist(
@@ -702,6 +755,50 @@ mod tests {
             )
             .expect("refresh smaller demand");
         assert_eq!(graph.worker_demand_by_region().get("beta"), Some(&1));
+    }
+
+    #[test]
+    fn current_connectivity_requirements_are_region_scoped_and_priority_merged() {
+        let repository = repository();
+        let mut graph = DirectorRequirementGraph::load(&repository, 100).expect("load graph");
+        let beta_id = graph
+            .raise(
+                DirectorRequirement::Connectivity {
+                    region: "beta".to_owned(),
+                    target_system: "BETA-MINE".to_owned(),
+                },
+                "expand_mining_ops:beta",
+                "mining dependency",
+                650,
+            )
+            .expect("raise beta mining connectivity");
+        graph
+            .raise(
+                DirectorRequirement::Connectivity {
+                    region: "beta".to_owned(),
+                    target_system: "BETA-MINE".to_owned(),
+                },
+                "event_completion:beta",
+                "event dependency",
+                700,
+            )
+            .expect("raise beta event connectivity");
+        graph
+            .raise(
+                DirectorRequirement::Connectivity {
+                    region: "gamma".to_owned(),
+                    target_system: "GAMMA-MINE".to_owned(),
+                },
+                "expand_mining_ops:gamma",
+                "other region",
+                650,
+            )
+            .expect("raise gamma connectivity");
+
+        assert_eq!(
+            graph.current_connectivity_requirements("beta"),
+            BTreeMap::from([("BETA-MINE".to_owned(), (beta_id, 700))])
+        );
     }
 
     #[test]

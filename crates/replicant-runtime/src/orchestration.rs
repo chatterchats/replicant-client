@@ -23,8 +23,9 @@ use replicant_client::{
 };
 use replicant_protocol::{
     DirectorGoalKind, DirectorGoalStatus, DirectorGoalSummary, DirectorMode, DirectorRegionStatus,
-    DirectorRegionSummary, DirectorReplicantAssignment, DirectorSnapshot, DirectorUrgencyFact,
-    DirectorWorkforceSummary, SnapshotMetadata, WorkflowId as ProtocolWorkflowId,
+    DirectorMiningPolicySummary, DirectorRegionSummary, DirectorReplicantAssignment,
+    DirectorSnapshot, DirectorUrgencyFact, DirectorWorkforceSummary, SnapshotMetadata,
+    WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
 use replicant_workflow::RepositoryError;
@@ -62,6 +63,7 @@ use crate::{
 const SETTINGS_NS: &str = "director.settings";
 const SETTINGS_KEY: &str = "singleton";
 const GOAL_CONTROL_NS: &str = "director.goal_control";
+const MINING_POLICY_NS: &str = "director.mining_policy";
 const GOAL_RUNTIME_NS: &str = "director.goal_runtime";
 const REPLICANT_NS: &str = "director.replicant";
 const WORKFORCE_NS: &str = "director.workforce";
@@ -85,7 +87,9 @@ const DEFAULT_PROSPECT_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 const DEFAULT_RETRY_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const DEFAULT_IDLE_TARGET: f64 = 0.15;
 const DEFAULT_SCALE_THRESHOLD: f64 = 0.10;
-const MINING_BATCH_SIZE: usize = 12;
+const MINING_WARD_SITES_PER_REGION: usize = 4;
+const MINING_BATCH_SIZE: usize = 4;
+const MAX_ACTIVE_SYSTEM_WARDS: usize = 25;
 const CATALOGUE_SYSTEMS_PER_WORKER: usize = 20;
 const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // A system hub has 15 LY operational reach. An owned hub just outside a named
@@ -145,6 +149,27 @@ impl Default for DirectorSettings {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct GoalControl {
     enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct MiningExpansionPolicy {
+    #[serde(default = "default_true")]
+    expand_moderate: bool,
+    #[serde(default = "default_true")]
+    expand_sparse: bool,
+}
+
+impl Default for MiningExpansionPolicy {
+    fn default() -> Self {
+        Self {
+            expand_moderate: true,
+            expand_sparse: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Default)]
@@ -406,6 +431,57 @@ pub fn set_goal_enabled(
     Ok(())
 }
 
+/// Updates which non-dense belt classes may receive new mining deployments in
+/// one region. Dense belts are always eligible. Disabling a density stops new
+/// expansion into that class; an existing lower-density site remains managed
+/// until a higher-priority ward allocation displaces it.
+pub fn set_mining_expansion_policy(
+    repository: &WorkflowRepository,
+    region: &str,
+    expand_moderate: bool,
+    expand_sparse: bool,
+) -> Result<(), ApplicationError> {
+    let region = canonical_region(region);
+    repository.put_document(
+        MINING_POLICY_NS,
+        &region,
+        &MiningExpansionPolicy {
+            expand_moderate,
+            expand_sparse,
+        },
+    )?;
+    Ok(())
+}
+
+fn mining_expansion_policy(
+    repository: &WorkflowRepository,
+    region: &str,
+) -> Result<MiningExpansionPolicy, ApplicationError> {
+    repository
+        .read_document(MINING_POLICY_NS, &canonical_region(region))?
+        .map(|(value, _)| serde_json::from_value(value))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+        .map_err(Into::into)
+}
+
+fn mining_policy_summaries<'a>(
+    repository: &WorkflowRepository,
+    regions: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<DirectorMiningPolicySummary>, ApplicationError> {
+    regions
+        .into_iter()
+        .map(|region| {
+            let policy = mining_expansion_policy(repository, region)?;
+            Ok(DirectorMiningPolicySummary {
+                region: canonical_region(region),
+                expand_moderate: policy.expand_moderate,
+                expand_sparse: policy.expand_sparse,
+            })
+        })
+        .collect()
+}
+
 /// Permanently assigns an existing Replicant to a region.
 ///
 /// Passing `None` is an explicit operator action that clears the assignment;
@@ -467,6 +543,7 @@ pub fn cached_director_snapshot(
                 mode: settings.mode,
                 regions: Vec::new(),
                 goals,
+                mining_policies: Vec::new(),
                 replicants: Vec::new(),
                 requirements: load_requirement_summaries(repository)?,
                 workforce: DirectorWorkforceSummary {
@@ -518,6 +595,10 @@ fn apply_durable_snapshot_overrides(
             .map(|replicant| replicant.code.clone())
             .collect();
     }
+    snapshot.mining_policies = mining_policy_summaries(
+        repository,
+        snapshot.regions.iter().map(|region| region.region.as_str()),
+    )?;
     snapshot.requirements = load_requirement_summaries(repository)?;
 
     Ok(())
@@ -839,6 +920,7 @@ pub async fn reconcile_director(
             &workers,
             &workflows,
             &devices,
+            &catalogue,
             &locations,
             &location_systems,
             &system_regions,
@@ -1010,6 +1092,7 @@ pub async fn reconcile_director(
             &workers,
             &workflows,
             &devices,
+            &catalogue,
             &locations,
             &location_systems,
             &system_regions,
@@ -1197,6 +1280,10 @@ pub async fn reconcile_director(
             .cmp(&right.region)
             .then_with(|| goal_kind_key(left.kind).cmp(goal_kind_key(right.kind)))
     });
+    let mining_policies = mining_policy_summaries(
+        repository.as_ref(),
+        region_summaries.iter().map(|region| region.region.as_str()),
+    )?;
     let requirement_summaries = requirements.persist(&repository)?;
 
     tracing::info!(
@@ -1218,6 +1305,7 @@ pub async fn reconcile_director(
         mode: settings.mode,
         regions: region_summaries,
         goals,
+        mining_policies,
         replicants: workers
             .into_iter()
             .map(|worker| DirectorReplicantAssignment {
@@ -2847,6 +2935,8 @@ fn reconcile_maintain_system_hubs(
                     devices: Vec::new(),
                     device_codes: Vec::new(),
                     device_tags: Vec::new(),
+                    pre_deactivate_device_codes: Vec::new(),
+                    release_mining_reservations: false,
                     return_transports: true,
                     allow_transport_staging: false,
                     region: Some(region.region.clone()),
@@ -3885,13 +3975,14 @@ fn reconcile_expand_mining(
     _workers: &[WorkerView],
     workflows: &[WorkflowInstance],
     devices: &[Device],
+    catalogue: &[Star],
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
     system_regions: &BTreeMap<String, String>,
     controls: &GoalControls,
     automatic: bool,
     _reserved: &mut BTreeSet<String>,
-    _requirements: &mut DirectorRequirementGraph,
+    requirements: &mut DirectorRequirementGraph,
     now: i64,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandMiningOps;
@@ -3899,14 +3990,708 @@ fn reconcile_expand_mining(
     let id = goal_instance_id(kind, Some(&region.region));
     let mut runtime = load_goal_runtime(repository, &id)?;
     prune_runtime_workflows(&mut runtime, workflows);
-    let belt_systems = locations
-        .iter()
-        .filter(|location| {
-            location
-                .location_type
-                .as_ref()
-                .is_some_and(|kind| kind.as_str() == "belt")
+
+    let policy = mining_expansion_policy(repository, &region.region)?;
+    let belt_systems =
+        known_belt_systems(locations, location_systems, system_regions, &region.region);
+    let belt_density = belt_density_priorities(locations, location_systems);
+    let belt_designations = known_belt_designations(locations, location_systems);
+
+    // A regional mining footprint has two classes of active sites:
+    //
+    // * up to four ward-backed systems, selected by density (dense > moderate
+    //   > sparse) with the regional density policy controlling new expansion;
+    // * any eligible belt system already protected by an owned active System
+    //   Hub. Hub-protected sites are "free" because they do not consume one of
+    //   the four regional ward allocations.
+    //
+    // Previously managed sites remain recognizable after they are displaced
+    // from the active ward set. Their hardware is left in place and can be
+    // repaired/reactivated later rather than being torn down.
+    let managed_systems = managed_mining_systems(devices, location_systems)
+        .intersection(&belt_systems)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let hub_systems = owned_mining_hub_systems(devices, catalogue, location_systems);
+    let selected_ward_systems = selected_mining_ward_systems(
+        &belt_systems,
+        &managed_systems,
+        &hub_systems,
+        &belt_density,
+        policy,
+    );
+    let hub_desired_systems = belt_systems
+        .intersection(&hub_systems)
+        .filter(|system| {
+            managed_systems.contains(*system)
+                || mining_density_allowed(
+                    belt_density.get(*system).copied().unwrap_or_default(),
+                    policy,
+                )
         })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let desired_systems = selected_ward_systems
+        .union(&hub_desired_systems)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let protected = crate::mining::protected_systems(devices, catalogue);
+    let healthy_systems = desired_systems
+        .iter()
+        .filter(|system| {
+            let Some(belts) = belt_designations.get(*system) else {
+                return false;
+            };
+            belts.iter().any(|belt| {
+                crate::mining::audit_site(devices, system, belt, protected.contains(*system))
+                    .operational
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let pending = desired_systems
+        .difference(&healthy_systems)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let relay_systems = relay_device_systems(devices, location_systems);
+    let disconnected = pending
+        .difference(&relay_systems)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let connectivity_targets =
+        prioritized_mining_repair_targets(&disconnected, &managed_systems, &belt_density);
+    if enabled {
+        for target in connectivity_targets.iter().take(MINING_BATCH_SIZE) {
+            requirements.raise(
+                DirectorRequirement::Connectivity {
+                    region: region.region.clone(),
+                    target_system: target.clone(),
+                },
+                &id,
+                format!(
+                    "Mining expansion or repair in {target} requires active regional FTL coverage"
+                ),
+                PRIORITY_FTL_EXPANSION,
+            )?;
+        }
+    }
+
+    // Ward allocation is intentionally dynamic. A hub makes a ward redundant,
+    // and a newly eligible higher-density belt may displace a lower-density
+    // managed site. Move that existing ward before launching a mining campaign
+    // so the campaign adopts/activates the relocated identity instead of
+    // printing a replacement. Never strip protection from the donor until the
+    // destination itself is relay-reachable.
+    let relocations = plan_mining_ward_relocations(MiningWardRebalanceContext {
+        devices,
+        managed_systems: &managed_systems,
+        selected_ward_systems: &selected_ward_systems,
+        relay_systems: &relay_systems,
+        hub_systems: &hub_systems,
+        belt_density: &belt_density,
+        belt_designations: &belt_designations,
+        location_systems,
+    });
+
+    let covered = healthy_systems.len();
+    let active = nonterminal_ids(&runtime, workflows);
+    let recently_launched = launch_is_recent(&runtime, now, DEFAULT_RETRY_COOLDOWN_MS);
+    let mut blocker = None;
+    let next_action;
+
+    let status = if !enabled {
+        next_action = Some("Enable this standing goal to reconcile regional mining sites".to_owned());
+        DirectorGoalStatus::Waiting
+    } else if !active.is_empty() {
+        next_action = Some(
+            "Continue the active regional mining repair, expansion, or ward-rebalance workflow"
+                .to_owned(),
+        );
+        DirectorGoalStatus::Active
+    } else if recently_launched {
+        next_action = Some(
+            "Wait briefly before replanning the next mining or ward-rebalance action".to_owned(),
+        );
+        DirectorGoalStatus::Waiting
+    } else if let Some(relocation) = relocations.first() {
+        next_action = Some(format!(
+            "Move System Ward {} from {} to {} so the higher-priority mining belt is protected",
+            relocation.ward_code, relocation.source_system, relocation.target_system
+        ));
+        if automatic {
+            let mut pre_deactivate_device_codes = relocation.pause_devices.clone();
+            if !pre_deactivate_device_codes.contains(&relocation.ward_code) {
+                // Keep the ward last: displaced mining/survey controllers must
+                // be quiesced before the system protection is removed.
+                pre_deactivate_device_codes.push(relocation.ward_code.clone());
+            }
+            let workflow = repository.create(new_logistics_manifest_workflow(
+                LogisticsManifestIntent {
+                    origin: relocation.origin.clone(),
+                    destination: relocation.target_belt.clone(),
+                    resources: ResourceMap::new(),
+                    devices: Vec::new(),
+                    device_codes: vec![relocation.ward_code.clone()],
+                    device_tags: Vec::new(),
+                    pre_deactivate_device_codes,
+                    release_mining_reservations: true,
+                    return_transports: relocation.origin.contains('-'),
+                    allow_transport_staging: true,
+                    region: Some(region.region.clone()),
+                    purpose: mining_ward_relocation_purpose(
+                        &region.region,
+                        &relocation.ward_code,
+                        &relocation.target_system,
+                    ),
+                },
+            ))?;
+            tracing::info!(
+                workflow_id = %workflow.id,
+                region = %region.region,
+                ward = %relocation.ward_code,
+                source_system = %relocation.source_system,
+                target_system = %relocation.target_system,
+                "Director launched mining System Ward rebalance"
+            );
+            runtime.active_workflows = vec![workflow.id];
+            runtime.last_launch_at_ms = Some(now);
+        }
+        DirectorGoalStatus::Active
+    } else if pending.is_empty() {
+        next_action = Some(format!(
+            "Maintain {MINING_WARD_SITES_PER_REGION} density-prioritized ward-backed mining belts plus hub-protected sites"
+        ));
+        DirectorGoalStatus::Satisfied
+    } else {
+        // Targets that already have active protection can be repaired
+        // immediately. Unprotected ward-selected targets may consume one of the
+        // remaining account-wide active-ward slots. A relocated ward is handled
+        // above and therefore never competes with this capacity calculation.
+        let protected_pending = pending
+            .intersection(&protected)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let active_ward_systems = crate::mining::active_owned_ward_systems(devices, catalogue);
+        let available_ward_slots =
+            MAX_ACTIVE_SYSTEM_WARDS.saturating_sub(active_ward_systems.len());
+        let ward_activation_needed = pending
+            .intersection(&selected_ward_systems)
+            .filter(|system| !protected.contains(*system))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let managed_ward_needed = ward_activation_needed
+            .intersection(&managed_systems)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let new_ward_needed = ward_activation_needed
+            .difference(&managed_systems)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let ward_slot_targets = prioritized_mining_targets(&managed_ward_needed, &belt_density)
+            .into_iter()
+            .chain(prioritized_mining_targets(&new_ward_needed, &belt_density))
+            .take(available_ward_slots)
+            .collect::<BTreeSet<_>>();
+        let actionable_pending = protected_pending
+            .union(&ward_slot_targets)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let ward_blocked = pending
+            .difference(&actionable_pending)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let targets = relay_connected_mining_targets(
+            &actionable_pending,
+            &relay_systems,
+            &managed_systems,
+            &belt_density,
+        );
+
+        if targets.is_empty() && !disconnected.is_empty() {
+            blocker = Some(format!(
+                "{} mining system(s) needing deployment or repair require active FTL coverage",
+                disconnected.len()
+            ));
+            next_action = Some(
+                "Extend regional FTL coverage to the highest-priority mining systems".to_owned(),
+            );
+            DirectorGoalStatus::Blocked
+        } else if targets.is_empty() && !ward_blocked.is_empty() {
+            blocker = Some(format!(
+                "the account-wide limit of {MAX_ACTIVE_SYSTEM_WARDS} active System Wards leaves {} selected mining system(s) without an activation slot",
+                ward_blocked.len()
+            ));
+            next_action = Some(
+                "Free an active System Ward, add System Hub protection, or let the ward rebalancer reuse an existing regional ward"
+                    .to_owned(),
+            );
+            DirectorGoalStatus::Blocked
+        } else if targets.is_empty() {
+            blocker = Some("No pending mining site is currently actionable".to_owned());
+            next_action = Some("Wait for managed state to refresh before replanning".to_owned());
+            DirectorGoalStatus::Waiting
+        } else {
+            next_action = Some(format!(
+                "Deploy or repair mining stacks in {} reachable system(s) as one regional campaign",
+                targets.len()
+            ));
+            if automatic
+                && let Some(hub) = region
+                    .hub_location
+                    .clone()
+                    .or_else(|| region.hub_system.clone())
+            {
+                let workflow =
+                    repository.create(new_mining_campaign_workflow(MiningCampaignIntent {
+                        systems: targets,
+                        region: region.region.clone(),
+                        hub,
+                        max_concurrency: 4,
+                    }))?;
+                tracing::info!(
+                    workflow_id = %workflow.id,
+                    region = %region.region,
+                    "Director launched regional mining expansion/repair campaign"
+                );
+                runtime.active_workflows = vec![workflow.id];
+                runtime.last_launch_at_ms = Some(now);
+            }
+            DirectorGoalStatus::Active
+        }
+    };
+    save_goal_runtime(repository, &id, &runtime)?;
+
+    let mut density_scope = vec!["dense"];
+    if policy.expand_moderate {
+        density_scope.push("moderate");
+    }
+    if policy.expand_sparse {
+        density_scope.push("sparse");
+    }
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: format!(
+            "Maintain {MINING_WARD_SITES_PER_REGION} ward-backed mining belts in {} ({}), plus eligible System Hub-protected sites",
+            region.region,
+            density_scope.join(", ")
+        ),
+        blocker,
+        next_action,
+        progress_current: covered as u64,
+        progress_total: desired_systems.len() as u64,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
+}
+
+fn managed_mining_systems(
+    devices: &[Device],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    devices
+        .iter()
+        .filter(|device| {
+            device.device_type.as_ref().is_some_and(|device_type| {
+                matches!(
+                    device_type,
+                    DeviceType::MiningController
+                        | DeviceType::MiningDrone
+                        | DeviceType::SurveyController
+                        | DeviceType::SurveyDrone
+                ) || (device_type == &DeviceType::MaintenanceDrone
+                    && device.tags.iter().any(|tag| tag.starts_with("mine-s:")))
+            })
+        })
+        .filter_map(|device| device_system(device, location_systems))
+        .collect()
+}
+
+fn mining_density_allowed(priority: u8, policy: MiningExpansionPolicy) -> bool {
+    match priority {
+        3.. => true,
+        2 => policy.expand_moderate,
+        1 => policy.expand_sparse,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MiningWardRelocation {
+    ward_code: String,
+    source_system: String,
+    origin: String,
+    target_system: String,
+    target_belt: String,
+    pause_devices: Vec<String>,
+}
+
+fn selected_mining_ward_systems(
+    belt_systems: &BTreeSet<String>,
+    managed_systems: &BTreeSet<String>,
+    hub_systems: &BTreeSet<String>,
+    belt_density: &BTreeMap<String, u8>,
+    policy: MiningExpansionPolicy,
+) -> BTreeSet<String> {
+    let mut candidates = belt_systems
+        .iter()
+        .filter(|system| !hub_systems.contains(*system))
+        .filter(|system| {
+            managed_systems.contains(*system)
+                || mining_density_allowed(
+                    belt_density.get(*system).copied().unwrap_or_default(),
+                    policy,
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        belt_density
+            .get(right)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&belt_density.get(left).copied().unwrap_or_default())
+            .then_with(|| managed_systems.contains(right).cmp(&managed_systems.contains(left)))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+        .into_iter()
+        .take(MINING_WARD_SITES_PER_REGION)
+        .collect()
+}
+
+fn owned_mining_hub_systems(
+    devices: &[Device],
+    catalogue: &[Star],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    catalogue
+        .iter()
+        .filter(|star| star.has_hub == Some(true))
+        .filter_map(|star| {
+            let system = star.key.id.as_str();
+            devices
+                .iter()
+                .any(|device| {
+                    device.device_type.as_ref() == Some(&DeviceType::SystemHub)
+                        && device_system(device, location_systems).as_deref() == Some(system)
+                })
+                .then_some(system.to_owned())
+        })
+        .collect()
+}
+
+fn owned_mining_wards_by_system(
+    devices: &[Device],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<(String, String)>> {
+    let mut wards = BTreeMap::<String, Vec<(String, String)>>::new();
+    for device in devices.iter().filter(|device| {
+        device.device_type.as_ref() == Some(&DeviceType::SystemWard)
+            && device.relationships.attached_to.is_none()
+            && device.relationships.stowed_in.is_none()
+            && device.travel.is_none()
+    }) {
+        let Some(system) = device_system(device, location_systems) else {
+            continue;
+        };
+        let Some(location) = device.location.as_ref() else {
+            continue;
+        };
+        wards.entry(system).or_default().push((
+            device.key.id.as_str().to_owned(),
+            location.id.as_str().to_owned(),
+        ));
+    }
+    for devices in wards.values_mut() {
+        devices.sort();
+    }
+    wards
+}
+
+fn mining_site_pause_devices(
+    devices: &[Device],
+    system: &str,
+    belt_designations: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let Some(belt) = belt_designations
+        .get(system)
+        .and_then(|belts| belts.first())
+    else {
+        return Vec::new();
+    };
+    let audit = crate::mining::audit_site(devices, system, belt, false);
+    let mut controllers = audit
+        .assets
+        .mining_controller
+        .into_iter()
+        .chain(audit.assets.survey_controller)
+        .collect::<Vec<_>>();
+    controllers.sort();
+    controllers.dedup();
+    controllers
+}
+
+struct MiningWardRebalanceContext<'a> {
+    devices: &'a [Device],
+    managed_systems: &'a BTreeSet<String>,
+    selected_ward_systems: &'a BTreeSet<String>,
+    relay_systems: &'a BTreeSet<String>,
+    hub_systems: &'a BTreeSet<String>,
+    belt_density: &'a BTreeMap<String, u8>,
+    belt_designations: &'a BTreeMap<String, Vec<String>>,
+    location_systems: &'a BTreeMap<String, String>,
+}
+
+fn plan_mining_ward_relocations(
+    context: MiningWardRebalanceContext<'_>,
+) -> Vec<MiningWardRelocation> {
+    let wards = owned_mining_wards_by_system(context.devices, context.location_systems);
+    let warded_systems = wards.keys().cloned().collect::<BTreeSet<_>>();
+    let mut targets = context
+        .selected_ward_systems
+        .difference(&warded_systems)
+        .filter(|system| context.relay_systems.contains(*system))
+        .filter_map(|system| {
+            context
+                .belt_designations
+                .get(system)
+                .and_then(|belts| belts.first())
+                .map(|belt| (system.clone(), belt.clone()))
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        context
+            .belt_density
+            .get(&right.0)
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &context
+                    .belt_density
+                    .get(&left.0)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    // Only repurpose wards from mining-managed systems. A System Hub in an
+    // unrelated system must not cause the mining Director to steal a ward that
+    // belongs to some other standing goal or manual setup. Hub-protected
+    // mining systems are preferred donors because moving their ward does not
+    // interrupt mining there. Among remaining donors, lower-density sites give
+    // up their wards first.
+    let donor_systems = context
+        .managed_systems
+        .difference(context.selected_ward_systems)
+        .filter(|system| context.relay_systems.contains(*system))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut donors = donor_systems
+        .iter()
+        .flat_map(|system| {
+            wards.get(system).into_iter().flatten().map(move |(code, origin)| {
+                (system.clone(), code.clone(), origin.clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    donors.sort_by(|left, right| {
+        context
+            .hub_systems
+            .contains(&right.0)
+            .cmp(&context.hub_systems.contains(&left.0))
+            .then_with(|| {
+                context
+                    .belt_density
+                    .get(&left.0)
+                    .copied()
+                    .unwrap_or_default()
+                    .cmp(
+                        &context
+                            .belt_density
+                            .get(&right.0)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+            })
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    donors
+        .into_iter()
+        .zip(targets)
+        .map(
+            |((source_system, ward_code, origin), (target_system, target_belt))| {
+                let pause_devices = if context.hub_systems.contains(&source_system) {
+                    Vec::new()
+                } else {
+                    mining_site_pause_devices(
+                        context.devices,
+                        &source_system,
+                        context.belt_designations,
+                    )
+                };
+                MiningWardRelocation {
+                    ward_code,
+                    source_system,
+                    origin,
+                    target_system,
+                    target_belt,
+                    pause_devices,
+                }
+            },
+        )
+        .collect()
+}
+
+fn mining_ward_relocation_purpose(region: &str, ward: &str, target_system: &str) -> String {
+    format!(
+        "director:expand_mining_ops:ward-rebalance:{}:{}:{}",
+        canonical_region(region),
+        ward.to_ascii_lowercase(),
+        target_system.to_ascii_uppercase()
+    )
+}
+
+fn known_belt_designations(
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut choices = BTreeMap::<String, Vec<(u8, String)>>::new();
+    for location in locations {
+        let Some(system) = location
+            .system
+            .clone()
+            .or_else(|| location_systems.get(location.key.id.as_str()).cloned())
+        else {
+            continue;
+        };
+
+        let mut candidates = Vec::<(u8, String)>::new();
+        if location
+            .location_type
+            .as_ref()
+            .is_some_and(|kind| kind.as_str() == "belt")
+        {
+            let density = ["belt", "asteroid_belt"]
+                .iter()
+                .filter_map(|field| location.unknown.get(*field))
+                .map(belt_density_priority)
+                .max()
+                .unwrap_or_default();
+            candidates.push((density, location.key.id.as_str().to_owned()));
+        }
+        if let Some(value) = location.unknown.get("asteroid_belt") {
+            let belts = value
+                .get("belts")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(value));
+            for belt in belts {
+                let Some(designation) = belt.get("designation").and_then(Value::as_str) else {
+                    continue;
+                };
+                let density = belt
+                    .get("density")
+                    .and_then(Value::as_str)
+                    .map(belt_density_name_priority)
+                    .unwrap_or_default();
+                candidates.push((density, designation.to_owned()));
+            }
+        }
+        choices.entry(system).or_default().extend(candidates);
+    }
+
+    choices
+        .into_iter()
+        .map(|(system, mut belts)| {
+            belts.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            belts.dedup_by(|left, right| left.1 == right.1);
+            (
+                system,
+                belts
+                    .into_iter()
+                    .map(|(_, designation)| designation)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn relay_connected_mining_targets(
+    pending_systems: &BTreeSet<String>,
+    relay_systems: &BTreeSet<String>,
+    managed_systems: &BTreeSet<String>,
+    belt_density: &BTreeMap<String, u8>,
+) -> Vec<String> {
+    let connected = pending_systems
+        .intersection(relay_systems)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    prioritized_mining_repair_targets(&connected, managed_systems, belt_density)
+        .into_iter()
+        .take(MINING_BATCH_SIZE)
+        .collect()
+}
+
+fn prioritized_mining_repair_targets(
+    systems: &BTreeSet<String>,
+    managed_systems: &BTreeSet<String>,
+    belt_density: &BTreeMap<String, u8>,
+) -> Vec<String> {
+    let mut targets = systems.iter().cloned().collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        managed_systems
+            .contains(right)
+            .cmp(&managed_systems.contains(left))
+            .then_with(|| {
+                belt_density
+                    .get(right)
+                    .copied()
+                    .unwrap_or_default()
+                    .cmp(&belt_density.get(left).copied().unwrap_or_default())
+            })
+            .then_with(|| left.cmp(right))
+    });
+    targets
+}
+
+fn prioritized_mining_targets(
+    systems: &BTreeSet<String>,
+    belt_density: &BTreeMap<String, u8>,
+) -> Vec<String> {
+    let mut targets = systems.iter().cloned().collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        belt_density
+            .get(right)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&belt_density.get(left).copied().unwrap_or_default())
+            .then_with(|| left.cmp(right))
+    });
+    targets
+}
+
+fn known_belt_systems(
+    locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    region: &str,
+) -> BTreeSet<String> {
+    locations
+        .iter()
+        .filter(|location| location_has_known_belt(location))
         .filter_map(|location| {
             location
                 .system
@@ -3916,99 +4701,30 @@ fn reconcile_expand_mining(
         .filter(|system| {
             system_regions
                 .get(system)
-                .is_some_and(|candidate| candidate == &region.region)
+                .is_some_and(|candidate| candidate == region)
         })
-        .collect::<BTreeSet<_>>();
-    let staffed_systems = devices
-        .iter()
-        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::MiningController))
-        .filter_map(|device| device_system(device, location_systems))
-        .collect::<BTreeSet<_>>();
-    let relay_systems = relay_device_systems(devices, location_systems);
-    let unstaffed = belt_systems
-        .difference(&staffed_systems)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let targets = relay_connected_mining_targets(&unstaffed, &relay_systems);
-    let covered = belt_systems
-        .len()
-        .saturating_sub(belt_systems.difference(&staffed_systems).count());
-    let active = nonterminal_ids(&runtime, workflows);
-    let recently_launched = launch_is_recent(&runtime, now, DEFAULT_RETRY_COOLDOWN_MS);
-    let blocker = None;
-    let mut next_action = None;
-    let status = if !enabled {
-        DirectorGoalStatus::Waiting
-    } else if unstaffed.is_empty() {
-        next_action = Some("Wait for newly discovered belts or depleted mining spokes".to_owned());
-        DirectorGoalStatus::Satisfied
-    } else if !active.is_empty() {
-        next_action = Some("Continue the active regional mining expansion batch".to_owned());
-        DirectorGoalStatus::Active
-    } else if recently_launched {
-        next_action =
-            Some("Wait briefly before replanning the next mining expansion batch".to_owned());
-        DirectorGoalStatus::Waiting
-    } else if targets.is_empty() {
-        next_action =
-            Some("Wait for FTL relay coverage to reach a discovered belt system".to_owned());
-        DirectorGoalStatus::Waiting
-    } else {
-        next_action = Some(format!(
-            "Expand mining into {} known belt system(s) as one regional campaign",
-            targets.len()
-        ));
-        if automatic
-            && let Some(hub) = region
-                .hub_location
-                .clone()
-                .or_else(|| region.hub_system.clone())
-        {
-            let workflow =
-                repository.create(new_mining_campaign_workflow(MiningCampaignIntent {
-                    systems: targets,
-                    region: region.region.clone(),
-                    hub,
-                    max_concurrency: 4,
-                }))?;
-            tracing::info!(
-                workflow_id = %workflow.id,
-                region = %region.region,
-                "Director launched regional mining campaign"
-            );
-            runtime.active_workflows = vec![workflow.id];
-            runtime.last_launch_at_ms = Some(now);
-        }
-        DirectorGoalStatus::Active
-    };
-    save_goal_runtime(repository, &id, &runtime)?;
-    Ok(DirectorGoalSummary {
-        id,
-        kind,
-        region: Some(region.region.clone()),
-        status,
-        objective: format!(
-            "Continually extend useful mining coverage throughout {}",
-            region.region
-        ),
-        blocker,
-        next_action,
-        progress_current: covered as u64,
-        progress_total: belt_systems.len() as u64,
-        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
-        enabled,
-    })
+        .collect()
 }
 
-fn relay_connected_mining_targets(
-    unstaffed_belt_systems: &BTreeSet<String>,
-    relay_systems: &BTreeSet<String>,
-) -> Vec<String> {
-    unstaffed_belt_systems
-        .intersection(relay_systems)
-        .take(MINING_BATCH_SIZE)
-        .cloned()
-        .collect()
+fn location_has_known_belt(location: &Location) -> bool {
+    if location
+        .location_type
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == "belt")
+    {
+        return true;
+    }
+    ["belt", "asteroid_belt"]
+        .iter()
+        .filter_map(|field| location.unknown.get(*field))
+        .any(|value| {
+            value
+                .get("belts")
+                .and_then(Value::as_array)
+                .is_some_and(|belts| !belts.is_empty())
+                || value.get("present").and_then(Value::as_bool) == Some(true)
+                || value.get("density").and_then(Value::as_str).is_some()
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4031,6 +4747,7 @@ fn reconcile_expand_ftl_network(
 
     let relay_systems = relay_device_systems(devices, location_systems);
     let belt_density = belt_density_priorities(locations, location_systems);
+    let connectivity_requirements = requirements.current_connectivity_requirements(&region.region);
     let covered = region.known_systems.intersection(&relay_systems).count();
     let mut uncovered = region
         .known_systems
@@ -4039,8 +4756,18 @@ fn reconcile_expand_ftl_network(
         .map(|system| {
             let event_priority = event_systems.contains(system);
             let density_priority = belt_density.get(system).copied().unwrap_or_default();
-            let score = ftl_priority_score(event_priority, density_priority);
-            (system.clone(), score, event_priority, density_priority)
+            let connectivity_priority = connectivity_requirements
+                .get(system)
+                .map(|(_, priority)| *priority)
+                .unwrap_or_default();
+            let score = ftl_priority_score(connectivity_priority, event_priority, density_priority);
+            (
+                system.clone(),
+                score,
+                connectivity_priority,
+                event_priority,
+                density_priority,
+            )
         })
         .collect::<Vec<_>>();
     uncovered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -4076,7 +4803,10 @@ fn reconcile_expand_ftl_network(
             Some("Continue the active regional FTL expansion campaign".to_owned()),
         )
     } else {
-        let (target, _, event_priority, density_priority) = &uncovered[0];
+        let (target, _, connectivity_priority, event_priority, density_priority) = &uncovered[0];
+        let connectivity_requirement_id = connectivity_requirements
+            .get(target)
+            .map(|(requirement_id, _)| requirement_id.clone());
         if let Some(existing) = active_exploration_workflow_for_target(context.workflows, target)? {
             runtime.active_workflows = vec![existing];
             active = vec![existing];
@@ -4087,13 +4817,16 @@ fn reconcile_expand_ftl_network(
                     target: target.clone(),
                 },
             );
+            if let Some(requirement_id) = connectivity_requirement_id.as_deref() {
+                requirements.attach_workflow(requirement_id, existing)?;
+            }
         }
         if !active.is_empty() {
             (
                 DirectorGoalStatus::Active,
                 Some(format!(
                     "Continue the existing FTL expansion toward {target}{}",
-                    ftl_priority_suffix(*event_priority, *density_priority)
+                    ftl_priority_suffix(*connectivity_priority, *event_priority, *density_priority,)
                 )),
             )
         } else if let Some(failure) = permanent_failure {
@@ -4109,7 +4842,7 @@ fn reconcile_expand_ftl_network(
                 DirectorGoalStatus::Waiting,
                 Some(format!(
                     "Wait briefly before retrying FTL expansion toward {target}{}",
-                    ftl_priority_suffix(*event_priority, *density_priority)
+                    ftl_priority_suffix(*connectivity_priority, *event_priority, *density_priority,)
                 )),
             )
         } else if let Some(worker) =
@@ -4146,7 +4879,7 @@ fn reconcile_expand_ftl_network(
             };
             let next_action = Some(format!(
                 "Extend FTL coverage toward {target} with {worker}{}",
-                ftl_priority_suffix(*event_priority, *density_priority)
+                ftl_priority_suffix(*connectivity_priority, *event_priority, *density_priority,)
             ));
             if context.automatic {
                 let workflow =
@@ -4162,6 +4895,7 @@ fn reconcile_expand_ftl_network(
                     workflow_id = %workflow.id,
                     region = %region.region,
                     target = %target,
+                    connectivity_priority = *connectivity_priority,
                     event_priority = *event_priority,
                     belt_density_priority = *density_priority,
                     replicant = %worker,
@@ -4176,6 +4910,9 @@ fn reconcile_expand_ftl_network(
                         target: target.clone(),
                     },
                 );
+                if let Some(requirement_id) = connectivity_requirement_id.as_deref() {
+                    requirements.attach_workflow(requirement_id, workflow.id)?;
+                }
                 reserved.insert(worker);
             }
             (DirectorGoalStatus::Active, next_action)
@@ -4251,8 +4988,18 @@ fn relay_device_systems(
                     || device_type.as_str() == "deep_space_relay_station"
             })
         })
+        .filter(|device| relay_device_is_active(device))
         .filter_map(|device| device_system(device, location_systems))
         .collect()
+}
+
+fn relay_device_is_active(device: &Device) -> bool {
+    device.relationships.stowed_in.is_none()
+        && device.relationships.attached_to.is_none()
+        && device
+            .status
+            .as_ref()
+            .is_some_and(|status| matches!(status.as_str(), "active" | "relaying"))
 }
 
 fn belt_density_priorities(
@@ -4285,12 +5032,17 @@ fn belt_density_priorities(
     priorities
 }
 
-fn belt_density_priority(value: &Value) -> u8 {
-    let rank = |density: &str| match density.to_ascii_lowercase().as_str() {
-        "dense" => 2,
-        "moderate" => 1,
+fn belt_density_name_priority(density: &str) -> u8 {
+    match density.to_ascii_lowercase().as_str() {
+        "dense" => 3,
+        "moderate" => 2,
+        "sparse" => 1,
         _ => 0,
-    };
+    }
+}
+
+fn belt_density_priority(value: &Value) -> u8 {
+    let rank = belt_density_name_priority;
     value
         .get("belts")
         .and_then(Value::as_array)
@@ -4303,18 +5055,43 @@ fn belt_density_priority(value: &Value) -> u8 {
         .unwrap_or_default()
 }
 
-fn ftl_priority_score(event_priority: bool, density_priority: u8) -> u32 {
-    (if event_priority { 200 } else { 0 }) + u32::from(density_priority) * 80
+fn ftl_priority_score(
+    connectivity_priority: u32,
+    event_priority: bool,
+    density_priority: u8,
+) -> u32 {
+    let strategic_priority = connectivity_priority.max(if event_priority {
+        PRIORITY_EVENT_COMPLETION
+    } else {
+        0
+    });
+    strategic_priority
+        .saturating_mul(1_000)
+        .saturating_add(u32::from(density_priority) * 80)
 }
 
-fn ftl_priority_suffix(event_priority: bool, density_priority: u8) -> &'static str {
-    match (event_priority, density_priority) {
-        (true, 2..) => " (active events + dense belt)",
-        (true, 1) => " (active events + moderate belt)",
-        (true, _) => " (active events)",
-        (false, 2..) => " (dense belt)",
-        (false, 1) => " (moderate belt)",
-        (false, _) => "",
+fn ftl_priority_suffix(
+    connectivity_priority: u32,
+    event_priority: bool,
+    density_priority: u8,
+) -> &'static str {
+    match (connectivity_priority > 0, event_priority, density_priority) {
+        (true, true, 3..) => " (goal dependency + active events + dense belt)",
+        (true, true, 2) => " (goal dependency + active events + moderate belt)",
+        (true, true, 1) => " (goal dependency + active events + sparse belt)",
+        (true, true, _) => " (goal dependency + active events)",
+        (true, false, 3..) => " (goal dependency + dense belt)",
+        (true, false, 2) => " (goal dependency + moderate belt)",
+        (true, false, 1) => " (goal dependency + sparse belt)",
+        (true, false, _) => " (goal dependency)",
+        (false, true, 3..) => " (active events + dense belt)",
+        (false, true, 2) => " (active events + moderate belt)",
+        (false, true, 1) => " (active events + sparse belt)",
+        (false, true, _) => " (active events)",
+        (false, false, 3..) => " (dense belt)",
+        (false, false, 2) => " (moderate belt)",
+        (false, false, 1) => " (sparse belt)",
+        (false, false, _) => "",
     }
 }
 
@@ -4876,10 +5653,17 @@ fn location_system_map(locations: &[Location]) -> BTreeMap<String, String> {
     locations
         .iter()
         .filter_map(|location| {
-            location
-                .system
-                .as_ref()
-                .map(|system| (location.key.id.as_str().to_owned(), system.clone()))
+            let location_id = location.key.id.as_str();
+            location.system.as_ref().map_or_else(
+                || {
+                    location
+                        .location_type
+                        .as_ref()
+                        .is_some_and(|kind| kind.as_str() == "star")
+                        .then(|| (location_id.to_owned(), location_id.to_owned()))
+                },
+                |system| Some((location_id.to_owned(), system.clone())),
+            )
         })
         .collect()
 }
@@ -5997,26 +6781,342 @@ mod tests {
 
         assert_eq!(
             belt_density_priorities(&[location, moderate], &BTreeMap::new()),
-            BTreeMap::from([("BETA-STAR".to_owned(), 2), ("GAMMA-STAR".to_owned(), 1)])
+            BTreeMap::from([("BETA-STAR".to_owned(), 3), ("GAMMA-STAR".to_owned(), 2)])
         );
-        assert!(ftl_priority_score(true, 0) > ftl_priority_score(false, 2));
-        assert!(ftl_priority_score(false, 2) > ftl_priority_score(false, 1));
-        assert!(ftl_priority_score(false, 1) > ftl_priority_score(false, 0));
+        assert!(ftl_priority_score(0, true, 0) > ftl_priority_score(650, false, 3));
+        assert!(ftl_priority_score(650, false, 0) > ftl_priority_score(0, false, 3));
+        assert!(ftl_priority_score(0, false, 3) > ftl_priority_score(0, false, 2));
+        assert!(ftl_priority_score(0, false, 2) > ftl_priority_score(0, false, 1));
+        assert!(ftl_priority_score(0, false, 1) > ftl_priority_score(0, false, 0));
         assert_eq!(
-            ftl_priority_suffix(true, 2),
+            ftl_priority_suffix(0, true, 3),
             " (active events + dense belt)"
         );
-        assert_eq!(ftl_priority_suffix(false, 1), " (moderate belt)");
+        assert_eq!(
+            ftl_priority_suffix(650, false, 2),
+            " (goal dependency + moderate belt)"
+        );
+        assert_eq!(
+            ftl_priority_suffix(650, false, 1),
+            " (goal dependency + sparse belt)"
+        );
+    }
+
+    #[test]
+    fn mining_density_policy_only_filters_new_expansion() {
+        let dense_only = MiningExpansionPolicy {
+            expand_moderate: false,
+            expand_sparse: false,
+        };
+        assert!(mining_density_allowed(3, dense_only));
+        assert!(!mining_density_allowed(2, dense_only));
+        assert!(!mining_density_allowed(1, dense_only));
+
+        let through_moderate = MiningExpansionPolicy {
+            expand_moderate: true,
+            expand_sparse: false,
+        };
+        assert!(mining_density_allowed(3, through_moderate));
+        assert!(mining_density_allowed(2, through_moderate));
+        assert!(!mining_density_allowed(1, through_moderate));
+    }
+
+    #[test]
+    fn mining_ward_allocation_selects_only_four_non_hub_sites() {
+        let belts = ["HUB", "DENSE-A", "DENSE-B", "DENSE-C", "DENSE-D", "DENSE-E"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let density = belts
+            .iter()
+            .cloned()
+            .map(|system| (system, 3))
+            .collect::<BTreeMap<_, _>>();
+
+        let selected = selected_mining_ward_systems(
+            &belts,
+            &BTreeSet::new(),
+            &BTreeSet::from(["HUB".to_owned()]),
+            &density,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert_eq!(selected.len(), MINING_WARD_SITES_PER_REGION);
+        assert!(!selected.contains("HUB"));
+        assert_eq!(
+            selected,
+            ["DENSE-A", "DENSE-B", "DENSE-C", "DENSE-D"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn mining_ward_allocation_prefers_existing_sites_only_within_same_density() {
+        let belts = ["EXISTING", "DENSE-A", "DENSE-B", "DENSE-C", "DENSE-D"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let managed = BTreeSet::from(["EXISTING".to_owned()]);
+        let density = belts
+            .iter()
+            .cloned()
+            .map(|system| (system, 3))
+            .collect::<BTreeMap<_, _>>();
+
+        let selected = selected_mining_ward_systems(
+            &belts,
+            &managed,
+            &BTreeSet::new(),
+            &density,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert_eq!(selected.len(), MINING_WARD_SITES_PER_REGION);
+        assert!(selected.contains("EXISTING"));
+        assert!(!selected.contains("DENSE-D"));
+    }
+
+    #[test]
+    fn newly_discovered_dense_belt_displaces_lower_density_ward_slot() {
+        let belts = ["DENSE-A", "DENSE-B", "DENSE-C", "MOD-A", "MOD-B"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let managed = ["DENSE-A", "DENSE-B", "MOD-A", "MOD-B"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let density = BTreeMap::from([
+            ("DENSE-A".to_owned(), 3),
+            ("DENSE-B".to_owned(), 3),
+            ("DENSE-C".to_owned(), 3),
+            ("MOD-A".to_owned(), 2),
+            ("MOD-B".to_owned(), 2),
+        ]);
+
+        let selected = selected_mining_ward_systems(
+            &belts,
+            &managed,
+            &BTreeSet::new(),
+            &density,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert_eq!(
+            selected,
+            ["DENSE-A", "DENSE-B", "DENSE-C", "MOD-A"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ward_rebalance_moves_displaced_lower_density_ward_to_dense_target() {
+        let mut ward = test_hub_device();
+        ward.key = replicant_client::DeviceKey::live("WARD-MOD-B".into());
+        ward.device_type = Some(DeviceType::SystemWard);
+        ward.location = Some(replicant_client::LocationKey::live("MOD-B-L4".into()));
+
+        let mut mining_controller = test_hub_device();
+        mining_controller.key = replicant_client::DeviceKey::live("MC-MOD-B".into());
+        mining_controller.device_type = Some(DeviceType::MiningController);
+        mining_controller.location = Some(replicant_client::LocationKey::live(
+            "MOD-B-BELT-1".into(),
+        ));
+        let mut survey_controller = mining_controller.clone();
+        survey_controller.key = replicant_client::DeviceKey::live("SC-MOD-B".into());
+        survey_controller.device_type = Some(DeviceType::SurveyController);
+
+        let devices = vec![ward, mining_controller, survey_controller];
+        let managed = BTreeSet::from(["MOD-B".to_owned()]);
+        let selected = BTreeSet::from(["DENSE-C".to_owned()]);
+        let relays = BTreeSet::from(["DENSE-C".to_owned(), "MOD-B".to_owned()]);
+        let density = BTreeMap::from([
+            ("DENSE-C".to_owned(), 3),
+            ("MOD-B".to_owned(), 2),
+        ]);
+        let belts = BTreeMap::from([
+            ("DENSE-C".to_owned(), vec!["DENSE-C-BELT-1".to_owned()]),
+            ("MOD-B".to_owned(), vec!["MOD-B-BELT-1".to_owned()]),
+        ]);
+        let locations = BTreeMap::from([("MOD-B-L4".to_owned(), "MOD-B".to_owned())]);
+
+        let relocations = plan_mining_ward_relocations(MiningWardRebalanceContext {
+            devices: &devices,
+            managed_systems: &managed,
+            selected_ward_systems: &selected,
+            relay_systems: &relays,
+            hub_systems: &BTreeSet::new(),
+            belt_density: &density,
+            belt_designations: &belts,
+            location_systems: &locations,
+        });
+
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].ward_code, "WARD-MOD-B");
+        assert_eq!(relocations[0].source_system, "MOD-B");
+        assert_eq!(relocations[0].target_system, "DENSE-C");
+        assert_eq!(relocations[0].target_belt, "DENSE-C-BELT-1");
+        assert_eq!(
+            relocations[0].pause_devices,
+            ["MC-MOD-B", "SC-MOD-B"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn hub_protected_donor_ward_is_reused_before_displaced_site_ward() {
+        let mut hub_ward = test_hub_device();
+        hub_ward.key = replicant_client::DeviceKey::live("WARD-HUB".into());
+        hub_ward.device_type = Some(DeviceType::SystemWard);
+        hub_ward.location = Some(replicant_client::LocationKey::live("HUB-L4".into()));
+        let mut moderate_ward = hub_ward.clone();
+        moderate_ward.key = replicant_client::DeviceKey::live("WARD-MOD".into());
+        moderate_ward.location = Some(replicant_client::LocationKey::live("MOD-L4".into()));
+
+        let devices = vec![hub_ward, moderate_ward];
+        let managed = BTreeSet::from(["HUB".to_owned(), "MOD".to_owned()]);
+        let selected = BTreeSet::from(["DENSE".to_owned()]);
+        let relays = BTreeSet::from(["DENSE".to_owned(), "HUB".to_owned(), "MOD".to_owned()]);
+        let hubs = BTreeSet::from(["HUB".to_owned()]);
+        let density = BTreeMap::from([
+            ("DENSE".to_owned(), 3),
+            ("HUB".to_owned(), 3),
+            ("MOD".to_owned(), 2),
+        ]);
+        let belts = BTreeMap::from([(
+            "DENSE".to_owned(),
+            vec!["DENSE-BELT-1".to_owned()],
+        )]);
+        let locations = BTreeMap::from([
+            ("HUB-L4".to_owned(), "HUB".to_owned()),
+            ("MOD-L4".to_owned(), "MOD".to_owned()),
+        ]);
+
+        let relocations = plan_mining_ward_relocations(MiningWardRebalanceContext {
+            devices: &devices,
+            managed_systems: &managed,
+            selected_ward_systems: &selected,
+            relay_systems: &relays,
+            hub_systems: &hubs,
+            belt_density: &density,
+            belt_designations: &belts,
+            location_systems: &locations,
+        });
+
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].ward_code, "WARD-HUB");
+        assert_eq!(relocations[0].source_system, "HUB");
+        assert_eq!(relocations[0].target_system, "DENSE");
+        assert!(relocations[0].pause_devices.is_empty());
+    }
+
+    #[test]
+    fn ward_rebalance_never_strips_donor_for_disconnected_target() {
+        let mut ward = test_hub_device();
+        ward.key = replicant_client::DeviceKey::live("WARD-MOD".into());
+        ward.device_type = Some(DeviceType::SystemWard);
+        ward.location = Some(replicant_client::LocationKey::live("MOD-L4".into()));
+
+        let relocations = plan_mining_ward_relocations(MiningWardRebalanceContext {
+            devices: &[ward],
+            managed_systems: &BTreeSet::from(["MOD".to_owned()]),
+            selected_ward_systems: &BTreeSet::from(["DENSE".to_owned()]),
+            relay_systems: &BTreeSet::from(["MOD".to_owned()]),
+            hub_systems: &BTreeSet::new(),
+            belt_density: &BTreeMap::from([
+                ("DENSE".to_owned(), 3),
+                ("MOD".to_owned(), 2),
+            ]),
+            belt_designations: &BTreeMap::from([(
+                "DENSE".to_owned(),
+                vec!["DENSE-BELT-1".to_owned()],
+            )]),
+            location_systems: &BTreeMap::from([("MOD-L4".to_owned(), "MOD".to_owned())]),
+        });
+
+        assert!(relocations.is_empty());
     }
 
     #[test]
     fn mining_waits_for_relay_connected_belt_systems() {
         let belts = BTreeSet::from(["CONNECTED".to_owned(), "UNREACHABLE".to_owned()]);
         let relays = BTreeSet::from(["CONNECTED".to_owned(), "OTHER".to_owned()]);
+        let density = BTreeMap::from([("CONNECTED".to_owned(), 1), ("UNREACHABLE".to_owned(), 2)]);
 
         assert_eq!(
-            relay_connected_mining_targets(&belts, &relays),
+            relay_connected_mining_targets(&belts, &relays, &BTreeSet::new(), &density),
             vec!["CONNECTED".to_owned()]
+        );
+    }
+
+    #[test]
+    fn system_root_asteroid_belts_feed_director_mining_and_ftl_priority() {
+        let root = Location {
+            key: replicant_client::LocationKey::live("DELTA-STAR".into()),
+            location_type: Some(replicant_client::domain::LocationType::from("star")),
+            scanned: Some(true),
+            system_scanned: Some(true),
+            system_tags: Vec::new(),
+            system: None,
+            parent: None,
+            custom_name: None,
+            survey_progress: replicant_client::domain::LocationSurveyProgress::default(),
+            environment: replicant_client::domain::LocationEnvironment::default(),
+            unknown: BTreeMap::from([(
+                "asteroid_belt".to_owned(),
+                serde_json::json!({
+                    "present": true,
+                    "belts": [{"density": "dense"}]
+                }),
+            )]),
+        };
+        let locations = vec![root];
+        let location_systems = location_system_map(&locations);
+        let regions = BTreeMap::from([("DELTA-STAR".to_owned(), "delta".to_owned())]);
+
+        assert_eq!(
+            location_systems.get("DELTA-STAR").map(String::as_str),
+            Some("DELTA-STAR")
+        );
+        assert_eq!(
+            known_belt_systems(&locations, &location_systems, &regions, "delta"),
+            BTreeSet::from(["DELTA-STAR".to_owned()])
+        );
+        assert_eq!(
+            belt_density_priorities(&locations, &location_systems),
+            BTreeMap::from([("DELTA-STAR".to_owned(), 3)])
+        );
+    }
+
+    #[test]
+    fn relay_coverage_counts_only_active_unstowed_relays() {
+        let mut active = test_hub_device();
+        active.key = replicant_client::DeviceKey::live("RELAY-ACTIVE".into());
+        active.device_type = Some(DeviceType::FtlRelay);
+        active.location = Some(replicant_client::LocationKey::live("CONNECTED-L4".into()));
+
+        let mut inactive = active.clone();
+        inactive.key = replicant_client::DeviceKey::live("RELAY-IDLE".into());
+        inactive.status = Some(replicant_client::DeviceStatus::from("inactive"));
+        inactive.location = Some(replicant_client::LocationKey::live("IDLE-L4".into()));
+
+        let mut stowed = active.clone();
+        stowed.key = replicant_client::DeviceKey::live("RELAY-STOWED".into());
+        stowed.location = Some(replicant_client::LocationKey::live("STOWED-L4".into()));
+        stowed.relationships.stowed_in = Some(replicant_client::DeviceKey::live("VESSEL".into()));
+
+        let systems = BTreeMap::from([
+            ("CONNECTED-L4".to_owned(), "CONNECTED".to_owned()),
+            ("IDLE-L4".to_owned(), "IDLE".to_owned()),
+            ("STOWED-L4".to_owned(), "STOWED".to_owned()),
+        ]);
+
+        assert_eq!(
+            relay_device_systems(&[active, inactive, stowed], &systems),
+            BTreeSet::from(["CONNECTED".to_owned()])
         );
     }
 
@@ -6317,6 +7417,8 @@ mod tests {
                 devices: Vec::new(),
                 device_codes: Vec::new(),
                 device_tags: Vec::new(),
+                pre_deactivate_device_codes: Vec::new(),
+                release_mining_reservations: false,
                 return_transports: true,
                 allow_transport_staging: false,
                 region: Some("alpha".to_owned()),

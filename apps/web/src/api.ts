@@ -203,6 +203,22 @@ export const daemonApi = {
       }),
     ).payload;
   },
+  async setDirectorMiningPolicy(
+    region: string,
+    expandModerate: boolean,
+    expandSparse: boolean,
+  ) {
+    return parseDirectorResponse(
+      await send(
+        "PUT",
+        `/api/director/mining-policies/${encodeURIComponent(region)}`,
+        {
+          expand_moderate: expandModerate,
+          expand_sparse: expandSparse,
+        },
+      ),
+    ).payload;
+  },
   async assignDirectorReplicant(
     code: string,
     region: string | null,

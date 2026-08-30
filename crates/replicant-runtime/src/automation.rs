@@ -392,6 +392,8 @@ pub struct MiningCampaignIntent {
 struct LegacyMiningCampaignIntent {
     systems: Vec<String>,
     #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
     replicant: Option<String>,
     #[serde(default)]
     hub: Option<String>,
@@ -491,6 +493,16 @@ pub struct LogisticsManifestIntent {
     /// Optional tagged device groups to include.
     #[serde(default)]
     pub device_tags: Vec<String>,
+    /// Exact devices that must be paused before the shipment begins. This is
+    /// used by mining ward rebalancing so an old mining site is quiesced
+    /// before its protection is removed.
+    #[serde(default)]
+    pub pre_deactivate_device_codes: Vec<String>,
+    /// Remove mining-workflow reservation tags from exact payload devices
+    /// after this manifest has claimed them. Used when reassigning a System
+    /// Ward away from a retired or hub-protected mining site.
+    #[serde(default)]
+    pub release_mining_reservations: bool,
     /// Return transports after delivery.
     #[serde(default)]
     pub return_transports: bool,
@@ -1030,7 +1042,7 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
             .map_err(string_error)?;
         let config = MiningCampaignIntent {
             systems: legacy.systems,
-            region: String::new(),
+            region: legacy.region.unwrap_or_default(),
             hub: checkpoint.hub.or(legacy.hub).unwrap_or_default(),
             max_concurrency: legacy.max_concurrency,
         };
@@ -2974,6 +2986,16 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                 return Err("logistics manifest must contain at least one payload".to_owned());
             }
             let client = managed_client(context)?;
+            for code in &intent.device_codes {
+                claim_device(context, code)?;
+            }
+            for code in &intent.pre_deactivate_device_codes {
+                claim_device(context, code)?;
+            }
+            ensure_logistics_pre_deactivation(&client, &intent.pre_deactivate_device_codes).await?;
+            if intent.release_mining_reservations {
+                release_mining_reservation_tags(&client, &intent.device_codes).await?;
+            }
             let mut checkpoint: LogisticsWorkflowCheckpoint =
                 context.checkpoint().map_err(string_error)?;
             let plan = if checkpoint.started {
@@ -3099,6 +3121,78 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
             context.mark_succeeded(Some(report)).map_err(string_error)
         })
     }
+}
+
+
+async fn release_mining_reservation_tags(
+    client: &Client,
+    device_codes: &[String],
+) -> Result<(), String> {
+    for code in device_codes {
+        let handle = client.devices().get(code).await.map_err(string_error)?;
+        let snapshot = handle.snapshot().await.map_err(string_error)?;
+        let removable = snapshot
+            .tags
+            .iter()
+            .filter(|tag| tag.starts_with("mine-"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            continue;
+        }
+        let operation = handle
+            .configure(replicant_client::raw::devices::DeviceConfiguration {
+                remove_tags: Some(removable),
+                ..Default::default()
+            })
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_logistics_pre_deactivation(
+    client: &Client,
+    device_codes: &[String],
+) -> Result<(), String> {
+    for code in device_codes {
+        let detail = client
+            .raw()
+            .devices()
+            .get(code)
+            .await
+            .map_err(string_error)?
+            .value;
+        let status = detail.status.as_deref().unwrap_or_default();
+        if ["idle", "inactive", "deactivated", "stopped", "paused"]
+            .iter()
+            .any(|candidate| status.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        let can_deactivate = detail
+            .available_commands
+            .iter()
+            .chain(detail.commands.iter())
+            .any(|command| command.eq_ignore_ascii_case("deactivate"));
+        if can_deactivate {
+            let operation = client
+                .devices()
+                .get(code)
+                .await
+                .map_err(string_error)?
+                .deactivate()
+                .await
+                .map_err(string_error)?;
+            await_success(&operation).await?;
+            continue;
+        }
+        return Err(format!(
+            "pre-delivery device {code} is {status:?} and cannot be deactivated safely"
+        ));
+    }
+    Ok(())
 }
 
 fn retryable_manifest_planning_failure(error: &TransportError) -> bool {
@@ -5429,12 +5523,15 @@ pub fn new_mining_deploy_workflow(
 /// Creates a queued batch mining expansion workflow.
 pub fn new_mining_campaign_workflow(
     intent: MiningCampaignIntent,
-) -> NewWorkflow<MiningCampaignIntent, MiningDeployCheckpoint> {
-    queued_workflow(
-        mining_campaign_workflow_kind(),
-        intent,
-        MiningDeployCheckpoint::default(),
-    )
+) -> NewWorkflow<MiningCampaignIntent, MiningCampaignCheckpoint> {
+    NewWorkflow {
+        kind: mining_campaign_workflow_kind(),
+        schema_version: 2,
+        config: intent,
+        checkpoint: MiningCampaignCheckpoint::default(),
+        current_step: Some("queued".to_owned()),
+        parent_id: None,
+    }
 }
 
 /// Creates a queued logistics workflow.
@@ -6284,6 +6381,8 @@ async fn ensure_trade_payment_ready(
                 devices: Vec::new(),
                 device_codes: payment_codes.clone(),
                 device_tags: Vec::new(),
+                pre_deactivate_device_codes: Vec::new(),
+                release_mining_reservations: false,
                 return_transports: false,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
@@ -6653,11 +6752,25 @@ async fn ensure_trade_device_at(
         ));
     }
     context.advance_to(step, checkpoint).map_err(string_error)?;
+    let via = client
+        .smart_travel()
+        .route_for_device(code, destination)
+        .await
+        .map_err(string_error)?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.intermediate_systems
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
     let operation = handle
         .command(replicant_client::raw::devices::DeviceCommand::Travel {
             destination: destination.to_owned(),
             dry_run: None,
-            via: None,
+            via,
         })
         .await
         .map_err(string_error)?;
@@ -7926,6 +8039,8 @@ async fn ensure_shop_trade_criteria(
                 devices: Vec::new(),
                 device_codes: Vec::new(),
                 device_tags: Vec::new(),
+                pre_deactivate_device_codes: Vec::new(),
+                release_mining_reservations: false,
                 return_transports: false,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
@@ -7970,6 +8085,8 @@ async fn ensure_shop_trade_criteria(
                 devices: Vec::new(),
                 device_codes: staged_codes.clone(),
                 device_tags: Vec::new(),
+                pre_deactivate_device_codes: Vec::new(),
+                release_mining_reservations: false,
                 return_transports: false,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
@@ -8958,6 +9075,8 @@ async fn ensure_scan_tour_fleet_capacity(
             devices: Vec::new(),
             device_codes: printed_codes.clone(),
             device_tags: Vec::new(),
+            pre_deactivate_device_codes: Vec::new(),
+            release_mining_reservations: false,
             return_transports: true,
             allow_transport_staging: true,
             region: None,
@@ -11860,6 +11979,41 @@ mod tests {
             .schema_version,
             2
         );
+    }
+
+    #[test]
+    fn mining_campaign_factory_preserves_region_from_accidentally_versioned_v1_config() {
+        let repository = WorkflowRepository::open_in_memory().expect("open repository");
+        let legacy = repository
+            .create(NewWorkflow {
+                kind: mining_campaign_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "systems": ["SOL"],
+                    "region": "delta",
+                    "hub": "ROOT-1-L4",
+                    "max_concurrency": 1
+                }),
+                checkpoint: MiningDeployCheckpoint::default(),
+                current_step: Some("queued".into()),
+                parent_id: None,
+            })
+            .expect("create accidentally versioned campaign");
+        let factory = MiningCampaignWorkflowFactory::new();
+        let migration = factory
+            .migrate(&legacy)
+            .expect("migrate campaign")
+            .expect("migration exists");
+        assert_eq!(migration.config()["region"], "delta");
+
+        let current = new_mining_campaign_workflow(MiningCampaignIntent {
+            systems: vec!["SOL".into()],
+            region: "delta".into(),
+            hub: "ROOT-1-L4".into(),
+            max_concurrency: 1,
+        });
+        assert_eq!(current.schema_version, 2);
+        assert_eq!(current.config.region, "delta");
     }
 
     #[test]

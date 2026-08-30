@@ -225,6 +225,7 @@ const director: DirectorSnapshot = {
   mode: "advisory",
   regions: [],
   goals: [],
+  mining_policies: [],
   replicants: [],
   requirements: [],
   workforce: {

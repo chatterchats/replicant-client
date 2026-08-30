@@ -198,6 +198,12 @@ export interface DirectorRegionSummary {
   known_systems: number;
 }
 
+export interface DirectorMiningPolicySummary {
+  region: string;
+  expand_moderate: boolean;
+  expand_sparse: boolean;
+}
+
 export interface DirectorGoalSummary {
   id: string;
   kind: DirectorGoalKind;
@@ -246,6 +252,7 @@ export interface DirectorSnapshot {
   mode: DirectorMode;
   regions: DirectorRegionSummary[];
   goals: DirectorGoalSummary[];
+  mining_policies: DirectorMiningPolicySummary[];
   replicants: DirectorReplicantAssignment[];
   requirements: DirectorRequirementSummary[];
   workforce: DirectorWorkforceSummary;
@@ -4248,6 +4255,20 @@ export function parseDirectorResponse(
             "goal workflows",
           ),
           enabled: boolean(goal.enabled, "goal enabled"),
+        };
+      }),
+      mining_policies: array(
+        item.mining_policies ?? [],
+        "Director mining policies",
+      ).map((value) => {
+        const policy = record(value, "Director mining policy");
+        return {
+          region: requiredString(policy.region, "mining policy region"),
+          expand_moderate: boolean(
+            policy.expand_moderate,
+            "expand moderate belts",
+          ),
+          expand_sparse: boolean(policy.expand_sparse, "expand sparse belts"),
         };
       }),
       replicants: item.replicants.map((value) => {

@@ -194,6 +194,54 @@ describe("Director goal controls", () => {
       }),
     );
   });
+  it("updates the regional mining density policy", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          protocol_version: 1,
+          payload: {
+            metadata: { revision: 3, generated_at_ms: 20 },
+            mode: "automatic",
+            regions: [],
+            goals: [],
+            mining_policies: [
+              {
+                region: "delta",
+                expand_moderate: false,
+                expand_sparse: true,
+              },
+            ],
+            replicants: [],
+            requirements: [],
+            workforce: {
+              total: 0,
+              busy: 0,
+              idle: 0,
+              idle_ratio: 1,
+              pending_worker_demand: 0,
+              scale_up_recommended: false,
+              scale_reason: null,
+            },
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await daemonApi.setDirectorMiningPolicy("delta", false, true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/director/mining-policies/delta",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          expand_moderate: false,
+          expand_sparse: true,
+        }),
+      }),
+    );
+  });
+
   it("keeps the manual salvage recovery template visible", async () => {
     vi.useFakeTimers();
     const descriptors = {

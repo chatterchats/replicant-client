@@ -57,8 +57,9 @@ use replicant_protocol::{
     BootstrapSnapshot, CargoCarrierSummary, CargoResourceSummary, CargoSnapshot,
     CreateTriggerRequest, DaemonHealth, DescriptorCatalog, DeviceClaim, DeviceLogSummary,
     DeviceLogsSnapshot, DeviceSummary, DevicesSnapshot, DirectorGoalControlRequest,
-    DirectorModeRequest, DirectorReplicantRegionRequest, DirectorSnapshot,
-    DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot, DirectoryReplicantSummary,
+    DirectorMiningPolicyRequest, DirectorModeRequest, DirectorReplicantRegionRequest,
+    DirectorSnapshot, DirectoryReplicantDetail, DirectoryReplicantDetailSnapshot,
+    DirectoryReplicantSummary,
     DirectorySnapshot, DomainSlice, EntityId, EntityIndexSnapshot, EntityInspectorDetail,
     EntityInspectorSnapshot, EntityKind, EntityRef, EntitySummary, ErrorResponse,
     EventCriterionSummary, EventRequirementKind, EventRequirementSummary, EventRewardItem,
@@ -100,7 +101,7 @@ use replicant_runtime::{
     orchestration::expanded_system_region_map,
     orchestration::{
         assign_replicant_region, cached_director_snapshot, goal_is_regional, parse_goal_kind,
-        reconcile_director, set_director_mode, set_goal_enabled,
+        reconcile_director, set_director_mode, set_goal_enabled, set_mining_expansion_policy,
     },
     requirements::{AvailabilityKind, InfrastructureKind, RequirementScope, RequirementTarget},
     survey::summarize_plan,
@@ -591,6 +592,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/director/reconcile", post(reconcile_director_now))
         .route("/api/director/mode", put(update_director_mode))
         .route("/api/director/goals/{kind}", put(update_director_goal))
+        .route(
+            "/api/director/mining-policies/{region}",
+            put(update_director_mining_policy),
+        )
         .route(
             "/api/director/replicants/{code}/region",
             put(update_director_replicant_region),
@@ -6042,6 +6047,33 @@ async fn update_director_goal(
     );
     set_goal_enabled(&state.repository, kind, region, request.enabled)
         .map_err(ApiError::runtime)?;
+    director_control_changed(&state)
+}
+
+async fn update_director_mining_policy(
+    State(state): State<Arc<AppState>>,
+    Path(region): Path<String>,
+    payload: Result<Json<DirectorMiningPolicyRequest>, JsonRejection>,
+) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
+    let Json(request) =
+        payload.map_err(|_| ApiError::invalid("invalid Director mining policy request"))?;
+    let region = region.trim();
+    if region.is_empty() {
+        return Err(ApiError::invalid("Director mining policy requires a region"));
+    }
+    tracing::info!(
+        region,
+        expand_moderate = request.expand_moderate,
+        expand_sparse = request.expand_sparse,
+        "Automation Director mining expansion policy changed"
+    );
+    set_mining_expansion_policy(
+        &state.repository,
+        region,
+        request.expand_moderate,
+        request.expand_sparse,
+    )
+    .map_err(ApiError::runtime)?;
     director_control_changed(&state)
 }
 

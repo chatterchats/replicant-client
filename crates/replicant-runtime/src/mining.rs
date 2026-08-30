@@ -8,14 +8,14 @@ use std::{
 };
 
 use replicant_client::{
-    Client, Replicant,
+    Client, Replicant, Star,
     domain::{Device, DeviceType, Location},
 };
 use replicant_mining_planner::{
     BlueprintSpec, CARGO_FREIGHTER, FactoryWorkload, MAINTENANCE_DRONE, MINING_CONTROLLER,
-    MINING_DRONE, PrintBatch, QuantityMap, SURVEY_CONTROLLER, SURVEY_DRONE, TRANSPORT_CONTROLLER,
-    add_quantities, blueprint_resource_cost, mining_site_requirements, schedule_prints, shortages,
-    site_tag,
+    MINING_DRONE, PrintBatch, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE,
+    SYSTEM_WARD, TRANSPORT_CONTROLLER, add_quantities, blueprint_resource_cost,
+    mining_site_requirements, schedule_prints, shortages, site_tag,
 };
 use replicant_printing::managed::discover_factories;
 use replicant_workflow::{
@@ -156,6 +156,11 @@ pub struct SiteAssets {
     pub survey_controller: Option<String>,
     pub survey_drones: Vec<String>,
     pub maintenance_drone: Option<String>,
+    /// Owned System Ward assigned to protect this mining system. A System Hub
+    /// may satisfy protection without populating this field because wards and
+    /// hubs cannot be active in the same system.
+    #[serde(default)]
+    pub system_ward: Option<String>,
 }
 
 impl SiteAssets {
@@ -166,6 +171,7 @@ impl SiteAssets {
             .chain(self.survey_controller.iter())
             .chain(&self.survey_drones)
             .chain(self.maintenance_drone.iter())
+            .chain(self.system_ward.iter())
             .cloned()
             .collect()
     }
@@ -203,6 +209,10 @@ impl SiteAssets {
             } else {
                 0
             },
+        );
+        counts.insert(
+            SYSTEM_WARD.into(),
+            if self.system_ward.is_some() { 1 } else { 0 },
         );
         counts
     }
@@ -345,7 +355,7 @@ pub fn mining_work_item_specs(
                 "kind": "mining.site_incomplete",
                 "parameters": { "belt": site.belt }
             }]),
-            requirements_json: serde_json::to_value(mining_site_item_requirements(region))?,
+            requirements_json: serde_json::to_value(mining_site_item_requirements(region, site))?,
             deadline_at_ms: None,
         });
     }
@@ -425,74 +435,65 @@ pub fn mining_work_item_specs(
     Ok(specs)
 }
 
-fn mining_site_item_requirements(region: &str) -> Vec<ResourceRequirement> {
+fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<ResourceRequirement> {
     let scope = || RequirementScope::Region(region.to_owned());
-    vec![
-        ResourceRequirement {
-            key: "worker".into(),
-            kind: "replicant".into(),
-            capabilities: Vec::new(),
-            scope: scope(),
-            count: 1,
-            quantity: 1,
-        },
-        ResourceRequirement {
-            key: "mining_controller".into(),
+    let mut requirements = vec![ResourceRequirement {
+        key: "worker".into(),
+        kind: "replicant".into(),
+        capabilities: Vec::new(),
+        scope: scope(),
+        count: 1,
+        quantity: 1,
+    }];
+    for (device_type, quantity) in &site.missing {
+        let Ok(count) = u32::try_from(*quantity) else {
+            continue;
+        };
+        if count == 0 {
+            continue;
+        }
+        let key = match device_type.as_str() {
+            MINING_CONTROLLER => "mining_controller",
+            MINING_DRONE => "mining_drones",
+            SURVEY_CONTROLLER => "survey_controller",
+            SURVEY_DRONE => "survey_drones",
+            MAINTENANCE_DRONE => "maintenance_drone",
+            SYSTEM_WARD => "system_ward",
+            _ => continue,
+        };
+        requirements.push(ResourceRequirement {
+            key: key.into(),
             kind: "device".into(),
-            capabilities: vec![MINING_CONTROLLER.into()],
+            capabilities: vec![device_type.clone()],
             scope: scope(),
-            count: 1,
+            count,
             quantity: 1,
-        },
-        ResourceRequirement {
-            key: "mining_drones".into(),
-            kind: "device".into(),
-            capabilities: vec![MINING_DRONE.into()],
-            scope: scope(),
-            count: 4,
-            quantity: 1,
-        },
-        ResourceRequirement {
-            key: "survey_controller".into(),
-            kind: "device".into(),
-            capabilities: vec![SURVEY_CONTROLLER.into()],
-            scope: scope(),
-            count: 1,
-            quantity: 1,
-        },
-        ResourceRequirement {
-            key: "survey_drones".into(),
-            kind: "device".into(),
-            capabilities: vec![SURVEY_DRONE.into()],
-            scope: scope(),
-            count: 2,
-            quantity: 1,
-        },
-        ResourceRequirement {
-            key: "maintenance_drone".into(),
-            kind: "device".into(),
-            capabilities: vec![MAINTENANCE_DRONE.into()],
-            scope: scope(),
-            count: 1,
-            quantity: 1,
-        },
-        ResourceRequirement {
+        });
+    }
+    let missing_devices = site
+        .missing
+        .values()
+        .filter_map(|quantity| u64::try_from(*quantity).ok())
+        .sum::<u64>();
+    if missing_devices > 0 {
+        requirements.push(ResourceRequirement {
             key: "carrier".into(),
             kind: "device".into(),
-            capabilities: vec![CARGO_FREIGHTER.into()],
+            capabilities: vec![SURGE_CARRIER.into()],
             scope: scope(),
             count: 1,
             quantity: 1,
-        },
-        ResourceRequirement {
+        });
+        requirements.push(ResourceRequirement {
             key: "stow".into(),
             kind: "stow".into(),
             capabilities: Vec::new(),
             scope: scope(),
             count: 1,
-            quantity: 9,
-        },
-    ]
+            quantity: missing_devices,
+        });
+    }
+    requirements
 }
 
 fn mining_route_item_requirements(region: &str) -> Vec<ResourceRequirement> {
@@ -550,27 +551,58 @@ pub async fn execute_mining_item(
             let mut site = lane.sites.get(index).cloned().ok_or_else(|| {
                 app_error(io::ErrorKind::InvalidInput, "mining site index is invalid")
             })?;
-            site.assets.mining_controller = Some(mining_allocated_identity(
-                allocations,
-                "mining_controller",
-                "device",
-            )?);
-            site.assets.mining_drones =
-                mining_allocated_identities(allocations, "mining_drones", "device")?;
-            site.assets.survey_controller = Some(mining_allocated_identity(
-                allocations,
-                "survey_controller",
-                "device",
-            )?);
-            site.assets.survey_drones =
-                mining_allocated_identities(allocations, "survey_drones", "device")?;
-            site.assets.maintenance_drone = Some(mining_allocated_identity(
-                allocations,
-                "maintenance_drone",
-                "device",
-            )?);
-            site.carrier = Some(mining_allocated_identity(allocations, "carrier", "device")?);
-            mining_validate_stow_owner(allocations, "carrier")?;
+            let missing = site.missing.clone();
+            if missing.contains_key(MINING_CONTROLLER) {
+                site.assets.mining_controller = Some(mining_allocated_identity(
+                    allocations,
+                    "mining_controller",
+                    "device",
+                )?);
+            }
+            if missing.contains_key(MINING_DRONE) {
+                site.assets.mining_drones.extend(mining_allocated_identities(
+                    allocations,
+                    "mining_drones",
+                    "device",
+                )?);
+                site.assets.mining_drones.sort();
+                site.assets.mining_drones.dedup();
+            }
+            if missing.contains_key(SURVEY_CONTROLLER) {
+                site.assets.survey_controller = Some(mining_allocated_identity(
+                    allocations,
+                    "survey_controller",
+                    "device",
+                )?);
+            }
+            if missing.contains_key(SURVEY_DRONE) {
+                site.assets.survey_drones.extend(mining_allocated_identities(
+                    allocations,
+                    "survey_drones",
+                    "device",
+                )?);
+                site.assets.survey_drones.sort();
+                site.assets.survey_drones.dedup();
+            }
+            if missing.contains_key(MAINTENANCE_DRONE) {
+                site.assets.maintenance_drone = Some(mining_allocated_identity(
+                    allocations,
+                    "maintenance_drone",
+                    "device",
+                )?);
+            }
+            if missing.contains_key(SYSTEM_WARD) {
+                site.assets.system_ward = Some(mining_allocated_identity(
+                    allocations,
+                    "system_ward",
+                    "device",
+                )?);
+            }
+            if !missing.is_empty() {
+                site.carrier = Some(mining_allocated_identity(allocations, "carrier", "device")?);
+                mining_validate_stow_owner(allocations, "carrier")?;
+            }
+            site.missing.clear();
             lane.sites = vec![site];
             lane.routes.clear();
             lane.print_batches
@@ -850,14 +882,20 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMissio
     let selected_replicant = select_replicant(client, config.replicant.as_deref()).await?;
     let systems = config.requested_systems()?;
     let devices = refresh_device_snapshots(client).await?;
+    let protection = protected_systems(&devices, &client.galaxy().catalogue());
     let blueprints = fetch_blueprints(client).await?;
     let factories = factory_workloads(client, &blueprints, &config.hub).await?;
 
     let mut sites = Vec::new();
     for system in systems {
-        let belt = select_belt(client, &system).await?;
-        let audit = audit_site(&devices, &belt.designation);
-        let missing = shortages(&mining_site_requirements(), &audit.assets.counts());
+        let belt = select_belt(client, &system, &devices).await?;
+        let audit = audit_site(
+            &devices,
+            &system,
+            &belt.designation,
+            protection.contains(&system),
+        );
+        let missing = site_shortages(&audit);
         sites.push(SiteMission {
             system: system.clone(),
             belt: belt.designation,
@@ -1141,12 +1179,17 @@ struct SelectedBelt {
     density: String,
 }
 
-async fn select_belt(client: &Client, system: &str) -> AnyResult<SelectedBelt> {
+async fn select_belt(
+    client: &Client,
+    system: &str,
+    devices: &[Device],
+) -> AnyResult<SelectedBelt> {
     let location = client.locations().get(system).await?;
     let mut belts = belts_from_location(&location);
     belts.sort_by(|left, right| {
-        density_rank(&right.density)
-            .cmp(&density_rank(&left.density))
+        managed_belt_asset_count(devices, &right.designation)
+            .cmp(&managed_belt_asset_count(devices, &left.designation))
+            .then_with(|| density_rank(&right.density).cmp(&density_rank(&left.density)))
             .then_with(|| left.designation.cmp(&right.designation))
     });
     belts.into_iter().next().ok_or_else(|| {
@@ -1155,6 +1198,25 @@ async fn select_belt(client: &Client, system: &str) -> AnyResult<SelectedBelt> {
             format!("system {system} has no discovered asteroid belt"),
         )
     })
+}
+
+fn managed_belt_asset_count(devices: &[Device], belt: &str) -> usize {
+    devices
+        .iter()
+        .filter(|device| device_location(device) == Some(belt))
+        .filter(|device| {
+            matches!(
+                device_type(device),
+                Some(
+                    MINING_CONTROLLER
+                        | MINING_DRONE
+                        | SURVEY_CONTROLLER
+                        | SURVEY_DRONE
+                        | MAINTENANCE_DRONE
+                )
+            )
+        })
+        .count()
 }
 
 fn belts_from_location(location: &Location) -> Vec<SelectedBelt> {
@@ -1190,12 +1252,18 @@ fn density_rank(density: &str) -> u8 {
     }
 }
 
-struct SiteAudit {
-    assets: SiteAssets,
-    operational: bool,
+pub(crate) struct SiteAudit {
+    pub(crate) assets: SiteAssets,
+    pub(crate) protection_active: bool,
+    pub(crate) operational: bool,
 }
 
-fn audit_site(devices: &[Device], belt: &str) -> SiteAudit {
+pub(crate) fn audit_site(
+    devices: &[Device],
+    system: &str,
+    belt: &str,
+    protection_active: bool,
+) -> SiteAudit {
     let at_belt = devices
         .iter()
         .filter(|device| device_location(device) == Some(belt))
@@ -1215,24 +1283,43 @@ fn audit_site(devices: &[Device], belt: &str) -> SiteAudit {
                 .then_with(|| left.key.id.as_str().cmp(right.key.id.as_str()))
         })
         .map(|device| device.key.id.as_str().to_owned());
+    let system_ward = devices
+        .iter()
+        .filter(|device| device_type(device) == Some(SYSTEM_WARD))
+        .filter(|device| device_is_in_system(device, system))
+        .min_by_key(|device| device.key.id.as_str())
+        .map(|device| device.key.id.as_str().to_owned());
     let assets = SiteAssets {
         mining_controller,
         mining_drones,
         survey_controller,
         survey_drones,
         maintenance_drone: maintenance,
+        system_ward,
     };
     let operational = assets
         .mining_controller
         .as_deref()
         .and_then(|code| find_device(devices, code))
-        .is_some_and(|device| has_directive(device, "deplete_smallest"))
+        .is_some_and(|device| {
+            has_directive(device, "deplete_smallest")
+                && device
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.as_str() == "coordinating")
+        })
         && assets.mining_drones.len() >= 4
         && assets
             .survey_controller
             .as_deref()
             .and_then(|code| find_device(devices, code))
-            .is_some_and(|device| has_directive(device, "belt_search"))
+            .is_some_and(|device| {
+                has_directive(device, "belt_search")
+                    && device
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.as_str() == "coordinating")
+            })
         && assets.survey_drones.len() >= 2
         && assets
             .maintenance_drone
@@ -1240,11 +1327,66 @@ fn audit_site(devices: &[Device], belt: &str) -> SiteAudit {
             .and_then(|code| find_device(devices, code))
             .is_some_and(|device| has_directive(device, "patrol"))
         && adopted_count(devices, assets.mining_controller.as_deref(), MINING_DRONE) >= 4
-        && adopted_count(devices, assets.survey_controller.as_deref(), SURVEY_DRONE) >= 2;
+        && adopted_count(devices, assets.survey_controller.as_deref(), SURVEY_DRONE) >= 2
+        && protection_active;
     SiteAudit {
         assets,
+        protection_active,
         operational,
     }
+}
+
+fn site_shortages(audit: &SiteAudit) -> QuantityMap {
+    let mut missing = shortages(&mining_site_requirements(), &audit.assets.counts());
+    if !audit.protection_active && audit.assets.system_ward.is_none() {
+        missing.insert(SYSTEM_WARD.to_owned(), 1);
+    }
+    missing
+}
+
+fn device_is_in_system(device: &Device, system: &str) -> bool {
+    device_location(device).is_some_and(|location| {
+        location == system
+            || location
+                .strip_prefix(system)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
+}
+
+pub(crate) fn active_owned_ward_systems(
+    devices: &[Device],
+    catalogue: &[Star],
+) -> BTreeSet<String> {
+    catalogue
+        .iter()
+        .filter(|star| star.has_ward == Some(true))
+        .filter_map(|star| {
+            let system = star.key.id.as_str();
+            devices
+                .iter()
+                .any(|device| {
+                    device.device_type.as_ref() == Some(&DeviceType::SystemWard)
+                        && device_is_in_system(device, system)
+                })
+                .then_some(system.to_owned())
+        })
+        .collect()
+}
+
+pub(crate) fn protected_systems(devices: &[Device], catalogue: &[Star]) -> BTreeSet<String> {
+    let active_wards = active_owned_ward_systems(devices, catalogue);
+    catalogue
+        .iter()
+        .filter_map(|star| {
+            let system = star.key.id.as_str();
+            let owned_hub = star.has_hub == Some(true)
+                && devices.iter().any(|device| {
+                    device.device_type.as_ref() == Some(&DeviceType::SystemHub)
+                        && device_is_in_system(device, system)
+                });
+            (owned_hub || active_wards.contains(system)).then_some(system.to_owned())
+        })
+        .collect()
 }
 
 fn select_controller(
@@ -1372,6 +1514,7 @@ fn reusable_counts(devices: &[Device], hub: &str, site_devices: bool) -> Quantit
             SURVEY_CONTROLLER,
             SURVEY_DRONE,
             MAINTENANCE_DRONE,
+            SYSTEM_WARD,
         ]
         .into_iter()
         .collect()
@@ -1698,6 +1841,8 @@ mod tests {
         directive(&mut devices[0], "deplete_smallest");
         directive(&mut devices[1], "belt_search");
         directive(&mut devices[2], "patrol");
+        devices[0].status = Some(DeviceStatus::from("coordinating"));
+        devices[1].status = Some(DeviceStatus::from("coordinating"));
         for index in 0..4 {
             let mut drone = device(&format!("M{index}"), MINING_DRONE, belt);
             drone.relationships.controller = Some(DeviceKey::live(DeviceId::from("MC")));
@@ -1708,9 +1853,19 @@ mod tests {
             drone.relationships.controller = Some(DeviceKey::live(DeviceId::from("SC")));
             devices.push(drone);
         }
-        let audit = audit_site(&devices, belt);
+        let audit = audit_site(&devices, "SOL", belt, true);
         assert!(audit.operational);
         assert!(shortages(&mining_site_requirements(), &audit.assets.counts()).is_empty());
+    }
+
+    #[test]
+    fn deployed_inactive_ward_is_a_configuration_repair_not_a_print_shortage() {
+        let belt = "SOL-BELT-1";
+        let devices = vec![device("WARD", SYSTEM_WARD, "SOL-OORT")];
+        let audit = audit_site(&devices, "SOL", belt, false);
+        assert_eq!(audit.assets.system_ward.as_deref(), Some("WARD"));
+        assert!(!audit.operational);
+        assert!(!site_shortages(&audit).contains_key(SYSTEM_WARD));
     }
 
     #[test]

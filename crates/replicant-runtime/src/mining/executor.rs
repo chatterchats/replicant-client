@@ -11,7 +11,7 @@ use replicant_client::{
 };
 use replicant_mining_planner::{
     BlueprintSpec, CARGO_FREIGHTER, FactoryWorkload, MAINTENANCE_DRONE, MINING_CONTROLLER,
-    MINING_DRONE, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE,
+    MINING_DRONE, QuantityMap, SURGE_CARRIER, SURVEY_CONTROLLER, SURVEY_DRONE, SYSTEM_WARD,
     TRANSPORT_CONTROLLER, role_tag,
 };
 use replicant_printing::managed::{enqueue_print, factory_queue_slots};
@@ -23,10 +23,10 @@ use tracing::{info, warn};
 
 use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
-    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code, device_location,
-    device_type, factory_workloads, fetch_blueprints, find_device, format_quantities,
-    has_directive, has_reservation_tag, is_opaque_mining_mission_tag, refresh_device_snapshots,
-    save_plan, stable_hash,
+    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code, device_is_in_system,
+    device_location, device_type, factory_workloads, fetch_blueprints, find_device,
+    format_quantities, has_directive, has_reservation_tag, is_opaque_mining_mission_tag,
+    protected_systems, refresh_device_snapshots, save_plan, site_shortages, stable_hash,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -150,18 +150,24 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
 async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission) -> AnyResult<()> {
     reconcile_print_batches(client, mission).await?;
     let devices = refresh_device_snapshots(client).await?;
+    let protection = protected_systems(&devices, &client.galaxy().catalogue());
     for site in &mut mission.sites {
-        let audit = audit_site(&devices, &site.belt);
+        let audit = audit_site(
+            &devices,
+            &site.system,
+            &site.belt,
+            protection.contains(&site.system),
+        );
         if audit.operational {
             site.assets = audit.assets;
             site.missing.clear();
             site.phase = SitePhase::Operational;
         } else if site.phase == SitePhase::Operational {
             site.phase = SitePhase::Planned;
-            site.missing = replicant_mining_planner::shortages(
-                &replicant_mining_planner::mining_site_requirements(),
-                &audit.assets.counts(),
-            );
+            site.missing = site_shortages(&audit);
+            site.assets = audit.assets;
+        } else if site.phase == SitePhase::Planned {
+            site.missing = site_shortages(&audit);
             site.assets = audit.assets;
         }
     }
@@ -801,8 +807,9 @@ async fn allocate_available_site_assets(
     let mut pool = reusable_pool(&devices, &mission.hub_location, &mission.mission_tag, &used);
     let mut allocated = 0usize;
     for index in 0..mission.sites.len() {
+        let missing = mission.sites[index].missing.clone();
         if mission.sites[index].phase != SitePhase::Planned
-            || !pool_can_complete_site(&pool, &mission.sites[index].assets)
+            || !pool_can_complete_site(&pool, &missing)
         {
             continue;
         }
@@ -838,6 +845,14 @@ async fn allocate_available_site_assets(
             &mut pool,
             &mut used,
         )?;
+        if missing.contains_key(SYSTEM_WARD) {
+            fill_site_asset(
+                &mut mission.sites[index].assets.system_ward,
+                SYSTEM_WARD,
+                &mut pool,
+                &mut used,
+            )?;
+        }
         mission.sites[index].missing.clear();
         mission.sites[index].phase = SitePhase::Ready;
         allocated += 1;
@@ -853,11 +868,7 @@ async fn allocate_available_site_assets(
     Ok(allocated)
 }
 
-fn pool_can_complete_site(pool: &BTreeMap<String, Vec<String>>, assets: &SiteAssets) -> bool {
-    let missing = replicant_mining_planner::shortages(
-        &replicant_mining_planner::mining_site_requirements(),
-        &assets.counts(),
-    );
+fn pool_can_complete_site(pool: &BTreeMap<String, Vec<String>>, missing: &QuantityMap) -> bool {
     missing.iter().all(|(device_type, quantity)| {
         i64::try_from(pool.get(device_type).map_or(0, Vec::len))
             .is_ok_and(|available| available >= *quantity)
@@ -989,6 +1000,9 @@ fn site_roles(assets: &SiteAssets) -> Vec<(String, &'static str)> {
     if let Some(code) = &assets.maintenance_drone {
         roles.push((code.clone(), "maintenance"));
     }
+    if let Some(code) = &assets.system_ward {
+        roles.push((code.clone(), "system-ward"));
+    }
     roles
 }
 
@@ -1041,12 +1055,15 @@ async fn dispatch_ready_sites(
     mission: &mut MiningMission,
 ) -> AnyResult<()> {
     let devices = refresh_device_snapshots(client).await?;
-    let claimed_count = mission
+    let in_flight = mission
         .sites
         .iter()
-        .filter(|site| site.carrier.is_some())
+        .filter(|site| {
+            site.carrier.is_some()
+                && matches!(site.phase, SitePhase::Outbound | SitePhase::Deploying)
+        })
         .count();
-    let available_slots = config.max_concurrency.saturating_sub(claimed_count);
+    let available_slots = config.max_concurrency.saturating_sub(in_flight);
     if available_slots == 0 {
         return Ok(());
     }
@@ -1080,9 +1097,7 @@ async fn dispatch_ready_sites(
         .sites
         .iter()
         .enumerate()
-        .filter_map(|(index, site)| {
-            (site.phase == SitePhase::Ready && site.carrier.is_none()).then_some(index)
-        })
+        .filter_map(|(index, site)| (site.phase == SitePhase::Ready).then_some(index))
         .take(available_slots)
         .collect::<Vec<_>>();
     let mut deliveries = Vec::new();
@@ -1103,13 +1118,19 @@ async fn dispatch_ready_sites(
             })
             .collect::<Vec<_>>();
         if payload.is_empty() {
+            mission.sites[index].carrier = None;
             mission.sites[index].phase = SitePhase::Deploying;
             save_plan(&config.plan_path, mission)?;
             configure_site(client, config, mission, index).await?;
             continue;
         }
-        let Some(carrier) = carriers.pop() else {
-            break;
+        let carrier = if let Some(carrier) = mission.sites[index].carrier.clone() {
+            carrier
+        } else {
+            let Some(carrier) = carriers.pop() else {
+                break;
+            };
+            carrier
         };
         mission.sites[index].carrier = Some(carrier.clone());
         mission.sites[index].phase = SitePhase::Outbound;
@@ -1192,7 +1213,7 @@ async fn configure_site(
     mission: &mut MiningMission,
     index: usize,
 ) -> AnyResult<()> {
-    let site = &mission.sites[index];
+    let site = mission.sites[index].clone();
     for code in site.assets.codes() {
         // Arrival events keep each site asset current in the projection.
         let handle = match client.devices().cached(&code) {
@@ -1200,17 +1221,30 @@ async fn configure_site(
             None => client.devices().get(&code).await?,
         };
         let snapshot = handle.snapshot().await?;
-        if device_location(&snapshot) != Some(site.belt.as_str()) {
+        let is_ward = site.assets.system_ward.as_deref() == Some(code.as_str());
+        let in_place = if is_ward {
+            device_is_in_system(&snapshot, &site.system)
+        } else {
+            device_location(&snapshot) == Some(site.belt.as_str())
+        };
+        if !in_place {
             return Err(app_error(
                 io::ErrorKind::InvalidData,
-                format!("site asset {code} has not arrived at {}", site.belt),
+                if is_ward {
+                    format!(
+                        "system ward {code} is not deployed anywhere in {}",
+                        site.system
+                    )
+                } else {
+                    format!("site asset {code} has not arrived at {}", site.belt)
+                },
             ));
         }
     }
-    tag_site_assets(client, site).await?;
+    tag_site_assets(client, &site).await?;
+    ensure_site_protection(client, &site).await?;
     mission.sites[index].phase = SitePhase::Adopting;
     save_plan(&config.plan_path, mission)?;
-    let site = &mission.sites[index];
     let mining_controller =
         site.assets.mining_controller.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no mining controller")
@@ -1223,7 +1257,6 @@ async fn configure_site(
     ensure_adoption(client, survey_controller, &site.assets.survey_drones).await?;
     mission.sites[index].phase = SitePhase::Verifying;
     save_plan(&config.plan_path, mission)?;
-    let site = &mission.sites[index];
     let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
     // Fleet reconciliation already populated the selected controller.
     let mining_handle = match client.devices().cached(mining_controller) {
@@ -1295,7 +1328,15 @@ async fn configure_site(
     let mut watch = client.events().watch().await?;
     loop {
         let devices = refresh_device_snapshots(client).await?;
-        if audit_site(&devices, &site.belt).operational {
+        let protection = protected_systems(&devices, &client.galaxy().catalogue());
+        if audit_site(
+            &devices,
+            &site.system,
+            &site.belt,
+            protection.contains(&site.system),
+        )
+        .operational
+        {
             break;
         }
         if Instant::now() >= deadline {
@@ -1312,6 +1353,46 @@ async fn configure_site(
     info!(system = %site.system, belt = %site.belt, "mining site operational");
     mission.sites[index].phase = SitePhase::Operational;
     save_plan(&config.plan_path, mission)?;
+    Ok(())
+}
+
+async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> AnyResult<()> {
+    let devices = refresh_device_snapshots(client).await?;
+    let protection = protected_systems(&devices, &client.galaxy().catalogue());
+    if protection.contains(&site.system) {
+        return Ok(());
+    }
+
+    let ward = site.assets.system_ward.as_deref().ok_or_else(|| {
+        app_error(
+            io::ErrorKind::InvalidData,
+            format!("mining site {} has no System Ward", site.system),
+        )
+    })?;
+    let snapshot = find_device(&devices, ward).ok_or_else(|| {
+        app_error(
+            io::ErrorKind::NotFound,
+            format!("System Ward {ward} is absent from the owned-device projection"),
+        )
+    })?;
+    if !device_is_in_system(snapshot, &site.system) {
+        return Err(app_error(
+            io::ErrorKind::InvalidData,
+            format!("System Ward {ward} is not deployed in {}", site.system),
+        ));
+    }
+
+    let handle = match client.devices().cached(ward) {
+        Some(handle) => handle,
+        None => client.devices().get(ward).await?,
+    };
+    ensure_operation_accepted(
+        &handle
+            .command(api_raw::devices::DeviceCommand::Activate)
+            .await?,
+    )
+    .await?;
+    client.galaxy().refresh_catalogue().await?;
     Ok(())
 }
 
@@ -1740,11 +1821,24 @@ async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResu
         }
         return Ok(());
     }
+    let via = client
+        .smart_travel()
+        .route_for_device(code, destination)
+        .await?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.intermediate_systems
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
     let operation = handle
         .command(api_raw::devices::DeviceCommand::Travel {
             destination: destination.to_owned(),
             dry_run: None,
-            via: None,
+            via,
         })
         .await?;
     ensure_operation_accepted(&operation).await
@@ -1940,7 +2034,7 @@ mod tests {
 
     #[test]
     fn site_pipeline_waits_for_one_complete_setup() {
-        let assets = SiteAssets::default();
+        let missing = replicant_mining_planner::mining_site_requirements();
         let mut pool = BTreeMap::<String, Vec<String>>::new();
         pool.insert(MINING_CONTROLLER.into(), vec!["mc".into()]);
         pool.insert(
@@ -1956,9 +2050,9 @@ mod tests {
             ["s1", "s2"].into_iter().map(str::to_owned).collect(),
         );
 
-        assert!(!pool_can_complete_site(&pool, &assets));
+        assert!(!pool_can_complete_site(&pool, &missing));
         pool.insert(MAINTENANCE_DRONE.into(), vec!["md".into()]);
-        assert!(pool_can_complete_site(&pool, &assets));
+        assert!(pool_can_complete_site(&pool, &missing));
     }
 
     #[test]

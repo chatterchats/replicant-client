@@ -17,6 +17,8 @@ pub const SURVEY_CONTROLLER: &str = "ami_survey_controller";
 pub const SURVEY_DRONE: &str = "survey_drone";
 /// Maintenance drone blueprint identifier.
 pub const MAINTENANCE_DRONE: &str = "maintenance_drone";
+/// System Ward blueprint identifier.
+pub const SYSTEM_WARD: &str = "system_ward";
 /// AMI transport controller blueprint identifier.
 pub const TRANSPORT_CONTROLLER: &str = "ami_transport_controller";
 /// Cargo Freighter blueprint identifier.

@@ -325,6 +325,17 @@ pub struct DirectorGoalSummary {
     pub enabled: bool,
 }
 
+/// Density scope for one region's mining-expansion standing goal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorMiningPolicySummary {
+    /// Canonical Director region.
+    pub region: String,
+    /// Whether new mining sites may expand into moderate belts.
+    pub expand_moderate: bool,
+    /// Whether new mining sites may expand into sparse belts.
+    pub expand_sparse: bool,
+}
+
 /// Shared prerequisite categories raised by Automation Director goals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -455,6 +466,9 @@ pub struct DirectorSnapshot {
     pub regions: Vec<DirectorRegionSummary>,
     /// Standing goal instances.
     pub goals: Vec<DirectorGoalSummary>,
+    /// Per-region density policy for the mining-expansion goal.
+    #[serde(default)]
+    pub mining_policies: Vec<DirectorMiningPolicySummary>,
     /// Replicant assignments and utilization.
     pub replicants: Vec<DirectorReplicantAssignment>,
     /// Durable cross-goal prerequisites raised during reconciliation.
@@ -481,6 +495,15 @@ pub struct DirectorGoalControlRequest {
     pub region: Option<String>,
     /// Whether this standing goal should be instantiated and reconciled.
     pub enabled: bool,
+}
+
+/// Updates the density scope used by one regional mining-expansion goal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectorMiningPolicyRequest {
+    /// Whether new mining sites may expand into moderate belts.
+    pub expand_moderate: bool,
+    /// Whether new mining sites may expand into sparse belts.
+    pub expand_sparse: bool,
 }
 
 /// Permanently assigns a Replicant to a region.

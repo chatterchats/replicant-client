@@ -3226,6 +3226,26 @@ h1 {
   font-size: 0.88rem;
   color: var(--muted);
 }
+.director-regional-goal > .director-mining-policy {
+  margin-top: 0.55rem;
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+  font-size: 0.8rem;
+}
+.director-mining-policy > span {
+  color: var(--muted);
+}
+.director-mining-policy > strong {
+  font-size: 0.8rem;
+}
+.director-mining-policy label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
 .director-roster-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));

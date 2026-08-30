@@ -1404,6 +1404,9 @@ function DirectorView() {
     },
     {},
   );
+  const miningPolicies = new Map(
+    data.mining_policies.map((policy) => [policy.region, policy]),
+  );
   const replicantLabels = new Map(
     data.replicants.map((replicant) => [
       replicant.code,
@@ -1575,6 +1578,11 @@ function DirectorView() {
             <div className="director-regional-goals">
               {(grouped[region.region] ?? []).map((goal) => {
                 const progress = goalProgress(goal);
+                const miningPolicy = miningPolicies.get(region.region) ?? {
+                  region: region.region,
+                  expand_moderate: true,
+                  expand_sparse: true,
+                };
                 return (
                   <div
                     className={`director-regional-goal ${goal.status}`}
@@ -1602,6 +1610,51 @@ function DirectorView() {
                         {progress ? ` · ${progress}` : ""}
                       </label>
                     </div>
+                    {goal.kind === "expand_mining_ops" ? (
+                      <div
+                        className="director-mining-policy"
+                        aria-label={`Mining expansion density in ${region.region}`}
+                      >
+                        <span>New expansion · 4 ward-backed belts</span>
+                        <strong>Dense</strong>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={miningPolicy.expand_moderate}
+                            disabled={mutating}
+                            aria-label={`Expand mining to moderate belts in ${region.region}`}
+                            onChange={(event) =>
+                              void mutate(() =>
+                                daemonApi.setDirectorMiningPolicy(
+                                  region.region,
+                                  event.target.checked,
+                                  miningPolicy.expand_sparse,
+                                ),
+                              )
+                            }
+                          />
+                          Moderate
+                        </label>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={miningPolicy.expand_sparse}
+                            disabled={mutating}
+                            aria-label={`Expand mining to sparse belts in ${region.region}`}
+                            onChange={(event) =>
+                              void mutate(() =>
+                                daemonApi.setDirectorMiningPolicy(
+                                  region.region,
+                                  miningPolicy.expand_moderate,
+                                  event.target.checked,
+                                ),
+                              )
+                            }
+                          />
+                          Sparse
+                        </label>
+                      </div>
+                    ) : null}
                     <p>{goal.blocker ?? goal.next_action ?? goal.objective}</p>
                   </div>
                 );
