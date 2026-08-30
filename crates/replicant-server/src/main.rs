@@ -21,7 +21,7 @@ use replicant_server::{
 };
 use replicant_workflow::WorkflowRepository;
 use tokio::{net::TcpListener, sync::watch};
-use tracing_subscriber::{EnvFilter, fmt::MakeWriter, prelude::*};
+use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt::MakeWriter, prelude::*};
 
 #[derive(Clone)]
 struct PersistentLogWriter {
@@ -196,7 +196,9 @@ fn init_logging(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     fs::create_dir_all(&config.log_directory)?;
     let log_path = config.log_directory.join("replicantd.log");
+    let web_log_path = config.log_directory.join("replicant-web.log");
     let file_writer = PersistentLogWriter::open(&log_path)?;
+    let web_file_writer = PersistentLogWriter::open(&web_log_path)?;
     let (filter, filter_error) = match EnvFilter::try_new(log_filter) {
         Ok(filter) => (filter, None),
         Err(error) => (EnvFilter::new("info"), Some(error.to_string())),
@@ -213,7 +215,15 @@ fn init_logging(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_target(true)
-                .with_writer(file_writer),
+                .with_writer(file_writer)
+                .with_filter(filter_fn(|metadata| metadata.target() != "replicant_web")),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(web_file_writer)
+                .with_filter(filter_fn(|metadata| metadata.target() == "replicant_web")),
         )
         .try_init()?;
 
@@ -224,7 +234,11 @@ fn init_logging(
             "invalid RUST_LOG directive; falling back to info"
         );
     }
-    tracing::info!(path = %log_path.display(), "persistent daemon logging initialized");
+    tracing::info!(
+        path = %log_path.display(),
+        frontend_path = %web_log_path.display(),
+        "persistent daemon/frontend logging initialized"
+    );
     Ok(())
 }
 

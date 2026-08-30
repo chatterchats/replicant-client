@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useDaemonState } from "./daemon";
 import type { DomainSlice, SnapshotMetadata } from "./protocol";
+import { recordWebEvent } from "./telemetry";
 
 export type DomainQueryStatus = "loading" | "error" | "empty" | "loaded";
 
@@ -96,6 +97,12 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
 }): DomainQueryResult<T> {
   const invalidated = useDaemonState().invalidated;
   const invalidation = domainInvalidationKey(slice, invalidated);
+  const sliceLabel =
+    slice === undefined
+      ? "manual"
+      : typeof slice === "string"
+        ? slice
+        : slice.join(",");
   const fetcherRef = useRef(fetcher);
   const isEmptyRef = useRef(isEmpty);
   fetcherRef.current = fetcher;
@@ -113,7 +120,37 @@ export function useDomainQuery<T extends { metadata: SnapshotMetadata }>({
   const hasAutomaticallyRequestedRef = useRef(false);
   if (!gateRef.current) {
     gateRef.current = createRequestGate(
-      (signal) => fetcherRef.current(signal),
+      async (signal) => {
+        const started = performance.now();
+        try {
+          const value = await fetcherRef.current(signal);
+          recordWebEvent(
+            "info",
+            "frontend.domain_query",
+            "frontend domain projection loaded",
+            {
+              slice: sliceLabel,
+              elapsed_ms: Math.round(performance.now() - started),
+              revision: value.metadata.revision,
+            },
+          );
+          return value;
+        } catch (error) {
+          if (!signal.aborted) {
+            recordWebEvent(
+              "error",
+              "frontend.domain_query_failed",
+              "frontend domain projection failed",
+              {
+                slice: sliceLabel,
+                elapsed_ms: Math.round(performance.now() - started),
+                error: String(error).slice(0, 500),
+              },
+            );
+          }
+          throw error;
+        }
+      },
       () => {
         const explicit = explicitRefreshRef.current;
         explicitRefreshRef.current = false;

@@ -160,6 +160,46 @@ pub struct DaemonHealth {
     pub detail: Option<String>,
 }
 
+/// Severity attached to one browser/frontend telemetry event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendTelemetryLevel {
+    /// Verbose diagnostic event.
+    Debug,
+    /// Normal lifecycle/performance event.
+    Info,
+    /// Degraded or unusually slow frontend behavior.
+    Warn,
+    /// Failed frontend operation.
+    Error,
+}
+
+/// One structured diagnostic event emitted by a local frontend.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrontendTelemetryEvent {
+    /// Browser-session identifier used only to correlate nearby events.
+    pub session_id: String,
+    /// Client-side wall-clock timestamp in Unix milliseconds.
+    pub observed_at_ms: i64,
+    /// Event severity.
+    pub level: FrontendTelemetryLevel,
+    /// Stable machine-readable event name.
+    pub event: String,
+    /// Short human-readable description.
+    pub message: String,
+    /// Current frontend route/hash when the event was emitted.
+    pub page: Option<String>,
+    /// Small structured dimensions and timing values.
+    pub fields: BTreeMap<String, Value>,
+}
+
+/// Bounded batch of frontend telemetry events.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrontendTelemetryBatch {
+    /// Events queued by the browser since the previous flush.
+    pub events: Vec<FrontendTelemetryEvent>,
+}
+
 /// Managed-client synchronization phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

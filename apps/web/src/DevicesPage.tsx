@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
@@ -9,6 +9,7 @@ import {
 } from "./CommandPalette";
 import { useDaemonState } from "./daemon";
 import { type DomainQueryStatus, useDomainQuery } from "./domainQuery";
+import { recordWebEvent } from "./telemetry";
 import type {
   DescriptorCatalog,
   DeviceSummary,
@@ -533,11 +534,28 @@ export function DevicesPage({
   onOpenSystem: (system: string) => void;
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
+  const mountedAt = useRef(performance.now());
+  const firstRenderLogged = useRef(false);
   const query = useDomainQuery({
     slice: "devices",
     fetcher: (signal) => daemonApi.devices(signal),
     isEmpty: devicesEmpty,
   });
+  useEffect(() => {
+    if (firstRenderLogged.current || query.data === undefined) return;
+    if (query.status !== "loaded" && query.status !== "empty") return;
+    firstRenderLogged.current = true;
+    recordWebEvent(
+      "info",
+      "frontend.devices_page_ready",
+      "device list rendered with its initial projection",
+      {
+        elapsed_ms: Math.round(performance.now() - mountedAt.current),
+        devices: query.data.devices.length,
+        revision: query.data.metadata.revision,
+      },
+    );
+  }, [query.data, query.status]);
   const historyRevision = useDaemonState().invalidated.history ?? 0;
   return (
     <DevicesContent

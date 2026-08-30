@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { mapGalaxyScene, type GalaxyLayers } from "./galaxyMapData";
 import type { GalaxySceneSnapshot, GalaxyStar } from "./protocol";
+import { recordWebEvent } from "./telemetry";
 
 const CAMERA_KEY = "replicant.galaxy.camera";
 type RendererModule =
@@ -130,15 +131,18 @@ export function GalaxyMapWasm({
   const lastCenteredSystem = useRef<string>("");
   const [rendererReady, setRendererReady] = useState(false);
   const [error, setError] = useState(false);
-  const geometry = useMemo(
-    () => mapGalaxyScene(scene, visibleStars, layers),
-    [layers, scene, visibleStars],
-  );
+  const mappedGeometry = useMemo(() => {
+    const started = performance.now();
+    const geometry = mapGalaxyScene(scene, visibleStars, layers);
+    return { geometry, mapMs: performance.now() - started };
+  }, [layers, scene, visibleStars]);
+  const geometry = mappedGeometry.geometry;
 
   useEffect(() => {
     const controller = new AbortController();
     let frame = 0;
     let observer: ResizeObserver | undefined;
+    const started = performance.now();
     void loadRenderer()
       .then(({ GalaxyRenderer }) => {
         const canvas = canvasRef.current;
@@ -166,9 +170,23 @@ export function GalaxyMapWasm({
         };
         render();
         setRendererReady(true);
+        recordWebEvent(
+          "info",
+          "frontend.galaxy_renderer_ready",
+          "galaxy WASM/WebGL renderer initialized",
+          { elapsed_ms: Math.round(performance.now() - started) },
+        );
       })
-      .catch(() => {
-        if (!controller.signal.aborted) setError(true);
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          recordWebEvent(
+            "error",
+            "frontend.galaxy_renderer_failed",
+            "galaxy WASM/WebGL renderer failed to initialize",
+            { error: String(reason).slice(0, 500) },
+          );
+          setError(true);
+        }
       });
     return () => {
       controller.abort();
@@ -182,6 +200,7 @@ export function GalaxyMapWasm({
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!rendererReady || !renderer) return;
+    const started = performance.now();
     renderer.set_census_geometry(
       String(scene.revision),
       JSON.stringify(geometry.stars),
@@ -194,7 +213,27 @@ export function GalaxyMapWasm({
     renderer.set_life_sphere_geometry(JSON.stringify(geometry.life));
     renderer.set_device_sphere_geometry(JSON.stringify(geometry.devices));
     renderer.set_influence_geometry(JSON.stringify(geometry.influence));
-  }, [geometry, rendererReady, scene.revision]);
+    const elapsedMs = performance.now() - started;
+    recordWebEvent(
+      elapsedMs >= 250 ? "warn" : "info",
+      "frontend.galaxy_geometry_applied",
+      "galaxy renderer geometry updated",
+      {
+        elapsed_ms: Math.round(elapsedMs),
+        map_ms: Math.round(mappedGeometry.mapMs),
+        revision: scene.revision,
+        visible_stars: visibleStars.length,
+        relay_edges: geometry.relays.length,
+        travel_segments: geometry.travel.length,
+      },
+    );
+  }, [
+    geometry,
+    mappedGeometry.mapMs,
+    rendererReady,
+    scene.revision,
+    visibleStars.length,
+  ]);
 
   useEffect(() => {
     const renderer = rendererRef.current;

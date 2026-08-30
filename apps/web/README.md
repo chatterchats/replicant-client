@@ -32,6 +32,15 @@ Page data comes from typed projection endpoints, not raw JSON assembled in the
 browser. The frontend store is a **disposable projection** — never
 authoritative. `replicantd` owns truth.
 
+## Diagnostics
+
+The packaged web service emits two complementary diagnostic streams:
+
+- nginx writes structured JSON access records to container stdout. Each record includes the full web request duration plus `replicantd` upstream connect/header/response timing when the request was proxied through `/api/`. `docker compose logs web` therefore answers what the webserver itself observed.
+- the browser batches structured frontend telemetry to `replicantd`, which writes only those events to `REPLICANT_LOG_DIR/replicant-web.log`. This includes daemon connection/degradation transitions, browser-to-daemon request timing (including nginx upstream timing headers), page changes, domain-query timing, device projection counts, galaxy scene/WASM renderer timing, uncaught browser errors, promise rejections, and supported long-task observations.
+
+Frontend telemetry is deliberately bounded and batched so diagnostics do not become a second request storm. Request bodies, authentication tokens, and application command payloads are not logged.
+
 ## Checks
 
 ```sh

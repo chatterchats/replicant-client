@@ -54,6 +54,7 @@ import { TutorialsPage } from "./TutorialsPage";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import { NotificationCenter, NotificationToasts } from "./Notifications";
 import { absoluteTime, relativeTime } from "./time";
+import { recordWebEvent } from "./telemetry";
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -237,6 +238,12 @@ export function App() {
       ),
     [dismissedNotificationIds, rawNotifications],
   );
+
+  useEffect(() => {
+    recordWebEvent("info", "frontend.page_view", "frontend page activated", {
+      page: shell.page,
+    });
+  }, [shell.page]);
 
   useEffect(() => {
     const controller = new AbortController();

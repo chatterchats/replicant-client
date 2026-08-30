@@ -15,6 +15,7 @@ import {
   type DescriptorCommand,
 } from "./CommandPalette";
 import { useDomainQuery } from "./domainQuery";
+import { recordWebEvent } from "./telemetry";
 import type {
   DescriptorCatalog,
   GalaxySceneSnapshot,
@@ -122,7 +123,22 @@ export function GalaxyPage({
         let requestedRevision: number;
         do {
           requestedRevision = latestRevision.current;
+          const started = performance.now();
           const next = await daemonApi.galaxyScene();
+          recordWebEvent(
+            "info",
+            "frontend.galaxy_scene_loaded",
+            "galaxy scene projection loaded",
+            {
+              elapsed_ms: Math.round(performance.now() - started),
+              revision: next.revision,
+              stars: next.stars.length,
+              relay_edges: next.relay_edges.length,
+              active_travel: next.active_travel.length,
+              signals: next.signals.length,
+              workflow_targets: next.workflow_targets.length,
+            },
+          );
           if (!mounted.current) return;
           setScene((current) =>
             current?.revision === next.revision ? current : next,
@@ -130,6 +146,12 @@ export function GalaxyPage({
           setError(undefined);
         } while (latestRevision.current !== requestedRevision);
       } catch (reason: unknown) {
+        recordWebEvent(
+          "error",
+          "frontend.galaxy_scene_failed",
+          "galaxy scene projection failed",
+          { error: String(reason).slice(0, 500) },
+        );
         if (mounted.current) setError(String(reason));
       } finally {
         loading.current = false;

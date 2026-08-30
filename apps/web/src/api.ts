@@ -49,6 +49,11 @@ import type {
   DirectorMode,
   TriggerRequest,
 } from "./protocol";
+import {
+  configureWebTelemetryTransport,
+  recordWebEvent,
+  type WebTelemetryFields,
+} from "./telemetry";
 
 export function daemonUrl(path: string, origin?: string): string {
   const configuredOrigin = (
@@ -90,6 +95,109 @@ function authHeaders(base?: Record<string, string>): Record<string, string> {
     : { ...base, Authorization: `Bearer ${token}` };
 }
 
+function proxyTimingMs(response: Response, header: string): number | null {
+  const value = response.headers.get(header);
+  if (!value || value === "-") return null;
+  const seconds = Number.parseFloat(value.split(",").at(-1)?.trim() ?? "");
+  return Number.isFinite(seconds) ? Math.round(seconds * 1_000) : null;
+}
+
+function daemonResponseFields(
+  response: Response,
+  method: string,
+  path: string,
+  elapsedMs: number,
+  headersMs: number,
+  bodyMs: number,
+): WebTelemetryFields {
+  return {
+    method,
+    path,
+    status: response.status,
+    elapsed_ms: Math.round(elapsedMs),
+    headers_ms: Math.round(headersMs),
+    body_ms: Math.round(bodyMs),
+    bytes:
+      Number.parseInt(response.headers.get("Content-Length") ?? "", 10) || null,
+    proxy_request_id: response.headers.get("X-Replicant-Request-Id"),
+    proxy_connect_ms: proxyTimingMs(
+      response,
+      "X-Replicant-Upstream-Connect-Time",
+    ),
+    proxy_header_ms: proxyTimingMs(
+      response,
+      "X-Replicant-Upstream-Header-Time",
+    ),
+    proxy_response_ms: proxyTimingMs(
+      response,
+      "X-Replicant-Upstream-Response-Time",
+    ),
+  };
+}
+
+function recordDaemonResponse(
+  response: Response,
+  method: string,
+  path: string,
+  elapsedMs: number,
+  headersMs: number,
+  bodyMs: number,
+) {
+  const fields = daemonResponseFields(
+    response,
+    method,
+    path,
+    elapsedMs,
+    headersMs,
+    bodyMs,
+  );
+  const level = !response.ok || elapsedMs >= 5_000 ? "warn" : "info";
+  recordWebEvent(
+    level,
+    "frontend.daemon_http",
+    response.ok ? "daemon request completed" : "daemon request was rejected",
+    fields,
+  );
+}
+
+function recordDaemonFailure(
+  method: string,
+  path: string,
+  started: number,
+  reason: unknown,
+  signal: AbortSignal,
+) {
+  const timeoutReason = signal.reason as unknown;
+  const timedOut =
+    timeoutReason instanceof Error &&
+    timeoutReason.message === "replicantd did not respond in time";
+  if (signal.aborted && !timedOut) return;
+  recordWebEvent(
+    timedOut ? "warn" : "error",
+    "frontend.daemon_http_failed",
+    timedOut ? "daemon request timed out" : "daemon request failed",
+    {
+      method,
+      path,
+      elapsed_ms: Math.round(performance.now() - started),
+      timed_out: timedOut,
+      aborted: signal.aborted,
+      error:
+        reason instanceof Error
+          ? reason.message.slice(0, 500)
+          : String(reason).slice(0, 500),
+    },
+  );
+}
+
+const webMode = (import.meta as unknown as { env: { MODE?: string } }).env.MODE;
+if (webMode !== "test") {
+  configureWebTelemetryTransport(
+    daemonUrl("/api/frontend/telemetry"),
+    daemonToken(),
+  );
+}
+
 /**
  * Aborts a request that outlives the caller's signal or the timeout.
  *
@@ -123,14 +231,42 @@ function withTimeout(
 
 async function get(path: string, signal?: AbortSignal): Promise<unknown> {
   const request = withTimeout(signal);
+  const started = performance.now();
+  let response: Response | undefined;
+  let headersAt = started;
   try {
-    const response = await fetch(daemonUrl(path), {
+    response = await fetch(daemonUrl(path), {
       signal: request.signal,
       headers: authHeaders(),
     });
-    if (!response.ok)
+    headersAt = performance.now();
+    if (!response.ok) {
+      recordDaemonResponse(
+        response,
+        "GET",
+        path,
+        headersAt - started,
+        headersAt - started,
+        0,
+      );
       throw new Error(`replicantd returned ${String(response.status)}`);
-    return (await response.json()) as unknown;
+    }
+    const value = (await response.json()) as unknown;
+    const completed = performance.now();
+    recordDaemonResponse(
+      response,
+      "GET",
+      path,
+      completed - started,
+      headersAt - started,
+      completed - headersAt,
+    );
+    return value;
+  } catch (reason: unknown) {
+    if (response === undefined) {
+      recordDaemonFailure("GET", path, started, reason, request.signal);
+    }
+    throw reason;
   } finally {
     request.done();
   }
@@ -151,7 +287,9 @@ async function send(
   timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
   const request = withTimeout(undefined, timeoutMs);
-  let response: Response;
+  const started = performance.now();
+  let response: Response | undefined;
+  let headersAt = started;
   try {
     response = await fetch(daemonUrl(path), {
       method,
@@ -161,20 +299,45 @@ async function send(
       ),
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    headersAt = performance.now();
+    if (response.status === 204) {
+      recordDaemonResponse(
+        response,
+        method,
+        path,
+        headersAt - started,
+        headersAt - started,
+        0,
+      );
+      return null;
+    }
+    const value = (await response.json()) as unknown;
+    const completed = performance.now();
+    recordDaemonResponse(
+      response,
+      method,
+      path,
+      completed - started,
+      headersAt - started,
+      completed - headersAt,
+    );
+    if (!response.ok) {
+      const payload = (value as { payload?: { message?: unknown } }).payload;
+      throw new Error(
+        typeof payload?.message === "string"
+          ? payload.message
+          : `replicantd returned ${String(response.status)}`,
+      );
+    }
+    return value;
+  } catch (reason: unknown) {
+    if (response === undefined) {
+      recordDaemonFailure(method, path, started, reason, request.signal);
+    }
+    throw reason;
   } finally {
     request.done();
   }
-  if (response.status === 204) return null;
-  const value = (await response.json()) as unknown;
-  if (!response.ok) {
-    const payload = (value as { payload?: { message?: unknown } }).payload;
-    throw new Error(
-      typeof payload?.message === "string"
-        ? payload.message
-        : `replicantd returned ${String(response.status)}`,
-    );
-  }
-  return value;
 }
 
 export const daemonApi = {
@@ -255,7 +418,15 @@ export const daemonApi = {
     return parseOverviewResponse(await get("/api/overview", signal)).payload;
   },
   async devices(signal?: AbortSignal) {
-    return parseDevicesResponse(await get("/api/devices", signal)).payload;
+    const payload = parseDevicesResponse(await get("/api/devices", signal))
+      .payload;
+    recordWebEvent(
+      "info",
+      "frontend.devices_loaded",
+      "device projection loaded",
+      { devices: payload.devices.length, revision: payload.metadata.revision },
+    );
+    return payload;
   },
   async entityInspector(kind: string, id: string, signal?: AbortSignal) {
     return parseEntityInspectorResponse(
@@ -397,8 +568,21 @@ export const daemonApi = {
     return parseSettingsResponse(await get("/api/settings", signal)).payload;
   },
   async galaxyScene(signal?: AbortSignal) {
-    return parseGalaxySceneResponse(await get("/api/galaxy-scene", signal))
-      .payload;
+    const payload = parseGalaxySceneResponse(
+      await get("/api/galaxy-scene", signal),
+    ).payload;
+    recordWebEvent(
+      "info",
+      "frontend.galaxy_scene_parsed",
+      "galaxy scene payload parsed",
+      {
+        revision: payload.revision,
+        stars: payload.stars.length,
+        relay_edges: payload.relay_edges.length,
+        active_travel: payload.active_travel.length,
+      },
+    );
+    return payload;
   },
   async systemScene(system: string, signal?: AbortSignal) {
     return parseSystemSceneResponse(

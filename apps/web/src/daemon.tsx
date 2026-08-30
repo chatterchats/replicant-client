@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import { daemonApi, daemonToken, daemonUrl } from "./api";
+import { recordWebEvent } from "./telemetry";
 import {
   type AutomationControlAction,
   type AutomationStatus,
@@ -326,6 +327,7 @@ export function socketUrl(
 export function DaemonProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(daemonReducer, initialDaemonState);
   const socketRef = useRef<WebSocket | undefined>(undefined);
+  const lastDiagnosticState = useRef<string>("");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -334,7 +336,14 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     let attempt = 0;
 
     const connect = async () => {
+      const started = performance.now();
       dispatch({ type: "connecting", retry: attempt > 0 });
+      recordWebEvent(
+        "info",
+        "frontend.daemon_connecting",
+        attempt > 0 ? "reconnecting to daemon" : "connecting to daemon",
+        { attempt },
+      );
       try {
         // The socket is opened *before* the snapshot is fetched, and messages
         // that arrive meanwhile are buffered and replayed afterwards. Fetching
@@ -350,6 +359,12 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         socket = new WebSocket(socketUrl());
         socketRef.current = socket;
         socket.addEventListener("open", () => {
+          recordWebEvent(
+            "info",
+            "frontend.daemon_socket_open",
+            "daemon WebSocket connected",
+            { connect_ms: Math.round(performance.now() - started), attempt },
+          );
           attempt = 0;
           dispatch({ type: "connected" });
         });
@@ -359,11 +374,36 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
               throw new Error("Invalid binary live message");
             deliver(parseLiveMessage(JSON.parse(event.data) as unknown));
           } catch (error) {
+            recordWebEvent(
+              "error",
+              "frontend.daemon_live_message_invalid",
+              "daemon live message could not be parsed",
+              { error: String(error).slice(0, 500) },
+            );
             dispatch({ type: "continuity_lost", error: String(error) });
           }
         });
-        socket.addEventListener("close", scheduleReconnect);
-        socket.addEventListener("error", () => socket?.close());
+        socket.addEventListener("close", (event) => {
+          recordWebEvent(
+            event.wasClean ? "info" : "warn",
+            "frontend.daemon_socket_closed",
+            "daemon WebSocket closed",
+            {
+              code: event.code,
+              clean: event.wasClean,
+              reason: event.reason.slice(0, 300),
+            },
+          );
+          scheduleReconnect();
+        });
+        socket.addEventListener("error", () => {
+          recordWebEvent(
+            "warn",
+            "frontend.daemon_socket_error",
+            "daemon WebSocket reported an error",
+          );
+          socket?.close();
+        });
 
         const [health, snapshot, entities] = await Promise.all([
           daemonApi.health(controller.signal),
@@ -372,6 +412,20 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         ]);
         if (controller.signal.aborted) return;
         dispatch({ type: "snapshot", snapshot, health, entities });
+        recordWebEvent(
+          health.status === "healthy" ? "info" : "warn",
+          "frontend.daemon_snapshot_loaded",
+          "initial daemon snapshot loaded",
+          {
+            elapsed_ms: Math.round(performance.now() - started),
+            health: health.status,
+            sync_phase: snapshot.sync.phase,
+            revision: snapshot.metadata.revision,
+            workflows: snapshot.workflows.length,
+            entities: entities.entities.length,
+            notifications: snapshot.notifications.length,
+          },
+        );
 
         // Replay anything received while the snapshot was in flight; the
         // reducer discards messages at or below the snapshot's revision.
@@ -380,6 +434,15 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         for (const message of replay) dispatch({ type: "live", message });
       } catch (error) {
         if (!controller.signal.aborted) {
+          recordWebEvent(
+            "warn",
+            "frontend.daemon_connection_failed",
+            "daemon connection/bootstrap failed",
+            {
+              elapsed_ms: Math.round(performance.now() - started),
+              error: String(error).slice(0, 500),
+            },
+          );
           dispatch({ type: "disconnected", error: String(error) });
           scheduleReconnect();
         }
@@ -389,11 +452,18 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     const scheduleReconnect = () => {
       if (controller.signal.aborted || timer !== undefined) return;
       dispatch({ type: "disconnected", error: "Daemon connection closed" });
+      const delayMs = retryDelay(attempt);
+      recordWebEvent(
+        "warn",
+        "frontend.daemon_reconnect_scheduled",
+        "daemon reconnect scheduled",
+        { attempt: attempt + 1, delay_ms: delayMs },
+      );
       timer = setTimeout(() => {
         timer = undefined;
         attempt += 1;
         void connect();
-      }, retryDelay(attempt));
+      }, delayMs);
     };
 
     void connect();
@@ -450,6 +520,41 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       controller.abort();
     };
   }, [state.invalidated.entities]);
+
+  useEffect(() => {
+    const signature = [
+      state.connection,
+      state.health?.status ?? "unknown",
+      state.sync?.phase ?? "unknown",
+      state.sync?.detail ?? "",
+    ].join("|");
+    if (signature === lastDiagnosticState.current) return;
+    lastDiagnosticState.current = signature;
+    const degraded =
+      state.connection !== "connected" ||
+      (state.health !== null && state.health.status !== "healthy") ||
+      (state.sync !== null && state.sync.phase !== "ready");
+    recordWebEvent(
+      degraded ? "warn" : "info",
+      "frontend.daemon_state",
+      degraded
+        ? "daemon connectivity/synchronization is degraded"
+        : "daemon is ready",
+      {
+        connection: state.connection,
+        health: state.health?.status ?? null,
+        sync_phase: state.sync?.phase ?? null,
+        revision: state.revision,
+        detail: (state.sync?.detail ?? state.health?.detail ?? "").slice(0, 500),
+      },
+    );
+  }, [
+    state.connection,
+    state.health?.detail,
+    state.health?.status,
+    state.sync?.detail,
+    state.sync?.phase,
+  ]);
 
   return <DaemonContext value={state}>{children}</DaemonContext>;
 }

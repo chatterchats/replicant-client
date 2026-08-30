@@ -64,7 +64,8 @@ use replicant_protocol::{
     ErrorResponse, EventCriterionSummary, EventRequirementKind, EventRequirementSummary,
     EventRewardItem, EventRewardsSummary, EventSummary, EventsSnapshot, FactoryJobSummary,
     FiniteExecution as ProtocolFiniteExecution, FiniteExecutionHistoryResponse,
-    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, GalaxySceneSnapshot, HealthStatus,
+    FiniteExecutionStatus as ProtocolFiniteExecutionStatus, FrontendTelemetryBatch,
+    FrontendTelemetryLevel, GalaxySceneSnapshot, HealthStatus,
     InboxMessageSummary, InventoryDistribution, InventoryLocationSummary, InventoryOwnerKind,
     InventoryQuantity, InventoryResourceSummary, InventorySnapshot, LeaderboardBoardSummary,
     LeaderboardEntrySummary, LeaderboardsSnapshot, LiveDelta, LiveMessage, MessagesSnapshot,
@@ -542,6 +543,7 @@ async fn trace_http_request(request: Request<axum::body::Body>, next: Next) -> R
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/frontend/telemetry", post(frontend_telemetry))
         .route("/api/snapshot", get(snapshot))
         .route("/api/refreshes", get(list_refreshes).post(start_refresh))
         .route("/api/refreshes/{run_id}", get(refresh_detail))
@@ -5160,6 +5162,84 @@ async fn refresh_system_locations(
     Ok(StatusCode::NO_CONTENT)
 }
 
+const MAX_FRONTEND_TELEMETRY_EVENTS: usize = 100;
+const MAX_FRONTEND_TELEMETRY_TEXT: usize = 512;
+const MAX_FRONTEND_TELEMETRY_FIELDS: usize = 4_096;
+
+fn frontend_log_text(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\n' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .take(limit)
+        .collect()
+}
+
+async fn frontend_telemetry(
+    payload: Result<Json<FrontendTelemetryBatch>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(batch) = payload.map_err(|_| ApiError::invalid("invalid frontend telemetry batch"))?;
+    if batch.events.len() > MAX_FRONTEND_TELEMETRY_EVENTS {
+        return Err(ApiError::invalid("frontend telemetry batch is too large"));
+    }
+
+    for item in batch.events {
+        let event_name = frontend_log_text(&item.event, 128);
+        let session_id = frontend_log_text(&item.session_id, 128);
+        let message = frontend_log_text(&item.message, MAX_FRONTEND_TELEMETRY_TEXT);
+        let page = item
+            .page
+            .as_deref()
+            .map(|value| frontend_log_text(value, 256))
+            .unwrap_or_default();
+        let mut fields = serde_json::to_string(&item.fields).unwrap_or_else(|_| "{}".to_owned());
+        fields = frontend_log_text(&fields, MAX_FRONTEND_TELEMETRY_FIELDS);
+
+        match item.level {
+            FrontendTelemetryLevel::Debug => tracing::debug!(
+                target: "replicant_web",
+                event = %event_name,
+                session_id = %session_id,
+                observed_at_ms = item.observed_at_ms,
+                page = %page,
+                fields = %fields,
+                "{message}"
+            ),
+            FrontendTelemetryLevel::Info => tracing::info!(
+                target: "replicant_web",
+                event = %event_name,
+                session_id = %session_id,
+                observed_at_ms = item.observed_at_ms,
+                page = %page,
+                fields = %fields,
+                "{message}"
+            ),
+            FrontendTelemetryLevel::Warn => tracing::warn!(
+                target: "replicant_web",
+                event = %event_name,
+                session_id = %session_id,
+                observed_at_ms = item.observed_at_ms,
+                page = %page,
+                fields = %fields,
+                "{message}"
+            ),
+            FrontendTelemetryLevel::Error => tracing::error!(
+                target: "replicant_web",
+                event = %event_name,
+                session_id = %session_id,
+                observed_at_ms = item.observed_at_ms,
+                page = %page,
+                fields = %fields,
+                "{message}"
+            ),
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn descriptors(State(state): State<Arc<AppState>>) -> Json<Versioned<DescriptorCatalog>> {
     Json(Versioned::current(state.catalogue.descriptors().clone()))
 }
@@ -6746,6 +6826,17 @@ fn now_millis() -> Result<i64, ApiError> {
         .map_err(|_| ApiError::internal())?
         .as_millis();
     i64::try_from(millis).map_err(|_| ApiError::internal())
+}
+
+#[cfg(test)]
+mod frontend_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn frontend_log_text_sanitizes_control_whitespace_and_bounds_length() {
+        assert_eq!(frontend_log_text("one\ntwo\tthree", 64), "one two three");
+        assert_eq!(frontend_log_text("abcdef", 4), "abcd");
+    }
 }
 
 #[cfg(test)]
@@ -8498,6 +8589,35 @@ mod tests {
         assert_eq!(job.quantity, 2);
         assert_eq!(job.eta_seconds, Some(30.0));
         assert_eq!(job.tags, ["network"]);
+    }
+
+    #[tokio::test]
+    async fn frontend_telemetry_accepts_a_bounded_structured_batch() {
+        let (app, client, _) = test_app().await;
+        let response = app
+            .oneshot(
+                Request::post("/api/frontend/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "events": [{
+                                "session_id": "test-session",
+                                "observed_at_ms": 1,
+                                "level": "info",
+                                "event": "frontend.test",
+                                "message": "hello",
+                                "page": "#Devices",
+                                "fields": {"elapsed_ms": 12}
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        client.close().await.expect("close client");
     }
 
     #[tokio::test]

@@ -25,17 +25,21 @@ Configuration is environment-based:
 A non-empty `RS_API_TOKEN` takes precedence over `RS_API_TOKEN_FILE`. Token
 files are trimmed when read and neither source is printed in logs or status.
 
-`replicantd` writes the same tracing stream to stderr and to
-`REPLICANT_LOG_DIR/replicantd.log`. When `REPLICANT_LOG_DIR` is unset, it
-defaults to a `logs/` directory beside `REPLICANT_RUNTIME_DB`; a native or
-desktop default run therefore writes
-`~/.local/share/replicant/logs/replicantd.log`.
+`replicantd` writes its tracing stream to stderr and to
+`REPLICANT_LOG_DIR/replicantd.log`. Authenticated browser diagnostics received
+through `POST /api/frontend/telemetry` are kept out of that file and written
+separately to `REPLICANT_LOG_DIR/replicant-web.log`, so frontend timing/error
+noise can be inspected without obscuring workflow/runtime logs. When
+`REPLICANT_LOG_DIR` is unset, it defaults to a `logs/` directory beside
+`REPLICANT_RUNTIME_DB`; a native or desktop default run therefore writes both
+files under `~/.local/share/replicant/logs/`.
 
 The default binding is loopback-only. Binding to a non-loopback address is an explicit advanced deployment choice and should only be done behind an authenticated same-origin proxy or on an isolated container network.
 
 The daemon exposes these local routes:
 
 - `GET /api/health`
+- `POST /api/frontend/telemetry`
 - `GET /api/snapshot`
 - `GET /api/entities`
 - `GET /ws` (WebSocket upgrade)

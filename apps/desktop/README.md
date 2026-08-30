@@ -60,10 +60,11 @@ The sidecar uses the daemon's shared defaults,
 `~/.local/share/replicant/replicant-client.sqlite` and
 `~/.local/share/replicant/replicant-runtime.sqlite`, unless `REPLICANT_DB` or
 `REPLICANT_RUNTIME_DB` is configured. The daemon automatically writes persistent
-tracing output to a sibling `logs/replicantd.log` directory (or
-`REPLICANT_LOG_DIR` when explicitly configured), so desktop runtime diagnostics
-survive sidecar restarts alongside the databases. No API token, database
-contents, or shell/process command is exposed through the frontend capability set.
+tracing output to sibling `logs/replicantd.log` and `logs/replicant-web.log`
+files (or `REPLICANT_LOG_DIR` when explicitly configured), so daemon and
+frontend diagnostics survive sidecar restarts alongside the databases. No API
+token, database contents, or shell/process command is exposed through the
+frontend capability set.
 
 ## Validation and release packaging
 
