@@ -977,6 +977,12 @@ impl Client {
         super::galaxy::GalaxyGateway::new(self.clone())
     }
 
+    /// Builds a local-only smart travel route selector.
+    #[must_use]
+    pub fn smart_travel(&self) -> super::smart_travel::SmartTravelRouter {
+        super::smart_travel::SmartTravelRouter::new(self.clone())
+    }
+
     /// Builds a synchronization request using this managed client.
     #[must_use]
     pub fn sync(&self) -> super::sync::SyncClient {

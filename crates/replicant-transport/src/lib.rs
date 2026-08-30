@@ -1423,11 +1423,24 @@ async fn ensure_device_at(
         None
     } else {
         info!(device = %code, destination = %destination, "dispatching transport travel");
+        let via = client
+            .smart_travel()
+            .route_for_device(code, destination)
+            .await?
+            .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+            .map(|plan| {
+                Value::Array(
+                    plan.intermediate_systems
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                )
+            });
         let operation = handle
             .command(raw::devices::DeviceCommand::Travel {
                 destination: destination.to_owned(),
                 dry_run: None,
-                via: None,
+                via,
             })
             .await?;
         ensure_operation_accepted(&operation).await?;

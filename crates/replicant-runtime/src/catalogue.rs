@@ -422,12 +422,26 @@ impl OperationCatalogue {
                     .get(&input.device)
                     .await
                     .map_err(runtime_error)?;
+                let via = client
+                    .smart_travel()
+                    .route_for_device(&input.device, &input.destination)
+                    .await
+                    .map_err(runtime_error)?
+                    .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+                    .map(|plan| {
+                        Value::Array(
+                            plan.intermediate_systems
+                                .into_iter()
+                                .map(Value::String)
+                                .collect(),
+                        )
+                    });
                 managed_operation_value(
                     handle
                         .command(raw::devices::DeviceCommand::Travel {
                             destination: input.destination,
                             dry_run: None,
-                            via: None,
+                            via,
                         })
                         .await
                         .map_err(runtime_error)?,
@@ -2313,11 +2327,26 @@ async fn create_device_lifecycle_operation(
                 .ok_or_else(|| {
                     CatalogueError::Invalid("bulk device travel requires a destination".to_owned())
                 })?;
+            let destination = destination.trim();
+            let via = client
+                .smart_travel()
+                .route_for_device(device, destination)
+                .await
+                .map_err(runtime_error)?
+                .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+                .map(|plan| {
+                    Value::Array(
+                        plan.intermediate_systems
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    )
+                });
             return handle
                 .command(raw::devices::DeviceCommand::Travel {
-                    destination: destination.trim().to_owned(),
+                    destination: destination.to_owned(),
                     dry_run: None,
-                    via: None,
+                    via,
                 })
                 .await
                 .map_err(runtime_error);
@@ -3601,8 +3630,74 @@ fn default_mining_concurrency() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
+    };
 
+    use super::*;
+    async fn smart_travel_test_client(server: &MockServer) -> Client {
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .in_memory()
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("start client");
+        client
+            .galaxy()
+            .refresh_catalogue()
+            .await
+            .expect("refresh catalogue");
+        client
+            .devices()
+            .list(&raw::devices::DeviceListQuery::default())
+            .await
+            .expect("refresh devices");
+        client
+    }
+
+    async fn mount_smart_travel_state(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-08-29T00:00:00Z",
+                "stars": [
+                    {"designation":"A","position":{"x":0.0,"y":0.0,"z":0.0},"has_hub":false},
+                    {"designation":"B","position":{"x":2.0,"y":0.0,"z":0.0},"has_hub":true},
+                    {"designation":"D","position":{"x":10.0,"y":0.0,"z":0.0},"has_hub":false}
+                ]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [{
+                    "device_code":"D1",
+                    "device_type":"cargo_vessel",
+                    "location":"A-1",
+                    "status":"active",
+                    "available_commands":["travel"]
+                }],
+                "next_cursor": null
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code":"D1",
+                "device_type":"cargo_vessel",
+                "location":"A-1",
+                "status":"active",
+                "available_commands":["travel"]
+            })))
+            .mount(server)
+            .await;
+    }
     #[test]
     fn device_command_bindings_cover_advertised_commands() {
         let catalogue = OperationCatalogue::new().expect("catalogue");
@@ -3631,6 +3726,7 @@ mod tests {
             "start_mining",
             "stellar_census",
         ];
+
         assert_eq!(
             advertised
                 .iter()
@@ -3729,6 +3825,65 @@ mod tests {
             .device_commands
             .push(descriptor.device_commands[0].clone());
         assert!(duplicate.validate_device_command_bindings().is_err());
+    }
+    #[tokio::test]
+    async fn device_travel_action_emits_shared_smart_waypoints() {
+        let server = MockServer::start().await;
+        mount_smart_travel_state(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/D1"))
+            .and(body_json(serde_json::json!({
+                "command": "travel",
+                "destination": "D",
+                "via": ["B"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = smart_travel_test_client(&server).await;
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+
+        catalogue
+            .run_action(
+                &client,
+                "device.travel",
+                BTreeMap::from([
+                    ("device".to_owned(), Value::String("D1".to_owned())),
+                    ("destination".to_owned(), Value::String("D".to_owned())),
+                ]),
+            )
+            .await
+            .expect("device travel");
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn bulk_lifecycle_travel_emits_shared_smart_waypoints() {
+        let server = MockServer::start().await;
+        mount_smart_travel_state(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/D1"))
+            .and(body_json(serde_json::json!({
+                "command": "travel",
+                "destination": "D",
+                "via": ["B"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = smart_travel_test_client(&server).await;
+
+        let operation = create_device_lifecycle_operation(&client, "D1", "travel", Some("D"))
+            .await
+            .expect("bulk lifecycle travel");
+        operation.outcome().await.expect("operation outcome");
+
+        server.verify().await;
+        client.close().await.expect("close");
     }
 
     #[test]

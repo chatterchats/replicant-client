@@ -1,7 +1,7 @@
 //! `replicant-client` is a durable, stateful Rust client for building
 //! Replicant Space applications.
 //!
-//! The crate targets the verified Replicant Space `2.5.1` rendered and
+//! The crate targets the verified Replicant Space `2.5.2` rendered and
 //! OpenAPI contract. Contract provenance, operation classifications, and
 //! release-specific schema decisions are recorded under `policy/`; the pinned
 //! snapshot and its digests live in `Cargo.toml` under
@@ -65,12 +65,12 @@ pub mod managed {
     mod operation;
     mod refresh;
     mod simulations;
+    mod smart_travel;
     mod state;
     mod store;
     mod sync;
     mod trading;
     mod travel;
-
     #[cfg(test)]
     async fn test_client_at(base_url: &str) -> client::Client {
         client::Client::builder()
@@ -118,6 +118,7 @@ pub mod managed {
         RefreshRunStatus,
     };
     pub use simulations::{SimulationQuery, SimulationsGateway};
+    pub use smart_travel::SmartTravelRouter;
     pub use state::{GalaxyRevisionWatch, ManagedStateSnapshot, StateGateway, StateRevisionWatch};
     pub use sync::{
         SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind,
@@ -143,12 +144,12 @@ pub use managed::{
     RefreshClient, RefreshDelta, RefreshMode, RefreshPhase, RefreshPhaseState, RefreshPhaseStatus,
     RefreshReadiness, RefreshRequest, RefreshRunId, RefreshRunState, RefreshRunStatus,
     RelayHistoryQuery, ReplicantHandle, ReplicantQuery, ReplicantStarSyncReport, ReplicantsGateway,
-    SimulationQuery, SimulationsGateway, StartupPolicy, StateGateway, StateRevisionWatch,
-    SurveyController, SurveyDirective, SyncCancellation, SyncClient, SyncDiagnostic, SyncDomain,
-    SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError, SyncProgress, SyncReadiness, SyncReport,
-    TradeControllerHandle, TradingGateway, TransportController, TransportDirective, TravelBuilder,
-    TravelPreview, TravelVia, TutorialsGateway, default_data_directory, default_database_path,
-    default_history_database_path,
+    SimulationQuery, SimulationsGateway, SmartTravelRouter, StartupPolicy, StateGateway,
+    StateRevisionWatch, SurveyController, SurveyDirective, SyncCancellation, SyncClient,
+    SyncDiagnostic, SyncDomain, SyncFailure, SyncFailureKind, SyncPlan, SyncPlanError,
+    SyncProgress, SyncReadiness, SyncReport, TradeControllerHandle, TradingGateway,
+    TransportController, TransportDirective, TravelBuilder, TravelPreview, TravelVia,
+    TutorialsGateway, default_data_directory, default_database_path, default_history_database_path,
 };
 
 #[cfg(feature = "raw")]
@@ -159,6 +160,6 @@ pub use domain::{
     Account, AccountId, ActiveDeviceDirective, Atmosphere, Device, DeviceCommand, DeviceId,
     DeviceKey, DeviceRelationships, DeviceStatus, DeviceType, Event, EventId, Knowledge, LifeStage,
     Location, LocationId, LocationKey, LocationSurveyProgress, OperationId, Realm, Replicant,
-    ReplicantId, ReplicantKey, SimulationId, Star, StarId, StarKnowledge, TradeId, TravelState,
-    WorldKey,
+    ReplicantId, ReplicantKey, SimulationId, SmartTravelPlan, SmartTravelPlanner, Star, StarId,
+    StarKnowledge, TradeId, TravelProfile, TravelState, WorldKey, surge_seconds,
 };

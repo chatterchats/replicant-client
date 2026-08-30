@@ -15,6 +15,8 @@ mod model;
 mod observation;
 #[allow(missing_docs)] // Query implementation details are re-exported through this facade.
 mod query;
+#[allow(missing_docs)] // Pure travel planning details are re-exported through this facade.
+mod travel;
 #[allow(missing_docs)] // Vocabulary implementation details are re-exported through this facade.
 mod vocab;
 
@@ -24,4 +26,5 @@ pub use merge::*;
 pub use model::*;
 pub use observation::*;
 pub use query::*;
+pub use travel::*;
 pub use vocab::*;

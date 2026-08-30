@@ -2720,7 +2720,7 @@ mod tests {
 
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param, query_param_is_missing},
+        matchers::{body_json, method, path, query_param, query_param_is_missing},
     };
 
     use super::*;
@@ -3170,7 +3170,7 @@ mod tests {
                     Some("live"),
                     Some("replicant"),
                     Some("R1"),
-                    &serde_json::json!({"kind": "replicant_travel", "replicant_code":"R1", "request": {"destination":"SOL"}, "expects_evidence": true}),
+                    &serde_json::json!({"kind": "replicant_travel", "replicant_code":"R1", "request": {"destination":"SOL", "via":["SCEPTURUM"]}, "expects_evidence": true}),
                 )
                 .expect("record travel");
             store
@@ -3221,6 +3221,10 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/replicants/R1/travel"))
+            .and(body_json(serde_json::json!({
+                "destination": "SOL",
+                "via": ["SCEPTURUM"]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&server)

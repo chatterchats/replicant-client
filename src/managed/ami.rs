@@ -3,9 +3,9 @@
 //! Every AMI controller (mining, survey, transport, fleet) shares one common
 //! command set — `adopt`, `release`, `launch`, `withdraw`, `assemble`,
 //! `activate`, `deactivate`, `clear_directive` — documented on
-//! `reference/replicant-space-2-5-1/ami/index.md`. Each controller type then adds
+//! `reference/replicant-space-2-5-2/ami/index.md`. Each controller type then adds
 //! its own `set_directive` catalogue, documented on its own
-//! `reference/replicant-space-2-5-1/ami/<kind>-controller/index.md` page. AMI
+//! `reference/replicant-space-2-5-2/ami/<kind>-controller/index.md` page. AMI
 //! digest events (`ami.*.digest`) are periodic operational reports, not
 //! complete fleet snapshots, so they are exposed only through
 //! [`crate::managed::EventsGateway`] like any other account event, never
@@ -179,7 +179,7 @@ async fn set_directive(
 }
 
 /// Directives available on an AMI mining controller
-/// (`reference/replicant-space-2-5-1/ami/mining-controller/index.md`).
+/// (`reference/replicant-space-2-5-2/ami/mining-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum MiningDirective {
@@ -252,7 +252,7 @@ impl MiningController {
 }
 
 /// Directives available on an AMI survey controller
-/// (`reference/replicant-space-2-5-1/ami/survey-controller/index.md`).
+/// (`reference/replicant-space-2-5-2/ami/survey-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum SurveyDirective {
@@ -315,7 +315,7 @@ impl SurveyController {
 }
 
 /// Directives available on an AMI transport controller
-/// (`reference/replicant-space-2-5-1/ami/transport-controller/index.md`).
+/// (`reference/replicant-space-2-5-2/ami/transport-controller/index.md`).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum TransportDirective {
@@ -440,7 +440,7 @@ impl TransportController {
 
 /// A typed handle to an AMI fleet controller device. Fleet controllers have
 /// no directives: their only job is relaying `travel` commands to every
-/// adopted device (`reference/replicant-space-2-5-1/ami/fleet-controller/index.md`).
+/// adopted device (`reference/replicant-space-2-5-2/ami/fleet-controller/index.md`).
 #[derive(Clone, Debug)]
 pub struct FleetController {
     device: DeviceHandle,
@@ -457,6 +457,9 @@ impl FleetController {
     /// Issues one travel command that cascades to every adopted device (and,
     /// transitively, every device adopted by an adopted fleet controller).
     pub async fn travel(&self, destination: impl Into<String>) -> Result<Operation> {
+        // A fleet controller cascades one route to potentially heterogeneous
+        // adopted vessels. Preserve server auto routing because no single
+        // local vessel profile can represent that fleet safely.
         self.device
             .command(DeviceCommand::Travel {
                 destination: destination.into(),
@@ -602,6 +605,29 @@ mod tests {
             })
             .await
             .expect("set_directive");
+
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn fleet_travel_preserves_per_child_server_auto_routing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/F1"))
+            .and(body_json(serde_json::json!({
+                "command": "travel",
+                "destination": "VEGA"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        seed_device(&client, "F1", DeviceType::FleetController, Vec::new());
+        let controller = FleetController::new(handle(&client, "F1")).expect("controller");
+
+        controller.travel("VEGA").await.expect("travel");
 
         server.verify().await;
         client.close().await.expect("close");

@@ -2985,12 +2985,25 @@ async fn start_device_travel_matching(
             format!("device {code} is travelling to {planned:?}, not {destination}"),
         ));
     }
+    let via = client
+        .smart_travel()
+        .route_for_device(code, destination)
+        .await?
+        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+        .map(|plan| {
+            Value::Array(
+                plan.intermediate_systems
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
     ensure_operation(
         &handle
             .command(raw::devices::DeviceCommand::Travel {
                 destination: destination.into(),
                 dry_run: None,
-                via: None,
+                via,
             })
             .await?,
     )
