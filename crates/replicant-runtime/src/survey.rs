@@ -3700,6 +3700,7 @@ async fn latest_event_history_cursor(
         .events()
         .history()
         .for_device(controller)
+        .latest(1)
         .collect()
         .await?;
     Ok(events.last().map(|event| event.id.as_str().to_owned()))

@@ -4,12 +4,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use replicant_client::{
-    Client, Replicant, Star,
+    Client, Star,
     domain::{Device, DeviceType, Location},
 };
 use replicant_mining_planner::{
@@ -28,11 +27,9 @@ use serde_json::Value;
 use tracing::info;
 
 mod executor;
+mod validation;
 
 const PLAN_VERSION: u32 = 1;
-const MINING_SYNC_REUSE_WINDOW: Duration = Duration::from_secs(60);
-static MINING_SYNC_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static LAST_MINING_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Error type returned by the reusable mining workflow.
 pub type AnyError = Box<dyn StdError + Send + Sync + 'static>;
@@ -873,11 +870,7 @@ impl Drop for MissionLock {
     }
 }
 
-async fn create_plan(
-    client: &Client,
-    config: &Config,
-    synchronize: bool,
-) -> AnyResult<MiningMission> {
+async fn create_plan(client: &Client, config: &Config) -> AnyResult<MiningMission> {
     if config.plan_path.exists() && !config.replace_plan {
         let existing = load_expansion(&config.plan_path)?;
         if !existing.phase.is_terminal() {
@@ -892,11 +885,7 @@ async fn create_plan(
         }
     }
 
-    if synchronize {
-        synchronize_mining_state(client).await?;
-    } else {
-        info!("planning mining expansion from committed managed state");
-    }
+    info!("planning mining expansion from committed managed state");
     let selected_replicant = select_replicant(client, config.replicant.as_deref()).await?;
     let mut systems = config.requested_systems()?;
     let devices = device_snapshots(client).await?;
@@ -1194,58 +1183,16 @@ pub(crate) async fn device_snapshots(client: &Client) -> AnyResult<Vec<Device>> 
     Ok(devices)
 }
 
-pub(crate) async fn authoritative_device_refresh(client: &Client) -> AnyResult<()> {
-    client
-        .devices()
-        .refresh_many()
-        .page_size(50)
-        .collect()
-        .await?;
-    Ok(())
-}
-
-pub(crate) async fn synchronize_mining_state(client: &Client) -> AnyResult<()> {
-    let _gate = MINING_SYNC_GATE.lock().await;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| app_error(io::ErrorKind::Other, "system clock is before Unix epoch"))?
-        .as_millis() as u64;
-    let last_ms = LAST_MINING_SYNC_MS.load(Ordering::Acquire);
-    if last_ms != 0
-        && now_ms.saturating_sub(last_ms)
-            < u64::try_from(MINING_SYNC_REUSE_WINDOW.as_millis()).unwrap_or(u64::MAX)
-    {
-        info!(
-            age_ms = now_ms.saturating_sub(last_ms),
-            reuse_window_ms = MINING_SYNC_REUSE_WINDOW.as_millis() as u64,
-            "reusing recent full managed synchronization for mining"
-        );
-        return Ok(());
-    }
-
-    let sync = client.sync().full().await?;
-    let completed_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| app_error(io::ErrorKind::Other, "system clock is before Unix epoch"))?
-        .as_millis() as u64;
-    LAST_MINING_SYNC_MS.store(completed_ms, Ordering::Release);
-    info!(readiness = ?sync.readiness, "full managed synchronization completed for mining");
-    Ok(())
-}
-
 async fn select_replicant(client: &Client, requested: Option<&str>) -> AnyResult<String> {
-    let handles = client.replicants().find().owned().collect().await?;
-    let mut replicants = Vec::new();
-    for handle in handles {
-        replicants.push(handle.snapshot().await?);
-    }
     let requested = requested.ok_or_else(|| {
         app_error(
             io::ErrorKind::InvalidInput,
             "mining expansion requires a replicant name or code",
         )
     })?;
-    let mut matches = replicants
+    let mut matches = client
+        .state()
+        .owned_replicants()?
         .into_iter()
         .filter(|replicant| {
             replicant.key.id.as_str().eq_ignore_ascii_case(requested)
@@ -1254,7 +1201,7 @@ async fn select_replicant(client: &Client, requested: Option<&str>) -> AnyResult
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case(requested))
         })
-        .collect::<Vec<Replicant>>();
+        .collect::<Vec<_>>();
     match matches.len() {
         1 => Ok(matches.remove(0).key.id.as_str().to_owned()),
         0 => Err(app_error(
@@ -1275,7 +1222,12 @@ struct SelectedBelt {
 }
 
 async fn select_belt(client: &Client, system: &str, devices: &[Device]) -> AnyResult<SelectedBelt> {
-    let location = client.locations().get(system).await?;
+    let location = match client.locations().cached(system) {
+        Some(location) => location,
+        None => {
+            validation::location(client, system, validation::ValidationReason::Mutation).await?
+        }
+    };
     let mut belts = belts_from_location(&location);
     belts.sort_by(|left, right| {
         managed_belt_asset_count(devices, &right.designation)
@@ -1801,14 +1753,13 @@ pub async fn plan_expansion(
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
     };
-    create_plan(client, &config, true).await
+    create_plan(client, &config).await
 }
 
 /// Creates a mining expansion plan from the daemon's committed managed state.
 ///
-/// Durable Director workflows use this path because the Director already plans
-/// from the managed projection. Avoiding a second account-wide synchronization
-/// prevents one full sync per regional campaign from stampeding the daemon.
+/// Durable Director workflows use this path so both planning entry points
+/// consume the same projection-first planner.
 pub(crate) async fn plan_expansion_from_managed_state(
     client: &Client,
     request: &MiningExpansionRequest,
@@ -1824,7 +1775,7 @@ pub(crate) async fn plan_expansion_from_managed_state(
         wait_timeout: request.wait_timeout,
         max_concurrency: request.max_concurrency,
     };
-    create_plan(client, &config, false).await
+    create_plan(client, &config).await
 }
 
 /// Creates or resumes a mining expansion using an already-running managed client.
@@ -1886,9 +1837,17 @@ fn validate_request(request: &MiningExpansionRequest) -> AnyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use replicant_client::domain::{
-        AccessScope, ActiveDeviceDirective, DeviceDirective, DeviceId, DeviceKey,
-        DeviceRelationships, DeviceStatus, GalacticPosition, StarKey,
+    use replicant_client::{
+        SecretString,
+        domain::{
+            AccessScope, ActiveDeviceDirective, DeviceDirective, DeviceId, DeviceKey,
+            DeviceRelationships, DeviceStatus, GalacticPosition, StarKey,
+        },
+        raw::Url,
+    };
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     #[test]
@@ -1897,6 +1856,59 @@ mod tests {
         let long =
             mining_mission_tag("A-SYSTEM-NAME-THAT-IS-WELL-PAST-THE-DEVICE-TAG-LIMIT-BELT-1");
         assert!(long.chars().count() <= MAX_DEVICE_TAG_CHARS);
+    }
+
+    #[tokio::test]
+    async fn planning_uses_projection_then_exact_location_without_full_sync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/replicants/WORKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "replicant_code": "WORKER",
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blueprints"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"blueprints": []})),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::builder()
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .authentication_token(SecretString::from("test-token"))
+            .in_memory()
+            .startup_policy(replicant_client::StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("restore-only startup");
+        client
+            .replicants()
+            .get_owned("WORKER")
+            .await
+            .expect("seed committed worker projection");
+        let mission_file = std::env::temp_dir().join(format!(
+            "replicant-mining-no-full-sync-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let request = MiningExpansionRequest {
+            systems: vec!["SOL".into()],
+            replicant: "WORKER".into(),
+            hub: "SOL-L4".into(),
+            mission_file,
+            wait_timeout: Duration::from_secs(1),
+            max_concurrency: 1,
+        };
+
+        assert!(plan_expansion(&client, &request, false).await.is_err());
+        let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].url.path(), "/v1/replicants/WORKER");
+        assert_eq!(requests[1].url.path(), "/v1/blueprints");
+        assert_eq!(requests[2].url.path(), "/v1/locations/SOL");
+        client.close().await.expect("close");
     }
 
     fn device(code: &str, device_type_name: &str, location: &str) -> Device {

@@ -747,25 +747,19 @@ impl StateEngine {
             .event_cursor()
     }
 
-    /// Returns durable, deduplicated account event history.
-    pub(crate) fn events(&self) -> Result<Vec<Event>, StoreError> {
-        self.store
-            .lock()
-            .as_ref()
-            .ok_or(StoreError::Closed)?
-            .read_events()
-    }
-
-    pub(crate) fn events_desc(
+    /// Returns matching durable, deduplicated account event history.
+    pub(crate) fn events(
         &self,
-        limit: usize,
-        offset: usize,
+        after: Option<String>,
+        device_code: Option<String>,
+        event_name: Option<String>,
+        latest: Option<usize>,
     ) -> Result<Vec<Event>, StoreError> {
         self.store
             .lock()
             .as_ref()
             .ok_or(StoreError::Closed)?
-            .read_events_desc(limit, offset)
+            .read_events(after, device_code, event_name, latest)
     }
 
     pub(crate) fn prepare_projection_replay(

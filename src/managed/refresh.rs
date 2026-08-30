@@ -3445,7 +3445,7 @@ mod tests {
             .append_archived_events(&[newest.clone(), oldest.clone()])
             .unwrap();
         assert!(store.event_cursor().unwrap().is_none());
-        let events = store.read_events().unwrap();
+        let events = store.read_events(None, None, None, None).unwrap();
         assert_eq!(events[0].id.as_str(), "9-999");
         assert_eq!(events[1].id.as_str(), "10-0");
         assert!(

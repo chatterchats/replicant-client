@@ -19,10 +19,13 @@ std::thread_local! {
     static INTERRUPT_NEXT_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
+};
 use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, mpsc as tokio_mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{Span, debug, info, warn};
 
 use super::refresh::{
     RefreshDelta, RefreshMode, RefreshPhase, RefreshPhaseState, RefreshPhaseStatus,
@@ -168,7 +171,10 @@ enum StoreCommand {
     Execute {
         id: u64,
         operation_type: &'static str,
+        /// Starts when submission begins; queue_wait telemetry is submission-to-start.
         queued_at: Instant,
+        span: Span,
+        dispatcher: tracing::Dispatch,
         command: Box<dyn FnOnce(&mut Store) + Send + 'static>,
     },
     Close(oneshot::Sender<Result<(), StoreError>>),
@@ -252,38 +258,43 @@ impl StoreHandle {
                             id,
                             operation_type,
                             queued_at,
+                            span,
+                            dispatcher,
                             command,
                         } => {
                             let queue_wait = queued_at.elapsed();
-                            let execute_started = Instant::now();
-                            command(&mut store);
-                            let execute = execute_started.elapsed();
-                            let elapsed = queued_at.elapsed();
-                            if queue_wait >= Duration::from_secs(1)
-                                || execute >= Duration::from_secs(1)
-                            {
-                                warn!(
-                                    target: "replicant_client::store",
-                                    event = "store.command_slow",
-                                    command_id = id,
-                                    operation_type,
-                                    queue_wait_ms = queue_wait.as_millis() as u64,
-                                    execute_ms = execute.as_millis() as u64,
-                                    elapsed_ms = elapsed.as_millis() as u64,
-                                    "SQLite store command exceeded responsiveness threshold"
-                                );
-                            } else {
-                                debug!(
-                                    target: "replicant_client::store",
-                                    event = "store.command_completed",
-                                    command_id = id,
-                                    operation_type,
-                                    queue_wait_ms = queue_wait.as_millis() as u64,
-                                    execute_ms = execute.as_millis() as u64,
-                                    elapsed_ms = elapsed.as_millis() as u64,
-                                    "SQLite store command completed"
-                                );
-                            }
+                            tracing::dispatcher::with_default(&dispatcher, || {
+                                let _span_guard = span.enter();
+                                let execute_started = Instant::now();
+                                command(&mut store);
+                                let execute = execute_started.elapsed();
+                                let elapsed = queued_at.elapsed();
+                                if queue_wait >= Duration::from_secs(1)
+                                    || execute >= Duration::from_secs(1)
+                                {
+                                    warn!(
+                                        target: "replicant_client::store",
+                                        event = "store.command_slow",
+                                        command_id = id,
+                                        operation_type,
+                                        queue_wait_ms = queue_wait.as_millis() as u64,
+                                        execute_ms = execute.as_millis() as u64,
+                                        elapsed_ms = elapsed.as_millis() as u64,
+                                        "SQLite store command exceeded responsiveness threshold"
+                                    );
+                                } else {
+                                    debug!(
+                                        target: "replicant_client::store",
+                                        event = "store.command_completed",
+                                        command_id = id,
+                                        operation_type,
+                                        queue_wait_ms = queue_wait.as_millis() as u64,
+                                        execute_ms = execute.as_millis() as u64,
+                                        elapsed_ms = elapsed.as_millis() as u64,
+                                        "SQLite store command completed"
+                                    );
+                                }
+                            });
                         }
                         StoreCommand::Close(response) => {
                             let close_started = Instant::now();
@@ -321,12 +332,16 @@ impl StoreHandle {
         let id = NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let operation_type = std::any::type_name::<F>();
         let queued_at = Instant::now();
+        let span = Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let (response_sender, response_receiver) = oneshot::channel();
         self.sender
             .send(StoreCommand::Execute {
                 id,
                 operation_type,
                 queued_at,
+                span,
+                dispatcher,
                 command: Box::new(move |store| {
                     let _ = response_sender.send(operation(store));
                 }),
@@ -350,12 +365,16 @@ impl StoreHandle {
         let id = NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let operation_type = std::any::type_name::<F>();
         let queued_at = Instant::now();
+        let span = Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.sender
             .try_send(StoreCommand::Execute {
                 id,
                 operation_type,
                 queued_at,
+                span,
+                dispatcher,
                 command: Box::new(move |store| {
                     let _ = response_sender.send(operation(store));
                 }),
@@ -552,16 +571,21 @@ impl StoreProxy {
     pub(crate) fn event_cursor(&self) -> Result<Option<String>, StoreError> {
         self.0.execute_blocking(|s| s.event_cursor())
     }
-    pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
-        self.0.execute_blocking(|store| store.read_events())
-    }
-    pub(crate) fn read_events_desc(
+    pub(crate) fn read_events(
         &self,
-        limit: usize,
-        offset: usize,
+        after: Option<String>,
+        device_code: Option<String>,
+        event_name: Option<String>,
+        latest: Option<usize>,
     ) -> Result<Vec<Event>, StoreError> {
-        self.0
-            .execute_blocking(move |store| store.read_events_desc(limit, offset))
+        self.0.execute_blocking(move |store| {
+            store.read_events(
+                after.as_deref(),
+                device_code.as_deref(),
+                event_name.as_deref(),
+                latest,
+            )
+        })
     }
     pub(crate) fn prepare_projection_replay(
         &mut self,
@@ -2057,30 +2081,104 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn read_events(&self) -> Result<Vec<Event>, StoreError> {
-        let mut statement = self.history.prepare(
-            "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
-             FROM event_history WHERE applied_at IS NOT NULL OR archived_only = 1 \
-             ORDER BY stream_millis, stream_sequence",
-        )?;
-        let rows = statement.query_map([], history_event_row)?;
-        rows.map(|row| decode_history_event(row?)).collect()
-    }
-
-    pub(crate) fn read_events_desc(
+    pub(crate) fn read_events(
         &self,
-        limit: usize,
-        offset: usize,
+        after: Option<&str>,
+        device_code: Option<&str>,
+        event_name: Option<&str>,
+        latest: Option<usize>,
     ) -> Result<Vec<Event>, StoreError> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-        let mut statement = self.history.prepare(
+        let started = Instant::now();
+        let after_parts = after.map(parse_event_id).transpose()?;
+        let mut sql = String::from(
             "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json \
-             FROM event_history WHERE applied_at IS NOT NULL OR archived_only = 1 \
-             ORDER BY stream_millis DESC, stream_sequence DESC LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = statement.query_map(params![limit, offset], history_event_row)?;
-        rows.map(|row| decode_history_event(row?)).collect()
+             FROM event_history WHERE (applied_at IS NOT NULL OR archived_only = 1)",
+        );
+        let mut parameters = Vec::<SqlValue>::new();
+        if let Some((milliseconds, sequence)) = after_parts {
+            sql.push_str(" AND (stream_millis, stream_sequence, event_id) > (?, ?, ?)");
+            parameters.push(milliseconds.into());
+            parameters.push(sequence.into());
+            parameters.push(after.unwrap_or_default().to_owned().into());
+        }
+        if let Some(device_code) = device_code {
+            sql.push_str(" AND device_code = ?");
+            parameters.push(device_code.to_owned().into());
+        }
+        if let Some(event_name) = event_name {
+            sql.push_str(" AND event_name = ?");
+            parameters.push(event_name.to_owned().into());
+        }
+        if let Some(limit) = latest {
+            sql.push_str(
+                " ORDER BY stream_millis DESC, stream_sequence DESC, event_id DESC LIMIT ?",
+            );
+            parameters.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
+        } else {
+            sql.push_str(" ORDER BY stream_millis, stream_sequence, event_id");
+        }
+
+        let prepare_started = Instant::now();
+        let mut statement = self.history.prepare(&sql)?;
+        let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+        let query_started = Instant::now();
+        let mut rows = statement.query(params_from_iter(parameters.iter()))?;
+        let query_ms = query_started.elapsed().as_millis() as u64;
+        let mut events = Vec::with_capacity(latest.unwrap_or_default());
+        let mut row_ms = 0u64;
+        let mut decode_ms = 0u64;
+        loop {
+            let row_started = Instant::now();
+            let Some(row) = rows.next()? else {
+                row_ms = row_ms.saturating_add(row_started.elapsed().as_millis() as u64);
+                break;
+            };
+            let row = history_event_row(row)?;
+            row_ms = row_ms.saturating_add(row_started.elapsed().as_millis() as u64);
+            let decode_started = Instant::now();
+            events.push(decode_history_event(row)?);
+            decode_ms = decode_ms.saturating_add(decode_started.elapsed().as_millis() as u64);
+        }
+        drop(rows);
+        drop(statement);
+        if latest.is_some() {
+            events.reverse();
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            warn!(
+                target: "replicant_client::store",
+                event = "store.read_events_slow",
+                requested_after_id = after.unwrap_or(""),
+                requested_device_code = device_code.unwrap_or(""),
+                requested_event_name = event_name.unwrap_or(""),
+                limit = latest.unwrap_or_default(),
+                rows_returned = events.len(),
+                prepare_ms,
+                query_ms,
+                row_ms,
+                decode_ms,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "managed event-history query exceeded responsiveness threshold"
+            );
+        } else {
+            debug!(
+                target: "replicant_client::store",
+                event = "store.read_events_completed",
+                requested_after_id = after.unwrap_or(""),
+                requested_device_code = device_code.unwrap_or(""),
+                requested_event_name = event_name.unwrap_or(""),
+                limit = latest.unwrap_or_default(),
+                rows_returned = events.len(),
+                prepare_ms,
+                query_ms,
+                row_ms,
+                decode_ms,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "read indexed managed event history"
+            );
+        }
+        Ok(events)
     }
 
     pub(crate) fn read_operation(
@@ -4637,6 +4735,41 @@ mod tests {
         }
     }
 
+    fn seed_realistic_event_history(store: &Store) {
+        store
+            .history
+            .execute_batch(
+                "WITH RECURSIVE sequence(value) AS (
+                    VALUES(0)
+                    UNION ALL
+                    SELECT value + 1 FROM sequence WHERE value < 24999
+                )
+                INSERT INTO event_history(
+                    event_id, realm, event_name, category, device_code, replicant_code,
+                    star_id, location_id, occurred_at, payload_json, appended_at, applied_at,
+                    archived_only, stream_millis, stream_sequence
+                )
+                SELECT
+                    printf('%d-0', 1000000 + value),
+                    'live',
+                    CASE value % 2 WHEN 0 THEN 'device.updated' ELSE 'travel.arrived' END,
+                    'activity',
+                    printf('D%d', value % 20),
+                    NULL,
+                    NULL,
+                    NULL,
+                    '2026-08-30T00:00:00Z',
+                    '{\"detail\":\"representative event payload\"}',
+                    datetime('now'),
+                    datetime('now'),
+                    0,
+                    1000000 + value,
+                    0
+                FROM sequence;",
+            )
+            .expect("seed realistic event history");
+    }
+
     fn star(id: &str) -> Observation<Star> {
         Observation {
             value: Star {
@@ -4908,7 +5041,12 @@ mod tests {
         drop(connection);
 
         let store = Store::open_file(&path).expect("migrate v3 store");
-        assert_eq!(store.read_events().expect("history events"), vec![event]);
+        assert_eq!(
+            store
+                .read_events(None, None, None, None)
+                .expect("history events"),
+            vec![event]
+        );
         let catalogue = store.restore_catalogue().expect("restore catalogue").0;
         let sol = catalogue
             .get(&StarKey::live("SOL".into()))
@@ -5085,7 +5223,12 @@ mod tests {
         assert_eq!(store.event_count().expect("event count"), 0);
         assert_eq!(store.event_cursor().expect("cursor"), None);
         assert_eq!(store.device_count().expect("device count"), 0);
-        assert!(store.read_events().expect("event journal").is_empty());
+        assert!(
+            store
+                .read_events(None, None, None, None)
+                .expect("event journal")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5124,7 +5267,12 @@ mod tests {
         store
             .apply_event_projection(&event(), "cursor-1", &EventProjectionBatch::default())
             .expect("append event");
-        assert_eq!(store.read_events().expect("read events"), vec![event()]);
+        assert_eq!(
+            store
+                .read_events(None, None, None, None)
+                .expect("read events"),
+            vec![event()]
+        );
         store
             .record_operation(
                 "operation-1",
@@ -5146,6 +5294,118 @@ mod tests {
         assert_eq!(entry.target_kind.as_deref(), Some("device"));
         assert_eq!(entry.intent, json!({"kind": "activate"}));
         assert_eq!(entry.projection, Some(json!({"device": "d1"})));
+    }
+
+    #[test]
+    fn cursor_bounded_event_history_uses_indexed_search() {
+        let store = Store::open_memory().expect("open memory store");
+        seed_realistic_event_history(&store);
+
+        let plan = {
+            let mut statement = store
+                .history
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json
+                     FROM event_history
+                     WHERE (applied_at IS NOT NULL OR archived_only = 1)
+                       AND (stream_millis, stream_sequence, event_id) > (?1, ?2, ?3)
+                     ORDER BY stream_millis, stream_sequence, event_id",
+                )
+                .expect("prepare query plan");
+            statement
+                .query_map(params![1_024_990_i64, 0_i64, "1024990-0"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("query plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH event_history USING INDEX event_history_retained_stream_order",
+                )
+            }),
+            "expected cursor search through retained stream index, got {plan:?}"
+        );
+
+        let legacy_started = Instant::now();
+        let legacy_rows = {
+            let mut statement = store
+                .history
+                .prepare(
+                    "SELECT event_id, realm, event_name, category, device_code, replicant_code, star_id, location_id, occurred_at, payload_json
+                     FROM event_history
+                     WHERE applied_at IS NOT NULL OR archived_only = 1
+                     ORDER BY stream_millis, stream_sequence",
+                )
+                .expect("prepare legacy history read");
+            statement
+                .query_map([], history_event_row)
+                .expect("query legacy history")
+                .map(|row| decode_history_event(row.expect("extract legacy row")))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("decode legacy history")
+        };
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let bounded_started = Instant::now();
+        let bounded_rows = store
+            .read_events(Some("1024990-0"), None, None, None)
+            .expect("read cursor-bounded history");
+        let bounded_elapsed = bounded_started.elapsed();
+
+        assert_eq!(legacy_rows.len(), 25_000);
+        assert_eq!(bounded_rows.len(), 9);
+        assert_eq!(
+            bounded_rows.first().map(|event| event.id.as_str()),
+            Some("1024991-0")
+        );
+        assert_eq!(
+            bounded_rows.last().map(|event| event.id.as_str()),
+            Some("1024999-0")
+        );
+        assert!(
+            bounded_elapsed < legacy_elapsed,
+            "bounded read {bounded_elapsed:?} should be faster than full decode {legacy_elapsed:?}"
+        );
+        eprintln!(
+            "event history benchmark: before_full_decode_ms={} after_cursor_read_ms={} before_rows={} after_rows={}",
+            legacy_elapsed.as_millis(),
+            bounded_elapsed.as_millis(),
+            legacy_rows.len(),
+            bounded_rows.len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_bounded_history_does_not_starve_following_store_commands() {
+        let store = StoreHandle::open_memory().await.expect("open worker store");
+        store
+            .execute(|store| {
+                seed_realistic_event_history(store);
+                Ok(())
+            })
+            .await
+            .expect("seed worker history");
+
+        let (history, write, read) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                store.execute(|store| { store.read_events(Some("1024990-0"), None, None, None) }),
+                store.execute(|store| store.set_event_cursor("1024999-0")),
+                store.execute(|store| store.event_cursor()),
+            )
+        })
+        .await
+        .expect("bounded history and queued follower commands must complete promptly");
+
+        assert_eq!(history.expect("history read").len(), 9);
+        write.expect("small cursor write");
+        assert_eq!(
+            read.expect("small cursor read").as_deref(),
+            Some("1024999-0")
+        );
+        store.close().await.expect("close worker store");
     }
 
     #[test]
@@ -5298,7 +5558,12 @@ mod tests {
         ));
         assert_eq!(store.device_count().expect("device count"), 1);
         assert_eq!(store.event_cursor().expect("cursor"), None);
-        assert!(store.read_events().expect("event journal").is_empty());
+        assert!(
+            store
+                .read_events(None, None, None, None)
+                .expect("event journal")
+                .is_empty()
+        );
         assert_eq!(reconciliation_count(&store, "device:d1"), 1);
     }
 
@@ -5531,6 +5796,58 @@ mod tests {
         assert_ne!(caller, worker);
         store.close().await.expect("close worker store");
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_propagates_request_spans_in_command_order() {
+        let store = StoreHandle::open_memory().await.expect("open worker store");
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        let (order_sender, order_receiver) = mpsc::sync_channel(2);
+
+        let (async_observed, async_expected, blocking_observed, blocking_expected) =
+            tracing::subscriber::with_default(subscriber, || {
+                let async_span = tracing::info_span!("store.async_request");
+                let async_expected = async_span.id();
+                let async_sender = order_sender.clone();
+                let async_observed = tokio::task::block_in_place(|| {
+                    async_span.in_scope(|| {
+                        tokio::runtime::Handle::current().block_on(store.execute(move |_| {
+                            async_sender.send("async").expect("record async command");
+                            Ok::<_, StoreError>(Span::current().id())
+                        }))
+                    })
+                })
+                .expect("async worker response");
+
+                let blocking_span = tracing::info_span!("store.blocking_request");
+                let blocking_expected = blocking_span.id();
+                let blocking_observed = blocking_span.in_scope(|| {
+                    store
+                        .execute_blocking(move |_| {
+                            order_sender
+                                .send("blocking")
+                                .expect("record blocking command");
+                            Ok::<_, StoreError>(Span::current().id())
+                        })
+                        .expect("blocking worker response")
+                });
+                (
+                    async_observed,
+                    async_expected,
+                    blocking_observed,
+                    blocking_expected,
+                )
+            });
+
+        assert_eq!(async_observed, async_expected);
+        assert_eq!(blocking_observed, blocking_expected);
+        assert_eq!(
+            [
+                order_receiver.recv().expect("first command"),
+                order_receiver.recv().expect("second command"),
+            ],
+            ["async", "blocking"]
+        );
+        store.close().await.expect("close worker store");
+    }
 
     #[tokio::test]
     async fn worker_rejects_requests_once_close_begins() {
@@ -5599,6 +5916,8 @@ mod tests {
                     id: NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed),
                     operation_type: "test.queue_fill",
                     queued_at: Instant::now(),
+                    span: Span::none(),
+                    dispatcher: tracing::dispatcher::get_default(Clone::clone),
                     command: Box::new(|_| {}),
                 })
                 .expect("fill bounded queue");
@@ -5608,6 +5927,8 @@ mod tests {
                 id: NEXT_STORE_COMMAND_ID.fetch_add(1, AtomicOrdering::Relaxed),
                 operation_type: "test.queue_overflow",
                 queued_at: Instant::now(),
+                span: Span::none(),
+                dispatcher: tracing::dispatcher::get_default(Clone::clone),
                 command: Box::new(|_| {}),
             }),
             Err(tokio_mpsc::error::TrySendError::Full(_))

@@ -21,13 +21,13 @@ use serde_json::Value;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+use super::validation::{self, ValidationReason};
 use super::{
     AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
-    SiteAssets, SitePhase, app_error, audit_route, audit_site, authoritative_device_refresh,
-    controller_code, device_is_in_system, device_location, device_snapshots, device_type,
-    factory_workloads, fetch_blueprints, find_device, format_quantities, has_directive,
-    has_reservation_tag, is_opaque_mining_mission_tag, protected_systems, save_plan,
-    site_shortages, stable_hash, synchronize_mining_state,
+    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code,
+    device_is_in_system, device_location, device_snapshots, device_type, factory_workloads,
+    fetch_blueprints, find_device, format_quantities, has_directive, has_reservation_tag,
+    is_opaque_mining_mission_tag, protected_systems, save_plan, site_shortages, stable_hash,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -52,10 +52,9 @@ enum MissionWake {
 /// authoritative poll interval.
 ///
 /// Mission progress is driven by device and print events. Sleeping a flat
-/// interval between full-account refreshes meant every wait re-read the entire
-/// device census every few seconds regardless of whether anything had changed;
-/// waking on the event stream keeps the reaction time while cutting the idle
-/// refreshes by an order of magnitude.
+/// interval between selected-resource refreshes still delayed event handling;
+/// waking on the event stream keeps the reaction time while bounding fallback
+/// validation to the mission resources involved in the current phase.
 async fn wait_for_mission_event(
     watch: &mut replicant_client::EventWatch,
     deadline: Instant,
@@ -80,16 +79,80 @@ async fn wait_for_mission_event(
         }
     }
 }
-
-async fn refresh_after_fallback_wake(client: &Client, wake: MissionWake) -> AnyResult<()> {
+async fn refresh_after_fallback_wake(
+    client: &Client,
+    wake: MissionWake,
+    codes: &[String],
+) -> AnyResult<()> {
     if matches!(wake, MissionWake::Poll | MissionWake::Gap) {
         info!(
             wake = ?wake,
-            "refreshing authoritative device state after mining event-stream fallback"
+            resources = codes.len(),
+            "refreshing selected mining resources after event-stream fallback"
         );
-        authoritative_device_refresh(client).await?;
+        for code in codes {
+            validation::device(client, code, ValidationReason::EventGap).await?;
+        }
     }
     Ok(())
+}
+
+fn mission_resource_codes(mission: &MiningMission) -> Vec<String> {
+    let mut codes = mission
+        .sites
+        .iter()
+        .flat_map(|site| {
+            site.assets
+                .codes()
+                .into_iter()
+                .chain(site.carrier.iter().cloned())
+        })
+        .chain(
+            mission
+                .routes
+                .iter()
+                .flat_map(|route| route.controller.iter().chain(&route.freighter).cloned()),
+        )
+        .chain(mission.print_batches.iter().flat_map(|batch| {
+            std::iter::once(batch.factory_code.clone()).chain(batch.produced_codes.clone())
+        }))
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+fn site_resource_codes(site: &super::SiteMission) -> Vec<String> {
+    let mut codes = site
+        .assets
+        .codes()
+        .into_iter()
+        .chain(site.carrier.iter().cloned())
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+fn route_resource_codes(route: &super::RouteMission) -> Vec<String> {
+    route
+        .controller
+        .iter()
+        .chain(&route.freighter)
+        .cloned()
+        .collect()
+}
+
+async fn validate_codes(
+    client: &Client,
+    codes: &[String],
+    reason: ValidationReason,
+) -> AnyResult<Vec<Device>> {
+    let mut snapshots = Vec::with_capacity(codes.len());
+    for code in codes {
+        snapshots.push(validation::device(client, code, reason).await?);
+    }
+    Ok(snapshots)
 }
 
 pub(crate) async fn execute(
@@ -101,7 +164,12 @@ pub(crate) async fn execute(
         return Ok(());
     }
 
-    synchronize_mining_state(client).await?;
+    validation::replicant(
+        client,
+        &mission.selected_replicant,
+        ValidationReason::Mutation,
+    )
+    .await?;
     migrate_legacy_mission_devices(client, mission).await?;
     save_plan(&config.plan_path, mission)?;
     reconcile(client, config, mission).await?;
@@ -182,16 +250,6 @@ async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission
             site.assets = audit.assets;
         }
     }
-    for route in &mut mission.routes {
-        let audit = audit_route(&devices, &route.system, &route.belt, &mission.hub_location);
-        if audit.active {
-            route.controller = audit.controller;
-            route.freighter = audit.freighter;
-            route.phase = RoutePhase::Active;
-        } else if route.phase == RoutePhase::Active {
-            route.phase = RoutePhase::Planned;
-        }
-    }
     reconcile_carrier_claims(client, mission).await?;
     save_plan(&config.plan_path, mission)?;
     Ok(())
@@ -202,12 +260,8 @@ async fn reconcile_carrier_claims(client: &Client, mission: &mut MiningMission) 
         let Some(carrier) = site.carrier.clone() else {
             continue;
         };
-        // Reconciliation just refreshed the owned-device projection in bulk.
-        let handle = match client.devices().cached(&carrier) {
-            Some(handle) => handle,
-            None => client.devices().get(&carrier).await?,
-        };
-        let snapshot = handle.snapshot().await?;
+        let snapshot =
+            validation::device(client, &carrier, ValidationReason::StateConflict).await?;
         if device_location(&snapshot) == Some(mission.hub_location.as_str())
             && snapshot.travel.is_none()
             && snapshot.relationships.attached_devices.is_empty()
@@ -521,6 +575,12 @@ async fn submit_print_batches(
 
             mission.print_batches[index].submission_started = true;
             save_plan(&config.plan_path, mission)?;
+            validation::device(
+                client,
+                &batch.factory_code,
+                ValidationReason::CapacitySensitive,
+            )
+            .await?;
             let operation = enqueue_print(
                 client,
                 &batch.factory_code,
@@ -721,7 +781,8 @@ async fn wait_for_print_outputs(
             &["print.completed", "device.print_completed"],
         )
         .await?;
-        refresh_after_fallback_wake(client, wake).await?;
+        let codes = mission_resource_codes(mission);
+        refresh_after_fallback_wake(client, wake, &codes).await?;
     }
 }
 
@@ -1081,7 +1142,8 @@ async fn deploy_sites(
             ));
         }
         let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
-        refresh_after_fallback_wake(client, wake).await?;
+        let codes = mission_resource_codes(mission);
+        refresh_after_fallback_wake(client, wake, &codes).await?;
     }
 }
 
@@ -1171,6 +1233,10 @@ async fn dispatch_ready_sites(
             };
             carrier
         };
+        validation::device(client, &carrier, ValidationReason::CapacitySensitive).await?;
+        for item in &payload {
+            validation::device(client, &item.code, ValidationReason::CapacitySensitive).await?;
+        }
         mission.sites[index].carrier = Some(carrier.clone());
         mission.sites[index].phase = SitePhase::Outbound;
         save_plan(&config.plan_path, mission)?;
@@ -1255,12 +1321,7 @@ async fn configure_site(
     let site = mission.sites[index].clone();
     let mut ward_pending = site.assets.system_ward.is_none();
     for code in site.assets.codes() {
-        // Arrival events keep each site asset current in the projection.
-        let handle = match client.devices().cached(&code) {
-            Some(handle) => handle,
-            None => client.devices().get(&code).await?,
-        };
-        let snapshot = handle.snapshot().await?;
+        let snapshot = validation::device(client, &code, ValidationReason::StateConflict).await?;
         let is_ward = site.assets.system_ward.as_deref() == Some(code.as_str());
         let in_place = if is_ward {
             device_is_in_system(&snapshot, &site.system)
@@ -1297,20 +1358,21 @@ async fn configure_site(
     mission.sites[index].phase = SitePhase::Verifying;
     save_plan(&config.plan_path, mission)?;
     let mining_controller = site.assets.mining_controller.as_deref().unwrap_or_default();
-    // Fleet reconciliation already populated the selected controller.
+    let mining_snapshot =
+        validation::device(client, mining_controller, ValidationReason::StateConflict).await?;
     let mining_handle = match client.devices().cached(mining_controller) {
         Some(handle) => handle,
         None => client.devices().get(mining_controller).await?,
     };
     let mining = mining_handle.as_mining_controller()?;
-    let mining_snapshot = mining.device().snapshot().await?;
     if !has_directive(&mining_snapshot, "deplete_smallest") {
         let operation = mining
             .set_directive(MiningDirective::DepleteSmallest)
             .await?;
         ensure_operation_accepted(&operation).await?;
     }
-    let mining_snapshot = mining.device().refresh().await?.snapshot().await?;
+    let mining_snapshot =
+        validation::device(client, mining_controller, ValidationReason::StateConflict).await?;
     if mining_snapshot
         .status
         .as_ref()
@@ -1320,18 +1382,19 @@ async fn configure_site(
     }
 
     let survey_controller = site.assets.survey_controller.as_deref().unwrap_or_default();
-    // Fleet reconciliation already populated the selected controller.
+    let survey_snapshot =
+        validation::device(client, survey_controller, ValidationReason::StateConflict).await?;
     let survey_handle = match client.devices().cached(survey_controller) {
         Some(handle) => handle,
         None => client.devices().get(survey_controller).await?,
     };
     let survey = survey_handle.as_survey_controller()?;
-    let survey_snapshot = survey.device().snapshot().await?;
     if !has_directive(&survey_snapshot, "belt_search") {
         ensure_operation_accepted(&survey.set_directive(SurveyDirective::BeltSearch).await?)
             .await?;
     }
-    let survey_snapshot = survey.device().refresh().await?.snapshot().await?;
+    let survey_snapshot =
+        validation::device(client, survey_controller, ValidationReason::StateConflict).await?;
     if survey_snapshot
         .status
         .as_ref()
@@ -1344,12 +1407,12 @@ async fn configure_site(
         site.assets.maintenance_drone.as_deref().ok_or_else(|| {
             app_error(io::ErrorKind::InvalidData, "site has no maintenance drone")
         })?;
-    // Fleet reconciliation already populated the maintenance drone.
+    let maintenance_snapshot =
+        validation::device(client, maintenance, ValidationReason::StateConflict).await?;
     let maintenance_handle = match client.devices().cached(maintenance) {
         Some(handle) => handle,
         None => client.devices().get(maintenance).await?,
     };
-    let maintenance_snapshot = maintenance_handle.snapshot().await?;
     if !has_directive(&maintenance_snapshot, "patrol") {
         ensure_operation_accepted(
             &maintenance_handle
@@ -1372,16 +1435,19 @@ async fn configure_site(
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut watch = client.events().watch().await?;
     loop {
-        let devices = device_snapshots(client).await?;
-        let protection = protected_systems(&devices, &client.galaxy().catalogue());
-        if audit_site(
-            &devices,
-            &site.system,
-            &site.belt,
-            protection.contains(&site.system),
+        let devices = validate_codes(
+            client,
+            &site_resource_codes(&site),
+            ValidationReason::StateConflict,
         )
-        .operational
-        {
+        .await?;
+        let protection_active = site.assets.system_ward.is_some()
+            || client
+                .galaxy()
+                .catalogue()
+                .iter()
+                .any(|star| star.key.id.as_str() == site.system && star.has_hub == Some(true));
+        if audit_site(&devices, &site.system, &site.belt, protection_active).operational {
             break;
         }
         if Instant::now() >= deadline {
@@ -1394,7 +1460,8 @@ async fn configure_site(
             ));
         }
         let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
-        refresh_after_fallback_wake(client, wake).await?;
+        let codes = site_resource_codes(&site);
+        refresh_after_fallback_wake(client, wake, &codes).await?;
     }
     info!(system = %site.system, belt = %site.belt, "mining site operational");
     mission.sites[index].phase = SitePhase::Operational;
@@ -1403,31 +1470,26 @@ async fn configure_site(
 }
 
 async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> AnyResult<()> {
-    let devices = device_snapshots(client).await?;
-    let protection = protected_systems(&devices, &client.galaxy().catalogue());
-    if protection.contains(&site.system) {
-        return Ok(());
-    }
-
-    let ward = site.assets.system_ward.as_deref().ok_or_else(|| {
-        app_error(
+    let catalogue = client.galaxy().catalogue();
+    let hub_protection = catalogue
+        .iter()
+        .any(|star| star.key.id.as_str() == site.system && star.has_hub == Some(true));
+    let Some(ward) = site.assets.system_ward.as_deref() else {
+        if hub_protection {
+            return Ok(());
+        }
+        return Err(app_error(
             io::ErrorKind::InvalidData,
             format!("mining site {} has no System Ward", site.system),
-        )
-    })?;
-    let snapshot = find_device(&devices, ward).ok_or_else(|| {
-        app_error(
-            io::ErrorKind::NotFound,
-            format!("System Ward {ward} is absent from the owned-device projection"),
-        )
-    })?;
-    if !device_is_in_system(snapshot, &site.system) {
+        ));
+    };
+    let snapshot = validation::device(client, ward, ValidationReason::StateConflict).await?;
+    if !device_is_in_system(&snapshot, &site.system) {
         return Err(app_error(
             io::ErrorKind::InvalidData,
             format!("System Ward {ward} is not deployed in {}", site.system),
         ));
     }
-
     let handle = match client.devices().cached(ward) {
         Some(handle) => handle,
         None => client.devices().get(ward).await?,
@@ -1438,7 +1500,6 @@ async fn ensure_site_protection(client: &Client, site: &super::SiteMission) -> A
             .await?,
     )
     .await?;
-    client.galaxy().refresh_catalogue().await?;
     Ok(())
 }
 
@@ -1455,7 +1516,10 @@ async fn ensure_adoption(client: &Client, controller: &str, devices: &[String]) 
     if missing.is_empty() {
         return Ok(());
     }
-    // Adoption checks read the controller and drone projection immediately above.
+    validation::device(client, controller, ValidationReason::CapacitySensitive).await?;
+    for code in &missing {
+        validation::device(client, code, ValidationReason::CapacitySensitive).await?;
+    }
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
@@ -1566,13 +1630,12 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         .as_deref()
         .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route has no Cargo Freighter"))?;
     ensure_adoption(client, controller, &[freighter.to_owned()]).await?;
-    // Adoption and fleet reconciliation already populated the controller.
+    let snapshot = validation::device(client, controller, ValidationReason::StateConflict).await?;
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
     };
     let transport = handle.as_transport_controller()?;
-    let snapshot = transport.device().snapshot().await?;
     if !super::ferry_route_matches(&snapshot, &route.belt, hub) {
         ensure_operation_accepted(
             &transport
@@ -1585,7 +1648,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         )
         .await?;
     }
-    let snapshot = transport.device().refresh().await?.snapshot().await?;
+    let snapshot = validation::device(client, controller, ValidationReason::StateConflict).await?;
     if snapshot
         .status
         .as_ref()
@@ -1596,7 +1659,12 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut watch = client.events().watch().await?;
     loop {
-        let devices = device_snapshots(client).await?;
+        let devices = validate_codes(
+            client,
+            &route_resource_codes(route),
+            ValidationReason::StateConflict,
+        )
+        .await?;
         if audit_route(&devices, &route.system, &route.belt, hub).active {
             break;
         }
@@ -1607,7 +1675,8 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
             ));
         }
         let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
-        refresh_after_fallback_wake(client, wake).await?;
+        let codes = route_resource_codes(route);
+        refresh_after_fallback_wake(client, wake, &codes).await?;
     }
     info!(
         system = %route.system,
@@ -1631,12 +1700,8 @@ async fn return_and_release_carriers(
             let Some(carrier) = site.carrier.clone() else {
                 continue;
             };
-            // Travel events keep returning carriers current between loop passes.
-            let handle = match client.devices().cached(&carrier) {
-                Some(handle) => handle,
-                None => client.devices().get(&carrier).await?,
-            };
-            let snapshot = handle.snapshot().await?;
+            let snapshot =
+                validation::device(client, &carrier, ValidationReason::StateConflict).await?;
             if snapshot.travel.is_none()
                 && device_location(&snapshot) == Some(mission.hub_location.as_str())
                 && snapshot.relationships.attached_devices.is_empty()
@@ -1669,7 +1734,12 @@ async fn return_and_release_carriers(
             ));
         }
         let wake = wait_for_mission_event(&mut watch, deadline, &["travel.arrived"]).await?;
-        refresh_after_fallback_wake(client, wake).await?;
+        let codes = mission
+            .sites
+            .iter()
+            .filter_map(|site| site.carrier.clone())
+            .collect::<Vec<_>>();
+        refresh_after_fallback_wake(client, wake, &codes).await?;
     }
 }
 
@@ -1702,12 +1772,13 @@ async fn migrate_legacy_mission_devices(
         if removable.is_empty() {
             continue;
         }
-        // The bulk refresh that produced `device` also populated its handle.
+        let current =
+            validation::device(client, device.key.id.as_str(), ValidationReason::Mutation).await?;
         let handle = match client.devices().cached(device.key.id.as_str()) {
             Some(handle) => handle,
             None => client.devices().get(device.key.id.as_str()).await?,
         };
-        let add_tags = (!device.tags.contains(&mission.mission_tag))
+        let add_tags = (!current.tags.contains(&mission.mission_tag))
             .then_some(vec![mission.mission_tag.clone()]);
         ensure_operation_accepted(
             &handle
@@ -1736,15 +1807,8 @@ async fn cleanup_transient_tags(client: &Client, mission: &MiningMission) -> Any
         .iter()
         .map(|batch| batch.batch_tag.clone())
         .collect::<BTreeSet<_>>();
-    let handles = client
-        .devices()
-        .refresh_many()
-        .with_tag(mission.mission_tag.clone())
-        .page_size(50)
-        .collect()
-        .await?;
-    for handle in handles {
-        let snapshot = handle.snapshot().await?;
+    for code in mission_resource_codes(mission) {
+        let snapshot = validation::device(client, &code, ValidationReason::Mutation).await?;
         let mut removable = vec![mission.mission_tag.clone()];
         removable.extend(
             snapshot
@@ -1753,7 +1817,7 @@ async fn cleanup_transient_tags(client: &Client, mission: &MiningMission) -> Any
                 .filter(|tag| batch_tags.contains(*tag))
                 .cloned(),
         );
-        remove_tags(client, handle.id().as_str(), &removable).await?;
+        remove_tags(client, &code, &removable).await?;
     }
     Ok(())
 }
@@ -1764,18 +1828,17 @@ async fn ensure_asset_ownership(
     selected_replicant: &str,
 ) -> AnyResult<()> {
     for code in codes {
-        // Selected mission assets are maintained by the SSE projection.
-        let handle = match client.devices().cached(code) {
-            Some(handle) => handle,
-            None => client.devices().get(code).await?,
-        };
-        let snapshot = handle.snapshot().await?;
+        let snapshot = validation::device(client, code, ValidationReason::Mutation).await?;
         if snapshot
             .relationships
             .assigned_replicant
             .as_ref()
             .is_none_or(|replicant| replicant.id.as_str() != selected_replicant)
         {
+            let handle = match client.devices().cached(code) {
+                Some(handle) => handle,
+                None => client.devices().get(code).await?,
+            };
             ensure_operation_accepted(&handle.change_owner(selected_replicant).await?).await?;
         }
     }
@@ -1783,12 +1846,7 @@ async fn ensure_asset_ownership(
 }
 
 async fn add_tags(client: &Client, code: &str, desired: &[String]) -> AnyResult<()> {
-    // Mission tag mutations operate on projection-backed selected assets.
-    let handle = match client.devices().cached(code) {
-        Some(handle) => handle,
-        None => client.devices().get(code).await?,
-    };
-    let snapshot = handle.snapshot().await?;
+    let snapshot = validation::device(client, code, ValidationReason::Mutation).await?;
     let missing = desired
         .iter()
         .filter(|tag| !snapshot.tags.contains(*tag))
@@ -1797,6 +1855,10 @@ async fn add_tags(client: &Client, code: &str, desired: &[String]) -> AnyResult<
     if missing.is_empty() {
         return Ok(());
     }
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     ensure_operation_accepted(
         &handle
             .configure(api_raw::devices::DeviceConfiguration {
@@ -1809,12 +1871,7 @@ async fn add_tags(client: &Client, code: &str, desired: &[String]) -> AnyResult<
 }
 
 async fn remove_tags(client: &Client, code: &str, removable: &[String]) -> AnyResult<()> {
-    // Mission tag mutations operate on projection-backed selected assets.
-    let handle = match client.devices().cached(code) {
-        Some(handle) => handle,
-        None => client.devices().get(code).await?,
-    };
-    let snapshot = handle.snapshot().await?;
+    let snapshot = validation::device(client, code, ValidationReason::Mutation).await?;
     let present = removable
         .iter()
         .filter(|tag| snapshot.tags.contains(*tag))
@@ -1823,6 +1880,10 @@ async fn remove_tags(client: &Client, code: &str, removable: &[String]) -> AnyRe
     if present.is_empty() {
         return Ok(());
     }
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     ensure_operation_accepted(
         &handle
             .configure(api_raw::devices::DeviceConfiguration {
@@ -1846,12 +1907,7 @@ fn targets(devices: &[String]) -> api_raw::devices::TargetsCommand {
 }
 
 async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResult<()> {
-    // Travel events keep mission-device location and travel state current.
-    let handle = match client.devices().cached(code) {
-        Some(handle) => handle,
-        None => client.devices().get(code).await?,
-    };
-    let snapshot = handle.snapshot().await?;
+    let snapshot = validation::device(client, code, ValidationReason::StateConflict).await?;
     if snapshot.travel.is_none() && device_location(&snapshot) == Some(destination) {
         return Ok(());
     }
@@ -1882,6 +1938,10 @@ async fn start_travel(client: &Client, code: &str, destination: &str) -> AnyResu
                     .collect(),
             )
         });
+    let handle = match client.devices().cached(code) {
+        Some(handle) => handle,
+        None => client.devices().get(code).await?,
+    };
     let operation = handle
         .command(api_raw::devices::DeviceCommand::Travel {
             destination: destination.to_owned(),
@@ -2125,6 +2185,37 @@ mod tests {
 
         assert!(pool_can_complete_initial_deployment(&pool, &missing));
         assert!(!pool_can_complete_site(&pool, &missing));
+    }
+
+    #[test]
+    fn site_validation_scope_contains_only_selected_assets_and_carrier() {
+        let site = super::super::SiteMission {
+            system: "SOL".into(),
+            belt: "SOL-BELT-1".into(),
+            density: "dense".into(),
+            tag: "mine-s:sol".into(),
+            phase: SitePhase::Ready,
+            assets: SiteAssets {
+                mining_controller: Some("MC".into()),
+                mining_drones: ["M1", "M2", "M3", "M4"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                survey_controller: Some("SC".into()),
+                survey_drones: ["S1", "S2"].into_iter().map(str::to_owned).collect(),
+                maintenance_drone: Some("MD".into()),
+                system_ward: Some("WARD".into()),
+            },
+            missing: QuantityMap::new(),
+            carrier: Some("CARRIER".into()),
+        };
+
+        assert_eq!(
+            site_resource_codes(&site),
+            [
+                "CARRIER", "M1", "M2", "M3", "M4", "MC", "MD", "S1", "S2", "SC", "WARD"
+            ]
+        );
     }
 
     #[test]

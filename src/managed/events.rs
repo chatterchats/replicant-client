@@ -236,72 +236,11 @@ impl EventHistoryQuery {
     /// Collects a stable event-ID-ordered view from durable local history.
     pub async fn collect(self) -> Result<Vec<Event>> {
         self.client.ensure_open()?;
-        let matches = |event: &Event| {
-            self.after
-                .as_deref()
-                .is_none_or(|cursor| stream_id_is_after(event.id.as_str(), cursor))
-                && self.device_code.as_deref().is_none_or(|device_code| {
-                    event
-                        .device
-                        .as_ref()
-                        .is_some_and(|device| device.id.as_str() == device_code)
-                })
-                && self
-                    .event_name
-                    .as_deref()
-                    .is_none_or(|event_name| event.name.as_str() == event_name)
-        };
-        let mut events = if let Some(limit) = self.latest {
-            // Read newest rows in bounded pages rather than deserializing the
-            // entire durable event history for every Activity-page refresh.
-            // Filtering is applied per page so device/name queries still
-            // return the requested number of matching events when available.
-            let page_size = limit.clamp(100, 1_000);
-            let mut offset = 0usize;
-            let mut matched = Vec::with_capacity(limit);
-            loop {
-                let page = self
-                    .client
-                    .managed_state()
-                    .events_desc(page_size, offset)
-                    .map_err(persistence_error)?;
-                let page_len = page.len();
-                matched.extend(page.into_iter().filter(&matches));
-                if matched.len() >= limit || page_len < page_size {
-                    break;
-                }
-                offset = offset.saturating_add(page_len);
-            }
-            matched.truncate(limit);
-            matched
-        } else {
-            let mut all = self
-                .client
-                .managed_state()
-                .events()
-                .map_err(persistence_error)?;
-            all.retain(matches);
-            all
-        };
-        events.sort_by(|left, right| stream_id_cmp(left.id.as_str(), right.id.as_str()));
-        Ok(events)
+        self.client
+            .managed_state()
+            .events(self.after, self.device_code, self.event_name, self.latest)
+            .map_err(persistence_error)
     }
-}
-
-fn stream_id_parts(value: &str) -> Option<(u64, u64)> {
-    let (milliseconds, sequence) = value.split_once('-')?;
-    Some((milliseconds.parse().ok()?, sequence.parse().ok()?))
-}
-
-fn stream_id_cmp(left: &str, right: &str) -> core::cmp::Ordering {
-    match (stream_id_parts(left), stream_id_parts(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
-}
-
-fn stream_id_is_after(candidate: &str, cursor: &str) -> bool {
-    stream_id_cmp(candidate, cursor).is_gt()
 }
 
 /// Managed event observation gateway returned by [`Client::events`].
@@ -1953,14 +1892,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stream_ids_are_ordered_numerically_not_lexically() {
-        assert!(stream_id_is_after("10-0", "9-999"));
-        assert!(stream_id_is_after("10-2", "10-1"));
-        assert!(!stream_id_is_after("10-1", "10-1"));
-        assert!(stream_id_cmp("100-0", "99-999").is_gt());
-    }
-
     #[tokio::test]
     async fn managed_event_history_is_durable_local_and_filterable() {
         let client = restore_only_client().await;
@@ -2951,7 +2882,7 @@ mod tests {
         assert!(
             replayed
                 .managed_state()
-                .events()
+                .events(None, None, None, None)
                 .expect("retained history")
                 .iter()
                 .any(|event| event.id.as_str() == "9-0"),

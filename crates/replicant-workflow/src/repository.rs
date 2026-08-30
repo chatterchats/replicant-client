@@ -232,6 +232,7 @@ struct ConnectionGuard<'a> {
     connection: MutexGuard<'a, Connection>,
     acquired_at: Instant,
     wait_micros: u64,
+    span: tracing::Span,
 }
 
 impl Deref for ConnectionGuard<'_> {
@@ -251,19 +252,22 @@ impl DerefMut for ConnectionGuard<'_> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         let held_micros = u64::try_from(self.acquired_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if self.wait_micros >= 1_000_000 || held_micros >= 1_000_000 {
-            tracing::warn!(
-                wait_micros = self.wait_micros,
-                held_micros,
-                "workflow repository connection exceeded responsiveness threshold"
-            );
-        } else {
+        self.span.in_scope(|| {
             tracing::debug!(
+                event = "workflow.repository.connection_hold_complete",
                 wait_micros = self.wait_micros,
                 held_micros,
                 "workflow repository connection released"
             );
-        }
+            if self.wait_micros >= 1_000_000 || held_micros >= 1_000_000 {
+                tracing::warn!(
+                    event = "workflow.repository.connection_slow",
+                    wait_micros = self.wait_micros,
+                    held_micros,
+                    "workflow repository connection exceeded responsiveness threshold"
+                );
+            }
+        });
     }
 }
 
@@ -310,14 +314,24 @@ impl WorkflowRepository {
 
     fn connection(&self) -> Result<ConnectionGuard<'_>, RepositoryError> {
         let waiting_at = Instant::now();
+        let span = tracing::Span::current();
         let connection = self
             .connection
             .lock()
             .map_err(|_| RepositoryError::LockPoisoned)?;
+        let wait_micros = u64::try_from(waiting_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        span.in_scope(|| {
+            tracing::debug!(
+                event = "workflow.repository.connection_wait",
+                wait_micros,
+                "workflow repository connection acquired"
+            );
+        });
         Ok(ConnectionGuard {
             connection,
             acquired_at: Instant::now(),
-            wait_micros: u64::try_from(waiting_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            wait_micros,
+            span,
         })
     }
 
@@ -800,8 +814,8 @@ impl WorkflowRepository {
 
     /// Atomically reuses the oldest compatible active workflow or creates one.
     ///
-    /// The proposed workflow is validated and serialized while an immediate
-    /// transaction holds SQLite's write lock. Active rows are visited in
+    /// The proposed workflow is validated and serialized before an immediate
+    /// transaction takes SQLite's write lock. Active rows are visited in
     /// `(created_at, id)` order, and the first row accepted by `compatible` is
     /// returned. If no row matches, the proposed workflow is inserted as
     /// queued work and returned.
@@ -815,13 +829,13 @@ impl WorkflowRepository {
         P: Serialize,
         F: FnMut(&WorkflowInstance) -> Result<bool, RepositoryError>,
     {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if workflow.schema_version == 0 {
             return Err(RepositoryError::InvalidWorkflowSchemaVersion);
         }
         let config_json = serde_json::to_string(&workflow.config)?;
         let checkpoint_json = serde_json::to_string(&workflow.checkpoint)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = WorkflowId::new();
         let now = now_millis()?;
         let active = {

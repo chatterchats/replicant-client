@@ -129,6 +129,7 @@ use tokio::{
     task::AbortHandle,
 };
 use tower_http::cors::CorsLayer;
+use tracing::Instrument;
 
 /// Live broadcast capacity. Deltas are coalesced per supervisor tick, so this
 /// holds many seconds of updates even during heavy fleet activity; lagging
@@ -554,15 +555,24 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned());
-    let started = Instant::now();
-    tracing::debug!(
+    let route = matched_route.as_deref().unwrap_or("<unmatched>").to_owned();
+    let span = tracing::info_span!(
+        "daemon.http.request",
         request_id = %request_id,
         method = %method,
         path = %path,
-        route = matched_route.as_deref().unwrap_or("<unmatched>"),
+        route = %route,
+    );
+    let started = Instant::now();
+    tracing::debug!(
+        parent: &span,
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        route = %route,
         "daemon HTTP request started"
     );
-    let mut response = next.run(request).await;
+    let mut response = next.run(request).instrument(span).await;
     let status = response.status();
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis();
@@ -583,7 +593,7 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
             request_id = %request_id,
             method = %method,
             path = %path,
-            route = matched_route.as_deref().unwrap_or("<unmatched>"),
+            route = %route,
             status = status.as_u16(),
             elapsed_ms,
             handler_ms,
@@ -593,7 +603,7 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
             request_id = %request_id,
             method = %method,
             path = %path,
-            route = matched_route.as_deref().unwrap_or("<unmatched>"),
+            route = %route,
             status = status.as_u16(),
             elapsed_ms,
             handler_ms,
@@ -604,7 +614,7 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
             request_id = %request_id,
             method = %method,
             path = %path,
-            route = matched_route.as_deref().unwrap_or("<unmatched>"),
+            route = %route,
             status = status.as_u16(),
             elapsed_ms,
             handler_ms,
@@ -614,7 +624,7 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
             request_id = %request_id,
             method = %method,
             path = %path,
-            route = matched_route.as_deref().unwrap_or("<unmatched>"),
+            route = %route,
             status = status.as_u16(),
             elapsed_ms,
             handler_ms,
@@ -622,6 +632,31 @@ async fn trace_http_request(mut request: Request<axum::body::Body>, next: Next) 
         ),
     }
     response
+}
+
+/// Runs one synchronous workflow-repository operation without blocking the
+/// async executor, while preserving the request span on the worker thread.
+async fn spawn_blocking_repository<T, F>(
+    repository: Arc<WorkflowRepository>,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&WorkflowRepository) -> Result<T, ApiError> + Send + 'static,
+{
+    let span = tracing::Span::current();
+    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatcher, || {
+            let _entered = span.enter();
+            operation(&repository)
+        })
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %error, "workflow repository blocking task failed");
+        ApiError::internal()
+    })?
 }
 
 /// Builds the local HTTP router.
@@ -1665,17 +1700,19 @@ async fn overview(
 ) -> Result<Json<Versioned<OverviewSnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
     let status = state.client().status();
-    let workflows = state.repository.list().map_err(ApiError::repository)?;
-    let triggers = state
-        .repository
-        .list_triggers()
-        .map_err(ApiError::repository)?;
-    let automation = automation_status(
-        state
-            .repository
-            .automation_policy()
-            .map_err(ApiError::repository)?,
-    );
+    let repository = state.repository.clone();
+    let (workflows, triggers, policy, activity) =
+        spawn_blocking_repository(repository, |repository| {
+            let workflows = repository.list().map_err(ApiError::repository)?;
+            let triggers = repository.list_triggers().map_err(ApiError::repository)?;
+            let policy = repository
+                .automation_policy()
+                .map_err(ApiError::repository)?;
+            let activity = repository.activity_since(0).map_err(ApiError::repository)?;
+            Ok((workflows, triggers, policy, activity))
+        })
+        .await?;
+    let automation = automation_status(policy);
     let locations = state
         .client()
         .locations()
@@ -1737,10 +1774,7 @@ async fn overview(
             )
         })
         .collect();
-    let mut recent_activity = state
-        .repository
-        .activity_since(0)
-        .map_err(ApiError::repository)?
+    let mut recent_activity = activity
         .into_iter()
         .rev()
         .take(12)
@@ -3108,12 +3142,14 @@ async fn directory(
         latest: None,
         name: query.name.clone().filter(|value| !value.trim().is_empty()),
     };
+    let remote_started = Instant::now();
     let replicants = state
         .client()
         .directory()
         .search(&search)
         .await
         .map_err(|_| ApiError::unavailable())?;
+    trace_endpoint_phase("directory", "remote_search", remote_started.elapsed());
     Ok(Json(Versioned::current(DirectorySnapshot {
         metadata: state.snapshot_metadata()?,
         query: query.name,
@@ -3135,12 +3171,14 @@ async fn directory_replicant(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
 ) -> Result<Json<Versioned<DirectoryReplicantDetailSnapshot>>, ApiError> {
+    let remote_started = Instant::now();
     let replicant = state
         .client()
         .directory()
         .replicant(&code)
         .await
         .map_err(|_| ApiError::unavailable())?;
+    trace_endpoint_phase("directory_detail", "remote_read", remote_started.elapsed());
     let profile = DirectoryReplicantDetail {
         entity: summary_ref(EntityKind::Replicant, replicant.key.id.as_str()),
         name: replicant.name,
@@ -3166,12 +3204,14 @@ async fn tutorials(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TutorialsQuery>,
 ) -> Result<Json<Versioned<TutorialsSnapshot>>, ApiError> {
+    let remote_started = Instant::now();
     let list = state
         .client()
         .tutorials()
         .list()
         .await
         .map_err(|_| ApiError::unavailable())?;
+    trace_endpoint_phase("tutorials", "remote_list", remote_started.elapsed());
     let tutorials = list
         .tutorials
         .into_iter()
@@ -3193,12 +3233,14 @@ async fn tutorials(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
+        let remote_started = Instant::now();
         let detail = state
             .client()
             .tutorials()
             .get(slug)
             .await
             .map_err(|_| ApiError::unavailable())?;
+        trace_endpoint_phase("tutorials", "remote_detail", remote_started.elapsed());
         Some(TutorialSummary {
             slug: detail.slug.unwrap_or_else(|| slug.to_owned()),
             name: detail.name,
@@ -3836,14 +3878,39 @@ async fn reports(
     })))
 }
 
+fn trace_endpoint_phase(endpoint: &'static str, phase: &'static str, elapsed: Duration) {
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= Duration::from_secs(1) {
+        tracing::warn!(
+            event = "daemon.endpoint_phase_slow",
+            endpoint,
+            phase,
+            elapsed_ms,
+            "daemon endpoint phase exceeded responsiveness threshold"
+        );
+    } else {
+        tracing::debug!(
+            event = "daemon.endpoint_phase",
+            endpoint,
+            phase,
+            elapsed_ms,
+            "daemon endpoint phase completed"
+        );
+    }
+}
+
 async fn messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<MessagesSnapshot>>, ApiError> {
+    let lock_started = Instant::now();
     let _guard = state.message_sync.lock().await;
+    trace_endpoint_phase("messages", "lock_wait", lock_started.elapsed());
+    let remote_started = Instant::now();
     let inbox = state.client().messages().list().await.map_err(|error| {
         tracing::warn!(error = %error, "account message projection refresh failed");
         ApiError::unavailable()
     })?;
+    trace_endpoint_phase("messages", "remote_refresh", remote_started.elapsed());
     if let Err(error) = state.repository.delete_document("messages", "inbox") {
         tracing::warn!(error = %error, "legacy runtime message cache cleanup failed");
     }
@@ -3868,9 +3935,12 @@ async fn mark_messages_read(
         ));
     }
 
+    let lock_started = Instant::now();
     let _guard = state.message_sync.lock().await;
+    trace_endpoint_phase("messages_read", "lock_wait", lock_started.elapsed());
     let ids = request.ids.into_iter().collect::<BTreeSet<_>>();
     let gateway = state.client().messages();
+    let remote_started = Instant::now();
     let operation = gateway
         .mark_read(replicant_client::raw::messages::MessagesReadRequest {
             ids: (!request.mark_all).then(|| ids.iter().copied().collect()),
@@ -3885,6 +3955,11 @@ async fn mark_messages_read(
         tracing::warn!(error = %error, "reading message read operation outcome failed");
         ApiError::unavailable()
     })?;
+    trace_endpoint_phase(
+        "messages_read",
+        "remote_operation",
+        remote_started.elapsed(),
+    );
     if outcome.status != ManagedOperationStatus::Completed {
         tracing::warn!(
             status = ?outcome.status,
@@ -4325,9 +4400,11 @@ async fn settings(
 async fn standing_snapshot(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<StandingSnapshot>>, ApiError> {
+    let remote_started = Instant::now();
     let (account, achievements, reputation) = standing(state.client())
         .await
         .map_err(|_| ApiError::unavailable())?;
+    trace_endpoint_phase("standing", "remote_bundle", remote_started.elapsed());
     Ok(Json(Versioned::current(build_standing_snapshot(
         state.snapshot_metadata()?,
         account,
@@ -4385,9 +4462,11 @@ async fn leaderboards(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LeaderboardsQuery>,
 ) -> Result<Json<Versioned<LeaderboardsSnapshot>>, ApiError> {
+    let remote_started = Instant::now();
     let index = leaderboard_index(state.client())
         .await
         .map_err(|_| ApiError::unavailable())?;
+    trace_endpoint_phase("leaderboards", "remote_index", remote_started.elapsed());
     let selected = query.board.or_else(|| {
         index
             .boards
@@ -4412,9 +4491,12 @@ async fn leaderboards(
         return Err(ApiError::invalid("unknown leaderboard"));
     }
     let entries = if let Some(board) = selected.as_deref() {
-        leaderboard(state.client(), board)
+        let remote_started = Instant::now();
+        let entries = leaderboard(state.client(), board)
             .await
-            .map_err(|_| ApiError::unavailable())?
+            .map_err(|_| ApiError::unavailable())?;
+        trace_endpoint_phase("leaderboards", "remote_board", remote_started.elapsed());
+        entries
     } else {
         LeaderboardResponse::default()
     };
@@ -6122,10 +6204,12 @@ async fn list_workflows(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<WorkflowFilter>,
 ) -> Result<Json<Versioned<WorkflowListResponse>>, ApiError> {
-    let workflows = state
-        .repository
-        .list_summaries()
-        .map_err(ApiError::repository)?
+    let repository = state.repository.clone();
+    let summaries = spawn_blocking_repository(repository, |repository| {
+        repository.list_summaries().map_err(ApiError::repository)
+    })
+    .await?;
+    let workflows = summaries
         .iter()
         .filter(|instance| {
             filter
@@ -6142,15 +6226,11 @@ async fn workflow_detail(
     Path(id): Path<String>,
 ) -> Result<Json<Versioned<WorkflowDetail>>, ApiError> {
     let repository = state.repository.clone();
-    let workflow = tokio::task::spawn_blocking(move || {
-        let instance = read_workflow(&repository, &id)?;
-        detail(&repository, &instance)
+    let workflow = spawn_blocking_repository(repository, move |repository| {
+        let instance = read_workflow(repository, &id)?;
+        detail(repository, &instance)
     })
-    .await
-    .map_err(|error| {
-        tracing::error!(error = %error, "workflow detail blocking task failed");
-        ApiError::internal()
-    })??;
+    .await?;
     Ok(Json(Versioned::current(workflow)))
 }
 
@@ -6174,9 +6254,12 @@ async fn start_workflow(
 async fn director_snapshot(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<DirectorSnapshot>>, ApiError> {
-    let snapshot =
-        cached_director_snapshot(&state.repository, state.revision.load(Ordering::Relaxed))
-            .map_err(ApiError::runtime)?;
+    let revision = state.revision.load(Ordering::Relaxed);
+    let repository = state.repository.clone();
+    let snapshot = spawn_blocking_repository(repository, move |repository| {
+        cached_director_snapshot(repository, revision).map_err(ApiError::runtime)
+    })
+    .await?;
     Ok(Json(Versioned::current(snapshot)))
 }
 
@@ -6538,21 +6621,19 @@ async fn workflow_activity(
     Path(id): Path<String>,
 ) -> Result<Json<Versioned<WorkflowActivityResponse>>, ApiError> {
     let id = parse_id(&id)?;
-    if state
-        .repository
-        .read(id)
-        .map_err(ApiError::repository)?
-        .is_none()
-    {
-        return Err(ApiError::not_found());
-    }
-    let activity = state
-        .repository
-        .activity(id)
-        .map_err(ApiError::repository)?
-        .into_iter()
-        .map(protocol_activity)
-        .collect::<Result<Vec<_>, ApiError>>()?;
+    let repository = state.repository.clone();
+    let activity = spawn_blocking_repository(repository, move |repository| {
+        if repository.read(id).map_err(ApiError::repository)?.is_none() {
+            return Err(ApiError::not_found());
+        }
+        repository
+            .activity(id)
+            .map_err(ApiError::repository)?
+            .into_iter()
+            .map(protocol_activity)
+            .collect::<Result<Vec<_>, ApiError>>()
+    })
+    .await?;
     Ok(Json(Versioned::current(WorkflowActivityResponse {
         activity,
     })))
@@ -9033,6 +9114,85 @@ mod tests {
         );
         assert!(!entities.to_string().contains("do-not-export"));
         assert!(!entities.to_string().contains("also-private"));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workflow_repository_wait_does_not_starve_health() {
+        let (app, client, state) = test_app().await;
+        let workflow = state
+            .repository
+            .create(NewWorkflow {
+                kind: WorkflowKind::new("test.contention").expect("kind"),
+                schema_version: 1,
+                config: (),
+                checkpoint: (),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("create workflow");
+        let repository = state.repository.clone();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            repository.create_or_reuse_active(
+                NewWorkflow {
+                    kind: WorkflowKind::new("test.contention").expect("kind"),
+                    schema_version: 1,
+                    config: (),
+                    checkpoint: (),
+                    current_step: None,
+                    parent_id: None,
+                },
+                |_| {
+                    entered_sender.send(()).expect("signal held connection");
+                    let _ = release_receiver.recv_timeout(Duration::from_secs(2));
+                    Ok(true)
+                },
+            )
+        });
+        entered_receiver.recv().expect("repository connection held");
+
+        let mut blocked_reads = Vec::new();
+        for _ in 0..4 {
+            let app = app.clone();
+            let id = workflow.id;
+            blocked_reads.push(tokio::spawn(async move {
+                app.oneshot(
+                    Request::get(format!("/api/workflows/{id}/activity"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("activity response")
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        let health = tokio::time::timeout(
+            Duration::from_millis(500),
+            app.oneshot(
+                Request::get("/api/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            ),
+        )
+        .await
+        .expect("health must not wait for the workflow repository")
+        .expect("health response");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let _ = release_sender.send(());
+        for blocked in blocked_reads {
+            assert_eq!(
+                blocked.await.expect("activity task").status(),
+                StatusCode::OK
+            );
+        }
+        holder
+            .join()
+            .expect("holder thread")
+            .expect("reuse active workflow");
         client.close().await.expect("close client");
     }
 
