@@ -15,7 +15,7 @@ use std::{
 };
 
 use futures::future;
-use replicant_client::{Client, Device, Operation, OperationStatus, raw};
+use replicant_client::{Client, Device, Operation, OperationId, OperationStatus, raw};
 // Workflow device claims are shared vocabulary; the prefix list lives in one
 // place so transport can never disagree with a workflow about what is claimed.
 use replicant_protocol::workflow_reserved;
@@ -24,6 +24,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::time::{Instant, sleep};
 use tracing::info;
+use uuid::Uuid;
 
 /// Resource quantities keyed by Replicant Space resource type.
 pub type ResourceMap = BTreeMap<String, i64>;
@@ -119,6 +120,12 @@ pub struct DeliveryPlan {
     /// Attachment-capable transports.
     #[serde(default)]
     pub device_carriers: Vec<String>,
+    /// Exact pre-delivery location for every selected transport.
+    ///
+    /// Plans persisted before this field was introduced deserialize with an
+    /// empty map and use the exact `origin` compatibility fallback.
+    #[serde(default)]
+    pub transport_origins: BTreeMap<String, String>,
 }
 
 /// Runtime behavior for delivery execution.
@@ -130,13 +137,20 @@ pub struct DeliveryOptions {
     pub poll_interval: Duration,
     /// Unfurl compacted modular payload after it is detached at destination.
     pub unfurl_modular_payload: bool,
-    /// Return selected transport devices after delivery.
+    /// Return each selected transport to its recorded pre-delivery location.
     pub return_transports: bool,
     /// Maximum transports auto-selected for one delivery when the caller does
     /// not pin an explicit [`CarrierPreference`]. Trips run concurrently per
     /// transport, so this bounds how much of the free fleet one delivery may
     /// claim from other workflows.
     pub transport_limit: usize,
+    /// Stable UUID namespace for restart-safe managed transport mutations.
+    ///
+    /// When set, travel, compaction, unfurling, attachment, and detachment
+    /// commands use deterministic operation identities derived from their
+    /// complete target and action. `None` preserves the ordinary random-ID
+    /// behavior for standalone callers.
+    pub operation_namespace: Option<Uuid>,
 }
 
 impl Default for DeliveryOptions {
@@ -147,6 +161,7 @@ impl Default for DeliveryOptions {
             unfurl_modular_payload: true,
             return_transports: false,
             transport_limit: DEFAULT_TRANSPORT_LIMIT,
+            operation_namespace: None,
         }
     }
 }
@@ -201,6 +216,7 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 struct TransportCandidate {
     code: String,
     device_type: String,
+    location: String,
     origin_rank: u8,
     cargo_capacity: i64,
     attach_capacity: i64,
@@ -307,6 +323,8 @@ pub async fn plan_delivery_with(
         )
         .await?
     };
+    let transport_origins =
+        selected_transport_origins(&candidates, &cargo_transports, &device_carriers);
 
     Ok(DeliveryPlan {
         origin: request.origin.trim().to_ascii_uppercase(),
@@ -315,7 +333,21 @@ pub async fn plan_delivery_with(
         payload_devices,
         cargo_transports,
         device_carriers,
+        transport_origins,
     })
+}
+fn selected_transport_origins(
+    candidates: &[TransportCandidate],
+    cargo_transports: &[String],
+    device_carriers: &[String],
+) -> BTreeMap<String, String> {
+    let mut selected = cargo_transports.iter().cloned().collect::<BTreeSet<_>>();
+    selected.extend(device_carriers.iter().cloned());
+    candidates
+        .iter()
+        .filter(|candidate| selected.contains(&candidate.code))
+        .map(|candidate| (candidate.code.clone(), candidate.location.clone()))
+        .collect()
 }
 
 /// Revalidates every planned resource pickup against a fresh account inventory
@@ -412,6 +444,24 @@ pub async fn execute_delivery(
     plan: &DeliveryPlan,
     options: DeliveryOptions,
 ) -> Result<DeliveryReport> {
+    let mut transports = plan.cargo_transports.clone();
+    transports.extend(plan.device_carriers.iter().cloned());
+    transports.sort();
+    transports.dedup();
+    // Validate legacy fallback targets before any delivery mutation. A
+    // hyphenated system scope must never become a carrier travel destination.
+    let return_locations = if options.return_transports {
+        let mut locations = BTreeMap::new();
+        for code in &transports {
+            locations.insert(
+                code.clone(),
+                return_location_at_execution(client, plan, code).await?,
+            );
+        }
+        locations
+    } else {
+        BTreeMap::new()
+    };
     let resources_delivered = deliver_resource_pickups(
         client,
         &plan.destination,
@@ -430,17 +480,13 @@ pub async fn execute_delivery(
     .await?;
 
     if options.return_transports {
-        let return_location = exact_return_location(plan).ok_or_else(|| {
-            TransportError::Invalid(
-                "--return-carriers requires an exact origin location, not only a system".into(),
-            )
-        })?;
-        let mut transports = plan.cargo_transports.clone();
-        transports.extend(plan.device_carriers.iter().cloned());
-        transports.sort();
-        transports.dedup();
         for code in &transports {
-            ensure_device_at(client, code, return_location, options).await?;
+            let return_location = return_locations.get(code).ok_or_else(|| {
+                TransportError::Invalid(format!(
+                    "missing validated return location for transport {code}"
+                ))
+            })?;
+            ensure_device_at(client, code, return_location, options, "return").await?;
         }
     }
 
@@ -911,10 +957,12 @@ fn transport_candidates(
                 return None;
             }
             let attach_capacity = device.attach_capacity.unwrap_or(blueprint_attach).max(0);
+            let origin_rank = transport_origin_rank(origin, &location);
             Some(TransportCandidate {
                 code: device.key.id.as_str().to_owned(),
                 device_type,
-                origin_rank: transport_origin_rank(origin, &location),
+                location,
+                origin_rank,
                 cargo_capacity: blueprint_cargo.max(0),
                 attach_capacity,
             })
@@ -1099,8 +1147,9 @@ async fn run_cargo_trips(
         if lock(remaining).is_empty() {
             return Ok(());
         }
-        settle_transport_between(client, code, origin, destination, options).await?;
-        ensure_device_at(client, code, origin, options).await?;
+        let leg = format_resources(&lock(remaining));
+        settle_transport_between(client, code, origin, destination, options, &leg).await?;
+        ensure_device_at(client, code, origin, options, &leg).await?;
         let mut detail = client.raw().devices().get(code).await?.value;
         ensure_uncontrolled(&detail, code)?;
         if !cargo_map(&detail).is_empty() {
@@ -1132,8 +1181,9 @@ async fn run_cargo_trips(
             manifest = %format_resources(&manifest),
             "delivering resource manifest"
         );
+        let leg = format_resources(&manifest);
         collect_resources(client, code, origin, &manifest, options).await?;
-        ensure_device_at(client, code, destination, options).await?;
+        ensure_device_at(client, code, destination, options, &leg).await?;
         deposit_resources(client, code, Some(&manifest), options).await?;
         merge_resources(&mut lock(delivered), &manifest);
     }
@@ -1181,7 +1231,8 @@ async fn deliver_payload_devices(
         // have (a) already delivered payloads now standing free at the
         // destination, (b) reached the destination with payloads still
         // attached, or (c) attached payloads at the origin before travelling.
-        // The concurrent trips below assume every carrier starts empty.
+        // The last two states continue the achieved attachment to the
+        // destination; they must never detach at the origin and retry attach.
         for payload in &remaining_payloads {
             if device_already_delivered(client, &payload.code, destination).await? {
                 if options.unfurl_modular_payload {
@@ -1191,28 +1242,52 @@ async fn deliver_payload_devices(
                 delivered.push(payload.code.clone());
             }
         }
+        let pending = remaining_payloads
+            .iter()
+            .filter(|payload| payload_is_pending(&payload.code, &delivered))
+            .collect::<Vec<_>>();
+        // A carrier may already be on its own return leg after the last
+        // payload was detached. Do not run delivery preflight in that case:
+        // return reconciliation below owns that state.
+        if pending.is_empty() {
+            continue;
+        }
+
+        let preflight_leg = canonical_payload_key(
+            &pending
+                .iter()
+                .map(|payload| payload.code.clone())
+                .collect::<Vec<_>>(),
+        );
         for carrier in carriers {
-            settle_transport_between(client, carrier, &origin, destination, options).await?;
             let detail = client.raw().devices().get(carrier).await?.value;
             let attached = detail
                 .attached_devices
                 .iter()
                 .filter_map(reference_code)
                 .collect::<Vec<_>>();
-            ensure_only_delivery_attachments(carrier, &attached, &payload_codes)?;
             if attached.is_empty() {
+                settle_transport_between(
+                    client,
+                    carrier,
+                    &origin,
+                    destination,
+                    options,
+                    &preflight_leg,
+                )
+                .await?;
                 continue;
             }
-            // Detach wherever the carrier settled: at the destination the
-            // payload counts as delivered, anywhere else it re-enters the
-            // still-needed pool for the trips below.
-            detach_devices(client, carrier, &attached, options).await?;
-            if detail.location.as_deref() == Some(destination) {
-                if options.unfurl_modular_payload {
-                    unfurl_modular_devices(client, &attached, options).await?;
-                }
-                delivered.extend(attached);
-            }
+            let continued = continue_attached_delivery(
+                client,
+                carrier,
+                &origin,
+                destination,
+                &payload_codes,
+                options,
+            )
+            .await?;
+            delivered.extend(continued);
         }
         delivered.sort();
         delivered.dedup();
@@ -1255,6 +1330,100 @@ async fn deliver_payload_devices(
     Ok(delivered)
 }
 
+/// Continues an already-attached delivery without undoing the attachment.
+///
+/// This is the restart path after attach has been accepted but before the
+/// carrier has reached the destination. The carrier is allowed to be
+/// stationary at the origin, already travelling to either leg endpoint, or
+/// stationary at the destination. Attachments are detached only at the exact
+/// destination.
+async fn continue_attached_delivery(
+    client: &Client,
+    carrier: &str,
+    origin: &str,
+    destination: &str,
+    payload_codes: &BTreeSet<String>,
+    options: DeliveryOptions,
+) -> Result<Vec<String>> {
+    let detail = client.raw().devices().get(carrier).await?.value;
+    let attached = detail
+        .attached_devices
+        .iter()
+        .filter_map(reference_code)
+        .collect::<Vec<_>>();
+    ensure_only_delivery_attachments(carrier, &attached, payload_codes)?;
+    if attached.is_empty() {
+        return Ok(Vec::new());
+    }
+    let attached_leg = canonical_payload_key(&attached);
+
+    if let Some(travel) = &detail.travel {
+        let planned = travel
+            .final_destination
+            .as_ref()
+            .or(travel.destination.as_ref())
+            .map(String::as_str)
+            .ok_or_else(|| {
+                TransportError::Invalid(format!(
+                    "carrier {carrier} is travelling with attached payloads but has no destination"
+                ))
+            })?;
+        if attached_delivery_state(
+            detail.location.as_deref(),
+            Some(planned),
+            origin,
+            destination,
+        )
+        .is_none()
+        {
+            return Err(TransportError::Invalid(format!(
+                "carrier {carrier} is already travelling to {planned}, outside this delivery"
+            )));
+        }
+        settle_transport_between(client, carrier, origin, destination, options, &attached_leg)
+            .await?;
+    }
+
+    let current = client.raw().devices().get(carrier).await?.value;
+    match attached_delivery_state(current.location.as_deref(), None, origin, destination) {
+        Some(AttachedDeliveryState::AtDestination) => {}
+        Some(AttachedDeliveryState::AtOrigin) => {
+            ensure_device_at(client, carrier, destination, options, &attached_leg).await?;
+        }
+        _ => {
+            return Err(TransportError::Invalid(format!(
+                "carrier {carrier} with attached payloads is not at the delivery origin or destination"
+            )));
+        }
+    }
+
+    let final_detail = client.raw().devices().get(carrier).await?.value;
+    if final_detail.travel.is_some()
+        || !final_detail
+            .location
+            .as_deref()
+            .is_some_and(|location| same_location(location, destination))
+    {
+        return Err(TransportError::Invalid(format!(
+            "carrier {carrier} did not reach exact delivery destination {destination}"
+        )));
+    }
+    let attached = final_detail
+        .attached_devices
+        .iter()
+        .filter_map(reference_code)
+        .collect::<Vec<_>>();
+    ensure_only_delivery_attachments(carrier, &attached, payload_codes)?;
+    if attached.is_empty() {
+        return Ok(Vec::new());
+    }
+    detach_devices(client, carrier, &attached, options).await?;
+    if options.unfurl_modular_payload {
+        unfurl_modular_devices(client, &attached, options).await?;
+    }
+    Ok(attached)
+}
+
 /// One attachment carrier's trip loop between an origin and the destination.
 /// Runs until the shared payload pool is drained.
 #[expect(
@@ -1275,8 +1444,18 @@ async fn run_carrier_trips(
         if lock(remaining).is_empty() {
             return Ok(());
         }
-        settle_transport_between(client, carrier, origin, destination, options).await?;
-        ensure_device_at(client, carrier, origin, options).await?;
+        let leg = {
+            let pending = lock(remaining)
+                .iter()
+                .map(|payload| payload.code.clone())
+                .collect::<Vec<_>>();
+            canonical_payload_key(&pending)
+        };
+
+        // Inspect attachments before preflighting the carrier to origin.
+        // An accepted attach is an achieved physical state, so taking this
+        // carrier back to origin (or detaching there) would make a restart
+        // issue the same completed attach ID again.
         let detail = client.raw().devices().get(carrier).await?.value;
         let existing = detail
             .attached_devices
@@ -1284,10 +1463,47 @@ async fn run_carrier_trips(
             .filter_map(reference_code)
             .collect::<Vec<_>>();
         if !existing.is_empty() {
-            ensure_only_delivery_attachments(carrier, &existing, payload_codes)?;
-            // Another automation attached delivery payloads mid-run; drop them
-            // back at the origin so this trip starts from a clean carrier.
-            detach_devices(client, carrier, &existing, options).await?;
+            let continued = continue_attached_delivery(
+                client,
+                carrier,
+                origin,
+                destination,
+                payload_codes,
+                options,
+            )
+            .await?;
+            {
+                let mut pending = lock(remaining);
+                pending.retain(|payload| !continued.contains(&payload.code));
+            }
+            lock(delivered).extend(continued);
+            continue;
+        }
+
+        settle_transport_between(client, carrier, origin, destination, options, &leg).await?;
+        ensure_device_at(client, carrier, origin, options, &leg).await?;
+        let detail = client.raw().devices().get(carrier).await?.value;
+        let existing = detail
+            .attached_devices
+            .iter()
+            .filter_map(reference_code)
+            .collect::<Vec<_>>();
+        if !existing.is_empty() {
+            let continued = continue_attached_delivery(
+                client,
+                carrier,
+                origin,
+                destination,
+                payload_codes,
+                options,
+            )
+            .await?;
+            {
+                let mut pending = lock(remaining);
+                pending.retain(|payload| !continued.contains(&payload.code));
+            }
+            lock(delivered).extend(continued);
+            continue;
         }
 
         let capacity = detail.attach_capacity.unwrap_or(0).max(0);
@@ -1314,6 +1530,7 @@ async fn run_carrier_trips(
         for code in &selected {
             ensure_attachable_device(client, code, options).await?;
         }
+        let leg = canonical_payload_key(&selected);
         info!(
             carrier = %carrier,
             origin = %origin,
@@ -1322,7 +1539,7 @@ async fn run_carrier_trips(
             "delivering device payload"
         );
         attach_devices(client, carrier, &selected, options).await?;
-        ensure_device_at(client, carrier, destination, options).await?;
+        ensure_device_at(client, carrier, destination, options, &leg).await?;
         detach_devices(client, carrier, &selected, options).await?;
         if options.unfurl_modular_payload {
             unfurl_modular_devices(client, &selected, options).await?;
@@ -1353,9 +1570,50 @@ fn ensure_only_delivery_attachments(
 async fn device_already_delivered(client: &Client, code: &str, destination: &str) -> Result<bool> {
     let detail = client.raw().devices().get(code).await?.value;
     Ok(detail.travel.is_none()
-        && detail.location.as_deref() == Some(destination)
+        && detail
+            .location
+            .as_deref()
+            .is_some_and(|location| same_location(location, destination))
         && detail.attached_to_device_code.is_none()
         && detail.stowed_in_device_code.is_none())
+}
+fn same_location(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachedDeliveryState {
+    AtOrigin,
+    AtDestination,
+    TravelingToOrigin,
+    TravelingToDestination,
+}
+
+fn attached_delivery_state(
+    location: Option<&str>,
+    travel_destination: Option<&str>,
+    origin: &str,
+    destination: &str,
+) -> Option<AttachedDeliveryState> {
+    if let Some(travel_destination) = travel_destination {
+        if same_location(travel_destination, origin) {
+            Some(AttachedDeliveryState::TravelingToOrigin)
+        } else if same_location(travel_destination, destination) {
+            Some(AttachedDeliveryState::TravelingToDestination)
+        } else {
+            None
+        }
+    } else if location.is_some_and(|location| same_location(location, origin)) {
+        Some(AttachedDeliveryState::AtOrigin)
+    } else if location.is_some_and(|location| same_location(location, destination)) {
+        Some(AttachedDeliveryState::AtDestination)
+    } else {
+        None
+    }
+}
+
+fn payload_is_pending(code: &str, delivered: &[String]) -> bool {
+    !delivered.iter().any(|delivered| delivered == code)
 }
 
 async fn settle_transport_between(
@@ -1364,6 +1622,7 @@ async fn settle_transport_between(
     origin: &str,
     destination: &str,
     options: DeliveryOptions,
+    leg: &str,
 ) -> Result<()> {
     let detail = client.raw().devices().get(code).await?.value;
     if detail.travel.is_none() {
@@ -1384,12 +1643,65 @@ async fn settle_transport_between(
                 "transport {code} is travelling without a destination"
             ))
         })?;
-    if planned != origin && planned != destination {
+
+    if !same_location(&planned, origin) && !same_location(&planned, destination) {
         return Err(TransportError::Invalid(format!(
             "transport {code} is already travelling to {planned}, outside this delivery"
         )));
     }
-    ensure_device_at(client, code, &planned, options).await
+    ensure_device_at(client, code, &planned, options, leg).await
+}
+/// Builds a deterministic operation identity for one restart-safe transport
+/// mutation. Length-prefixing every component prevents delimiter ambiguity and
+/// keeps action, target, destination, and payload-set changes in distinct
+/// namespaces.
+fn managed_operation_id(
+    options: DeliveryOptions,
+    action: &str,
+    target: &str,
+    destination: &str,
+    payload: &str,
+) -> Option<OperationId> {
+    let namespace = options.operation_namespace?;
+    let canonical_action = action.trim().to_ascii_lowercase();
+    let canonical_target = canonical_device_code(target);
+    let canonical_destination = canonical_device_code(destination);
+    let canonical_payload = if payload.trim().is_empty() {
+        String::new()
+    } else {
+        canonical_payload_codes(&payload.split(',').map(str::to_owned).collect::<Vec<_>>())
+            .join(",")
+    };
+    let mut name = Vec::new();
+    for component in [
+        &canonical_action,
+        &canonical_target,
+        &canonical_destination,
+        &canonical_payload,
+    ] {
+        name.extend_from_slice(&(component.len() as u64).to_le_bytes());
+        name.extend_from_slice(component.as_bytes());
+    }
+    Some(OperationId::new(
+        Uuid::new_v5(&namespace, &name).to_string(),
+    ))
+}
+
+fn canonical_device_code(code: &str) -> String {
+    code.trim().to_ascii_uppercase()
+}
+
+fn canonical_payload_codes(codes: &[String]) -> Vec<String> {
+    codes
+        .iter()
+        .map(|code| canonical_device_code(code))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn canonical_payload_key(codes: &[String]) -> String {
+    canonical_payload_codes(codes).join(",")
 }
 
 async fn ensure_device_at(
@@ -1397,14 +1709,17 @@ async fn ensure_device_at(
     code: &str,
     destination: &str,
     options: DeliveryOptions,
+    leg: &str,
 ) -> Result<()> {
-    let handle = client.devices().get(code).await?;
+    let code = canonical_device_code(code);
+    let destination = canonical_device_code(destination);
+    let handle = client.devices().get(&code).await?;
     let snapshot = handle.snapshot().await?;
     if snapshot.travel.is_none()
         && snapshot
             .location
             .as_ref()
-            .is_some_and(|location| location.id.as_str() == destination)
+            .is_some_and(|location| same_location(location.id.as_str(), &destination))
     {
         return Ok(());
     }
@@ -1414,7 +1729,7 @@ async fn ensure_device_at(
             .as_ref()
             .or(travel.destination.as_ref())
             .map(|location| location.id.as_str());
-        if planned != Some(destination) {
+        if !planned.is_some_and(|planned| same_location(planned, &destination)) {
             return Err(TransportError::Invalid(format!(
                 "device {code} is already travelling to {:?}, not {destination}",
                 planned
@@ -1425,34 +1740,39 @@ async fn ensure_device_at(
         info!(device = %code, destination = %destination, "dispatching transport travel");
         let via = client
             .smart_travel()
-            .route_for_device(code, destination)
+            .route_for_device(&code, &destination)
             .await?
             .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
             .map(|plan| {
                 Value::Array(
-                    plan.explicit_waypoints_for(destination)
+                    plan.explicit_waypoints_for(&destination)
                         .into_iter()
                         .map(Value::String)
                         .collect(),
                 )
             });
-        let operation = handle
-            .command(raw::devices::DeviceCommand::Travel {
-                destination: destination.to_owned(),
-                dry_run: None,
-                via,
-            })
-            .await?;
+        let command = raw::devices::DeviceCommand::Travel {
+            destination: destination.clone(),
+            dry_run: None,
+            via,
+        };
+        let operation = if let Some(operation_id) =
+            managed_operation_id(options, "travel", &code, &destination, leg)
+        {
+            handle.command_with_id(operation_id, command).await?
+        } else {
+            handle.command(command).await?
+        };
         ensure_operation_accepted(&operation).await?;
         Some(operation)
     };
 
-    wait_for_device(client, code, operation.as_ref(), options, |device| {
+    wait_for_device(client, &code, operation.as_ref(), options, |device| {
         device.travel.is_none()
             && device
                 .location
                 .as_ref()
-                .is_some_and(|location| location.id.as_str() == destination)
+                .is_some_and(|location| same_location(location.id.as_str(), &destination))
     })
     .await
 }
@@ -1591,8 +1911,15 @@ async fn ensure_attachable_device(
     }
 
     info!(device = %code, "compacting modular payload for transport");
-    let operation = client.devices().get(code).await?.compact().await?;
-    ensure_operation_accepted(&operation).await?;
+    let handle = client.devices().get(code).await?;
+    let command = raw::devices::DeviceCommand::Compact;
+    let operation = if let Some(operation_id) =
+        managed_operation_id(options, "compact", &canonical_device_code(code), "", "")
+    {
+        handle.command_with_id(operation_id, command).await?
+    } else {
+        handle.command(command).await?
+    };
     wait_for_raw_device(client, code, Some(&operation), options, |device| {
         status_is(device, "compacted")
             && device.attached_to_device_code.is_none()
@@ -1609,21 +1936,30 @@ async fn attach_devices(
     if devices.is_empty() {
         return Ok(());
     }
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
-        .attach(raw::devices::TargetsCommand {
-            device: None,
-            devices: Some(Value::Array(
-                devices.iter().cloned().map(Value::String).collect(),
-            )),
-            target: None,
-            targets: None,
-        })
-        .await?;
+    let carrier = canonical_device_code(carrier);
+    let devices = canonical_payload_codes(devices);
+    let handle = client.devices().get(&carrier).await?;
+    let command = raw::devices::DeviceCommand::Attach(raw::devices::TargetsCommand {
+        device: None,
+        devices: Some(Value::Array(
+            devices.iter().cloned().map(Value::String).collect(),
+        )),
+        target: None,
+        targets: None,
+    });
+    let operation = if let Some(operation_id) = managed_operation_id(
+        options,
+        "attach",
+        &carrier,
+        "",
+        &canonical_payload_key(&devices),
+    ) {
+        handle.command_with_id(operation_id, command).await?
+    } else {
+        handle.command(command).await?
+    };
     ensure_operation_accepted(&operation).await?;
-    for code in devices {
+    for code in &devices {
         wait_for_device(client, code, Some(&operation), options, |device| {
             device
                 .relationships
@@ -1645,24 +1981,31 @@ async fn detach_devices(
     if devices.is_empty() {
         return Ok(());
     }
-    ensure_cached_command_available(client, carrier, "detach").await?;
-    let operation = client
-        .devices()
-        .get(carrier)
-        .await?
-        .command(raw::devices::DeviceCommand::Detach(
-            raw::devices::TargetsCommand {
-                device: None,
-                devices: Some(Value::Array(
-                    devices.iter().cloned().map(Value::String).collect(),
-                )),
-                target: None,
-                targets: None,
-            },
-        ))
-        .await?;
+    let carrier = canonical_device_code(carrier);
+    let devices = canonical_payload_codes(devices);
+    ensure_cached_command_available(client, &carrier, "detach").await?;
+    let handle = client.devices().get(&carrier).await?;
+    let command = raw::devices::DeviceCommand::Detach(raw::devices::TargetsCommand {
+        device: None,
+        devices: Some(Value::Array(
+            devices.iter().cloned().map(Value::String).collect(),
+        )),
+        target: None,
+        targets: None,
+    });
+    let operation = if let Some(operation_id) = managed_operation_id(
+        options,
+        "detach",
+        &carrier,
+        "",
+        &canonical_payload_key(&devices),
+    ) {
+        handle.command_with_id(operation_id, command).await?
+    } else {
+        handle.command(command).await?
+    };
     ensure_operation_accepted(&operation).await?;
-    for code in devices {
+    for code in &devices {
         wait_for_device(client, code, Some(&operation), options, |device| {
             device.relationships.attached_to.is_none()
         })
@@ -1715,8 +2058,15 @@ async fn unfurl_modular_devices(
             )));
         }
         info!(device = %code, "unfurling modular payload after delivery");
-        let operation = client.devices().get(code).await?.unfurl().await?;
-        ensure_operation_accepted(&operation).await?;
+        let handle = client.devices().get(code).await?;
+        let command = raw::devices::DeviceCommand::Unfurl;
+        let operation = if let Some(operation_id) =
+            managed_operation_id(options, "unfurl", &canonical_device_code(code), "", "")
+        {
+            handle.command_with_id(operation_id, command).await?
+        } else {
+            handle.command(command).await?
+        };
         wait_for_raw_device(client, code, Some(&operation), options, |device| {
             !status_is(device, "compacted")
                 && !status_is(device, "compacting")
@@ -1969,6 +2319,52 @@ fn eligible_payload(device: &Device) -> bool {
         && device.relationships.stowed_in.is_none()
         && device.relationships.controller.is_none()
 }
+fn return_location_for_transport<'a>(plan: &'a DeliveryPlan, code: &str) -> Option<&'a str> {
+    if let Some(location) = plan.transport_origins.get(code) {
+        return is_exact_location(location).then_some(location.as_str());
+    }
+    let origin = plan.origin.trim();
+    is_exact_location(origin).then_some(origin)
+}
+
+/// Resolves a return target with an authoritative exact-location check for
+/// plans persisted before `transport_origins` existed. A hyphen is not enough
+/// to distinguish a location from a system scope; only the location endpoint's
+/// canonical designation can prove that legacy fallback is safe.
+async fn return_location_at_execution(
+    client: &Client,
+    plan: &DeliveryPlan,
+    code: &str,
+) -> Result<String> {
+    let return_location = return_location_for_transport(plan, code).ok_or_else(|| {
+        TransportError::Invalid(
+            "--return-carriers requires an exact recorded transport location \
+             (legacy plans may use an exact origin, not only a system)"
+                .into(),
+        )
+    })?;
+    if plan.transport_origins.contains_key(code) {
+        return Ok(return_location.to_owned());
+    }
+
+    let response = client.raw().locations().get(return_location, None).await?;
+    let authoritative = response.value.location.as_deref();
+    if authoritative_exact_location(authoritative, return_location) {
+        Ok(return_location.to_owned())
+    } else {
+        Err(TransportError::Invalid(format!(
+            "legacy return origin {return_location} is not an authoritative exact location for transport {code}"
+        )))
+    }
+}
+fn authoritative_exact_location(authoritative: Option<&str>, requested: &str) -> bool {
+    authoritative.is_some_and(|location| same_location(location, requested))
+}
+
+fn is_exact_location(location: &str) -> bool {
+    let location = location.trim();
+    !location.is_empty() && !location.eq_ignore_ascii_case("account") && location.contains('-')
+}
 
 fn scope_matches(origin: &str, location: &str) -> bool {
     let origin = origin.trim();
@@ -1998,9 +2394,12 @@ fn transport_origin_rank(origin: &str, location: &str) -> u8 {
 }
 
 fn origin_location_rank(origin: &str, location: &str) -> u8 {
-    if location.eq_ignore_ascii_case(origin) {
+    if origin.eq_ignore_ascii_case(location) {
         0
-    } else if location.to_ascii_uppercase().contains("-BELT-") {
+    } else if location
+        .split('-')
+        .any(|component| component.eq_ignore_ascii_case("belt"))
+    {
         1
     } else {
         2
@@ -2013,10 +2412,6 @@ fn system_designation(location: &str) -> &str {
         .next()
         .filter(|system| !system.is_empty())
         .unwrap_or(location)
-}
-
-fn exact_return_location(plan: &DeliveryPlan) -> Option<&str> {
-    plan.origin.contains('-').then_some(plan.origin.as_str())
 }
 
 fn take_manifest(resources: &ResourceMap, capacity: i64) -> ResourceMap {
@@ -2073,6 +2468,8 @@ mod tests {
             device_type: Some(replicant_client::DeviceType::from("exotic_matter_injector")),
             status: Some(replicant_client::DeviceStatus::from("inactive")),
             location: Some(replicant_client::LocationKey::live(location.into())),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),
@@ -2107,6 +2504,8 @@ mod tests {
             device_type: Some(replicant_client::DeviceType::from("mobile_fleet")),
             status: Some(replicant_client::DeviceStatus::from("inactive")),
             location: Some(replicant_client::LocationKey::live(location.into())),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),
@@ -2215,6 +2614,179 @@ mod tests {
                 .find(|candidate| candidate.code == "REMOTE")
                 .map(|candidate| candidate.origin_rank),
             Some(REMOTE_TRANSPORT_RANK)
+        );
+    }
+    #[test]
+    fn selected_transport_origins_capture_every_selected_carrier() {
+        let candidates = vec![
+            TransportCandidate {
+                code: "LOCAL".into(),
+                device_type: "mobile_fleet".into(),
+                location: "ALPHA-7-L4".into(),
+                origin_rank: 0,
+                cargo_capacity: 100,
+                attach_capacity: 1,
+            },
+            TransportCandidate {
+                code: "REMOTE".into(),
+                device_type: "mobile_fleet".into(),
+                location: "BETA-HUB".into(),
+                origin_rank: REMOTE_TRANSPORT_RANK,
+                cargo_capacity: 100,
+                attach_capacity: 1,
+            },
+        ];
+
+        let origins =
+            selected_transport_origins(&candidates, &["LOCAL".into()], &["REMOTE".into()]);
+        assert_eq!(
+            origins,
+            BTreeMap::from([
+                ("LOCAL".into(), "ALPHA-7-L4".into()),
+                ("REMOTE".into(), "BETA-HUB".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn remote_carrier_returns_to_recorded_home_not_payload_origin() {
+        let plan = DeliveryPlan {
+            origin: "ALPHA-BELT-1".into(),
+            destination: "ALPHA-HUB".into(),
+            device_carriers: vec!["REMOTE".into()],
+            transport_origins: BTreeMap::from([("REMOTE".into(), "BETA-HUB".into())]),
+            ..DeliveryPlan::default()
+        };
+
+        assert_eq!(
+            return_location_for_transport(&plan, "REMOTE"),
+            Some("BETA-HUB")
+        );
+        assert_ne!(
+            return_location_for_transport(&plan, "REMOTE"),
+            Some(plan.origin.as_str())
+        );
+    }
+
+    #[test]
+    fn managed_operation_ids_are_stable_and_action_target_payload_specific() {
+        let options = DeliveryOptions {
+            operation_namespace: Some(Uuid::nil()),
+            ..DeliveryOptions::default()
+        };
+        let attach = managed_operation_id(options, "attach", "CARRIER", "", "DEVICE-1,DEVICE-2")
+            .expect("namespace produces an ID");
+        let reordered = managed_operation_id(
+            options,
+            "attach",
+            "carrier",
+            "",
+            &canonical_payload_key(&[" device-2 ".into(), "DEVICE-1".into()]),
+        )
+        .expect("namespace produces an ID");
+        assert_eq!(attach, reordered);
+        assert_ne!(
+            attach,
+            managed_operation_id(options, "detach", "CARRIER", "", "DEVICE-1,DEVICE-2")
+                .expect("namespace produces an ID")
+        );
+        assert_ne!(
+            attach,
+            managed_operation_id(options, "attach", "OTHER-CARRIER", "", "DEVICE-1,DEVICE-2",)
+                .expect("namespace produces an ID")
+        );
+        assert_ne!(
+            attach,
+            managed_operation_id(options, "attach", "CARRIER", "", "DEVICE-1")
+                .expect("namespace produces an ID")
+        );
+        let first_leg = managed_operation_id(options, "travel", "carrier", "ALPHA-HUB", "device-1")
+            .expect("namespace produces an ID");
+        let second_leg =
+            managed_operation_id(options, "travel", "CARRIER", "ALPHA-HUB", "DEVICE-2")
+                .expect("namespace produces an ID");
+        let first_retry =
+            managed_operation_id(options, "TRAVEL", "CARRIER", " alpha-hub ", " DEVICE-1 ")
+                .expect("namespace produces an ID");
+        assert_ne!(first_leg, second_leg);
+        assert_eq!(first_leg, first_retry);
+        assert_eq!(
+            managed_operation_id(DeliveryOptions::default(), "travel", "D1", "HUB", "leg",),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_exact_origin_is_return_compatibility_fallback() {
+        let plan = DeliveryPlan {
+            origin: "ALPHA-BELT-1".into(),
+            ..DeliveryPlan::default()
+        };
+
+        assert_eq!(
+            return_location_for_transport(&plan, "LEGACY-CARRIER"),
+            Some("ALPHA-BELT-1")
+        );
+    }
+
+    #[test]
+    fn legacy_system_origin_is_rejected_for_return() {
+        let plan = DeliveryPlan {
+            origin: "ALPHA".into(),
+            ..DeliveryPlan::default()
+        };
+
+        assert_eq!(return_location_for_transport(&plan, "LEGACY-CARRIER"), None);
+    }
+    #[test]
+    fn attached_at_origin_continues_to_destination_without_detach() {
+        assert_eq!(
+            attached_delivery_state(Some("ALPHA-BELT-1"), None, "ALPHA-BELT-1", "ALPHA-HUB",),
+            Some(AttachedDeliveryState::AtOrigin)
+        );
+        assert_eq!(
+            attached_delivery_state(
+                Some("ALPHA-BELT-1"),
+                Some("ALPHA-HUB"),
+                "ALPHA-BELT-1",
+                "ALPHA-HUB",
+            ),
+            Some(AttachedDeliveryState::TravelingToDestination)
+        );
+    }
+
+    #[test]
+    fn all_delivered_payloads_skip_delivery_preflight() {
+        assert!(!payload_is_pending("DEVICE-1", &["DEVICE-1".to_owned()]));
+        assert!(payload_is_pending("DEVICE-2", &["DEVICE-1".to_owned()]));
+    }
+
+    #[test]
+    fn active_own_home_return_is_an_exact_target() {
+        assert!(same_location("BETA-HUB", "beta-hub"));
+        assert!(!same_location("BETA-HUB", "ALPHA-HUB"));
+    }
+
+    #[test]
+    fn hyphenated_legacy_system_requires_authoritative_location() {
+        let requested = "ALPHA-SECTOR";
+        assert!(!authoritative_exact_location(None, requested));
+        assert!(authoritative_exact_location(
+            Some("alpha-sector"),
+            requested
+        ));
+    }
+
+    #[test]
+    fn legacy_plan_deserializes_with_empty_transport_origins() {
+        let plan: DeliveryPlan =
+            serde_json::from_str(r#"{"origin":"ALPHA-BELT-1","destination":"ALPHA-HUB"}"#)
+                .expect("legacy delivery plan");
+
+        assert!(plan.transport_origins.is_empty());
+        assert_eq!(
+            return_location_for_transport(&plan, "LEGACY-CARRIER"),
+            Some("ALPHA-BELT-1")
         );
     }
 

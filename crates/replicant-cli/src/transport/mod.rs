@@ -254,6 +254,7 @@ pub(crate) async fn run_cli(arguments: Vec<String>) -> crate::AnyResult<()> {
         unfurl_modular_payload: config.unfurl_modular_payload,
         return_transports: config.return_carriers,
         transport_limit: config.transport_limit,
+        operation_namespace: None,
     };
 
     let plan_result = plan_delivery_with(&client, &config.request, options).await;
