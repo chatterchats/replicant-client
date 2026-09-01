@@ -64,8 +64,10 @@ impl Camera {
         match drag.mode {
             DragMode::Rotate => {
                 self.theta = drag.start_theta + dx * ROTATE_SPEED;
-                self.phi = (drag.start_phi - dy * ROTATE_SPEED)
-                    .clamp(-std::f32::consts::FRAC_PI_2 + 0.02, std::f32::consts::FRAC_PI_2 - 0.02);
+                self.phi = (drag.start_phi - dy * ROTATE_SPEED).clamp(
+                    -std::f32::consts::FRAC_PI_2 + 0.02,
+                    std::f32::consts::FRAC_PI_2 - 0.02,
+                );
             }
             DragMode::Pan => {
                 let scale = self.distance * PAN_SPEED;

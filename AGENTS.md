@@ -205,12 +205,5 @@ Do not trust these; the code is authoritative:
 - `CONTRIBUTING.md` cites `docs/implementation/rewrite-guide.md` and
   `src/lib.rs` cites `docs/contract/`. Neither exists.
 - `CURRENT_STATE.md` is a historical Phase 9 UI snapshot, not current state.
-- `Makefile` `.PHONY` lists `check-raw`, `check-events`, `check-all-features`,
-  `feature-checks`, `observability-policy-check`, and
-  `remediation-policy-check`. None have recipes.
-- `scripts/mutation_adapter_policy_check.py`,
-  `scripts/package_contents_check.py`, and
-  `scripts/phase_11_5_remediation_check.py` exist but are not wired into
-  `make policy-checks`.
 
 If you fix one of these, delete its bullet here.

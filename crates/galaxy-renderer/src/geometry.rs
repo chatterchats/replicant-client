@@ -8,15 +8,7 @@ pub fn build_galaxy_plane_verts(radius: f32, segments: u32) -> Vec<f32> {
     verts.extend_from_slice(&[0.0, 0.0, 0.0, cr, cg, cb, 0.09]);
     for i in 0..=segments {
         let a = (i as f32 / segments as f32) * std::f32::consts::TAU;
-        verts.extend_from_slice(&[
-            radius * a.cos(),
-            0.0,
-            radius * a.sin(),
-            cr,
-            cg,
-            cb,
-            0.0,
-        ]);
+        verts.extend_from_slice(&[radius * a.cos(), 0.0, radius * a.sin(), cr, cg, cb, 0.0]);
     }
     verts
 }

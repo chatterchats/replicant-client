@@ -38,9 +38,12 @@ pub struct GlSignal {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TravelRouteLeg {
-    pub leg: i32,
-    pub from: String,
-    pub to: String,
+    #[serde(rename = "leg")]
+    pub _leg: i32,
+    #[serde(rename = "from")]
+    pub _from: String,
+    #[serde(rename = "to")]
+    pub _to: String,
     #[serde(default)]
     pub time_seconds: f32,
 }

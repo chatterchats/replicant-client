@@ -145,27 +145,53 @@ pub fn create_programs(gl: &glow::Context) -> Result<GlPrograms, String> {
     let sphere_program = create_program(gl, SPHERE_VERTEX_SRC, SPHERE_FRAG_SRC)?;
     unsafe {
         let s_radii = [
-            gl.get_uniform_location(sphere_program, "u_r0").ok_or("missing u_r0")?,
-            gl.get_uniform_location(sphere_program, "u_r1").ok_or("missing u_r1")?,
-            gl.get_uniform_location(sphere_program, "u_r2").ok_or("missing u_r2")?,
-            gl.get_uniform_location(sphere_program, "u_r3").ok_or("missing u_r3")?,
-            gl.get_uniform_location(sphere_program, "u_r4").ok_or("missing u_r4")?,
-            gl.get_uniform_location(sphere_program, "u_r5").ok_or("missing u_r5")?,
-            gl.get_uniform_location(sphere_program, "u_r6").ok_or("missing u_r6")?,
-            gl.get_uniform_location(sphere_program, "u_r7").ok_or("missing u_r7")?,
-            gl.get_uniform_location(sphere_program, "u_r8").ok_or("missing u_r8")?,
-            gl.get_uniform_location(sphere_program, "u_r9").ok_or("missing u_r9")?,
-            gl.get_uniform_location(sphere_program, "u_r10").ok_or("missing u_r10")?,
-            gl.get_uniform_location(sphere_program, "u_r11").ok_or("missing u_r11")?,
+            gl.get_uniform_location(sphere_program, "u_r0")
+                .ok_or("missing u_r0")?,
+            gl.get_uniform_location(sphere_program, "u_r1")
+                .ok_or("missing u_r1")?,
+            gl.get_uniform_location(sphere_program, "u_r2")
+                .ok_or("missing u_r2")?,
+            gl.get_uniform_location(sphere_program, "u_r3")
+                .ok_or("missing u_r3")?,
+            gl.get_uniform_location(sphere_program, "u_r4")
+                .ok_or("missing u_r4")?,
+            gl.get_uniform_location(sphere_program, "u_r5")
+                .ok_or("missing u_r5")?,
+            gl.get_uniform_location(sphere_program, "u_r6")
+                .ok_or("missing u_r6")?,
+            gl.get_uniform_location(sphere_program, "u_r7")
+                .ok_or("missing u_r7")?,
+            gl.get_uniform_location(sphere_program, "u_r8")
+                .ok_or("missing u_r8")?,
+            gl.get_uniform_location(sphere_program, "u_r9")
+                .ok_or("missing u_r9")?,
+            gl.get_uniform_location(sphere_program, "u_r10")
+                .ok_or("missing u_r10")?,
+            gl.get_uniform_location(sphere_program, "u_r11")
+                .ok_or("missing u_r11")?,
         ];
         Ok(GlPrograms {
-            l_pos: gl.get_attrib_location(line_program, "a_world").ok_or("missing a_world")?,
-            l_col: gl.get_attrib_location(line_program, "a_color").ok_or("missing a_color")?,
-            p_pos: gl.get_attrib_location(point_program, "a_world").ok_or("missing a_world")?,
-            p_col: gl.get_attrib_location(point_program, "a_color").ok_or("missing a_color")?,
-            p_size: gl.get_attrib_location(point_program, "a_size").ok_or("missing a_size")?,
-            s_ring: gl.get_attrib_location(sphere_program, "a_ring").ok_or("missing a_ring")?,
-            s_angle: gl.get_attrib_location(sphere_program, "a_angle").ok_or("missing a_angle")?,
+            l_pos: gl
+                .get_attrib_location(line_program, "a_world")
+                .ok_or("missing a_world")?,
+            l_col: gl
+                .get_attrib_location(line_program, "a_color")
+                .ok_or("missing a_color")?,
+            p_pos: gl
+                .get_attrib_location(point_program, "a_world")
+                .ok_or("missing a_world")?,
+            p_col: gl
+                .get_attrib_location(point_program, "a_color")
+                .ok_or("missing a_color")?,
+            p_size: gl
+                .get_attrib_location(point_program, "a_size")
+                .ok_or("missing a_size")?,
+            s_ring: gl
+                .get_attrib_location(sphere_program, "a_ring")
+                .ok_or("missing a_ring")?,
+            s_angle: gl
+                .get_attrib_location(sphere_program, "a_angle")
+                .ok_or("missing a_angle")?,
             l_mvp: gl
                 .get_uniform_location(line_program, "u_mvp")
                 .ok_or("missing u_mvp in line program")?,
@@ -248,7 +274,13 @@ fn f32_slice_as_u8(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
 }
 
-pub fn draw_lines(gl: &glow::Context, programs: &GlPrograms, buf: glow::Buffer, mvp: &[f32; 16], count: i32) {
+pub fn draw_lines(
+    gl: &glow::Context,
+    programs: &GlPrograms,
+    buf: glow::Buffer,
+    mvp: &[f32; 16],
+    count: i32,
+) {
     if count <= 0 {
         return;
     }
@@ -264,7 +296,13 @@ pub fn draw_lines(gl: &glow::Context, programs: &GlPrograms, buf: glow::Buffer, 
     }
 }
 
-pub fn draw_glow_lines(gl: &glow::Context, programs: &GlPrograms, buf: glow::Buffer, mvp: &[f32; 16], count: i32) {
+pub fn draw_glow_lines(
+    gl: &glow::Context,
+    programs: &GlPrograms,
+    buf: glow::Buffer,
+    mvp: &[f32; 16],
+    count: i32,
+) {
     unsafe {
         gl.blend_func(glow::SRC_ALPHA, glow::ONE);
     }
@@ -335,23 +373,6 @@ fn draw_triangles(
     }
 }
 
-pub fn draw_glow_triangle_fan(
-    gl: &glow::Context,
-    programs: &GlPrograms,
-    buf: glow::Buffer,
-    mvp: &[f32; 16],
-    first: i32,
-    count: i32,
-) {
-    unsafe {
-        gl.blend_func(glow::SRC_ALPHA, glow::ONE);
-    }
-    draw_triangle_fan(gl, programs, buf, mvp, first, count);
-    unsafe {
-        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-    }
-}
-
 pub fn draw_points(
     gl: &glow::Context,
     programs: &GlPrograms,
@@ -380,15 +401,19 @@ pub fn draw_points(
     }
 }
 
+pub struct SphereView {
+    pub target: [f32; 3],
+    pub distance: f32,
+    pub theta: f32,
+    pub phi: f32,
+}
+
 pub fn draw_sphere_lines(
     gl: &glow::Context,
     programs: &GlPrograms,
     buf: glow::Buffer,
     mvp: &[f32; 16],
-    target: [f32; 3],
-    distance: f32,
-    theta: f32,
-    phi: f32,
+    view: &SphereView,
     radii: &[f32],
     count: i32,
 ) {
@@ -398,10 +423,15 @@ pub fn draw_sphere_lines(
     unsafe {
         gl.use_program(Some(programs.sphere_program));
         gl.uniform_matrix_4_f32_slice(Some(&programs.s_mvp), false, mvp);
-        gl.uniform_3_f32(Some(&programs.s_target), target[0], target[1], target[2]);
-        gl.uniform_1_f32(Some(&programs.s_distance), distance);
-        gl.uniform_1_f32(Some(&programs.s_theta), theta);
-        gl.uniform_1_f32(Some(&programs.s_phi), phi);
+        gl.uniform_3_f32(
+            Some(&programs.s_target),
+            view.target[0],
+            view.target[1],
+            view.target[2],
+        );
+        gl.uniform_1_f32(Some(&programs.s_distance), view.distance);
+        gl.uniform_1_f32(Some(&programs.s_theta), view.theta);
+        gl.uniform_1_f32(Some(&programs.s_phi), view.phi);
         gl.uniform_1_i32(Some(&programs.s_ring_count), radii.len() as i32);
         for (index, location) in programs.s_radii.iter().enumerate() {
             let radius = radii.get(index).copied().unwrap_or(0.0);

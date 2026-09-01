@@ -1,10 +1,17 @@
 use crate::camera::{Camera, DragMode, DragState};
 use crate::chart_geometry::{
-    build_colored_sphere_geometry, build_influence_sphere_geometry, build_line_vertices, build_pulse_sphere_geometry,
-    build_signal_point_vertices, build_star_point_vertices, INFLUENCE_SPHERE_RADIUS_LY,
+    build_colored_sphere_geometry, build_influence_sphere_geometry, build_line_vertices,
+    build_pulse_sphere_geometry, build_signal_point_vertices, build_star_point_vertices,
+    INFLUENCE_SPHERE_RADIUS_LY,
 };
-use crate::chart_types::{parse_colored_sphere_centers, parse_influence_centers, parse_links, parse_pulses, parse_signals, parse_stars};
-use crate::geometry::{build_galaxy_plane_verts, build_sphere_line_template, sphere_template_segments, MAX_GALAXY_LINK_DISTANCE_LY, MAX_SPHERE_RINGS};
+use crate::chart_types::{
+    parse_colored_sphere_centers, parse_influence_centers, parse_links, parse_pulses,
+    parse_signals, parse_stars,
+};
+use crate::geometry::{
+    build_galaxy_plane_verts, build_sphere_line_template, sphere_template_segments,
+    MAX_GALAXY_LINK_DISTANCE_LY, MAX_SPHERE_RINGS,
+};
 use crate::gl::{self, GlPrograms};
 use crate::math::build_mvp;
 use crate::pick::{find_marker_at_point, PickMarker};
@@ -65,9 +72,8 @@ impl GalaxyRendererInner {
             .get_context("webgl")
             .map_err(|_| "get_context failed")?
             .ok_or("WebGL unavailable")?;
-        let webgl: web_sys::WebGlRenderingContext = context
-            .dyn_into()
-            .map_err(|_| "not a WebGL context")?;
+        let webgl: web_sys::WebGlRenderingContext =
+            context.dyn_into().map_err(|_| "not a WebGL context")?;
         let gl = glow::Context::from_webgl1_context(webgl);
         let programs = gl::create_programs(&gl)?;
 
@@ -135,7 +141,11 @@ impl GalaxyRendererInner {
 
     fn cached_census_lines(&mut self, cache_key: &str, links_json: &str) -> Vec<f32> {
         if self.census_line_cache.contains_key(cache_key) {
-            if let Some(pos) = self.census_cache_order.iter().position(|key| key == cache_key) {
+            if let Some(pos) = self
+                .census_cache_order
+                .iter()
+                .position(|key| key == cache_key)
+            {
                 self.census_cache_order.remove(pos);
             }
             self.census_cache_order.push(cache_key.to_string());
@@ -143,7 +153,8 @@ impl GalaxyRendererInner {
         }
         let links = parse_links(links_json);
         let verts = build_line_vertices(&links, 0.0);
-        self.census_line_cache.insert(cache_key.to_string(), verts.clone());
+        self.census_line_cache
+            .insert(cache_key.to_string(), verts.clone());
         self.census_cache_order.push(cache_key.to_string());
         if self.census_cache_order.len() > MAX_CENSUS_CACHE_ENTRIES {
             if let Some(oldest) = self.census_cache_order.first().cloned() {
@@ -184,14 +195,25 @@ impl GalaxyRendererInner {
         self.camera_dirty = true;
     }
 
-    pub fn set_census_geometry(&mut self, cache_key: &str, stars_json: &str, links_json: &str, signals_json: &str) {
+    pub fn set_census_geometry(
+        &mut self,
+        cache_key: &str,
+        stars_json: &str,
+        links_json: &str,
+        signals_json: &str,
+    ) {
         let stars = parse_stars(stars_json);
         let signals = parse_signals(signals_json);
         let line_verts = self.cached_census_lines(cache_key, links_json);
         let mut point_verts = build_star_point_vertices(&stars);
         point_verts.extend(build_signal_point_vertices(&signals));
 
-        gl::upload_buffer(&self.gl, self.static_line_buf, &line_verts, glow::STATIC_DRAW);
+        gl::upload_buffer(
+            &self.gl,
+            self.static_line_buf,
+            &line_verts,
+            glow::STATIC_DRAW,
+        );
         gl::upload_buffer(&self.gl, self.point_buf, &point_verts, glow::STATIC_DRAW);
         self.static_line_count = (line_verts.len() / 7) as i32;
         self.point_count = (point_verts.len() / 8) as i32;
@@ -218,28 +240,48 @@ impl GalaxyRendererInner {
     pub fn set_relay_geometry(&mut self, links_json: &str) {
         let links = parse_links(links_json);
         let line_verts = build_line_vertices(&links, 0.0);
-        gl::upload_buffer(&self.gl, self.relay_line_buf, &line_verts, glow::DYNAMIC_DRAW);
+        gl::upload_buffer(
+            &self.gl,
+            self.relay_line_buf,
+            &line_verts,
+            glow::DYNAMIC_DRAW,
+        );
         self.relay_line_count = (line_verts.len() / 7) as i32;
     }
 
     pub fn set_highlight_geometry(&mut self, links_json: &str) {
         let links = parse_links(links_json);
         let line_verts = build_line_vertices(&links, 0.0);
-        gl::upload_buffer(&self.gl, self.highlight_line_buf, &line_verts, glow::DYNAMIC_DRAW);
+        gl::upload_buffer(
+            &self.gl,
+            self.highlight_line_buf,
+            &line_verts,
+            glow::DYNAMIC_DRAW,
+        );
         self.highlight_line_count = (line_verts.len() / 7) as i32;
     }
 
     pub fn set_travel_geometry(&mut self, links_json: &str, now_ms: f64) {
         let links = parse_links(links_json);
         let line_verts = build_line_vertices(&links, now_ms);
-        gl::upload_buffer(&self.gl, self.travel_line_buf, &line_verts, glow::DYNAMIC_DRAW);
+        gl::upload_buffer(
+            &self.gl,
+            self.travel_line_buf,
+            &line_verts,
+            glow::DYNAMIC_DRAW,
+        );
         self.travel_line_count = (line_verts.len() / 7) as i32;
     }
 
     pub fn set_pulse_geometry(&mut self, pulses_json: &str) {
         let pulses = parse_pulses(pulses_json);
         let geometry = build_pulse_sphere_geometry(&pulses);
-        gl::upload_buffer(&self.gl, self.pulse_sphere_buf, &geometry.vertices, glow::DYNAMIC_DRAW);
+        gl::upload_buffer(
+            &self.gl,
+            self.pulse_sphere_buf,
+            &geometry.vertices,
+            glow::DYNAMIC_DRAW,
+        );
         self.pulse_sphere_vertex_count = geometry.vertex_count;
     }
 
@@ -348,19 +390,44 @@ impl GalaxyRendererInner {
     }
 
     pub fn pick_star(&self, screen_x: f32, screen_y: f32) -> Option<String> {
-        find_marker_at_point(&self.stars, screen_x, screen_y, 20.0, &self.mvp, self.css_width, self.css_height)
+        find_marker_at_point(
+            &self.stars,
+            screen_x,
+            screen_y,
+            20.0,
+            &self.mvp,
+            self.css_width,
+            self.css_height,
+        )
     }
 
     pub fn pick_signal(&self, screen_x: f32, screen_y: f32) -> Option<String> {
-        find_marker_at_point(&self.signals, screen_x, screen_y, 24.0, &self.mvp, self.css_width, self.css_height)
+        find_marker_at_point(
+            &self.signals,
+            screen_x,
+            screen_y,
+            24.0,
+            &self.mvp,
+            self.css_width,
+            self.css_height,
+        )
     }
 
     fn ensure_plane_cache(&mut self) {
-        let outer_r = self.sphere_radii.last().copied().unwrap_or(MAX_GALAXY_LINK_DISTANCE_LY);
+        let outer_r = self
+            .sphere_radii
+            .last()
+            .copied()
+            .unwrap_or(MAX_GALAXY_LINK_DISTANCE_LY);
         if (self.cached_plane_radius - outer_r).abs() > f32::EPSILON {
             self.cached_plane_verts = build_galaxy_plane_verts(outer_r, 128);
             self.cached_plane_radius = outer_r;
-            gl::upload_buffer(&self.gl, self.plane_buf, &self.cached_plane_verts, glow::STATIC_DRAW);
+            gl::upload_buffer(
+                &self.gl,
+                self.plane_buf,
+                &self.cached_plane_verts,
+                glow::STATIC_DRAW,
+            );
         }
     }
 
@@ -399,7 +466,14 @@ impl GalaxyRendererInner {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
-        gl::draw_triangle_fan(&self.gl, &self.programs, self.plane_buf, &self.mvp, 0, plane_count);
+        gl::draw_triangle_fan(
+            &self.gl,
+            &self.programs,
+            self.plane_buf,
+            &self.mvp,
+            0,
+            plane_count,
+        );
         gl::draw_glow_triangles(
             &self.gl,
             &self.programs,
@@ -426,19 +500,33 @@ impl GalaxyRendererInner {
             &self.programs,
             self.sphere_buf,
             &self.mvp,
-            [
-                self.camera.target_x,
-                self.camera.target_y,
-                self.camera.target_z,
-            ],
-            self.camera.distance,
-            self.camera.theta,
-            self.camera.phi,
+            &gl::SphereView {
+                target: [
+                    self.camera.target_x,
+                    self.camera.target_y,
+                    self.camera.target_z,
+                ],
+                distance: self.camera.distance,
+                theta: self.camera.theta,
+                phi: self.camera.phi,
+            },
             &self.sphere_radii,
             self.sphere_line_count,
         );
-        gl::draw_lines(&self.gl, &self.programs, self.static_line_buf, &self.mvp, self.static_line_count);
-        gl::draw_lines(&self.gl, &self.programs, self.relay_line_buf, &self.mvp, self.relay_line_count);
+        gl::draw_lines(
+            &self.gl,
+            &self.programs,
+            self.static_line_buf,
+            &self.mvp,
+            self.static_line_count,
+        );
+        gl::draw_lines(
+            &self.gl,
+            &self.programs,
+            self.relay_line_buf,
+            &self.mvp,
+            self.relay_line_count,
+        );
         gl::draw_glow_lines(
             &self.gl,
             &self.programs,
@@ -446,7 +534,13 @@ impl GalaxyRendererInner {
             &self.mvp,
             self.highlight_line_count,
         );
-        gl::draw_lines(&self.gl, &self.programs, self.travel_line_buf, &self.mvp, self.travel_line_count);
+        gl::draw_lines(
+            &self.gl,
+            &self.programs,
+            self.travel_line_buf,
+            &self.mvp,
+            self.travel_line_count,
+        );
         gl::draw_points(
             &self.gl,
             &self.programs,
@@ -490,8 +584,15 @@ impl GalaxyRenderer {
         self.inner.set_sphere_radii(radii);
     }
 
-    pub fn set_census_geometry(&mut self, cache_key: &str, stars_json: &str, links_json: &str, signals_json: &str) {
-        self.inner.set_census_geometry(cache_key, stars_json, links_json, signals_json);
+    pub fn set_census_geometry(
+        &mut self,
+        cache_key: &str,
+        stars_json: &str,
+        links_json: &str,
+        signals_json: &str,
+    ) {
+        self.inner
+            .set_census_geometry(cache_key, stars_json, links_json, signals_json);
     }
 
     pub fn set_relay_geometry(&mut self, links_json: &str) {

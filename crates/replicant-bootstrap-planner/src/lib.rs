@@ -465,10 +465,12 @@ mod tests {
 
     #[test]
     fn carrier_count_tracks_profile_changes_without_a_manual_reserve() {
-        let mut profile = BootstrapProfile::default();
-        profile.mining_setups = 10;
-        profile.expansion_relays = 9;
-        profile.ftl_beacons = 0;
+        let profile = BootstrapProfile {
+            mining_setups: 10,
+            expansion_relays: 9,
+            ftl_beacons: 0,
+            ..BootstrapProfile::default()
+        };
         let requirements = ark_device_requirements(&profile);
         assert_eq!(required_role_carriers(&profile, &requirements, 9), Ok(14));
     }

@@ -1,5 +1,24 @@
 [build]
 incremental = true
+rustflags = ["-Ctarget-cpu=native", "-Clink-arg=-fuse-ld=mold"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.dev.package."*"]
+debug = false
 
 [future-incompat-report]
 frequency = "always"

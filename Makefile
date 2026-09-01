@@ -11,7 +11,26 @@ GALAXY_WASM_OUT := ../../apps/web/src/wasm/galaxy_renderer
 DOCS_CRAWLER_DIR := reference/replicant-docs-crawler
 DOCS_CRAWLER_PYTHON ?= $(DOCS_CRAWLER_DIR)/venv/bin/python
 
-.PHONY: help build build-workspace check-all ci clean contract-policy-check desktop-build desktop-check desktop-dev desktop-fmt desktop-fmt-check desktop-prepare desktop-sidecar doc docker-artifacts docker-build docker-check docker-down docker-persistence-smoke docker-rebuild-deploy docker-restart docker-smoke docker-up docs-reference-sync else fmt fmt-check galaxy-wasm lint observability-down observability-up policy-checks test token token-rotate web-check web-fmt web-fmt-check zip
+# Aggregate and workspace targets
+.PHONY: help ci clean build build-workspace fmt fmt-check lint test doc
+.PHONY: check-all check-all-features check-events check-raw feature-checks
+
+# Galaxy renderer targets
+.PHONY: galaxy-check galaxy-doc galaxy-fmt galaxy-fmt-check galaxy-lint galaxy-wasm
+
+# Frontend and desktop targets
+.PHONY: web-check web-fmt web-fmt-check
+.PHONY: desktop-build desktop-check desktop-dev desktop-fmt desktop-fmt-check
+.PHONY: desktop-prepare desktop-sidecar
+
+# Documentation and policy targets
+.PHONY: docs-crawler-check docs-reference-sync contract-policy-check coverage-audit-check
+.PHONY: mutation-adapter-policy-check package-contents-check policy-checks policy-tests
+
+# Deployment and utility targets
+.PHONY: docker-artifacts docker-build docker-check docker-down docker-persistence-smoke
+.PHONY: docker-rebuild-deploy docker-restart docker-smoke docker-up
+.PHONY: observability-down observability-up token token-rotate zip
 
 help:
 	@printf '%s\n' \
@@ -21,16 +40,20 @@ help:
 	  '' \
 	  'Gates' \
 	  '  ci                       Full local CI-equivalent suite (expensive)' \
-	  '  lint                     Clippy with warnings denied' \
-	  '  test                     cargo test --all-features' \
-	  '  check-all                cargo check --all-features --all-targets' \
-	  '  doc                      Build docs with warnings denied' \
-	  '  policy-checks            Run all checked-in policy gates' \
+	  '  lint                     Clippy all workspace targets and feature modes' \
+	  '  test                     Test the workspace in default and all-feature modes' \
+	  '  check-all                Check all workspace targets and features' \
+	  '  feature-checks           Check raw, events, and all-feature configurations' \
+	  '  galaxy-check             Format, lint, document, and build the WASM crate' \
+	  '  docs-crawler-check       Test the documentation crawler' \
+	  '  doc                      Build workspace docs with warnings denied' \
+	  '  policy-checks            Run all checked-in policy gates and policy tests' \
 	  '  contract-policy-check    Verify operation inventory and exclusions only' \
+	  '  coverage-audit-check     Verify current units and schema fields' \
 	  '' \
 	  'Build and format' \
-	  '  build                    cargo build --all-features (root package)' \
-	  '  build-workspace          cargo build --workspace --all-features' \
+	  '  build                    Build the workspace in default and all-feature modes' \
+	  '  build-workspace          Alias for build' \
 	  '  clean                    cargo clean' \
 	  '  fmt                      Format Rust and frontend sources' \
 	  '  fmt-check                Verify Rust and frontend formatting' \
@@ -61,33 +84,77 @@ help:
 	  '  zip                      Create a clean working-tree ZIP for handoff' \
 	  '  token                    Generate a REPLICANTD_TOKEN in .env if not present' \
 	  '  token-rotate             Rotate the REPLICANTD_TOKEN in .env' \
-	  '' \
-	  'Feature-combination checks have no target; run cargo directly:' \
-	  '  cargo check --no-default-features --features raw' \
-	  '  cargo check --no-default-features --features events'
+	  ''
 
+# Aggregate gate
+ci: fmt-check build lint test check-all feature-checks doc policy-checks \
+  docs-crawler-check galaxy-check web-check desktop-check
+
+# Workspace lifecycle and quality
 clean:
 	$(CARGO) clean
+	$(CARGO) clean --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml
 
-build:
-	$(CARGO) build --all-features
-
-build-workspace:
+build: desktop-prepare
+	$(CARGO) build --workspace
 	$(CARGO) build --workspace --all-features
 
-fmt:
+build-workspace: build
+
+fmt: galaxy-fmt
 	$(CARGO) fmt --all
 	$(MAKE) web-fmt
 	$(MAKE) desktop-fmt
 
-fmt-check:
+fmt-check: galaxy-fmt-check
 	$(CARGO) fmt --all -- --check
 	$(MAKE) web-fmt-check
 	$(MAKE) desktop-fmt-check
 
-galaxy-wasm:
-	$(WASM_PACK) build $(GALAXY_RENDERER_DIR) --target web --out-dir $(GALAXY_WASM_OUT) --release --locked
+lint: galaxy-lint
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
+check-all: check-all-features
+	$(CARGO) check --workspace --all-targets
+
+check-all-features:
+	$(CARGO) check --workspace --all-targets --all-features
+
+check-raw:
+	$(CARGO) check -p replicant-client --no-default-features --features raw
+
+check-events:
+	$(CARGO) check -p replicant-client --no-default-features --features events
+
+feature-checks: check-raw check-events check-all-features
+
+test:
+	$(CARGO) test --workspace
+	$(CARGO) test --workspace --all-features
+
+doc: galaxy-doc
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --all-features --no-deps
+
+# Galaxy renderer
+galaxy-wasm:
+	RUSTFLAGS="" $(WASM_PACK) build $(GALAXY_RENDERER_DIR) --target web --out-dir $(GALAXY_WASM_OUT) --release --locked
+
+galaxy-fmt:
+	$(CARGO) fmt --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml
+
+galaxy-fmt-check:
+	$(CARGO) fmt --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml -- --check
+
+galaxy-lint:
+	RUSTFLAGS="" $(CARGO) clippy --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+galaxy-doc:
+	RUSTFLAGS="" RUSTDOCFLAGS="-D warnings" $(CARGO) doc --manifest-path $(GALAXY_RENDERER_DIR)/Cargo.toml --target wasm32-unknown-unknown --no-deps
+
+galaxy-check: galaxy-fmt-check galaxy-lint galaxy-doc galaxy-wasm
+
+# Web frontend
 web-fmt:
 	$(NPM) --prefix $(WEB_DIR) run format
 
@@ -95,8 +162,9 @@ web-fmt-check:
 	$(NPM) --prefix $(WEB_DIR) run format:check
 
 web-check:
-	$(NPM) --prefix $(WEB_DIR) run check
+	RUSTFLAGS="" $(NPM) --prefix $(WEB_DIR) run check
 
+# Desktop application
 desktop-fmt:
 	$(NPM) --prefix $(WEB_DIR) exec -- prettier --write \
 	  "apps/desktop/package.json" "apps/desktop/README.md" "apps/desktop/scripts/*.mjs" \
@@ -123,18 +191,7 @@ desktop-dev:
 desktop-build:
 	$(NPM) --prefix $(DESKTOP_DIR) run build
 
-lint:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
-
-check-all:
-	$(CARGO) check --all-features --all-targets
-
-test:
-	$(CARGO) test --all-features
-
-doc:
-	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --all-features --no-deps
-
+# Documentation and policy
 docs-reference-sync:
 	@test -x "$(DOCS_CRAWLER_PYTHON)" || { \
 	  printf '%s\n' "Missing crawler virtualenv: $(DOCS_CRAWLER_PYTHON)" \
@@ -144,18 +201,39 @@ docs-reference-sync:
 	}
 	$(DOCS_CRAWLER_PYTHON) $(DOCS_CRAWLER_DIR)/crawl_replicant_docs.py --refresh
 
+docs-crawler-check:
+	@test -x "$(DOCS_CRAWLER_PYTHON)" || { \
+	  printf '%s\n' "Missing crawler virtualenv: $(DOCS_CRAWLER_PYTHON)" \
+	    "Create it with: python3 -m venv $(DOCS_CRAWLER_DIR)/venv" \
+	    "Then install: $(DOCS_CRAWLER_PYTHON) -m pip install -r $(DOCS_CRAWLER_DIR)/requirements.txt"; \
+	  exit 1; \
+	}
+	cd $(DOCS_CRAWLER_DIR) && $(abspath $(DOCS_CRAWLER_PYTHON)) -m unittest discover -p 'test_*.py'
+
 contract-policy-check:
 	$(PYTHON) scripts/contract_policy_check.py
 
-policy-checks: contract-policy-check
+coverage-audit-check:
+	$(PYTHON) scripts/coverage_audit.py check
+
+mutation-adapter-policy-check:
+	$(PYTHON) scripts/mutation_adapter_policy_check.py
+
+package-contents-check:
+	$(PYTHON) scripts/package_contents_check.py
+
+policy-tests:
+	$(PYTHON) scripts/test_contract_coverage.py
+
+policy-checks: contract-policy-check coverage-audit-check mutation-adapter-policy-check \
+  package-contents-check policy-tests
 	$(PYTHON) scripts/contract_coverage_check.py
 	$(PYTHON) scripts/forward_compatibility_policy_check.py
 	$(PYTHON) scripts/raw_transport_policy_check.py
 	$(PYTHON) scripts/schema_policy_check.py
 	$(PYTHON) scripts/authority_matrix_check.py
 
-ci: desktop-prepare lint test check-all doc policy-checks web-check desktop-check
-
+# Deployment and observability
 docker-artifacts:
 	$(CARGO) build --locked --release -p replicant-server --bin replicantd
 	$(NPM) --prefix $(WEB_DIR) ci
@@ -209,6 +287,7 @@ docker-persistence-smoke: docker-build
 	$(DOCKER_COMPOSE) run --rm --no-deps --entrypoint sh replicantd \
 	  -c 'test "$$(cat /var/lib/replicant/.persistence-smoke)" = persisted'
 
+# Utilities
 zip:
 	$(PYTHON) scripts/repo_zip.py $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
 

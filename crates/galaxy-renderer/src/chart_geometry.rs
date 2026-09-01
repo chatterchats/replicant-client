@@ -1,4 +1,7 @@
-use crate::chart_types::{GlColoredSphereCenter, GlInfluenceCenter, GlLink, GlPulse, GlSignal, GlStar, TravelRouteLeg, Vec3};
+use crate::chart_types::{
+    GlColoredSphereCenter, GlInfluenceCenter, GlLink, GlPulse, GlSignal, GlStar, TravelRouteLeg,
+    Vec3,
+};
 use js_sys::Date;
 use wasm_bindgen::JsValue;
 
@@ -24,24 +27,16 @@ pub fn build_line_vertices(links: &[GlLink], now_ms: f64) -> Vec<f32> {
             if progress > 0.0 {
                 push_line(
                     &mut vertices,
-                    link.from.x,
-                    link.from.y,
-                    link.from.z,
-                    mid_x,
-                    mid_y,
-                    mid_z,
+                    [link.from.x, link.from.y, link.from.z],
+                    [mid_x, mid_y, mid_z],
                     [0.36, 0.95, 0.88, 0.82],
                 );
             }
             if progress < 1.0 {
                 push_line(
                     &mut vertices,
-                    mid_x,
-                    mid_y,
-                    mid_z,
-                    link.to.x,
-                    link.to.y,
-                    link.to.z,
+                    [mid_x, mid_y, mid_z],
+                    [link.to.x, link.to.y, link.to.z],
                     [0.36, 0.95, 0.88, 0.22],
                 );
             }
@@ -55,12 +50,8 @@ pub fn build_line_vertices(links: &[GlLink], now_ms: f64) -> Vec<f32> {
         if link.relay {
             push_line(
                 &mut vertices,
-                link.from.x,
-                link.from.y,
-                link.from.z,
-                link.to.x,
-                link.to.y,
-                link.to.z,
+                [link.from.x, link.from.y, link.from.z],
+                [link.to.x, link.to.y, link.to.z],
                 [0.4, 0.72, 1.0, 0.88],
             );
             continue;
@@ -68,12 +59,8 @@ pub fn build_line_vertices(links: &[GlLink], now_ms: f64) -> Vec<f32> {
         if link.exploration_route {
             push_line(
                 &mut vertices,
-                link.from.x,
-                link.from.y,
-                link.from.z,
-                link.to.x,
-                link.to.y,
-                link.to.z,
+                [link.from.x, link.from.y, link.from.z],
+                [link.to.x, link.to.y, link.to.z],
                 [0.72, 0.9, 1.0, 0.68],
             );
             continue;
@@ -86,12 +73,8 @@ pub fn build_line_vertices(links: &[GlLink], now_ms: f64) -> Vec<f32> {
         };
         push_line(
             &mut vertices,
-            link.from.x,
-            link.from.y,
-            link.from.z,
-            link.to.x,
-            link.to.y,
-            link.to.z,
+            [link.from.x, link.from.y, link.from.z],
+            [link.to.x, link.to.y, link.to.z],
             color,
         );
     }
@@ -116,7 +99,14 @@ pub fn build_star_point_vertices(stars: &[GlStar]) -> Vec<f32> {
             continue;
         }
         if star.current {
-            push_point(&mut vertices, star.x, star.y, star.z, [0.26, 0.83, 0.78, 0.16], 34.0);
+            push_point(
+                &mut vertices,
+                star.x,
+                star.y,
+                star.z,
+                [0.26, 0.83, 0.78, 0.16],
+                34.0,
+            );
             match star.exploration.as_str() {
                 "explored" => {
                     push_star_explored_layers(&mut vertices, star, 28.0, 20.0);
@@ -173,9 +163,30 @@ pub fn build_star_point_vertices(stars: &[GlStar]) -> Vec<f32> {
 pub fn build_signal_point_vertices(signals: &[GlSignal]) -> Vec<f32> {
     let mut vertices = Vec::new();
     for signal in signals {
-        push_point(&mut vertices, signal.x, signal.y, signal.z, [0.92, 0.38, 1.0, 0.2], 40.0);
-        push_point(&mut vertices, signal.x, signal.y, signal.z, [0.98, 0.55, 1.0, 0.68], 26.0);
-        push_point(&mut vertices, signal.x, signal.y, signal.z, [1.0, 0.92, 1.0, 0.96], 14.0);
+        push_point(
+            &mut vertices,
+            signal.x,
+            signal.y,
+            signal.z,
+            [0.92, 0.38, 1.0, 0.2],
+            40.0,
+        );
+        push_point(
+            &mut vertices,
+            signal.x,
+            signal.y,
+            signal.z,
+            [0.98, 0.55, 1.0, 0.68],
+            26.0,
+        );
+        push_point(
+            &mut vertices,
+            signal.x,
+            signal.y,
+            signal.z,
+            [1.0, 0.92, 1.0, 0.96],
+            14.0,
+        );
     }
     vertices
 }
@@ -222,20 +233,14 @@ pub const INFLUENCE_SPHERE_RADIUS_LY: f32 = 3.75;
 pub const PULSE_SPHERE_RADIUS_LY: f32 = 2.5;
 const INFLUENCE_LAT_SEGMENTS: u32 = 12;
 const INFLUENCE_LON_SEGMENTS: u32 = 20;
-const INFLUENCE_SHELL_LAYERS: [(f32, f32); 4] = [
-    (1.0, 0.04),
-    (0.78, 0.028),
-    (0.56, 0.018),
-    (0.34, 0.01),
-];
-const PULSE_SHELL_LAYERS: [(f32, f32); 4] = [
-    (1.0, 0.16),
-    (0.78, 0.11),
-    (0.56, 0.07),
-    (0.34, 0.04),
-];
+const INFLUENCE_SHELL_LAYERS: [(f32, f32); 4] =
+    [(1.0, 0.04), (0.78, 0.028), (0.56, 0.018), (0.34, 0.01)];
+const PULSE_SHELL_LAYERS: [(f32, f32); 4] = [(1.0, 0.16), (0.78, 0.11), (0.56, 0.07), (0.34, 0.04)];
 
-pub fn build_colored_sphere_geometry(centers: &[GlColoredSphereCenter], radius: f32) -> InfluenceSphereGeometry {
+pub fn build_colored_sphere_geometry(
+    centers: &[GlColoredSphereCenter],
+    radius: f32,
+) -> InfluenceSphereGeometry {
     let mut vertices = Vec::new();
 
     for center in centers {
@@ -290,6 +295,7 @@ fn push_influence_sphere_shell(
     if radius <= 0.0 || alpha <= 0.0 {
         return;
     }
+    let color = [r, g, blue, alpha];
 
     let lat_n = INFLUENCE_LAT_SEGMENTS;
     let lon_n = INFLUENCE_LON_SEGMENTS;
@@ -324,7 +330,7 @@ fn push_influence_sphere_shell(
     for lon in 0..lon_n {
         let a = positions[ring_one + lon as usize];
         let b = positions[ring_one + ((lon + 1) % lon_n) as usize];
-        push_influence_triangle(vertices, north, a, b, r, g, blue, alpha);
+        push_influence_triangle(vertices, north, a, b, color);
     }
 
     for lat in 1..lat_n - 1 {
@@ -336,8 +342,8 @@ fn push_influence_sphere_shell(
             let v01 = positions[curr + lon_next as usize];
             let v10 = positions[next + lon as usize];
             let v11 = positions[next + lon_next as usize];
-            push_influence_triangle(vertices, v00, v01, v11, r, g, blue, alpha);
-            push_influence_triangle(vertices, v00, v11, v10, r, g, blue, alpha);
+            push_influence_triangle(vertices, v00, v01, v11, color);
+            push_influence_triangle(vertices, v00, v11, v10, color);
         }
     }
 
@@ -346,7 +352,7 @@ fn push_influence_sphere_shell(
     for lon in 0..lon_n {
         let a = positions[last_ring + lon as usize];
         let b = positions[last_ring + ((lon + 1) % lon_n) as usize];
-        push_influence_triangle(vertices, south, b, a, r, g, blue, alpha);
+        push_influence_triangle(vertices, south, b, a, color);
     }
 }
 
@@ -355,18 +361,17 @@ fn push_influence_triangle(
     a: (f32, f32, f32),
     b: (f32, f32, f32),
     c: (f32, f32, f32),
-    r: f32,
-    g: f32,
-    blue: f32,
-    alpha: f32,
+    color: Rgba,
 ) {
-    push_influence_vertex(vertices, a.0, a.1, a.2, r, g, blue, alpha);
-    push_influence_vertex(vertices, b.0, b.1, b.2, r, g, blue, alpha);
-    push_influence_vertex(vertices, c.0, c.1, c.2, r, g, blue, alpha);
+    push_influence_vertex(vertices, a, color);
+    push_influence_vertex(vertices, b, color);
+    push_influence_vertex(vertices, c, color);
 }
 
-fn push_influence_vertex(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, r: f32, g: f32, b: f32, a: f32) {
-    vertices.extend_from_slice(&[x, y, z, r, g, b, a]);
+fn push_influence_vertex(vertices: &mut Vec<f32>, position: (f32, f32, f32), color: Rgba) {
+    vertices.extend_from_slice(&[
+        position.0, position.1, position.2, color[0], color[1], color[2], color[3],
+    ]);
 }
 
 fn resolve_travel_route_progress(link: &GlLink, now_ms: f64) -> f32 {
@@ -378,7 +383,8 @@ fn resolve_travel_route_progress(link: &GlLink, now_ms: f64) -> f32 {
     }
     let started = link.travel_started_at.as_ref().unwrap();
     let ends = link.travel_ends_at.as_ref().unwrap();
-    let Some(active) = resolve_active_route_leg(&link.travel_route_legs, started, ends, now_ms) else {
+    let Some(active) = resolve_active_route_leg(&link.travel_route_legs, started, ends, now_ms)
+    else {
         return 0.0;
     };
     let leg_index = link.travel_route_leg_index.unwrap_or(-1);
@@ -443,7 +449,11 @@ fn resolve_active_route_leg(
 
 fn parse_time_ms(value: &str) -> Option<f64> {
     let ms = Date::new(&JsValue::from_str(value)).get_time();
-    if ms.is_nan() { None } else { Some(ms) }
+    if ms.is_nan() {
+        None
+    } else {
+        Some(ms)
+    }
 }
 
 fn build_travel_chevrons(vertices: &mut Vec<f32>, link: &GlLink, progress: f32, time_sec: f32) {
@@ -496,22 +506,22 @@ fn build_travel_chevrons(vertices: &mut Vec<f32>, link: &GlLink, progress: f32, 
 
         push_line(
             vertices,
-            bk_x + perp_x * CHEVRON_WING,
-            bk_y + perp_y * CHEVRON_WING,
-            bk_z + perp_z * CHEVRON_WING,
-            tip_x,
-            tip_y,
-            tip_z,
+            [
+                bk_x + perp_x * CHEVRON_WING,
+                bk_y + perp_y * CHEVRON_WING,
+                bk_z + perp_z * CHEVRON_WING,
+            ],
+            [tip_x, tip_y, tip_z],
             color,
         );
         push_line(
             vertices,
-            bk_x - perp_x * CHEVRON_WING,
-            bk_y - perp_y * CHEVRON_WING,
-            bk_z - perp_z * CHEVRON_WING,
-            tip_x,
-            tip_y,
-            tip_z,
+            [
+                bk_x - perp_x * CHEVRON_WING,
+                bk_y - perp_y * CHEVRON_WING,
+                bk_z - perp_z * CHEVRON_WING,
+            ],
+            [tip_x, tip_y, tip_z],
             color,
         );
     }
@@ -530,9 +540,17 @@ fn push_relay_coverage_gap(vertices: &mut Vec<f32>, link: &GlLink) {
         z: dz / length,
     };
     let reference = if dir.y.abs() < 0.9 {
-        Vec3 { x: 0.0, y: 1.0, z: 0.0 }
+        Vec3 {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        }
     } else {
-        Vec3 { x: 1.0, y: 0.0, z: 0.0 }
+        Vec3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        }
     };
     let side = normalize_vec(cross(&dir, &reference));
     let up = normalize_vec(cross(&dir, &side));
@@ -587,12 +605,16 @@ fn push_offset_line(
 ) {
     push_line(
         vertices,
-        from.x + axis.x * offset,
-        from.y + axis.y * offset,
-        from.z + axis.z * offset,
-        to.x + axis.x * offset,
-        to.y + axis.y * offset,
-        to.z + axis.z * offset,
+        [
+            from.x + axis.x * offset,
+            from.y + axis.y * offset,
+            from.z + axis.z * offset,
+        ],
+        [
+            to.x + axis.x * offset,
+            to.y + axis.y * offset,
+            to.z + axis.z * offset,
+        ],
         color,
     );
 }
@@ -606,12 +628,16 @@ fn push_centered_line(
 ) {
     push_line(
         vertices,
-        center.x - axis.x * half_length,
-        center.y - axis.y * half_length,
-        center.z - axis.z * half_length,
-        center.x + axis.x * half_length,
-        center.y + axis.y * half_length,
-        center.z + axis.z * half_length,
+        [
+            center.x - axis.x * half_length,
+            center.y - axis.y * half_length,
+            center.z - axis.z * half_length,
+        ],
+        [
+            center.x + axis.x * half_length,
+            center.y + axis.y * half_length,
+            center.z + axis.z * half_length,
+        ],
         color,
     );
 }
@@ -633,7 +659,9 @@ fn cross(left: &Vec3, right: &Vec3) -> Vec3 {
 }
 
 fn normalize_vec(vector: Vec3) -> Vec3 {
-    let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt().max(1.0);
+    let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z)
+        .sqrt()
+        .max(1.0);
     Vec3 {
         x: vector.x / length,
         y: vector.y / length,
@@ -658,9 +686,30 @@ fn sub(left: &Vec3, right: &Vec3) -> Vec3 {
 }
 
 fn push_hub_marker(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, is_current: bool) {
-    push_point(vertices, x, y, z, [0.1, 0.96, 0.86, 0.24], if is_current { 46.0 } else { 42.0 });
-    push_point(vertices, x, y, z, [0.98, 0.82, 0.34, 0.36], if is_current { 34.0 } else { 30.0 });
-    push_point(vertices, x, y, z, [1.0, 0.97, 0.78, 0.95], if is_current { 20.0 } else { 18.0 });
+    push_point(
+        vertices,
+        x,
+        y,
+        z,
+        [0.1, 0.96, 0.86, 0.24],
+        if is_current { 46.0 } else { 42.0 },
+    );
+    push_point(
+        vertices,
+        x,
+        y,
+        z,
+        [0.98, 0.82, 0.34, 0.36],
+        if is_current { 34.0 } else { 30.0 },
+    );
+    push_point(
+        vertices,
+        x,
+        y,
+        z,
+        [1.0, 0.97, 0.78, 0.95],
+        if is_current { 20.0 } else { 18.0 },
+    );
 }
 
 fn push_megastructure_marker(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, is_current: bool) {
@@ -682,18 +731,11 @@ fn push_megastructure_marker(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, is
     );
 }
 
-fn push_line(
-    vertices: &mut Vec<f32>,
-    x1: f32,
-    y1: f32,
-    z1: f32,
-    x2: f32,
-    y2: f32,
-    z2: f32,
-    color: Rgba,
-) {
-    vertices.extend_from_slice(&[x1, y1, z1, color[0], color[1], color[2], color[3]]);
-    vertices.extend_from_slice(&[x2, y2, z2, color[0], color[1], color[2], color[3]]);
+fn push_line(vertices: &mut Vec<f32>, from: [f32; 3], to: [f32; 3], color: Rgba) {
+    vertices.extend_from_slice(&[
+        from[0], from[1], from[2], color[0], color[1], color[2], color[3],
+    ]);
+    vertices.extend_from_slice(&[to[0], to[1], to[2], color[0], color[1], color[2], color[3]]);
 }
 
 fn push_point(vertices: &mut Vec<f32>, x: f32, y: f32, z: f32, color: Rgba, size: f32) {
@@ -715,7 +757,14 @@ fn push_undiscovered_layers(vertices: &mut Vec<f32>, star: &GlStar, outer: f32, 
 
 fn push_star_explored_layers(vertices: &mut Vec<f32>, star: &GlStar, outer: f32, inner: f32) {
     if star.is_relay {
-        push_point(vertices, star.x, star.y, star.z, [0.4, 0.72, 1.0, 0.24], outer);
+        push_point(
+            vertices,
+            star.x,
+            star.y,
+            star.z,
+            [0.4, 0.72, 1.0, 0.24],
+            outer,
+        );
         push_point(
             vertices,
             star.x,
@@ -740,8 +789,22 @@ fn push_star_explored_layers(vertices: &mut Vec<f32>, star: &GlStar, outer: f32,
 
 fn push_star_partial_layers(vertices: &mut Vec<f32>, star: &GlStar, outer: f32, inner: f32) {
     if star.is_relay {
-        push_point(vertices, star.x, star.y, star.z, [0.4, 0.72, 1.0, 0.2], outer);
-        push_point(vertices, star.x, star.y, star.z, relay_star_rgba(star), inner);
+        push_point(
+            vertices,
+            star.x,
+            star.y,
+            star.z,
+            [0.4, 0.72, 1.0, 0.2],
+            outer,
+        );
+        push_point(
+            vertices,
+            star.x,
+            star.y,
+            star.z,
+            relay_star_rgba(star),
+            inner,
+        );
         return;
     }
     let spectral = spectral_star_rgba(star, 0.92);

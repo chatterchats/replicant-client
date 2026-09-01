@@ -1,3 +1,5 @@
+//! Finite execution protocol serialization coverage.
+
 use replicant_protocol::{
     EntityId, EntityKind, EntityRef, FiniteExecution, FiniteExecutionStatus, OperationClass,
     OperationKind, ResultSummary,

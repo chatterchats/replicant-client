@@ -232,7 +232,7 @@ async fn select_replicant(
     }
 
     if let Some(requested) = requested {
-        return Ok(resolve_trade_viewer(&replicants, requested)?);
+        return resolve_trade_viewer(&replicants, requested);
     }
 
     let default_index = replicants
