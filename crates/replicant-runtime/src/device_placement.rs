@@ -655,6 +655,11 @@ fn append_unique(
 mod tests {
     use super::*;
     use replicant_client::{DeviceCommand, DeviceId, DeviceKey, LocationKey, ReplicantKey};
+    type PlacementMaps = (
+        BTreeMap<String, BTreeSet<String>>,
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+    );
 
     fn device(code: &str, kind: &str, status: &str) -> Device {
         Device {
@@ -713,11 +718,7 @@ mod tests {
         classify_device_placement(candidate, &placement_context)
     }
 
-    fn maps() -> (
-        BTreeMap<String, BTreeSet<String>>,
-        BTreeMap<String, String>,
-        BTreeMap<String, String>,
-    ) {
+    fn maps() -> PlacementMaps {
         (
             BTreeMap::from([("north".to_owned(), BTreeSet::from(["HOME".to_owned()]))]),
             BTreeMap::from([

@@ -2494,10 +2494,12 @@ mod tests {
 
     #[test]
     fn placement_projection_failed_emits_only_unfinished_custody() {
-        let mut state = AsteroidDiversionItemCheckpoint::default();
-        state.claimed_propulsors = BTreeSet::from(["prop-1".to_owned(), "prop-2".to_owned()]);
-        state.delivered.insert("prop-2".to_owned());
-        state.deployed.insert("prop-3".to_owned());
+        let state = AsteroidDiversionItemCheckpoint {
+            claimed_propulsors: BTreeSet::from(["prop-1".to_owned(), "prop-2".to_owned()]),
+            delivered: BTreeSet::from(["prop-2".to_owned()]),
+            deployed: BTreeSet::from(["prop-3".to_owned()]),
+            ..AsteroidDiversionItemCheckpoint::default()
+        };
         let projection = core_projection(replicant_workflow::WorkflowStatus::Failed, state);
         assert_eq!(projection.intents.len(), 2);
         assert!(
