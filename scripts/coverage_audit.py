@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Replicant Space 2.5.1 coverage-audit worklist and validator."""
+"""Deterministic Replicant Space 2.5.2 coverage audit and validator."""
 
 from __future__ import annotations
 
@@ -15,23 +15,42 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT = ROOT / "reference" / "replicant-space-2-5-1"
+SNAPSHOT = ROOT / "reference" / "replicant-space-2-5-2"
 OPENAPI = SNAPSHOT / "openapi.json"
 MANIFEST = SNAPSHOT / "manifest.json"
 CATALOGUE = SNAPSHOT / "api" / "events" / "catalogue" / "index.md"
 METADATA = ROOT / "policy" / "contract-metadata.json"
-AUDIT = ROOT / "audit" / "2.5.1"
+AUDIT = ROOT / "audit" / "2.5.2"
 WORKLIST = AUDIT / "worklist.jsonl"
 DOC_PAGES = AUDIT / "doc-pages.jsonl"
 MERGED = AUDIT / "merged.jsonl"
-REPORT = ROOT / "AUDIT-2.5.1.md"
-
+REPORT = ROOT / "AUDIT-2.5.2.md"
 METHODS = {"get", "post", "put", "patch", "delete"}
 KINDS = ("operation", "schema", "event")
 VERDICTS = ("covered", "partial", "missing", "drift", "n/a")
+DOC_ONLY_FIELDS = {
+    "schema:app_schemas_locations_LocationResponseSchema": {
+        "/properties/atmosphere":
+            "reference/replicant-space-2-5-2/api/locations/index.md:78",
+        "/properties/has_atmosphere":
+            "reference/replicant-space-2-5-2/changelog/index.md:66",
+        "/properties/code": "reference/replicant-space-2-5-2/api/locations/index.md:73",
+        "/properties/parent": "reference/replicant-space-2-5-2/api/locations/index.md:76",
+        "/properties/surveyed": "reference/replicant-space-2-5-2/api/locations/index.md:77",
+        "/properties/system": "reference/replicant-space-2-5-2/api/locations/index.md:75",
+        "/properties/your_devices":
+            "reference/replicant-space-2-5-2/api/locations/index.md:83",
+        "/properties/your_resources":
+            "reference/replicant-space-2-5-2/api/locations/index.md:84",
+    },
+    "schema:flask_smorest_error_handler_ErrorSchema": {
+        "/properties/error": "reference/replicant-space-2-5-2/errors/index.md:19",
+    },
+}
+
 
 SLICES = (
-    (1, "01-changelog-2.5.1"),
+    (1, "01-changelog-2.5.2"),
     (2, "02-accounts-achievements"),
     (3, "03-replicants-travel-mining-printing"),
     (4, "04-devices"),
@@ -163,6 +182,26 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 def pointer_part(value: str) -> str:
     return value.replace("~", "~0").replace("/", "~1")
+def schema_field_pointers(schema: Any, path: str = "") -> set[str]:
+    pointers: set[str] = set()
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for name, value in properties.items():
+                pointer = f"{path}/properties/{pointer_part(name)}"
+                pointers.add(pointer)
+                pointers.update(schema_field_pointers(value, pointer))
+        for key, value in schema.items():
+            if key != "properties":
+                pointers.update(schema_field_pointers(value, f"{path}/{pointer_part(key)}"))
+    elif isinstance(schema, list):
+        for index, value in enumerate(schema):
+            pointers.update(schema_field_pointers(value, f"{path}/{index}"))
+    return pointers
+
+
+
+
 
 
 def read_json(path: Path) -> Any:
@@ -213,13 +252,16 @@ def validate_sources() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, A
     if manifest.get("page_count") != 87:
         fail(f"manifest page_count is {manifest.get('page_count')!r}, expected 87")
     digest = hashlib.sha256(OPENAPI.read_bytes()).hexdigest()
-    expected_digest = "732314ad27f9d1e488bf232717a4a109e793afce34d9db0468ed1b5f2eef72c1"
+    expected_digest = "df5f74046e95678f54161b930af6d8b1abbe4b07b1718e485b5a4d46f6757639"
     if metadata.get("openapi_sha256") != expected_digest or digest != expected_digest:
-        fail(f"openapi SHA-256 mismatch: expected {expected_digest}, got {digest}")
+        fail(
+            "openapi SHA-256 mismatch: "
+            f"metadata {metadata.get('openapi_sha256')}, expected {expected_digest}, got {digest}"
+        )
     expected_metadata = {
-        "replicant_space_version": "2.5.1",
-        "documentation_version": "2.5.1",
-        "openapi_version": "2.5.1",
+        "replicant_space_version": "2.5.2",
+        "documentation_version": "2.5.2",
+        "openapi_version": "2.5.2",
         "openapi_path_count": 75,
         "openapi_operation_count": 89,
         "openapi_schema_count": 160,
@@ -377,7 +419,7 @@ def evidence_path(value: Any) -> tuple[Path, int]:
     if path.is_absolute() or ".." in path.parts:
         fail(f"evidence is not repository-relative: {value!r}")
     normalized = path.as_posix()
-    if normalized == "AUDIT-2.5.1.md" or normalized.startswith("audit/2.5.1/"):
+    if normalized.startswith("AUDIT-") or normalized.startswith("audit/"):
         fail(f"evidence points into generated audit output: {value!r}")
     target = ROOT / path
     if not target.is_file():
@@ -386,9 +428,16 @@ def evidence_path(value: Any) -> tuple[Path, int]:
     if line_number > len(target.read_bytes().splitlines()):
         fail(f"evidence line is out of range: {value!r}")
     return target, line_number
-def validate_result_row(row: Any, expected_unit: str, location: str) -> dict[str, Any]:
-    if not isinstance(row, dict) or set(row) != {"unit", "verdict", "client_symbol", "evidence", "notes"}:
-        fail(f"{location}: result row must have exactly the five contract keys")
+def validate_result_row(
+    row: Any,
+    expected_unit: str,
+    expected_fields: set[str] | None,
+    location: str,
+) -> dict[str, Any]:
+    base_keys = {"unit", "verdict", "client_symbol", "evidence", "notes"}
+    expected_keys = base_keys | ({"field_verdicts"} if expected_fields is not None else set())
+    if not isinstance(row, dict) or set(row) != expected_keys:
+        fail(f"{location}: result row keys differ from the required contract")
     if row["unit"] != expected_unit:
         fail(f"{location}: expected unit {expected_unit!r}, got {row['unit']!r}")
     verdict = row["verdict"]
@@ -413,12 +462,47 @@ def validate_result_row(row: Any, expected_unit: str, location: str) -> dict[str
         notes,
     ):
         fail(f"{location}: source disagreement notes must cite a repository path:line")
-    evidence_path(row["evidence"])
+    row_evidence = row["evidence"]
+    if isinstance(row_evidence, list):
+        if not row_evidence:
+            fail(f"{location}: row has no evidence")
+        for locator in row_evidence:
+            evidence_path(locator)
+    else:
+        evidence_path(row_evidence)
+    if expected_fields is not None:
+        field_verdicts = row["field_verdicts"]
+        if not isinstance(field_verdicts, dict) or set(field_verdicts) != expected_fields:
+            fail(f"{location}: field_verdicts must exhaustively match the schema properties")
+        for pointer, field_result in field_verdicts.items():
+            if not isinstance(field_result, dict) or set(field_result) != {"verdict", "evidence"}:
+                fail(f"{location}: {pointer} must have verdict and evidence")
+            if field_result["verdict"] not in VERDICTS:
+                fail(f"{location}: {pointer} has invalid verdict {field_result['verdict']!r}")
+            evidence = field_result["evidence"]
+            if isinstance(evidence, list):
+                if not evidence:
+                    fail(f"{location}: {pointer} has no evidence")
+                for locator in evidence:
+                    evidence_path(locator)
+            else:
+                evidence_path(evidence)
     return row
 
 
 def validate_results(worklist: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_slice = {number: [row["unit"] for row in worklist if row["slice"] == number] for number, _ in SLICES}
+    schemas = read_json(OPENAPI)["components"]["schemas"]
+    fields_by_unit = {
+        f"schema:{name}": schema_field_pointers(schema)
+        for name, schema in schemas.items()
+    }
+    for unit, fields in DOC_ONLY_FIELDS.items():
+        if unit not in fields_by_unit:
+            fail(f"docs-only fields reference unknown schema unit {unit!r}")
+        fields_by_unit[unit].update(fields)
+        for evidence in fields.values():
+            evidence_path(evidence)
     all_rows = []
     seen: set[str] = set()
     for number, stem in SLICES:
@@ -432,7 +516,7 @@ def validate_results(worklist: list[dict[str, Any]]) -> list[dict[str, Any]]:
             fail(f"{result_path.relative_to(ROOT)}: expected {len(expected)} rows, got {len(parsed)}")
         for index, ((line_number, raw), unit) in enumerate(zip(parsed, expected), 1):
             location = f"{result_path.relative_to(ROOT)}:{line_number}"
-            row = validate_result_row(raw, unit, location)
+            row = validate_result_row(raw, unit, fields_by_unit.get(unit), location)
             if unit in seen:
                 fail(f"duplicate unit {unit}")
             seen.add(unit)
@@ -450,21 +534,23 @@ def validate_results(worklist: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def validate_calibration(rows: list[dict[str, Any]]) -> None:
     by_unit = {row["unit"]: row for row in rows}
-    for unit in (
-        "event:hub.maintained",
-        "event:hub.warning",
-        "event:multiplayer.replicant_entered",
-        "event:multiplayer.replicant_left",
-    ):
+    event_evidence = {
+        "event:hub.maintained": "src/events.rs:532",
+        "event:hub.warning": "src/events.rs:533",
+        "event:multiplayer.replicant_entered": "src/events.rs:539",
+        "event:multiplayer.replicant_left": "src/events.rs:540",
+    }
+    for unit, evidence in event_evidence.items():
         row = by_unit[unit]
-        if row["verdict"] != "missing" or row["evidence"] != "src/raw/vocab.rs:74":
-            fail(f"calibration mismatch for {unit}: expected missing at src/raw/vocab.rs:74")
+        if row["verdict"] != "covered" or row["evidence"] != evidence:
+            fail(f"calibration mismatch for {unit}: expected covered at {evidence}")
     location = by_unit["schema:app_schemas_locations_LocationResponseSchema"]
     location_note = location["notes"].lower()
     if (
         location["verdict"] != "drift"
-        or location["client_symbol"] != "replicant_client::raw::locations::PlanetaryBody::atmosphere"
-        or location["evidence"] != "src/raw/locations.rs:52"
+        or location["client_symbol"] != "replicant_client::raw::locations::Location"
+        or location["evidence"]
+        != ["src/raw/locations.rs:80", "reference/replicant-space-2-5-2/api/locations/index.md:78"]
         or "boolean" not in location_note
         or "atmosphere" not in location_note
         or "option<string>" not in location_note
@@ -473,6 +559,8 @@ def validate_calibration(rows: list[dict[str, Any]]) -> None:
 
 
 def md(value: Any) -> str:
+    if isinstance(value, list):
+        value = "<br>".join(value)
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
@@ -494,7 +582,7 @@ def render_report(worklist: list[dict[str, Any]], rows: list[dict[str, Any]], di
     }
     disagreements = [row for row in ordered if row["notes"].startswith("Source disagreement:")]
     lines = [
-        "# Replicant Space 2.5.1 Coverage Audit",
+        "# Replicant Space 2.5.2 Contract Unit Audit",
         "",
         "## Verdict summary",
         "",
@@ -529,13 +617,13 @@ def render_report(worklist: list[dict[str, Any]], rows: list[dict[str, Any]], di
             "",
             "## Source snapshot",
             "",
-            "- Snapshot: `reference/replicant-space-2-5-1/`",
+            "- Snapshot: `reference/replicant-space-2-5-2/`",
             f"- OpenAPI SHA-256: `{digest}`",
             "- Counts: 75 paths, 89 operations, 160 schemas, 79 catalogue events, 87 rendered pages, 328 worklist units.",
             "",
             "## Methodology",
             "",
-            "OpenAPI is authoritative, followed by the 87-page rendered markdown mirror, then the v2.5.1 changelog. Source disagreements remain `drift` findings. `covered` requires the complete public transport or representation; `partial` records an incomplete symbol; `missing` records no public implementation; `n/a` is reserved for a concrete player-facing exclusion.",
+            "OpenAPI is authoritative, followed by the 87-page rendered markdown mirror, then the v2.5.2 changelog. Source disagreements remain `drift` findings. `covered` requires the complete public transport or representation; `partial` records an incomplete symbol; `missing` records no public implementation; `n/a` is reserved for a concrete player-facing exclusion.",
             "",
             "## Fixed slices",
             "",
@@ -553,19 +641,19 @@ def render_report(worklist: list[dict[str, Any]], rows: list[dict[str, Any]], di
     lines.extend(
         [
             "",
-            "## Changelog-only observation",
+            "## Changelog delta adjudication",
             "",
-            "The v2.5.1 changelog's Bill narrative is a changelog-only observation, not a wire operation, schema, or catalogue event, so it is intentionally excluded from the generated worklist (`reference/replicant-space-2-5-1/changelog/index.md:13`).",
+            "The v2.5.2 changelog documents the event-catalogue field additions (`reference/replicant-space-2-5-2/changelog/index.md:26`) and separately lists reactive AMI Mining Controller re-evaluation, account-wipe and webhook behavior, compacted-device capacity, both event payload fields, notification deduplication, and BobNet chatter changes (`reference/replicant-space-2-5-2/changelog/index.md:30-37`). The wire-visible webhook and event payload deltas are adjudicated in their schema and event rows; the remaining server-behavior changes introduce no operation, schema, or catalogue-event unit and are therefore excluded from the generated worklist.",
             "",
             "## Artifacts",
             "",
-            "- [`audit/2.5.1/doc-pages.jsonl`](audit/2.5.1/doc-pages.jsonl)",
-            "- [`audit/2.5.1/worklist.jsonl`](audit/2.5.1/worklist.jsonl)",
-            "- [`audit/2.5.1/merged.jsonl`](audit/2.5.1/merged.jsonl)",
+            "- [`audit/2.5.2/doc-pages.jsonl`](audit/2.5.2/doc-pages.jsonl)",
+            "- [`audit/2.5.2/worklist.jsonl`](audit/2.5.2/worklist.jsonl)",
+            "- [`audit/2.5.2/merged.jsonl`](audit/2.5.2/merged.jsonl)",
         ]
     )
     for _number, stem in SLICES:
-        lines.append(f"- [`audit/2.5.1/results/{stem}.jsonl`](audit/2.5.1/results/{stem}.jsonl)")
+        lines.append(f"- [`audit/2.5.2/results/{stem}.jsonl`](audit/2.5.2/results/{stem}.jsonl)")
     lines.extend(["", "## Appendix: covered rows", "", "| Unit | Client symbol | Evidence |", "|---|---|---|"])
     for row in findings.get("covered", []):
         lines.append(f"| `{md(row['unit'])}` | `{md(row['client_symbol'])}` | `{md(row['evidence'])}` |")
