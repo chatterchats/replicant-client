@@ -963,6 +963,7 @@ impl OperationCatalogue {
                     systems: csv(parameters.systems_csv),
                     region: parameters.region,
                     hub: parameters.hub,
+                    transport_routes: Vec::new(),
                     mission_file: parameters.mission_file,
                     wait_timeout_seconds: parameters.wait_timeout_seconds,
                     max_concurrency: parameters.max_concurrency,
@@ -2659,9 +2660,9 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
         },
         WorkflowDescriptor {
             kind: operation_kind(exploration_workflow_kind().as_str()),
-            display_name: "Explore toward system".to_owned(),
+            display_name: "Expand FTL Network".to_owned(),
             aliases: strings(&["explore_system"]),
-            description: "Extend the relay frontier toward one target system, automatically selecting a replicant and manufacturing hub when they are not pinned.".to_owned(),
+            description: "Extend the FTL Relay network towards the target system, automatically selecting a replicant and manufacturing hub when they are not pinned.".to_owned(),
             category: "exploration".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
@@ -2858,7 +2859,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                 EntityKind::Replicant,
             ],
             parameters: vec![
-                required("replicant", "Replicant", ParameterKind::Replicant),
+                required("region", "Campaign region", ParameterKind::String),
                 required("hub", "Manufacturing hub", ParameterKind::Location),
                 required(
                     "targets_csv",
@@ -2904,7 +2905,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                 EntityKind::Replicant,
             ],
             parameters: vec![
-                required("replicant", "Replicant", ParameterKind::Replicant),
+                required("region", "Campaign region", ParameterKind::String),
                 required("hub", "Manufacturing hub", ParameterKind::Location),
                 required(
                     "systems_csv",

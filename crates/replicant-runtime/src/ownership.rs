@@ -758,6 +758,8 @@ mod tests {
             device_type: Some(replicant_client::DeviceType::from("mining_drone")),
             status: None,
             location: location.map(|value| LocationKey::live(LocationId::from(value))),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: vec![replicant_client::DeviceCommand::from("change_owner")],
             available_directives: Vec::new(),

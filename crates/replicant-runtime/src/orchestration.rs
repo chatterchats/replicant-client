@@ -18,7 +18,8 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     Client, Device, DeviceType, Location, Replicant, Star,
-    domain::{GalacticPosition, Inventory, InventoryOwner},
+    domain::{GalacticPosition, Inventory, InventoryOwner, LocationType},
+    managed::ReadinessComponent,
     raw::RequestPriority,
 };
 use replicant_protocol::{
@@ -28,31 +29,42 @@ use replicant_protocol::{
     WorkflowId as ProtocolWorkflowId,
 };
 use replicant_transport::ResourceMap;
-use replicant_workflow::RepositoryError;
 use replicant_workflow::{
-    ResourceKey, WorkflowFailureDisposition, WorkflowId, WorkflowInstance, WorkflowRepository,
-    WorkflowStatus,
+    RepositoryError, ResourceKey, WorkflowFailureDisposition, WorkflowId, WorkflowInstance,
+    WorkflowPlacementIntentSnapshot, WorkflowPlacementIntentSubject, WorkflowPlacementProvenance,
+    WorkflowPlacementResolution, WorkflowRegistry, WorkflowRepository,
+    WorkflowServiceIntentSnapshot, WorkflowServiceIntentState, WorkflowStatus,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{
     ApplicationError,
+    asteroid_diversion::{
+        AsteroidDiversionIntent, AsteroidHistorySnapshot, AsteroidLifecycle, AsteroidOccurrence,
+        asteroid_diversion_workflow_matches, asteroid_history_snapshot,
+        new_asteroid_diversion_workflow,
+    },
     automation::{
         BeltSearchCampaignIntent, BlueprintAcquireIntent, BlueprintShopPurchaseIntent,
-        EventCampaignIntent, ExplorationIntent, LogisticsManifestIntent, MiningCampaignIntent,
-        ObservatoryIntent, RegionEstablishIntent, ReplicantProvisionIntent,
+        EventCampaignIntent, ExplorationIntent, LogisticsManifestIntent,
+        LogisticsWorkflowCheckpoint, MiningCampaignIntent, ObservatoryIntent,
+        PlacementRecoveryMetadata, RegionEstablishIntent, ReplicantProvisionIntent,
         SalvageRecoveryHistorySnapshot, SalvageRecoveryIntent, ScanTourIntent,
         blueprint_acquire_workflow_kind, blueprint_source_is_candidate, blueprint_source_location,
         completed_salvage_sites, exploration_workflow_kind, new_belt_search_campaign_workflow,
         new_blueprint_acquire_workflow, new_event_campaign_workflow, new_exploration_workflow,
         new_logistics_manifest_workflow, new_mining_campaign_workflow, new_observatory_workflow,
         new_region_establish_workflow, new_replicant_provision_workflow,
-        new_salvage_recovery_workflow, new_scan_tour_workflow, recoverable_salvage_sites,
-        salvage_recovery_history_snapshot, salvage_recovery_workflow_kind,
-        salvage_recovery_workflow_matches,
+        new_salvage_recovery_workflow, new_scan_tour_workflow, placement_recovery_authorization,
+        placement_recovery_authorization_matches, placement_recovery_metadata_matches_snapshot,
+        read_placement_recovery_authorization, recoverable_salvage_sites,
+        revoke_placement_recovery_authorization, salvage_recovery_history_snapshot,
+        salvage_recovery_workflow_kind, salvage_recovery_workflow_matches,
+        write_placement_recovery_authorization,
     },
     canonical_region,
+    device_placement::{DevicePlacementClass, DevicePlacementContext, classify_device_placement},
     director_requirements::{
         DirectorRequirement, DirectorRequirementGraph, load_requirement_summaries,
     },
@@ -89,7 +101,6 @@ const DEFAULT_IDLE_TARGET: f64 = 0.15;
 const DEFAULT_SCALE_THRESHOLD: f64 = 0.10;
 const MINING_WARD_SITES_PER_REGION: usize = 4;
 const MINING_BATCH_SIZE: usize = 4;
-const MAX_ACTIVE_SYSTEM_WARDS: usize = 25;
 const CATALOGUE_SYSTEMS_PER_WORKER: usize = 20;
 const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // A system hub has 15 LY operational reach. An owned hub just outside a named
@@ -110,10 +121,15 @@ const ACTIVE_EVENT_CACHE_TTL_MS: i64 = 2 * 60 * 1000;
 const ACTIVE_EVENT_STALE_FALLBACK_MS: i64 = 10 * 60 * 1000;
 
 const PRIORITY_REGION_ESTABLISHMENT: u32 = 900;
+const PRIORITY_ASTEROID_DIVERSION: u32 = 800;
 const PRIORITY_EVENT_COMPLETION: u32 = 700;
 const PRIORITY_FTL_EXPANSION: u32 = 650;
 const PRIORITY_CATALOGUE: u32 = 500;
 const PRIORITY_CATALOGUE_BLUEPRINT: u32 = 400;
+const _: () = assert!(
+    PRIORITY_ASTEROID_DIVERSION < PRIORITY_REGION_ESTABLISHMENT
+        && PRIORITY_ASTEROID_DIVERSION > PRIORITY_EVENT_COMPLETION
+);
 
 /// Durable Automation Director settings.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,12 +224,26 @@ enum GoalWorkIdentity {
         region: String,
         events: BTreeSet<String>,
     },
+    AsteroidDiversion {
+        region: String,
+        occurrences: BTreeSet<String>,
+    },
     Exploration {
         target: String,
     },
     SalvageRecovery {
         region: String,
         sites: BTreeSet<String>,
+    },
+    StrandedDeviceRecovery {
+        region: String,
+        device_code: String,
+        origin: String,
+        destination: String,
+        failed_provenance: BTreeMap<String, Vec<WorkflowPlacementProvenance>>,
+        release_tags: Vec<String>,
+        #[serde(default)]
+        placement_resolutions: Vec<WorkflowPlacementResolution>,
     },
 }
 
@@ -244,6 +274,34 @@ struct RegionView {
     hub_system: Option<String>,
     hub_location: Option<String>,
     known_systems: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StrandedRecoveryCandidate {
+    device_code: String,
+    origin: String,
+    destination: String,
+    metadata: PlacementRecoveryMetadata,
+}
+
+fn recovery_metadata_identity(
+    region: &str,
+    candidate: &StrandedRecoveryCandidate,
+) -> GoalWorkIdentity {
+    GoalWorkIdentity::StrandedDeviceRecovery {
+        region: region.to_owned(),
+        device_code: candidate.device_code.clone(),
+        origin: candidate.origin.clone(),
+        destination: candidate.destination.clone(),
+        failed_provenance: candidate.metadata.failed_provenance.clone(),
+        release_tags: candidate
+            .metadata
+            .release_device_tags
+            .get(&candidate.device_code)
+            .cloned()
+            .unwrap_or_default(),
+        placement_resolutions: candidate.metadata.placement_resolutions.clone(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -390,6 +448,7 @@ struct BlueprintReconcileContext<'a> {
     shop_snapshot: &'a BlueprintShopSnapshot,
     location_systems: &'a BTreeMap<String, String>,
     system_regions: &'a BTreeMap<String, String>,
+    placement_reserved_devices: &'a BTreeSet<String>,
 }
 
 /// Returns the current Director settings, creating defaults lazily when absent.
@@ -563,6 +622,10 @@ pub fn cached_director_snapshot(
     };
 
     apply_durable_snapshot_overrides(repository, &mut snapshot)?;
+    snapshot.metadata = SnapshotMetadata {
+        revision,
+        generated_at_ms: now_millis(),
+    };
     Ok(snapshot)
 }
 
@@ -691,6 +754,7 @@ async fn refresh_system_hubs(
 pub async fn reconcile_director(
     client: &Client,
     repository: Arc<WorkflowRepository>,
+    workflow_registry: &WorkflowRegistry,
     revision: u64,
     allow_launch: bool,
     force_slow_refresh: bool,
@@ -879,6 +943,11 @@ pub async fn reconcile_director(
         observatory_blueprint_known,
         &mut requirements,
     )?);
+    // Placement recovery is intentionally evaluated only after global goals
+    // have persisted their work, so this snapshot includes same-pass intent.
+    let placement_authority_complete = complete_owned_device_census(client);
+    let placement_snapshot = workflow_registry.placement_intent_snapshot(&repository, None);
+    let placement_snapshot_error = placement_snapshot.is_err();
 
     let established_regions = regions
         .values()
@@ -996,6 +1065,30 @@ pub async fn reconcile_director(
             BTreeSet::new()
         }
     };
+    // Asteroid history is fetched once and shared by every established regional
+    // goal. Disabled controls still receive the snapshot so enabling a region
+    // never creates a second authority read in the same pass.
+    let asteroid_controls_enabled = !established_regions.is_empty();
+    let mut asteroid_discovery_error = None;
+    let asteroid_history = if asteroid_controls_enabled {
+        match asteroid_history_snapshot(client, now).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(error = %error, "Director asteroid diversion history unavailable");
+                asteroid_discovery_error = Some(format!(
+                    "asteroid diversion history discovery failed: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (
+        asteroid_occurrences_by_region,
+        asteroid_conflicts_by_region,
+        asteroid_unavailable_by_region,
+    ) = partition_asteroid_occurrences(asteroid_history.as_ref(), &catalogue, &regions);
     let event_designations_by_region = if event_controls_enabled && !established_regions.is_empty()
     {
         match active_events_for_director(
@@ -1036,6 +1129,7 @@ pub async fn reconcile_director(
         BTreeMap::new()
     };
 
+    let mut unserviced_launch_available = true;
     for region in &established_regions {
         goals.push(reconcile_maintain_system_hubs(
             &goal_context,
@@ -1048,12 +1142,40 @@ pub async fn reconcile_director(
             &location_systems,
             &system_regions,
         )?);
+        goals.push(reconcile_stranded_device_recovery(
+            &goal_context,
+            region,
+            &devices,
+            &locations,
+            &location_systems,
+            &system_regions,
+            &regions,
+            placement_snapshot.as_ref().ok(),
+            placement_authority_complete,
+            placement_snapshot_error,
+        )?);
         goals.push(reconcile_salvage_recovery(
             &goal_context,
             region,
             salvage_history.as_ref(),
             &salvage_completed,
             salvage_discovery_error.as_deref(),
+        )?);
+        goals.push(reconcile_asteroid_diversion(
+            &goal_context,
+            region,
+            asteroid_occurrences_by_region
+                .get(&region.region)
+                .unwrap_or(&BTreeMap::new()),
+            asteroid_conflicts_by_region
+                .get(&region.region)
+                .copied()
+                .unwrap_or(0),
+            asteroid_unavailable_by_region
+                .get(&region.region)
+                .copied()
+                .unwrap_or(0),
+            asteroid_discovery_error.as_deref(),
         )?);
         let regional_events = event_designations_by_region
             .get(&region.region)
@@ -1102,6 +1224,25 @@ pub async fn reconcile_director(
             &mut requirements,
             now,
         )?);
+        // Expand Mining may have created the exact route campaign above.  Read
+        // the repository and service projection again so this goal never races
+        // a same-pass mining expansion with a duplicate campaign.
+        let unserviced_workflows = repository.list()?;
+        let service_snapshot = workflow_registry.service_intent_snapshot(&repository, None)?;
+        goals.push(reconcile_unserviced_resources(
+            &goal_context,
+            workflow_registry,
+            &service_snapshot,
+            region,
+            &devices,
+            &locations,
+            &inventories,
+            &system_regions,
+            &unserviced_workflows,
+            placement_authority_complete,
+            &mut unserviced_launch_available,
+        )?);
+
         let regional_event_systems = event_systems_by_region
             .get(&region.region)
             .cloned()
@@ -1162,6 +1303,34 @@ pub async fn reconcile_director(
             )?;
         }
     }
+    // Recovery may have queued an exact-device manifest earlier in this pass.
+    // Refresh both workflow rows and placement projections before Blueprint
+    // Acquisition selects any source that it could irreversibly consume.
+    let blueprint_workflows = repository.list()?;
+    let blueprint_placement_reserved =
+        match workflow_registry.placement_intent_snapshot(&repository, None) {
+            Ok(snapshot) => devices
+                .iter()
+                .filter(|device| {
+                    !snapshot
+                        .explain_device(device.key.id.as_str(), &device.tags)
+                        .live
+                        .is_empty()
+                })
+                .map(|device| device.key.id.as_str().to_owned())
+                .collect::<BTreeSet<_>>(),
+            Err(_) => devices
+                .iter()
+                .map(|device| device.key.id.as_str().to_owned())
+                .collect::<BTreeSet<_>>(),
+        };
+    let blueprint_goal_context = GoalReconcileContext {
+        repository: repository.as_ref(),
+        workflows: &blueprint_workflows,
+        controls: &goal_controls,
+        automatic,
+        now,
+    };
 
     // Shop discovery is intentionally demand-driven and happens only after
     // the standing goals have raised this pass's Blueprint requirements. Owned
@@ -1169,16 +1338,17 @@ pub async fn reconcile_director(
     // acquisition already has enough information to finish.
     let mut shop_requested_blueprints = BTreeSet::new();
     if goal_enabled(&goal_controls, DirectorGoalKind::BlueprintAcquisition, None)
-        && active_blueprint_acquisition_workflow(&workflows).is_none()
+        && active_blueprint_acquisition_workflow(&blueprint_workflows).is_none()
     {
         for device_type in requirements.current_blueprint_priorities().keys() {
             let kind = DeviceType::from(device_type.as_str());
             let already_known = unlocked_blueprints
                 .as_ref()
                 .is_some_and(|known| known.contains(&kind));
-            let owned_source = devices
-                .iter()
-                .any(|device| blueprint_source_is_candidate(device, kind.as_str(), &devices));
+            let owned_source = devices.iter().any(|device| {
+                blueprint_source_is_candidate(device, kind.as_str(), &devices)
+                    && !blueprint_placement_reserved.contains(device.key.id.as_str())
+            });
             if !already_known && !owned_source {
                 shop_requested_blueprints.insert(device_type.to_ascii_lowercase());
             }
@@ -1202,9 +1372,10 @@ pub async fn reconcile_director(
         shop_snapshot: &blueprint_shop_snapshot,
         location_systems: &location_systems,
         system_regions: &system_regions,
+        placement_reserved_devices: &blueprint_placement_reserved,
     };
     goals.push(reconcile_blueprint_acquisition(
-        &goal_context,
+        &blueprint_goal_context,
         &mut blueprint_context,
         &mut requirements,
     )?);
@@ -2338,6 +2509,9 @@ fn reconcile_blueprint_acquisition(
             .filter(|device| {
                 blueprint_source_is_candidate(device, device_type.as_str(), devices)
                     && !claimed.contains(device.key.id.as_str())
+                    && !blueprint
+                        .placement_reserved_devices
+                        .contains(device.key.id.as_str())
             })
             .min_by_key(|device| device.key.id.clone())?;
         let source_location = blueprint_source_location(source, devices)?;
@@ -2393,12 +2567,12 @@ fn reconcile_blueprint_acquisition(
                 let mut dependency_blocked = false;
                 for criterion_type in opportunity.criteria.devices.keys() {
                     let criterion = DeviceType::from(criterion_type.as_str());
-                    if unlocked_blueprints.contains(&criterion) {
-                        continue;
-                    }
                     let criterion_has_owned_source = devices.iter().any(|device| {
                         blueprint_source_is_candidate(device, criterion.as_str(), devices)
                             && !claimed.contains(device.key.id.as_str())
+                            && !blueprint
+                                .placement_reserved_devices
+                                .contains(device.key.id.as_str())
                     });
                     if !criterion_has_owned_source
                         && blueprint_shop_dependency_cycle(
@@ -2754,6 +2928,704 @@ fn active_blueprint_claims(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn reconcile_stranded_device_recovery(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    devices: &[Device],
+    _locations: &[Location],
+    location_systems: &BTreeMap<String, String>,
+    system_regions: &BTreeMap<String, String>,
+    regions: &BTreeMap<String, RegionView>,
+    placement_snapshot: Option<&WorkflowPlacementIntentSnapshot>,
+    complete_owned_census: bool,
+    placement_snapshot_error: bool,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::StrandedDeviceRecovery;
+    let id = goal_instance_id(kind, Some(&region.region));
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
+    let objective = "Recover stranded owned devices to regional System Hubs";
+    let disabled_next = "Enable this standing goal to recover stranded owned devices";
+    let authority_blocker =
+        "Complete managed device and workflow authority before recovering stranded devices";
+    let ambiguous_blocker =
+        "One or more owned devices have unresolved workflow custody and cannot be recovered safely";
+    let missing_home =
+        "No exact regional System Hub location is available for stranded device recovery";
+    let active_next = "Continue the active stranded device recovery";
+    let satisfied_next = "Wait for newly stranded owned devices";
+
+    let mut workflows = context.repository.list()?;
+    workflows.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let is_authorized_in_flight = |workflow: &replicant_workflow::WorkflowInstance| {
+        let Ok(intent) = workflow.config::<LogisticsManifestIntent>() else {
+            return false;
+        };
+        let Ok(checkpoint) = workflow.checkpoint::<LogisticsWorkflowCheckpoint>() else {
+            return false;
+        };
+        if !checkpoint.started && checkpoint.placement_recovery_cleanup.is_empty() {
+            return false;
+        }
+        read_placement_recovery_authorization(context.repository, workflow.id)
+            .ok()
+            .flatten()
+            .is_some_and(|authorization| {
+                placement_recovery_authorization_matches(&authorization, workflow.id, &intent)
+            })
+    };
+    let scoped_recovery_workflows = workflows
+        .iter()
+        .filter(|workflow| {
+            !workflow.status.is_terminal()
+                && workflow.kind == crate::automation::logistics_manifest_workflow_kind()
+                && !is_authorized_in_flight(workflow)
+        })
+        .filter_map(
+            |workflow| match workflow.config::<LogisticsManifestIntent>() {
+                Ok(intent) => {
+                    intent.placement_recovery.as_ref()?;
+                    let belongs_here = intent
+                        .region
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none_or(|value| crate::canonical_region(value) == region.region);
+                    belongs_here.then_some(workflow.id)
+                }
+                Err(_) => Some(workflow.id),
+            },
+        )
+        .collect::<Vec<_>>();
+    let revoke_scoped_authorizations = || -> Result<(), ApplicationError> {
+        for workflow_id in &scoped_recovery_workflows {
+            revoke_placement_recovery_authorization(context.repository, *workflow_id)?;
+        }
+        Ok(())
+    };
+    let active_recovery_config_error = workflows.iter().any(|workflow| {
+        if workflow.status.is_terminal()
+            || workflow.kind != crate::automation::logistics_manifest_workflow_kind()
+        {
+            return false;
+        }
+        let Ok(intent) = workflow.config::<LogisticsManifestIntent>() else {
+            return true;
+        };
+        let declared_region = intent
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(crate::canonical_region);
+        if declared_region
+            .as_deref()
+            .is_some_and(|value| value != region.region)
+        {
+            return false;
+        }
+        let Some(metadata) = intent.placement_recovery.as_ref() else {
+            return false;
+        };
+        let owns_code = intent
+            .device_codes
+            .iter()
+            .all(|code| devices.iter().any(|device| device.key.id.as_str() == code));
+        let valid = crate::automation::validate_placement_recovery_intent(&intent).is_ok();
+        let resolutions_valid = metadata.placement_resolutions.iter().all(|resolution| {
+            intent
+                .device_codes
+                .iter()
+                .any(|code| code == &resolution.device_code)
+        });
+        if is_authorized_in_flight(workflow) {
+            return !valid || !owns_code || !resolutions_valid;
+        }
+        let evidence_valid = placement_snapshot.is_some_and(|snapshot| {
+            let filtered = recovery_snapshot_matches_for_workflow(snapshot, workflow.id);
+            placement_recovery_metadata_matches_snapshot(metadata, &filtered).is_ok()
+        });
+        !valid
+            || !evidence_valid
+            || !owns_code
+            || !resolutions_valid
+            || region
+                .hub_location
+                .as_ref()
+                .is_some_and(|hub| intent.destination != *hub)
+    });
+    let active_recovery = workflows
+        .iter()
+        .filter(|workflow| {
+            !workflow.status.is_terminal()
+                && workflow.kind == crate::automation::logistics_manifest_workflow_kind()
+        })
+        .filter_map(|workflow| {
+            let intent = workflow.config::<LogisticsManifestIntent>().ok()?;
+            let metadata = intent.placement_recovery.as_ref()?;
+            let belongs_here = intent
+                .region
+                .as_deref()
+                .is_some_and(|current| crate::canonical_region(current) == region.region);
+            if !belongs_here {
+                return None;
+            }
+            let valid = crate::automation::validate_placement_recovery_intent(&intent).is_ok()
+                && !metadata.failed_provenance.is_empty();
+            if is_authorized_in_flight(workflow) {
+                return valid.then_some(workflow.id);
+            }
+            let destination_matches = region
+                .hub_location
+                .as_ref()
+                .is_some_and(|hub| intent.destination == *hub);
+            let metadata_matches_retained_evidence = placement_snapshot.is_some_and(|snapshot| {
+                let filtered = recovery_snapshot_matches_for_workflow(snapshot, workflow.id);
+                placement_recovery_metadata_matches_snapshot(metadata, &filtered).is_ok()
+            });
+            (destination_matches && valid && metadata_matches_retained_evidence)
+                .then_some(workflow.id)
+        })
+        .collect::<Vec<_>>();
+    let active_recovery_ids = protocol_workflow_ids(&active_recovery);
+
+    let summary =
+        |status: DirectorGoalStatus,
+         blocker: Option<&str>,
+         next_action: Option<String>,
+         current: usize,
+         total: usize,
+         active_workflows: Vec<ProtocolWorkflowId>| DirectorGoalSummary {
+            id: id.clone(),
+            kind,
+            region: Some(region.region.clone()),
+            status,
+            objective: objective.to_owned(),
+            blocker: blocker.map(str::to_owned),
+            next_action,
+            progress_current: current as u64,
+            progress_total: total as u64,
+            active_workflows,
+            enabled,
+        };
+
+    if !enabled {
+        return Ok(summary(
+            DirectorGoalStatus::Waiting,
+            None,
+            Some(disabled_next.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    }
+    if active_recovery_config_error {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(authority_blocker),
+            Some(authority_blocker.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    }
+    if !complete_owned_census || placement_snapshot_error || placement_snapshot.is_none() {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(authority_blocker),
+            Some(authority_blocker.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    }
+    let snapshot = placement_snapshot.expect("checked above");
+    if !snapshot.unknown_live_workflows.is_empty() || !snapshot.unknown_terminal_outcomes.is_empty()
+    {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(authority_blocker),
+            Some(authority_blocker.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    }
+    let Some(destination) = region.hub_location.clone() else {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(missing_home),
+            Some(missing_home.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    };
+    if destination.trim().is_empty() {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(missing_home),
+            Some(missing_home.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids,
+        ));
+    }
+    let hub_authority_is_exact = region.hub_system.as_deref().is_some_and(|hub_system| {
+        let location_system = location_systems
+            .iter()
+            .find(|(location, _)| location.eq_ignore_ascii_case(&destination))
+            .map(|(_, system)| system);
+        let Some(location_system) = location_system else {
+            return false;
+        };
+        if !location_system.eq_ignore_ascii_case(hub_system) {
+            return false;
+        }
+        // Gateway hubs intentionally have no formal system→region entry. The
+        // RegionView itself is the authoritative registration in that case;
+        // a formal mapping, when present, must still agree exactly.
+        system_regions
+            .iter()
+            .find(|(system, _)| system.eq_ignore_ascii_case(hub_system))
+            .is_none_or(|(_, mapped_region)| {
+                crate::canonical_region(mapped_region) == region.region
+            })
+    });
+    if !hub_authority_is_exact {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(authority_blocker),
+            Some(authority_blocker.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids,
+        ));
+    }
+    if active_recovery.len() > 1 {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(authority_blocker),
+            Some(authority_blocker.to_owned()),
+            0,
+            active_recovery.len(),
+            active_recovery_ids.clone(),
+        ));
+    }
+
+    let registered_homes = regions
+        .values()
+        .filter(|candidate| candidate.status == DirectorRegionStatus::Established)
+        .filter_map(|candidate| {
+            candidate
+                .hub_location
+                .as_ref()
+                .filter(|location| !location.trim().is_empty())
+                .map(|location| {
+                    (
+                        crate::canonical_region(&candidate.region),
+                        BTreeSet::from([location.clone()]),
+                    )
+                })
+        })
+        .fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut homes, (region, locations)| {
+                homes.entry(region).or_default().extend(locations);
+                homes
+            },
+        );
+    let device_map = devices
+        .iter()
+        .map(|device| (device.key.id.as_str().to_owned(), device.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let filtered_active_snapshot = active_recovery
+        .first()
+        .map(|workflow_id| recovery_snapshot_matches_for_workflow(snapshot, *workflow_id));
+    let classification_snapshot = filtered_active_snapshot.as_ref().unwrap_or(snapshot);
+    let placement_context = DevicePlacementContext {
+        complete_owned_census,
+        devices: &device_map,
+        registered_homes: &registered_homes,
+        location_systems,
+        system_regions,
+        workflow_snapshot: classification_snapshot,
+    };
+
+    let mut candidates = Vec::new();
+    let mut ambiguous = 0usize;
+    for device in devices {
+        let classification = classify_device_placement(device, &placement_context);
+        let relevant_ambiguous = classification.class == DevicePlacementClass::Ambiguous
+            && (!classification.workflow_evidence.failed_transient.is_empty()
+                || !classification
+                    .workflow_evidence
+                    .terminal_residuals
+                    .is_empty()
+                || !classification
+                    .workflow_evidence
+                    .unknown_live_workflows
+                    .is_empty()
+                || !classification
+                    .workflow_evidence
+                    .unknown_terminal_outcomes
+                    .is_empty()
+                || device
+                    .tags
+                    .iter()
+                    .any(|tag| replicant_protocol::workflow_tag_reserved(tag)));
+        if relevant_ambiguous && classification.region.as_deref() == Some(region.region.as_str()) {
+            ambiguous += 1;
+        }
+        if classification.class != DevicePlacementClass::Stranded
+            || classification.region.as_deref() != Some(region.region.as_str())
+        {
+            continue;
+        }
+        let Some(origin) = classification.effective_location.clone() else {
+            continue;
+        };
+        let code = classification.device_code.clone();
+        let mut failed_provenance =
+            BTreeMap::<String, BTreeSet<WorkflowPlacementProvenance>>::new();
+        let mut release_tags = BTreeSet::new();
+        let mut resolutions = BTreeSet::new();
+        for evidence in &classification.workflow_evidence.failed_transient {
+            let provenance = WorkflowPlacementProvenance {
+                workflow_id: evidence.workflow_id,
+                work_item_id: evidence.intent.work_item_id,
+            };
+            failed_provenance
+                .entry(code.clone())
+                .or_default()
+                .insert(provenance.clone());
+            match &evidence.intent.subject {
+                WorkflowPlacementIntentSubject::Device(subject)
+                    if subject.eq_ignore_ascii_case(&code) =>
+                {
+                    resolutions.insert(WorkflowPlacementResolution {
+                        device_code: code.clone(),
+                        provenance,
+                    });
+                }
+                WorkflowPlacementIntentSubject::DeviceTag(tag)
+                    if device.tags.iter().any(|candidate| candidate == tag) =>
+                {
+                    release_tags.insert(tag.clone());
+                }
+                _ => {}
+            }
+        }
+        let failed_provenance = failed_provenance
+            .into_iter()
+            .map(|(key, values)| (key, values.into_iter().collect()))
+            .collect::<BTreeMap<_, _>>();
+        let metadata = PlacementRecoveryMetadata {
+            failed_provenance,
+            release_device_tags: BTreeMap::from([(
+                code.clone(),
+                release_tags.into_iter().collect(),
+            )]),
+            placement_resolutions: resolutions.into_iter().collect(),
+        };
+        candidates.push(StrandedRecoveryCandidate {
+            device_code: code,
+            origin,
+            destination: destination.clone(),
+            metadata,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.device_code
+            .cmp(&right.device_code)
+            .then_with(|| left.origin.cmp(&right.origin))
+            .then_with(|| left.destination.cmp(&right.destination))
+    });
+
+    let total = candidates.len() + active_recovery.len() + ambiguous;
+    if ambiguous > 0 {
+        revoke_scoped_authorizations()?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(ambiguous_blocker),
+            Some(ambiguous_blocker.to_owned()),
+            0,
+            total,
+            active_recovery_ids.clone(),
+        ));
+    }
+    if !active_recovery.is_empty() {
+        // Re-adoption requires a current classified candidate, not just a
+        // durable workflow config.
+        for workflow_id in &active_recovery {
+            let workflow = workflows
+                .iter()
+                .find(|workflow| workflow.id == *workflow_id)
+                .expect("active recovery workflow came from workflow list");
+            let intent = workflow.config::<LogisticsManifestIntent>()?;
+            if is_authorized_in_flight(workflow) {
+                continue;
+            }
+            let Some(candidate) = candidates.iter().find(|candidate| {
+                intent_matches_recovery(
+                    &intent,
+                    &region.region,
+                    &candidate.device_code,
+                    &candidate.origin,
+                    &candidate.destination,
+                    &candidate.metadata,
+                )
+            }) else {
+                revoke_scoped_authorizations()?;
+                return Ok(summary(
+                    DirectorGoalStatus::Blocked,
+                    Some(authority_blocker),
+                    Some(authority_blocker.to_owned()),
+                    0,
+                    total,
+                    active_recovery_ids.clone(),
+                ));
+            };
+            let authorization = placement_recovery_authorization(
+                *workflow_id,
+                &region.region,
+                &candidate.device_code,
+                &candidate.origin,
+                &candidate.destination,
+                candidate.metadata.clone(),
+            );
+            write_placement_recovery_authorization(context.repository, &authorization)?;
+        }
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(active_next.to_owned()),
+            0,
+            total,
+            active_recovery_ids.clone(),
+        ));
+    }
+    if candidates.is_empty() {
+        return Ok(summary(
+            DirectorGoalStatus::Satisfied,
+            None,
+            Some(satisfied_next.to_owned()),
+            0,
+            total,
+            Vec::new(),
+        ));
+    }
+    let candidate = &candidates[0];
+    let identity = recovery_metadata_identity(&region.region, candidate);
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, &workflows);
+    retain_work_identity(&mut runtime, &identity);
+    let exact_failures = workflows
+        .iter()
+        .filter(|workflow| workflow.status == WorkflowStatus::Failed)
+        .filter_map(|workflow| {
+            let intent = workflow.config::<LogisticsManifestIntent>().ok()?;
+            intent_matches_recovery(
+                &intent,
+                &region.region,
+                &candidate.device_code,
+                &candidate.origin,
+                &candidate.destination,
+                &candidate.metadata,
+            )
+            .then_some(workflow)
+        })
+        .collect::<Vec<_>>();
+    let permanent_failure = exact_failures.iter().copied().find(|workflow| {
+        workflow.failure_disposition == Some(WorkflowFailureDisposition::Permanent)
+    });
+    let retry_at = exact_failures
+        .into_iter()
+        .max_by_key(|workflow| workflow.updated_at)
+        .map(|workflow| workflow.updated_at)
+        .or(runtime.last_launch_at_ms);
+    let retry_cooldown =
+        retry_at.is_some_and(|last| context.now.saturating_sub(last) < DEFAULT_RETRY_COOLDOWN_MS);
+    let action = format!(
+        "Recover stranded device {} from {} to {}",
+        candidate.device_code, candidate.origin, candidate.destination
+    );
+    if let Some(failure) = permanent_failure {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            failure.last_error.as_deref().or(Some(
+                "The exact stranded device recovery previously failed permanently",
+            )),
+            Some(action),
+            0,
+            total,
+            Vec::new(),
+        ));
+    }
+    if retry_cooldown {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(summary(
+            DirectorGoalStatus::Waiting,
+            None,
+            Some("Wait briefly before retrying stranded device recovery".to_owned()),
+            0,
+            total,
+            Vec::new(),
+        ));
+    }
+    if !context.automatic {
+        save_goal_runtime(context.repository, &id, &runtime)?;
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(action),
+            0,
+            total,
+            Vec::new(),
+        ));
+    }
+    let intent = LogisticsManifestIntent {
+        origin: candidate.origin.clone(),
+        destination: candidate.destination.clone(),
+        resources: ResourceMap::new(),
+        devices: Vec::new(),
+        device_codes: vec![candidate.device_code.clone()],
+        device_tags: Vec::new(),
+        pre_deactivate_device_codes: Vec::new(),
+        release_mining_reservations: false,
+        return_transports: true,
+        allow_transport_staging: true,
+        region: Some(region.region.clone()),
+        purpose: format!(
+            "director:stranded_device_recovery:{}:{}",
+            candidate.device_code, candidate.destination
+        ),
+        placement_recovery: Some(candidate.metadata.clone()),
+    };
+    let created = context.repository.create_or_reuse_active(
+        new_logistics_manifest_workflow(intent),
+        |workflow| {
+            let Ok(intent) = workflow.config::<LogisticsManifestIntent>() else {
+                return Ok(false);
+            };
+            Ok(intent_matches_recovery(
+                &intent,
+                &region.region,
+                &candidate.device_code,
+                &candidate.origin,
+                &candidate.destination,
+                &candidate.metadata,
+            ))
+        },
+    );
+    match created {
+        Ok(result) => {
+            let authorization = placement_recovery_authorization(
+                result.instance.id,
+                &region.region,
+                &candidate.device_code,
+                &candidate.origin,
+                &candidate.destination,
+                candidate.metadata.clone(),
+            );
+            write_placement_recovery_authorization(context.repository, &authorization)?;
+            runtime.active_workflows = vec![result.instance.id];
+            runtime.last_launch_at_ms = Some(if result.created {
+                context.now
+            } else {
+                result.instance.created_at
+            });
+            record_goal_launch(&mut runtime, result.instance.id, identity);
+            save_goal_runtime(context.repository, &id, &runtime)?;
+            Ok(summary(
+                DirectorGoalStatus::Active,
+                None,
+                Some(action),
+                0,
+                total,
+                vec![ProtocolWorkflowId(result.instance.id.to_string())],
+            ))
+        }
+        Err(error) => {
+            save_goal_runtime(context.repository, &id, &runtime)?;
+            Ok(summary(
+                DirectorGoalStatus::Blocked,
+                Some(&error.to_string()),
+                Some(action),
+                0,
+                total,
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+fn recovery_manifest_well_formed(intent: &LogisticsManifestIntent) -> bool {
+    crate::automation::validate_placement_recovery_intent(intent).is_ok()
+}
+
+fn recovery_snapshot_matches_for_workflow(
+    snapshot: &WorkflowPlacementIntentSnapshot,
+    workflow_id: WorkflowId,
+) -> WorkflowPlacementIntentSnapshot {
+    let mut filtered = snapshot.clone();
+    filtered
+        .live
+        .retain(|evidence| evidence.workflow_id != workflow_id);
+    filtered
+        .settled_placements
+        .retain(|evidence| evidence.workflow_id != workflow_id);
+    filtered
+        .terminal_residuals
+        .retain(|evidence| evidence.workflow_id != workflow_id);
+    filtered
+        .failed_transient
+        .retain(|evidence| evidence.workflow_id != workflow_id);
+    filtered
+        .resolved_transient
+        .retain(|evidence| evidence.workflow_id != workflow_id);
+    filtered
+}
+
+fn intent_matches_recovery(
+    intent: &LogisticsManifestIntent,
+    region: &str,
+    device_code: &str,
+    origin: &str,
+    destination: &str,
+    metadata: &PlacementRecoveryMetadata,
+) -> bool {
+    recovery_manifest_well_formed(intent)
+        && intent
+            .region
+            .as_deref()
+            .is_some_and(|current| crate::canonical_region(current) == region)
+        && intent.origin == origin
+        && intent.destination == destination
+        && intent.device_codes.len() == 1
+        && intent
+            .device_codes
+            .first()
+            .is_some_and(|code| code == device_code)
+        && intent.placement_recovery.as_ref().is_some_and(|current| {
+            current.failed_provenance == metadata.failed_provenance
+                && current.release_device_tags == metadata.release_device_tags
+                && current.placement_resolutions == metadata.placement_resolutions
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reconcile_maintain_system_hubs(
     context: &GoalReconcileContext<'_>,
     region: &RegionView,
@@ -2937,6 +3809,7 @@ fn reconcile_maintain_system_hubs(
                     device_tags: Vec::new(),
                     pre_deactivate_device_codes: Vec::new(),
                     release_mining_reservations: false,
+                    placement_recovery: None,
                     return_transports: true,
                     allow_transport_staging: false,
                     region: Some(region.region.clone()),
@@ -3241,6 +4114,281 @@ fn system_resources_cover(stocks: &[&StockLocation], system: &str, deficits: &Re
         }
     }
     resources_cover(&aggregate, deficits)
+}
+type AsteroidOccurrencesByRegion = BTreeMap<String, BTreeMap<String, AsteroidOccurrence>>;
+type AsteroidPartition = (
+    AsteroidOccurrencesByRegion,
+    BTreeMap<String, usize>,
+    BTreeMap<String, usize>,
+);
+
+fn partition_asteroid_occurrences(
+    history: Option<&AsteroidHistorySnapshot>,
+    catalogue: &[Star],
+    regions: &BTreeMap<String, RegionView>,
+) -> AsteroidPartition {
+    let mut occurrences_by_region = BTreeMap::new();
+    let mut conflicts_by_region = BTreeMap::new();
+    let mut unavailable_by_region = BTreeMap::new();
+    let Some(history) = history else {
+        return (
+            occurrences_by_region,
+            conflicts_by_region,
+            unavailable_by_region,
+        );
+    };
+    let system_regions = expanded_system_region_map(catalogue);
+    for (occurrence_id, occurrence) in &history.occurrences {
+        let Some(system) = catalogue_system_for_target(&occurrence.impact_target, &system_regions)
+        else {
+            continue;
+        };
+        let Some(region) = system_regions.get(&system) else {
+            continue;
+        };
+        if !regions.contains_key(region) {
+            continue;
+        }
+        match history
+            .lifecycle
+            .get(occurrence_id)
+            .copied()
+            .unwrap_or(AsteroidLifecycle::ObservationUnavailable)
+        {
+            AsteroidLifecycle::IdentityConflict => {
+                *conflicts_by_region.entry(region.clone()).or_insert(0) += 1;
+            }
+            AsteroidLifecycle::ObservationUnavailable => {
+                *unavailable_by_region.entry(region.clone()).or_insert(0) += 1;
+            }
+            AsteroidLifecycle::Detected
+            | AsteroidLifecycle::DiversionActive
+            | AsteroidLifecycle::Partial => {
+                occurrences_by_region
+                    .entry(region.clone())
+                    .or_insert_with(BTreeMap::new)
+                    .insert(occurrence_id.clone(), occurrence.clone());
+            }
+            AsteroidLifecycle::Diverted
+            | AsteroidLifecycle::Impacted
+            | AsteroidLifecycle::Expired
+            | AsteroidLifecycle::Superseded => {}
+        }
+    }
+    (
+        occurrences_by_region,
+        conflicts_by_region,
+        unavailable_by_region,
+    )
+}
+
+fn catalogue_system_for_target(
+    target: &str,
+    system_regions: &BTreeMap<String, String>,
+) -> Option<String> {
+    system_regions
+        .keys()
+        .find(|system| system.eq_ignore_ascii_case(target))
+        .cloned()
+        .or_else(|| {
+            system_regions
+                .keys()
+                .find(|system| system_prefix(system).eq_ignore_ascii_case(system_prefix(target)))
+                .cloned()
+        })
+}
+
+fn matching_asteroid_diversion_workflows<'a>(
+    workflows: &'a [WorkflowInstance],
+    region: &str,
+) -> Result<Vec<&'a WorkflowInstance>, RepositoryError> {
+    let mut matches = Vec::new();
+    for workflow in workflows {
+        if asteroid_diversion_workflow_matches(workflow, region)? {
+            matches.push(workflow);
+        }
+    }
+    matches.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(matches)
+}
+
+fn reconcile_asteroid_diversion(
+    context: &GoalReconcileContext<'_>,
+    region: &RegionView,
+    occurrences: &BTreeMap<String, AsteroidOccurrence>,
+    identity_conflicts: usize,
+    unavailable: usize,
+    discovery_error: Option<&str>,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::AsteroidDiversion;
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
+    let id = goal_instance_id(kind, Some(&region.region));
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+
+    if !enabled {
+        return Ok(DirectorGoalSummary {
+            id,
+            kind,
+            region: Some(region.region.clone()),
+            status: DirectorGoalStatus::Waiting,
+            objective: initial_goal_objective(kind).to_owned(),
+            blocker: None,
+            next_action: Some("Enable Asteroid Diversion for this region".to_owned()),
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: Vec::new(),
+            enabled,
+        });
+    }
+
+    prune_runtime_workflows(&mut runtime, context.workflows);
+    let adopted = matching_asteroid_diversion_workflows(context.workflows, &region.region)?;
+    let adopted_id = adopted.first().map(|workflow| workflow.id);
+    runtime.active_workflows = adopted_id.into_iter().collect();
+    let identity = GoalWorkIdentity::AsteroidDiversion {
+        region: region.region.clone(),
+        occurrences: occurrences.keys().cloned().collect(),
+    };
+    retain_work_identity(&mut runtime, &identity);
+    if let Some(workflow_id) = adopted_id
+        && !runtime
+            .launch_records
+            .iter()
+            .any(|record| record.workflow_id == workflow_id)
+    {
+        runtime.launch_records.push(GoalLaunchRecord {
+            workflow_id,
+            identity: identity.clone(),
+        });
+    }
+
+    let active = nonterminal_ids(&runtime, context.workflows);
+    let permanent_failure = permanent_failure_for_identity(&runtime, context.workflows, &identity);
+    let mut progress_current = 0;
+    if let Some(workflow_id) = active.first().copied() {
+        progress_current = context
+            .repository
+            .list_work_items(workflow_id)?
+            .into_iter()
+            .filter(|item| item.state.status.is_terminal())
+            .count() as u64;
+    }
+    let progress_total = occurrences.len() as u64;
+    let mut blocker = None;
+    let status = if let Some(error) = discovery_error {
+        blocker = Some(error.to_owned());
+        if active.is_empty() {
+            DirectorGoalStatus::Blocked
+        } else {
+            DirectorGoalStatus::Active
+        }
+    } else if !active.is_empty() {
+        DirectorGoalStatus::Active
+    } else if occurrences.is_empty() {
+        if identity_conflicts > 0 {
+            blocker = Some(format!(
+                "{identity_conflicts} asteroid occurrence identity conflict(s) need authoritative disambiguation"
+            ));
+            DirectorGoalStatus::Blocked
+        } else if unavailable > 0 {
+            DirectorGoalStatus::Waiting
+        } else {
+            runtime.launch_records.clear();
+            runtime.last_launch_at_ms = None;
+            DirectorGoalStatus::Satisfied
+        }
+    } else if let Some(failure) = permanent_failure {
+        blocker = failure.last_error.clone();
+        DirectorGoalStatus::Blocked
+    } else if launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS) {
+        DirectorGoalStatus::Waiting
+    } else {
+        let Some(home) = region
+            .hub_location
+            .clone()
+            .or_else(|| region.hub_system.clone())
+        else {
+            blocker = Some(format!(
+                "{} has no operational regional home for asteroid diversion",
+                region.region
+            ));
+            save_goal_runtime(context.repository, &id, &runtime)?;
+            return Ok(DirectorGoalSummary {
+                id,
+                kind,
+                region: Some(region.region.clone()),
+                status: DirectorGoalStatus::Blocked,
+                objective: initial_goal_objective(kind).to_owned(),
+                blocker,
+                next_action: Some(
+                    "Establish a regional System Hub before diverting asteroids".to_owned(),
+                ),
+                progress_current,
+                progress_total,
+                active_workflows: Vec::new(),
+                enabled,
+            });
+        };
+        if context.automatic {
+            let result = context.repository.create_or_reuse_active(
+                new_asteroid_diversion_workflow(AsteroidDiversionIntent {
+                    region: region.region.clone(),
+                    home,
+                }),
+                |workflow| asteroid_diversion_workflow_matches(workflow, &region.region),
+            )?;
+            runtime.active_workflows = vec![result.instance.id];
+            runtime.last_launch_at_ms = Some(if result.created {
+                context.now
+            } else {
+                result.instance.created_at
+            });
+            record_goal_launch(&mut runtime, result.instance.id, identity.clone());
+        }
+        DirectorGoalStatus::Active
+    };
+    let next_action = match status {
+        DirectorGoalStatus::Satisfied => {
+            Some("Wait for a new incoming asteroid detection".to_owned())
+        }
+        DirectorGoalStatus::Active if runtime.active_workflows.is_empty() => Some(format!(
+            "Divert {} incoming asteroid(s) in this region",
+            occurrences.len()
+        )),
+        DirectorGoalStatus::Active => {
+            Some("Continue the active regional asteroid diversion campaign".to_owned())
+        }
+        DirectorGoalStatus::Blocked if discovery_error.is_some() => {
+            Some("Retry asteroid diversion history discovery on the next Director pass".to_owned())
+        }
+        DirectorGoalStatus::Blocked => {
+            Some("Resolve the regional asteroid diversion blocker before retrying".to_owned())
+        }
+        DirectorGoalStatus::Waiting if unavailable > 0 => {
+            Some("Wait for authoritative asteroid evidence".to_owned())
+        }
+        DirectorGoalStatus::Waiting => {
+            Some("Wait briefly before retrying asteroid diversion".to_owned())
+        }
+    };
+    save_goal_runtime(context.repository, &id, &runtime)?;
+    Ok(DirectorGoalSummary {
+        id,
+        kind,
+        region: Some(region.region.clone()),
+        status,
+        objective: initial_goal_objective(kind).to_owned(),
+        blocker,
+        next_action,
+        progress_current,
+        progress_total,
+        active_workflows: protocol_workflow_ids(&runtime.active_workflows),
+        enabled,
+    })
 }
 
 fn hub_at_risk(hub: &HubMaintenanceView) -> bool {
@@ -3967,6 +5115,473 @@ fn belt_searched_systems(
         })
         .collect()
 }
+#[derive(Clone, Debug)]
+struct UnservicedRouteCandidate {
+    route: crate::mining::AmiTransportRouteIntent,
+    resource_state: crate::mining::EvidenceState,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_unserviced_resources(
+    context: &GoalReconcileContext<'_>,
+    workflow_registry: &WorkflowRegistry,
+    service_snapshot: &WorkflowServiceIntentSnapshot,
+    region: &RegionView,
+    devices: &[Device],
+    locations: &[Location],
+    inventories: &[Inventory],
+    system_regions: &BTreeMap<String, String>,
+    workflows: &[WorkflowInstance],
+    complete_authority: bool,
+    launch_available: &mut bool,
+) -> Result<DirectorGoalSummary, ApplicationError> {
+    let kind = DirectorGoalKind::UnservicedResources;
+    let id = goal_instance_id(kind, Some(&region.region));
+    let enabled = goal_enabled(context.controls, kind, Some(&region.region));
+    let objective = initial_goal_objective(kind);
+    let disabled_next = "Enable this standing goal to reconcile AMI transport coverage";
+    let missing_home =
+        "No exact regional System Hub location is available for AMI transport delivery";
+    let mut runtime = load_goal_runtime(context.repository, &id)?;
+    prune_runtime_workflows(&mut runtime, workflows);
+
+    let summary =
+        |status: DirectorGoalStatus,
+         blocker: Option<String>,
+         next_action: Option<String>,
+         current: usize,
+         total: usize,
+         active_workflows: Vec<ProtocolWorkflowId>| DirectorGoalSummary {
+            id: id.clone(),
+            kind,
+            region: Some(region.region.clone()),
+            status,
+            objective: objective.to_owned(),
+            blocker,
+            next_action,
+            progress_current: current as u64,
+            progress_total: total as u64,
+            active_workflows,
+            enabled,
+        };
+    let retained = workflows
+        .iter()
+        .filter(|workflow| {
+            !workflow.status.is_terminal() && runtime.active_workflows.contains(&workflow.id)
+        })
+        .filter_map(|workflow| {
+            let intent = workflow.config::<MiningCampaignIntent>().ok()?;
+            (intent.region == region.region
+                && intent.transport_routes.iter().any(|route| {
+                    !route.system.trim().is_empty()
+                        && route.collect != route.deliver
+                        && route.deliver == region.hub_location.as_deref().unwrap_or_default()
+                }))
+            .then_some(workflow.id)
+        })
+        .collect::<Vec<_>>();
+    let retained_route = workflows
+        .iter()
+        .filter(|workflow| retained.contains(&workflow.id))
+        .filter_map(|workflow| workflow.config::<MiningCampaignIntent>().ok())
+        .flat_map(|intent| intent.transport_routes)
+        .find(|route| route.deliver == region.hub_location.as_deref().unwrap_or_default());
+    if !enabled {
+        return Ok(summary(
+            DirectorGoalStatus::Waiting,
+            None,
+            Some(disabled_next.to_owned()),
+            0,
+            retained.len(),
+            protocol_workflow_ids(&retained),
+        ));
+    }
+    if !retained.is_empty() {
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(retained_route.as_ref().map_or_else(
+                || "Continue active AMI transport service provisioning".to_owned(),
+                |route| {
+                    format!(
+                        "Wait for existing durable work to establish AMI transport service from {} to {}",
+                        route.collect, route.deliver
+                    )
+                },
+            )),
+            0,
+            retained.len(),
+            protocol_workflow_ids(&retained),
+        ));
+    }
+    if !complete_authority {
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some("Managed resource and device authority is incomplete".to_owned()),
+            Some(
+                "Complete managed synchronization before reconciling AMI transport coverage"
+                    .to_owned(),
+            ),
+            0,
+            0,
+            Vec::new(),
+        ));
+    }
+    let mut positive_location_count = 0usize;
+    let mut unknown_location_count = 0usize;
+    let mut seen_stock = BTreeSet::new();
+    for inventory in inventories {
+        let InventoryOwner::Location(owner) = &inventory.owner else {
+            continue;
+        };
+        let collect = owner.id.as_str();
+        if !inventory.items.iter().any(|item| item.quantity > 0)
+            || !seen_stock.insert(collect.to_owned())
+        {
+            continue;
+        }
+        let Some(location) = locations
+            .iter()
+            .find(|location| location.key.id == owner.id)
+        else {
+            unknown_location_count += 1;
+            continue;
+        };
+        match location.location_type.as_ref() {
+            None => {
+                unknown_location_count += 1;
+                continue;
+            }
+            Some(LocationType::Belt) => {}
+            Some(_) => continue,
+        }
+        let Some(system) = location.system.as_deref() else {
+            unknown_location_count += 1;
+            continue;
+        };
+        match system_regions.get(system) {
+            Some(mapped) if mapped != &region.region => continue,
+            None => {
+                unknown_location_count += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        match crate::mining::resource_present_with_authority(
+            devices,
+            locations,
+            inventories,
+            collect,
+            complete_authority,
+        ) {
+            crate::mining::EvidenceState::Present => positive_location_count += 1,
+            crate::mining::EvidenceState::Unknown => unknown_location_count += 1,
+            crate::mining::EvidenceState::Absent => {}
+        }
+    }
+    if unknown_location_count > 0 {
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some("Managed resource evidence is incomplete for AMI transport".to_owned()),
+            Some(
+                "Complete managed resource authority before reconciling AMI transport coverage"
+                    .to_owned(),
+            ),
+            0,
+            positive_location_count + unknown_location_count,
+            Vec::new(),
+        ));
+    }
+    if positive_location_count == 0 {
+        return Ok(summary(
+            DirectorGoalStatus::Satisfied,
+            None,
+            Some("Wait for newly producing regional resources".to_owned()),
+            0,
+            0,
+            protocol_workflow_ids(&retained),
+        ));
+    }
+    let Some(hub) = region
+        .hub_location
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(missing_home.to_owned()),
+            Some(missing_home.to_owned()),
+            0,
+            positive_location_count,
+            protocol_workflow_ids(&retained),
+        ));
+    };
+
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for inventory in inventories {
+        let InventoryOwner::Location(owner) = &inventory.owner else {
+            continue;
+        };
+        let collect = owner.id.as_str();
+        if !inventory.items.iter().any(|item| item.quantity > 0) || !seen.insert(collect.to_owned())
+        {
+            continue;
+        }
+        let Some(system) = locations
+            .iter()
+            .find(|location| location.key.id.as_str() == collect)
+            .and_then(|location| location.system.clone())
+        else {
+            candidates.push(UnservicedRouteCandidate {
+                route: crate::mining::AmiTransportRouteIntent {
+                    system: String::new(),
+                    collect: collect.to_owned(),
+                    deliver: hub.to_owned(),
+                },
+                resource_state: crate::mining::EvidenceState::Unknown,
+            });
+            continue;
+        };
+        let resource_state = if !system_regions.contains_key(&system)
+            || system_regions.get(&system) != Some(&region.region)
+        {
+            if system_regions
+                .get(&system)
+                .is_some_and(|mapped| mapped != &region.region)
+            {
+                crate::mining::EvidenceState::Absent
+            } else {
+                crate::mining::EvidenceState::Unknown
+            }
+        } else {
+            crate::mining::resource_present_with_authority(
+                devices,
+                locations,
+                inventories,
+                collect,
+                complete_authority,
+            )
+        };
+        if collect == hub {
+            continue;
+        }
+        if resource_state != crate::mining::EvidenceState::Absent {
+            candidates.push(UnservicedRouteCandidate {
+                route: crate::mining::AmiTransportRouteIntent {
+                    system,
+                    collect: collect.to_owned(),
+                    deliver: hub.to_owned(),
+                },
+                resource_state,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| left.route.cmp(&right.route));
+    let total = candidates.len() + retained.len();
+    if candidates
+        .iter()
+        .any(|candidate| candidate.resource_state == crate::mining::EvidenceState::Unknown)
+    {
+        return Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some("Managed resource evidence is incomplete for AMI transport".to_owned()),
+            Some(
+                "Complete managed resource authority before reconciling AMI transport coverage"
+                    .to_owned(),
+            ),
+            0,
+            total,
+            Vec::new(),
+        ));
+    }
+    if candidates.is_empty() {
+        return Ok(summary(
+            DirectorGoalStatus::Satisfied,
+            None,
+            Some("Wait for newly producing regional resources".to_owned()),
+            0,
+            0,
+            Vec::new(),
+        ));
+    }
+    let mut pending_route = None;
+    let mut covered = 0usize;
+    let mut pending = Vec::new();
+    let mut uncovered = Vec::new();
+    for candidate in &candidates {
+        let route = &candidate.route;
+        let service = if route.collect == route.deliver {
+            crate::mining::EvidenceState::Present
+        } else {
+            crate::mining::transport_service_present(
+                devices,
+                &route.system,
+                &route.collect,
+                &route.deliver,
+            )
+            .state
+        };
+        if service == crate::mining::EvidenceState::Unknown {
+            return Ok(summary(
+                DirectorGoalStatus::Blocked,
+                Some(format!(
+                    "Durable workflow intent is incomplete for AMI transport from {} to {}",
+                    route.collect, route.deliver
+                )),
+                Some(format!(
+                    "Durable workflow intent is incomplete for AMI transport from {} to {}",
+                    route.collect, route.deliver
+                )),
+                covered,
+                total,
+                Vec::new(),
+            ));
+        }
+        if service == crate::mining::EvidenceState::Present {
+            covered += 1;
+            continue;
+        }
+        let target = route.workflow_service_intent();
+        match service_snapshot.state_for(&target, Some(&region.region), Some(&route.system)) {
+            WorkflowServiceIntentState::Present(ids) => {
+                pending.extend(ids);
+                if pending_route.is_none() {
+                    pending_route = Some(route);
+                }
+            }
+            WorkflowServiceIntentState::Unknown(_) => {
+                return Ok(summary(
+                    DirectorGoalStatus::Blocked,
+                    Some(format!(
+                        "Durable workflow intent is incomplete for AMI transport from {} to {}",
+                        route.collect, route.deliver
+                    )),
+                    Some(format!(
+                        "Complete durable workflow intent for AMI transport from {} to {}",
+                        route.collect, route.deliver
+                    )),
+                    covered,
+                    total,
+                    Vec::new(),
+                ));
+            }
+            WorkflowServiceIntentState::Absent => uncovered.push(candidate),
+        }
+    }
+    pending.sort();
+    pending.dedup();
+    if !pending.is_empty() {
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(format!(
+                "Wait for existing durable work to establish AMI transport service from {} to {}",
+                pending_route
+                    .map(|route| route.collect.as_str())
+                    .unwrap_or(""),
+                pending_route
+                    .map(|route| route.deliver.as_str())
+                    .unwrap_or(""),
+            )),
+            covered,
+            total,
+            protocol_workflow_ids(&pending),
+        ));
+    }
+    if uncovered.is_empty() {
+        return Ok(summary(
+            DirectorGoalStatus::Satisfied,
+            None,
+            Some("Maintain AMI transport coverage for producing regional resources".to_owned()),
+            covered,
+            total,
+            Vec::new(),
+        ));
+    }
+    let candidate = uncovered[0];
+    let route = candidate.route.clone();
+    let next_action = format!(
+        "Establish AMI {} service from {} to {}",
+        if same_system(&route.system, &route.deliver) {
+            "shuttle"
+        } else {
+            "ferry"
+        },
+        route.collect,
+        route.deliver
+    );
+    if !context.automatic {
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(next_action),
+            covered,
+            total,
+            Vec::new(),
+        ));
+    }
+    if !*launch_available {
+        return Ok(summary(
+            DirectorGoalStatus::Active,
+            None,
+            Some(format!("{next_action} on the next Director pass")),
+            covered,
+            total,
+            Vec::new(),
+        ));
+    }
+    let target = route.workflow_service_intent();
+    let intent = MiningCampaignIntent {
+        systems: vec![route.system.clone()],
+        region: region.region.clone(),
+        hub: route.deliver.clone(),
+        max_concurrency: 1,
+        transport_routes: vec![route.clone()],
+    };
+    let created = context.repository.create_or_reuse_active(
+        new_mining_campaign_workflow(intent),
+        |instance| match workflow_registry.service_intent_state_for_instance(
+            instance,
+            &target,
+            Some(&region.region),
+            Some(&route.system),
+        ) {
+            WorkflowServiceIntentState::Present(_) => Ok(true),
+            WorkflowServiceIntentState::Absent => Ok(false),
+            WorkflowServiceIntentState::Unknown(_) => Err(RepositoryError::Compatibility(format!(
+                "AMI transport intent is unknown for {} to {}",
+                route.collect, route.deliver
+            ))),
+        },
+    );
+    match created {
+        Ok(result) => {
+            if result.created {
+                *launch_available = false;
+            }
+            runtime.active_workflows = vec![result.instance.id];
+            runtime.last_launch_at_ms = Some(context.now);
+            save_goal_runtime(context.repository, &id, &runtime)?;
+            Ok(summary(
+                DirectorGoalStatus::Active,
+                None,
+                Some(next_action),
+                covered,
+                total,
+                vec![ProtocolWorkflowId(result.instance.id.to_string())],
+            ))
+        }
+        Err(error) => Ok(summary(
+            DirectorGoalStatus::Blocked,
+            Some(error.to_string()),
+            Some(next_action),
+            covered,
+            total,
+            Vec::new(),
+        )),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_expand_mining(
@@ -3997,27 +5612,32 @@ fn reconcile_expand_mining(
     let belt_density = belt_density_priorities(locations, location_systems);
     let belt_designations = known_belt_designations(locations, location_systems);
 
-    // A regional mining footprint has two classes of active sites:
+    // A regional mining footprint selects up to four non-hub belt systems by
+    // density (dense > moderate > sparse), then by distance from the regional
+    // hub. Eligible hub-protected belt systems are additional "free" sites.
     //
-    // * up to four ward-backed systems, selected by density (dense > moderate
-    //   > sparse) with the regional density policy controlling new expansion;
-    // * any eligible belt system already protected by an owned active System
-    //   Hub. Hub-protected sites are "free" because they do not consume one of
-    //   the four regional ward allocations.
-    //
+    // System Wards are follow-up hardening, not an initial deployment gate.
     // Previously managed sites remain recognizable after they are displaced
-    // from the active ward set. Their hardware is left in place and can be
-    // repaired/reactivated later rather than being torn down.
+    // from the preferred set; their hardware is left in place rather than torn
+    // down.
     let managed_systems = managed_mining_systems(devices, location_systems)
         .intersection(&belt_systems)
         .cloned()
         .collect::<BTreeSet<_>>();
     let hub_systems = owned_mining_hub_systems(devices, catalogue, location_systems);
+    let mining_hub_system = region.hub_system.as_deref().or_else(|| {
+        region
+            .hub_location
+            .as_deref()
+            .and_then(|location| location_systems.get(location).map(String::as_str))
+    });
     let selected_ward_systems = selected_mining_ward_systems(
         &belt_systems,
         &managed_systems,
         &hub_systems,
         &belt_density,
+        mining_hub_system,
+        catalogue,
         policy,
     );
     let hub_desired_systems = belt_systems
@@ -4036,17 +5656,15 @@ fn reconcile_expand_mining(
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    let protected = crate::mining::protected_systems(devices, catalogue);
     let healthy_systems = desired_systems
         .iter()
         .filter(|system| {
             let Some(belts) = belt_designations.get(*system) else {
                 return false;
             };
-            belts.iter().any(|belt| {
-                crate::mining::audit_site(devices, system, belt, protected.contains(*system))
-                    .operational
-            })
+            belts
+                .iter()
+                .any(|belt| crate::mining::audit_site(devices, system, belt).operational)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -4078,12 +5696,11 @@ fn reconcile_expand_mining(
         }
     }
 
-    // Ward allocation is intentionally dynamic. A hub makes a ward redundant,
-    // and a newly eligible higher-density belt may displace a lower-density
-    // managed site. Move that existing ward before launching a mining campaign
-    // so the campaign adopts/activates the relocated identity instead of
-    // printing a replacement. Never strip protection from the donor until the
-    // destination itself is relay-reachable.
+    // Ward allocation is intentionally dynamic, but protection is follow-up
+    // hardening. Never delay a missing mining stack just to move a ward. Once
+    // the selected mining footprint is operational, a redundant/displaced ward
+    // can be relocated to a preferred target. Never strip protection from the
+    // donor until the destination itself is relay-reachable.
     let relocations = plan_mining_ward_relocations(MiningWardRebalanceContext {
         devices,
         managed_systems: &managed_systems,
@@ -4116,7 +5733,9 @@ fn reconcile_expand_mining(
             "Wait briefly before replanning the next mining or ward-rebalance action".to_owned(),
         );
         DirectorGoalStatus::Waiting
-    } else if let Some(relocation) = relocations.first() {
+    } else if pending.is_empty()
+        && let Some(relocation) = relocations.first()
+    {
         next_action = Some(format!(
             "Move System Ward {} from {} to {} so the higher-priority mining belt is protected",
             relocation.ward_code, relocation.source_system, relocation.target_system
@@ -4138,6 +5757,7 @@ fn reconcile_expand_mining(
                     device_tags: Vec::new(),
                     pre_deactivate_device_codes,
                     release_mining_reservations: true,
+                    placement_recovery: None,
                     return_transports: relocation.origin.contains('-'),
                     allow_transport_staging: true,
                     region: Some(region.region.clone()),
@@ -4161,49 +5781,15 @@ fn reconcile_expand_mining(
         DirectorGoalStatus::Active
     } else if pending.is_empty() {
         next_action = Some(format!(
-            "Maintain {MINING_WARD_SITES_PER_REGION} density-prioritized ward-backed mining belts plus hub-protected sites"
+            "Maintain {MINING_WARD_SITES_PER_REGION} density-and-distance-prioritized mining belts plus hub-protected sites; backfill System Wards when available"
         ));
         DirectorGoalStatus::Satisfied
     } else {
-        // Targets that already have active protection can be repaired
-        // immediately. Unprotected ward-selected targets may consume one of the
-        // remaining account-wide active-ward slots. A relocated ward is handled
-        // above and therefore never competes with this capacity calculation.
-        let protected_pending = pending
-            .intersection(&protected)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let active_ward_systems = crate::mining::active_owned_ward_systems(devices, catalogue);
-        let available_ward_slots =
-            MAX_ACTIVE_SYSTEM_WARDS.saturating_sub(active_ward_systems.len());
-        let ward_activation_needed = pending
-            .intersection(&selected_ward_systems)
-            .filter(|system| !protected.contains(*system))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let managed_ward_needed = ward_activation_needed
-            .intersection(&managed_systems)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let new_ward_needed = ward_activation_needed
-            .difference(&managed_systems)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let ward_slot_targets = prioritized_mining_targets(&managed_ward_needed, &belt_density)
-            .into_iter()
-            .chain(prioritized_mining_targets(&new_ward_needed, &belt_density))
-            .take(available_ward_slots)
-            .collect::<BTreeSet<_>>();
-        let actionable_pending = protected_pending
-            .union(&ward_slot_targets)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let ward_blocked = pending
-            .difference(&actionable_pending)
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        // System Ward availability must never prevent the base mining stack
+        // from coming online. Protection is reconciled opportunistically after
+        // the selected sites are operational.
         let targets = relay_connected_mining_targets(
-            &actionable_pending,
+            &pending,
             &relay_systems,
             &managed_systems,
             &belt_density,
@@ -4216,16 +5802,6 @@ fn reconcile_expand_mining(
             ));
             next_action = Some(
                 "Extend regional FTL coverage to the highest-priority mining systems".to_owned(),
-            );
-            DirectorGoalStatus::Blocked
-        } else if targets.is_empty() && !ward_blocked.is_empty() {
-            blocker = Some(format!(
-                "the account-wide limit of {MAX_ACTIVE_SYSTEM_WARDS} active System Wards leaves {} selected mining system(s) without an activation slot",
-                ward_blocked.len()
-            ));
-            next_action = Some(
-                "Free an active System Ward, add System Hub protection, or let the ward rebalancer reuse an existing regional ward"
-                    .to_owned(),
             );
             DirectorGoalStatus::Blocked
         } else if targets.is_empty() {
@@ -4243,12 +5819,33 @@ fn reconcile_expand_mining(
                     .clone()
                     .or_else(|| region.hub_system.clone())
             {
+                let transport_routes = region
+                    .hub_location
+                    .as_ref()
+                    .filter(|location| !location.trim().is_empty())
+                    .map(|deliver| {
+                        targets
+                            .iter()
+                            .filter_map(|system| {
+                                belt_designations
+                                    .get(system)
+                                    .and_then(|belts| belts.first())
+                                    .map(|collect| crate::mining::AmiTransportRouteIntent {
+                                        system: system.clone(),
+                                        collect: collect.clone(),
+                                        deliver: deliver.clone(),
+                                    })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let workflow =
                     repository.create(new_mining_campaign_workflow(MiningCampaignIntent {
                         systems: targets,
                         region: region.region.clone(),
                         hub,
                         max_concurrency: 4,
+                        transport_routes,
                     }))?;
                 tracing::info!(
                     workflow_id = %workflow.id,
@@ -4276,7 +5873,7 @@ fn reconcile_expand_mining(
         region: Some(region.region.clone()),
         status,
         objective: format!(
-            "Maintain {MINING_WARD_SITES_PER_REGION} ward-backed mining belts in {} ({}), plus eligible System Hub-protected sites",
+            "Maintain {MINING_WARD_SITES_PER_REGION} preferred mining belts in {} ({}), plus eligible System Hub-protected sites; System Wards are follow-up hardening",
             region.region,
             density_scope.join(", ")
         ),
@@ -4335,6 +5932,8 @@ fn selected_mining_ward_systems(
     managed_systems: &BTreeSet<String>,
     hub_systems: &BTreeSet<String>,
     belt_density: &BTreeMap<String, u8>,
+    hub_system: Option<&str>,
+    catalogue: &[Star],
     policy: MiningExpansionPolicy,
 ) -> BTreeSet<String> {
     let mut candidates = belt_systems
@@ -4349,12 +5948,33 @@ fn selected_mining_ward_systems(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let positions = catalogue
+        .iter()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.as_str().to_owned(), position))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let hub_position = hub_system.and_then(|system| positions.get(system).copied());
+    let distance = |system: &str| {
+        hub_position
+            .zip(positions.get(system).copied())
+            .map(|(hub, target)| galactic_distance(hub, target))
+    };
     candidates.sort_by(|left, right| {
         belt_density
             .get(right)
             .copied()
             .unwrap_or_default()
             .cmp(&belt_density.get(left).copied().unwrap_or_default())
+            .then_with(|| match (distance(left), distance(right)) {
+                (Some(left_distance), Some(right_distance)) => {
+                    left_distance.total_cmp(&right_distance)
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
             .then_with(|| {
                 managed_systems
                     .contains(right)
@@ -4428,7 +6048,7 @@ fn mining_site_pause_devices(
     else {
         return Vec::new();
     };
-    let audit = crate::mining::audit_site(devices, system, belt, false);
+    let audit = crate::mining::audit_site(devices, system, belt);
     let mut controllers = audit
         .assets
         .mining_controller
@@ -4663,22 +6283,6 @@ fn prioritized_mining_repair_targets(
                     .unwrap_or_default()
                     .cmp(&belt_density.get(left).copied().unwrap_or_default())
             })
-            .then_with(|| left.cmp(right))
-    });
-    targets
-}
-
-fn prioritized_mining_targets(
-    systems: &BTreeSet<String>,
-    belt_density: &BTreeMap<String, u8>,
-) -> Vec<String> {
-    let mut targets = systems.iter().cloned().collect::<Vec<_>>();
-    targets.sort_by(|left, right| {
-        belt_density
-            .get(right)
-            .copied()
-            .unwrap_or_default()
-            .cmp(&belt_density.get(left).copied().unwrap_or_default())
             .then_with(|| left.cmp(right))
     });
     targets
@@ -6202,7 +7806,11 @@ fn goal_enabled(controls: &GoalControls, kind: DirectorGoalKind, region: Option<
 fn default_goal_enabled(kind: DirectorGoalKind) -> bool {
     !matches!(
         kind,
-        DirectorGoalKind::EstablishBeacons | DirectorGoalKind::SalvageRecovery
+        DirectorGoalKind::EstablishBeacons
+            | DirectorGoalKind::SalvageRecovery
+            | DirectorGoalKind::AsteroidDiversion
+            | DirectorGoalKind::StrandedDeviceRecovery
+            | DirectorGoalKind::UnservicedResources
     )
 }
 
@@ -6219,18 +7827,27 @@ fn initial_goal_objective(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::ExpandMiningOps => "Expand useful regional mining infrastructure",
         DirectorGoalKind::SalvageRecovery => "Recover discovered regional salvage",
         DirectorGoalKind::EventCompletion => "Complete worthwhile active regional events",
+        DirectorGoalKind::AsteroidDiversion => {
+            "Divert incoming asteroids threatening regional systems"
+        }
         DirectorGoalKind::BlueprintAcquisition => {
             "Learn missing blueprints from known owned-device opportunities"
         }
         DirectorGoalKind::MaintainSystemHubs => {
             "Keep operational System Hubs supplied with reported upkeep resources"
         }
+        DirectorGoalKind::StrandedDeviceRecovery => {
+            "Recover stranded owned devices to regional System Hubs"
+        }
+        DirectorGoalKind::UnservicedResources => {
+            "Establish AMI transport service for producing regional resources"
+        }
         DirectorGoalKind::ExpandFtlNetwork => "Maintain and extend regional FTL reach",
         DirectorGoalKind::EstablishBeacons => "Maintain beacon coverage at useful known systems",
     }
 }
 
-fn all_goal_kinds() -> [DirectorGoalKind; 11] {
+fn all_goal_kinds() -> [DirectorGoalKind; 14] {
     [
         DirectorGoalKind::EstablishRegions,
         DirectorGoalKind::ExpandStarCatalogue,
@@ -6239,8 +7856,11 @@ fn all_goal_kinds() -> [DirectorGoalKind; 11] {
         DirectorGoalKind::ExpandMiningOps,
         DirectorGoalKind::SalvageRecovery,
         DirectorGoalKind::EventCompletion,
+        DirectorGoalKind::AsteroidDiversion,
         DirectorGoalKind::BlueprintAcquisition,
         DirectorGoalKind::MaintainSystemHubs,
+        DirectorGoalKind::StrandedDeviceRecovery,
+        DirectorGoalKind::UnservicedResources,
         DirectorGoalKind::ExpandFtlNetwork,
         DirectorGoalKind::EstablishBeacons,
     ]
@@ -6257,8 +7877,11 @@ pub fn goal_kind_key(kind: DirectorGoalKind) -> &'static str {
         DirectorGoalKind::ExpandMiningOps => "expand_mining_ops",
         DirectorGoalKind::SalvageRecovery => "salvage_recovery",
         DirectorGoalKind::EventCompletion => "event_completion",
+        DirectorGoalKind::AsteroidDiversion => "asteroid_diversion",
         DirectorGoalKind::BlueprintAcquisition => "blueprint_acquisition",
         DirectorGoalKind::MaintainSystemHubs => "maintain_system_hubs",
+        DirectorGoalKind::StrandedDeviceRecovery => "stranded_device_recovery",
+        DirectorGoalKind::UnservicedResources => "unserviced_resources",
         DirectorGoalKind::ExpandFtlNetwork => "expand_ftl_network",
         DirectorGoalKind::EstablishBeacons => "establish_beacons",
     }
@@ -6281,10 +7904,45 @@ pub fn goal_is_regional(kind: DirectorGoalKind) -> bool {
             | DirectorGoalKind::ExpandMiningOps
             | DirectorGoalKind::SalvageRecovery
             | DirectorGoalKind::EventCompletion
+            | DirectorGoalKind::AsteroidDiversion
             | DirectorGoalKind::MaintainSystemHubs
+            | DirectorGoalKind::StrandedDeviceRecovery
+            | DirectorGoalKind::UnservicedResources
             | DirectorGoalKind::ExpandFtlNetwork
             | DirectorGoalKind::EstablishBeacons
     )
+}
+/// Managed events that should wake an in-flight Director reconciliation.
+#[must_use]
+pub fn director_reconcile_event_names() -> &'static [&'static str] {
+    &[
+        "system.object_detected",
+        "diversion.activated",
+        "diversion.deactivated",
+        "diversion.partial",
+        "diversion.diverted",
+        "diversion.impacted",
+        "device.attached",
+        "device.compacted",
+        "device.deployed",
+        "device.detached",
+        "device.stowed",
+        "device.unfurled",
+        "ami.adopted",
+        "ami.launched",
+        "ami.released",
+        "ami.withdrawn",
+        "ami.transport.digest",
+        "device.decommissioned",
+        "directive.set",
+        "directive.cleared",
+        "directive.paused",
+        "directive.resumed",
+        "directive.completed",
+        "mining.started",
+        "mining.stopped",
+        "mining.retargeted",
+    ]
 }
 
 fn goal_instance_id(kind: DirectorGoalKind, region: Option<&str>) -> String {
@@ -6292,6 +7950,18 @@ fn goal_instance_id(kind: DirectorGoalKind, region: Option<&str>) -> String {
         Some(region) => format!("{}:{region}", goal_kind_key(kind)),
         None => goal_kind_key(kind).to_owned(),
     }
+}
+
+fn complete_owned_device_census(client: &Client) -> bool {
+    let readiness = client.readiness();
+    [
+        readiness.full_rest,
+        readiness.event_catchup,
+        readiness.sse_connectivity,
+        readiness.store_health,
+    ]
+    .into_iter()
+    .all(|component| component == ReadinessComponent::Ready)
 }
 
 fn now_millis() -> i64 {
@@ -6409,6 +8079,8 @@ mod tests {
             device_type: Some(DeviceType::SystemHub),
             status: Some(replicant_client::DeviceStatus::Active),
             location: Some(replicant_client::LocationKey::live("SCEPTURUM-7-L4".into())),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),
@@ -6843,6 +8515,8 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::from(["HUB".to_owned()]),
             &density,
+            None,
+            &[],
             MiningExpansionPolicy::default(),
         );
 
@@ -6855,6 +8529,44 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         );
+    }
+
+    #[test]
+    fn mining_selection_prefers_closest_systems_within_density() {
+        let belts = ["NEAR", "NEAR-2", "MID", "FAR", "FARTHEST"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let density = belts
+            .iter()
+            .cloned()
+            .map(|system| (system, 3))
+            .collect::<BTreeMap<_, _>>();
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("NEAR", 2.0, Some("delta")),
+            positioned_star("NEAR-2", 4.0, Some("delta")),
+            positioned_star("MID", 8.0, Some("delta")),
+            positioned_star("FAR", 12.0, Some("delta")),
+            positioned_star("FARTHEST", 20.0, Some("delta")),
+        ];
+
+        let selected = selected_mining_ward_systems(
+            &belts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &density,
+            Some("HUB"),
+            &catalogue,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert_eq!(selected.len(), MINING_WARD_SITES_PER_REGION);
+        assert!(selected.contains("NEAR"));
+        assert!(selected.contains("NEAR-2"));
+        assert!(selected.contains("MID"));
+        assert!(selected.contains("FAR"));
+        assert!(!selected.contains("FARTHEST"));
     }
 
     #[test]
@@ -6875,6 +8587,8 @@ mod tests {
             &managed,
             &BTreeSet::new(),
             &density,
+            None,
+            &[],
             MiningExpansionPolicy::default(),
         );
 
@@ -6906,6 +8620,8 @@ mod tests {
             &managed,
             &BTreeSet::new(),
             &density,
+            None,
+            &[],
             MiningExpansionPolicy::default(),
         );
 
@@ -7414,6 +9130,7 @@ mod tests {
                 device_tags: Vec::new(),
                 pre_deactivate_device_codes: Vec::new(),
                 release_mining_reservations: false,
+                placement_recovery: None,
                 return_transports: true,
                 allow_transport_staging: false,
                 region: Some("alpha".to_owned()),
@@ -7646,6 +9363,7 @@ mod tests {
             .expect("assign regional worker");
 
         let cached = cached_director_snapshot(&repository, 2).expect("read updated cache");
+        assert_eq!(cached.metadata.revision, 2);
 
         assert_eq!(cached.mode, DirectorMode::Automatic);
         assert!(
@@ -7712,7 +9430,9 @@ mod tests {
             .expect("persist Director snapshot");
 
         let cached = cached_director_snapshot(&repository, 99).expect("read cached snapshot");
-
+        assert_eq!(cached.metadata.revision, 99);
+        assert!(cached.metadata.generated_at_ms >= expected.metadata.generated_at_ms);
+        expected.metadata = cached.metadata.clone();
         assert_eq!(cached, expected);
 
         drop(repository);
@@ -8938,6 +10658,274 @@ mod tests {
     }
 
     #[test]
+    fn director_asteroid_diversion_registry_is_disabled_regional_and_wakes_on_lifecycle_events() {
+        assert!(!default_goal_enabled(DirectorGoalKind::AsteroidDiversion));
+        assert!(goal_is_regional(DirectorGoalKind::AsteroidDiversion));
+        assert_eq!(
+            goal_kind_key(DirectorGoalKind::AsteroidDiversion),
+            "asteroid_diversion"
+        );
+        assert_eq!(
+            parse_goal_kind("asteroid_diversion"),
+            Some(DirectorGoalKind::AsteroidDiversion)
+        );
+        assert_eq!(
+            initial_goal_objective(DirectorGoalKind::AsteroidDiversion),
+            "Divert incoming asteroids threatening regional systems"
+        );
+        assert_eq!(
+            director_reconcile_event_names(),
+            &[
+                "system.object_detected",
+                "diversion.activated",
+                "diversion.deactivated",
+                "diversion.partial",
+                "diversion.diverted",
+                "diversion.impacted",
+                "device.attached",
+                "device.compacted",
+                "device.deployed",
+                "device.detached",
+                "device.stowed",
+                "device.unfurled",
+                "ami.adopted",
+                "ami.launched",
+                "ami.released",
+                "ami.withdrawn",
+                "ami.transport.digest",
+                "device.decommissioned",
+                "directive.set",
+                "directive.cleared",
+                "directive.paused",
+                "directive.resumed",
+                "directive.completed",
+                "mining.started",
+                "mining.stopped",
+                "mining.retargeted",
+            ]
+        );
+    }
+
+    #[test]
+    fn stranded_device_recovery_goal_is_regional_disabled_and_wakes_on_device_events() {
+        assert!(!default_goal_enabled(
+            DirectorGoalKind::StrandedDeviceRecovery
+        ));
+        assert!(goal_is_regional(DirectorGoalKind::StrandedDeviceRecovery));
+        assert_eq!(
+            goal_kind_key(DirectorGoalKind::StrandedDeviceRecovery),
+            "stranded_device_recovery"
+        );
+        assert_eq!(
+            parse_goal_kind("stranded_device_recovery"),
+            Some(DirectorGoalKind::StrandedDeviceRecovery)
+        );
+        assert_eq!(
+            initial_goal_objective(DirectorGoalKind::StrandedDeviceRecovery),
+            "Recover stranded owned devices to regional System Hubs"
+        );
+        for event in [
+            "device.attached",
+            "device.compacted",
+            "device.deployed",
+            "device.detached",
+            "device.stowed",
+            "device.unfurled",
+        ] {
+            assert!(director_reconcile_event_names().contains(&event));
+        }
+    }
+
+    #[test]
+    fn unserviced_resources_goal_is_regional_disabled_and_wakes_on_transport_events() {
+        assert!(!default_goal_enabled(DirectorGoalKind::UnservicedResources));
+        assert!(goal_is_regional(DirectorGoalKind::UnservicedResources));
+        assert_eq!(
+            goal_kind_key(DirectorGoalKind::UnservicedResources),
+            "unserviced_resources"
+        );
+        assert_eq!(
+            parse_goal_kind("unserviced_resources"),
+            Some(DirectorGoalKind::UnservicedResources)
+        );
+        assert_eq!(
+            initial_goal_objective(DirectorGoalKind::UnservicedResources),
+            "Establish AMI transport service for producing regional resources"
+        );
+        for event in [
+            "ami.adopted",
+            "ami.launched",
+            "ami.released",
+            "ami.withdrawn",
+            "ami.transport.digest",
+            "device.deployed",
+            "device.decommissioned",
+            "directive.set",
+            "directive.cleared",
+            "directive.paused",
+            "directive.resumed",
+            "directive.completed",
+            "mining.started",
+            "mining.stopped",
+            "mining.retargeted",
+        ] {
+            assert!(director_reconcile_event_names().contains(&event));
+        }
+    }
+
+    #[test]
+    fn unserviced_resources_retains_work_and_requires_complete_authority() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let mut controls = GoalControls::default();
+        controls
+            .regional
+            .entry(DirectorGoalKind::UnservicedResources)
+            .or_default()
+            .insert("alpha".to_owned(), true);
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: Some("ALPHA-HUB".to_owned()),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        };
+        let registry = WorkflowRegistry::new();
+        let service_snapshot = WorkflowServiceIntentSnapshot::default();
+        let empty_workflows = Vec::new();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &empty_workflows,
+            controls: &controls,
+            automatic: true,
+            now: 10,
+        };
+        let mut launch_available = true;
+
+        let blocked = reconcile_unserviced_resources(
+            &context,
+            &registry,
+            &service_snapshot,
+            &region,
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &[],
+            false,
+            &mut launch_available,
+        )
+        .expect("incomplete authority summary");
+        assert_eq!(blocked.status, DirectorGoalStatus::Blocked);
+
+        let route = crate::mining::AmiTransportRouteIntent {
+            system: "ALPHA".to_owned(),
+            collect: "ALPHA-BELT-1".to_owned(),
+            deliver: "ALPHA-HUB".to_owned(),
+        };
+        let workflow = repository
+            .create(new_mining_campaign_workflow(MiningCampaignIntent {
+                systems: vec![route.system.clone()],
+                region: region.region.clone(),
+                hub: route.deliver.clone(),
+                transport_routes: vec![route],
+                max_concurrency: 1,
+            }))
+            .expect("route campaign");
+        save_goal_runtime(
+            &repository,
+            &goal_instance_id(DirectorGoalKind::UnservicedResources, Some("alpha")),
+            &GoalRuntime {
+                active_workflows: vec![workflow.id],
+                last_launch_at_ms: Some(0),
+                launch_records: Vec::new(),
+            },
+        )
+        .expect("save runtime");
+        let workflows = vec![workflow];
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 20,
+        };
+        let active = reconcile_unserviced_resources(
+            &context,
+            &registry,
+            &service_snapshot,
+            &region,
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &workflows,
+            false,
+            &mut launch_available,
+        )
+        .expect("retained work summary");
+        assert_eq!(active.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            active.active_workflows,
+            vec![ProtocolWorkflowId(workflows[0].id.to_string())]
+        );
+    }
+
+    #[test]
+    fn unserviced_route_campaign_reuses_exact_intent_after_repository_reopen() {
+        let directory =
+            std::env::temp_dir().join(format!("replicant-unserviced-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("workflow.sqlite");
+        let route = crate::mining::AmiTransportRouteIntent {
+            system: "ALPHA".to_owned(),
+            collect: "ALPHA-BELT-1".to_owned(),
+            deliver: "ALPHA-HUB".to_owned(),
+        };
+        let target = route.workflow_service_intent();
+        let new_campaign = || {
+            new_mining_campaign_workflow(MiningCampaignIntent {
+                systems: vec![route.system.clone()],
+                region: "alpha".to_owned(),
+                hub: route.deliver.clone(),
+                transport_routes: vec![route.clone()],
+                max_concurrency: 1,
+            })
+        };
+
+        let repository = WorkflowRepository::open(&path).expect("repository");
+        let first = repository
+            .create_or_reuse_active(new_campaign(), |_| Ok(false))
+            .expect("create route campaign");
+        assert!(first.created);
+        drop(repository);
+
+        let repository = WorkflowRepository::open(&path).expect("reopen repository");
+        let mut registry = WorkflowRegistry::new();
+        crate::automation::register(&mut registry).expect("register automation");
+        let second = repository
+            .create_or_reuse_active(new_campaign(), |instance| {
+                match registry.service_intent_state_for_instance(
+                    instance,
+                    &target,
+                    Some("alpha"),
+                    Some("ALPHA"),
+                ) {
+                    WorkflowServiceIntentState::Present(_) => Ok(true),
+                    WorkflowServiceIntentState::Absent => Ok(false),
+                    WorkflowServiceIntentState::Unknown(_) => Err(RepositoryError::Compatibility(
+                        "unknown AMI route intent".to_owned(),
+                    )),
+                }
+            })
+            .expect("reuse route campaign");
+        assert!(!second.created);
+        assert_eq!(second.instance.id, first.instance.id);
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+
+        drop(repository);
+        std::fs::remove_dir_all(directory).expect("cleanup repository");
+    }
+
+    #[test]
     fn no_scale_down_goal_or_operation_exists() {
         assert!(
             all_goal_kinds()
@@ -8945,5 +10933,1073 @@ mod tests {
                 .all(|kind| !goal_kind_key(kind).contains("delete"))
         );
         assert!(!goal_kind_key(DirectorGoalKind::EstablishRegions).contains("retire"));
+    }
+    #[test]
+    fn recovery_adoption_requires_exact_identity_and_strict_metadata() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = PlacementRecoveryMetadata {
+            failed_provenance: BTreeMap::from([("DEVICE-1".to_owned(), vec![provenance.clone()])]),
+            release_device_tags: BTreeMap::from([(
+                "DEVICE-1".to_owned(),
+                vec!["mine-m:DEVICE-1".to_owned()],
+            )]),
+            placement_resolutions: vec![WorkflowPlacementResolution {
+                device_code: "DEVICE-1".to_owned(),
+                provenance,
+            }],
+        };
+        let intent = LogisticsManifestIntent {
+            origin: "BELT-1".to_owned(),
+            destination: "ALPHA-HUB".to_owned(),
+            device_codes: vec!["DEVICE-1".to_owned()],
+            region: Some("Alpha".to_owned()),
+            placement_recovery: Some(metadata.clone()),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        };
+        assert!(recovery_manifest_well_formed(&intent));
+        assert!(intent_matches_recovery(
+            &intent,
+            "alpha",
+            "DEVICE-1",
+            "BELT-1",
+            "ALPHA-HUB",
+            &metadata,
+        ));
+        assert!(!intent_matches_recovery(
+            &intent,
+            "alpha",
+            "DEVICE-1",
+            "BELT-1",
+            "OTHER-HUB",
+            &metadata,
+        ));
+        let mut malformed = intent.clone();
+        malformed
+            .placement_recovery
+            .as_mut()
+            .expect("metadata")
+            .placement_resolutions[0]
+            .device_code = "DEVICE-2".to_owned();
+        assert!(!recovery_manifest_well_formed(&malformed));
+    }
+    fn recovery_controls(enabled: bool) -> GoalControls {
+        let mut controls = GoalControls::default();
+        controls
+            .regional
+            .entry(DirectorGoalKind::StrandedDeviceRecovery)
+            .or_default()
+            .insert("alpha".to_owned(), enabled);
+        controls
+    }
+
+    fn recovery_region(hub: Option<&str>) -> RegionView {
+        RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("ALPHA".to_owned()),
+            hub_location: hub.map(str::to_owned),
+            known_systems: BTreeSet::from(["ALPHA".to_owned()]),
+        }
+    }
+
+    fn recovery_device(code: &str, location: &str) -> Device {
+        let mut device = test_hub_device();
+        device.key = replicant_client::DeviceKey::live(code.into());
+        device.device_type = Some(DeviceType::from("mining_drone"));
+        device.status = Some(replicant_client::DeviceStatus::Idle);
+        device.location = Some(replicant_client::LocationKey::live(location.into()));
+        device.available_commands = vec![replicant_client::DeviceCommand::from("attach")];
+        device.tags = vec![format!("mine-m:{code}")];
+        device
+    }
+
+    fn recovery_snapshot(
+        provenance: &WorkflowPlacementProvenance,
+        code: &str,
+        include_tag: bool,
+        terminal_residual: bool,
+    ) -> WorkflowPlacementIntentSnapshot {
+        let kind = replicant_workflow::WorkflowKind::new("test").expect("workflow kind");
+        let mut failed = vec![replicant_workflow::WorkflowPlacementIntentEvidence {
+            workflow_id: provenance.workflow_id,
+            workflow_kind: kind.clone(),
+            workflow_status: replicant_workflow::WorkflowStatus::Failed,
+            intent: replicant_workflow::WorkflowPlacementIntent {
+                subject: WorkflowPlacementIntentSubject::Device(code.to_owned()),
+                relation: replicant_workflow::WorkflowPlacementIntentRelation::Staged,
+                work_item_id: provenance.work_item_id,
+                expected_location: None,
+            },
+        }];
+        if include_tag {
+            failed.push(replicant_workflow::WorkflowPlacementIntentEvidence {
+                workflow_id: provenance.workflow_id,
+                workflow_kind: kind.clone(),
+                workflow_status: replicant_workflow::WorkflowStatus::Failed,
+                intent: replicant_workflow::WorkflowPlacementIntent {
+                    subject: WorkflowPlacementIntentSubject::DeviceTag(format!("mine-m:{code}")),
+                    relation: replicant_workflow::WorkflowPlacementIntentRelation::Staged,
+                    work_item_id: provenance.work_item_id,
+                    expected_location: None,
+                },
+            });
+        }
+        let terminal = terminal_residual.then(|| {
+            vec![replicant_workflow::WorkflowPlacementIntentEvidence {
+                workflow_id: provenance.workflow_id,
+                workflow_kind: kind,
+                workflow_status: replicant_workflow::WorkflowStatus::Succeeded,
+                intent: replicant_workflow::WorkflowPlacementIntent {
+                    subject: WorkflowPlacementIntentSubject::Device(code.to_owned()),
+                    relation: replicant_workflow::WorkflowPlacementIntentRelation::Staged,
+                    work_item_id: provenance.work_item_id,
+                    expected_location: None,
+                },
+            }]
+        });
+        WorkflowPlacementIntentSnapshot {
+            failed_transient: failed,
+            terminal_residuals: terminal.unwrap_or_default(),
+            ..WorkflowPlacementIntentSnapshot::default()
+        }
+    }
+
+    fn recovery_metadata(
+        provenance: &WorkflowPlacementProvenance,
+        code: &str,
+    ) -> PlacementRecoveryMetadata {
+        PlacementRecoveryMetadata {
+            failed_provenance: BTreeMap::from([(code.to_owned(), vec![provenance.clone()])]),
+            release_device_tags: BTreeMap::from([(
+                code.to_owned(),
+                vec!["mine-m:DEVICE-1".to_owned()],
+            )]),
+            placement_resolutions: vec![WorkflowPlacementResolution {
+                device_code: code.to_owned(),
+                provenance: provenance.clone(),
+            }],
+        }
+    }
+
+    fn recovery_intent(
+        metadata: &PlacementRecoveryMetadata,
+        code: &str,
+        origin: &str,
+        destination: &str,
+    ) -> LogisticsManifestIntent {
+        LogisticsManifestIntent {
+            origin: origin.to_owned(),
+            destination: destination.to_owned(),
+            device_codes: vec![code.to_owned()],
+            region: Some("alpha".to_owned()),
+            placement_recovery: Some(metadata.clone()),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        }
+    }
+
+    struct RecoveryRunContext<'a> {
+        repository: &'a WorkflowRepository,
+        controls: &'a GoalControls,
+        automatic: bool,
+        now: i64,
+    }
+
+    fn run_recovery(
+        run: RecoveryRunContext<'_>,
+        devices: &[Device],
+        region: &RegionView,
+        snapshot: Option<&WorkflowPlacementIntentSnapshot>,
+        complete_owned_census: bool,
+        placement_snapshot_error: bool,
+    ) -> DirectorGoalSummary {
+        let RecoveryRunContext {
+            repository,
+            controls,
+            automatic,
+            now,
+        } = run;
+        let workflows = repository.list().expect("list workflows");
+        let context = GoalReconcileContext {
+            repository,
+            workflows: &workflows,
+            controls,
+            automatic,
+            now,
+        };
+        let mut location_systems = devices
+            .iter()
+            .filter_map(|device| {
+                device
+                    .location
+                    .as_ref()
+                    .map(|location| (location.id.as_str().to_owned(), "ALPHA".to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let (Some(hub_location), Some(hub_system)) =
+            (region.hub_location.as_ref(), region.hub_system.as_ref())
+        {
+            location_systems.insert(hub_location.clone(), hub_system.clone());
+        }
+        let system_regions = BTreeMap::from([("ALPHA".to_owned(), "alpha".to_owned())]);
+        let regions = BTreeMap::from([("alpha".to_owned(), region.clone())]);
+        reconcile_stranded_device_recovery(
+            &context,
+            region,
+            devices,
+            &[],
+            &location_systems,
+            &system_regions,
+            &regions,
+            snapshot,
+            complete_owned_census,
+            placement_snapshot_error,
+        )
+        .expect("reconcile stranded-device recovery")
+    }
+
+    #[test]
+    fn recovery_director_status_matrix_reports_exact_authority_and_custody() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let region = recovery_region(Some("ALPHA-HUB"));
+
+        let disabled = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(false),
+                automatic: true,
+                now: 1,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            false,
+            false,
+        );
+        assert_eq!(disabled.status, DirectorGoalStatus::Waiting);
+        assert_eq!(
+            disabled.next_action.as_deref(),
+            Some("Enable this standing goal to recover stranded owned devices")
+        );
+        assert!(disabled.active_workflows.is_empty());
+        assert_eq!(repository.list().expect("rows").len(), 0);
+
+        let blocked = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 2,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            false,
+            false,
+        );
+        assert_eq!(blocked.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            blocked.blocker.as_deref(),
+            Some(
+                "Complete managed device and workflow authority before recovering stranded devices"
+            )
+        );
+        assert_eq!(blocked.next_action, blocked.blocker.clone());
+
+        let no_home = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 3,
+            },
+            std::slice::from_ref(&device),
+            &recovery_region(None),
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(no_home.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            no_home.blocker.as_deref(),
+            Some("No exact regional System Hub location is available for stranded device recovery")
+        );
+
+        let ambiguous_snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, true);
+        let ambiguous = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 4,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&ambiguous_snapshot),
+            true,
+            false,
+        );
+        assert_eq!(ambiguous.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            ambiguous.blocker.as_deref(),
+            Some(
+                "One or more owned devices have unresolved workflow custody and cannot be recovered safely"
+            )
+        );
+        assert_eq!(ambiguous.progress_total, 1);
+
+        let satisfied = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 5,
+            },
+            &[],
+            &region,
+            Some(&WorkflowPlacementIntentSnapshot::default()),
+            true,
+            false,
+        );
+        assert_eq!(satisfied.status, DirectorGoalStatus::Satisfied);
+        assert_eq!(
+            satisfied.next_action.as_deref(),
+            Some("Wait for newly stranded owned devices")
+        );
+        assert_eq!(satisfied.progress_total, 0);
+    }
+
+    #[test]
+    fn recovery_rejects_hub_location_without_exact_regional_authority() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let region = recovery_region(Some("ALPHA-HUB"));
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workflows = repository.list().expect("workflows");
+        let controls = recovery_controls(true);
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 6,
+        };
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let location_systems = BTreeMap::from([
+            ("ALPHA-BELT-1".to_owned(), "ALPHA".to_owned()),
+            ("ALPHA-HUB".to_owned(), "BETA".to_owned()),
+        ]);
+        let system_regions = BTreeMap::from([
+            ("ALPHA".to_owned(), "alpha".to_owned()),
+            ("BETA".to_owned(), "beta".to_owned()),
+        ]);
+        let regions = BTreeMap::from([("alpha".to_owned(), region.clone())]);
+        let summary = reconcile_stranded_device_recovery(
+            &context,
+            &region,
+            std::slice::from_ref(&device),
+            &[],
+            &location_systems,
+            &system_regions,
+            &regions,
+            Some(&snapshot),
+            true,
+            false,
+        )
+        .expect("reconcile");
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            summary.blocker.as_deref(),
+            Some(
+                "Complete managed device and workflow authority before recovering stranded devices"
+            )
+        );
+        assert!(repository.list().expect("rows").is_empty());
+    }
+
+    #[test]
+    fn recovery_advisory_and_automatic_creation_report_exact_manifest_identity() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let controls = recovery_controls(true);
+        let region = recovery_region(Some("ALPHA-HUB"));
+        let advisory = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &controls,
+                automatic: false,
+                now: 10,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(advisory.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            advisory.next_action.as_deref(),
+            Some("Recover stranded device DEVICE-1 from ALPHA-BELT-1 to ALPHA-HUB")
+        );
+        assert_eq!(advisory.progress_total, 1);
+        assert!(advisory.active_workflows.is_empty());
+        assert!(repository.list().expect("advisory rows").is_empty());
+
+        let created = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &controls,
+                automatic: true,
+                now: 11,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(created.status, DirectorGoalStatus::Active);
+        assert_eq!(created.active_workflows.len(), 1);
+        let rows = repository.list().expect("created rows");
+        assert_eq!(rows.len(), 1);
+        let intent = rows[0]
+            .config::<LogisticsManifestIntent>()
+            .expect("manifest config");
+        assert_eq!(intent.origin, "ALPHA-BELT-1");
+        assert_eq!(intent.destination, "ALPHA-HUB");
+        assert_eq!(intent.device_codes, vec!["DEVICE-1".to_owned()]);
+        assert_eq!(
+            intent.placement_recovery,
+            Some(recovery_metadata(&provenance, "DEVICE-1"))
+        );
+        assert_eq!(
+            intent.purpose,
+            "director:stranded_device_recovery:DEVICE-1:ALPHA-HUB"
+        );
+
+        let repeated = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &controls,
+                automatic: true,
+                now: 12,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(repeated.status, DirectorGoalStatus::Active);
+        assert_eq!(repeated.active_workflows, created.active_workflows);
+        assert_eq!(repository.list().expect("repeated rows").len(), 1);
+    }
+
+    #[test]
+    fn recovery_rejects_multi_device_manifests_as_not_closed_shape() {
+        let provenance_one = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let provenance_two = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let provenance_three = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = PlacementRecoveryMetadata {
+            failed_provenance: BTreeMap::from([
+                ("DEVICE-1".to_owned(), vec![provenance_one.clone()]),
+                ("DEVICE-2".to_owned(), vec![provenance_two.clone()]),
+            ]),
+            release_device_tags: BTreeMap::from([
+                ("DEVICE-1".to_owned(), vec!["mine-m:DEVICE-1".to_owned()]),
+                ("DEVICE-2".to_owned(), vec!["mine-m:DEVICE-2".to_owned()]),
+            ]),
+            placement_resolutions: vec![
+                WorkflowPlacementResolution {
+                    device_code: "DEVICE-1".to_owned(),
+                    provenance: provenance_one.clone(),
+                },
+                WorkflowPlacementResolution {
+                    device_code: "DEVICE-2".to_owned(),
+                    provenance: provenance_two.clone(),
+                },
+            ],
+        };
+        let intent = LogisticsManifestIntent {
+            origin: "ALPHA-BELT-1".to_owned(),
+            destination: "ALPHA-HUB".to_owned(),
+            device_codes: vec!["DEVICE-1".to_owned(), "DEVICE-2".to_owned()],
+            region: Some("alpha".to_owned()),
+            placement_recovery: Some(metadata),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        };
+        assert!(!recovery_manifest_well_formed(&intent));
+
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        repository
+            .create(new_logistics_manifest_workflow(intent.clone()))
+            .expect("active multi-device recovery manifest");
+        let devices = vec![
+            recovery_device("DEVICE-1", "ALPHA-BELT-1"),
+            recovery_device("DEVICE-2", "ALPHA-BELT-2"),
+            recovery_device("DEVICE-3", "ALPHA-BELT-3"),
+        ];
+        let mut snapshot = WorkflowPlacementIntentSnapshot::default();
+        for (provenance, code) in [
+            (&provenance_one, "DEVICE-1"),
+            (&provenance_two, "DEVICE-2"),
+            (&provenance_three, "DEVICE-3"),
+        ] {
+            snapshot
+                .failed_transient
+                .extend(recovery_snapshot(provenance, code, true, false).failed_transient);
+        }
+        let summary = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 13,
+            },
+            &devices,
+            &recovery_region(Some("ALPHA-HUB")),
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert!(summary.active_workflows.is_empty());
+        assert_eq!(repository.list().expect("multi-device rows").len(), 1);
+
+        let mut malformed = intent;
+        malformed
+            .placement_recovery
+            .as_mut()
+            .expect("multi-device metadata")
+            .placement_resolutions[0]
+            .device_code = "DEVICE-3".to_owned();
+        assert!(!recovery_manifest_well_formed(&malformed));
+        let malformed_repository = WorkflowRepository::open_in_memory().expect("repository");
+        malformed_repository
+            .create(new_logistics_manifest_workflow(malformed))
+            .expect("malformed multi-device recovery manifest");
+        let blocked = run_recovery(
+            RecoveryRunContext {
+                repository: &malformed_repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 14,
+            },
+            &devices,
+            &recovery_region(Some("ALPHA-HUB")),
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(blocked.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            blocked.blocker.as_deref(),
+            Some(
+                "Complete managed device and workflow authority before recovering stranded devices"
+            )
+        );
+        assert!(blocked.active_workflows.is_empty());
+        assert_eq!(
+            malformed_repository
+                .list()
+                .expect("malformed multi-device rows")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_adopts_only_valid_exact_manual_identity_and_blocks_malformed_rows() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = recovery_metadata(&provenance, "DEVICE-1");
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let region = recovery_region(Some("ALPHA-HUB"));
+
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let manual = repository
+            .create(new_logistics_manifest_workflow(recovery_intent(
+                &metadata,
+                "DEVICE-1",
+                "ALPHA-BELT-1",
+                "ALPHA-HUB",
+            )))
+            .expect("manual recovery manifest");
+        let adopted = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: false,
+                now: 20,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(adopted.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            adopted.active_workflows,
+            vec![ProtocolWorkflowId(manual.id.to_string())]
+        );
+        assert_eq!(repository.list().expect("manual rows").len(), 1);
+
+        for (destination, malformed) in [("OTHER-HUB", false), ("ALPHA-HUB", true)] {
+            let isolated = WorkflowRepository::open_in_memory().expect("isolated repository");
+            let mut intent = recovery_intent(&metadata, "DEVICE-1", "ALPHA-BELT-1", destination);
+            if malformed {
+                intent
+                    .placement_recovery
+                    .as_mut()
+                    .expect("metadata")
+                    .placement_resolutions[0]
+                    .device_code = "DEVICE-2".to_owned();
+            }
+            isolated
+                .create(new_logistics_manifest_workflow(intent))
+                .expect("malformed manual manifest row");
+            let summary = run_recovery(
+                RecoveryRunContext {
+                    repository: &isolated,
+                    controls: &recovery_controls(true),
+                    automatic: true,
+                    now: 21,
+                },
+                std::slice::from_ref(&device),
+                &region,
+                Some(&snapshot),
+                true,
+                false,
+            );
+            assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+            assert_eq!(
+                summary.blocker.as_deref(),
+                Some(
+                    "Complete managed device and workflow authority before recovering stranded devices"
+                )
+            );
+            assert!(summary.active_workflows.is_empty());
+            assert_eq!(isolated.list().expect("blocked rows").len(), 1);
+        }
+    }
+
+    #[test]
+    fn recovery_retries_retryable_exact_failure_after_cooldown() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = recovery_metadata(&provenance, "DEVICE-1");
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let created = repository
+            .create(new_logistics_manifest_workflow(recovery_intent(
+                &metadata,
+                "DEVICE-1",
+                "ALPHA-BELT-1",
+                "ALPHA-HUB",
+            )))
+            .expect("recovery manifest");
+        let failed = repository
+            .update(
+                created.id,
+                created.revision,
+                replicant_workflow::WorkflowState {
+                    status: replicant_workflow::WorkflowStatus::Failed,
+                    current_step: Some("failed".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: Some("transient recovery failure".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("persist failed manifest");
+        assert_eq!(
+            failed.failure_disposition,
+            Some(replicant_workflow::WorkflowFailureDisposition::Retryable)
+        );
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let region = recovery_region(Some("ALPHA-HUB"));
+        let before = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: failed.updated_at + DEFAULT_RETRY_COOLDOWN_MS - 1,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(before.status, DirectorGoalStatus::Waiting);
+        assert_eq!(
+            before.next_action.as_deref(),
+            Some("Wait briefly before retrying stranded device recovery")
+        );
+        assert_eq!(repository.list().expect("cooldown rows").len(), 1);
+        let after = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: failed.updated_at + DEFAULT_RETRY_COOLDOWN_MS + 1,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(after.status, DirectorGoalStatus::Active);
+        assert_eq!(repository.list().expect("retry rows").len(), 2);
+    }
+
+    #[test]
+    fn recovery_legacy_failed_exact_identity_retries_after_cooldown() {
+        let path = std::env::temp_dir().join(format!(
+            "replicant-stranded-recovery-legacy-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = recovery_metadata(&provenance, "DEVICE-1");
+        let repository = WorkflowRepository::open(&path).expect("open repository");
+        repository
+            .create(new_logistics_manifest_workflow(recovery_intent(
+                &metadata,
+                "DEVICE-1",
+                "ALPHA-BELT-1",
+                "ALPHA-HUB",
+            )))
+            .expect("legacy recovery manifest");
+        let created = repository.list().expect("created row").pop().expect("row");
+        drop(repository);
+        let connection = rusqlite::Connection::open(&path).expect("open fixture database");
+        connection
+            .execute(
+                "UPDATE workflow_instances
+                 SET status = 'failed',
+                     failure_disposition = NULL,
+                     last_error = 'legacy recovery failure'
+                 WHERE id = ?1",
+                rusqlite::params![created.id.to_string()],
+            )
+            .expect("persist legacy failure fixture");
+        drop(connection);
+
+        let repository = WorkflowRepository::open(&path).expect("reopen repository");
+        let failed = repository
+            .list()
+            .expect("legacy failed row")
+            .pop()
+            .expect("row");
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let region = recovery_region(Some("ALPHA-HUB"));
+        let before = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: failed.updated_at + DEFAULT_RETRY_COOLDOWN_MS - 1,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(before.status, DirectorGoalStatus::Waiting);
+        let after = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: failed.updated_at + DEFAULT_RETRY_COOLDOWN_MS + 1,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(after.status, DirectorGoalStatus::Active);
+        assert_eq!(
+            before.next_action.as_deref(),
+            Some("Wait briefly before retrying stranded device recovery")
+        );
+        assert_eq!(
+            after.next_action.as_deref(),
+            Some("Recover stranded device DEVICE-1 from ALPHA-BELT-1 to ALPHA-HUB")
+        );
+        assert_eq!(repository.list().expect("legacy retry rows").len(), 2);
+        drop(repository);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_reopen_and_separate_handles_reuse_one_row_then_new_identity_launches() {
+        let path = std::env::temp_dir().join(format!(
+            "replicant-stranded-recovery-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let region = recovery_region(Some("ALPHA-HUB"));
+        let first = WorkflowRepository::open(&path).expect("open first handle");
+        let second = WorkflowRepository::open(&path).expect("open concurrent handle");
+        let first_controls = recovery_controls(true);
+        let second_controls = recovery_controls(true);
+        let (first_summary, concurrent_summary) = std::thread::scope(|scope| {
+            let first_job = scope.spawn(|| {
+                run_recovery(
+                    RecoveryRunContext {
+                        repository: &first,
+                        controls: &first_controls,
+                        automatic: true,
+                        now: 30,
+                    },
+                    std::slice::from_ref(&device),
+                    &region,
+                    Some(&snapshot),
+                    true,
+                    false,
+                )
+            });
+            let second_job = scope.spawn(|| {
+                run_recovery(
+                    RecoveryRunContext {
+                        repository: &second,
+                        controls: &second_controls,
+                        automatic: true,
+                        now: 31,
+                    },
+                    std::slice::from_ref(&device),
+                    &region,
+                    Some(&snapshot),
+                    true,
+                    false,
+                )
+            });
+            (
+                first_job.join().expect("first concurrent reconcile"),
+                second_job.join().expect("second concurrent reconcile"),
+            )
+        });
+        assert_eq!(first_summary.active_workflows.len(), 1);
+        assert_eq!(
+            concurrent_summary.active_workflows,
+            first_summary.active_workflows
+        );
+        assert_eq!(second.list().expect("concurrent rows").len(), 1);
+
+        drop(first);
+        drop(second);
+        let second = WorkflowRepository::open(&path).expect("reopen second handle");
+        let reopened = run_recovery(
+            RecoveryRunContext {
+                repository: &second,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 32,
+            },
+            std::slice::from_ref(&device),
+            &region,
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(reopened.active_workflows, first_summary.active_workflows);
+        assert_eq!(second.list().expect("reopened rows").len(), 1);
+
+        let old = second
+            .list()
+            .expect("old row")
+            .into_iter()
+            .next()
+            .expect("old manifest");
+        let failed = second
+            .update(
+                old.id,
+                old.revision,
+                replicant_workflow::WorkflowState {
+                    status: replicant_workflow::WorkflowStatus::Failed,
+                    current_step: Some("failed".to_owned()),
+                    checkpoint: Value::Null,
+                    last_error: Some("changed identity".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("fail old identity");
+        let changed_provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let changed_device = recovery_device("DEVICE-2", "ALPHA-BELT-2");
+        let changed_snapshot = recovery_snapshot(&changed_provenance, "DEVICE-2", true, false);
+        let changed = run_recovery(
+            RecoveryRunContext {
+                repository: &second,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: failed.updated_at + DEFAULT_RETRY_COOLDOWN_MS + 1,
+            },
+            std::slice::from_ref(&changed_device),
+            &RegionView {
+                hub_location: Some("NEW-HUB".to_owned()),
+                ..region
+            },
+            Some(&changed_snapshot),
+            true,
+            false,
+        );
+        assert_eq!(changed.status, DirectorGoalStatus::Active);
+        assert_eq!(second.list().expect("changed identity rows").len(), 2);
+        drop(second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recovery_excludes_fresh_blueprints_in_the_same_pass() {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let mut blueprint = recovery_device("BLUEPRINT-1", "ALPHA-BELT-2");
+        blueprint.device_type = Some(DeviceType::EmptyReplicantMatrix);
+        blueprint.tags.clear();
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let summary = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: 40,
+            },
+            &[device.clone(), blueprint],
+            &recovery_region(Some("ALPHA-HUB")),
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(summary.progress_total, 1);
+        let rows = repository.list().expect("blueprint exclusion rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .config::<LogisticsManifestIntent>()
+                .expect("manifest")
+                .device_codes,
+            vec!["DEVICE-1".to_owned()]
+        );
+    }
+    #[test]
+    fn recovery_permanent_exact_failure_blocks_without_new_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "replicant-stranded-recovery-permanent-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let metadata = recovery_metadata(&provenance, "DEVICE-1");
+        let repository = WorkflowRepository::open(&path).expect("open repository");
+        let created = repository
+            .create(new_logistics_manifest_workflow(recovery_intent(
+                &metadata,
+                "DEVICE-1",
+                "ALPHA-BELT-1",
+                "ALPHA-HUB",
+            )))
+            .expect("recovery manifest");
+        drop(repository);
+        let connection = rusqlite::Connection::open(&path).expect("open fixture database");
+        connection
+            .execute(
+                "UPDATE workflow_instances
+                 SET status = 'failed',
+                     failure_disposition = 'permanent',
+                     last_error = 'exact recovery is permanently unavailable'
+                 WHERE id = ?1",
+                rusqlite::params![created.id.to_string()],
+            )
+            .expect("persist permanent failure fixture");
+        drop(connection);
+
+        let repository = WorkflowRepository::open(&path).expect("reopen repository");
+        let device = recovery_device("DEVICE-1", "ALPHA-BELT-1");
+        let snapshot = recovery_snapshot(&provenance, "DEVICE-1", true, false);
+        let summary = run_recovery(
+            RecoveryRunContext {
+                repository: &repository,
+                controls: &recovery_controls(true),
+                automatic: true,
+                now: created.updated_at + DEFAULT_RETRY_COOLDOWN_MS + 1,
+            },
+            std::slice::from_ref(&device),
+            &recovery_region(Some("ALPHA-HUB")),
+            Some(&snapshot),
+            true,
+            false,
+        );
+        assert_eq!(summary.status, DirectorGoalStatus::Blocked);
+        assert_eq!(
+            summary.blocker.as_deref(),
+            Some("exact recovery is permanently unavailable")
+        );
+        assert_eq!(
+            summary.next_action.as_deref(),
+            Some("Recover stranded device DEVICE-1 from ALPHA-BELT-1 to ALPHA-HUB")
+        );
+        assert!(summary.active_workflows.is_empty());
+        assert_eq!(repository.list().expect("permanent rows").len(), 1);
+        drop(repository);
+        let _ = std::fs::remove_file(path);
     }
 }

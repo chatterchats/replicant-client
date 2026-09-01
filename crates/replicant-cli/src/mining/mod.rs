@@ -160,6 +160,7 @@ impl Config {
             .collect();
         Ok(MiningExpansionRequest {
             systems,
+            transport_routes: Vec::new(),
             replicant: self.replicant.clone(),
             hub: self.hub.clone(),
             mission_file: self.mission_file.clone(),

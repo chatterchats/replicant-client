@@ -15,7 +15,10 @@ use replicant_workflow::{
     AllocationCandidate, AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, NewWorkflow,
     RegistryError, ReplacementOutcome, ResourceKey, WorkItem, WorkItemSpec, WorkItemStatus,
     WorkItemTransition, WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId,
-    WorkflowKind, WorkflowMigration, WorkflowRegistry, WorkflowStatus,
+    WorkflowKind, WorkflowMigration, WorkflowPlacementIntent, WorkflowPlacementIntentCoverage,
+    WorkflowPlacementIntentProjection, WorkflowPlacementIntentRelation,
+    WorkflowPlacementIntentSubject, WorkflowRegistry, WorkflowServiceIntentProjection,
+    WorkflowServiceScope, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,8 +31,9 @@ use crate::{
         event_mission_preflight, plan_event_mission,
     },
     mining::{
-        MiningExpansionRequest, MiningMission, execute_mining_item, merge_mining_item_state,
-        mining_item_completed, mining_work_item_specs, plan_expansion_from_managed_state,
+        AmiTransportRouteIntent, MiningExpansionRequest, MiningMission, execute_mining_item,
+        merge_mining_item_state, mining_item_completed, mining_work_item_specs,
+        plan_expansion_from_managed_state,
     },
     relay::{
         RelayExecutionState, RelayExpansionRequest, elastic_relay_assignment, execute_relay_trip,
@@ -296,6 +300,9 @@ pub struct MiningWorkflowConfig {
     pub region: String,
     /// Manufacturing hub used for staging and printing.
     pub hub: String,
+    /// Exact AMI transport routes to provision.
+    #[serde(default)]
+    pub transport_routes: Vec<AmiTransportRouteIntent>,
     /// Existing mining mission file retained for direct-action interoperability.
     pub mission_file: std::path::PathBuf,
     /// Maximum duration for managed-state waits.
@@ -487,6 +494,7 @@ impl WorkflowFactory for MiningWorkflowFactory {
             systems: legacy.systems,
             region: String::new(),
             hub: legacy.hub,
+            transport_routes: Vec::new(),
             mission_file: legacy.mission_file,
             wait_timeout_seconds: legacy.wait_timeout_seconds,
             max_concurrency: legacy.max_concurrency,
@@ -495,6 +503,173 @@ impl WorkflowFactory for MiningWorkflowFactory {
             serde_json::to_value(config).map_err(string_error)?,
             serde_json::to_value(checkpoint).map_err(string_error)?,
         )))
+    }
+
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let _: MiningWorkflowConfig = instance.config().map_err(string_error)?;
+        let checkpoint: MiningWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+        let mut intents = Vec::new();
+        if let Some(mission) = checkpoint.mission {
+            let value = serde_json::to_value(mission).map_err(string_error)?;
+            let mission: PlacementMiningMission =
+                serde_json::from_value(value).map_err(string_error)?;
+            if placement_status_is_live(instance.status) {
+                if !mission.mission_tag.trim().is_empty() {
+                    intents.push(placement_intent(
+                        WorkflowPlacementIntentSubject::DeviceTag(mission.mission_tag.clone()),
+                        WorkflowPlacementIntentRelation::Awaited,
+                        None,
+                        None,
+                    ));
+                }
+                for tag in &mission.legacy_mission_tags {
+                    if !tag.trim().is_empty() {
+                        intents.push(placement_intent(
+                            WorkflowPlacementIntentSubject::DeviceTag(tag.clone()),
+                            WorkflowPlacementIntentRelation::Awaited,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            for site in mission.sites {
+                let relation = match site.phase.as_deref() {
+                    Some("outbound" | "adopting" | "verifying" | "configuring")
+                        if !site.system.trim().is_empty() =>
+                    {
+                        Some(WorkflowPlacementIntentRelation::Transported)
+                    }
+                    Some("ready" | "deploying") if !site.system.trim().is_empty() => {
+                        Some(WorkflowPlacementIntentRelation::Staged)
+                    }
+                    _ => None,
+                };
+                if placement_status_is_live(instance.status) && !site.tag.trim().is_empty() {
+                    intents.push(placement_intent(
+                        WorkflowPlacementIntentSubject::DeviceTag(site.tag.clone()),
+                        WorkflowPlacementIntentRelation::Awaited,
+                        None,
+                        None,
+                    ));
+                }
+                let mut codes = site.assets.mining_drones;
+                codes.extend(site.assets.survey_drones);
+                if let Some(code) = site.assets.mining_controller {
+                    codes.push(code);
+                }
+                if let Some(code) = site.assets.survey_controller {
+                    codes.push(code);
+                }
+                if let Some(code) = site.assets.maintenance_drone {
+                    codes.push(code);
+                }
+                if let Some(code) = site.assets.system_ward {
+                    codes.push(code);
+                }
+                if let Some(code) = site.carrier {
+                    codes.push(code);
+                }
+                for code in codes {
+                    if let Some(subject) = placement_subject(&code)
+                        && let Some(intent) =
+                            status_intent(instance.status, subject, relation, None, None)
+                    {
+                        intents.push(intent);
+                    }
+                }
+            }
+            for route in mission.routes {
+                let relation = match route.phase.as_deref() {
+                    Some("activating") => Some(WorkflowPlacementIntentRelation::Transported),
+                    Some("ready") => Some(WorkflowPlacementIntentRelation::Staged),
+                    _ => None,
+                };
+                for code in [route.controller, route.freighter].into_iter().flatten() {
+                    if let Some(subject) = placement_subject(&code)
+                        && let Some(intent) =
+                            status_intent(instance.status, subject, relation, None, None)
+                    {
+                        intents.push(intent);
+                    }
+                }
+            }
+            for batch in mission.print_batches {
+                for code in batch.produced_codes {
+                    if let Some(subject) = placement_subject(&code)
+                        && let Some(intent) = status_intent(
+                            instance.status,
+                            subject,
+                            Some(WorkflowPlacementIntentRelation::Staged),
+                            None,
+                            None,
+                        )
+                    {
+                        intents.push(intent);
+                    }
+                }
+            }
+        }
+        decode_typed_work_items::<PlacementMiningItem>(work_items)?;
+        Ok(complete_projection(intents))
+    }
+
+    fn service_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<WorkflowServiceIntentProjection, String> {
+        let config: MiningWorkflowConfig = instance.config().map_err(string_error)?;
+        let checkpoint: MiningWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+        if let Some(mission) = checkpoint.mission
+            && !mission.routes.is_empty()
+            && !mission.hub_location.trim().is_empty()
+            && mission
+                .routes
+                .iter()
+                .all(|route| !route.system.trim().is_empty() && !route.belt.trim().is_empty())
+        {
+            let destination = mission.hub_location;
+            return Ok(WorkflowServiceIntentProjection::complete(
+                mission
+                    .routes
+                    .into_iter()
+                    .map(|route| {
+                        crate::mining::AmiTransportRouteIntent {
+                            system: route.system,
+                            collect: route.belt,
+                            deliver: destination.clone(),
+                        }
+                        .workflow_service_intent()
+                    })
+                    .collect(),
+            ));
+        }
+        if !config.transport_routes.is_empty() {
+            return Ok(WorkflowServiceIntentProjection::complete(
+                config
+                    .transport_routes
+                    .iter()
+                    .map(crate::mining::AmiTransportRouteIntent::workflow_service_intent)
+                    .collect(),
+            ));
+        }
+        if config.systems.iter().all(|system| system.trim().is_empty()) {
+            return Err("mining workflow has no service scope".into());
+        }
+        Ok(WorkflowServiceIntentProjection::unknown(
+            config
+                .systems
+                .iter()
+                .filter(|system| !system.trim().is_empty())
+                .map(|system| WorkflowServiceScope::System(system.trim().to_ascii_uppercase())),
+        ))
     }
 
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
@@ -524,6 +699,13 @@ async fn execute_mining_pool(
     execute_mining_pool_config(context, item_executor, config, checkpoint).await
 }
 
+fn mining_checkpoint_has_legacy_ward_gate(mission: &MiningMission) -> bool {
+    mission
+        .print_batches
+        .iter()
+        .any(|batch| batch.device_type == "system_ward")
+}
+
 pub(crate) async fn execute_mining_pool_config(
     context: &mut WorkflowContext,
     item_executor: Arc<dyn MiningItemExecutor>,
@@ -543,6 +725,17 @@ pub(crate) async fn execute_mining_pool_config(
     .ok_or_else(|| "mining campaign has no Director region evidence".to_owned())?;
     let broker =
         crate::assignment::ResourceBroker::with_managed_client(repository.clone(), client.clone());
+    if checkpoint
+        .mission
+        .as_ref()
+        .is_some_and(mining_checkpoint_has_legacy_ward_gate)
+    {
+        return context
+            .mark_failed(
+                "mining campaign checkpoint uses the obsolete System-Ward-gated deployment plan; replan without ward gating",
+            )
+            .map_err(string_error);
+    }
     if checkpoint.mission.is_none() {
         let candidates = regional_relay_candidates(
             repository.as_ref(),
@@ -559,6 +752,7 @@ pub(crate) async fn execute_mining_pool_config(
                     systems: config.systems.clone(),
                     replicant: worker,
                     hub: config.hub.clone(),
+                    transport_routes: config.transport_routes.clone(),
                     mission_file: config.mission_file.clone(),
                     wait_timeout: Duration::from_secs(config.wait_timeout_seconds),
                     max_concurrency: config.max_concurrency.max(1),
@@ -584,9 +778,11 @@ pub(crate) async fn execute_mining_pool_config(
         )
         .map_err(string_error)?;
     for item in reconciled {
-        if item.spec.payload_json["legacy_complete"] == Value::Bool(true)
-            && !item.state.status.is_terminal()
-        {
+        let completed_in_checkpoint = item.spec.payload_json["legacy_complete"]
+            == Value::Bool(true)
+            || (item.spec.kind.as_str() == "mining.stage"
+                && mining_item_completed(&mission, "stage"));
+        if completed_in_checkpoint && !item.state.status.is_terminal() {
             repository
                 .transition_work_item(
                     item.id,
@@ -611,6 +807,36 @@ pub(crate) async fn execute_mining_pool_config(
             broker.discover_candidates().map_err(string_error)?,
             &region,
         )?;
+        let now_ms = workflow_now_millis();
+        let manufacturing_stage = repository
+            .list_work_items(context.id())
+            .map_err(string_error)?
+            .into_iter()
+            .find(|item| item.spec.kind.as_str() == "mining.stage");
+        let manufacturing_incomplete = manufacturing_stage.as_ref().is_some_and(|item| {
+            !matches!(
+                item.state.status,
+                WorkItemStatus::Succeeded | WorkItemStatus::Skipped
+            )
+        });
+        let manufacturing_claimable =
+            manufacturing_stage
+                .as_ref()
+                .is_none_or(|item| match item.state.status {
+                    WorkItemStatus::Pending => true,
+                    WorkItemStatus::Waiting => item
+                        .state
+                        .next_attempt_at_ms
+                        .is_some_and(|retry_at_ms| retry_at_ms <= now_ms),
+                    WorkItemStatus::Succeeded | WorkItemStatus::Skipped => true,
+                    WorkItemStatus::Assigned
+                    | WorkItemStatus::Running
+                    | WorkItemStatus::Failed
+                    | WorkItemStatus::Abandoned => false,
+                });
+        if manufacturing_incomplete && !manufacturing_claimable {
+            break;
+        }
         let mut running = Vec::new();
         while running.len() < config.max_concurrency.max(1) {
             let Some(assigned) = repository
@@ -619,29 +845,48 @@ pub(crate) async fn execute_mining_pool_config(
             else {
                 break;
             };
-            let allocations =
-                match broker.allocate(assigned.id, assigned.state.revision, &candidates) {
-                    Ok(allocations) => allocations,
-                    Err(error) => {
-                        repository
-                            .transition_work_item(
-                                assigned.id,
-                                assigned.state.revision,
-                                WorkItemTransition::Waiting {
-                                    checkpoint_json: assigned.state.checkpoint_json.clone(),
-                                    reason: error.to_string(),
-                                    retry_at_ms: Some(
-                                        workflow_now_millis().saturating_add(300_000),
-                                    ),
-                                },
-                                workflow_now_millis(),
-                            )
-                            .map_err(string_error)?;
-                        break;
-                    }
-                };
+            let assigned_item_type = assigned.spec.payload_json["type"]
+                .as_str()
+                .unwrap_or_default();
+            if manufacturing_incomplete && assigned_item_type != "stage" {
+                repository
+                    .transition_work_item(
+                        assigned.id,
+                        assigned.state.revision,
+                        WorkItemTransition::Reclaimed {
+                            checkpoint_json: assigned.state.checkpoint_json.clone(),
+                        },
+                        workflow_now_millis(),
+                    )
+                    .map_err(string_error)?;
+                break;
+            }
+            let allocation_affinities = mining_allocation_affinities(assigned_item_type);
+            let allocations = match broker.allocate_with_affinity(
+                assigned.id,
+                assigned.state.revision,
+                &candidates,
+                allocation_affinities,
+            ) {
+                Ok(allocations) => allocations,
+                Err(error) => {
+                    repository
+                        .transition_work_item(
+                            assigned.id,
+                            assigned.state.revision,
+                            WorkItemTransition::Waiting {
+                                checkpoint_json: assigned.state.checkpoint_json.clone(),
+                                reason: error.to_string(),
+                                retry_at_ms: Some(workflow_now_millis().saturating_add(300_000)),
+                            },
+                            workflow_now_millis(),
+                        )
+                        .map_err(string_error)?;
+                    break;
+                }
+            };
             let worker = survey_allocated_identity(&allocations, "worker", "replicant")?;
-            let assignment_id = format!("mining:{}:{worker}", assigned.id);
+            let assignment_id = mining_assignment_id(assigned.id, assigned.state.revision, &worker);
             repository
                 .assign_work_item(
                     assigned.id,
@@ -664,6 +909,7 @@ pub(crate) async fn execute_mining_pool_config(
                 .as_str()
                 .ok_or_else(|| "mining item payload omitted type".to_owned())?
                 .to_owned();
+            let manufacturing_barrier = item_type == "stage";
             let index = started.spec.payload_json["index"]
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
@@ -681,6 +927,12 @@ pub(crate) async fn execute_mining_pool_config(
                 allocations,
                 Duration::from_secs(config.wait_timeout_seconds),
             ));
+            if manufacturing_barrier {
+                // Manufacturing owns the inventory/autofactory inputs that produce the
+                // downstream site/route hardware. Run it as a barrier without mutating
+                // persisted work-item specs, so already-active campaigns remain restartable.
+                break;
+            }
         }
         if running.is_empty() {
             break;
@@ -717,6 +969,31 @@ pub(crate) async fn execute_mining_pool_config(
             )
             .map_err(string_error),
         None => context.mark_waiting().map_err(string_error),
+    }
+}
+
+fn mining_assignment_id(
+    item_id: replicant_workflow::WorkItemId,
+    assignment_revision: u64,
+    worker: &str,
+) -> String {
+    format!("mining:{item_id}:r{assignment_revision}:{worker}")
+}
+
+fn mining_allocation_affinities(item_type: &str) -> &'static [(&'static str, &'static str)] {
+    match item_type {
+        "site" => &[("stow", "carrier")],
+        "route" => &[("stow", "freighter")],
+        _ => &[],
+    }
+}
+
+fn allocation_resource_identity(resource: &ResourceKey) -> &str {
+    match resource {
+        ResourceKey::Replicant(key) | ResourceKey::Device(key) | ResourceKey::Autofactory(key) => {
+            key
+        }
+        ResourceKey::Namespaced { key, .. } => key,
     }
 }
 
@@ -794,10 +1071,11 @@ async fn run_mining_item(
                     None => missing_mining_allocation(&client, &allocations).await?,
                 } {
                     match broker
-                        .replace_dead_allocation_from(
+                        .replace_dead_allocation_from_with_affinity(
                             item.id,
                             allocation_id,
                             &replacement_candidates,
+                            mining_allocation_affinities(&item_type),
                         )
                         .map_err(string_error)?
                     {
@@ -813,7 +1091,51 @@ async fn run_mining_item(
                                 .ok_or_else(|| {
                                     format!("mining allocation {allocation_id} disappeared")
                                 })?;
-                            *allocation = replacement;
+                            *allocation = replacement.clone();
+                            if matches!(requirement.as_str(), "carrier" | "freighter")
+                                && let Some(stow) = allocations
+                                    .by_requirement
+                                    .get("stow")
+                                    .and_then(|values| values.first())
+                                    .cloned()
+                                && allocation_resource_identity(&stow.resource)
+                                    != allocation_resource_identity(&replacement.resource)
+                            {
+                                match broker
+                                    .replace_dead_allocation_from_with_affinity(
+                                        item.id,
+                                        stow.id,
+                                        &replacement_candidates,
+                                        mining_allocation_affinities(&item_type),
+                                    )
+                                    .map_err(string_error)?
+                                {
+                                    ReplacementOutcome::Replaced(replacement_stow) => {
+                                        allocations
+                                            .by_requirement
+                                            .insert("stow".to_owned(), vec![replacement_stow]);
+                                    }
+                                    ReplacementOutcome::Waiting => {
+                                        repository
+                                            .transition_work_item(
+                                                item.id,
+                                                revision,
+                                                WorkItemTransition::Reclaimed {
+                                                    checkpoint_json: Some(
+                                                        serde_json::to_value(&mission)
+                                                            .map_err(string_error)?,
+                                                    ),
+                                                },
+                                                workflow_now_millis(),
+                                            )
+                                            .map_err(string_error)?;
+                                        return Ok((item_type, index, mission));
+                                    }
+                                    ReplacementOutcome::Unavailable => {
+                                        return Ok((item_type, index, mission));
+                                    }
+                                }
+                            }
                             continue;
                         }
                         ReplacementOutcome::Waiting => {
@@ -996,6 +1318,53 @@ impl WorkflowFactory for EventWorkflowFactory {
             serde_json::to_value(config).map_err(string_error)?,
             serde_json::to_value(checkpoint).map_err(string_error)?,
         )))
+    }
+
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let _: EventWorkflowConfig = instance.config().map_err(string_error)?;
+        let checkpoint: EventWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+
+        // The event executor's mission document is persisted as an opaque
+        // compatibility payload.  EventMissionPlan is private to the event
+        // adapter, so there is no actual typed schema available here to
+        // decode safely.  Never claim complete coverage (and thereby prove
+        // absence of placement intent) while that document is present.
+        if checkpoint
+            .plan_json
+            .as_deref()
+            .is_some_and(|mission_json| !mission_json.trim().is_empty())
+        {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+
+        for item in work_items {
+            if item.state.checkpoint_json.is_some() {
+                return Ok(WorkflowPlacementIntentProjection::unknown());
+            }
+            let payload = match serde_json::from_value::<PlacementEventItem>(
+                item.spec.payload_json.clone(),
+            ) {
+                Ok(payload) => payload,
+                // Unknown outer fields (including an unmodelled device
+                // reference) must not be silently discarded.
+                Err(_) => return Ok(WorkflowPlacementIntentProjection::unknown()),
+            };
+            // This is the actual event mission document, not an event-work
+            // item envelope.  Without its private typed schema, an opaque
+            // non-empty value cannot safely contribute placement evidence.
+            if !payload.mission_json.trim().is_empty() {
+                return Ok(WorkflowPlacementIntentProjection::unknown());
+            }
+        }
+
+        Ok(complete_projection(Vec::new()))
     }
 
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
@@ -1436,6 +1805,38 @@ impl WorkflowFactory for SurveyWorkflowFactory {
         Some(Box::new(SurveyWorkflow {
             item_executor: self.item_executor.clone(),
         }))
+    }
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let _: SurveyWorkflowConfig = instance.config().map_err(string_error)?;
+        let checkpoint: SurveyWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+        let mut intents = Vec::new();
+        if let Some(state) = checkpoint.state {
+            let state: PlacementSurveyState =
+                serde_json::from_value(serde_json::to_value(state).map_err(string_error)?)
+                    .map_err(string_error)?;
+            let relation = state.relation();
+            for code in std::iter::once(Some(state.vessel))
+                .chain(std::iter::once(state.controller))
+                .chain(state.drones.into_iter().map(Some))
+                .flatten()
+            {
+                if let Some(subject) = placement_subject(&code)
+                    && let Some(intent) =
+                        status_intent(instance.status, subject, relation, None, None)
+                {
+                    intents.push(intent);
+                }
+            }
+        }
+        decode_typed_work_items::<PlacementSurveyItem>(work_items)?;
+        Ok(complete_projection(intents))
     }
 }
 
@@ -2068,6 +2469,171 @@ impl WorkflowFactory for RelayWorkflowFactory {
         Ok(Some(WorkflowMigration::new(config, checkpoint)))
     }
 
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let _: RelayWorkflowConfig = instance.config().map_err(string_error)?;
+        let checkpoint: RelayWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+        let mut intents = Vec::new();
+        if let Some(state) = checkpoint.state {
+            let state: PlacementRelayState =
+                serde_json::from_value(serde_json::to_value(state).map_err(string_error)?)
+                    .map_err(string_error)?;
+            if placement_status_is_live(instance.status) {
+                for tag in state.legacy_mission_tags {
+                    if !tag.trim().is_empty() {
+                        intents.push(placement_intent(
+                            WorkflowPlacementIntentSubject::DeviceTag(tag),
+                            WorkflowPlacementIntentRelation::Awaited,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            let staged = state.stops.iter().any(|stop| stop.relay_code.is_some())
+                || state.print_jobs.iter().any(|job| job.submitted)
+                || state
+                    .supply
+                    .as_ref()
+                    .is_some_and(|supply| supply.carriers.iter().any(|carrier| carrier.dispatched));
+            if let Some(subject) = placement_subject(&state.vessel_code)
+                && let Some(intent) = status_intent(
+                    instance.status,
+                    subject,
+                    staged.then_some(WorkflowPlacementIntentRelation::Staged),
+                    None,
+                    None,
+                )
+            {
+                intents.push(intent);
+            }
+            if let Some(code) = state.dsr_carrier_code
+                && let Some(subject) = placement_subject(&code)
+                && let Some(intent) = status_intent(
+                    instance.status,
+                    subject,
+                    staged.then_some(WorkflowPlacementIntentRelation::Staged),
+                    None,
+                    None,
+                )
+            {
+                intents.push(intent);
+            }
+            for stop in state.stops {
+                let Some(code) = stop.relay_code else {
+                    continue;
+                };
+                let Some(subject) = placement_subject(&code) else {
+                    continue;
+                };
+                let deployed = stop.completed && !stop.location.trim().is_empty();
+                let relation = if deployed {
+                    WorkflowPlacementIntentRelation::Deployed
+                } else {
+                    WorkflowPlacementIntentRelation::Staged
+                };
+                if let Some(intent) = status_intent(
+                    instance.status,
+                    subject,
+                    Some(relation),
+                    None,
+                    deployed.then_some(stop.location),
+                ) {
+                    intents.push(intent);
+                }
+            }
+            for print in state.print_jobs {
+                if placement_status_is_live(instance.status) {
+                    for tag in [print.mission_tag.clone(), print.site_tag.clone()] {
+                        if !tag.trim().is_empty() {
+                            intents.push(placement_intent(
+                                WorkflowPlacementIntentSubject::DeviceTag(tag),
+                                WorkflowPlacementIntentRelation::Awaited,
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                    if let Some(tag) = print.batch_tag.clone()
+                        && !tag.trim().is_empty()
+                    {
+                        intents.push(placement_intent(
+                            WorkflowPlacementIntentSubject::DeviceTag(tag),
+                            WorkflowPlacementIntentRelation::Awaited,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+                if let Some(code) = print.relay_code
+                    && print.submitted
+                    && let Some(subject) = placement_subject(&code)
+                    && let Some(intent) = status_intent(
+                        instance.status,
+                        subject,
+                        Some(WorkflowPlacementIntentRelation::Staged),
+                        None,
+                        None,
+                    )
+                {
+                    intents.push(intent);
+                }
+            }
+            if let Some(supply) = state.supply {
+                for carrier in supply.carriers {
+                    let Some(subject) = placement_subject(&carrier.code) else {
+                        continue;
+                    };
+                    let relation = if carrier.dispatched && !carrier.returned_home {
+                        Some(WorkflowPlacementIntentRelation::Transported)
+                    } else {
+                        Some(WorkflowPlacementIntentRelation::Staged)
+                    };
+                    if let Some(intent) =
+                        status_intent(instance.status, subject, relation, None, None)
+                    {
+                        intents.push(intent);
+                    }
+                }
+                for restock in supply.restocks {
+                    if !restock.completed {
+                        if let Some(subject) = placement_subject(&restock.carrier_code)
+                            && let Some(intent) = status_intent(
+                                instance.status,
+                                subject,
+                                Some(WorkflowPlacementIntentRelation::Transported),
+                                None,
+                                None,
+                            )
+                        {
+                            intents.push(intent);
+                        }
+                        for code in restock.confirmed_detached_relays {
+                            if let Some(subject) = placement_subject(&code)
+                                && let Some(intent) = status_intent(
+                                    instance.status,
+                                    subject,
+                                    Some(WorkflowPlacementIntentRelation::Staged),
+                                    None,
+                                    None,
+                                )
+                            {
+                                intents.push(intent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        decode_typed_work_items::<PlacementRelayItem>(work_items)?;
+        Ok(complete_projection(intents))
+    }
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
         Some(Box::new(RelayWorkflow {
             trip_executor: self.trip_executor.clone(),
@@ -2082,6 +2648,7 @@ struct RelayWorkflow {
 impl WorkflowExecutor for RelayWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         let trip_executor = self.trip_executor.clone();
+
         Box::pin(async move {
             let config: RelayWorkflowConfig = context.config().map_err(string_error)?;
             let mut checkpoint: RelayWorkflowCheckpoint =
@@ -2707,12 +3274,19 @@ pub(crate) fn regional_relay_candidates(
     mut candidates: Vec<AllocationCandidate>,
     region: &str,
 ) -> Result<Vec<AllocationCandidate>, String> {
+    let requested_region = crate::canonical_region(region);
     let workers = repository
         .list_documents("director.replicant")
         .map_err(string_error)?
         .into_iter()
         .filter_map(|(worker, value, _)| {
-            (value.get("region").and_then(Value::as_str) == Some(region)).then_some(worker)
+            value
+                .get("region")
+                .and_then(Value::as_str)
+                .is_some_and(|worker_region| {
+                    crate::canonical_region(worker_region) == requested_region
+                })
+                .then_some(worker)
         })
         .collect::<BTreeSet<_>>();
     let state = client.state();
@@ -2741,22 +3315,77 @@ pub(crate) fn regional_relay_candidates(
             })
             .map(|device| device.key.id.as_str().to_owned()),
     );
-    candidates.retain(|candidate| match &candidate.resource {
-        ResourceKey::Replicant(code) => workers.contains(code),
-        ResourceKey::Device(code) | ResourceKey::Autofactory(code) => {
-            regional_devices.contains(code)
+
+    let system_regions =
+        crate::orchestration::expanded_system_region_map(&client.galaxy().catalogue());
+    for candidate in &mut candidates {
+        if let Some(location) = candidate.location.as_mut()
+            && let Some(designation) = location.designation.as_deref()
+            && let Some(system) = allocation_system_for_designation(designation, &system_regions)
+        {
+            location.region = system_regions.get(&system).cloned();
+            location.system = Some(system);
         }
-        ResourceKey::Namespaced { namespace, key } if namespace == "stow" => {
-            regional_devices.contains(key)
-        }
-        ResourceKey::Namespaced { namespace, .. } if namespace == "inventory" => true,
-        _ => false,
+    }
+
+    candidates.retain(|candidate| {
+        allocation_candidate_belongs_to_region(
+            candidate,
+            &requested_region,
+            &workers,
+            &regional_devices,
+        )
     });
     for candidate in &mut candidates {
-        let location = candidate.location.get_or_insert_default();
-        location.region = Some(region.to_owned());
+        candidate.location.get_or_insert_default().region = Some(region.to_owned());
     }
     Ok(candidates)
+}
+
+fn allocation_candidate_belongs_to_region(
+    candidate: &AllocationCandidate,
+    requested_region: &str,
+    workers: &BTreeSet<String>,
+    regional_devices: &BTreeSet<String>,
+) -> bool {
+    let physical_region = candidate
+        .location
+        .as_ref()
+        .and_then(|location| location.region.as_deref())
+        .map(crate::canonical_region);
+    match &candidate.resource {
+        ResourceKey::Replicant(code) => workers.contains(code),
+        ResourceKey::Device(code) | ResourceKey::Autofactory(code) => {
+            physical_region.as_deref().map_or_else(
+                || regional_devices.contains(code),
+                |physical| physical == requested_region,
+            )
+        }
+        ResourceKey::Namespaced { namespace, key } if namespace == "stow" => {
+            physical_region.as_deref().map_or_else(
+                || regional_devices.contains(key),
+                |physical| physical == requested_region,
+            )
+        }
+        ResourceKey::Namespaced { namespace, .. } if namespace == "inventory" => physical_region
+            .as_deref()
+            .is_none_or(|physical| physical == requested_region),
+        _ => false,
+    }
+}
+
+fn allocation_system_for_designation(
+    designation: &str,
+    system_regions: &BTreeMap<String, String>,
+) -> Option<String> {
+    let mut candidate = designation;
+    loop {
+        if system_regions.contains_key(candidate) {
+            return Some(candidate.to_owned());
+        }
+        let (parent, _) = candidate.rsplit_once('-')?;
+        candidate = parent;
+    }
 }
 
 fn survey_bundle_drone_capacities(
@@ -2946,6 +3575,359 @@ fn string_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn placement_subject(code: &str) -> Option<WorkflowPlacementIntentSubject> {
+    let code = code.trim();
+    (!code.is_empty()).then(|| WorkflowPlacementIntentSubject::Device(code.to_ascii_uppercase()))
+}
+
+fn placement_intent(
+    subject: WorkflowPlacementIntentSubject,
+    relation: WorkflowPlacementIntentRelation,
+    work_item_id: Option<replicant_workflow::WorkItemId>,
+    expected_location: Option<String>,
+) -> WorkflowPlacementIntent {
+    WorkflowPlacementIntent {
+        subject,
+        relation,
+        work_item_id,
+        expected_location: (relation == WorkflowPlacementIntentRelation::Deployed)
+            .then_some(expected_location)
+            .flatten(),
+    }
+}
+
+fn status_intent(
+    status: WorkflowStatus,
+    subject: WorkflowPlacementIntentSubject,
+    durable_relation: Option<WorkflowPlacementIntentRelation>,
+    work_item_id: Option<replicant_workflow::WorkItemId>,
+    expected_location: Option<String>,
+) -> Option<WorkflowPlacementIntent> {
+    let relation = match status {
+        WorkflowStatus::Queued
+        | WorkflowStatus::Running
+        | WorkflowStatus::Waiting
+        | WorkflowStatus::Reconciling
+        | WorkflowStatus::Paused => {
+            durable_relation.or(Some(WorkflowPlacementIntentRelation::Awaited))
+        }
+        WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+            durable_relation
+        }
+    }?;
+    Some(placement_intent(
+        subject,
+        relation,
+        work_item_id,
+        expected_location,
+    ))
+}
+
+fn placement_status_is_live(status: WorkflowStatus) -> bool {
+    matches!(
+        status,
+        WorkflowStatus::Queued
+            | WorkflowStatus::Running
+            | WorkflowStatus::Waiting
+            | WorkflowStatus::Reconciling
+            | WorkflowStatus::Paused
+    )
+}
+fn complete_projection(intents: Vec<WorkflowPlacementIntent>) -> WorkflowPlacementIntentProjection {
+    WorkflowPlacementIntentProjection {
+        coverage: WorkflowPlacementIntentCoverage::Complete,
+        intents,
+        resolutions: Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlacementSurveyPhase {
+    PreparingFleet,
+    Ready,
+    Traveling,
+    SystemScanning,
+    Surveying,
+    Restowing,
+    MaintenanceRecovering,
+    MaintenanceReturning,
+    MaintenanceRepairing,
+    MaintenanceRestowing,
+    Complete,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementSurveyState {
+    #[serde(default)]
+    vessel: String,
+    #[serde(default)]
+    controller: Option<String>,
+    #[serde(default)]
+    drones: Vec<String>,
+    #[serde(default)]
+    fleet_prepared: bool,
+    #[serde(default)]
+    phase: Option<PlacementSurveyPhase>,
+}
+
+impl PlacementSurveyState {
+    fn relation(&self) -> Option<WorkflowPlacementIntentRelation> {
+        match self.phase {
+            Some(
+                PlacementSurveyPhase::Traveling
+                | PlacementSurveyPhase::SystemScanning
+                | PlacementSurveyPhase::Surveying
+                | PlacementSurveyPhase::Restowing
+                | PlacementSurveyPhase::MaintenanceRecovering
+                | PlacementSurveyPhase::MaintenanceReturning
+                | PlacementSurveyPhase::MaintenanceRepairing
+                | PlacementSurveyPhase::MaintenanceRestowing,
+            ) => Some(WorkflowPlacementIntentRelation::Transported),
+            Some(PlacementSurveyPhase::Ready) if self.fleet_prepared => {
+                Some(WorkflowPlacementIntentRelation::Staged)
+            }
+            Some(PlacementSurveyPhase::PreparingFleet) if self.fleet_prepared => {
+                Some(WorkflowPlacementIntentRelation::Staged)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelayStop {
+    #[serde(default)]
+    location: String,
+    #[serde(default)]
+    relay_code: Option<String>,
+    #[serde(default)]
+    completed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelayPrint {
+    #[serde(default)]
+    mission_tag: String,
+    #[serde(default)]
+    site_tag: String,
+    #[serde(default)]
+    batch_tag: Option<String>,
+    #[serde(default)]
+    relay_code: Option<String>,
+    #[serde(default)]
+    submitted: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelayCarrier {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    dispatched: bool,
+    #[serde(default)]
+    returned_home: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelayRestock {
+    #[serde(default)]
+    carrier_code: String,
+    #[serde(default)]
+    confirmed_detached_relays: BTreeSet<String>,
+    #[serde(default)]
+    completed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelaySupply {
+    #[serde(default)]
+    carriers: Vec<PlacementRelayCarrier>,
+    #[serde(default)]
+    restocks: Vec<PlacementRelayRestock>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementRelayState {
+    #[serde(default)]
+    legacy_mission_tags: Vec<String>,
+    #[serde(default)]
+    vessel_code: String,
+    #[serde(default)]
+    dsr_carrier_code: Option<String>,
+    #[serde(default)]
+    stops: Vec<PlacementRelayStop>,
+    #[serde(default)]
+    print_jobs: Vec<PlacementRelayPrint>,
+    #[serde(default)]
+    supply: Option<PlacementRelaySupply>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementMiningAssets {
+    #[serde(default)]
+    mining_controller: Option<String>,
+    #[serde(default)]
+    mining_drones: Vec<String>,
+    #[serde(default)]
+    survey_controller: Option<String>,
+    #[serde(default)]
+    survey_drones: Vec<String>,
+    #[serde(default)]
+    maintenance_drone: Option<String>,
+    #[serde(default)]
+    system_ward: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementMiningSite {
+    #[serde(default)]
+    system: String,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    assets: PlacementMiningAssets,
+    #[serde(default)]
+    carrier: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementMiningRoute {
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    controller: Option<String>,
+    #[serde(default)]
+    freighter: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementMiningBatch {
+    #[serde(default)]
+    produced_codes: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlacementMiningMission {
+    #[serde(default)]
+    mission_tag: String,
+    #[serde(default)]
+    legacy_mission_tags: Vec<String>,
+    #[serde(default)]
+    sites: Vec<PlacementMiningSite>,
+    #[serde(default)]
+    routes: Vec<PlacementMiningRoute>,
+    #[serde(default)]
+    print_batches: Vec<PlacementMiningBatch>,
+}
+
+trait PlacementTypedItem: serde::de::DeserializeOwned {
+    fn touch(&self);
+}
+
+#[derive(Debug, Deserialize)]
+struct PlacementSurveyItem {
+    star: String,
+    entry_point: Option<String>,
+    survey_required: bool,
+    legacy_complete: bool,
+}
+
+impl PlacementTypedItem for PlacementSurveyItem {
+    fn touch(&self) {
+        let _ = (
+            &self.star,
+            &self.entry_point,
+            self.survey_required,
+            self.legacy_complete,
+        );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlacementRelayItem {
+    system: String,
+}
+
+impl PlacementTypedItem for PlacementRelayItem {
+    fn touch(&self) {
+        let _ = &self.system;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlacementMiningItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    index: usize,
+    system: String,
+    belt: String,
+    legacy_complete: bool,
+}
+
+impl PlacementTypedItem for PlacementMiningItem {
+    fn touch(&self) {
+        let _ = (
+            &self.item_type,
+            self.index,
+            &self.system,
+            &self.belt,
+            self.legacy_complete,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlacementEventStage {
+    Stage,
+    Delivery,
+    Resolve,
+    Return,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlacementEventItem {
+    event: String,
+    criterion: String,
+    selected: bool,
+    stage: PlacementEventStage,
+    mission_path: PathBuf,
+    mission_json: String,
+    legacy_complete: bool,
+}
+
+impl PlacementTypedItem for PlacementEventItem {
+    fn touch(&self) {
+        let _ = (
+            &self.event,
+            &self.criterion,
+            self.selected,
+            self.stage,
+            &self.mission_path,
+            &self.mission_json,
+            self.legacy_complete,
+        );
+    }
+}
+
+fn decode_typed_work_items<T: PlacementTypedItem>(items: &[WorkItem]) -> Result<(), String> {
+    for item in items {
+        if item.state.checkpoint_json.is_some() {
+            return Err("work-item checkpoint has no supported typed placement schema".to_owned());
+        }
+        if !item.spec.payload_json.is_null() {
+            let payload = serde_json::from_value::<T>(item.spec.payload_json.clone())
+                .map_err(string_error)?;
+            payload.touch();
+        }
+    }
+    Ok(())
+}
+
 struct RequirementWorkflowFactory(WorkflowKind);
 
 impl RequirementWorkflowFactory {
@@ -2965,6 +3947,33 @@ impl WorkflowFactory for RequirementWorkflowFactory {
 
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
         Some(Box::new(RequirementWorkflow))
+    }
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let config: RequirementWorkflowConfig = instance.config().map_err(string_error)?;
+        let _: RequirementWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+        if !work_items.is_empty() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let mut intents = Vec::new();
+        for claim in config.requirement.fulfillment.claims {
+            let ResourceKey::Device(code) = claim else {
+                continue;
+            };
+            let Some(subject) = placement_subject(&code) else {
+                continue;
+            };
+            if let Some(intent) = status_intent(instance.status, subject, None, None, None) {
+                intents.push(intent);
+            }
+        }
+        Ok(complete_projection(intents))
     }
 }
 
@@ -3127,6 +4136,33 @@ impl WorkflowFactory for RequirementActionFactory {
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
         Some(Box::new(RequirementActionWorkflow))
     }
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != self.current_schema_version() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let config: RequirementActionConfig = instance.config().map_err(string_error)?;
+        let checkpoint: Value = instance.checkpoint().map_err(string_error)?;
+        if !checkpoint.is_null() || !work_items.is_empty() {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        }
+        let mut intents = Vec::new();
+        for claim in config.operation.claims {
+            let ResourceKey::Device(code) = claim else {
+                continue;
+            };
+            let Some(subject) = placement_subject(&code) else {
+                continue;
+            };
+            if let Some(intent) = status_intent(instance.status, subject, None, None, None) {
+                intents.push(intent);
+            }
+        }
+        Ok(complete_projection(intents))
+    }
 }
 
 struct RequirementActionWorkflow;
@@ -3270,6 +4306,7 @@ pub fn new_requirement_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::requirements::RequirementScope;
     use std::sync::{
         Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -3280,6 +4317,60 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn mining_assignment_ids_change_between_claim_revisions() {
+        let item_id = replicant_workflow::WorkItemId::new();
+        assert_ne!(
+            mining_assignment_id(item_id, 7, "R-1"),
+            mining_assignment_id(item_id, 8, "R-1")
+        );
+    }
+
+    #[test]
+    fn physical_device_region_overrides_assigned_worker_fallback() {
+        let workers = ["ALPHA-WORKER".to_owned()].into_iter().collect();
+        let regional_devices = ["BETA-AF".to_owned()].into_iter().collect();
+        let candidate = AllocationCandidate {
+            resource: ResourceKey::Autofactory("BETA-AF".into()),
+            kind: "autofactory".into(),
+            capabilities: Vec::new(),
+            location: Some(replicant_workflow::AllocationLocation {
+                region: Some("beta".into()),
+                system: Some("THYFFAWFF".into()),
+                designation: Some("THYFFAWFF-BELT-1".into()),
+                ..replicant_workflow::AllocationLocation::default()
+            }),
+            available_quantity: 1,
+            observed_revision: 1,
+            observed_at_ms: 1,
+        };
+
+        assert!(allocation_candidate_belongs_to_region(
+            &candidate,
+            "beta",
+            &workers,
+            &regional_devices,
+        ));
+        assert!(!allocation_candidate_belongs_to_region(
+            &candidate,
+            "alpha",
+            &workers,
+            &regional_devices,
+        ));
+    }
+
+    #[test]
+    fn allocation_location_resolves_against_the_longest_known_system_prefix() {
+        let regions = BTreeMap::from([
+            ("KHAHKUHKAK".to_owned(), "delta".to_owned()),
+            ("KHAHKUHKAK-OUTER".to_owned(), "delta".to_owned()),
+        ]);
+        assert_eq!(
+            allocation_system_for_designation("KHAHKUHKAK-OUTER-2-L4", &regions).as_deref(),
+            Some("KHAHKUHKAK-OUTER")
+        );
+    }
 
     async fn mining_pool_client(server: &MockServer) -> replicant_client::Client {
         replicant_client::Client::builder()
@@ -3475,7 +4566,7 @@ mod tests {
                     tag: "mine-s:pending".into(),
                     phase: crate::mining::SitePhase::Planned,
                     assets: crate::mining::SiteAssets::default(),
-                    missing: BTreeMap::new(),
+                    missing: BTreeMap::from([("ami_mining_controller".into(), 1)]),
                     carrier: None,
                 },
             ],
@@ -3529,6 +4620,43 @@ mod tests {
         mission
     }
 
+    #[test]
+    fn manufacturing_work_item_spec_stays_immutable_when_checkpoint_completes() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: mining_workflow_kind(),
+                schema_version: SCHEMA_VERSION,
+                config: Value::Null,
+                checkpoint: Value::Null,
+                current_step: Some("executing".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let mut mission = mining_pool_material_mission();
+        let initial =
+            mining_work_item_specs(workflow.id, &mission, "Alpha").expect("initial specs");
+        repository
+            .reconcile_work_items(workflow.id, &initial, 1)
+            .expect("initial reconciliation");
+
+        mission.print_batches[0]
+            .produced_codes
+            .push("PRINTED-1".into());
+        let resumed =
+            mining_work_item_specs(workflow.id, &mission, "Alpha").expect("resumed specs");
+        assert_eq!(resumed, initial);
+        let stage = resumed
+            .iter()
+            .find(|spec| spec.kind.as_str() == "mining.stage")
+            .expect("manufacturing stage");
+        assert_eq!(stage.payload_json["legacy_complete"], Value::Bool(false));
+        repository
+            .reconcile_work_items(workflow.id, &resumed, 2)
+            .expect("restart reconciliation");
+    }
+
     #[tokio::test]
     async fn mining_pool_registered_schema_one_workflow_uses_allocated_concurrent_items() {
         let server = MockServer::start().await;
@@ -3539,7 +4667,7 @@ mod tests {
             "REP-A",
             "A-CARRIER",
             &[
-                ("A-CARRIER", "cargo_freighter", Some(12)),
+                ("A-CARRIER", "surge_carrier", Some(12)),
                 ("A-MC", "ami_mining_controller", None),
                 ("A-MD1", "mining_drone", None),
                 ("A-MD2", "mining_drone", None),
@@ -3572,6 +4700,7 @@ mod tests {
                 ("C-FREIGHTER", "cargo_freighter", Some(4)),
                 ("C-TC", "ami_transport_controller", None),
                 ("C-AF", "autofactory", None),
+                ("C-CARRIER", "surge_carrier", Some(12)),
             ],
         )
         .await;
@@ -3672,13 +4801,12 @@ mod tests {
             1,
             "replacement resumes the same durable attempt"
         );
-        assert_eq!(items.len(), 4);
-        assert_eq!(
+        assert_eq!(items.len(), 3);
+        assert!(
             items
                 .iter()
-                .filter(|item| item.state.status == WorkItemStatus::Skipped)
-                .count(),
-            1
+                .all(|item| item.spec.dedupe_key != "mining.site:DONE-BELT-1"),
+            "operational sites must not reopen durable work"
         );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
         assert_eq!(executor.peak.load(Ordering::SeqCst), 2);
@@ -3688,7 +4816,7 @@ mod tests {
             .expect("stow quantities")
             .clone();
         stow.sort_unstable();
-        assert_eq!(stow, [2, 2, 9, 9]);
+        assert_eq!(stow, [1, 1, 2, 2]);
         let progress = workflow
             .result::<Value>()
             .expect("mining result")
@@ -3733,7 +4861,7 @@ mod tests {
             .read(campaign.id)
             .expect("campaign")
             .expect("campaign exists");
-        assert_eq!(campaign.schema_version, 2);
+        assert_eq!(campaign.schema_version, 3);
         assert_eq!(
             campaign.status,
             WorkflowStatus::Succeeded,
@@ -3750,6 +4878,7 @@ mod tests {
                     systems: vec!["DONE".into(), "PENDING".into()],
                     region: "Alpha".into(),
                     hub: "ROOT-1-L4".into(),
+                    transport_routes: Vec::new(),
                     mission_file: std::env::temp_dir().join("mining-shortage-unused.json"),
                     wait_timeout_seconds: 1,
                     max_concurrency: 2,
@@ -4040,5 +5169,364 @@ mod tests {
         assert!(migration.config().get("replicant").is_none());
         assert!(migration.config().get("request").is_none());
         assert_eq!(factory.current_schema_version(), 2);
+    }
+    #[test]
+    fn direct_factory_projectors_cover_current_payloads_and_reject_legacy() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let survey = repository
+            .create(NewWorkflow {
+                kind: survey_workflow_kind(),
+                schema_version: 2,
+                config: SurveyWorkflowConfig {
+                    region: "alpha".into(),
+                    center: "HOME".into(),
+                    radius_ly: 1.0,
+                    system_limit: 1,
+                    target_systems: None,
+                    star_detail_concurrency: 1,
+                    mission_file: PathBuf::from("survey.json"),
+                    replace_plan: false,
+                    include_explored: false,
+                    travel_timeout: Duration::from_secs(1),
+                    survey_timeout: Duration::from_secs(1),
+                    maintenance_home: "HOME".into(),
+                    maintenance_interval: 1,
+                    maintenance_threshold_pct: 10.0,
+                    maintenance_resume_pct: 90.0,
+                    maintenance_check_interval: Duration::from_secs(1),
+                },
+                checkpoint: SurveyWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("survey workflow");
+        let relay = repository
+            .create(NewWorkflow {
+                kind: relay_workflow_kind(),
+                schema_version: 2,
+                config: RelayWorkflowConfig {
+                    hub: "HOME".into(),
+                    region: Some("alpha".into()),
+                    targets: vec!["TARGET".into()],
+                    mission_file: PathBuf::from("relay.json"),
+                    max_hop_ly: 1.0,
+                    wait_timeout_seconds: 1,
+                    wait_timeout_nanoseconds: 0,
+                    unavailable_autofactories: BTreeSet::new(),
+                },
+                checkpoint: RelayWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("relay workflow");
+        let mining = repository
+            .create(NewWorkflow {
+                kind: mining_workflow_kind(),
+                schema_version: 2,
+                config: MiningWorkflowConfig {
+                    systems: vec!["TARGET".into()],
+                    region: "alpha".into(),
+                    hub: "HOME".into(),
+                    transport_routes: Vec::new(),
+                    mission_file: PathBuf::from("mining.json"),
+                    wait_timeout_seconds: 1,
+                    max_concurrency: 1,
+                },
+                checkpoint: MiningWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("mining workflow");
+        let event = repository
+            .create(NewWorkflow {
+                kind: event_workflow_kind(),
+                schema_version: 2,
+                config: EventWorkflowConfig {
+                    event: Some("EVENT".into()),
+                    criterion: None,
+                    region: "alpha".into(),
+                    home: "HOME".into(),
+                    plan_file: PathBuf::from("event.json"),
+                    replace_plan: false,
+                    wait_timeout_seconds: 1,
+                },
+                checkpoint: EventWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("event workflow");
+        let requirement = repository
+            .create(NewWorkflow {
+                kind: requirement_workflow_kind(),
+                schema_version: 1,
+                config: RequirementWorkflowConfig {
+                    requirement: Requirement {
+                        id: "req".into(),
+                        name: "requirement".into(),
+                        scope: RequirementScope::Location("HOME".into()),
+                        target: crate::requirements::RequirementTarget::Device {
+                            device_type: "cargo_freighter".into(),
+                            state: Default::default(),
+                        },
+                        desired: 1,
+                        fulfillment: FulfillmentOperation {
+                            operation_class: FulfillmentOperationClass::Action,
+                            kind: "noop".into(),
+                            parameters: BTreeMap::new(),
+                            claims: vec![ResourceKey::Device("dev-1".into())],
+                        },
+                    },
+                },
+                checkpoint: RequirementWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("requirement workflow");
+        let action = repository
+            .create(NewWorkflow {
+                kind: requirement_action_kind(),
+                schema_version: 1,
+                config: RequirementActionConfig {
+                    requirement_id: "req".into(),
+                    quantity: 1,
+                    operation: FulfillmentOperation {
+                        operation_class: FulfillmentOperationClass::Action,
+                        kind: "noop".into(),
+                        parameters: BTreeMap::new(),
+                        claims: vec![ResourceKey::Device("dev-2".into())],
+                    },
+                },
+                checkpoint: Value::Null,
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("action workflow");
+
+        assert_eq!(
+            SurveyWorkflowFactory::new()
+                .placement_intents(&survey, &[])
+                .expect("survey projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Complete
+        );
+        assert_eq!(
+            RelayWorkflowFactory::new()
+                .placement_intents(&relay, &[])
+                .expect("relay projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Complete
+        );
+        assert_eq!(
+            MiningWorkflowFactory::new()
+                .placement_intents(&mining, &[])
+                .expect("mining projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Complete
+        );
+        assert_eq!(
+            EventWorkflowFactory::new()
+                .placement_intents(&event, &[])
+                .expect("event projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Complete
+        );
+        let requirement_projection = RequirementWorkflowFactory::new()
+            .placement_intents(&requirement, &[])
+            .expect("requirement projection");
+        assert_eq!(
+            requirement_projection.intents[0].subject,
+            WorkflowPlacementIntentSubject::Device("DEV-1".into())
+        );
+        assert_eq!(
+            RequirementActionFactory::new()
+                .placement_intents(&action, &[])
+                .expect("action projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Complete
+        );
+
+        let legacy = repository
+            .create(NewWorkflow {
+                kind: survey_workflow_kind(),
+                schema_version: 1,
+                config: Value::Null,
+                checkpoint: Value::Null,
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("legacy workflow");
+        assert_eq!(
+            SurveyWorkflowFactory::new()
+                .placement_intents(&legacy, &[])
+                .expect("legacy projection")
+                .coverage,
+            WorkflowPlacementIntentCoverage::Unknown
+        );
+    }
+    #[test]
+    fn placement_status_boundaries_keep_terminal_and_opaque_state_conservative() {
+        let subject = placement_subject(" dev-9 ").expect("device subject");
+        assert_eq!(
+            status_intent(WorkflowStatus::Queued, subject.clone(), None, None, None)
+                .expect("live intent")
+                .relation,
+            WorkflowPlacementIntentRelation::Awaited
+        );
+        assert_eq!(
+            status_intent(
+                WorkflowStatus::Failed,
+                subject.clone(),
+                Some(WorkflowPlacementIntentRelation::Transported),
+                None,
+                None
+            )
+            .expect("failed custody")
+            .relation,
+            WorkflowPlacementIntentRelation::Transported
+        );
+        assert_eq!(
+            status_intent(
+                WorkflowStatus::Cancelled,
+                subject.clone(),
+                Some(WorkflowPlacementIntentRelation::Staged),
+                None,
+                None
+            )
+            .expect("cancelled custody")
+            .relation,
+            WorkflowPlacementIntentRelation::Staged
+        );
+        assert_eq!(
+            status_intent(
+                WorkflowStatus::Succeeded,
+                subject,
+                Some(WorkflowPlacementIntentRelation::Deployed),
+                None,
+                Some("HOME".into())
+            )
+            .expect("settled placement")
+            .expected_location
+            .as_deref(),
+            Some("HOME")
+        );
+        assert!(
+            placement_subject(" ").is_none(),
+            "blank device codes are not exact subjects"
+        );
+    }
+
+    fn event_projection_instance(
+        repository: &replicant_workflow::WorkflowRepository,
+    ) -> replicant_workflow::WorkflowInstance {
+        repository
+            .create(NewWorkflow {
+                kind: event_workflow_kind(),
+                schema_version: 2,
+                config: EventWorkflowConfig {
+                    event: Some("EVENT".into()),
+                    criterion: None,
+                    region: "alpha".into(),
+                    home: "HOME".into(),
+                    plan_file: PathBuf::from("event.json"),
+                    replace_plan: false,
+                    wait_timeout_seconds: 1,
+                },
+                checkpoint: EventWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("event workflow")
+    }
+
+    fn event_projection_item(payload_json: Value) -> WorkItem {
+        WorkItem {
+            id: replicant_workflow::WorkItemId::new(),
+            spec: WorkItemSpec {
+                workflow_id: WorkflowId::new(),
+                dedupe_key: "event:item".into(),
+                kind: WorkflowKind::new("event.stage").expect("event item kind"),
+                sort_key: "event:item".into(),
+                payload_json,
+                preconditions_json: Value::Array(Vec::new()),
+                requirements_json: Value::Array(Vec::new()),
+                deadline_at_ms: None,
+            },
+            state: replicant_workflow::WorkItemState {
+                status: WorkItemStatus::Pending,
+                checkpoint_json: None,
+                result_json: None,
+                last_error: None,
+                attempt_count: 0,
+                consecutive_failure_count: 0,
+                next_attempt_at_ms: None,
+                ever_started: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                revision: 0,
+            },
+        }
+    }
+
+    fn event_item_payload(mission_json: &str) -> Value {
+        serde_json::json!({
+            "event": "EVENT",
+            "criterion": "CRITERION",
+            "selected": true,
+            "stage": "stage",
+            "mission_path": "event.json",
+            "mission_json": mission_json,
+            "legacy_complete": false,
+        })
+    }
+
+    #[test]
+    fn event_projection_requires_decoded_mission_content_for_complete_coverage() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let instance = event_projection_instance(&repository);
+        let factory = EventWorkflowFactory::new();
+
+        let empty = factory
+            .placement_intents(&instance, &[event_projection_item(event_item_payload(""))])
+            .expect("empty mission projection");
+        assert_eq!(
+            empty.coverage,
+            WorkflowPlacementIntentCoverage::Complete,
+            "an outer event item with no mission document is fully understood",
+        );
+
+        let opaque = factory
+            .placement_intents(
+                &instance,
+                &[event_projection_item(event_item_payload(
+                    r#"{"claimed_devices":[{"device_code":"HIDDEN-DEVICE"}]}"#,
+                ))],
+            )
+            .expect("opaque mission projection");
+        assert_eq!(
+            opaque.coverage,
+            WorkflowPlacementIntentCoverage::Unknown,
+            "opaque mission JSON cannot prove absence of placement intent",
+        );
+        assert!(opaque.intents.is_empty());
+    }
+
+    #[test]
+    fn event_projection_rejects_unmodelled_device_references() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let instance = event_projection_instance(&repository);
+        let mut payload = event_item_payload("");
+        payload["device_code"] = Value::String("SILENTLY-DROPPED".into());
+
+        let projection = EventWorkflowFactory::new()
+            .placement_intents(&instance, &[event_projection_item(payload)])
+            .expect("unknown outer event projection");
+        assert_eq!(
+            projection.coverage,
+            WorkflowPlacementIntentCoverage::Unknown,
+            "new device-bearing fields must not be ignored by a complete projector",
+        );
     }
 }

@@ -12,6 +12,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::bootstrap::{
+    BootstrapExecutionRequest, BootstrapPlanningRequest, plan_bootstrap, run_bootstrap,
+};
 use replicant_client::{
     Client, Device, DeviceHandle, DeviceType, MiningDirective, Operation, OperationId,
     OperationStatus, SurveyDirective, domain::AccessScope,
@@ -20,24 +23,27 @@ use replicant_printing::{
     PrintRequest,
     managed::{QueueOptions, printing_status_in_system, queue_prints_with_components},
 };
-use replicant_protocol::workflow_reserved;
+use replicant_protocol::{workflow_reserved, workflow_tag_reserved};
+#[cfg(test)]
+use replicant_transport::PayloadDevice;
 use replicant_transport::{
-    DeliveryOptions, DeliveryPlan, DeliveryRequest, DeviceRequest, ResourceMap, TransportError,
-    execute_delivery, plan_delivery, validate_resource_pickups,
+    DeliveryOptions, DeliveryPlan, DeliveryReport, DeliveryRequest, DeviceRequest, ResourceMap,
+    TransportError, execute_delivery, plan_delivery, validate_resource_pickups,
 };
 use replicant_workflow::{
     AllocationSet, BoxWorkflowFuture, ClaimAcquireOutcome, ControlRequest, NewWorkflow,
     RegistryError, RepositoryError, RequirementScope, ResourceKey, ResourceRequirement, WaitIntent,
     WaitOutcome, WaitSignal, WorkItem, WorkItemSpec, WorkItemStatus, WorkItemTransition,
     WorkflowContext, WorkflowExecutor, WorkflowFactory, WorkflowId, WorkflowKind,
-    WorkflowMigration, WorkflowRegistry, WorkflowStatus,
+    WorkflowMigration, WorkflowPlacementIntent, WorkflowPlacementIntentCoverage,
+    WorkflowPlacementIntentProjection, WorkflowPlacementIntentRelation,
+    WorkflowPlacementIntentSnapshot, WorkflowPlacementIntentSubject, WorkflowPlacementProvenance,
+    WorkflowPlacementResolution, WorkflowRegistry, WorkflowServiceIntentProjection,
+    WorkflowServiceScope, WorkflowStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::bootstrap::{
-    BootstrapExecutionRequest, BootstrapPlanningRequest, plan_bootstrap, run_bootstrap,
-};
+use sha2::{Digest, Sha256};
 
 use crate::{
     belt_search::{BeltOperationRejection, execute_belt_search_system, travel_to_system},
@@ -50,7 +56,7 @@ use crate::{
         plan_event_mission, prestage_event_mission, reconcile_event_stock, restore_event_campaign,
     },
     failure::{FailureClass, failure_class, failure_class_from_message, failure_disposition},
-    mining::{MiningExpansionRequest, MiningMission, execute_expansion},
+    mining::{AmiTransportRouteIntent, MiningExpansionRequest, MiningMission, execute_expansion},
     observatory::auto_prospect,
     relay::{
         RelayExecutionState, RelayExpansionRequest, execute_relay_workflow,
@@ -71,7 +77,7 @@ use crate::{
 const SCHEMA_VERSION: u32 = 1;
 const DEFAULT_WAIT_SECONDS: u64 = 21_600;
 const IDLE_CAMPAIGN_RETRY_INTERVAL: Duration = Duration::from_secs(300);
-const EVENT_DEPENDENCY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const EVENT_DEPENDENCY_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60);
 const EVENT_CONNECTIVITY_RETRY_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const CAMPAIGN_RESOURCE_EVENT_NAMES: [&str; 11] = [
     "device.attached",
@@ -86,7 +92,7 @@ const CAMPAIGN_RESOURCE_EVENT_NAMES: [&str; 11] = [
     "device.unfurling",
     "replicant.transferred",
 ];
-const EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES: [&str; 14] = [
+pub(crate) const EVENT_CAMPAIGN_DEPENDENCY_EVENT_NAMES: [&str; 14] = [
     "device.attached",
     "device.changed_owner",
     "device.compacted",
@@ -219,6 +225,9 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(EventCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(ObservatoryWorkflowFactory::new()))?;
     registry.register(Arc::new(ReplicantProvisionWorkflowFactory::new()))?;
+    registry.register(Arc::new(
+        crate::asteroid_diversion::AsteroidDiversionWorkflowFactory::new(),
+    ))?;
     registry.register(Arc::new(RegionEstablishWorkflowFactory::new()))
 }
 
@@ -304,6 +313,7 @@ pub struct BeltSearchCampaignCheckpoint {
 
 /// Restart-safe controller workflow checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ControllerWorkflowCheckpoint {
     /// Controller selected by the workflow.
     pub controller: Option<String>,
@@ -356,6 +366,7 @@ pub struct SalvageSiteRecord {
 
 /// Durable salvage campaign checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SalvageRecoveryCheckpoint {
     /// Last authoritative worklist, keyed by site designation.
     pub sites: BTreeMap<String, SalvageSiteRecord>,
@@ -383,6 +394,9 @@ pub struct MiningCampaignIntent {
     pub region: String,
     /// Regional manufacturing hub.
     pub hub: String,
+    /// Exact AMI transport routes to establish.
+    #[serde(default)]
+    pub transport_routes: Vec<AmiTransportRouteIntent>,
     /// Scheduler ceiling for simultaneously runnable items.
     #[serde(default = "default_mining_concurrency")]
     pub max_concurrency: usize,
@@ -403,6 +417,7 @@ struct LegacyMiningCampaignIntent {
 
 /// Restart-safe mining deployment checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct MiningDeployCheckpoint {
     /// Resolved replicant.
     pub replicant: Option<String>,
@@ -414,7 +429,7 @@ pub struct MiningDeployCheckpoint {
     pub started: bool,
 }
 
-/// Schema-version-two mining campaign checkpoint.
+/// Schema-version-three mining campaign checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MiningCampaignCheckpoint {
     /// Last merged mission state.
@@ -473,6 +488,123 @@ pub struct LogisticsIntent {
     pub return_transports: bool,
 }
 
+/// Exact failed-custody evidence and stale reservation tags for a recovery
+/// manifest. Device-code map keys are canonical uppercase codes.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlacementRecoveryMetadata {
+    /// Exact failed transient custody episodes keyed by canonical device code.
+    #[serde(default)]
+    pub failed_provenance: BTreeMap<String, Vec<WorkflowPlacementProvenance>>,
+    /// Reserved workflow tags to remove, keyed by canonical device code.
+    #[serde(default)]
+    pub release_device_tags: BTreeMap<String, Vec<String>>,
+    /// Exact failed episodes resolved after successful placement recovery.
+    #[serde(default)]
+    pub placement_resolutions: Vec<WorkflowPlacementResolution>,
+}
+
+/// Exact Director authorization for one placement-recovery workflow.
+///
+/// The document key is the workflow ID.  Keeping the complete candidate
+/// identity in the value prevents a workflow row (or a manually fabricated
+/// config) from being rebound to a different device, origin, destination, or
+/// failed custody episode after the Director has issued authorization.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(crate) struct PlacementRecoveryAuthorization {
+    pub(crate) workflow_id: WorkflowId,
+    pub(crate) region: String,
+    pub(crate) device_code: String,
+    pub(crate) origin: String,
+    pub(crate) destination: String,
+    pub(crate) metadata: PlacementRecoveryMetadata,
+}
+
+const PLACEMENT_RECOVERY_AUTHORIZATION_NS: &str = "director.placement_recovery_authorization";
+
+pub(crate) fn placement_recovery_authorization(
+    workflow_id: WorkflowId,
+    region: &str,
+    device_code: &str,
+    origin: &str,
+    destination: &str,
+    metadata: PlacementRecoveryMetadata,
+) -> PlacementRecoveryAuthorization {
+    PlacementRecoveryAuthorization {
+        workflow_id,
+        region: canonical_region(region),
+        device_code: canonical_manifest_device_code(device_code),
+        origin: origin.to_owned(),
+        destination: destination.to_owned(),
+        metadata,
+    }
+}
+
+pub(crate) fn read_placement_recovery_authorization(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+) -> Result<Option<PlacementRecoveryAuthorization>, String> {
+    let Some((value, _revision)) = repository
+        .read_document(
+            PLACEMENT_RECOVERY_AUTHORIZATION_NS,
+            &workflow_id.to_string(),
+        )
+        .map_err(string_error)?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| format!("invalid placement recovery authorization: {error}"))
+}
+
+pub(crate) fn write_placement_recovery_authorization(
+    repository: &replicant_workflow::WorkflowRepository,
+    authorization: &PlacementRecoveryAuthorization,
+) -> Result<(), RepositoryError> {
+    repository
+        .put_document(
+            PLACEMENT_RECOVERY_AUTHORIZATION_NS,
+            &authorization.workflow_id.to_string(),
+            authorization,
+        )
+        .map(|_| ())
+}
+
+pub(crate) fn revoke_placement_recovery_authorization(
+    repository: &replicant_workflow::WorkflowRepository,
+    workflow_id: WorkflowId,
+) -> Result<(), RepositoryError> {
+    repository
+        .put_document(
+            PLACEMENT_RECOVERY_AUTHORIZATION_NS,
+            &workflow_id.to_string(),
+            &serde_json::json!({"revoked": true}),
+        )
+        .map(|_| ())
+}
+
+/// Checks that a recovery workflow's immutable config is exactly what the
+/// Director authorized under its workflow-ID document.
+pub(crate) fn placement_recovery_authorization_matches(
+    authorization: &PlacementRecoveryAuthorization,
+    workflow_id: WorkflowId,
+    intent: &LogisticsManifestIntent,
+) -> bool {
+    let Some(metadata) = intent.placement_recovery.as_ref() else {
+        return false;
+    };
+    authorization.workflow_id == workflow_id
+        && intent
+            .region
+            .as_deref()
+            .is_some_and(|region| canonical_region(region) == authorization.region)
+        && intent.origin == authorization.origin
+        && intent.destination == authorization.destination
+        && intent.device_codes.len() == 1
+        && intent.device_codes[0] == authorization.device_code
+        && metadata == &authorization.metadata
+}
+
 /// Internal Director/coordinator intent for one mixed resource/device shipment.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LogisticsManifestIntent {
@@ -503,7 +635,10 @@ pub struct LogisticsManifestIntent {
     /// Ward away from a retired or hub-protected mining site.
     #[serde(default)]
     pub release_mining_reservations: bool,
-    /// Return transports after delivery.
+    /// Optional exact failed-custody metadata for Stranded Device Recovery.
+    #[serde(default)]
+    pub placement_recovery: Option<PlacementRecoveryMetadata>,
+    /// Return borrowed transport carriers to their starting scope after delivery.
     #[serde(default)]
     pub return_transports: bool,
     /// Allow the transport planner to self-stage a free carrier from outside
@@ -518,8 +653,27 @@ pub struct LogisticsManifestIntent {
     pub purpose: String,
 }
 
+/// Durable state for one recovery manifest tag-cleanup operation.
+///
+/// The deterministic operation ID is written before invoking managed
+/// configure, so a resumed executor can recreate or observe the original
+/// mutation instead of issuing a second configure request.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PlacementRecoveryCleanup {
+    /// Managed operation identity for the exact configure mutation.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    /// Exact tags included in the configure request.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Last observed operation state, persisted for operator/restart evidence.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
 /// Restart-safe logistics checkpoint. The concrete plan is persisted before mutation.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct LogisticsWorkflowCheckpoint {
     /// Concrete transport plan selected from managed state.
     pub plan: Option<DeliveryPlan>,
@@ -527,6 +681,9 @@ pub struct LogisticsWorkflowCheckpoint {
     pub started: bool,
     #[serde(default)]
     failure_class: Option<FailureClass>,
+    /// Per-device recovery tag cleanup operation and its last observed state.
+    #[serde(default)]
+    pub placement_recovery_cleanup: BTreeMap<String, PlacementRecoveryCleanup>,
 }
 
 /// Intent for a fully provisioned buyer-side trade run.
@@ -864,9 +1021,1027 @@ pub struct ObservatoryIntent {
     #[serde(default)]
     pub observatory: Option<String>,
 }
+fn placement_device(code: impl AsRef<str>) -> Option<WorkflowPlacementIntentSubject> {
+    let code = code.as_ref().trim();
+    (!code.is_empty()).then(|| WorkflowPlacementIntentSubject::Device(code.to_ascii_uppercase()))
+}
+
+fn placement_tag(tag: impl AsRef<str>) -> Option<WorkflowPlacementIntentSubject> {
+    let tag = tag.as_ref();
+    (!tag.is_empty()).then(|| WorkflowPlacementIntentSubject::DeviceTag(tag.to_owned()))
+}
+
+fn placement_intent(
+    subject: WorkflowPlacementIntentSubject,
+    relation: WorkflowPlacementIntentRelation,
+    work_item_id: Option<replicant_workflow::WorkItemId>,
+    expected_location: Option<String>,
+) -> WorkflowPlacementIntent {
+    WorkflowPlacementIntent {
+        subject,
+        relation,
+        work_item_id,
+        expected_location: (relation == WorkflowPlacementIntentRelation::Deployed)
+            .then_some(expected_location)
+            .flatten(),
+    }
+}
+
+fn complete_placement_projection(
+    intents: impl IntoIterator<Item = WorkflowPlacementIntent>,
+) -> WorkflowPlacementIntentProjection {
+    let mut intents = intents.into_iter().collect::<Vec<_>>();
+    intents.sort();
+    intents.dedup();
+    WorkflowPlacementIntentProjection {
+        coverage: WorkflowPlacementIntentCoverage::Complete,
+        intents,
+        resolutions: Vec::new(),
+    }
+}
+fn bundle_has_unknown(bundle: Option<&crate::trade::TradeBundle>) -> bool {
+    bundle.is_some_and(|bundle| !bundle.unknown.is_empty())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementProjectionPhase {
+    Live,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+fn placement_projection_phase(status: WorkflowStatus) -> PlacementProjectionPhase {
+    match status {
+        WorkflowStatus::Queued
+        | WorkflowStatus::Running
+        | WorkflowStatus::Waiting
+        | WorkflowStatus::Reconciling
+        | WorkflowStatus::Paused => PlacementProjectionPhase::Live,
+        WorkflowStatus::Succeeded => PlacementProjectionPhase::Succeeded,
+        WorkflowStatus::Failed => PlacementProjectionPhase::Failed,
+        WorkflowStatus::Cancelled => PlacementProjectionPhase::Cancelled,
+    }
+}
+
+fn workflow_placement_projection(
+    instance: &replicant_workflow::WorkflowInstance,
+    work_items: &[WorkItem],
+    config_refs: impl FnOnce(&mut Vec<WorkflowPlacementIntent>),
+    checkpoint_refs: impl FnOnce(PlacementProjectionPhase, &mut Vec<WorkflowPlacementIntent>),
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    if !work_items.is_empty() {
+        return Err("automation work-item schema is not typed by this factory".into());
+    }
+    let mut intents = Vec::new();
+    let phase = placement_projection_phase(instance.status);
+    if phase == PlacementProjectionPhase::Live {
+        config_refs(&mut intents);
+    }
+    checkpoint_refs(phase, &mut intents);
+    Ok(complete_placement_projection(intents))
+}
+
+fn scan_system_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: ScanIntent = instance.config().map_err(string_error)?;
+    let checkpoint: ControllerWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(code) = config.controller.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    code,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            // A selected controller is not custody.  Only a durable directive
+            // boundary proves that a terminal workflow touched it.
+            if (phase == PlacementProjectionPhase::Live
+                || checkpoint.directive_set
+                || checkpoint.launched
+                || checkpoint.observed_active)
+                && let Some(code) = checkpoint.controller.as_deref().and_then(placement_device)
+            {
+                intents.push(placement_intent(
+                    code,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn scan_tour_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: ScanTourIntent = instance.config().map_err(string_error)?;
+    let checkpoint: ScanTourCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = config.vessel.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            let started = checkpoint.state.is_some() || checkpoint.fleet_logistics_child.is_some();
+            if phase != PlacementProjectionPhase::Live && !started {
+                return;
+            }
+            for code in checkpoint
+                .vessel
+                .iter()
+                .chain(checkpoint.fleet_controller.iter())
+                .chain(checkpoint.fleet_drones.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Staged,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            if let Some(subject) = checkpoint
+                .fleet_print_tag
+                .as_deref()
+                .and_then(placement_tag)
+            {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn salvage_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: SalvageIntent = instance.config().map_err(string_error)?;
+    let checkpoint: ControllerWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = config.controller.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            if (phase == PlacementProjectionPhase::Live
+                || checkpoint.directive_set
+                || checkpoint.launched
+                || checkpoint.observed_active)
+                && let Some(subject) = checkpoint.controller.as_deref().and_then(placement_device)
+            {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn salvage_recovery_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: SalvageRecoveryIntent = instance.config().map_err(string_error)?;
+    let _: SalvageRecoveryCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(instance, items, |_| {}, |_, _| {})
+}
+
+fn mining_deploy_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: MiningDeployIntent = instance.config().map_err(string_error)?;
+    let checkpoint: MiningDeployCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if checkpoint.plan_json.is_some() {
+        return Err("legacy mining mission state is opaque".into());
+    }
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = config.hub.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            if (phase == PlacementProjectionPhase::Live || checkpoint.started)
+                && let Some(subject) = checkpoint.hub.as_deref().and_then(placement_device)
+            {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn mining_campaign_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    if !matches!(instance.schema_version, 2 | 3) {
+        return Err("legacy mining campaign state is opaque".into());
+    }
+    let config: MiningCampaignIntent = instance.config().map_err(string_error)?;
+    let checkpoint: MiningCampaignCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = placement_device(&config.hub) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            let terminal = phase != PlacementProjectionPhase::Live;
+            let Some(mission) = checkpoint.mission.as_ref() else {
+                return;
+            };
+            let has_custody = checkpoint.started
+                && (mission.print_batches.iter().any(|batch| {
+                    batch.submission_started || batch.submitted || !batch.produced_codes.is_empty()
+                }) || mission.sites.iter().any(|site| {
+                    matches!(
+                        site.phase,
+                        crate::mining::SitePhase::Outbound
+                            | crate::mining::SitePhase::Deploying
+                            | crate::mining::SitePhase::Adopting
+                            | crate::mining::SitePhase::Verifying
+                            | crate::mining::SitePhase::Configuring
+                    )
+                }) || mission.routes.iter().any(|route| {
+                    matches!(
+                        route.phase,
+                        crate::mining::RoutePhase::Activating | crate::mining::RoutePhase::Active
+                    )
+                }));
+            if terminal && !has_custody {
+                return;
+            }
+            if let Some(subject) = placement_tag(&mission.mission_tag) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+            for batch in &mission.print_batches {
+                let batch_started = !terminal
+                    || batch.submission_started
+                    || batch.submitted
+                    || !batch.produced_codes.is_empty();
+                if !batch_started {
+                    continue;
+                }
+                if let Some(subject) = placement_device(&batch.factory_code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+                if batch.submitted || !batch.produced_codes.is_empty() {
+                    if let Some(subject) = placement_tag(&batch.batch_tag) {
+                        intents.push(placement_intent(
+                            subject,
+                            WorkflowPlacementIntentRelation::Staged,
+                            None,
+                            None,
+                        ));
+                    }
+                    for code in &batch.produced_codes {
+                        if let Some(subject) = placement_device(code) {
+                            intents.push(placement_intent(
+                                subject,
+                                WorkflowPlacementIntentRelation::Staged,
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+            for site in &mission.sites {
+                let relation = match site.phase {
+                    crate::mining::SitePhase::Planned | crate::mining::SitePhase::Ready => continue,
+                    crate::mining::SitePhase::Operational
+                        if phase == PlacementProjectionPhase::Live
+                            || phase == PlacementProjectionPhase::Succeeded =>
+                    {
+                        WorkflowPlacementIntentRelation::Deployed
+                    }
+                    crate::mining::SitePhase::Operational => continue,
+                    _ => WorkflowPlacementIntentRelation::Transported,
+                };
+                let location = (relation == WorkflowPlacementIntentRelation::Deployed)
+                    .then(|| site.system.clone());
+                if let Some(subject) = placement_tag(&site.tag) {
+                    intents.push(placement_intent(subject, relation, None, location.clone()));
+                }
+                for code in site
+                    .assets
+                    .mining_controller
+                    .iter()
+                    .chain(site.assets.mining_drones.iter())
+                    .chain(site.assets.survey_controller.iter())
+                    .chain(site.assets.survey_drones.iter())
+                    .chain(site.assets.maintenance_drone.iter())
+                    .chain(site.assets.system_ward.iter())
+                    .chain(site.carrier.iter())
+                {
+                    if let Some(subject) = placement_device(code) {
+                        intents.push(placement_intent(subject, relation, None, location.clone()));
+                    }
+                }
+            }
+            for route in &mission.routes {
+                let relation = match route.phase {
+                    crate::mining::RoutePhase::Planned | crate::mining::RoutePhase::Ready => {
+                        continue;
+                    }
+                    _ => WorkflowPlacementIntentRelation::Transported,
+                };
+                if let Some(subject) = placement_tag(&route.tag) {
+                    intents.push(placement_intent(subject, relation, None, None));
+                }
+                for code in route.controller.iter().chain(route.freighter.iter()) {
+                    if let Some(subject) = placement_device(code) {
+                        intents.push(placement_intent(subject, relation, None, None));
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn logistics_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: LogisticsIntent = instance.config().map_err(string_error)?;
+    let checkpoint: LogisticsWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+    let plan = checkpoint.plan.as_ref();
+    let delivered = if instance.status == WorkflowStatus::Succeeded {
+        instance
+            .result::<DeliveryReport>()
+            .map_err(string_error)?
+            .map(|report| {
+                report
+                    .devices_delivered
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+    } else {
+        None
+    };
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for tag in &config.device_tags {
+                if let Some(subject) = placement_tag(tag) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |phase, intents| {
+            if phase != PlacementProjectionPhase::Live && !checkpoint.started {
+                return;
+            }
+            let Some(plan) = plan else { return };
+            for payload in &plan.payload_devices {
+                if let Some(subject) = placement_device(&payload.code) {
+                    let deployed = delivered
+                        .as_ref()
+                        .is_some_and(|codes| codes.contains(&payload.code));
+                    let relation = if deployed {
+                        WorkflowPlacementIntentRelation::Deployed
+                    } else if checkpoint.started {
+                        WorkflowPlacementIntentRelation::Transported
+                    } else {
+                        WorkflowPlacementIntentRelation::Staged
+                    };
+                    intents.push(placement_intent(
+                        subject,
+                        relation,
+                        None,
+                        deployed.then(|| plan.destination.clone()),
+                    ));
+                }
+            }
+            for code in &plan.device_carriers {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+    )
+}
+
+fn logistics_manifest_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: LogisticsManifestIntent = instance.config().map_err(string_error)?;
+    if config.placement_recovery.is_some() && validate_placement_recovery_intent(&config).is_err() {
+        return Ok(WorkflowPlacementIntentProjection::unknown());
+    }
+    let checkpoint: LogisticsWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+    let plan = checkpoint.plan.as_ref();
+    let delivered = if instance.status == WorkflowStatus::Succeeded {
+        let result = instance.result::<DeliveryReport>();
+        if config.placement_recovery.is_some() {
+            let Ok(Some(report)) = result else {
+                // A successful manifest without an unambiguous delivery
+                // report cannot resolve failed custody.
+                return Ok(WorkflowPlacementIntentProjection::unknown());
+            };
+            let delivered = report
+                .devices_delivered
+                .into_iter()
+                .map(|code| canonical_manifest_device_code(&code))
+                .collect::<BTreeSet<_>>();
+            let expected = config
+                .device_codes
+                .iter()
+                .map(|code| canonical_manifest_device_code(code))
+                .collect::<BTreeSet<_>>();
+            let Some(plan) = plan else {
+                // A recovery manifest that was marked successful without a
+                // durable concrete plan cannot establish where its payload
+                // was delivered. Do not resolve failed custody from its
+                // report alone.
+                return Ok(WorkflowPlacementIntentProjection::unknown());
+            };
+            let planned = plan
+                .payload_devices
+                .iter()
+                .map(|payload| canonical_manifest_device_code(&payload.code))
+                .collect::<BTreeSet<_>>();
+            if delivered != expected
+                || planned != expected
+                || plan.destination != config.destination
+                || !checkpoint.started
+            {
+                // Recovery resolution is all-or-nothing: every exact code
+                // must be in the persisted payload plan and in the delivery
+                // report for the manifest's exact destination.
+                return Ok(WorkflowPlacementIntentProjection::unknown());
+            }
+            Some(delivered)
+        } else {
+            result.map_err(string_error)?.map(|report| {
+                report
+                    .devices_delivered
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+        }
+    } else {
+        None
+    };
+    let mut projection = workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for code in config
+                .device_codes
+                .iter()
+                .chain(config.pre_deactivate_device_codes.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            for tag in &config.device_tags {
+                if let Some(subject) = placement_tag(tag) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            if let Some(metadata) = config.placement_recovery.as_ref() {
+                for (code, tags) in &metadata.release_device_tags {
+                    let cleanup_applied = checkpoint
+                        .placement_recovery_cleanup
+                        .get(code)
+                        .and_then(|cleanup| cleanup.state.as_deref())
+                        .is_some_and(|state| state == "completed" || state == "absent");
+                    if cleanup_applied {
+                        continue;
+                    }
+                    for tag in tags {
+                        if let Some(subject) = placement_tag(tag) {
+                            intents.push(placement_intent(
+                                subject,
+                                WorkflowPlacementIntentRelation::Claimed,
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+        },
+        |phase, intents| {
+            if matches!(
+                phase,
+                PlacementProjectionPhase::Failed | PlacementProjectionPhase::Cancelled
+            ) && checkpoint.started
+            {
+                for code in config
+                    .device_codes
+                    .iter()
+                    .chain(config.pre_deactivate_device_codes.iter())
+                {
+                    if let Some(subject) = placement_device(code) {
+                        intents.push(placement_intent(
+                            subject,
+                            WorkflowPlacementIntentRelation::Claimed,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+                for tag in &config.device_tags {
+                    if let Some(subject) = placement_tag(tag) {
+                        intents.push(placement_intent(
+                            subject,
+                            WorkflowPlacementIntentRelation::Claimed,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            if phase != PlacementProjectionPhase::Live && !checkpoint.started {
+                return;
+            }
+            let Some(plan) = plan else { return };
+            for payload in &plan.payload_devices {
+                if let Some(subject) = placement_device(&payload.code) {
+                    let deployed = delivered.as_ref().is_some_and(|codes| {
+                        codes.contains(&canonical_manifest_device_code(&payload.code))
+                    });
+                    let relation = if deployed {
+                        WorkflowPlacementIntentRelation::Deployed
+                    } else if checkpoint.started {
+                        WorkflowPlacementIntentRelation::Transported
+                    } else {
+                        WorkflowPlacementIntentRelation::Staged
+                    };
+                    intents.push(placement_intent(
+                        subject,
+                        relation,
+                        None,
+                        deployed.then(|| plan.destination.clone()),
+                    ));
+                }
+            }
+            for code in &plan.device_carriers {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+    )?;
+    if instance.status == WorkflowStatus::Succeeded
+        && let Some(metadata) = config.placement_recovery.as_ref()
+    {
+        let Some(delivered) = delivered.as_ref() else {
+            return Ok(WorkflowPlacementIntentProjection::unknown());
+        };
+        projection.resolutions = metadata
+            .placement_resolutions
+            .iter()
+            .filter(|resolution| delivered.contains(&resolution.device_code))
+            .cloned()
+            .collect();
+    }
+    Ok(projection)
+}
+
+fn trade_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: TradeFulfillmentIntent = instance.config().map_err(string_error)?;
+    let checkpoint: TradeFulfillmentCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if bundle_has_unknown(checkpoint.criteria.as_ref())
+        || bundle_has_unknown(checkpoint.rewards.as_ref())
+    {
+        return Err("opaque trade bundle fields".into());
+    }
+    let terminal_started = checkpoint.purchase_submitted
+        || checkpoint.purchase_observed
+        || checkpoint.reward_resources_loaded
+        || checkpoint.returned_home;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for code in
+                std::iter::once(&config.controller).chain(config.expected_reward_device.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |phase, intents| {
+            if phase != PlacementProjectionPhase::Live && !terminal_started {
+                return;
+            }
+            for code in checkpoint
+                .payment_device_codes
+                .iter()
+                .chain(checkpoint.escort_carriers.iter())
+                .chain(checkpoint.reward_devices.iter())
+                .chain(checkpoint.reward_storage.keys())
+            {
+                if let Some(subject) = placement_device(code) {
+                    let deployed = checkpoint.returned_home
+                        && checkpoint
+                            .reward_devices
+                            .iter()
+                            .any(|reward| reward == code);
+                    intents.push(placement_intent(
+                        subject,
+                        if deployed {
+                            WorkflowPlacementIntentRelation::Deployed
+                        } else {
+                            WorkflowPlacementIntentRelation::Staged
+                        },
+                        None,
+                        deployed.then(|| config.home.clone()),
+                    ));
+                }
+            }
+            if let Some(tag) = checkpoint
+                .payment_print_tag
+                .as_deref()
+                .and_then(placement_tag)
+            {
+                intents.push(placement_intent(
+                    tag,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn blueprint_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: BlueprintAcquireIntent = instance.config().map_err(string_error)?;
+    let checkpoint: BlueprintAcquireCheckpoint = instance.checkpoint().map_err(string_error)?;
+    let terminal_started = checkpoint.purchase_submitted
+        || checkpoint.purchase_observed
+        || checkpoint.decommission_submitted
+        || checkpoint.blueprint_verified;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            for code in config
+                .source_device
+                .iter()
+                .chain(config.autofactory.iter())
+                .chain(config.acquisition_replicant.iter())
+                .chain(config.shop.iter().map(|shop| &shop.controller_code))
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Claimed,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        },
+        |phase, intents| {
+            if phase != PlacementProjectionPhase::Live && !terminal_started {
+                return;
+            }
+            for code in checkpoint
+                .source_device
+                .iter()
+                .chain(checkpoint.autofactory.iter())
+                .chain(checkpoint.acquisition_replicant.iter())
+                .chain(checkpoint.controller_code.iter())
+                .chain(checkpoint.pre_purchase_devices.iter())
+            {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Staged,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            if let Some(tag) = checkpoint
+                .criteria_print_tag
+                .as_deref()
+                .and_then(placement_tag)
+            {
+                intents.push(placement_intent(
+                    tag,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn exploration_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: ExplorationIntent = instance.config().map_err(string_error)?;
+    let checkpoint: ExplorationWorkflowCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = config.hub.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |phase, intents| {
+            if (phase == PlacementProjectionPhase::Live || checkpoint.state.is_some())
+                && let Some(subject) = checkpoint.hub.as_deref().and_then(placement_device)
+            {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn event_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: EventIntent = instance.config().map_err(string_error)?;
+    let checkpoint: EventDeliveryCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if checkpoint.plan_json.is_some() {
+        return Err("opaque event mission state".into());
+    }
+    workflow_placement_projection(instance, items, |_| {}, |_, _| {})
+}
+
+fn event_tour_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: EventIntent = instance.config().map_err(string_error)?;
+    let checkpoint: EventTourCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if checkpoint.plan_json.is_some() {
+        return Err("opaque event mission state".into());
+    }
+    workflow_placement_projection(instance, items, |_| {}, |_, _| {})
+}
+
+fn event_campaign_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: EventCampaignIntent = instance.config().map_err(string_error)?;
+    let checkpoint: EventCampaignCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if checkpoint.archive.is_some() {
+        return Err("opaque event campaign archive".into());
+    }
+    workflow_placement_projection(instance, items, |_| {}, |_, _| {})
+}
+
+fn observatory_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: ObservatoryIntent = instance.config().map_err(string_error)?;
+    let checkpoint: Value = instance.checkpoint().map_err(string_error)?;
+    if !checkpoint.is_null() {
+        return Err("opaque observatory checkpoint".into());
+    }
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = config.observatory.as_deref().and_then(placement_device) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |_, _| {},
+    )
+}
+
+fn provision_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let _: ReplicantProvisionIntent = instance.config().map_err(string_error)?;
+    let checkpoint: ReplicantProvisionCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |_| {},
+        |phase, intents| {
+            if phase != PlacementProjectionPhase::Live && !checkpoint.stowed {
+                return;
+            }
+            for code in checkpoint.matrix.iter().chain(checkpoint.cradle.iter()) {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        WorkflowPlacementIntentRelation::Staged,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            if let Some(tag) = checkpoint.tag.as_deref().and_then(placement_tag) {
+                intents.push(placement_intent(
+                    tag,
+                    WorkflowPlacementIntentRelation::Staged,
+                    None,
+                    None,
+                ));
+            }
+        },
+    )
+}
+
+fn region_establish_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: RegionEstablishIntent = instance.config().map_err(string_error)?;
+    let checkpoint: RegionEstablishCheckpoint = instance.checkpoint().map_err(string_error)?;
+    if checkpoint.mission_json.is_some() {
+        return Err("opaque bootstrap mission state".into());
+    }
+    workflow_placement_projection(
+        instance,
+        items,
+        |intents| {
+            if let Some(subject) = placement_device(&config.source_hub) {
+                intents.push(placement_intent(
+                    subject,
+                    WorkflowPlacementIntentRelation::Claimed,
+                    None,
+                    None,
+                ));
+            }
+        },
+        |_, _| {},
+    )
+}
+
+fn service_intents_for_factory(
+    kind: &str,
+    instance: &replicant_workflow::WorkflowInstance,
+) -> Result<WorkflowServiceIntentProjection, String> {
+    match kind {
+        "mining.deploy" => {
+            let intent: MiningDeployIntent = instance.config().map_err(string_error)?;
+            let checkpoint: MiningDeployCheckpoint = instance.checkpoint().map_err(string_error)?;
+            if let Some(plan) = checkpoint.plan_json.as_deref()
+                && let Ok(mission) = serde_json::from_str::<MiningMission>(plan)
+                && !mission.routes.is_empty()
+            {
+                let destination = mission.hub_location;
+                return Ok(WorkflowServiceIntentProjection::complete(
+                    mission
+                        .routes
+                        .into_iter()
+                        .map(|route| {
+                            AmiTransportRouteIntent {
+                                system: route.system,
+                                collect: route.belt,
+                                deliver: destination.clone(),
+                            }
+                            .workflow_service_intent()
+                        })
+                        .collect(),
+                ));
+            }
+            Ok(WorkflowServiceIntentProjection::unknown([
+                WorkflowServiceScope::System(intent.system.trim().to_ascii_uppercase()),
+            ]))
+        }
+        "region.establish" => {
+            let intent: RegionEstablishIntent = instance.config().map_err(string_error)?;
+            Ok(WorkflowServiceIntentProjection::unknown([
+                WorkflowServiceScope::Region(canonical_region(&intent.region)),
+            ]))
+        }
+        _ => Ok(WorkflowServiceIntentProjection::not_applicable()),
+    }
+}
 
 macro_rules! workflow_factory {
-    ($name:ident, $executor:ident, $kind_fn:ident) => {
+    ($name:ident, $executor:ident, $kind_fn:ident, $projector:ident) => {
         /// Registered factory for this intent-native workflow.
         pub struct $name(WorkflowKind);
 
@@ -896,6 +2071,23 @@ macro_rules! workflow_factory {
             fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
                 Some(Box::new($executor))
             }
+
+            fn placement_intents(
+                &self,
+                instance: &replicant_workflow::WorkflowInstance,
+                work_items: &[WorkItem],
+            ) -> Result<WorkflowPlacementIntentProjection, String> {
+                if instance.schema_version != SCHEMA_VERSION {
+                    return Err("unsupported automation schema is opaque".into());
+                }
+                $projector(instance, work_items)
+            }
+            fn service_intents(
+                &self,
+                instance: &replicant_workflow::WorkflowInstance,
+            ) -> Result<WorkflowServiceIntentProjection, String> {
+                service_intents_for_factory(self.kind().as_str(), instance)
+            }
         }
     };
 }
@@ -903,17 +2095,20 @@ macro_rules! workflow_factory {
 workflow_factory!(
     ScanSystemWorkflowFactory,
     ScanSystemWorkflow,
-    scan_system_workflow_kind
+    scan_system_workflow_kind,
+    scan_system_placement
 );
 workflow_factory!(
     ScanBeltWorkflowFactory,
     ScanBeltWorkflow,
-    scan_belt_workflow_kind
+    scan_belt_workflow_kind,
+    scan_system_placement
 );
 workflow_factory!(
     ScanTourWorkflowFactory,
     ScanTourWorkflow,
-    scan_tour_workflow_kind
+    scan_tour_workflow_kind,
+    scan_tour_placement
 );
 
 /// Schema-versioned factory for pooled belt-search campaigns.
@@ -976,18 +2171,37 @@ impl WorkflowFactory for BeltSearchCampaignWorkflowFactory {
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
         Some(Box::new(BeltSearchCampaignWorkflow))
     }
+
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        if instance.schema_version != 2 {
+            return Err("legacy belt-search state is opaque".into());
+        }
+        let _: BeltSearchCampaignIntent = instance.config().map_err(string_error)?;
+        let checkpoint: BeltSearchCampaignCheckpoint =
+            instance.checkpoint().map_err(string_error)?;
+        if checkpoint.legacy_checkpoint.is_some() {
+            return Err("legacy belt-search checkpoint is opaque".into());
+        }
+        workflow_placement_projection(instance, work_items, |_| {}, |_, _| {})
+    }
 }
 workflow_factory!(
     SalvageWorkflowFactory,
     SalvageWorkflow,
-    salvage_workflow_kind
+    salvage_workflow_kind,
+    salvage_placement
 );
 workflow_factory!(
     MiningDeployWorkflowFactory,
     MiningDeployWorkflow,
-    mining_deploy_workflow_kind
+    mining_deploy_workflow_kind,
+    mining_deploy_placement
 );
-/// Factory for schema-version-two pooled regional mining campaigns.
+/// Factory for schema-version-three pooled regional mining campaigns.
 pub struct MiningCampaignWorkflowFactory {
     kind: WorkflowKind,
     item_executor: Arc<dyn crate::workflows::MiningItemExecutor>,
@@ -1018,19 +2232,29 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
     }
 
     fn current_schema_version(&self) -> u32 {
-        2
+        3
     }
 
     fn supports_schema_version(&self, version: u32) -> bool {
-        matches!(version, 1 | 2)
+        matches!(version, 1..=3)
     }
 
     fn migrate(
         &self,
         instance: &replicant_workflow::WorkflowInstance,
     ) -> Result<Option<WorkflowMigration>, String> {
-        if instance.schema_version == 2 {
+        if instance.schema_version == 3 {
             return Ok(None);
+        }
+        if instance.schema_version == 2 {
+            let mut config: MiningCampaignIntent = instance.config().map_err(string_error)?;
+            config.transport_routes = Vec::new();
+            let checkpoint: MiningCampaignCheckpoint =
+                instance.checkpoint().map_err(string_error)?;
+            return Ok(Some(WorkflowMigration::new(
+                serde_json::to_value(config).map_err(string_error)?,
+                serde_json::to_value(checkpoint).map_err(string_error)?,
+            )));
         }
         let legacy: LegacyMiningCampaignIntent = instance.config().map_err(string_error)?;
         let checkpoint: MiningDeployCheckpoint = instance.checkpoint().map_err(string_error)?;
@@ -1044,6 +2268,7 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
             systems: legacy.systems,
             region: legacy.region.unwrap_or_default(),
             hub: checkpoint.hub.or(legacy.hub).unwrap_or_default(),
+            transport_routes: Vec::new(),
             max_concurrency: legacy.max_concurrency,
         };
         let checkpoint = MiningCampaignCheckpoint {
@@ -1057,51 +2282,116 @@ impl WorkflowFactory for MiningCampaignWorkflowFactory {
         )))
     }
 
+    fn service_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+    ) -> Result<WorkflowServiceIntentProjection, String> {
+        let config: MiningCampaignIntent = instance.config().map_err(string_error)?;
+        let checkpoint: MiningCampaignCheckpoint = instance.checkpoint().map_err(string_error)?;
+        if let Some(mission) = checkpoint.mission
+            && !mission.routes.is_empty()
+            && !mission.hub_location.trim().is_empty()
+            && mission
+                .routes
+                .iter()
+                .all(|route| !route.system.trim().is_empty() && !route.belt.trim().is_empty())
+        {
+            let destination = mission.hub_location.clone();
+            let intents = mission
+                .routes
+                .into_iter()
+                .map(|route| {
+                    AmiTransportRouteIntent {
+                        system: route.system,
+                        collect: route.belt,
+                        deliver: destination.clone(),
+                    }
+                    .workflow_service_intent()
+                })
+                .collect();
+            return Ok(WorkflowServiceIntentProjection::complete(intents));
+        }
+        if !config.transport_routes.is_empty() {
+            return Ok(WorkflowServiceIntentProjection::complete(
+                config
+                    .transport_routes
+                    .iter()
+                    .map(AmiTransportRouteIntent::workflow_service_intent)
+                    .collect(),
+            ));
+        }
+        let scopes = config
+            .systems
+            .iter()
+            .filter(|system| !system.trim().is_empty())
+            .map(|system| WorkflowServiceScope::System(system.trim().to_ascii_uppercase()))
+            .collect::<BTreeSet<_>>();
+        if scopes.is_empty() {
+            return Err("mining campaign has no service scope".into());
+        }
+        Ok(WorkflowServiceIntentProjection::unknown(scopes))
+    }
+
     fn create_executor(&self) -> Option<Box<dyn WorkflowExecutor>> {
         Some(Box::new(MiningCampaignWorkflow {
             item_executor: self.item_executor.clone(),
         }))
     }
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        mining_campaign_placement(instance, work_items)
+    }
 }
 workflow_factory!(
     SalvageRecoveryWorkflowFactory,
     SalvageRecoveryWorkflow,
-    salvage_recovery_workflow_kind
+    salvage_recovery_workflow_kind,
+    salvage_recovery_placement
 );
 workflow_factory!(
     LogisticsWorkflowFactory,
     LogisticsWorkflow,
-    logistics_workflow_kind
+    logistics_workflow_kind,
+    logistics_placement
 );
 workflow_factory!(
     LogisticsManifestWorkflowFactory,
     LogisticsManifestWorkflow,
-    logistics_manifest_workflow_kind
+    logistics_manifest_workflow_kind,
+    logistics_manifest_placement
 );
 workflow_factory!(
     TradeFulfillmentWorkflowFactory,
     TradeFulfillmentWorkflow,
-    trade_fulfillment_workflow_kind
+    trade_fulfillment_workflow_kind,
+    trade_placement
 );
 workflow_factory!(
     BlueprintAcquireWorkflowFactory,
     BlueprintAcquireWorkflow,
-    blueprint_acquire_workflow_kind
+    blueprint_acquire_workflow_kind,
+    blueprint_placement
 );
 workflow_factory!(
     ExplorationWorkflowFactory,
     ExplorationWorkflow,
-    exploration_workflow_kind
+    exploration_workflow_kind,
+    exploration_placement
 );
 workflow_factory!(
     EventDeliveryWorkflowFactory,
     EventDeliveryWorkflow,
-    event_delivery_workflow_kind
+    event_delivery_workflow_kind,
+    event_placement
 );
 workflow_factory!(
     EventTourWorkflowFactory,
     EventTourWorkflow,
-    event_tour_workflow_kind
+    event_tour_workflow_kind,
+    event_tour_placement
 );
 pub(crate) type EventItemFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<String, crate::event::AnyError>> + Send + 'a>>;
@@ -1207,21 +2497,31 @@ impl WorkflowFactory for EventCampaignWorkflowFactory {
             item_executor: self.item_executor.clone(),
         }))
     }
+    fn placement_intents(
+        &self,
+        instance: &replicant_workflow::WorkflowInstance,
+        work_items: &[WorkItem],
+    ) -> Result<WorkflowPlacementIntentProjection, String> {
+        event_campaign_placement(instance, work_items)
+    }
 }
 workflow_factory!(
     ObservatoryWorkflowFactory,
     ObservatoryWorkflow,
-    observatory_workflow_kind
+    observatory_workflow_kind,
+    observatory_placement
 );
 workflow_factory!(
     ReplicantProvisionWorkflowFactory,
     ReplicantProvisionWorkflow,
-    replicant_provision_workflow_kind
+    replicant_provision_workflow_kind,
+    provision_placement
 );
 workflow_factory!(
     RegionEstablishWorkflowFactory,
     RegionEstablishWorkflow,
-    region_establish_workflow_kind
+    region_establish_workflow_kind,
+    region_establish_placement
 );
 
 struct ScanSystemWorkflow;
@@ -2294,6 +3594,7 @@ impl WorkflowExecutor for MiningDeployWorkflow {
                 systems: vec![intent.system],
                 replicant,
                 hub,
+                transport_routes: Vec::new(),
                 mission_file: plan_file.clone(),
                 wait_timeout: Duration::from_secs(DEFAULT_WAIT_SECONDS),
                 max_concurrency: 1,
@@ -2891,6 +4192,7 @@ impl WorkflowExecutor for MiningCampaignWorkflow {
                     systems: intent.systems,
                     region: intent.region,
                     hub,
+                    transport_routes: intent.transport_routes,
                     mission_file: scratch_file(context.id(), "mining-campaign.json")?,
                     wait_timeout_seconds: DEFAULT_WAIT_SECONDS,
                     max_concurrency: intent.max_concurrency.max(1),
@@ -2977,6 +4279,35 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         Box::pin(async move {
             let intent: LogisticsManifestIntent = context.config().map_err(string_error)?;
+            validate_placement_recovery_intent(&intent)?;
+            if let Some(metadata) = intent.placement_recovery.as_ref() {
+                // A recovery row is executable only when the Director has
+                // durably authorized this exact workflow identity. This read
+                // intentionally precedes every claim and managed API read.
+                let authorization =
+                    read_placement_recovery_authorization(context.repository(), context.id())?
+                        .ok_or_else(|| {
+                            "placement recovery has no Director authorization for this workflow"
+                                .to_owned()
+                        })?;
+                if !placement_recovery_authorization_matches(&authorization, context.id(), &intent)
+                {
+                    return Err(
+                        "placement recovery Director authorization is missing or stale".to_owned(),
+                    );
+                }
+                // The Director owns the physical census/topology boundary. A
+                // workflow can only rebuild typed workflow-side custody; it
+                // must not fall back to generic transport eligibility when
+                // that authority is unavailable or incomplete.
+                let snapshot = context
+                    .workflow_registry()
+                    .placement_intent_snapshot(context.repository(), Some(context.id()))
+                    .map_err(|error| {
+                        format!("placement recovery authority unavailable before cleanup: {error}")
+                    })?;
+                placement_recovery_metadata_matches_snapshot(metadata, &snapshot)?;
+            }
             let request = manifest_delivery_request(&intent);
             if request.resources.is_empty()
                 && request.devices.is_empty()
@@ -2986,6 +4317,19 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                 return Err("logistics manifest must contain at least one payload".to_owned());
             }
             let client = managed_client(context)?;
+            let mut checkpoint: LogisticsWorkflowCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            let plan =
+                if checkpoint.started {
+                    Some(checkpoint.plan.clone().ok_or_else(|| {
+                        "started logistics manifest lost its durable plan".to_owned()
+                    })?)
+                } else {
+                    checkpoint.plan.clone()
+                };
+            // Claims are established before any recovery reservation tag is
+            // touched.  In particular, a resumed workflow must not perform
+            // cleanup merely because its intent names a device.
             for code in &intent.device_codes {
                 claim_device(context, code)?;
             }
@@ -2993,40 +4337,58 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                 claim_device(context, code)?;
             }
             ensure_logistics_pre_deactivation(&client, &intent.pre_deactivate_device_codes).await?;
-            if intent.release_mining_reservations {
+            if let Some(metadata) = intent.placement_recovery.as_ref()
+                && !release_placement_recovery_tags(
+                    context,
+                    &client,
+                    metadata,
+                    &intent.origin,
+                    &mut checkpoint,
+                )
+                .await?
+            {
+                context
+                    .advance_to("waiting_for_recovery_cleanup", &checkpoint)
+                    .map_err(string_error)?;
+                context.mark_waiting().map_err(string_error)?;
+                return Ok(());
+            }
+            if intent.placement_recovery.is_none() && intent.release_mining_reservations {
                 release_mining_reservation_tags(&client, &intent.device_codes).await?;
             }
-            let mut checkpoint: LogisticsWorkflowCheckpoint =
-                context.checkpoint().map_err(string_error)?;
-            let plan = if checkpoint.started {
-                checkpoint
-                    .plan
-                    .clone()
-                    .ok_or_else(|| "started logistics manifest lost its durable plan".to_owned())?
+            if checkpoint.started {
+                return execute_logistics_manifest_plan(
+                    context,
+                    &client,
+                    &intent,
+                    checkpoint,
+                    plan.expect("started checkpoint plan checked above"),
+                )
+                .await;
+            }
+            let plan = if let Some(plan) = plan {
+                plan
             } else {
                 context
                     .advance_to("planning", &checkpoint)
                     .map_err(string_error)?;
-                let plan = match checkpoint.plan.clone() {
-                    Some(plan) => plan,
-                    None => match plan_delivery(&client, &request).await {
-                        Ok(plan) => plan,
-                        Err(error) if retryable_manifest_planning_failure(&error) => {
-                            checkpoint.plan = None;
-                            checkpoint.started = false;
-                            context
-                                .advance_to("waiting_to_replan", &checkpoint)
-                                .map_err(string_error)?;
-                            context
-                                .emit_activity(format!(
-                                    "logistics manifest cannot currently be planned ({error}); waiting for fresh managed state or hub stock before replanning"
-                                ))
-                                .map_err(string_error)?;
-                            context.mark_waiting().map_err(string_error)?;
-                            return Ok(());
-                        }
-                        Err(error) => return Err(string_error(error)),
-                    },
+                let plan = match plan_delivery(&client, &request).await {
+                    Ok(plan) => plan,
+                    Err(error) if retryable_manifest_planning_failure(&error) => {
+                        checkpoint.plan = None;
+                        checkpoint.started = false;
+                        context
+                            .advance_to("waiting_to_replan", &checkpoint)
+                            .map_err(string_error)?;
+                        context
+                            .emit_activity(format!(
+                                "logistics manifest cannot currently be planned ({error}); waiting for fresh managed state or hub stock before replanning"
+                            ))
+                            .map_err(string_error)?;
+                        context.mark_waiting().map_err(string_error)?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(string_error(error)),
                 };
 
                 // Resource stock is mutable account state, so reserve each
@@ -3100,26 +4462,318 @@ impl WorkflowExecutor for LogisticsManifestWorkflow {
                     .map_err(string_error)?;
                 plan
             };
-            checkpoint.started = true;
-            context
-                .advance_to("delivering", &checkpoint)
-                .map_err(string_error)?;
-            let options = DeliveryOptions {
-                return_transports: intent.return_transports,
-                ..DeliveryOptions::default()
-            };
-            let report = match execute_delivery(&client, &plan, options).await {
-                Ok(report) => report,
-                Err(error) => {
-                    checkpoint.failure_class = logistics_failure_class(&error);
-                    context
-                        .persist_checkpoint(&checkpoint)
-                        .map_err(string_error)?;
-                    return Err(string_error(error));
-                }
-            };
-            context.mark_succeeded(Some(report)).map_err(string_error)
+            execute_logistics_manifest_plan(context, &client, &intent, checkpoint, plan).await
         })
+    }
+}
+
+async fn execute_logistics_manifest_plan(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &LogisticsManifestIntent,
+    mut checkpoint: LogisticsWorkflowCheckpoint,
+    plan: DeliveryPlan,
+) -> Result<(), String> {
+    checkpoint.plan = Some(plan.clone());
+    checkpoint.started = true;
+    context
+        .advance_to("delivering", &checkpoint)
+        .map_err(string_error)?;
+    let operation_namespace =
+        if intent.placement_recovery.is_some() {
+            let workflow_id = context.id().to_string();
+            Some(uuid::Uuid::parse_str(&workflow_id).map_err(|error| {
+                format!("workflow ID {workflow_id} is not a valid UUID: {error}")
+            })?)
+        } else {
+            None
+        };
+    let options = DeliveryOptions {
+        return_transports: intent.return_transports,
+        operation_namespace,
+        ..DeliveryOptions::default()
+    };
+    let report = match execute_delivery(client, &plan, options).await {
+        Ok(report) => report,
+        Err(error) => {
+            checkpoint.failure_class = logistics_failure_class(&error);
+            context
+                .persist_checkpoint(&checkpoint)
+                .map_err(string_error)?;
+            return Err(string_error(error));
+        }
+    };
+    context.mark_succeeded(Some(report)).map_err(string_error)
+}
+/// Derives the stable operation identity used for one workflow's exact
+/// recovery-device configure mutation. Length-prefixing the components keeps
+/// the identity unambiguous even if a future device-code alphabet changes.
+fn recovery_configure_operation_id(workflow_id: WorkflowId, device_code: &str) -> OperationId {
+    let canonical_code = device_code.to_ascii_uppercase();
+    let workflow = workflow_id.to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(b"replicant.recovery.device-configure.v1\0");
+    hasher.update((workflow.len() as u64).to_le_bytes());
+    hasher.update(workflow.as_bytes());
+    hasher.update((canonical_code.len() as u64).to_le_bytes());
+    hasher.update(canonical_code.as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    OperationId::new(format!("recovery-configure:{hex}"))
+}
+
+fn validate_recovery_device_authority(
+    device: &Device,
+    code: &str,
+    origin: &str,
+    configured_tags: &[String],
+) -> Result<(), String> {
+    if device.access != AccessScope::Owned {
+        return Err(format!("recovery device {code} is no longer account-owned"));
+    }
+    let status = device
+        .status
+        .as_ref()
+        .map(|status| status.as_str().to_ascii_lowercase())
+        .ok_or_else(|| format!("recovery device {code} has unknown lifecycle status"))?;
+    if !matches!(status.as_str(), "idle" | "inactive" | "deactivated") {
+        return Err(format!(
+            "recovery device {code} is no longer inactive/deactivated ({status})"
+        ));
+    }
+    if device
+        .location
+        .as_ref()
+        .is_none_or(|location| !location.id.as_str().eq_ignore_ascii_case(origin))
+    {
+        return Err(format!(
+            "recovery device {code} is no longer at exact origin {origin}"
+        ));
+    }
+    if device.travel.is_some()
+        || device.relationships.attached_to.is_some()
+        || device.relationships.stowed_in.is_some()
+        || device.relationships.controller.is_some()
+        || device.relationships.assigned_replicant.is_some()
+        || device.relationships.hosting_replicant.is_some()
+        || device.relationships.linked_device.is_some()
+    {
+        return Err(format!(
+            "recovery device {code} is no longer free-standing and unassigned"
+        ));
+    }
+    if device.active_directive.is_some() {
+        return Err(format!(
+            "recovery device {code} has an active or unavailable directive"
+        ));
+    }
+    if device.tags.iter().any(|tag| !configured_tags.contains(tag)) {
+        return Err(format!(
+            "recovery device {code} has a tag outside its authenticated recovery tags"
+        ));
+    }
+    Ok(())
+}
+
+async fn release_placement_recovery_tags(
+    context: &mut WorkflowContext,
+    client: &Client,
+    metadata: &PlacementRecoveryMetadata,
+    origin: &str,
+    checkpoint: &mut LogisticsWorkflowCheckpoint,
+) -> Result<bool, String> {
+    for (code, configured_tags) in &metadata.release_device_tags {
+        let exact_claim = context
+            .claims()
+            .map_err(string_error)?
+            .into_iter()
+            .any(|claim| claim.resource == ResourceKey::Device(code.clone()));
+        if !exact_claim {
+            return Err(format!(
+                "recovery cleanup for {code} requires an exact device claim"
+            ));
+        }
+
+        let handle = client.devices().get(code).await.map_err(string_error)?;
+        let prior = checkpoint.placement_recovery_cleanup.get(code).cloned();
+        let operation_id = prior
+            .as_ref()
+            .and_then(|cleanup| cleanup.operation_id.as_deref())
+            .map(|value| OperationId::new(value.to_owned()))
+            .unwrap_or_else(|| recovery_configure_operation_id(context.id(), code));
+        let snapshot = handle
+            .refresh()
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        validate_recovery_device_authority(&snapshot, code, origin, configured_tags)?;
+        let present = configured_tags
+            .iter()
+            .filter(|tag| snapshot.tags.iter().any(|existing| existing == *tag))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // The current managed tag postcondition is authoritative even when a
+        // prior operation was submitted, accepted, ambiguous, or nonterminal.
+        // An absent tag completes cleanup without replaying the mutation.
+        if present.is_empty() && !configured_tags.is_empty() && prior.is_none() {
+            return Err(format!(
+                "recovery target {code} does not physically carry its configured recovery tag"
+            ));
+        }
+        if present.is_empty() {
+            let mut cleanup = prior.unwrap_or_default();
+            cleanup.state = Some("absent".to_owned());
+            if cleanup.tags.is_empty() {
+                cleanup.tags = configured_tags.clone();
+            }
+            checkpoint
+                .placement_recovery_cleanup
+                .insert(code.clone(), cleanup);
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            continue;
+        }
+
+        let request_tags = prior
+            .as_ref()
+            .map(|cleanup| {
+                if cleanup.tags.is_empty() {
+                    present.clone()
+                } else {
+                    cleanup.tags.clone()
+                }
+            })
+            .unwrap_or_else(|| present.clone());
+        if request_tags.is_empty()
+            || request_tags
+                .iter()
+                .any(|tag| !configured_tags.contains(tag))
+        {
+            return Err(format!(
+                "recovery cleanup operation for {code} has unauthenticated tags"
+            ));
+        }
+
+        // the managed operation boundary. A crash here resumes through the
+        // same configure_with_id call; no separate in-flight marker is needed.
+        checkpoint.placement_recovery_cleanup.insert(
+            code.clone(),
+            PlacementRecoveryCleanup {
+                operation_id: Some(operation_id.as_str().to_owned()),
+                tags: request_tags.clone(),
+                state: Some("prepared".to_owned()),
+            },
+        );
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        let operation = handle
+            .configure_with_id(
+                operation_id,
+                replicant_client::raw::devices::DeviceConfiguration {
+                    remove_tags: Some(request_tags.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(string_error)?;
+        if let Some(saved) = checkpoint.placement_recovery_cleanup.get_mut(code) {
+            saved.state = Some("submitted".to_owned());
+        }
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        let result = await_recovery_operation(&operation).await;
+        let refreshed = handle.refresh().await.map_err(string_error)?;
+        let current = refreshed.snapshot().await.map_err(string_error)?;
+        let remaining = request_tags
+            .iter()
+            .filter(|tag| current.tags.iter().any(|present| present == *tag))
+            .count();
+        if remaining == 0 {
+            if let Some(saved) = checkpoint.placement_recovery_cleanup.get_mut(code) {
+                saved.state = Some("completed".to_owned());
+            }
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            continue;
+        }
+
+        let state = match &result {
+            Ok(true) => "ambiguous",
+            Ok(false) => "pending",
+            Err(_) => "failed",
+        };
+        if let Some(saved) = checkpoint.placement_recovery_cleanup.get_mut(code) {
+            saved.state = Some(state.to_owned());
+        }
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+        match result {
+            Ok(_) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// Recovery cleanup is applied only by a resolved managed operation.  In
+/// particular `Accepted` is not evidence that a configure mutation happened.
+async fn await_recovery_operation(operation: &Operation) -> Result<bool, String> {
+    let initial = operation.status().await.map_err(string_error)?;
+    if initial == OperationStatus::Accepted {
+        return Ok(false);
+    }
+    if initial == OperationStatus::Completed {
+        return Ok(true);
+    }
+    if matches!(
+        initial,
+        OperationStatus::ReconciliationRequired | OperationStatus::Ambiguous
+    ) {
+        let outcome = operation.reconcile().await.map_err(string_error)?;
+        return match outcome.status {
+            OperationStatus::Completed => Ok(true),
+            OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed => {
+                Err(format!(
+                    "managed cleanup operation {} ended as {:?}: {}",
+                    operation.id(),
+                    outcome.status,
+                    outcome.response.unwrap_or(Value::Null)
+                ))
+            }
+            _ => Ok(false),
+        };
+    }
+    let outcome = operation
+        .wait_timeout(Duration::from_secs(30))
+        .await
+        .map_err(string_error)?;
+    match outcome.status {
+        OperationStatus::Completed => Ok(true),
+        OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed => {
+            Err(format!(
+                "managed cleanup operation {} ended as {:?}: {}",
+                operation.id(),
+                outcome.status,
+                outcome.response.unwrap_or(Value::Null)
+            ))
+        }
+        status => {
+            // Prepared/submitted/in-progress/awaiting-evidence remain durable
+            // and must be observed on a later executor invocation.
+            let _ = status;
+            Ok(false)
+        }
     }
 }
 
@@ -5525,7 +7179,7 @@ pub fn new_mining_campaign_workflow(
 ) -> NewWorkflow<MiningCampaignIntent, MiningCampaignCheckpoint> {
     NewWorkflow {
         kind: mining_campaign_workflow_kind(),
-        schema_version: 2,
+        schema_version: 3,
         config: intent,
         checkpoint: MiningCampaignCheckpoint::default(),
         current_step: Some("queued".to_owned()),
@@ -6383,6 +8037,7 @@ async fn ensure_trade_payment_ready(
                 pre_deactivate_device_codes: Vec::new(),
                 release_mining_reservations: false,
                 return_transports: false,
+                placement_recovery: None,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
                 purpose: format!(
@@ -8033,9 +9688,10 @@ async fn ensure_shop_trade_criteria(
                 resources: missing_resources,
                 devices: Vec::new(),
                 device_codes: Vec::new(),
-                device_tags: Vec::new(),
                 pre_deactivate_device_codes: Vec::new(),
+                device_tags: Vec::new(),
                 release_mining_reservations: false,
+                placement_recovery: None,
                 return_transports: false,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
@@ -8079,9 +9735,10 @@ async fn ensure_shop_trade_criteria(
                 resources: ResourceMap::new(),
                 devices: Vec::new(),
                 device_codes: staged_codes.clone(),
-                device_tags: Vec::new(),
                 pre_deactivate_device_codes: Vec::new(),
+                device_tags: Vec::new(),
                 release_mining_reservations: false,
+                placement_recovery: None,
                 return_transports: false,
                 allow_transport_staging: true,
                 region: intent.preferred_region.clone(),
@@ -9072,6 +10729,7 @@ async fn ensure_scan_tour_fleet_capacity(
             device_tags: Vec::new(),
             pre_deactivate_device_codes: Vec::new(),
             release_mining_reservations: false,
+            placement_recovery: None,
             return_transports: true,
             allow_transport_staging: true,
             region: None,
@@ -9613,7 +11271,7 @@ async fn await_success(operation: &Operation) -> Result<(), String> {
             .await
             .map_err(string_error)?;
         match outcome.status {
-            OperationStatus::Completed | OperationStatus::Accepted => return Ok(()),
+            OperationStatus::Completed => return Ok(()),
             OperationStatus::Cancelled | OperationStatus::Rejected | OperationStatus::Failed => {
                 return Err(format!(
                     "managed operation {} ended as {:?}: {}",
@@ -9622,6 +11280,9 @@ async fn await_success(operation: &Operation) -> Result<(), String> {
                     outcome.response.unwrap_or(Value::Null)
                 ));
             }
+            // Accepted is explicitly nonterminal. Keep observing until the
+            // managed journal resolves it rather than treating acceptance as
+            // proof that the mutation applied.
             _ => {}
         }
     }
@@ -9676,6 +11337,247 @@ fn delivery_request(intent: &LogisticsIntent) -> DeliveryRequest {
         carrier: None,
         allow_transport_staging: false,
     }
+}
+
+fn strictly_sorted_unique<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn canonical_manifest_device_code(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+/// Validates recovery identity before any workflow claim or managed mutation.
+///
+/// A placement-recovery manifest is intentionally a closed shape: it may move
+/// only its exact canonical device codes and may not smuggle in selectors,
+/// resource payloads, pre-deactivation work, or alternate transport policy.
+/// Director adoption calls this same validator, so malformed
+/// manually-created manifests cannot suppress a valid recovery candidate.
+pub(crate) fn validate_placement_recovery_intent(
+    intent: &LogisticsManifestIntent,
+) -> Result<(), String> {
+    let Some(metadata) = intent.placement_recovery.as_ref() else {
+        return Ok(());
+    };
+    if intent
+        .region
+        .as_deref()
+        .is_none_or(|region| region.trim().is_empty())
+    {
+        return Err("placement recovery requires a nonempty region".to_owned());
+    }
+    if intent.origin.trim().is_empty() || intent.destination.trim().is_empty() {
+        return Err("placement recovery requires exact origin and destination".to_owned());
+    }
+    if !intent.resources.is_empty()
+        || !intent.devices.is_empty()
+        || !intent.device_tags.is_empty()
+        || !intent.pre_deactivate_device_codes.is_empty()
+        || intent.release_mining_reservations
+    {
+        return Err(
+            "placement recovery must contain only exact device codes and recovery metadata"
+                .to_owned(),
+        );
+    }
+    if !intent.return_transports || !intent.allow_transport_staging {
+        return Err(
+            "placement recovery requires return_transports and allow_transport_staging".to_owned(),
+        );
+    }
+    if intent.device_codes.len() != 1
+        || !strictly_sorted_unique(&intent.device_codes)
+        || intent
+            .device_codes
+            .iter()
+            .any(|code| code != &canonical_manifest_device_code(code))
+    {
+        return Err("placement recovery requires one canonical exact device code".to_owned());
+    }
+    let codes = intent.device_codes.iter().cloned().collect::<BTreeSet<_>>();
+    if metadata.failed_provenance.len() != codes.len()
+        || metadata
+            .failed_provenance
+            .keys()
+            .any(|code| !codes.contains(code))
+    {
+        return Err("placement recovery provenance must cover every exact device".to_owned());
+    }
+    if metadata.release_device_tags.len() != codes.len()
+        || metadata
+            .release_device_tags
+            .keys()
+            .any(|code| !codes.contains(code))
+    {
+        return Err("placement recovery release tags must cover every exact device".to_owned());
+    }
+    for (code, provenance) in &metadata.failed_provenance {
+        if code != &canonical_manifest_device_code(code)
+            || provenance.is_empty()
+            || !strictly_sorted_unique(provenance)
+        {
+            return Err(format!(
+                "placement recovery provenance for {code} is not canonical"
+            ));
+        }
+    }
+    for (code, tags) in &metadata.release_device_tags {
+        if !codes.contains(code)
+            || code != &canonical_manifest_device_code(code)
+            || !strictly_sorted_unique(tags)
+            || tags
+                .iter()
+                .any(|tag| tag.trim().is_empty() || !workflow_tag_reserved(tag))
+        {
+            return Err(format!(
+                "placement recovery release tags for {code} are not canonical reserved tags"
+            ));
+        }
+    }
+    if !strictly_sorted_unique(&metadata.placement_resolutions) {
+        return Err("placement recovery resolutions must be sorted and unique".to_owned());
+    }
+    for resolution in &metadata.placement_resolutions {
+        if resolution.device_code != canonical_manifest_device_code(&resolution.device_code)
+            || !codes.contains(&resolution.device_code)
+            || !metadata
+                .failed_provenance
+                .get(&resolution.device_code)
+                .is_some_and(|provenance| provenance.contains(&resolution.provenance))
+        {
+            return Err(format!(
+                "placement recovery resolution has an unmatched device or provenance: {}",
+                resolution.device_code
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Authenticates recovery metadata against the retained typed failed-custody
+/// projection. The workflow context has no physical census/topology, so this
+/// is deliberately limited to exact workflow evidence; the Director remains
+/// responsible for complete physical authority before launching recovery.
+pub(crate) fn placement_recovery_metadata_matches_snapshot(
+    metadata: &PlacementRecoveryMetadata,
+    snapshot: &WorkflowPlacementIntentSnapshot,
+) -> Result<(), String> {
+    if !snapshot.unknown_live_workflows.is_empty() || !snapshot.unknown_terminal_outcomes.is_empty()
+    {
+        return Err(
+            "placement recovery workflow authority is incomplete; unknown workflow coverage remains"
+                .to_owned(),
+        );
+    }
+    let authenticated_tags = metadata
+        .release_device_tags
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    for code in metadata.failed_provenance.keys() {
+        let evidence = snapshot.explain_device(code, &authenticated_tags);
+        if !evidence.live.is_empty() {
+            return Err(format!(
+                "placement recovery target {code} has current live workflow placement evidence"
+            ));
+        }
+        if !evidence.settled_placements.is_empty() {
+            return Err(format!(
+                "placement recovery target {code} has settled workflow placement evidence"
+            ));
+        }
+        if !evidence.terminal_residuals.is_empty() {
+            return Err(format!(
+                "placement recovery target {code} has terminal residual workflow placement evidence"
+            ));
+        }
+    }
+    let mut direct = BTreeMap::<String, BTreeSet<WorkflowPlacementProvenance>>::new();
+    let mut tag_provenance = BTreeMap::<String, BTreeSet<WorkflowPlacementProvenance>>::new();
+    for evidence in &snapshot.failed_transient {
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: evidence.workflow_id,
+            work_item_id: evidence.intent.work_item_id,
+        };
+        match &evidence.intent.subject {
+            WorkflowPlacementIntentSubject::Device(code) => {
+                direct
+                    .entry(canonical_manifest_device_code(code))
+                    .or_default()
+                    .insert(provenance);
+            }
+            WorkflowPlacementIntentSubject::DeviceTag(tag) => {
+                tag_provenance
+                    .entry(tag.clone())
+                    .or_default()
+                    .insert(provenance);
+            }
+        }
+    }
+    let mut expected_resolutions = BTreeSet::new();
+    for (code, provenances) in &metadata.failed_provenance {
+        let configured_tags = metadata
+            .release_device_tags
+            .get(code)
+            .ok_or_else(|| format!("recovery release tags missing exact device {code}"))?;
+        if direct.get(code).is_some_and(|values| {
+            values
+                .iter()
+                .any(|provenance| !provenances.contains(provenance))
+        }) {
+            return Err(format!(
+                "recovery provenance for {code} omits retained exact failed placement evidence"
+            ));
+        }
+        for provenance in provenances {
+            let direct_match = direct
+                .get(code)
+                .is_some_and(|values| values.contains(provenance));
+            let tag_match = configured_tags.iter().any(|tag| {
+                tag_provenance
+                    .get(tag)
+                    .is_some_and(|values| values.contains(provenance))
+            });
+            if !direct_match && !tag_match {
+                return Err(format!(
+                    "recovery provenance for {code} is not retained exact failed placement evidence"
+                ));
+            }
+        }
+        if let Some(values) = direct.get(code) {
+            for provenance in values {
+                if provenances.contains(provenance) {
+                    expected_resolutions.insert(WorkflowPlacementResolution {
+                        device_code: code.clone(),
+                        provenance: provenance.clone(),
+                    });
+                }
+            }
+        }
+        for tag in configured_tags {
+            if !tag_provenance.get(tag).is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|provenance| provenances.contains(provenance))
+            }) {
+                return Err(format!(
+                    "recovery cleanup tag {tag} for {code} is not retained exact failed placement evidence"
+                ));
+            }
+        }
+    }
+    let actual_resolutions = metadata
+        .placement_resolutions
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_resolutions != expected_resolutions {
+        return Err(
+            "placement recovery resolutions do not match retained exact failed custody".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryRequest {
@@ -9826,7 +11728,7 @@ fn event_connectivity_retry_deadline(
         })
 }
 
-fn campaign_retry_deadline(
+pub(crate) fn campaign_retry_deadline(
     repository: &replicant_workflow::WorkflowRepository,
     workflow_id: WorkflowId,
     fallback_deadline_ms: i64,
@@ -9871,7 +11773,7 @@ fn campaign_wait_signal_is_actionable(signal: WaitSignal) -> bool {
     )
 }
 
-async fn wait_for_campaign_work(
+pub(crate) async fn wait_for_campaign_work(
     context: &mut WorkflowContext,
     description: &str,
     event_names: &[&str],
@@ -11310,6 +13212,10 @@ mod tests {
         );
         assert!(resource_claim_contention(&contention));
         assert!(!stale_relay_plan_failure(&contention));
+
+        let travel_timeout =
+            io::Error::new(io::ErrorKind::TimedOut, "timed out traveling to TARGET");
+        assert!(retryable_connectivity_dependency_failure(&travel_timeout));
     }
 
     #[test]
@@ -11668,6 +13574,113 @@ mod tests {
     }
 
     #[test]
+    fn logistics_manifest_recovery_metadata_is_backward_compatible_and_exact() {
+        let legacy: LogisticsManifestIntent = serde_json::from_value(serde_json::json!({
+            "origin": "ORIGIN",
+            "destination": "DESTINATION"
+        }))
+        .expect("legacy manifest");
+        assert!(legacy.placement_recovery.is_none());
+
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let mut intent = LogisticsManifestIntent {
+            origin: "ORIGIN".to_owned(),
+            destination: "DESTINATION".to_owned(),
+            region: Some("alpha".to_owned()),
+            device_codes: vec!["DEVICE-1".to_owned()],
+            placement_recovery: Some(PlacementRecoveryMetadata {
+                failed_provenance: BTreeMap::from([(
+                    "DEVICE-1".to_owned(),
+                    vec![provenance.clone()],
+                )]),
+                release_device_tags: BTreeMap::from([(
+                    "DEVICE-1".to_owned(),
+                    vec!["mine-m:one".to_owned()],
+                )]),
+                placement_resolutions: Vec::new(),
+            }),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        };
+        validate_placement_recovery_intent(&intent).expect("valid recovery metadata");
+
+        intent.device_codes = vec!["device-1".to_owned()];
+        assert!(
+            validate_placement_recovery_intent(&intent)
+                .expect_err("lowercase exact code rejected")
+                .contains("canonical")
+        );
+    }
+
+    #[test]
+    fn logistics_checkpoint_legacy_shape_restores_cleanup_defaults() {
+        let checkpoint: LogisticsWorkflowCheckpoint = serde_json::from_value(serde_json::json!({
+            "plan": null,
+            "started": false
+        }))
+        .expect("legacy logistics checkpoint");
+        assert!(checkpoint.placement_recovery_cleanup.is_empty());
+
+        let checkpoint = LogisticsWorkflowCheckpoint {
+            placement_recovery_cleanup: BTreeMap::from([(
+                "DEVICE-1".to_owned(),
+                PlacementRecoveryCleanup {
+                    operation_id: Some("OP-CLEANUP".to_owned()),
+                    tags: vec!["mine-m:one".to_owned()],
+                    state: Some("submitted".to_owned()),
+                },
+            )]),
+            ..checkpoint
+        };
+        let restored: LogisticsWorkflowCheckpoint =
+            serde_json::from_value(serde_json::to_value(checkpoint).expect("checkpoint"))
+                .expect("restored checkpoint");
+        let cleanup = restored
+            .placement_recovery_cleanup
+            .get("DEVICE-1")
+            .expect("cleanup state");
+        assert_eq!(cleanup.operation_id.as_deref(), Some("OP-CLEANUP"));
+        assert_eq!(cleanup.state.as_deref(), Some("submitted"));
+        assert_eq!(cleanup.tags, vec!["mine-m:one".to_owned()]);
+    }
+
+    #[test]
+    fn logistics_manifest_recovery_malformed_projection_is_unknown() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "origin": "ORIGIN",
+                    "destination": "DESTINATION",
+                    "region": "alpha",
+                    "device_codes": ["device-1"],
+                    "placement_recovery": {
+                        "failed_provenance": {},
+                        "release_device_tags": {},
+                        "placement_resolutions": []
+                    }
+                }),
+                checkpoint: serde_json::json!({"plan": null, "started": false}),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("manifest");
+        let projection =
+            logistics_manifest_placement(&workflow, &[]).expect("project malformed manifest");
+        assert_eq!(
+            projection.coverage,
+            WorkflowPlacementIntentCoverage::Unknown
+        );
+        assert!(projection.resolutions.is_empty());
+    }
+
+    #[test]
     fn blueprint_transport_manifest_allows_cross_system_carrier_staging() {
         let intent = blueprint_transport_manifest(
             "service_bot",
@@ -11682,6 +13695,313 @@ mod tests {
         assert!(intent.return_transports);
         assert!(intent.allow_transport_staging);
     }
+    #[test]
+    fn logistics_manifest_recovery_resolves_only_succeeded_delivered_devices() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let intent = LogisticsManifestIntent {
+            origin: "ORIGIN".to_owned(),
+            destination: "DESTINATION".to_owned(),
+            region: Some("alpha".to_owned()),
+            device_codes: vec!["DEVICE-1".to_owned()],
+            placement_recovery: Some(PlacementRecoveryMetadata {
+                failed_provenance: BTreeMap::from([(
+                    "DEVICE-1".to_owned(),
+                    vec![provenance.clone()],
+                )]),
+                release_device_tags: BTreeMap::from([(
+                    "DEVICE-1".to_owned(),
+                    vec!["mine-m:DEVICE-1".to_owned()],
+                )]),
+                placement_resolutions: vec![WorkflowPlacementResolution {
+                    device_code: "DEVICE-1".to_owned(),
+                    provenance,
+                }],
+            }),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        };
+        let config = serde_json::to_value(&intent).expect("intent");
+        let new_manifest = || {
+            repository.create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: config.clone(),
+                checkpoint: serde_json::json!({"plan": null, "started": false}),
+                current_step: None,
+                parent_id: None,
+            })
+        };
+        let workflow = new_manifest().expect("manifest");
+
+        let failed = repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: Some("delivery failed".to_owned()),
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("failed manifest");
+        let failed_projection =
+            logistics_manifest_placement(&failed, &[]).expect("failed projection");
+        assert!(failed_projection.resolutions.is_empty());
+
+        let queued = new_manifest().expect("second manifest");
+        let workflow = repository
+            .update(
+                queued.id,
+                queued.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("running manifest");
+        let succeeded = repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Succeeded,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint {
+                        plan: Some(DeliveryPlan {
+                            origin: "ORIGIN".to_owned(),
+                            destination: "DESTINATION".to_owned(),
+                            payload_devices: vec![PayloadDevice {
+                                code: "DEVICE-1".to_owned(),
+                                device_type: "service_bot".to_owned(),
+                                origin: "ORIGIN".to_owned(),
+                            }],
+                            ..DeliveryPlan::default()
+                        }),
+                        started: true,
+                        ..LogisticsWorkflowCheckpoint::default()
+                    },
+                    last_error: None,
+                    result: Some(
+                        serde_json::to_value(DeliveryReport {
+                            devices_delivered: vec!["DEVICE-1".to_owned()],
+                            ..DeliveryReport::default()
+                        })
+                        .expect("delivery report"),
+                    ),
+                },
+            )
+            .expect("succeeded manifest");
+        let succeeded_projection =
+            logistics_manifest_placement(&succeeded, &[]).expect("succeeded projection");
+        assert_eq!(succeeded_projection.resolutions.len(), 1);
+        assert_eq!(succeeded_projection.resolutions[0].device_code, "DEVICE-1");
+        let deployed = succeeded_projection
+            .intents
+            .iter()
+            .find(|intent| {
+                intent.subject == WorkflowPlacementIntentSubject::Device("DEVICE-1".to_owned())
+            })
+            .expect("deployed device intent");
+        assert_eq!(deployed.relation, WorkflowPlacementIntentRelation::Deployed);
+        assert_eq!(deployed.expected_location.as_deref(), Some("DESTINATION"));
+        let queued = new_manifest().expect("partial report manifest");
+        let partial = repository
+            .update(
+                queued.id,
+                queued.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("running partial report manifest");
+        let partial = repository
+            .update(
+                partial.id,
+                partial.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Succeeded,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: Some(
+                        serde_json::to_value(DeliveryReport::default())
+                            .expect("partial delivery report"),
+                    ),
+                },
+            )
+            .expect("partial report update");
+        let partial_projection =
+            logistics_manifest_placement(&partial, &[]).expect("partial projection");
+        assert!(partial_projection.resolutions.is_empty());
+
+        let queued = new_manifest().expect("missing report manifest");
+        let missing = repository
+            .update(
+                queued.id,
+                queued.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("running missing report manifest");
+        let missing = repository
+            .update(
+                missing.id,
+                missing.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Succeeded,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("missing report update");
+        let missing_projection =
+            logistics_manifest_placement(&missing, &[]).expect("missing projection");
+        assert_eq!(
+            missing_projection.coverage,
+            WorkflowPlacementIntentCoverage::Unknown
+        );
+
+        let queued = new_manifest().expect("malformed report manifest");
+        let malformed = repository
+            .update(
+                queued.id,
+                queued.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("running malformed report manifest");
+        let malformed = repository
+            .update(
+                malformed.id,
+                malformed.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Succeeded,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: Some(serde_json::json!({"devices_delivered": "not-a-list"})),
+                },
+            )
+            .expect("malformed report update");
+        let malformed_projection =
+            logistics_manifest_placement(&malformed, &[]).expect("malformed projection");
+        assert_eq!(
+            malformed_projection.coverage,
+            WorkflowPlacementIntentCoverage::Unknown
+        );
+
+        let cancelled = new_manifest().expect("cancelled manifest");
+        let cancelled = repository
+            .update(
+                cancelled.id,
+                cancelled.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Cancelled,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: Some("cancelled".to_owned()),
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("cancelled report update");
+        let cancelled_projection =
+            logistics_manifest_placement(&cancelled, &[]).expect("cancelled projection");
+        assert!(cancelled_projection.resolutions.is_empty());
+    }
+    #[test]
+    fn recovery_success_without_matching_durable_plan_is_unknown() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let provenance = WorkflowPlacementProvenance {
+            workflow_id: WorkflowId::new(),
+            work_item_id: None,
+        };
+        let intent = recovery_test_intent(provenance, "mine-m:DEVICE-1");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::to_value(intent).expect("recovery intent"),
+                checkpoint: LogisticsWorkflowCheckpoint {
+                    started: true,
+                    ..LogisticsWorkflowCheckpoint::default()
+                },
+                current_step: Some("delivering".to_owned()),
+                parent_id: None,
+            })
+            .expect("recovery manifest");
+        let workflow = repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: Some("delivering".to_owned()),
+                    checkpoint: LogisticsWorkflowCheckpoint {
+                        started: true,
+                        ..LogisticsWorkflowCheckpoint::default()
+                    },
+                    last_error: None,
+                    result: None::<serde_json::Value>,
+                },
+            )
+            .expect("running recovery");
+        let succeeded = repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Succeeded,
+                    current_step: Some("delivering".to_owned()),
+                    checkpoint: LogisticsWorkflowCheckpoint {
+                        started: true,
+                        ..LogisticsWorkflowCheckpoint::default()
+                    },
+                    last_error: None,
+                    result: Some(
+                        serde_json::to_value(DeliveryReport {
+                            devices_delivered: vec!["DEVICE-1".to_owned()],
+                            ..DeliveryReport::default()
+                        })
+                        .expect("delivery report"),
+                    ),
+                },
+            )
+            .expect("succeeded recovery");
+        let projection =
+            logistics_manifest_placement(&succeeded, &[]).expect("recovery projection");
+        assert_eq!(
+            projection.coverage,
+            WorkflowPlacementIntentCoverage::Unknown
+        );
+        assert!(projection.resolutions.is_empty());
+    }
+
     #[test]
     fn manufacturing_capacity_failure_waits_instead_of_failing_exploration() {
         let error = crate::failure::ClassifiedError::new(
@@ -11977,7 +14297,7 @@ mod tests {
     }
 
     #[test]
-    fn mining_campaign_factory_preserves_region_from_accidentally_versioned_v1_config() {
+    fn mining_campaign_factory_migrates_legacy_and_projects_schema_three_routes() {
         let repository = WorkflowRepository::open_in_memory().expect("open repository");
         let legacy = repository
             .create(NewWorkflow {
@@ -12000,15 +14320,39 @@ mod tests {
             .expect("migrate campaign")
             .expect("migration exists");
         assert_eq!(migration.config()["region"], "delta");
+        assert_eq!(
+            migration.config()["transport_routes"],
+            serde_json::json!([])
+        );
 
-        let current = new_mining_campaign_workflow(MiningCampaignIntent {
-            systems: vec!["SOL".into()],
-            region: "delta".into(),
-            hub: "ROOT-1-L4".into(),
-            max_concurrency: 1,
-        });
-        assert_eq!(current.schema_version, 2);
-        assert_eq!(current.config.region, "delta");
+        let route = AmiTransportRouteIntent {
+            system: "SOL".into(),
+            collect: "SOL-BELT-1".into(),
+            deliver: "ROOT-1-L4".into(),
+        };
+        let current = repository
+            .create(new_mining_campaign_workflow(MiningCampaignIntent {
+                systems: vec!["SOL".into()],
+                region: "delta".into(),
+                hub: "ROOT-1-L4".into(),
+                transport_routes: vec![route.clone()],
+                max_concurrency: 1,
+            }))
+            .expect("create schema-three campaign");
+        assert_eq!(current.schema_version, 3);
+        assert_eq!(
+            current
+                .config::<MiningCampaignIntent>()
+                .expect("config")
+                .region,
+            "delta"
+        );
+        let projection = factory.service_intents(&current).expect("service intent");
+        assert_eq!(
+            projection.coverage,
+            replicant_workflow::WorkflowServiceIntentCoverage::Complete
+        );
+        assert_eq!(projection.intents, vec![route.workflow_service_intent()]);
     }
 
     #[test]
@@ -12312,6 +14656,1178 @@ mod tests {
             .allocate_requirements(reclaimed.id, reclaimed.state.revision, &[candidate("R-2")])
             .expect("released item accepts replacement worker");
         assert_eq!(allocation_worker(&reassigned).as_deref(), Some("R-2"));
+        client.close().await.expect("close client");
+    }
+    #[test]
+    fn every_automation_factory_projects_current_schema_or_explicitly_unknown() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let cases = [
+            (
+                scan_system_workflow_kind(),
+                serde_json::json!({"system":"SYS"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                scan_belt_workflow_kind(),
+                serde_json::json!({"system":"SYS"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                scan_tour_workflow_kind(),
+                serde_json::json!({"center":"SYS"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                belt_search_campaign_workflow_kind(),
+                serde_json::json!({"systems":[],"region":"alpha"}),
+                serde_json::json!({"legacy_checkpoint":null}),
+                2,
+            ),
+            (
+                salvage_workflow_kind(),
+                serde_json::json!({"location":"SYS"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                salvage_recovery_workflow_kind(),
+                serde_json::json!({"region":"alpha","home":"HOME"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                mining_deploy_workflow_kind(),
+                serde_json::json!({"system":"SYS"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                mining_campaign_workflow_kind(),
+                serde_json::json!({"systems":[],"region":"alpha","hub":"HUB","transport_routes":[]}),
+                serde_json::json!({"mission":null,"migration_worker":null,"started":false}),
+                3,
+            ),
+            (
+                logistics_workflow_kind(),
+                serde_json::json!({"origin":"ORIGIN","destination":"HOME"}),
+                serde_json::json!({"plan":null,"started":false}),
+                1,
+            ),
+            (
+                logistics_manifest_workflow_kind(),
+                serde_json::json!({"origin":"ORIGIN","destination":"HOME"}),
+                serde_json::json!({"plan":null,"started":false}),
+                1,
+            ),
+            (
+                trade_fulfillment_workflow_kind(),
+                serde_json::json!({"controller":"CTRL","trade_code":"TRADE","shop_location":"SHOP","home":"HOME"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                blueprint_acquire_workflow_kind(),
+                serde_json::json!({"device_type":"survey_drone"}),
+                serde_json::json!({}),
+                1,
+            ),
+            (
+                exploration_workflow_kind(),
+                serde_json::json!({"target":"SYS"}),
+                serde_json::json!({"replicant":null,"hub":null,"state":null}),
+                1,
+            ),
+            (
+                event_delivery_workflow_kind(),
+                serde_json::json!({"event":"EVENT"}),
+                serde_json::json!({"replicant":null,"home":null,"plan_json":null,"ready":false,"connectivity_workflows":{},"replan_after_connectivity":false}),
+                1,
+            ),
+            (
+                event_tour_workflow_kind(),
+                serde_json::json!({"event":"EVENT"}),
+                serde_json::json!({"delivery_child":null,"replicant":null,"plan_json":null}),
+                1,
+            ),
+            (
+                event_campaign_workflow_kind(),
+                serde_json::json!({"region":"alpha","home":"HOME"}),
+                serde_json::json!({"replicant":null,"home":null,"archive":null,"connectivity_workflows":{},"replan_after_connectivity":false}),
+                2,
+            ),
+            (
+                observatory_workflow_kind(),
+                serde_json::json!({}),
+                Value::Null,
+                1,
+            ),
+            (
+                replicant_provision_workflow_kind(),
+                serde_json::json!({"region":"alpha","home":"HOME","source_replicant":"REP"}),
+                serde_json::json!({"tag":null,"matrix":null,"cradle":null,"stowed":false,"new_replicant":null}),
+                1,
+            ),
+            (
+                region_establish_workflow_kind(),
+                serde_json::json!({"region":"alpha","landing_star":"STAR","source_hub":"HUB","operator":"OP","explorer":"EXP"}),
+                serde_json::json!({"mission_json":null}),
+                1,
+            ),
+        ];
+        let mut registry = WorkflowRegistry::new();
+        register(&mut registry).expect("automation registry");
+        for (kind, config, checkpoint, schema_version) in cases {
+            let workflow = repository
+                .create(NewWorkflow {
+                    kind: kind.clone(),
+                    schema_version,
+                    config,
+                    checkpoint,
+                    current_step: None,
+                    parent_id: None,
+                })
+                .expect("current workflow");
+            let projection = registry
+                .resolve(&workflow)
+                .expect("registered automation factory")
+                .placement_intents(&workflow, &[])
+                .expect("current typed state");
+            assert_eq!(
+                projection.coverage,
+                WorkflowPlacementIntentCoverage::Complete,
+                "factory {kind} must not inherit unknown for current typed state"
+            );
+        }
+    }
+    #[test]
+    fn placement_projectors_keep_untyped_current_items_unknown() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: logistics_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "origin": "ORIGIN",
+                    "destination": "HOME",
+                    "payload_kind": "device",
+                    "item": "survey_drone",
+                    "quantity": 1,
+                    "resources": {},
+                    "devices": [],
+                    "device_tags": [],
+                    "return_transports": false
+                }),
+                checkpoint: serde_json::json!({
+                    "plan": null,
+                    "started": false
+                }),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("logistics workflow");
+        let item = WorkItem {
+            id: replicant_workflow::WorkItemId::default(),
+            spec: WorkItemSpec {
+                workflow_id: workflow.id,
+                dedupe_key: "unknown".into(),
+                kind: logistics_workflow_kind(),
+                sort_key: "unknown".into(),
+                payload_json: serde_json::json!({"device_code": "D-1"}),
+                preconditions_json: Value::Array(Vec::new()),
+                requirements_json: Value::Array(Vec::new()),
+                deadline_at_ms: None,
+            },
+            state: replicant_workflow::WorkItemState {
+                status: WorkItemStatus::Pending,
+                checkpoint_json: None,
+                result_json: None,
+                last_error: None,
+                attempt_count: 0,
+                consecutive_failure_count: 0,
+                next_attempt_at_ms: None,
+                ever_started: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                revision: 0,
+            },
+        };
+        assert!(
+            LogisticsWorkflowFactory::new()
+                .placement_intents(&workflow, &[item])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_scan_before_directive_has_no_custody_evidence() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: scan_system_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "system": "SYS",
+                    "controller": "CTRL",
+                    "recall": true
+                }),
+                checkpoint: serde_json::to_value(ControllerWorkflowCheckpoint {
+                    controller: Some("CTRL".into()),
+                    ..ControllerWorkflowCheckpoint::default()
+                })
+                .expect("checkpoint"),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("scan workflow");
+        let running = repository
+            .update(
+                workflow.id,
+                workflow.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: ControllerWorkflowCheckpoint {
+                        controller: Some("CTRL".into()),
+                        ..ControllerWorkflowCheckpoint::default()
+                    },
+                    last_error: None,
+                    result: Option::<Value>::None,
+                },
+            )
+            .expect("running workflow");
+        let failed = repository
+            .update(
+                running.id,
+                running.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: None,
+                    checkpoint: ControllerWorkflowCheckpoint {
+                        controller: Some("CTRL".into()),
+                        ..ControllerWorkflowCheckpoint::default()
+                    },
+                    last_error: Some("controller unavailable".into()),
+                    result: Option::<Value>::None,
+                },
+            )
+            .expect("failed workflow");
+        let projection = ScanSystemWorkflowFactory::new()
+            .placement_intents(&failed, &[])
+            .expect("typed failed projection");
+        assert!(projection.intents.is_empty());
+
+        let after_custody = repository
+            .create(NewWorkflow {
+                kind: scan_system_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "system": "SYS",
+                    "controller": "CTRL",
+                    "recall": true
+                }),
+                checkpoint: serde_json::to_value(ControllerWorkflowCheckpoint {
+                    controller: Some("CTRL".into()),
+                    directive_set: true,
+                    ..ControllerWorkflowCheckpoint::default()
+                })
+                .expect("checkpoint"),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("second scan workflow");
+        let running = repository
+            .update(
+                after_custody.id,
+                after_custody.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: None,
+                    checkpoint: ControllerWorkflowCheckpoint {
+                        controller: Some("CTRL".into()),
+                        directive_set: true,
+                        ..ControllerWorkflowCheckpoint::default()
+                    },
+                    last_error: None,
+                    result: Option::<Value>::None,
+                },
+            )
+            .expect("running workflow");
+        let failed = repository
+            .update(
+                running.id,
+                running.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: None,
+                    checkpoint: ControllerWorkflowCheckpoint {
+                        controller: Some("CTRL".into()),
+                        directive_set: true,
+                        ..ControllerWorkflowCheckpoint::default()
+                    },
+                    last_error: Some("directive failed".into()),
+                    result: Option::<Value>::None,
+                },
+            )
+            .expect("failed after directive");
+        let projection = ScanSystemWorkflowFactory::new()
+            .placement_intents(&failed, &[])
+            .expect("typed failed projection");
+        assert_eq!(projection.intents.len(), 1);
+        assert_eq!(
+            projection.intents[0].relation,
+            WorkflowPlacementIntentRelation::Claimed
+        );
+    }
+    #[test]
+    fn mining_terminal_projection_requires_site_or_print_custody() {
+        fn failed_mining(site_phase: &str) -> replicant_workflow::WorkflowInstance {
+            let repository = WorkflowRepository::open_in_memory().expect("repository");
+            let workflow = repository
+                .create(NewWorkflow {
+                    kind: mining_campaign_workflow_kind(),
+                    schema_version: 2,
+                    config: serde_json::json!({
+                        "systems": ["SYS"],
+                        "region": "alpha",
+                        "hub": "HUB",
+                        "max_concurrency": 1
+                    }),
+                    checkpoint: serde_json::json!({
+                        "mission": {
+                            "version": 1,
+                            "mission_id": "M",
+                            "mission_tag": "mine:M",
+                            "legacy_mission_tags": [],
+                            "phase": "deploying_sites",
+                            "selected_replicant": "REP",
+                            "hub_location": "HUB",
+                            "sites": [{
+                                "system": "SYS",
+                                "belt": "BELT",
+                                "density": "high",
+                                "tag": "mine:site",
+                                "phase": site_phase,
+                                "assets": {
+                                    "mining_controller": null,
+                                    "mining_drones": [],
+                                    "survey_controller": null,
+                                    "survey_drones": [],
+                                    "maintenance_drone": null,
+                                    "system_ward": null
+                                },
+                                "missing": {},
+                                "carrier": null
+                            }],
+                            "routes": [],
+                            "print_batches": [],
+                            "site_print_requirements": {},
+                            "route_print_requirements": {},
+                            "total_material_cost": {},
+                            "warnings": []
+                        },
+                        "migration_worker": null,
+                        "started": true
+                    }),
+                    current_step: None,
+                    parent_id: None,
+                })
+                .expect("mining workflow");
+            let running = repository
+                .update(
+                    workflow.id,
+                    workflow.revision,
+                    replicant_workflow::WorkflowState {
+                        status: WorkflowStatus::Running,
+                        current_step: None,
+                        checkpoint: workflow
+                            .checkpoint::<MiningCampaignCheckpoint>()
+                            .expect("checkpoint"),
+                        last_error: None,
+                        result: Option::<Value>::None,
+                    },
+                )
+                .expect("running workflow");
+            repository
+                .update(
+                    running.id,
+                    running.revision,
+                    replicant_workflow::WorkflowState {
+                        status: WorkflowStatus::Failed,
+                        current_step: None,
+                        checkpoint: running
+                            .checkpoint::<MiningCampaignCheckpoint>()
+                            .expect("checkpoint"),
+                        last_error: Some("fixture failure".into()),
+                        result: Option::<Value>::None,
+                    },
+                )
+                .expect("failed workflow")
+        }
+
+        let before = failed_mining("ready");
+        let before_projection = MiningCampaignWorkflowFactory::new()
+            .placement_intents(&before, &[])
+            .expect("before-custody projection");
+        assert!(before_projection.intents.is_empty());
+
+        let after = failed_mining("outbound");
+        let after_projection = MiningCampaignWorkflowFactory::new()
+            .placement_intents(&after, &[])
+            .expect("after-custody projection");
+        assert!(
+            after_projection
+                .intents
+                .iter()
+                .any(|intent| { intent.relation == WorkflowPlacementIntentRelation::Transported })
+        );
+    }
+
+    #[test]
+    fn placement_projectors_keep_legacy_belt_state_unknown() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: belt_search_campaign_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({"systems": [], "region": "alpha"}),
+                checkpoint: Value::Null,
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("legacy belt workflow");
+        assert!(
+            BeltSearchCampaignWorkflowFactory::new()
+                .placement_intents(&workflow, &[])
+                .is_err()
+        );
+    }
+    fn recovery_test_metadata(
+        provenance: WorkflowPlacementProvenance,
+        tag: &str,
+    ) -> PlacementRecoveryMetadata {
+        PlacementRecoveryMetadata {
+            failed_provenance: BTreeMap::from([("DEVICE-1".into(), vec![provenance.clone()])]),
+            release_device_tags: BTreeMap::from([("DEVICE-1".into(), vec![tag.into()])]),
+            placement_resolutions: vec![WorkflowPlacementResolution {
+                device_code: "DEVICE-1".into(),
+                provenance,
+            }],
+        }
+    }
+
+    fn seed_failed_recovery_source(
+        repository: &WorkflowRepository,
+        tag: &str,
+    ) -> WorkflowPlacementProvenance {
+        let source = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "origin": "ALPHA-BELT-1",
+                    "destination": "ALPHA-HUB",
+                    "device_codes": ["DEVICE-1"],
+                    "device_tags": [tag]
+                }),
+                checkpoint: LogisticsWorkflowCheckpoint {
+                    started: true,
+                    ..LogisticsWorkflowCheckpoint::default()
+                },
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("failed recovery source");
+        let source = repository
+            .update(
+                source.id,
+                source.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Failed,
+                    current_step: None,
+                    checkpoint: LogisticsWorkflowCheckpoint {
+                        started: true,
+                        ..LogisticsWorkflowCheckpoint::default()
+                    },
+                    last_error: Some("fixture transport failure".to_owned()),
+                    result: None::<Value>,
+                },
+            )
+            .expect("terminal failed recovery source");
+        WorkflowPlacementProvenance {
+            workflow_id: source.id,
+            work_item_id: None,
+        }
+    }
+
+    fn recovery_test_intent(
+        provenance: WorkflowPlacementProvenance,
+        tag: &str,
+    ) -> LogisticsManifestIntent {
+        LogisticsManifestIntent {
+            origin: "ALPHA-BELT-1".into(),
+            destination: "ALPHA-HUB".into(),
+            region: Some("alpha".into()),
+            device_codes: vec!["DEVICE-1".into()],
+            placement_recovery: Some(recovery_test_metadata(provenance, tag)),
+            return_transports: true,
+            allow_transport_staging: true,
+            ..LogisticsManifestIntent::default()
+        }
+    }
+
+    fn authorize_recovery_test(
+        repository: &WorkflowRepository,
+        workflow_id: WorkflowId,
+        intent: &LogisticsManifestIntent,
+    ) {
+        let metadata = intent
+            .placement_recovery
+            .clone()
+            .expect("recovery metadata");
+        let authorization = placement_recovery_authorization(
+            workflow_id,
+            intent.region.as_deref().expect("recovery region"),
+            intent.device_codes.first().expect("recovery device"),
+            &intent.origin,
+            &intent.destination,
+            metadata,
+        );
+        write_placement_recovery_authorization(repository, &authorization)
+            .expect("write recovery authorization");
+    }
+
+    async fn tick_until_terminal(
+        supervisor: &replicant_workflow::WorkflowSupervisor,
+        repository: &WorkflowRepository,
+        workflow_id: WorkflowId,
+    ) {
+        for _ in 0..64 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow_id)
+                .expect("workflow")
+                .is_some_and(|workflow| workflow.status.is_terminal())
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("workflow did not reach a terminal state");
+    }
+
+    #[tokio::test]
+    async fn logistics_manifest_recovery_rejects_metadata_and_claims_before_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let malformed = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "origin": "ALPHA-BELT-1",
+                    "destination": "ALPHA-HUB",
+                    "region": "alpha",
+                    "device_codes": ["DEVICE-1"],
+                    "placement_recovery": {
+                        "failed_provenance": {},
+                        "release_device_tags": {
+                            "DEVICE-1": ["mine-m:DEVICE-1"]
+                        },
+                        "placement_resolutions": []
+                    }
+                }),
+                checkpoint: LogisticsWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("malformed recovery manifest");
+
+        let blocker = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({"origin": "X", "destination": "Y"}),
+                checkpoint: LogisticsWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("claim blocker");
+        let blocker = repository
+            .update(
+                blocker.id,
+                blocker.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Running,
+                    current_step: Some("claim-holder".into()),
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("running claim blocker");
+        repository
+            .update(
+                blocker.id,
+                blocker.revision,
+                replicant_workflow::WorkflowState {
+                    status: WorkflowStatus::Waiting,
+                    current_step: Some("claim-holder".into()),
+                    checkpoint: LogisticsWorkflowCheckpoint::default(),
+                    last_error: None,
+                    result: None::<Value>,
+                },
+            )
+            .expect("waiting claim blocker");
+        repository
+            .acquire_claim(blocker.id, ResourceKey::Device("DEVICE-1".into()))
+            .expect("claim blocker resource");
+
+        let claim_conflict = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::to_value(recovery_test_intent(
+                    WorkflowPlacementProvenance {
+                        workflow_id: WorkflowId::new(),
+                        work_item_id: None,
+                    },
+                    "mine-m:DEVICE-1",
+                ))
+                .expect("recovery intent"),
+                checkpoint: LogisticsWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("claim conflict manifest");
+
+        let mut registry = WorkflowRegistry::new();
+        register(&mut registry).expect("register runtime workflows");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        supervisor.tick().await.expect("initial supervisor tick");
+        tokio::task::yield_now().await;
+        supervisor.tick().await.expect("claim supervisor tick");
+
+        assert_eq!(
+            repository
+                .read(malformed.id)
+                .expect("malformed row")
+                .expect("malformed workflow")
+                .status,
+            WorkflowStatus::Failed
+        );
+        assert_eq!(
+            repository
+                .read(claim_conflict.id)
+                .expect("claim conflict row")
+                .expect("claim conflict workflow")
+                .status,
+            WorkflowStatus::Failed
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn logistics_manifest_recovery_configure_rejection_never_plans_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "DEVICE-1",
+                "device_type": "survey_drone",
+                "location": "ALPHA-BELT-1",
+                "status": "idle",
+                "tags": ["mine-m:DEVICE-1"]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "configuration rejected"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/blueprints"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+        let provenance = seed_failed_recovery_source(&repository, "mine-m:DEVICE-1");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: recovery_test_intent(provenance, "mine-m:DEVICE-1"),
+                checkpoint: LogisticsWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("recovery manifest");
+        authorize_recovery_test(
+            &repository,
+            workflow.id,
+            &workflow.config().expect("recovery intent"),
+        );
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(Arc::new(LogisticsManifestWorkflowFactory::new()))
+            .expect("register manifest workflow");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        tick_until_terminal(&supervisor, &repository, workflow.id).await;
+        let failed = repository
+            .read(workflow.id)
+            .expect("manifest row")
+            .expect("manifest workflow");
+        assert_eq!(failed.status, WorkflowStatus::Failed);
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("400") || error.contains("rejected")),
+            "unexpected configure rejection error: {:?}",
+            failed.last_error
+        );
+        assert!(
+            failed
+                .checkpoint::<LogisticsWorkflowCheckpoint>()
+                .expect("checkpoint")
+                .plan
+                .is_none(),
+            "configure rejection must precede transport planning"
+        );
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn logistics_manifest_recovery_pending_cleanup_waits_before_planning() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "DEVICE-1",
+                "device_type": "survey_drone",
+                "location": "ALPHA-BELT-1",
+                "status": "idle",
+                "tags": ["mine-m:DEVICE-1"]
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Reconciliation sees the reserved tag still present, so a successful
+        // HTTP response is not completion evidence.
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "DEVICE-1",
+                "device_type": "survey_drone",
+                "location": "ALPHA-BELT-1",
+                "status": "idle",
+                "tags": ["mine-m:DEVICE-1"]
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = test_client_at(&server).await;
+        let directory = std::env::temp_dir().join(format!(
+            "replicant-recovery-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("recovery cleanup test directory");
+        let database = directory.join("workflow.sqlite");
+        let repository = Arc::new(WorkflowRepository::open(&database).expect("repository"));
+        let provenance = seed_failed_recovery_source(&repository, "mine-m:DEVICE-1");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: recovery_test_intent(provenance, "mine-m:DEVICE-1"),
+                checkpoint: LogisticsWorkflowCheckpoint::default(),
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("recovery manifest");
+        authorize_recovery_test(
+            &repository,
+            workflow.id,
+            &workflow.config().expect("recovery intent"),
+        );
+        let mut registry = WorkflowRegistry::new();
+        registry
+            .register(Arc::new(LogisticsManifestWorkflowFactory::new()))
+            .expect("register recovery manifest");
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            Arc::new(registry),
+            client.clone(),
+        );
+        for _ in 0..64 {
+            supervisor.tick().await.expect("supervisor tick");
+            if repository
+                .read(workflow.id)
+                .expect("workflow")
+                .is_some_and(|workflow| workflow.status == WorkflowStatus::Waiting)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let waiting = repository
+            .read(workflow.id)
+            .expect("waiting row")
+            .expect("waiting workflow");
+        assert_eq!(
+            waiting.status,
+            WorkflowStatus::Waiting,
+            "unexpected pending cleanup error: {:?}",
+            waiting.last_error
+        );
+        assert_eq!(
+            waiting.current_step.as_deref(),
+            Some("waiting_for_recovery_cleanup")
+        );
+        let checkpoint = waiting
+            .checkpoint::<LogisticsWorkflowCheckpoint>()
+            .expect("waiting checkpoint");
+        assert!(checkpoint.plan.is_none());
+        assert_eq!(
+            checkpoint
+                .placement_recovery_cleanup
+                .get("DEVICE-1")
+                .and_then(|cleanup| cleanup.state.as_deref()),
+            Some("pending")
+        );
+        assert_eq!(
+            checkpoint
+                .placement_recovery_cleanup
+                .get("DEVICE-1")
+                .and_then(|cleanup| cleanup.operation_id.as_deref()),
+            Some(recovery_configure_operation_id(workflow.id, "DEVICE-1").as_str())
+        );
+        drop(checkpoint);
+        drop(waiting);
+        drop(supervisor);
+        drop(repository);
+        let reopened = WorkflowRepository::open(&database).expect("reopened repository");
+        let resumed = reopened
+            .read(workflow.id)
+            .expect("reopened cleanup row")
+            .expect("persisted cleanup workflow");
+        let resumed_checkpoint = resumed
+            .checkpoint::<LogisticsWorkflowCheckpoint>()
+            .expect("reopened cleanup checkpoint");
+        assert_eq!(resumed.status, WorkflowStatus::Waiting);
+        assert!(resumed_checkpoint.plan.is_none());
+        assert_eq!(
+            resumed_checkpoint
+                .placement_recovery_cleanup
+                .get("DEVICE-1")
+                .and_then(|cleanup| cleanup.operation_id.as_deref()),
+            Some(recovery_configure_operation_id(workflow.id, "DEVICE-1").as_str())
+        );
+        drop(reopened);
+        server.verify().await;
+        client.close().await.expect("close client");
+        std::fs::remove_dir_all(directory).expect("remove recovery cleanup test directory");
+    }
+
+    #[tokio::test]
+    async fn logistics_manifest_recovery_smoke_executes_delivery_and_rebuilds_placement_snapshot() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("repository"));
+
+        // First execute a real manifest that fails during planning. Its
+        // factory projection, rather than a hand-authored terminal row, is
+        // the retained exact Device+DeviceTag failed episode.
+        let failed = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: serde_json::json!({
+                    "origin": "ALPHA-BELT-1",
+                    "destination": "ALPHA-HUB",
+                    "device_codes": ["DEVICE-1"],
+                    "device_tags": ["mine-m:DEVICE-1"]
+                }),
+                checkpoint: LogisticsWorkflowCheckpoint {
+                    plan: Some(DeliveryPlan {
+                        origin: "ALPHA-BELT-1".into(),
+                        destination: "ALPHA-HUB".into(),
+                        payload_devices: vec![PayloadDevice {
+                            code: "DEVICE-1".into(),
+                            device_type: "survey_drone".into(),
+                            origin: "ALPHA-BELT-1".into(),
+                        }],
+                        ..DeliveryPlan::default()
+                    }),
+                    started: true,
+                    ..LogisticsWorkflowCheckpoint::default()
+                },
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("failed source manifest");
+        let mut source_registry = WorkflowRegistry::new();
+        source_registry
+            .register(Arc::new(LogisticsManifestWorkflowFactory::new()))
+            .expect("register source manifest");
+        let registry = Arc::new(source_registry);
+        let source_supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            registry.clone(),
+            client.clone(),
+        );
+        tick_until_terminal(&source_supervisor, &repository, failed.id).await;
+        assert_eq!(
+            repository
+                .read(failed.id)
+                .expect("failed source row")
+                .expect("failed source")
+                .status,
+            WorkflowStatus::Failed
+        );
+
+        let failed_provenance = WorkflowPlacementProvenance {
+            workflow_id: failed.id,
+            work_item_id: None,
+        };
+        let mut recovery_intent =
+            recovery_test_intent(failed_provenance.clone(), "mine-m:DEVICE-1");
+        recovery_intent
+            .placement_recovery
+            .as_mut()
+            .expect("metadata")
+            .placement_resolutions = vec![WorkflowPlacementResolution {
+            device_code: "DEVICE-1".into(),
+            provenance: failed_provenance,
+        }];
+
+        // Cleanup observes the original tag once; reconciliation observes the
+        // exact current destination with the tag absent. Priority keeps the
+        // two authoritative reads distinct while allowing later refreshes to
+        // reuse the destination projection.
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "DEVICE-1",
+                "device_type": "survey_drone",
+                "location": "ALPHA-BELT-1",
+                "status": "idle",
+                "tags": ["mine-m:DEVICE-1"]
+            })))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "DEVICE-1",
+                "device_type": "survey_drone",
+                "location": "ALPHA-HUB",
+                "status": "idle",
+                "tags": []
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/DEVICE-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/CARRIER-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "CARRIER-1",
+                "device_type": "cargo_freighter",
+                "location": "ALPHA-HUB",
+                "status": "idle",
+                "attached_devices": []
+            })))
+            .mount(&server)
+            .await;
+
+        let recovery = repository
+            .create(NewWorkflow {
+                kind: logistics_manifest_workflow_kind(),
+                schema_version: 1,
+                config: recovery_intent,
+                checkpoint: LogisticsWorkflowCheckpoint {
+                    plan: Some(DeliveryPlan {
+                        origin: "ALPHA-BELT-1".into(),
+                        destination: "ALPHA-HUB".into(),
+                        payload_devices: vec![PayloadDevice {
+                            code: "DEVICE-1".into(),
+                            device_type: "survey_drone".into(),
+                            origin: "ALPHA-BELT-1".into(),
+                        }],
+                        device_carriers: vec!["CARRIER-1".into()],
+                        transport_origins: BTreeMap::from([(
+                            "CARRIER-1".into(),
+                            "ALPHA-HUB".into(),
+                        )]),
+                        ..DeliveryPlan::default()
+                    }),
+                    ..LogisticsWorkflowCheckpoint::default()
+                },
+                current_step: None,
+                parent_id: None,
+            })
+            .expect("recovery manifest");
+        authorize_recovery_test(
+            &repository,
+            recovery.id,
+            &recovery.config().expect("recovery intent"),
+        );
+
+        let supervisor = replicant_workflow::WorkflowSupervisor::with_managed_client(
+            repository.clone(),
+            registry.clone(),
+            client.clone(),
+        );
+        tick_until_terminal(&supervisor, &repository, recovery.id).await;
+        let succeeded = repository
+            .read(recovery.id)
+            .expect("recovery row")
+            .expect("recovery workflow");
+        assert_eq!(
+            succeeded.status,
+            WorkflowStatus::Succeeded,
+            "unexpected recovery smoke error: {:?}",
+            succeeded.last_error
+        );
+        let checkpoint = succeeded
+            .checkpoint::<LogisticsWorkflowCheckpoint>()
+            .expect("recovery checkpoint");
+        assert_eq!(
+            checkpoint
+                .placement_recovery_cleanup
+                .get("DEVICE-1")
+                .and_then(|cleanup| cleanup.operation_id.as_deref()),
+            Some(recovery_configure_operation_id(recovery.id, "DEVICE-1").as_str())
+        );
+        let report = succeeded
+            .result::<DeliveryReport>()
+            .expect("delivery result")
+            .expect("delivery report");
+        assert_eq!(report.devices_delivered, vec!["DEVICE-1"]);
+
+        let snapshot = registry
+            .placement_intent_snapshot(&repository, None)
+            .expect("rebuilt placement snapshot");
+        assert!(snapshot.failed_transient.iter().all(|evidence| {
+            !matches!(
+                &evidence.intent.subject,
+                WorkflowPlacementIntentSubject::Device(code) if code == "DEVICE-1"
+            )
+        }));
+        assert!(snapshot.resolved_transient.iter().any(|evidence| {
+            matches!(
+                &evidence.intent.subject,
+                WorkflowPlacementIntentSubject::Device(code) if code == "DEVICE-1"
+            ) && evidence.workflow_id == failed.id
+        }));
+
+        let device = client
+            .devices()
+            .get("DEVICE-1")
+            .await
+            .expect("delivered device")
+            .snapshot()
+            .await
+            .expect("delivered device snapshot");
+        let devices = BTreeMap::from([("DEVICE-1".into(), device.clone())]);
+        let homes = BTreeMap::from([("alpha".into(), BTreeSet::from(["ALPHA-HUB".into()]))]);
+        let location_systems = BTreeMap::from([("ALPHA-HUB".into(), "ALPHA".into())]);
+        let system_regions = BTreeMap::from([("ALPHA".into(), "alpha".into())]);
+        let classification = crate::device_placement::classify_device_placement(
+            &device,
+            &crate::device_placement::DevicePlacementContext {
+                complete_owned_census: true,
+                devices: &devices,
+                registered_homes: &homes,
+                location_systems: &location_systems,
+                system_regions: &system_regions,
+                workflow_snapshot: &snapshot,
+            },
+        );
+        assert_eq!(
+            classification.class,
+            crate::device_placement::DevicePlacementClass::Intentional
+        );
+        assert!(
+            classification
+                .workflow_evidence
+                .live
+                .iter()
+                .chain(&classification.workflow_evidence.settled_placements)
+                .chain(&classification.workflow_evidence.terminal_residuals)
+                .chain(&classification.workflow_evidence.failed_transient)
+                .chain(&classification.workflow_evidence.resolved_transient)
+                .all(|evidence| {
+                    !matches!(
+                        &evidence.intent.subject,
+                        WorkflowPlacementIntentSubject::DeviceTag(_)
+                    )
+                }),
+            "removed recovery tag must not match the delivered device"
+        );
+        server.verify().await;
         client.close().await.expect("close client");
     }
 }

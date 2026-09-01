@@ -23,14 +23,23 @@ use tracing::{info, warn};
 
 use super::validation::{self, ValidationReason};
 use super::{
-    AnyResult, Config, ExecutionPrintBatch, MiningMission, MissionPhase, PrintPurpose, RoutePhase,
-    SiteAssets, SitePhase, app_error, audit_route, audit_site, controller_code,
+    AnyResult, Config, EvidenceState, ExecutionPrintBatch, MiningMission, MissionPhase,
+    PrintPurpose, RoutePhase, SiteAssets, SitePhase, app_error, audit_site, controller_code,
     device_is_in_system, device_location, device_snapshots, device_type, factory_workloads,
-    fetch_blueprints, find_device, format_quantities, has_directive, has_reservation_tag,
-    is_opaque_mining_mission_tag, protected_systems, save_plan, site_shortages, stable_hash,
+    fetch_blueprints, find_device, has_directive, has_reservation_tag,
+    is_opaque_mining_mission_tag, save_plan, site_shortages, stable_hash,
+    transport_service_present,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+fn format_quantities(quantities: &QuantityMap) -> String {
+    quantities
+        .iter()
+        .map(|(resource, quantity)| format!("{resource}={quantity}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Upper bound between authoritative refreshes while waiting on the event
 /// stream. Waits wake immediately on a relevant event; this only bounds how
 /// long a missed or filtered-out event can delay progress.
@@ -229,14 +238,8 @@ fn set_phase(config: &Config, mission: &mut MiningMission, phase: MissionPhase) 
 async fn reconcile(client: &Client, config: &Config, mission: &mut MiningMission) -> AnyResult<()> {
     reconcile_print_batches(client, mission).await?;
     let devices = device_snapshots(client).await?;
-    let protection = protected_systems(&devices, &client.galaxy().catalogue());
     for site in &mut mission.sites {
-        let audit = audit_site(
-            &devices,
-            &site.system,
-            &site.belt,
-            protection.contains(&site.system),
-        );
+        let audit = audit_site(&devices, &site.system, &site.belt);
         if audit.operational {
             site.assets = audit.assets;
             site.missing.clear();
@@ -1319,7 +1322,8 @@ async fn configure_site(
     index: usize,
 ) -> AnyResult<()> {
     let site = mission.sites[index].clone();
-    let mut ward_pending = site.assets.system_ward.is_none();
+    let ward_assigned = site.assets.system_ward.is_some();
+    let mut ward_pending = false;
     for code in site.assets.codes() {
         let snapshot = validation::device(client, &code, ValidationReason::StateConflict).await?;
         let is_ward = site.assets.system_ward.as_deref() == Some(code.as_str());
@@ -1340,7 +1344,7 @@ async fn configure_site(
         }
     }
     tag_site_assets(client, &site).await?;
-    if !ward_pending {
+    if ward_assigned && !ward_pending {
         ensure_site_protection(client, &site).await?;
     }
     mission.sites[index].phase = SitePhase::Adopting;
@@ -1441,13 +1445,7 @@ async fn configure_site(
             ValidationReason::StateConflict,
         )
         .await?;
-        let protection_active = site.assets.system_ward.is_some()
-            || client
-                .galaxy()
-                .catalogue()
-                .iter()
-                .any(|star| star.key.id.as_str() == site.system && star.has_hub == Some(true));
-        if audit_site(&devices, &site.system, &site.belt, protection_active).operational {
+        if audit_site(&devices, &site.system, &site.belt).operational {
             break;
         }
         if Instant::now() >= deadline {
@@ -1630,23 +1628,34 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         .as_deref()
         .ok_or_else(|| app_error(io::ErrorKind::InvalidData, "route has no Cargo Freighter"))?;
     ensure_adoption(client, controller, &[freighter.to_owned()]).await?;
-    let snapshot = validation::device(client, controller, ValidationReason::StateConflict).await?;
     let handle = match client.devices().cached(controller) {
         Some(handle) => handle,
         None => client.devices().get(controller).await?,
     };
     let transport = handle.as_transport_controller()?;
-    if !super::ferry_route_matches(&snapshot, &route.belt, hub) {
-        ensure_operation_accepted(
-            &transport
-                .set_directive(TransportDirective::Ferry {
-                    collect: route.belt.clone(),
-                    deliver: hub.to_owned(),
-                    priority: vec!["rares".into(), "volatiles".into()],
-                })
-                .await?,
-        )
-        .await?;
+    let initial_devices = validate_codes(
+        client,
+        &route_resource_codes(route),
+        ValidationReason::StateConflict,
+    )
+    .await?;
+    let initial_audit =
+        transport_service_present(&initial_devices, &route.system, &route.belt, hub);
+    if initial_audit.state != EvidenceState::Present {
+        let directive = if super::location_is_in_system(hub, &route.system) {
+            TransportDirective::Shuttle {
+                collect: route.belt.clone(),
+                deliver: hub.to_owned(),
+                priority: vec!["rares".into(), "volatiles".into()],
+            }
+        } else {
+            TransportDirective::Ferry {
+                collect: route.belt.clone(),
+                deliver: hub.to_owned(),
+                priority: vec!["rares".into(), "volatiles".into()],
+            }
+        };
+        ensure_operation_accepted(&transport.set_directive(directive).await?).await?;
     }
     let snapshot = validation::device(client, controller, ValidationReason::StateConflict).await?;
     if snapshot
@@ -1665,13 +1674,18 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
             ValidationReason::StateConflict,
         )
         .await?;
-        if audit_route(&devices, &route.system, &route.belt, hub).active {
+        if transport_service_present(&devices, &route.system, &route.belt, hub).state
+            == EvidenceState::Present
+        {
             break;
         }
         if Instant::now() >= deadline {
             return Err(app_error(
                 io::ErrorKind::TimedOut,
-                format!("ferry route for {} did not verify as active", route.system),
+                format!(
+                    "transport route for {} did not verify as active",
+                    route.system
+                ),
             ));
         }
         let wake = wait_for_mission_event(&mut watch, deadline, &[]).await?;
@@ -1682,7 +1696,7 @@ async fn configure_route(client: &Client, route: &super::RouteMission, hub: &str
         system = %route.system,
         collect = %route.belt,
         deliver = %hub,
-        "mining ferry route active"
+        "mining transport route active"
     );
     Ok(())
 }
@@ -2001,6 +2015,8 @@ mod tests {
             device_type: Some(replicant_client::domain::DeviceType::from(MINING_DRONE)),
             status: Some(DeviceStatus::from("idle")),
             location: Some(LocationKey::live("HUB-BELT-1".into())),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),

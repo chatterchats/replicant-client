@@ -425,6 +425,8 @@ mod tests {
             device_type: Some(DeviceType::FtlRelay),
             status: Some(DeviceStatus::Active),
             location: Some(LocationKey::live(LocationId::from(location))),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::<DeviceFeature>::new(),
             available_commands: Vec::<DeviceCommand>::new(),
             available_directives: Vec::new(),

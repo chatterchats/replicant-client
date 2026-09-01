@@ -95,6 +95,7 @@ use replicant_runtime::{
     bootstrap::BootstrapMission,
     catalogue::{CatalogueError, OperationCatalogue},
     config::{self, RuntimeConfig},
+    director_reconcile_event_names,
     event::{discovered_events, normalize_event},
     galaxy_scene::galaxy_scene as build_galaxy_scene,
     intelligence::{account_profile, leaderboard, leaderboard_index, standing},
@@ -1159,6 +1160,10 @@ fn workflow_status_name(status: WorkflowStatus) -> &'static str {
     }
 }
 
+fn director_should_wake_for_event(event_name: &str) -> bool {
+    director_reconcile_event_names().contains(&event_name)
+}
+
 /// Evaluates durable automation definitions from local managed events and projections.
 pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     // Schedules need second-level checks; the full event sweep is a safety net
@@ -1176,12 +1181,21 @@ pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Recei
                 evaluate_schedules_and_parents(&state).await;
             }
             _ = sweep.tick() => {
+                if events.is_none() {
+                    events = state.client().events().watch().await.ok();
+                    if events.is_some() {
+                        state.director_wake.notify_one();
+                    }
+                }
                 evaluate_event_triggers_for(&state, &[]).await;
             }
             event = async { events.as_mut().expect("guarded").next().await }, if events.is_some() => {
                 match event {
                     // Evaluate only the triggers watching this event name.
                     Ok(event) => {
+                        if director_should_wake_for_event(event.name.as_str()) {
+                            state.director_wake.notify_one();
+                        }
                         evaluate_event_triggers_for(&state, &[event.name.as_str().to_owned()]).await;
                     }
                     Err(error) => {
@@ -1189,6 +1203,7 @@ pub async fn run_trigger_engine(state: Arc<AppState>, mut shutdown: watch::Recei
                         state.record_runtime_telemetry("watcher_lag", "trigger_events", 1, None);
                         events = state.client().events().watch().await.ok();
                         evaluate_event_triggers_for(&state, &[]).await;
+                        state.director_wake.notify_one();
                     }
                 }
             }
@@ -6680,9 +6695,11 @@ async fn reconcile_and_invalidate_director(
             wait_ms = lock_started.elapsed().as_millis(),
             "Automation Director reconciliation lock acquired"
         );
+        let workflow_registry = state.catalogue.workflow_registry();
         reconcile_director(
             state.client(),
             state.repository.clone(),
+            workflow_registry.as_ref(),
             state.revision.load(Ordering::Relaxed),
             true,
             trigger == "manual",
@@ -6790,8 +6807,8 @@ pub async fn run_director(state: Arc<AppState>, mut shutdown: watch::Receiver<bo
                 reconcile_director_background(&state, "interval").await;
             },
             _ = state.director_wake.notified() => {
-                tracing::debug!(trigger = "control_change", "Automation Director reconciliation triggered");
-                reconcile_director_background(&state, "control_change").await;
+                tracing::debug!(trigger = "notification", "Automation Director reconciliation triggered");
+                reconcile_director_background(&state, "notification").await;
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -7659,7 +7676,7 @@ mod tests {
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use replicant_client::{
-        StartupPolicy,
+        EventStreamOptions, StartupPolicy,
         raw::{SecretString, Url},
     };
     use replicant_protocol::{Notification, NotificationLevel};
@@ -7716,6 +7733,162 @@ mod tests {
         )
         .expect("app state");
         (router(state.clone()), client, state)
+    }
+    #[test]
+    fn director_wakes_for_asteroid_event() {
+        for event_name in [
+            "system.object_detected",
+            "diversion.activated",
+            "diversion.deactivated",
+            "diversion.partial",
+            "diversion.diverted",
+            "diversion.impacted",
+        ] {
+            assert!(
+                director_should_wake_for_event(event_name),
+                "Director should wake for {event_name}"
+            );
+        }
+        for event_name in ["event.completed", "print.completed", "system.updated"] {
+            assert!(
+                !director_should_wake_for_event(event_name),
+                "Director should not wake for {event_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn director_reconciles_after_sse_disconnect_and_reconnect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/accounts/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"email": "a@b.test"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"devices": [], "next_cursor": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"events": [], "next_cursor": null})),
+            )
+            .mount(&server)
+            .await;
+
+        let release_event = Arc::new(AtomicBool::new(false));
+        let stream_requests = Arc::new(AtomicU64::new(0));
+        let release_event_for_response = release_event.clone();
+        let stream_requests_for_response = stream_requests.clone();
+        Mock::given(method("GET"))
+            .and(path("/v1/events/stream"))
+            .respond_with(move |_request: &wiremock::Request| {
+                stream_requests_for_response.fetch_add(1, Ordering::Relaxed);
+                let body = if release_event_for_response.load(Ordering::Relaxed) {
+                    concat!(
+                        "id: 1000-0\n",
+                        "event: system.object_detected\n",
+                        "data: {\"id\":\"1000-0\",\"version\":1,\"category\":\"system\",",
+                        "\"event\":\"system.object_detected\",",
+                        "\"created_at\":\"2026-08-30T00:00:00Z\",",
+                        "\"object_designation\":\"TEST-1\",\"star\":\"SOL\",",
+                        "\"impact_target\":\"SOL\",\"impact_eta\":\"2026-09-30T00:00:00Z\"}\n\n",
+                    )
+                } else {
+                    ": keepalive\n\n"
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body)
+            })
+            .mount(&server)
+            .await;
+
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(Url::parse(&server.uri()).expect("mock URL"))
+            .in_memory()
+            .startup_policy(StartupPolicy::Essential)
+            .event_stream_options(
+                EventStreamOptions::default()
+                    .log_poll_interval(Duration::from_secs(60))
+                    .reconnect_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+            )
+            .start()
+            .await
+            .expect("start managed client");
+        let repository = Arc::new(WorkflowRepository::open_in_memory().expect("runtime database"));
+        let state = AppState::new(
+            client.clone(),
+            RuntimeConfig::new("test"),
+            repository,
+            test_daemon_config(),
+        )
+        .expect("app state");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let trigger_task = tokio::spawn(run_trigger_engine(state.clone(), shutdown_rx.clone()));
+        let director_task = tokio::spawn(run_director(state.clone(), shutdown_rx));
+
+        let initial_director_revision = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(revision) = state
+                    .slice_revisions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&DomainSlice::Director)
+                    .copied()
+                {
+                    break revision;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial Director reconciliation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream_requests.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial SSE connection");
+
+        release_event.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let reconciled = state
+                    .slice_revisions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&DomainSlice::Director)
+                    .is_some_and(|revision| *revision > initial_director_revision);
+                if client.events().cursor().expect("event cursor").as_deref() == Some("1000-0")
+                    && reconciled
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("SSE reconnect event wakes and reconciles Director");
+        assert!(
+            stream_requests.load(Ordering::Relaxed) >= 2,
+            "the event must arrive on a replacement SSE connection"
+        );
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        trigger_task.await.expect("trigger engine exits");
+        director_task.await.expect("Director exits");
+        client.close().await.expect("close managed client");
     }
     #[tokio::test]
     async fn http_trace_propagates_safe_ids_and_replaces_malformed_ids() {
@@ -7927,7 +8100,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/v1/inventory"))
-            .and(query_param("limit", "100"))
+            .and(query_param("limit", "50"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "locations": [{
                     "location": "SYS-B",
@@ -9139,6 +9312,8 @@ mod tests {
             device_type: Some(DeviceType::from("future_device")),
             status: None,
             location: Some(LocationKey::live("EARTH".into())),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),
@@ -9870,7 +10045,7 @@ mod tests {
         let body = serde_json::json!({
             "kind": "relay.expansion",
             "parameters": {
-                "replicant": "TEST-1",
+                "region": "Alpha",
                 "hub": "SOL-HUB",
                 "targets_csv": "ALPHA,BETA",
                 "mission_file": "relay-test.json"
@@ -10086,7 +10261,7 @@ mod tests {
             "operation_class": "workflow",
             "kind": "relay.expansion",
             "parameters": {
-                "replicant": "TEST-1",
+                "region": "Alpha",
                 "hub": "SOL-HUB",
                 "targets_csv": "ALPHA,BETA",
                 "mission_file": "relay-test.json"
@@ -10325,6 +10500,59 @@ mod tests {
             panic!("expected a coalesced domain invalidation");
         };
         assert!(slices.contains_key(&DomainSlice::Missions));
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn stranded_recovery_goal_endpoint_requires_region_and_persists_exact_control() {
+        let (app, client, state) = test_app().await;
+
+        let missing_region = app
+            .clone()
+            .oneshot(
+                Request::put("/api/director/goals/stranded_device_recovery")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .expect("missing-region request"),
+            )
+            .await
+            .expect("missing-region response");
+        assert_eq!(missing_region.status(), StatusCode::BAD_REQUEST);
+
+        let enabled = app
+            .clone()
+            .oneshot(
+                Request::put("/api/director/goals/stranded_device_recovery")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"region":" Alpha ","enabled":true}"#))
+                    .expect("enable request"),
+            )
+            .await
+            .expect("enable response");
+        assert_eq!(enabled.status(), StatusCode::OK);
+        let (control, _) = state
+            .repository
+            .read_document("director.goal_control", "stranded_device_recovery:alpha")
+            .expect("read recovery control")
+            .expect("recovery control");
+        assert_eq!(control["enabled"], true);
+
+        let disabled = app
+            .oneshot(
+                Request::put("/api/director/goals/stranded_device_recovery")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"region":"alpha","enabled":false}"#))
+                    .expect("disable request"),
+            )
+            .await
+            .expect("disable response");
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let (control, _) = state
+            .repository
+            .read_document("director.goal_control", "stranded_device_recovery:alpha")
+            .expect("read disabled recovery control")
+            .expect("disabled recovery control");
+        assert_eq!(control["enabled"], false);
         client.close().await.expect("close client");
     }
 

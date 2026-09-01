@@ -99,6 +99,12 @@ pub(crate) fn failure_class(error: &(dyn Error + 'static)) -> Option<FailureClas
         if let Some(error) = error.downcast_ref::<ClassifiedError>() {
             return Some(error.class);
         }
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        {
+            return Some(FailureClass::TransientUpstream);
+        }
         if let Some(error) = error.downcast_ref::<replicant_client::Error>()
             && (matches!(error, replicant_client::Error::Closed) || error.status() == Some(500))
         {
@@ -208,6 +214,12 @@ mod tests {
             failure_class_from_message("timed out waiting for autofactory queue capacity"),
             Some(FailureClass::ManufacturingCapacity)
         );
+    }
+
+    #[test]
+    fn structured_timeout_is_transient_upstream_failure() {
+        let error = io::Error::new(io::ErrorKind::TimedOut, "timed out traveling to TARGET");
+        assert_eq!(failure_class(&error), Some(FailureClass::TransientUpstream));
     }
 
     #[test]

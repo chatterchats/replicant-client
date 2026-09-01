@@ -86,6 +86,8 @@ pub mod trade;
 /// Read-only messages, account standing, and leaderboard reports.
 pub mod intelligence;
 
+/// Conservative, evidence-bearing owned-device placement classification.
+pub mod device_placement;
 /// Finite regional device-ownership reassignment action.
 pub mod ownership;
 
@@ -101,11 +103,15 @@ pub mod relay;
 /// Durable compatibility workflow registrations and shared orchestration glue.
 pub mod workflows;
 
+/// Asteroid diversion history authority and durable campaign.
+mod asteroid_diversion;
+
 /// Intent-driven workflow layer for web and Tauri automation.
 pub mod automation;
 
 /// Empire-level standing-goal reconciliation and regional workforce planning.
 pub mod orchestration;
+pub use orchestration::director_reconcile_event_names;
 
 /// Durable shared prerequisites raised by Automation Director goals.
 pub mod director_requirements;

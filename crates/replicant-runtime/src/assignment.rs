@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use replicant_client::{
     Client, ManagedStateSnapshot,
-    domain::{Device, DeviceKey, InventoryOwner, Replicant},
+    domain::{Device, DeviceKey, InventoryOwner, Replicant, Star},
 };
 use replicant_workflow::{
     AllocationCandidate, AllocationId, AllocationLocation, AllocationSet, ReplacementOutcome,
@@ -61,16 +61,16 @@ impl ResourceBroker {
         } = client.state().snapshot()?;
         let observed_at_ms = unix_millis();
         let hosted_capabilities = hosted_device_capabilities(&devices);
+        let catalogue = client.galaxy().catalogue();
         let mut candidates = Vec::new();
         for replicant in owned_replicants {
             candidates.push(AllocationCandidate {
                 resource: ResourceKey::Replicant(replicant.key.id.to_string()),
                 kind: "replicant".into(),
                 capabilities: capabilities_for_replicant(&replicant, &hosted_capabilities),
-                location: replicant.location.map(|location| AllocationLocation {
-                    designation: Some(location.id.to_string()),
-                    ..AllocationLocation::default()
-                }),
+                location: replicant
+                    .location
+                    .map(|location| allocation_location(location.id.as_str(), &catalogue)),
                 available_quantity: 1,
                 observed_revision: revision,
                 observed_at_ms,
@@ -84,10 +84,10 @@ impl ResourceBroker {
             }
             capabilities.sort();
             capabilities.dedup();
-            let location = device.location.as_ref().map(|location| AllocationLocation {
-                designation: Some(location.id.to_string()),
-                ..AllocationLocation::default()
-            });
+            let location = device
+                .location
+                .as_ref()
+                .map(|location| allocation_location(location.id.as_str(), &catalogue));
             candidates.push(AllocationCandidate {
                 resource: ResourceKey::Device(device_code.clone()),
                 kind: "device".into(),
@@ -189,6 +189,20 @@ impl ResourceBroker {
             .allocate_requirements(item_id, expected_revision, candidates)
             .map_err(Into::into)
     }
+
+    /// Atomically allocates candidates while requiring selected requirement
+    /// pairs to share the same underlying resource identity.
+    pub fn allocate_with_affinity(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+        affinities: &[(&str, &str)],
+    ) -> Result<AllocationSet, AssignmentError> {
+        self.repository
+            .allocate_requirements_with_affinity(item_id, expected_revision, candidates, affinities)
+            .map_err(Into::into)
+    }
     /// Replaces a resource proven permanently missing using current managed candidates.
     pub fn replace_dead_allocation(
         &self,
@@ -214,6 +228,44 @@ impl ResourceBroker {
         self.repository
             .replace_dead_allocation(item_id, allocation_id, candidates, unix_millis())
             .map_err(Into::into)
+    }
+
+    /// Replaces a missing allocation while preserving requirement affinity.
+    pub fn replace_dead_allocation_from_with_affinity(
+        &self,
+        item_id: WorkItemId,
+        allocation_id: AllocationId,
+        candidates: &[AllocationCandidate],
+        affinities: &[(&str, &str)],
+    ) -> Result<ReplacementOutcome, AssignmentError> {
+        self.repository
+            .replace_dead_allocation_with_affinity(
+                item_id,
+                allocation_id,
+                candidates,
+                unix_millis(),
+                affinities,
+            )
+            .map_err(Into::into)
+    }
+}
+
+fn allocation_location(designation: &str, catalogue: &[Star]) -> AllocationLocation {
+    let star = catalogue
+        .iter()
+        .filter(|star| {
+            let system = star.key.id.as_str();
+            designation == system
+                || designation
+                    .strip_prefix(system)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+        .max_by_key(|star| star.key.id.as_str().len());
+    AllocationLocation {
+        region: star.and_then(|star| star.region.clone()),
+        system: star.map(|star| star.key.id.as_str().to_owned()),
+        designation: Some(designation.to_owned()),
+        distances_ly: BTreeMap::new(),
     }
 }
 
@@ -281,6 +333,8 @@ mod tests {
             device_type: None,
             status: None,
             location: None,
+            deployed_at: None,
+            in_control_range: None,
             features: features
                 .iter()
                 .map(|feature| DeviceFeature::from(*feature))

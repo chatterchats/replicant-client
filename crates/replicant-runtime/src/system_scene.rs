@@ -456,6 +456,8 @@ mod tests {
             device_type: Some(kind),
             status: None,
             location: Some(LocationKey::live(LocationId::from(at))),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::<DeviceFeature>::new(),
             available_commands: Vec::new(),
             available_directives: Vec::new(),

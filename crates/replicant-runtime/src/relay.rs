@@ -6222,6 +6222,10 @@ async fn travel_to(
 ) -> AnyResult<()> {
     let mut handle = client.replicants().get_owned(replicant_code).await?;
     let mut snapshot = handle.snapshot().await?;
+    if snapshot.location.is_none() && snapshot.travel.is_none() {
+        handle = handle.refresh().await?;
+        snapshot = handle.snapshot().await?;
+    }
     let mut departure_origin = snapshot
         .location
         .as_ref()
@@ -7511,6 +7515,8 @@ mod tests {
             location: Some(replicant_client::domain::LocationKey::live(
                 "ANTAR-1-L4".into(),
             )),
+            deployed_at: None,
+            in_control_range: None,
             features: Vec::new(),
             available_commands: commands
                 .iter()
@@ -7620,7 +7626,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "replicant_code": worker,
                 "hosted_device_code": vessel,
-                "location": "ANTAR-1-L4",
+                "location": "ROOT-1-L4",
                 "status": "active"
             })))
             .expect(1)
@@ -7636,7 +7642,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "device_code": vessel,
                 "device_type": "racing_vessel",
-                "location": "ANTAR-1-L4",
+                "location": "ROOT-1-L4",
                 "status": "active",
                 "stow_capacity": stow_capacity,
                 "stow_used": 0
@@ -7906,6 +7912,19 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/devices/VESSEL-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "VESSEL-1",
+                "device_type": "racing_vessel",
+                "location": "ROOT-1-L4",
+                "status": "active",
+                "stow_capacity": 9,
+                "stow_used": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = test_client_at(&server).await;
         client.devices().get("RELAY-1").await.expect("seed relay");
 
@@ -7922,9 +7941,13 @@ mod tests {
         config.plan_path =
             env::temp_dir().join(format!("relay-rendezvous-{}.json", uuid::Uuid::new_v4()));
 
-        prepare_carrier_supply(&client, &config, &mut plan)
-            .await
-            .expect("prepare initial carrier-supplied load");
+        if let Err(error) = prepare_carrier_supply(&client, &config, &mut plan).await {
+            let requests = server
+                .received_requests()
+                .await
+                .expect("record rendezvous requests");
+            panic!("prepare initial carrier-supplied load: {error:?}; requests: {requests:#?}");
+        }
 
         server.verify().await;
         let _ = fs::remove_file(&config.plan_path);
@@ -9580,6 +9603,25 @@ mod tests {
                 )
                 .expect("Director region");
         }
+        let candidates = crate::assignment::ResourceBroker::with_managed_client(
+            repository.clone(),
+            client.clone(),
+        )
+        .discover_candidates()
+        .expect("discover relay allocation candidates");
+        assert!(
+            candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.resource,
+                    replicant_workflow::ResourceKey::Replicant(code) if code == "REP-A"
+                ) && candidate
+                    .location
+                    .as_ref()
+                    .and_then(|location| location.region.as_deref())
+                    == Some("Alpha")
+            }),
+            "relay worker must retain its physical region: {candidates:#?}"
+        );
         let workflow = repository
             .create(replicant_workflow::NewWorkflow {
                 kind: crate::workflows::relay_workflow_kind(),

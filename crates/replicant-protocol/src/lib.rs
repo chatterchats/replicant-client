@@ -268,10 +268,16 @@ pub enum DirectorGoalKind {
     SalvageRecovery,
     /// Batch-plan and complete active location events in each region.
     EventCompletion,
+    /// Divert incoming asteroids threatening regional systems.
+    AsteroidDiversion,
     /// Learn missing account-wide blueprints from known acquisition opportunities.
     BlueprintAcquisition,
     /// Keep every operational System Hub supplied with its reported upkeep resources.
     MaintainSystemHubs,
+    /// Recover stranded owned devices to regional System Hubs.
+    StrandedDeviceRecovery,
+    /// Establish AMI transport service for producing regional resources.
+    UnservicedResources,
     /// Extend relay reach where regional work requires it.
     ExpandFtlNetwork,
     /// Ensure useful known systems receive monitoring beacons.
@@ -3350,6 +3356,62 @@ mod tests {
         let decoded: DirectorGoalKind =
             serde_json::from_str(&json).expect("deserialize Director goal kind");
         assert_eq!(decoded, DirectorGoalKind::SalvageRecovery);
+    }
+    #[test]
+    fn director_goal_kind_serializes_asteroid_diversion() {
+        let json = serde_json::to_string(&DirectorGoalKind::AsteroidDiversion)
+            .expect("serialize Director goal kind");
+        assert_eq!(json, "\"asteroid_diversion\"");
+        let decoded: DirectorGoalKind =
+            serde_json::from_str(&json).expect("deserialize Director goal kind");
+        assert_eq!(decoded, DirectorGoalKind::AsteroidDiversion);
+    }
+    #[test]
+    fn director_goal_kind_serializes_stranded_device_recovery() {
+        let json = serde_json::to_string(&DirectorGoalKind::StrandedDeviceRecovery)
+            .expect("serialize Director goal kind");
+        assert_eq!(json, "\"stranded_device_recovery\"");
+        let decoded: DirectorGoalKind =
+            serde_json::from_str(&json).expect("deserialize Director goal kind");
+        assert_eq!(decoded, DirectorGoalKind::StrandedDeviceRecovery);
+    }
+
+    #[test]
+    fn director_snapshot_deserializes_legacy_optional_fields() {
+        let legacy = serde_json::json!({
+            "metadata": {
+                "revision": 6,
+                "generated_at_ms": 40,
+            },
+            "mode": "advisory",
+            "regions": [],
+            "goals": [],
+            "replicants": [],
+            "workforce": {
+                "total": 0,
+                "busy": 0,
+                "idle": 0,
+                "idle_ratio": 1.0,
+                "pending_worker_demand": 0,
+                "scale_up_recommended": false,
+                "scale_reason": null,
+            },
+        });
+
+        let decoded: DirectorSnapshot =
+            serde_json::from_value(legacy).expect("deserialize legacy Director snapshot");
+        assert!(decoded.mining_policies.is_empty());
+        assert!(decoded.requirements.is_empty());
+        assert!(decoded.urgency.is_empty());
+    }
+    #[test]
+    fn director_goal_kind_serializes_unserviced_resources() {
+        let json = serde_json::to_string(&DirectorGoalKind::UnservicedResources)
+            .expect("serialize Director goal kind");
+        assert_eq!(json, "\"unserviced_resources\"");
+        let decoded: DirectorGoalKind =
+            serde_json::from_str(&json).expect("deserialize Director goal kind");
+        assert_eq!(decoded, DirectorGoalKind::UnservicedResources);
     }
 
     fn workflow() -> WorkflowSummary {
