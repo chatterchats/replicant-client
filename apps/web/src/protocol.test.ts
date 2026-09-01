@@ -24,6 +24,7 @@ import {
   parseLiveMessage,
   parseOverviewResponse,
   parseReportsResponse,
+  parseSettingsResponse,
   parseSnapshotResponse,
   parseStandingResponse,
   parseSurveyResponse,
@@ -286,7 +287,7 @@ describe("parseDescriptorsResponse device bindings", () => {
 });
 
 describe("parseDirectorResponse", () => {
-  it("parses durable shared requirements and defaults old snapshots to none", () => {
+  it("parses durable shared requirements and legacy snapshots without newer goal kinds", () => {
     const base = {
       metadata: { revision: 3, generated_at_ms: 10 },
       mode: "advisory",
@@ -307,7 +308,31 @@ describe("parseDirectorResponse", () => {
       protocol_version: 1,
       payload: base,
     });
+    expect(legacy.payload.goals).toEqual([]);
+    expect(legacy.payload.mining_policies).toEqual([]);
     expect(legacy.payload.requirements).toEqual([]);
+    const legacyWithGoal = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        ...base,
+        goals: [
+          {
+            id: "expand_mining_ops:alpha",
+            kind: "expand_mining_ops",
+            region: "alpha",
+            status: "waiting",
+            objective: "Expand mining operations",
+            blocker: null,
+            next_action: null,
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: [],
+            enabled: true,
+          },
+        ],
+      },
+    });
+    expect(legacyWithGoal.payload.goals[0]?.kind).toBe("expand_mining_ops");
 
     const parsed = parseDirectorResponse({
       protocol_version: 1,
@@ -457,6 +482,196 @@ describe("parseDirectorResponse", () => {
     });
 
     expect(parsed.payload.goals[0]?.kind).toBe("salvage_recovery");
+  });
+
+  it("accepts a disabled regional Asteroid Diversion goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 5, generated_at_ms: 30 },
+        mode: "automatic",
+        regions: [],
+        goals: [
+          {
+            id: "asteroid_diversion:alpha",
+            kind: "asteroid_diversion",
+            region: "alpha",
+            status: "waiting",
+            objective: "Divert incoming asteroids threatening regional systems",
+            blocker: null,
+            next_action: "Waiting for a threatening asteroid",
+            progress_current: 0,
+            progress_total: 0,
+            active_workflows: [],
+            enabled: false,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]).toMatchObject({
+      kind: "asteroid_diversion",
+      region: "alpha",
+      status: "waiting",
+      objective: "Divert incoming asteroids threatening regional systems",
+      enabled: false,
+    });
+  });
+  it("accepts the Stranded Device Recovery standing goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 6, generated_at_ms: 40 },
+        mode: "automatic",
+        regions: [],
+        goals: [
+          {
+            id: "stranded_device_recovery:alpha",
+            kind: "stranded_device_recovery",
+            region: "alpha",
+            status: "active",
+            objective: "Recover stranded owned devices to regional System Hubs",
+            blocker: null,
+            next_action:
+              "Recover stranded device DEVICE-1 from BELT-1 to ALPHA-HUB",
+            progress_current: 0,
+            progress_total: 1,
+            active_workflows: ["WF-RECOVERY"],
+            enabled: true,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]).toMatchObject({
+      id: "stranded_device_recovery:alpha",
+      kind: "stranded_device_recovery",
+      region: "alpha",
+      status: "active",
+      objective: "Recover stranded owned devices to regional System Hubs",
+      blocker: null,
+      next_action: "Recover stranded device DEVICE-1 from BELT-1 to ALPHA-HUB",
+      progress_current: 0,
+      progress_total: 1,
+      active_workflows: ["WF-RECOVERY"],
+      enabled: true,
+    });
+  });
+
+  it("accepts every Stranded Device Recovery lifecycle state", () => {
+    const statuses = ["waiting", "active", "blocked", "satisfied"] as const;
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 8, generated_at_ms: 50 },
+        mode: "advisory",
+        regions: [],
+        goals: statuses.map((status, index) => ({
+          id: `stranded_device_recovery:region-${String(index)}`,
+          kind: "stranded_device_recovery",
+          region: `region-${String(index)}`,
+          status,
+          objective: "Recover stranded owned devices to regional System Hubs",
+          blocker:
+            status === "blocked" ? "Placement authority is incomplete" : null,
+          next_action:
+            status === "active"
+              ? "Recover stranded device DEVICE-1 from BELT-1 to ALPHA-HUB"
+              : null,
+          progress_current: status === "satisfied" ? 1 : 0,
+          progress_total: 1,
+          active_workflows: status === "active" ? ["WF-RECOVERY"] : [],
+          enabled: status !== "waiting",
+        })),
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals.map((goal) => goal.status)).toEqual(statuses);
+    expect(parsed.payload.goals[2]?.blocker).toBe(
+      "Placement authority is incomplete",
+    );
+    expect(parsed.payload.goals[1]?.active_workflows).toEqual(["WF-RECOVERY"]);
+  });
+
+  it("accepts the Unserviced Resources standing goal", () => {
+    const parsed = parseDirectorResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 7, generated_at_ms: 50 },
+        mode: "automatic",
+        regions: [],
+        goals: [
+          {
+            id: "unserviced_resources:alpha",
+            kind: "unserviced_resources",
+            region: "alpha",
+            status: "active",
+            objective:
+              "Establish AMI transport service for producing regional resources",
+            blocker: null,
+            next_action:
+              "Establish AMI shuttle service from ALPHA-BELT to ALPHA-HUB",
+            progress_current: 0,
+            progress_total: 1,
+            active_workflows: ["WF-TRANSPORT"],
+            enabled: true,
+          },
+        ],
+        replicants: [],
+        requirements: [],
+        workforce: {
+          total: 0,
+          busy: 0,
+          idle: 0,
+          idle_ratio: 1,
+          pending_worker_demand: 0,
+          scale_up_recommended: false,
+          scale_reason: null,
+        },
+      },
+    });
+
+    expect(parsed.payload.goals[0]).toMatchObject({
+      id: "unserviced_resources:alpha",
+      kind: "unserviced_resources",
+      region: "alpha",
+      status: "active",
+      progress_current: 0,
+      progress_total: 1,
+    });
   });
 });
 
@@ -764,6 +979,31 @@ describe("parseHealthResponse", () => {
         },
       }).delta.type,
     ).toBe("entity_upsert");
+  });
+
+  it("parses the versioned settings snapshot shape", () => {
+    const parsed = parseSettingsResponse({
+      protocol_version: 1,
+      payload: {
+        metadata: { revision: 7, generated_at_ms: 12 },
+        profile: "default",
+        bind_address: "127.0.0.1:8080",
+        managed_database_path: "replicant-client.sqlite",
+        history_database_path: "replicant-history.sqlite",
+        telemetry_database_path: "replicant-telemetry.sqlite",
+        runtime_database_path: "replicant-runtime.sqlite",
+        log_filter: "info",
+        docker: false,
+        api_token_source: "unset",
+        daemon_settings_require_restart: false,
+      },
+    });
+
+    expect(parsed.payload).toMatchObject({
+      profile: "default",
+      api_token_source: "unset",
+      daemon_settings_require_restart: false,
+    });
   });
 
   it("parses typed entity index snapshots", () => {

@@ -151,8 +151,11 @@ export type DirectorGoalKind =
   | "expand_mining_ops"
   | "salvage_recovery"
   | "event_completion"
+  | "asteroid_diversion"
   | "blueprint_acquisition"
   | "maintain_system_hubs"
+  | "stranded_device_recovery"
+  | "unserviced_resources"
   | "expand_ftl_network"
   | "establish_beacons";
 export type DirectorGoalStatus = "satisfied" | "active" | "blocked" | "waiting";
@@ -4212,8 +4215,11 @@ const directorGoalKinds = [
   "expand_mining_ops",
   "salvage_recovery",
   "event_completion",
+  "asteroid_diversion",
   "blueprint_acquisition",
   "maintain_system_hubs",
+  "stranded_device_recovery",
+  "unserviced_resources",
   "expand_ftl_network",
   "establish_beacons",
 ] as const;

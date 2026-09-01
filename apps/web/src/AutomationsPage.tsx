@@ -1358,9 +1358,12 @@ const goalLabels: Record<DirectorGoalKind, string> = {
   expand_mining_ops: "Expand Mining Ops",
   salvage_recovery: "Salvage Recovery",
   event_completion: "Event Completion",
+  asteroid_diversion: "Asteroid Diversion",
   blueprint_acquisition: "Blueprint Acquisition",
   maintain_system_hubs: "Maintain System Hubs",
   expand_ftl_network: "Expand FTL Network",
+  stranded_device_recovery: "Stranded Device Recovery",
+  unserviced_resources: "Unserviced Resources",
   establish_beacons: "Establish Beacons",
 };
 
@@ -1376,7 +1379,11 @@ function goalProgress(goal: DirectorGoalSummary) {
   return `${String(goal.progress_current)} / ${String(goal.progress_total)}`;
 }
 
-function DirectorView() {
+function DirectorView({
+  onOpenWorkflow,
+}: {
+  onOpenWorkflow: (workflowId: string) => void;
+}) {
   const query = useDomainQuery({
     slice: "director",
     fetcher: (signal) => daemonApi.director(signal),
@@ -1563,6 +1570,22 @@ function DirectorView() {
                 <b>Next:</b> {goal.next_action}
               </p>
             ) : null}
+            {goal.active_workflows.length ? (
+              <p>
+                <b>Active:</b>{" "}
+                {goal.active_workflows.map((workflowId) => (
+                  <button
+                    className="text-button"
+                    key={workflowId}
+                    onClick={() => {
+                      onOpenWorkflow(workflowId);
+                    }}
+                  >
+                    {workflowId}
+                  </button>
+                ))}
+              </p>
+            ) : null}
           </article>
         ))}
       </div>
@@ -1668,7 +1691,33 @@ function DirectorView() {
                         </label>
                       </div>
                     ) : null}
-                    <p>{goal.blocker ?? goal.next_action ?? goal.objective}</p>
+                    <p>{goal.objective}</p>
+                    {goal.blocker ? (
+                      <p>
+                        <b>Blocked:</b> {goal.blocker}
+                      </p>
+                    ) : null}
+                    {goal.next_action ? (
+                      <p>
+                        <b>Next:</b> {goal.next_action}
+                      </p>
+                    ) : null}
+                    {goal.active_workflows.length ? (
+                      <p>
+                        <b>Active:</b>{" "}
+                        {goal.active_workflows.map((workflowId) => (
+                          <button
+                            className="text-button"
+                            key={workflowId}
+                            onClick={() => {
+                              onOpenWorkflow(workflowId);
+                            }}
+                          >
+                            {workflowId}
+                          </button>
+                        ))}
+                      </p>
+                    ) : null}
                   </div>
                 );
               })}
@@ -1961,7 +2010,12 @@ export function AutomationsPage({
       ) : null}
 
       {tab === "Director" ? (
-        <DirectorView />
+        <DirectorView
+          onOpenWorkflow={(workflowId) => {
+            setTab("Active");
+            setSelectedId(workflowId);
+          }}
+        />
       ) : tab === "Templates" ? (
         <div className="templates-layout">
           <div className="template-list">
