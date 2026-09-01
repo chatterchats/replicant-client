@@ -499,6 +499,8 @@ mod tests {
                 device_type: Some(device_type),
                 status: Some(DomainDeviceStatus::from("active")),
                 location: Some(LocationKey::live(LocationId::from("SOL-3-L4"))),
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives,

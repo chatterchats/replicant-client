@@ -1137,6 +1137,31 @@ impl StateEngine {
             )
     }
 
+    /// Atomically inserts a durable operation, returning the untouched
+    /// existing journal entry when another caller already used the ID.
+    pub(crate) fn record_operation_if_absent(
+        &self,
+        operation_id: &str,
+        state: &str,
+        target_realm: Option<&str>,
+        target_kind: Option<&str>,
+        target_id: Option<&str>,
+        intent: &serde_json::Value,
+    ) -> Result<Option<OperationJournalEntry>, StoreError> {
+        self.store
+            .lock()
+            .as_mut()
+            .ok_or(StoreError::Closed)?
+            .record_operation_if_absent(
+                operation_id,
+                state,
+                target_realm,
+                target_kind,
+                target_id,
+                intent,
+            )
+    }
+
     /// Advances an operation's state with no accompanying projection.
     pub(crate) fn set_operation_state(
         &self,
@@ -1484,6 +1509,8 @@ mod tests {
                 device_type: Some(DeviceType::from("miner")),
                 status: Some(DeviceStatus::from("idle")),
                 location: None,
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),

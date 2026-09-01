@@ -14,7 +14,7 @@ use tracing::{debug, info};
 use crate::domain::{
     self, AccessScope, Account, AccountId, Atmosphere, Blueprint, Device, DeviceCommand,
     DeviceFeature, DeviceId, DeviceKey, DeviceStatus, DeviceType, Knowledge, LifeStage, Location,
-    LocationType, Realm, Replicant, ReplicantId, ReplicantKey, ReplicantStatus,
+    LocationType, OperationId, Realm, Replicant, ReplicantId, ReplicantKey, ReplicantStatus,
 };
 use crate::raw;
 use crate::{Client, Error, Result};
@@ -1211,6 +1211,19 @@ impl DeviceHandle {
         operation::device_command(&self.client, self.id().as_str(), command).await
     }
 
+    /// Dispatches a known device command under a caller-supplied durable
+    /// operation identity. Reusing the identity with a different device or
+    /// command intent is rejected; matching identities resume the original
+    /// operation without submitting a duplicate request.
+    pub async fn command_with_id(
+        &self,
+        operation_id: OperationId,
+        command: raw::devices::DeviceCommand,
+    ) -> Result<Operation> {
+        operation::device_command_with_id(&self.client, self.id().as_str(), command, operation_id)
+            .await
+    }
+
     /// Dispatches a forward-compatible command this client's typed
     /// [`raw::devices::DeviceCommand`] does not (yet) name.
     pub async fn dynamic_command(&self, command: DynamicCommand) -> Result<Operation> {
@@ -1226,6 +1239,24 @@ impl DeviceHandle {
             &self.client,
             self.id().as_str(),
             raw::devices::DeviceConfigurationRequest { configuration },
+        )
+        .await
+    }
+
+    /// Updates this device's configuration under a caller-supplied durable
+    /// operation identity. Reusing the same identity with a different target
+    /// or request intent is rejected; matching identities resume the original
+    /// operation without submitting a duplicate configure request.
+    pub async fn configure_with_id(
+        &self,
+        operation_id: OperationId,
+        configuration: raw::devices::DeviceConfiguration,
+    ) -> Result<Operation> {
+        operation::device_configure_with_id(
+            &self.client,
+            self.id().as_str(),
+            raw::devices::DeviceConfigurationRequest { configuration },
+            operation_id,
         )
         .await
     }
@@ -2618,6 +2649,8 @@ mod tests {
                 device_type: Some(device_type),
                 status: Some(status),
                 location: None,
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),

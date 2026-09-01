@@ -652,13 +652,17 @@ impl Operation {
         };
         if !OperationStatus::parse(&entry.state).is_terminal() {
             let matches = snapshot.as_ref().is_some_and(|snapshot| {
-                entry
-                    .intent
-                    .get("evidence")
-                    .and_then(|evidence| evidence.get("expected_state"))
-                    .is_some_and(|expected| {
-                        !expected.is_null() && value_contains(snapshot, expected)
-                    })
+                if entry.intent.get("kind").and_then(Value::as_str) == Some("device_configure") {
+                    device_configuration_applied(&entry, snapshot)
+                } else {
+                    entry
+                        .intent
+                        .get("evidence")
+                        .and_then(|evidence| evidence.get("expected_state"))
+                        .is_some_and(|expected| {
+                            !expected.is_null() && value_contains(snapshot, expected)
+                        })
+                }
             });
             let state = if matches {
                 OperationStatus::Completed
@@ -1956,6 +1960,33 @@ pub(crate) async fn device_command(
     .await
 }
 
+/// Dispatches a device command under a caller-supplied durable operation
+/// identity. Reusing the identity is safe: the durable store compares the
+/// complete target and sanitized command intent before allowing an existing
+/// operation to be observed or a prepared operation submitted.
+pub(crate) async fn device_command_with_id(
+    client: &Client,
+    device_code: &str,
+    command: raw::devices::DeviceCommand,
+    operation_id: OperationId,
+) -> Result<Operation> {
+    let body = to_value(&command)?;
+    let command_name = body
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    check_device_capability(client, device_code, command_name)?;
+    create_with_id(
+        client,
+        MutationAdapter::DeviceCommand {
+            device_code: device_code.to_owned(),
+            command,
+        },
+        Some(operation_id),
+    )
+    .await
+}
+
 pub(crate) async fn device_dynamic_command(
     client: &Client,
     device_code: &str,
@@ -1989,6 +2020,27 @@ pub(crate) async fn device_configure(
             device_code: device_code.to_owned(),
             request,
         },
+    )
+    .await
+}
+
+/// Dispatches a device configuration under a caller-supplied durable
+/// operation identity. Reusing the identity is safe: the durable store
+/// compares the complete target and sanitized request intent before allowing
+/// an existing operation to be observed or a prepared operation submitted.
+pub(crate) async fn device_configure_with_id(
+    client: &Client,
+    device_code: &str,
+    request: raw::devices::DeviceConfigurationRequest,
+    operation_id: OperationId,
+) -> Result<Operation> {
+    create_with_id(
+        client,
+        MutationAdapter::DeviceConfigure {
+            device_code: device_code.to_owned(),
+            request,
+        },
+        Some(operation_id),
     )
     .await
 }
@@ -2284,11 +2336,24 @@ pub(crate) async fn account_wipe(
 
 /// The common entry point for every durable mutation: persists sanitized
 /// intent, then performs the one automatic submission attempt.
+/// Uses a fresh random operation identity for ordinary callers.
 async fn create(client: &Client, adapter: MutationAdapter) -> Result<Operation> {
+    create_with_id(client, adapter, None).await
+}
+
+/// The common entry point for every durable mutation: persists sanitized
+/// intent, then performs the one automatic submission attempt. A supplied
+/// identity is used by restart-safe workflows that must resume the exact
+/// mutation after a crash.
+async fn create_with_id(
+    client: &Client,
+    adapter: MutationAdapter,
+    supplied_id: Option<OperationId>,
+) -> Result<Operation> {
     client.ensure_open()?;
     debug_assert!(matches!(adapter.safety(), raw::RequestSafety::Mutating));
     let total_started = Instant::now();
-    let id = OperationId::new(Uuid::new_v4().to_string());
+    let id = supplied_id.unwrap_or_else(|| OperationId::new(Uuid::new_v4().to_string()));
     let operation_kind = adapter.operation_id();
     info!(
         target: "replicant_client::ops",
@@ -2326,9 +2391,9 @@ async fn create(client: &Client, adapter: MutationAdapter) -> Result<Operation> 
         };
     let intent_elapsed = intent_started.elapsed();
     let persist_started = Instant::now();
-    client
+    let existing = client
         .managed_state()
-        .record_operation(
+        .record_operation_if_absent(
             id.as_str(),
             OperationStatus::Prepared.as_str(),
             target_realm.as_deref(),
@@ -2337,15 +2402,38 @@ async fn create(client: &Client, adapter: MutationAdapter) -> Result<Operation> 
             &intent,
         )
         .map_err(persistence_error)?;
-    info!(
-        target: "replicant_client::ops",
-        event = "operation.registered",
-        operation_id = %id.as_str(),
-        operation_kind,
-        intent_ms = intent_elapsed.as_millis() as u64,
-        persist_ms = persist_started.elapsed().as_millis() as u64,
-        "durably registered operation"
-    );
+    if let Some(existing) = existing {
+        let identity_matches = existing.target_realm.as_deref() == target_realm.as_deref()
+            && existing.target_kind.as_deref() == target_kind
+            && existing.target_id.as_deref() == target_id.as_deref()
+            && existing.intent == intent;
+        if !identity_matches {
+            return Err(Error::Operation {
+                message: format!(
+                    "operation ID collision for {}: existing target or intent differs",
+                    id.as_str()
+                ),
+            });
+        }
+        info!(
+            target: "replicant_client::ops",
+            event = "operation.reused",
+            operation_id = %id.as_str(),
+            operation_kind,
+            state = %existing.state,
+            "reusing matching durable operation"
+        );
+    } else {
+        info!(
+            target: "replicant_client::ops",
+            event = "operation.registered",
+            operation_id = %id.as_str(),
+            operation_kind,
+            intent_ms = intent_elapsed.as_millis() as u64,
+            persist_ms = persist_started.elapsed().as_millis() as u64,
+            "durably registered operation"
+        );
+    }
     let attempt_started = Instant::now();
     attempt(client, &id).await?;
     info!(
@@ -2709,6 +2797,60 @@ fn value_contains(actual: &Value, predicate: &Value) -> bool {
     }
 }
 
+fn device_configuration_applied(
+    entry: &super::store::OperationJournalEntry,
+    snapshot: &Value,
+) -> bool {
+    if entry.intent.get("kind").and_then(Value::as_str) != Some("device_configure") {
+        return false;
+    }
+    let configuration = entry
+        .intent
+        .get("request")
+        .and_then(|request| request.get("configuration"))
+        .and_then(Value::as_object);
+    let Some(configuration) = configuration else {
+        return false;
+    };
+    // This reconciliation predicate intentionally covers tag-only configure
+    // requests, which is the recovery mutation. Linking has its own tri-state
+    // semantics and must not be declared complete from a tag snapshot alone.
+    if configuration.get("linked_device").is_some() {
+        return false;
+    }
+    let Some(tags) = snapshot.get("tags").and_then(Value::as_array) else {
+        return false;
+    };
+    let has_tag = |tag: &Value| {
+        tag.as_str()
+            .is_some_and(|tag| tags.iter().any(|present| present.as_str() == Some(tag)))
+    };
+    if let Some(remove_tags) = configuration.get("remove_tags").and_then(Value::as_array)
+        && remove_tags.iter().any(&has_tag)
+    {
+        return false;
+    }
+    if let Some(add_tags) = configuration.get("add_tags").and_then(Value::as_array)
+        && add_tags.iter().any(|tag| !has_tag(tag))
+    {
+        return false;
+    }
+    if let Some(expected_tags) = configuration.get("tags").and_then(Value::as_array) {
+        let current = tags
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected_tags
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        if current != expected {
+            return false;
+        }
+    }
+    true
+}
+
 /// Restart recovery: an operation left in `prepared` was durably registered
 /// but never confirmed to have even started its one automatic submission
 /// attempt, so it is safe (and required, for exactly-once delivery) to
@@ -2884,6 +3026,182 @@ mod tests {
         server.verify().await; // panics if the mock was not hit exactly once
     }
 
+    #[tokio::test]
+    async fn caller_supplied_configure_id_reuses_matching_intent_and_rejects_collision() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        let id = OperationId::new("recovery-configure:test");
+        let configuration = raw::devices::DeviceConfiguration {
+            remove_tags: Some(vec!["WORKFLOW:RECOVERY".into()]),
+            ..Default::default()
+        };
+
+        let first = device_configure_with_id(
+            &client,
+            "D1",
+            raw::devices::DeviceConfigurationRequest {
+                configuration: configuration.clone(),
+            },
+            id.clone(),
+        )
+        .await
+        .expect("first configure");
+        let second = device_configure_with_id(
+            &client,
+            "D1",
+            raw::devices::DeviceConfigurationRequest { configuration },
+            id.clone(),
+        )
+        .await
+        .expect("matching configure reuse");
+        assert_eq!(first.id(), second.id());
+
+        let collision = device_configure_with_id(
+            &client,
+            "D1",
+            raw::devices::DeviceConfigurationRequest {
+                configuration: raw::devices::DeviceConfiguration {
+                    add_tags: Some(vec!["different".into()]),
+                    ..Default::default()
+                },
+            },
+            id,
+        )
+        .await
+        .expect_err("same ID with different intent must be rejected");
+        assert!(matches!(collision, Error::Operation { .. }));
+        client.close().await.expect("close");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_command_id_reuses_matching_intent_after_database_reopen() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = std::env::temp_dir().join(format!(
+            "replicant-command-operation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("operation test directory");
+        let database = directory.join("managed.sqlite");
+        let base_url = Url::parse(&server.uri()).expect("mock URL");
+        let client = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(base_url.clone())
+            .sqlite(&database)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("first managed client");
+        let id = OperationId::new("transport-command:test");
+        let command = raw::devices::DeviceCommand::Travel {
+            destination: "ALPHA-HUB".into(),
+            dry_run: None,
+            via: None,
+        };
+
+        let first = device_command_with_id(&client, "D1", command.clone(), id.clone())
+            .await
+            .expect("first command");
+        client.close().await.expect("close first client");
+
+        let reopened = Client::builder()
+            .authentication_token(SecretString::from("token".to_owned()))
+            .base_url(base_url)
+            .sqlite(&database)
+            .startup_policy(StartupPolicy::RestoreOnly)
+            .start()
+            .await
+            .expect("reopened managed client");
+        let second = device_command_with_id(&reopened, "D1", command, id.clone())
+            .await
+            .expect("matching command reuse");
+        assert_eq!(first.id(), second.id());
+
+        let collision = device_command_with_id(
+            &reopened,
+            "D1",
+            raw::devices::DeviceCommand::Travel {
+                destination: "BETA-HUB".into(),
+                dry_run: None,
+                via: None,
+            },
+            id,
+        )
+        .await
+        .expect_err("same ID with different command intent must be rejected");
+        assert!(matches!(collision, Error::Operation { .. }));
+        reopened.close().await.expect("close reopened client");
+        server.verify().await;
+        std::fs::remove_dir_all(directory).expect("remove operation test directory");
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_configure_id_resumes_prepared_operation_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/devices/D1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_at(&server.uri()).await;
+        let adapter = MutationAdapter::DeviceConfigure {
+            device_code: "D1".into(),
+            request: raw::devices::DeviceConfigurationRequest {
+                configuration: raw::devices::DeviceConfiguration {
+                    remove_tags: Some(vec!["WORKFLOW:RECOVERY".into()]),
+                    ..Default::default()
+                },
+            },
+        };
+        let mut intent = adapter.durable_intent().expect("sanitize intent");
+        intent["expects_evidence"] = Value::Bool(adapter.expects_evidence());
+        intent["evidence"] = operation_evidence(&adapter);
+        intent["rate_limit_bucket"] = Value::String(adapter.rate_limit_bucket().into());
+        client
+            .managed_state()
+            .record_operation(
+                "recovery-configure:prepared",
+                OperationStatus::Prepared.as_str(),
+                Some("live"),
+                Some("device"),
+                Some("D1"),
+                &intent,
+            )
+            .expect("persist prepared operation");
+
+        let operation = device_configure_with_id(
+            &client,
+            "D1",
+            raw::devices::DeviceConfigurationRequest {
+                configuration: raw::devices::DeviceConfiguration {
+                    remove_tags: Some(vec!["WORKFLOW:RECOVERY".into()]),
+                    ..Default::default()
+                },
+            },
+            OperationId::new("recovery-configure:prepared"),
+        )
+        .await
+        .expect("resume prepared configure");
+        assert_eq!(
+            operation.status().await.expect("status"),
+            OperationStatus::ReconciliationRequired
+        );
+        client.close().await.expect("close");
+        server.verify().await;
+    }
     #[tokio::test]
     async fn message_mark_read_completes_from_its_authoritative_response() {
         let server = MockServer::start().await;

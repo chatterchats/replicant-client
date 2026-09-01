@@ -363,6 +363,8 @@ mod tests {
                 device_type: Some(crate::domain::DeviceType::from("heaven_vessel")),
                 status: Some(DomainDeviceStatus::from("active")),
                 location: None,
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),

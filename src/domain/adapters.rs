@@ -296,6 +296,8 @@ fn device(
         device_type: raw.device_type.clone().map(DeviceType::from),
         status: raw.status.clone().map(DeviceStatus::from),
         location,
+        deployed_at: raw.deployed_at.clone(),
+        in_control_range: raw.in_control_range,
         features: raw
             .features
             .iter()
@@ -1242,13 +1244,14 @@ mod location_tests {
         assert_eq!(merged.unknown["life_detected"], true);
         assert_eq!(merged.unknown["future_second"], true);
     }
-
     #[test]
     fn device_operational_state_is_retained_by_managed_normalization() {
         let raw: raw::devices::DeviceStatus = serde_json::from_value(serde_json::json!({
             "device_code": "DRONE",
             "device_type": "survey_drone",
             "status": "recalling",
+            "deployed_at": "2026-07-29T10:00:00Z",
+            "in_control_range": false,
             "replicant_code": "R1",
             "location": null,
             "stowed_in_device_code": "VESSEL",
@@ -1296,6 +1299,8 @@ mod location_tests {
         )
         .expect("device should normalize");
         let device = observation.value;
+        assert_eq!(device.deployed_at.as_deref(), Some("2026-07-29T10:00:00Z"));
+        assert_eq!(device.in_control_range, Some(false));
 
         assert_eq!(
             device
@@ -1385,6 +1390,23 @@ mod location_tests {
         );
         assert_eq!(travel.eta_seconds, Some(42));
         assert_eq!(travel.stage.as_deref(), Some("recalling"));
+    }
+
+    #[test]
+    fn device_placement_facts_remain_unknown_when_raw_status_omits_them() {
+        let raw: raw::devices::DeviceStatus =
+            serde_json::from_value(serde_json::json!({"device_code": "UNKNOWN"}))
+                .expect("sparse device status should decode");
+        let observation = device_detail(
+            &raw,
+            Realm::Live,
+            AccessScope::Owned,
+            ObservationTime::now(),
+        )
+        .expect("sparse device should normalize");
+
+        assert_eq!(observation.value.deployed_at, None);
+        assert_eq!(observation.value.in_control_range, None);
     }
 
     #[test]
@@ -1534,6 +1556,8 @@ mod location_tests {
         assert!(device.relationships.stowed_in.is_none());
         assert!(device.relationships.attached_devices.is_empty());
         assert!(device.operational_capacity.is_none());
+        assert_eq!(device.deployed_at, None);
+        assert_eq!(device.in_control_range, None);
         assert!(device.active_directive.is_none());
         assert!(device.travel.is_none());
     }

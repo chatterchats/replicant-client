@@ -80,10 +80,17 @@ pub fn merge_device(
         trace!(target: "replicant_client::domain", "retaining device because incoming observation is stale");
         return MergeOutcome::Retained(existing, MergeRejection::StaleObservation);
     }
+    // Placement facts may be absent from partial observations. Preserve a
+    // previously observed value in that case, while allowing an authoritative
+    // incoming value (including `Some(false)`) to replace it.
+    preserve(&mut incoming.value.deployed_at, &existing.value.deployed_at);
+    preserve(
+        &mut incoming.value.in_control_range,
+        &existing.value.in_control_range,
+    );
     if matches!(existing.metadata.access, AccessScope::Owned)
         && matches!(incoming.metadata.access, AccessScope::Public)
     {
-        trace!(target: "replicant_client::domain", "preserving private device ownership and hosting from public observation");
         incoming.value.relationships.assigned_replicant =
             existing.value.relationships.assigned_replicant;
         incoming.value.relationships.hosting_replicant =
@@ -186,4 +193,118 @@ pub fn collection_can_tombstone<T>(collection: &CollectionObservation<T>) -> boo
         && tombstone_eligible(&collection.metadata, &RemovalEvidence::CompleteCollection);
     trace!(target: "replicant_client::domain", "collection tombstone eligibility={can_tombstone}");
     can_tombstone
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(
+        deployed_at: Option<&str>,
+        in_control_range: Option<bool>,
+        observed_at: &str,
+    ) -> Observation<Device> {
+        Observation {
+            value: Device {
+                key: DeviceKey::live("D1".into()),
+                device_type: None,
+                status: None,
+                location: None,
+                deployed_at: deployed_at.map(str::to_owned),
+                in_control_range,
+                features: Vec::new(),
+                available_commands: Vec::new(),
+                available_directives: Vec::new(),
+                tags: Vec::new(),
+                relationships: DeviceRelationships::default(),
+                cargo: std::collections::BTreeMap::new(),
+                cargo_capacity: None,
+                attach_capacity: None,
+                stow_capacity: None,
+                stow_used: None,
+                operational_capacity: None,
+                grace_period_remaining: None,
+                upkeep_requirements: Vec::new(),
+                system_status: None,
+                active_directive: None,
+                travel: None,
+                access: AccessScope::Owned,
+            },
+            metadata: ObservationMetadata {
+                source: ObservationSource::RestDetail,
+                authority: ObservationAuthority::EntitySnapshot,
+                observed_at: observed_at.into(),
+                access: AccessScope::Owned,
+                reachability: Reachability::Reachable,
+                stale: false,
+                source_document: SourceDocument {
+                    operation: "test".into(),
+                    request_id: None,
+                    document_id: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn device_placement_facts_preserve_known_values_across_partial_updates() {
+        let existing = device(
+            Some("2026-08-01T00:00:00Z"),
+            Some(true),
+            "2026-08-01T00:00:00Z",
+        );
+        let incoming = device(None, None, "2026-08-02T00:00:00Z");
+
+        let MergeOutcome::Replaced(merged) = merge_device(existing, incoming) else {
+            panic!("newer partial device observation should replace the snapshot");
+        };
+        assert_eq!(
+            merged.value.deployed_at.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+        assert_eq!(merged.value.in_control_range, Some(true));
+    }
+
+    #[test]
+    fn device_placement_facts_accept_authoritative_updates_and_unknown_stays_unknown() {
+        let existing = device(
+            Some("2026-08-01T00:00:00Z"),
+            Some(true),
+            "2026-08-01T00:00:00Z",
+        );
+        let incoming = device(
+            Some("2026-08-02T00:00:00Z"),
+            Some(false),
+            "2026-08-02T00:00:00Z",
+        );
+
+        let MergeOutcome::Replaced(merged) = merge_device(existing, incoming) else {
+            panic!("newer device observation should replace the snapshot");
+        };
+        assert_eq!(
+            merged.value.deployed_at.as_deref(),
+            Some("2026-08-02T00:00:00Z")
+        );
+        assert_eq!(merged.value.in_control_range, Some(false));
+
+        let unknown = device(None, None, "2026-08-03T00:00:00Z");
+        let MergeOutcome::Replaced(merged) = merge_device(merged, unknown) else {
+            panic!("newer unknown device observation should replace the snapshot");
+        };
+        assert_eq!(
+            merged.value.deployed_at.as_deref(),
+            Some("2026-08-02T00:00:00Z")
+        );
+        assert_eq!(merged.value.in_control_range, Some(false));
+
+        let unknown_existing = device(None, None, "2026-08-03T00:00:00Z");
+        let unknown_incoming = device(None, None, "2026-08-04T00:00:00Z");
+        let MergeOutcome::Replaced(merged_unknown) =
+            merge_device(unknown_existing, unknown_incoming)
+        else {
+            panic!("newer unknown device observation should replace the snapshot");
+        };
+        assert_eq!(merged_unknown.value.deployed_at, None);
+        assert_eq!(merged_unknown.value.in_control_range, None);
+    }
 }

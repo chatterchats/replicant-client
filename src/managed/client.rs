@@ -1373,6 +1373,8 @@ mod tests {
                 device_type: Some(DeviceType::from("miner")),
                 status: Some(DeviceStatus::from("idle")),
                 location: None,
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),

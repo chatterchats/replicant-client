@@ -746,6 +746,35 @@ impl StoreProxy {
             )
         })
     }
+    /// Atomically records a new operation only when `operation_id` is absent.
+    /// Returns the existing untouched journal entry when another invocation
+    /// already owns the ID; existing rows are never overwritten.
+    pub(crate) fn record_operation_if_absent(
+        &mut self,
+        id: &str,
+        state: &str,
+        realm: Option<&str>,
+        kind: Option<&str>,
+        target: Option<&str>,
+        intent: &Value,
+    ) -> Result<Option<OperationJournalEntry>, StoreError> {
+        let id = id.to_owned();
+        let state = state.to_owned();
+        let realm = realm.map(str::to_owned);
+        let kind = kind.map(str::to_owned);
+        let target = target.map(str::to_owned);
+        let intent = intent.clone();
+        self.0.execute_blocking(move |s| {
+            s.record_operation_if_absent(
+                &id,
+                &state,
+                realm.as_deref(),
+                kind.as_deref(),
+                target.as_deref(),
+                &intent,
+            )
+        })
+    }
     pub(crate) fn set_operation_state(&mut self, id: &str, state: &str) -> Result<(), StoreError> {
         let id = id.to_owned();
         let state = state.to_owned();
@@ -1799,6 +1828,86 @@ impl Store {
             .optional()?;
         Ok(fresh != Some(1))
     }
+    /// Atomically inserts an operation journal row when its ID is absent.
+    /// When the ID already exists, returns the untouched journal entry so the
+    /// caller can verify identity without a check-then-insert race.
+    pub(crate) fn record_operation_if_absent(
+        &mut self,
+        operation_id: &str,
+        state: &str,
+        target_realm: Option<&str>,
+        target_kind: Option<&str>,
+        target_id: Option<&str>,
+        intent: &Value,
+    ) -> Result<Option<OperationJournalEntry>, StoreError> {
+        let fail_commit = self.take_commit_failure();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "INSERT INTO operation_journal(operation_id, state, target_realm, target_kind, target_id, intent_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) ON CONFLICT(operation_id) DO NOTHING",
+            params![
+                operation_id,
+                state,
+                target_realm,
+                target_kind,
+                target_id,
+                serde_json::to_string(intent)?
+            ],
+        )?;
+        if changed == 1 {
+            Self::commit(transaction, fail_commit)?;
+            return Ok(None);
+        }
+        let row = transaction
+            .query_row(
+                "SELECT state, target_realm, target_kind, target_id, intent_json, projection_json, submission_attempt_id, submitted_at, submission_cursor FROM operation_journal WHERE operation_id = ?1",
+                [operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let existing = row
+            .map(
+                |(
+                    state,
+                    target_realm,
+                    target_kind,
+                    target_id,
+                    intent,
+                    projection,
+                    submission_attempt_id,
+                    submitted_at,
+                    submission_cursor,
+                )| {
+                    Ok::<OperationJournalEntry, StoreError>(OperationJournalEntry {
+                        state,
+                        target_realm,
+                        target_kind,
+                        target_id,
+                        intent: serde_json::from_str(&intent)?,
+                        projection: projection
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        submission_attempt_id,
+                        submitted_at,
+                        submission_cursor,
+                    })
+                },
+            )
+            .transpose()?;
+        Self::commit(transaction, fail_commit)?;
+        Ok(existing)
+    }
 
     #[cfg(test)]
     pub(crate) fn backdate_event_cursor(&mut self, seconds: i64) -> Result<(), StoreError> {
@@ -1808,11 +1917,11 @@ impl Store {
         )?;
         Ok(())
     }
-
     /// Persists a durable operation's initial intent, before any unsafe
-    /// network transmission is attempted. `target_*` are `None` for
-    /// operations with no single affected entity (for example, marking
-    /// messages read).
+    /// network transmission is attempted. Duplicate IDs are rejected; callers
+    /// that need idempotent insertion must use `record_operation_if_absent`.
+    /// `target_*` are `None` for operations with no single affected entity
+    /// (for example, marking messages read).
     pub(crate) fn record_operation(
         &mut self,
         operation_id: &str,
@@ -1823,8 +1932,15 @@ impl Store {
         intent: &Value,
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO operation_journal(operation_id, state, target_realm, target_kind, target_id, intent_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) ON CONFLICT(operation_id) DO UPDATE SET state = excluded.state, target_realm = excluded.target_realm, target_kind = excluded.target_kind, target_id = excluded.target_id, intent_json = excluded.intent_json, updated_at = excluded.updated_at",
-            params![operation_id, state, target_realm, target_kind, target_id, serde_json::to_string(intent)?],
+            "INSERT INTO operation_journal(operation_id, state, target_realm, target_kind, target_id, intent_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+            params![
+                operation_id,
+                state,
+                target_realm,
+                target_kind,
+                target_id,
+                serde_json::to_string(intent)?
+            ],
         )?;
         Ok(())
     }
@@ -4794,6 +4910,8 @@ mod tests {
                 device_type: Some(DeviceType::from("miner")),
                 status: Some(DeviceStatus::from("idle")),
                 location: None,
+                deployed_at: None,
+                in_control_range: None,
                 features: Vec::new(),
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),

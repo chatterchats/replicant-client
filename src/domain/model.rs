@@ -110,6 +110,19 @@ pub struct Device {
     pub device_type: Option<DeviceType>,
     pub status: Option<DeviceStatus>,
     pub location: Option<LocationKey>,
+    /// Timestamp at which the device was deployed, when the authoritative
+    /// device status includes one.
+    ///
+    /// `None` means the deployment timestamp was not reported; it must not be
+    /// interpreted as evidence that the device was never deployed.
+    #[serde(default)]
+    pub deployed_at: Option<String>,
+    /// Whether the device is currently within range of its controller.
+    ///
+    /// `None` means the control-range fact was not reported. This is retained
+    /// as unknown rather than inferred from the device's relationships.
+    #[serde(default)]
+    pub in_control_range: Option<bool>,
     pub features: Vec<DeviceFeature>,
     pub available_commands: Vec<DeviceCommand>,
     pub available_directives: Vec<DeviceDirective>,
