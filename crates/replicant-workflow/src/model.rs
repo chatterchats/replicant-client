@@ -1,9 +1,13 @@
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::RepositoryError;
+use crate::{RepositoryError, work::WorkItemId};
 
 /// Persisted global automation safety policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -327,6 +331,412 @@ pub enum WorkflowStatus {
     Failed,
     /// Cooperatively cancelled.
     Cancelled,
+}
+/// A structural description of a durable service capability requested or
+/// established by a workflow.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkflowServiceIntent {
+    /// Stable service identifier (for example, an integration-owned literal).
+    pub service: String,
+    /// Exact dimensions that identify the service operation.
+    pub dimensions: BTreeMap<String, String>,
+}
+
+impl WorkflowServiceIntent {
+    /// Creates a structural service intent from a service and dimensions.
+    #[must_use]
+    pub fn new(service: impl Into<String>, dimensions: BTreeMap<String, String>) -> Self {
+        Self {
+            service: service.into(),
+            dimensions,
+        }
+    }
+}
+
+/// Scope whose service coverage may be unknown.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum WorkflowServiceScope {
+    /// Coverage is unknown for every service target.
+    Global,
+    /// Coverage is unknown within one canonical region.
+    Region(String),
+    /// Coverage is unknown within one canonical system.
+    System(String),
+}
+
+impl WorkflowServiceScope {
+    /// Canonicalizes a scope identity for deterministic matching.
+    #[must_use]
+    pub fn canonical(self) -> Self {
+        match self {
+            Self::Global => Self::Global,
+            Self::Region(value) => Self::Region(canonical_scope_value(&value)),
+            Self::System(value) => Self::System(canonical_scope_value(&value)),
+        }
+    }
+}
+
+/// Completeness of a workflow's service-intent projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowServiceIntentCoverage {
+    /// This workflow does not provide a service projection.
+    #[default]
+    NotApplicable,
+    /// All service evidence supported by the workflow was decoded.
+    Complete,
+    /// At least one service scope could not be decoded safely.
+    Unknown,
+}
+
+/// Typed service evidence projected from one workflow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowServiceIntentProjection {
+    /// Whether this workflow's service evidence is complete.
+    pub coverage: WorkflowServiceIntentCoverage,
+    /// Exact service intents decoded from durable state.
+    pub intents: Vec<WorkflowServiceIntent>,
+    /// Scopes where service coverage remains unknown.
+    pub unknown_scopes: BTreeSet<WorkflowServiceScope>,
+}
+
+impl WorkflowServiceIntentProjection {
+    /// Creates a projection for a workflow that does not provide a service.
+    #[must_use]
+    pub const fn not_applicable() -> Self {
+        Self {
+            coverage: WorkflowServiceIntentCoverage::NotApplicable,
+            intents: Vec::new(),
+            unknown_scopes: BTreeSet::new(),
+        }
+    }
+
+    /// Creates a complete exact-intent projection.
+    #[must_use]
+    pub fn complete(intents: Vec<WorkflowServiceIntent>) -> Self {
+        Self {
+            coverage: WorkflowServiceIntentCoverage::Complete,
+            intents,
+            unknown_scopes: BTreeSet::new(),
+        }
+    }
+
+    /// Creates an unknown projection scoped to the supplied identities.
+    #[must_use]
+    pub fn unknown(unknown_scopes: impl IntoIterator<Item = WorkflowServiceScope>) -> Self {
+        Self {
+            coverage: WorkflowServiceIntentCoverage::Unknown,
+            intents: Vec::new(),
+            unknown_scopes: unknown_scopes.into_iter().collect(),
+        }
+    }
+}
+
+impl Default for WorkflowServiceIntentProjection {
+    fn default() -> Self {
+        Self::not_applicable()
+    }
+}
+
+/// Service evidence retained with its durable workflow provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowServiceIntentEvidence {
+    /// Workflow producing this evidence.
+    pub workflow_id: WorkflowId,
+    /// Registered workflow kind producing this evidence.
+    pub workflow_kind: WorkflowKind,
+    /// Live lifecycle status when evidence was projected.
+    pub workflow_status: WorkflowStatus,
+    /// Exact intents decoded from the workflow.
+    pub intents: Vec<WorkflowServiceIntent>,
+    /// Scopes where the workflow's service evidence is unknown.
+    pub unknown_scopes: BTreeSet<WorkflowServiceScope>,
+}
+
+/// Live service-intent evidence from all registered workflow instances.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowServiceIntentSnapshot {
+    /// Evidence from live workflows only.
+    pub live: Vec<WorkflowServiceIntentEvidence>,
+}
+
+/// Result of querying one exact service intent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkflowServiceIntentState {
+    /// One or more live workflows project the exact intent.
+    Present(Vec<WorkflowId>),
+    /// No live workflow projects the intent or applicable unknown scope.
+    Absent,
+    /// Applicable live workflows have unresolved service coverage.
+    Unknown(Vec<WorkflowId>),
+}
+
+impl WorkflowServiceIntentSnapshot {
+    /// Returns the exact service state for a target and optional scope.
+    ///
+    /// Exact `Present` evidence always wins over unknown evidence. Region and
+    /// system names are compared after trimming and lowercasing, matching the
+    /// canonical scope identity used by runtime integrations.
+    #[must_use]
+    pub fn state_for(
+        &self,
+        target: &WorkflowServiceIntent,
+        region: Option<&str>,
+        system: Option<&str>,
+    ) -> WorkflowServiceIntentState {
+        let mut present = Vec::new();
+        let mut unknown = Vec::new();
+        for evidence in &self.live {
+            if evidence.intents.iter().any(|intent| intent == target) {
+                present.push(evidence.workflow_id);
+                continue;
+            }
+            if evidence
+                .unknown_scopes
+                .iter()
+                .any(|scope| scope_applies(scope, region, system))
+            {
+                unknown.push(evidence.workflow_id);
+            }
+        }
+        present.sort();
+        present.dedup();
+        if !present.is_empty() {
+            return WorkflowServiceIntentState::Present(present);
+        }
+        unknown.sort();
+        unknown.dedup();
+        if unknown.is_empty() {
+            WorkflowServiceIntentState::Absent
+        } else {
+            WorkflowServiceIntentState::Unknown(unknown)
+        }
+    }
+}
+
+fn canonical_scope_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn scope_applies(scope: &WorkflowServiceScope, region: Option<&str>, system: Option<&str>) -> bool {
+    match scope {
+        WorkflowServiceScope::Global => true,
+        WorkflowServiceScope::Region(value) => region
+            .is_some_and(|target| canonical_scope_value(value) == canonical_scope_value(target)),
+        WorkflowServiceScope::System(value) => system
+            .is_some_and(|target| canonical_scope_value(value) == canonical_scope_value(target)),
+    }
+}
+
+/// Subject of a workflow placement intent.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum WorkflowPlacementIntentSubject {
+    /// Exact device code.
+    Device(String),
+    /// Exact whole-device reservation tag.
+    DeviceTag(String),
+}
+
+/// Canonicalizes a device code at workflow placement snapshot boundaries.
+///
+/// Device codes are compared case-insensitively and tolerate surrounding
+/// whitespace in upstream evidence. Tags intentionally do not use this helper:
+/// they remain exact, whole-tag, case-sensitive values.
+pub(crate) fn canonical_device_code(code: &str) -> String {
+    code.trim().to_ascii_uppercase()
+}
+
+/// Physical relation asserted by a workflow placement intent.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPlacementIntentRelation {
+    /// The workflow has claimed the device.
+    Claimed,
+    /// The device has been staged for workflow work.
+    Staged,
+    /// The device is being transported by the workflow.
+    Transported,
+    /// The device is awaited by the workflow.
+    Awaited,
+    /// The workflow deployed the device at an exact location.
+    Deployed,
+}
+
+/// Completeness of a factory's typed placement projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPlacementIntentCoverage {
+    /// All supported placement evidence was decoded.
+    Complete,
+    /// The factory cannot safely decode all placement evidence.
+    #[default]
+    Unknown,
+}
+
+/// Durable provenance for a placement assertion.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkflowPlacementProvenance {
+    /// Workflow that produced the evidence.
+    pub workflow_id: WorkflowId,
+    /// Optional exact work item that produced the evidence.
+    pub work_item_id: Option<WorkItemId>,
+}
+
+/// Resolution of one exact failed placement episode.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkflowPlacementResolution {
+    /// Device whose failed episode was resolved.
+    pub device_code: String,
+    /// Failed workflow provenance being resolved.
+    pub provenance: WorkflowPlacementProvenance,
+}
+
+/// One typed placement assertion emitted by a workflow factory.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct WorkflowPlacementIntent {
+    /// Exact device or whole reservation tag covered by the intent.
+    pub subject: WorkflowPlacementIntentSubject,
+    /// Physical relation asserted by the workflow.
+    pub relation: WorkflowPlacementIntentRelation,
+    /// Optional exact work item producing this intent.
+    pub work_item_id: Option<WorkItemId>,
+    /// Exact expected location for a deployed device.
+    pub expected_location: Option<String>,
+}
+
+/// Typed placement evidence projected from one persisted workflow.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowPlacementIntentProjection {
+    /// Whether all supported evidence was decoded.
+    pub coverage: WorkflowPlacementIntentCoverage,
+    /// Current and retained placement assertions.
+    pub intents: Vec<WorkflowPlacementIntent>,
+    /// Exact failed episodes resolved by this workflow.
+    pub resolutions: Vec<WorkflowPlacementResolution>,
+}
+
+impl WorkflowPlacementIntentProjection {
+    /// Returns the safe default for a factory without a typed projector.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            coverage: WorkflowPlacementIntentCoverage::Unknown,
+            intents: Vec::new(),
+            resolutions: Vec::new(),
+        }
+    }
+}
+
+impl Default for WorkflowPlacementIntentProjection {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+/// Placement evidence with its durable workflow provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowPlacementIntentEvidence {
+    /// Workflow producing this evidence.
+    pub workflow_id: WorkflowId,
+    /// Registered kind producing this evidence.
+    pub workflow_kind: WorkflowKind,
+    /// Lifecycle status when evidence was retained.
+    pub workflow_status: WorkflowStatus,
+    /// Typed placement assertion.
+    pub intent: WorkflowPlacementIntent,
+}
+
+/// All workflow-derived placement evidence relevant to one device.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowPlacementEvidence {
+    /// Evidence from live workflows.
+    pub live: Vec<WorkflowPlacementIntentEvidence>,
+    /// Succeeded exact deployed placements.
+    pub settled_placements: Vec<WorkflowPlacementIntentEvidence>,
+    /// Custody left by succeeded or cancelled workflows.
+    pub terminal_residuals: Vec<WorkflowPlacementIntentEvidence>,
+    /// Unresolved transient custody from failed workflows.
+    pub failed_transient: Vec<WorkflowPlacementIntentEvidence>,
+    /// Failed evidence removed by an exact succeeded resolution.
+    pub resolved_transient: Vec<WorkflowPlacementIntentEvidence>,
+    /// Live workflows whose placement evidence is not typed.
+    pub unknown_live_workflows: Vec<WorkflowId>,
+    /// Succeeded/cancelled workflows whose placement evidence is not typed.
+    pub unknown_terminal_outcomes: Vec<WorkflowId>,
+}
+
+/// Derived, on-demand placement evidence for all device codes and tags.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowPlacementIntentSnapshot {
+    /// Typed live workflow evidence.
+    pub live: Vec<WorkflowPlacementIntentEvidence>,
+    /// Typed succeeded deployed placement evidence.
+    pub settled_placements: Vec<WorkflowPlacementIntentEvidence>,
+    /// Typed terminal residual custody evidence.
+    pub terminal_residuals: Vec<WorkflowPlacementIntentEvidence>,
+    /// Typed failed transient custody evidence.
+    pub failed_transient: Vec<WorkflowPlacementIntentEvidence>,
+    /// Failed evidence removed by an exact succeeded resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_transient: Vec<WorkflowPlacementIntentEvidence>,
+    /// Typed failed evidence resolutions.
+    pub resolutions: Vec<WorkflowPlacementResolution>,
+    /// Live workflows with unknown placement coverage.
+    pub unknown_live_workflows: Vec<WorkflowId>,
+    /// Terminal workflows with unknown placement coverage.
+    pub unknown_terminal_outcomes: Vec<WorkflowId>,
+}
+
+impl WorkflowPlacementIntentSnapshot {
+    /// Explains workflow placement evidence matching a device code or exact tag.
+    #[must_use]
+    pub fn explain_device(&self, code: &str, tags: &[String]) -> WorkflowPlacementEvidence {
+        let canonical_code = canonical_device_code(code);
+        let matches = |evidence: &WorkflowPlacementIntentEvidence| match &evidence.intent.subject {
+            WorkflowPlacementIntentSubject::Device(subject) => {
+                canonical_device_code(subject) == canonical_code
+            }
+            WorkflowPlacementIntentSubject::DeviceTag(tag) => {
+                tags.iter().any(|candidate| candidate == tag)
+            }
+        };
+        WorkflowPlacementEvidence {
+            live: self
+                .live
+                .iter()
+                .filter(|item| matches(item))
+                .cloned()
+                .collect(),
+            settled_placements: self
+                .settled_placements
+                .iter()
+                .filter(|item| matches(item))
+                .cloned()
+                .collect(),
+            terminal_residuals: self
+                .terminal_residuals
+                .iter()
+                .filter(|item| matches(item))
+                .cloned()
+                .collect(),
+            failed_transient: self
+                .failed_transient
+                .iter()
+                .filter(|item| matches(item))
+                .cloned()
+                .collect(),
+            resolved_transient: self
+                .resolved_transient
+                .iter()
+                .filter(|item| matches(item))
+                .cloned()
+                .collect(),
+            unknown_live_workflows: self.unknown_live_workflows.clone(),
+            unknown_terminal_outcomes: self.unknown_terminal_outcomes.clone(),
+        }
+    }
 }
 
 /// Director retry policy for a terminal workflow failure.
@@ -754,7 +1164,37 @@ impl fmt::Debug for WorkflowInstance {
 
 #[cfg(test)]
 mod tests {
-    use super::WaitIntent;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        WaitIntent, WorkflowId, WorkflowKind, WorkflowServiceIntent, WorkflowServiceIntentEvidence,
+        WorkflowServiceIntentSnapshot, WorkflowServiceIntentState, WorkflowServiceScope,
+        WorkflowStatus,
+    };
+
+    fn intent(collect: &str) -> WorkflowServiceIntent {
+        WorkflowServiceIntent {
+            service: "service".to_owned(),
+            dimensions: BTreeMap::from([
+                ("collect".to_owned(), collect.to_owned()),
+                ("deliver".to_owned(), "hub".to_owned()),
+            ]),
+        }
+    }
+
+    fn evidence(
+        id: WorkflowId,
+        intents: Vec<WorkflowServiceIntent>,
+        unknown_scopes: BTreeSet<WorkflowServiceScope>,
+    ) -> WorkflowServiceIntentEvidence {
+        WorkflowServiceIntentEvidence {
+            workflow_id: id,
+            workflow_kind: WorkflowKind::new("test.service").expect("kind"),
+            workflow_status: WorkflowStatus::Running,
+            intents,
+            unknown_scopes,
+        }
+    }
 
     #[test]
     fn old_wait_intent_json_remains_compatible() {
@@ -766,5 +1206,35 @@ mod tests {
         assert_eq!(wait.device_code.as_deref(), Some("D1"));
         assert!(wait.device_codes.is_empty());
         assert_eq!(wait.poll_interval_millis, None);
+    }
+
+    #[test]
+    fn service_state_prefers_exact_intents_and_matches_scopes_canonically() {
+        let exact_id = WorkflowId::new();
+        let unknown_id = WorkflowId::new();
+        let target = intent("belt-1");
+        let snapshot = WorkflowServiceIntentSnapshot {
+            live: vec![
+                evidence(
+                    unknown_id,
+                    Vec::new(),
+                    BTreeSet::from([WorkflowServiceScope::Region(" Alpha ".to_owned())]),
+                ),
+                evidence(exact_id, vec![target.clone()], BTreeSet::new()),
+            ],
+        };
+
+        assert_eq!(
+            snapshot.state_for(&target, Some("alpha"), Some("system")),
+            WorkflowServiceIntentState::Present(vec![exact_id])
+        );
+        assert_eq!(
+            snapshot.state_for(&intent("other"), Some(" ALPHA "), None),
+            WorkflowServiceIntentState::Unknown(vec![unknown_id])
+        );
+        assert_eq!(
+            snapshot.state_for(&intent("other"), Some("beta"), None),
+            WorkflowServiceIntentState::Absent
+        );
     }
 }

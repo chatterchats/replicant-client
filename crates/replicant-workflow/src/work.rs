@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{WorkflowId, WorkflowKind, WorkflowStatus};
 
 /// Stable identifier for a persisted workflow work item.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkItemId(Uuid);
 

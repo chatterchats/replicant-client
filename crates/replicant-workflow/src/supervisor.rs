@@ -63,6 +63,7 @@ pub enum ControlRequest {
 /// Persisted context for one executor invocation.
 pub struct WorkflowContext {
     repository: Arc<WorkflowRepository>,
+    registry: Arc<WorkflowRegistry>,
     instance: WorkflowInstance,
     client: Option<Client>,
     control: watch::Receiver<ControlRequest>,
@@ -72,6 +73,7 @@ pub struct WorkflowContext {
 impl WorkflowContext {
     fn new(
         repository: Arc<WorkflowRepository>,
+        registry: Arc<WorkflowRegistry>,
         instance: WorkflowInstance,
         client: Option<Client>,
         control: watch::Receiver<ControlRequest>,
@@ -79,6 +81,7 @@ impl WorkflowContext {
     ) -> Self {
         Self {
             repository,
+            registry,
             instance,
             client,
             control,
@@ -118,6 +121,12 @@ impl WorkflowContext {
     #[must_use]
     pub fn repository_handle(&self) -> Arc<WorkflowRepository> {
         self.repository.clone()
+    }
+
+    /// Returns the registry used to resolve this workflow's factories.
+    #[must_use]
+    pub fn workflow_registry(&self) -> &WorkflowRegistry {
+        &self.registry
     }
 
     /// Persists a child workflow owned by this orchestration.
@@ -822,6 +831,7 @@ impl WorkflowSupervisor {
                 None => {
                     let result = WorkflowContext::new(
                         self.repository.clone(),
+                        self.registry.clone(),
                         instance,
                         self.client.clone(),
                         control,
@@ -836,6 +846,7 @@ impl WorkflowSupervisor {
             Err(error) => {
                 let result = WorkflowContext::new(
                     self.repository.clone(),
+                    self.registry.clone(),
                     instance,
                     self.client.clone(),
                     control,
@@ -868,10 +879,17 @@ impl WorkflowSupervisor {
         let repository = self.repository.clone();
         let client = self.client.clone();
         let telemetry = self.telemetry.clone();
+        let registry = self.registry.clone();
         let task = tokio::spawn(async move {
             let executor_started = std::time::Instant::now();
-            let mut context =
-                WorkflowContext::new(repository, instance, client, control, telemetry.clone());
+            let mut context = WorkflowContext::new(
+                repository,
+                registry,
+                instance,
+                client,
+                control,
+                telemetry.clone(),
+            );
             if let Err(error) = executor.execute(&mut context).await {
                 tracing::error!(
                     workflow_id = %id,
@@ -928,6 +946,7 @@ impl WorkflowSupervisor {
         let (_, control) = watch::channel(ControlRequest::Continue);
         WorkflowContext::new(
             self.repository.clone(),
+            self.registry.clone(),
             instance,
             self.client.clone(),
             control,
@@ -968,6 +987,7 @@ impl WorkflowSupervisor {
                     let (_, control) = watch::channel(ControlRequest::Continue);
                     let mut context = WorkflowContext::new(
                         self.repository.clone(),
+                        self.registry.clone(),
                         instance,
                         self.client.clone(),
                         control,

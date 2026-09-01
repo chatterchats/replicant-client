@@ -22,7 +22,14 @@ pub use model::{
     FiniteExecutionClass, FiniteExecutionStatus, NewTrigger, NewWorkflow, ResourceClaim,
     ResourceKey, TriggerCondition, TriggerId, TriggerState, TriggerTarget, TriggerTargetClass,
     WaitIntent, WaitOutcome, WaitSignal, WorkflowActivity, WorkflowFailureDisposition, WorkflowId,
-    WorkflowInstance, WorkflowKind, WorkflowState, WorkflowStatus, WorkflowSummary,
+    WorkflowInstance, WorkflowKind, WorkflowPlacementEvidence, WorkflowPlacementIntent,
+    WorkflowPlacementIntentCoverage, WorkflowPlacementIntentEvidence,
+    WorkflowPlacementIntentProjection, WorkflowPlacementIntentRelation,
+    WorkflowPlacementIntentSnapshot, WorkflowPlacementIntentSubject, WorkflowPlacementProvenance,
+    WorkflowPlacementResolution, WorkflowServiceIntent, WorkflowServiceIntentCoverage,
+    WorkflowServiceIntentEvidence, WorkflowServiceIntentProjection, WorkflowServiceIntentSnapshot,
+    WorkflowServiceIntentState, WorkflowServiceScope, WorkflowState, WorkflowStatus,
+    WorkflowSummary,
 };
 pub use registry::{RegistryError, WorkflowFactory, WorkflowMigration, WorkflowRegistry};
 pub use repository::{CreateOrReuseWorkflow, RepositoryError, WorkflowRepository};

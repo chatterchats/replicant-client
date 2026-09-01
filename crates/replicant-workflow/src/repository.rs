@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     ops::{Deref, DerefMut},
     path::Path,
@@ -55,6 +55,9 @@ pub enum RepositoryError {
     /// Typed payload serialization or deserialization failed.
     #[error("workflow payload serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// A transactional active-workflow compatibility check could not prove safe reuse.
+    #[error("workflow compatibility check failed: {0}")]
+    Compatibility(String),
     /// A stable workflow kind was malformed.
     #[error("invalid workflow kind {0:?}")]
     InvalidKind(String),
@@ -1460,6 +1463,44 @@ impl WorkflowRepository {
         list_work_items_in(&connection, workflow_id)
     }
 
+    /// Lists work items for several workflows with one deterministic query.
+    ///
+    /// The result is grouped by owning workflow, avoiding one SQLite query per
+    /// workflow during placement-intent projection.
+    pub fn list_work_items_for_workflows(
+        &self,
+        workflow_ids: &[WorkflowId],
+    ) -> Result<BTreeMap<WorkflowId, Vec<WorkItem>>, RepositoryError> {
+        let mut grouped = workflow_ids
+            .iter()
+            .copied()
+            .map(|id| (id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        if workflow_ids.is_empty() {
+            return Ok(grouped);
+        }
+        let connection = self.connection()?;
+        let placeholders = std::iter::repeat_n("?", workflow_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {WORK_ITEM_COLUMNS} FROM workflow_work_items \
+             WHERE workflow_id IN ({placeholders}) \
+             ORDER BY workflow_id, sort_key, id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let params = workflow_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let rows = statement.query_map(rusqlite::params_from_iter(params), row_to_work_item)?;
+        for row in rows {
+            let item = row?;
+            grouped.entry(item.spec.workflow_id).or_default().push(item);
+        }
+        Ok(grouped)
+    }
+
     /// Lists all execution attempts for one work item by ordinal.
     pub fn list_work_item_attempts(
         &self,
@@ -1774,6 +1815,22 @@ impl WorkflowRepository {
         expected_revision: u64,
         candidates: &[AllocationCandidate],
     ) -> Result<AllocationSet, RepositoryError> {
+        self.allocate_requirements_with_affinity(item_id, expected_revision, candidates, &[])
+    }
+
+    /// Atomically allocates every stored item requirement while enforcing
+    /// caller-supplied same-resource-key affinity between requirement pairs.
+    ///
+    /// Affinity is execution policy rather than persisted work-item schema so
+    /// callers can strengthen allocation safety without invalidating durable
+    /// work items created by older runtime versions.
+    pub fn allocate_requirements_with_affinity(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+        affinities: &[(&str, &str)],
+    ) -> Result<AllocationSet, RepositoryError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let item = read_work_item_in(&transaction, item_id)?
@@ -1836,15 +1893,93 @@ impl WorkflowRepository {
             )?;
         }
 
-        for requirement in requirements {
+        for requirement in &requirements {
             let mut selected = allocation_set
                 .by_requirement
                 .remove(&requirement.key)
                 .unwrap_or_default();
+            if affinities
+                .iter()
+                .any(|(_, parent)| *parent == requirement.key.as_str())
+            {
+                let mut retained = Vec::with_capacity(selected.len());
+                for allocation in selected {
+                    let still_usable = if let Some(candidate) = ordered_candidates
+                        .iter()
+                        .find(|candidate| candidate.resource == allocation.resource)
+                    {
+                        candidate_matches_requirement(candidate, requirement)
+                            && candidate_supports_affined_dependents(
+                                &transaction,
+                                candidate,
+                                requirement,
+                                &requirements,
+                                &ordered_candidates,
+                                &allocation_set,
+                                item.spec.workflow_id,
+                                affinities,
+                            )?
+                    } else {
+                        false
+                    };
+                    if still_usable {
+                        retained.push(allocation);
+                    } else {
+                        release_active_allocation_in(
+                            &transaction,
+                            item.spec.workflow_id,
+                            &allocation,
+                            item.state.updated_at_ms,
+                        )?;
+                    }
+                }
+                selected = retained;
+            }
+            if let Some(parent_requirement) = affinity_parent(&requirement.key, affinities) {
+                let allowed_keys = allocation_set
+                    .by_requirement
+                    .get(parent_requirement)
+                    .into_iter()
+                    .flatten()
+                    .map(|allocation| resource_identity_key(&allocation.resource))
+                    .collect::<BTreeSet<_>>();
+                let mut retained = Vec::with_capacity(selected.len());
+                for allocation in selected {
+                    if allowed_keys.contains(resource_identity_key(&allocation.resource)) {
+                        retained.push(allocation);
+                        continue;
+                    }
+                    release_active_allocation_in(
+                        &transaction,
+                        item.spec.workflow_id,
+                        &allocation,
+                        item.state.updated_at_ms,
+                    )?;
+                }
+                selected = retained;
+            }
             for candidate in &ordered_candidates {
                 if selected.len() >= usize::try_from(requirement.count).unwrap_or(usize::MAX)
-                    || !candidate_matches_requirement(candidate, &requirement)
+                    || !candidate_matches_requirement(candidate, requirement)
+                    || !candidate_matches_affinity(
+                        candidate,
+                        &requirement.key,
+                        affinities,
+                        &allocation_set,
+                    )
                 {
+                    continue;
+                }
+                if !candidate_supports_affined_dependents(
+                    &transaction,
+                    candidate,
+                    requirement,
+                    &requirements,
+                    &ordered_candidates,
+                    &allocation_set,
+                    item.spec.workflow_id,
+                    affinities,
+                )? {
                     continue;
                 }
                 let pool_key = serde_json::to_string(&candidate.resource)?;
@@ -1870,6 +2005,21 @@ impl WorkflowRepository {
                     continue;
                 }
                 let (namespace, key) = candidate.resource.persisted_parts()?;
+                if namespace == "replicant" {
+                    let has_active_assignment: bool = transaction.query_row(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM workflow_assignments
+                            WHERE worker_namespace = ?1
+                              AND worker_key = ?2
+                              AND state != 'released'
+                         )",
+                        params![namespace, key],
+                        |row| row.get(0),
+                    )?;
+                    if has_active_assignment {
+                        continue;
+                    }
+                }
                 if is_exclusive_namespace(&namespace) {
                     let claim_owner = transaction
                         .query_row(
@@ -1901,7 +2051,7 @@ impl WorkflowRepository {
                     params![
                         allocation.id.to_string(),
                         item_id.to_string(),
-                        requirement.key,
+                        requirement.key.as_str(),
                         pool_key,
                         namespace,
                         key,
@@ -1930,13 +2080,13 @@ impl WorkflowRepository {
             let selected_count = u32::try_from(selected.len()).unwrap_or(u32::MAX);
             if selected_count < requirement.count {
                 return Err(RepositoryError::AllocationShortage {
-                    requirement_key: requirement.key,
+                    requirement_key: requirement.key.clone(),
                     missing_count: requirement.count - selected_count,
                 });
             }
             allocation_set
                 .by_requirement
-                .insert(requirement.key, selected);
+                .insert(requirement.key.clone(), selected);
         }
         transaction.commit()?;
         Ok(allocation_set)
@@ -1949,6 +2099,19 @@ impl WorkflowRepository {
         allocation_id: AllocationId,
         candidates: &[AllocationCandidate],
         now_ms: i64,
+    ) -> Result<ReplacementOutcome, RepositoryError> {
+        self.replace_dead_allocation_with_affinity(item_id, allocation_id, candidates, now_ms, &[])
+    }
+
+    /// Replaces one missing allocation while preserving caller-supplied
+    /// same-resource-key affinity between requirement pairs.
+    pub fn replace_dead_allocation_with_affinity(
+        &self,
+        item_id: WorkItemId,
+        allocation_id: AllocationId,
+        candidates: &[AllocationCandidate],
+        now_ms: i64,
+        affinities: &[(&str, &str)],
     ) -> Result<ReplacementOutcome, RepositoryError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1971,15 +2134,16 @@ impl WorkflowRepository {
             )
             .optional()?
             .ok_or(RepositoryError::WorkItemNotFound(item_id))?;
-        let requirement: ResourceRequirement = serde_json::from_value::<Vec<ResourceRequirement>>(
-            item.spec.requirements_json.clone(),
-        )?
-        .into_iter()
-        .find(|requirement| requirement.key == requirement_key)
-        .ok_or_else(|| RepositoryError::AllocationShortage {
-            requirement_key: requirement_key.clone(),
-            missing_count: 1,
-        })?;
+        let requirements: Vec<ResourceRequirement> =
+            serde_json::from_value(item.spec.requirements_json.clone())?;
+        let requirement = requirements
+            .iter()
+            .find(|requirement| requirement.key == requirement_key)
+            .cloned()
+            .ok_or_else(|| RepositoryError::AllocationShortage {
+                requirement_key: requirement_key.clone(),
+                missing_count: 1,
+            })?;
         transaction.execute(
             "UPDATE workflow_resource_allocations
              SET state = 'dead', updated_at_ms = ?2 WHERE id = ?1",
@@ -1993,17 +2157,35 @@ impl WorkflowRepository {
             )?;
         }
 
+        let active_allocations = list_active_allocations_in(&transaction, item_id)?;
         let mut eligible_owned = false;
         let mut ordered = candidates.to_vec();
         ordered.sort_by(|left, right| {
             resource_sort_key(&left.resource).cmp(&resource_sort_key(&right.resource))
         });
-        for candidate in ordered {
-            if !candidate_matches_kind_capabilities(&candidate, &requirement) {
+        for candidate in &ordered {
+            if !candidate_matches_kind_capabilities(candidate, &requirement) {
                 continue;
             }
             eligible_owned = true;
-            if !candidate_matches_scope(&candidate, &requirement.scope) {
+            if !candidate_matches_scope(candidate, &requirement.scope)
+                || !candidate_matches_affinity(
+                    candidate,
+                    &requirement.key,
+                    affinities,
+                    &active_allocations,
+                )
+                || !candidate_supports_affined_dependents(
+                    &transaction,
+                    candidate,
+                    &requirement,
+                    &requirements,
+                    &ordered,
+                    &active_allocations,
+                    item.spec.workflow_id,
+                    affinities,
+                )?
+            {
                 continue;
             }
             let (namespace, key) = candidate.resource.persisted_parts()?;
@@ -2022,6 +2204,21 @@ impl WorkflowRepository {
             let available = i64::try_from(candidate.available_quantity).unwrap_or(i64::MAX);
             if available.saturating_sub(active_quantity) < quantity {
                 continue;
+            }
+            if namespace == "replicant" {
+                let has_active_assignment: bool = transaction.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM workflow_assignments
+                        WHERE worker_namespace = ?1
+                          AND worker_key = ?2
+                          AND state != 'released'
+                     )",
+                    params![namespace, key],
+                    |row| row.get(0),
+                )?;
+                if has_active_assignment {
+                    continue;
+                }
             }
             if is_exclusive_namespace(&namespace) {
                 let claim_owner = transaction
@@ -2612,6 +2809,157 @@ fn resource_sort_key(resource: &ResourceKey) -> String {
     serde_json::to_string(resource).unwrap_or_default()
 }
 
+fn release_active_allocation_in(
+    transaction: &rusqlite::Transaction<'_>,
+    workflow_id: WorkflowId,
+    allocation: &ResourceAllocation,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    let (namespace, key) = allocation.resource.persisted_parts()?;
+    transaction.execute(
+        "UPDATE workflow_resource_allocations
+         SET state = 'released', updated_at_ms = ?2
+         WHERE id = ?1 AND state = 'active'",
+        params![allocation.id.to_string(), now_ms],
+    )?;
+    if is_exclusive_namespace(&namespace) {
+        transaction.execute(
+            "DELETE FROM workflow_resource_claims
+             WHERE workflow_id = ?1
+               AND resource_namespace = ?2
+               AND resource_key = ?3
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM workflow_resource_allocations allocation
+                 JOIN workflow_work_items item ON item.id = allocation.item_id
+                 WHERE item.workflow_id = ?1
+                   AND allocation.state = 'active'
+                   AND allocation.resource_namespace = ?2
+                   AND allocation.resource_key = ?3
+               )",
+            params![workflow_id.to_string(), namespace, key],
+        )?;
+    }
+    Ok(())
+}
+
+fn affinity_parent<'a>(requirement_key: &str, affinities: &'a [(&str, &str)]) -> Option<&'a str> {
+    affinities
+        .iter()
+        .find_map(|(dependent, parent)| (*dependent == requirement_key).then_some(*parent))
+}
+
+fn candidate_matches_affinity(
+    candidate: &AllocationCandidate,
+    requirement_key: &str,
+    affinities: &[(&str, &str)],
+    allocations: &AllocationSet,
+) -> bool {
+    let Some(parent_requirement) = affinity_parent(requirement_key, affinities) else {
+        return true;
+    };
+    let candidate_key = resource_identity_key(&candidate.resource);
+    allocations
+        .by_requirement
+        .get(parent_requirement)
+        .is_some_and(|selected| {
+            selected
+                .iter()
+                .any(|allocation| resource_identity_key(&allocation.resource) == candidate_key)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn candidate_supports_affined_dependents(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: &AllocationCandidate,
+    parent_requirement: &ResourceRequirement,
+    requirements: &[ResourceRequirement],
+    candidates: &[AllocationCandidate],
+    allocations: &AllocationSet,
+    workflow_id: WorkflowId,
+    affinities: &[(&str, &str)],
+) -> Result<bool, RepositoryError> {
+    let candidate_identity = resource_identity_key(&candidate.resource);
+    for dependent in requirements.iter().filter(|requirement| {
+        affinity_parent(&requirement.key, affinities) == Some(parent_requirement.key.as_str())
+    }) {
+        let existing_count = allocations
+            .by_requirement
+            .get(&dependent.key)
+            .into_iter()
+            .flatten()
+            .filter(|allocation| resource_identity_key(&allocation.resource) == candidate_identity)
+            .count();
+        if existing_count >= usize::try_from(dependent.count).unwrap_or(usize::MAX) {
+            continue;
+        }
+
+        let requested_quantity = i64::try_from(dependent.quantity).map_err(|_| {
+            RepositoryError::InvalidStoredWorkItemCount {
+                field: "required quantity",
+                value: i64::MAX,
+            }
+        })?;
+        let mut eligible = 0usize;
+        for dependent_candidate in candidates {
+            if resource_identity_key(&dependent_candidate.resource) != candidate_identity
+                || !candidate_matches_requirement(dependent_candidate, dependent)
+            {
+                continue;
+            }
+            let pool_key = serde_json::to_string(&dependent_candidate.resource)?;
+            let active_quantity: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(quantity), 0)
+                 FROM workflow_resource_allocations
+                 WHERE pool_key = ?1 AND state = 'active'",
+                [&pool_key],
+                |row| row.get(0),
+            )?;
+            let available_quantity =
+                i64::try_from(dependent_candidate.available_quantity).unwrap_or(i64::MAX);
+            if available_quantity.saturating_sub(active_quantity) < requested_quantity {
+                continue;
+            }
+            let (namespace, key) = dependent_candidate.resource.persisted_parts()?;
+            if is_exclusive_namespace(&namespace) {
+                let claim_owner = transaction
+                    .query_row(
+                        "SELECT workflow_id FROM workflow_resource_claims
+                         WHERE resource_namespace = ?1 AND resource_key = ?2",
+                        params![namespace, key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if claim_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner != workflow_id.to_string())
+                {
+                    continue;
+                }
+            }
+            eligible = eligible.saturating_add(1);
+        }
+
+        let needed = usize::try_from(dependent.count)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(existing_count);
+        if eligible < needed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn resource_identity_key(resource: &ResourceKey) -> &str {
+    match resource {
+        ResourceKey::Replicant(key) | ResourceKey::Device(key) | ResourceKey::Autofactory(key) => {
+            key
+        }
+        ResourceKey::Namespaced { key, .. } => key,
+    }
+}
+
 fn candidate_matches_requirement(
     candidate: &AllocationCandidate,
     requirement: &ResourceRequirement,
@@ -2931,7 +3279,7 @@ fn transition_work_item_in(
             params![current.id.to_string(), now_ms],
         )?;
     }
-    if status.is_terminal() || release_allocations {
+    if !matches!(status, WorkItemStatus::Assigned | WorkItemStatus::Running) {
         transaction.execute(
             "UPDATE workflow_assignments
              SET state = 'released', reclaim_requested_at_ms = NULL, updated_at_ms = ?2
@@ -3400,5 +3748,30 @@ mod tests {
         assert!(second.created);
         assert_ne!(first.instance.id, second.instance.id);
         assert_eq!(repository.list().expect("workflows").len(), 2);
+    }
+
+    #[test]
+    fn compatibility_error_aborts_create_without_inserting() {
+        let repository = WorkflowRepository::open_in_memory().expect("repository");
+        repository
+            .create(atomic_test_workflow("existing"))
+            .expect("existing workflow");
+        let error = match repository.create_or_reuse_active(atomic_test_workflow("unknown"), |_| {
+            Err(RepositoryError::Compatibility(
+                "unknown coverage".to_owned(),
+            ))
+        }) {
+            Ok(_) => panic!("unknown compatibility must abort"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RepositoryError::Compatibility(message) if message == "unknown coverage"
+        ));
+        assert_eq!(repository.list().expect("workflows").len(), 1);
+        assert_eq!(
+            RepositoryError::Compatibility("unknown coverage".to_owned()).to_string(),
+            "workflow compatibility check failed: unknown coverage"
+        );
     }
 }
