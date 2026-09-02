@@ -253,6 +253,9 @@ function systemScene(system: string): SystemSceneSnapshot {
   };
 }
 
+const mockRefreshGalaxy = vi.hoisted(() =>
+  vi.fn<() => Promise<void>>(() => Promise.resolve()),
+);
 const mockRefreshLocations = vi.hoisted(() =>
   vi.fn<(system?: string) => Promise<void>>(() => Promise.resolve()),
 );
@@ -300,6 +303,7 @@ vi.mock("./api", async (importOriginal) => {
       settings: () => Promise.resolve(settings),
       galaxyScene: mockGalaxyScene,
       systemScene: (system: string) => Promise.resolve(systemScene(system)),
+      refreshGalaxy: mockRefreshGalaxy,
       refreshLocations: mockRefreshLocations,
       history: () => Promise.resolve([]),
       director: () => Promise.resolve(director),
@@ -382,6 +386,8 @@ describe("App navigation", () => {
     mockDevices.mockClear();
     mockMessages.mockClear();
     mockGalaxyScene.mockClear();
+    mockRefreshGalaxy.mockClear();
+    mockRefreshLocations.mockClear();
     vi.stubGlobal("WebSocket", MockWebSocket);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -468,7 +474,7 @@ describe("App navigation", () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it("runs full, targeted, and palette location refreshes", async () => {
+  it("runs galaxy, targeted, and palette location refreshes", async () => {
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -497,10 +503,10 @@ describe("App navigation", () => {
 
     await navigate("Galaxy");
     await act(async () => {
-      buttonNamed("Refresh all locations")?.click();
+      buttonNamed("Refresh galaxy data")?.click();
       await flush();
     });
-    expect(mockRefreshLocations).toHaveBeenLastCalledWith();
+    expect(mockRefreshGalaxy).toHaveBeenCalledOnce();
 
     await navigate("System");
     await act(async () => {

@@ -854,6 +854,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/entities", get(entity_index))
         .route("/api/entities/{kind}/{id}", get(entity_inspector))
         .route("/api/galaxy-scene", get(galaxy_scene))
+        .route("/api/galaxy-scene/refresh", post(refresh_locations))
         .route("/api/system-scene/{system}", get(system_scene))
         .route("/api/locations/refresh", post(refresh_locations))
         .route(
@@ -5562,7 +5563,16 @@ async fn system_scene(
 }
 
 async fn refresh_locations(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
-    tracing::info!("full managed location refresh requested");
+    tracing::info!("full galaxy catalogue and managed location refresh requested");
+    state
+        .client()
+        .galaxy()
+        .refresh_catalogue()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "global star catalogue refresh failed");
+            ApiError::unavailable()
+        })?;
     let report = state
         .client()
         .sync()
@@ -8120,8 +8130,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn location_refresh_routes_run_full_and_targeted_traversals() {
+    async fn location_refresh_routes_update_catalogue_and_run_targeted_traversals() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/stars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "generated_at": "2026-09-02T00:00:00Z",
+                "stars": [{
+                    "designation": "SYS-C",
+                    "name": "New catalogue system",
+                    "position": {"x": 1.0, "y": 2.0, "z": 3.0}
+                }],
+                "total": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/v1/locations/SYS-A"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -8173,7 +8197,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/locations/refresh")
+                    .uri("/api/galaxy-scene/refresh")
                     .body(Body::empty())
                     .expect("full refresh request"),
             )
@@ -8193,6 +8217,15 @@ mod tests {
         assert_eq!(full.status(), StatusCode::NO_CONTENT);
         assert_eq!(targeted.status(), StatusCode::NO_CONTENT);
         assert!(client.locations().cached("SYS-B").is_some());
+        assert_eq!(
+            client
+                .galaxy()
+                .catalogue()
+                .iter()
+                .map(|star| star.key.id.as_str())
+                .collect::<Vec<_>>(),
+            ["SYS-C"]
+        );
         let inventories = client.state().inventories().expect("managed inventories");
         let refreshed = inventories
             .iter()

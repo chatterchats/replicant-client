@@ -258,15 +258,15 @@ export function GalaxyPage({
           targetMatrices.has(device.linked_device),
       )
     : [];
-  const refreshLocations = () => {
+  const refreshGalaxy = () => {
     setRefreshing(true);
     setError(undefined);
     void daemonApi
-      .refreshLocations()
+      .refreshGalaxy()
       .catch((reason: unknown) => {
         if (!mounted.current) return;
         setError(
-          reason instanceof Error ? reason.message : "Location refresh failed",
+          reason instanceof Error ? reason.message : "Galaxy refresh failed",
         );
       })
       .finally(() => {
@@ -357,8 +357,8 @@ export function GalaxyPage({
             <option value="undiscovered">Undiscovered</option>
           </select>
         </label>
-        <button disabled={refreshing} onClick={refreshLocations}>
-          {refreshing ? "Refreshing locations…" : "Refresh all locations"}
+        <button disabled={refreshing} onClick={refreshGalaxy}>
+          {refreshing ? "Refreshing galaxy…" : "Refresh galaxy data"}
         </button>
         <details className="galaxy-layers">
           <summary>Layers</summary>

@@ -760,6 +760,13 @@ export const daemonApi = {
       await get(`/api/system-scene/${encodeURIComponent(system)}`, signal),
     ).payload;
   },
+  async refreshGalaxy() {
+    await post(
+      "/api/galaxy-scene/refresh",
+      undefined,
+      LOCATION_REFRESH_TIMEOUT_MS,
+    );
+  },
   async refreshLocations(system?: string) {
     const suffix = system === undefined ? "" : `/${encodeURIComponent(system)}`;
     await post(
