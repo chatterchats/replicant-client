@@ -29,6 +29,7 @@ REFERENCE_SNAPSHOT_EXCLUDED_DIRS = frozenset({".source-html"})
 REFERENCE_SNAPSHOT_EXCLUDED_FILES = frozenset({".crawl-cache.json"})
 LOCAL_DATA_DIR = Path.home() / ".local" / "share" / "replicant"
 LOGS_DIR_NAME = "logs"
+TELEMETRY_DIR_NAME = "telemetry"
 EXCLUDED_DATABASE_NAME = "replicant-history.sqlite"
 ZIP_COMPRESSION = zipfile.ZIP_LZMA
 
@@ -208,6 +209,7 @@ def main() -> int:
             (relative, source)
             for relative, source in matching_files(data_dir, "*.sqlite")
             if source.name != EXCLUDED_DATABASE_NAME
+            and TELEMETRY_DIR_NAME not in PurePosixPath(relative).parts
         ]
         logs_output = companion_output(output, "logs")
         databases_output = companion_output(output, "databases")

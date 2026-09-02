@@ -37,6 +37,7 @@ def main() -> int:
         write(data / "main.sqlite", b"SQLite format 3\0" + b"A" * 4096)
         write(data / "nested" / "cache.sqlite", b"SQLite format 3\0" + b"B" * 4096)
         write(data / "replicant-history.sqlite", b"excluded history")
+        write(data / "telemetry" / "metrics.sqlite", b"excluded telemetry")
 
         subprocess.run(["git", "init", "-q", str(repository)], check=True)
         subprocess.run(["git", "-C", str(repository), "add", str(tracked)], check=True)
