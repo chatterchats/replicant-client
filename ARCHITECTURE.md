@@ -225,12 +225,14 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
 - **Discover Belts** searches each region outward from its selected hub system, prioritizing known
   systems by three-dimensional galactic distance rather than catalogue name.
 - **Expand Mining Ops** reconciles a protected regional mining footprint rather than treating
-  deployment as one-shot work. Each region targets four ward-backed belt systems, prioritizing
-  dense over moderate over sparse according to the regional density policy; active System Hubs
-  satisfy protection without consuming those ward slots. Existing sites are audited for missing
-  hardware, controller directives, adoption relationships, and protection. When a hub makes a ward
-  redundant or a higher-density belt displaces a lower-density allocation, the Director reuses the
-  existing ward before launching the repair/expansion campaign.
+  deployment as one-shot work. Each region expands into every density-policy-eligible belt system
+  within 30 LY of its selected regional hub; the footprint has no fixed system-count cap. Up to four
+  non-hub mining systems receive System Wards, prioritized dense over moderate over sparse and then
+  by distance, while active System Hubs satisfy protection without consuming those ward slots.
+  Existing in-range sites are audited for missing hardware, controller directives, adoption
+  relationships, and protection. When a hub makes a ward redundant or a higher-density belt
+  displaces a lower-density allocation, the Director reuses the existing ward before launching the
+  repair/expansion campaign.
 - **Event Completion** batches active regional events into campaign planning, staging, routing,
   and completion.
 - **Expand FTL Network** and **Establish Beacons** are persisted goal kinds but remain disabled by

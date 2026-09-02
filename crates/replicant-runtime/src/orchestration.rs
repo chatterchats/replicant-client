@@ -100,6 +100,7 @@ const DEFAULT_RETRY_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const DEFAULT_IDLE_TARGET: f64 = 0.15;
 const DEFAULT_SCALE_THRESHOLD: f64 = 0.10;
 const MINING_WARD_SITES_PER_REGION: usize = 4;
+const MINING_EXPANSION_RADIUS_LY: f64 = 30.0;
 const MINING_BATCH_SIZE: usize = 4;
 const CATALOGUE_SYSTEMS_PER_WORKER: usize = 20;
 const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
@@ -492,8 +493,8 @@ pub fn set_goal_enabled(
 
 /// Updates which non-dense belt classes may receive new mining deployments in
 /// one region. Dense belts are always eligible. Disabling a density stops new
-/// expansion into that class; an existing lower-density site remains managed
-/// until a higher-priority ward allocation displaces it.
+/// expansion into that class; an existing lower-density site remains managed.
+/// System Ward priority is reconciled independently from the mining footprint.
 pub fn set_mining_expansion_policy(
     repository: &WorkflowRepository,
     region: &str,
@@ -5612,14 +5613,17 @@ fn reconcile_expand_mining(
     let belt_density = belt_density_priorities(locations, location_systems);
     let belt_designations = known_belt_designations(locations, location_systems);
 
-    // A regional mining footprint selects up to four non-hub belt systems by
-    // density (dense > moderate > sparse), then by distance from the regional
-    // hub. Eligible hub-protected belt systems are additional "free" sites.
+    // The regional mining footprint is not capped by System Ward availability.
+    // Every known belt system within the mining radius of the regional hub and
+    // allowed by the regional density policy is a mining target. Already-managed
+    // sites within that radius remain managed even if their density class is
+    // later disabled.
     //
-    // System Wards are follow-up hardening, not an initial deployment gate.
-    // Previously managed sites remain recognizable after they are displaced
-    // from the preferred set; their hardware is left in place rather than torn
-    // down.
+    // System Wards are a separate follow-up hardening policy: select at most
+    // four non-hub mining systems from that same in-range footprint by density
+    // (dense > moderate > sparse), then by distance from the regional hub. Owned
+    // System Hubs already provide protection and therefore do not consume one of
+    // those four ward slots.
     let managed_systems = managed_mining_systems(devices, location_systems)
         .intersection(&belt_systems)
         .cloned()
@@ -5631,6 +5635,14 @@ fn reconcile_expand_mining(
             .as_deref()
             .and_then(|location| location_systems.get(location).map(String::as_str))
     });
+    let desired_systems = desired_mining_systems(
+        &belt_systems,
+        &managed_systems,
+        &belt_density,
+        mining_hub_system,
+        catalogue,
+        policy,
+    );
     let selected_ward_systems = selected_mining_ward_systems(
         &belt_systems,
         &managed_systems,
@@ -5640,21 +5652,6 @@ fn reconcile_expand_mining(
         catalogue,
         policy,
     );
-    let hub_desired_systems = belt_systems
-        .intersection(&hub_systems)
-        .filter(|system| {
-            managed_systems.contains(*system)
-                || mining_density_allowed(
-                    belt_density.get(*system).copied().unwrap_or_default(),
-                    policy,
-                )
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let desired_systems = selected_ward_systems
-        .union(&hub_desired_systems)
-        .cloned()
-        .collect::<BTreeSet<_>>();
 
     let healthy_systems = desired_systems
         .iter()
@@ -5781,7 +5778,7 @@ fn reconcile_expand_mining(
         DirectorGoalStatus::Active
     } else if pending.is_empty() {
         next_action = Some(format!(
-            "Maintain {MINING_WARD_SITES_PER_REGION} density-and-distance-prioritized mining belts plus hub-protected sites; backfill System Wards when available"
+            "Maintain all eligible regional mining belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub; keep up to {MINING_WARD_SITES_PER_REGION} priority non-hub mining systems protected with System Wards"
         ));
         DirectorGoalStatus::Satisfied
     } else {
@@ -5873,7 +5870,7 @@ fn reconcile_expand_mining(
         region: Some(region.region.clone()),
         status,
         objective: format!(
-            "Maintain {MINING_WARD_SITES_PER_REGION} preferred mining belts in {} ({}), plus eligible System Hub-protected sites; System Wards are follow-up hardening",
+            "Expand mining across eligible belts within {MINING_EXPANSION_RADIUS_LY:.0} LY of the regional hub in {} ({}); harden up to {MINING_WARD_SITES_PER_REGION} priority non-hub mining systems with System Wards",
             region.region,
             density_scope.join(", ")
         ),
@@ -5917,6 +5914,52 @@ fn mining_density_allowed(priority: u8, policy: MiningExpansionPolicy) -> bool {
     }
 }
 
+fn desired_mining_systems(
+    belt_systems: &BTreeSet<String>,
+    managed_systems: &BTreeSet<String>,
+    belt_density: &BTreeMap<String, u8>,
+    hub_system: Option<&str>,
+    catalogue: &[Star],
+    policy: MiningExpansionPolicy,
+) -> BTreeSet<String> {
+    let positions = catalogue
+        .iter()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.as_str().to_owned(), position))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let hub_position = hub_system.and_then(|system| positions.get(system).copied());
+
+    belt_systems
+        .iter()
+        .filter(|system| {
+            let density_allowed = managed_systems.contains(*system)
+                || mining_density_allowed(
+                    belt_density.get(*system).copied().unwrap_or_default(),
+                    policy,
+                );
+            if !density_allowed {
+                return false;
+            }
+            if hub_system == Some(system.as_str()) {
+                return true;
+            }
+
+            match (hub_position, positions.get(*system).copied()) {
+                (Some(hub), Some(target)) => {
+                    galactic_distance(hub, target) <= MINING_EXPANSION_RADIUS_LY
+                }
+                // Incomplete catalogue coordinates should not cause an already-managed
+                // mining site to fall out of management, but they must not permit new
+                // expansion whose range cannot be verified.
+                _ => managed_systems.contains(*system),
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MiningWardRelocation {
     ward_code: String,
@@ -5936,16 +5979,16 @@ fn selected_mining_ward_systems(
     catalogue: &[Star],
     policy: MiningExpansionPolicy,
 ) -> BTreeSet<String> {
-    let mut candidates = belt_systems
-        .iter()
-        .filter(|system| !hub_systems.contains(*system))
-        .filter(|system| {
-            managed_systems.contains(*system)
-                || mining_density_allowed(
-                    belt_density.get(*system).copied().unwrap_or_default(),
-                    policy,
-                )
-        })
+    let eligible_mining_systems = desired_mining_systems(
+        belt_systems,
+        managed_systems,
+        belt_density,
+        hub_system,
+        catalogue,
+        policy,
+    );
+    let mut candidates = eligible_mining_systems
+        .difference(hub_systems)
         .cloned()
         .collect::<Vec<_>>();
     let positions = catalogue
@@ -8499,6 +8542,109 @@ mod tests {
     }
 
     #[test]
+    fn mining_expansion_is_not_capped_by_system_ward_limit() {
+        let belts = [
+            "HUB", "DENSE-A", "DENSE-B", "DENSE-C", "DENSE-D", "DENSE-E", "DENSE-F",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        let density = belts
+            .iter()
+            .cloned()
+            .map(|system| (system, 3))
+            .collect::<BTreeMap<_, _>>();
+        let managed = BTreeSet::new();
+        let hubs = BTreeSet::from(["HUB".to_owned()]);
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("DENSE-A", 2.0, Some("delta")),
+            positioned_star("DENSE-B", 4.0, Some("delta")),
+            positioned_star("DENSE-C", 6.0, Some("delta")),
+            positioned_star("DENSE-D", 8.0, Some("delta")),
+            positioned_star("DENSE-E", 10.0, Some("delta")),
+            positioned_star("DENSE-F", 12.0, Some("delta")),
+        ];
+        let policy = MiningExpansionPolicy::default();
+
+        let desired =
+            desired_mining_systems(&belts, &managed, &density, Some("HUB"), &catalogue, policy);
+        let warded = selected_mining_ward_systems(
+            &belts,
+            &managed,
+            &hubs,
+            &density,
+            Some("HUB"),
+            &catalogue,
+            policy,
+        );
+
+        assert_eq!(desired, belts);
+        assert!(desired.len() > MINING_WARD_SITES_PER_REGION);
+        assert_eq!(warded.len(), MINING_WARD_SITES_PER_REGION);
+        assert!(!warded.contains("HUB"));
+    }
+
+    #[test]
+    fn mining_expansion_is_limited_to_thirty_light_years_from_regional_hub() {
+        let belts = ["HUB", "INSIDE", "EDGE", "OUTSIDE"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let density = belts
+            .iter()
+            .cloned()
+            .map(|system| (system, 3))
+            .collect::<BTreeMap<_, _>>();
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("INSIDE", MINING_EXPANSION_RADIUS_LY - 0.1, Some("delta")),
+            positioned_star("EDGE", MINING_EXPANSION_RADIUS_LY, Some("delta")),
+            positioned_star("OUTSIDE", MINING_EXPANSION_RADIUS_LY + 0.1, Some("delta")),
+        ];
+
+        let desired = desired_mining_systems(
+            &belts,
+            &BTreeSet::new(),
+            &density,
+            Some("HUB"),
+            &catalogue,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert_eq!(
+            desired,
+            ["HUB", "INSIDE", "EDGE"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert!(!desired.contains("OUTSIDE"));
+    }
+
+    #[test]
+    fn managed_mining_site_outside_radius_is_not_a_desired_target() {
+        let belts = BTreeSet::from(["OUTSIDE".to_owned()]);
+        let managed = belts.clone();
+        let density = BTreeMap::from([("OUTSIDE".to_owned(), 3)]);
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("OUTSIDE", MINING_EXPANSION_RADIUS_LY + 1.0, Some("delta")),
+        ];
+
+        let desired = desired_mining_systems(
+            &belts,
+            &managed,
+            &density,
+            Some("HUB"),
+            &catalogue,
+            MiningExpansionPolicy::default(),
+        );
+
+        assert!(desired.is_empty());
+    }
+
+    #[test]
     fn mining_ward_allocation_selects_only_four_non_hub_sites() {
         let belts = ["HUB", "DENSE-A", "DENSE-B", "DENSE-C", "DENSE-D", "DENSE-E"]
             .into_iter()
@@ -8510,13 +8656,21 @@ mod tests {
             .map(|system| (system, 3))
             .collect::<BTreeMap<_, _>>();
 
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("DENSE-A", 1.0, Some("delta")),
+            positioned_star("DENSE-B", 2.0, Some("delta")),
+            positioned_star("DENSE-C", 3.0, Some("delta")),
+            positioned_star("DENSE-D", 4.0, Some("delta")),
+            positioned_star("DENSE-E", 5.0, Some("delta")),
+        ];
         let selected = selected_mining_ward_systems(
             &belts,
             &BTreeSet::new(),
             &BTreeSet::from(["HUB".to_owned()]),
             &density,
-            None,
-            &[],
+            Some("HUB"),
+            &catalogue,
             MiningExpansionPolicy::default(),
         );
 
@@ -8582,13 +8736,21 @@ mod tests {
             .map(|system| (system, 3))
             .collect::<BTreeMap<_, _>>();
 
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("EXISTING", 1.0, Some("delta")),
+            positioned_star("DENSE-A", 2.0, Some("delta")),
+            positioned_star("DENSE-B", 3.0, Some("delta")),
+            positioned_star("DENSE-C", 4.0, Some("delta")),
+            positioned_star("DENSE-D", 5.0, Some("delta")),
+        ];
         let selected = selected_mining_ward_systems(
             &belts,
             &managed,
             &BTreeSet::new(),
             &density,
-            None,
-            &[],
+            Some("HUB"),
+            &catalogue,
             MiningExpansionPolicy::default(),
         );
 
@@ -8615,13 +8777,21 @@ mod tests {
             ("MOD-B".to_owned(), 2),
         ]);
 
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, Some("delta")),
+            positioned_star("DENSE-A", 1.0, Some("delta")),
+            positioned_star("DENSE-B", 2.0, Some("delta")),
+            positioned_star("DENSE-C", 3.0, Some("delta")),
+            positioned_star("MOD-A", 4.0, Some("delta")),
+            positioned_star("MOD-B", 5.0, Some("delta")),
+        ];
         let selected = selected_mining_ward_systems(
             &belts,
             &managed,
             &BTreeSet::new(),
             &density,
-            None,
-            &[],
+            Some("HUB"),
+            &catalogue,
             MiningExpansionPolicy::default(),
         );
 
