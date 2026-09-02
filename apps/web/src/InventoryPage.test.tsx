@@ -95,6 +95,11 @@ const content = (
 describe("inventory explorer", () => {
   it("filters locations and resources and sorts quantity deterministically", () => {
     expect(
+      filterInventoryLocations([...snapshot.locations].reverse(), "").map(
+        (row) => row.owner,
+      ),
+    ).toEqual(["EARTH", "R-1"]);
+    expect(
       filterInventoryLocations(snapshot.locations, "vega").map(
         (row) => row.owner,
       ),

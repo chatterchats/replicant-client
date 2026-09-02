@@ -20,18 +20,24 @@ export function filterInventoryLocations(
   search: string,
 ): InventoryLocationSummary[] {
   const query = search.trim().toLowerCase();
-  return rows.filter((row) =>
-    [
-      row.system,
-      row.location,
-      row.owner,
-      ...row.resources.map(({ resource }) => resource),
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase()
-      .includes(query),
-  );
+  return [...rows]
+    .filter((row) =>
+      [
+        row.system,
+        row.location,
+        row.owner,
+        ...row.resources.map(({ resource }) => resource),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(query),
+    )
+    .sort(
+      (left, right) =>
+        right.total_quantity - left.total_quantity ||
+        left.owner.localeCompare(right.owner),
+    );
 }
 
 export function filterInventoryResources(
