@@ -30,7 +30,7 @@ DOCS_CRAWLER_PYTHON ?= $(DOCS_CRAWLER_DIR)/venv/bin/python
 # Deployment and utility targets
 .PHONY: docker-artifacts docker-build docker-check docker-down docker-persistence-smoke
 .PHONY: docker-rebuild-deploy docker-restart docker-smoke docker-up
-.PHONY: observability-down observability-up token token-rotate zip
+.PHONY: observability-down observability-up token token-rotate utility-tests zip zip-with-data
 
 help:
 	@printf '%s\n' \
@@ -50,6 +50,7 @@ help:
 	  '  policy-checks            Run all checked-in policy gates and policy tests' \
 	  '  contract-policy-check    Verify operation inventory and exclusions only' \
 	  '  coverage-audit-check     Verify current units and schema fields' \
+	  '  utility-tests            Test repository utility scripts' \
 	  '' \
 	  'Build and format' \
 	  '  build                    Build the workspace in default and all-feature modes' \
@@ -82,12 +83,13 @@ help:
 	  'Utilities' \
 	  '  docs-reference-sync      Refresh the newest Replicant Space reference snapshot' \
 	  '  zip                      Create a clean working-tree ZIP for handoff' \
+	  '  zip-with-data            Create repository, local log, and database ZIPs' \
 	  '  token                    Generate a REPLICANTD_TOKEN in .env if not present' \
 	  '  token-rotate             Rotate the REPLICANTD_TOKEN in .env' \
 	  ''
 
 # Aggregate gate
-ci: fmt-check build lint test check-all feature-checks doc policy-checks \
+ci: fmt-check build lint test check-all feature-checks doc policy-checks utility-tests \
   docs-crawler-check galaxy-check web-check desktop-check
 
 # Workspace lifecycle and quality
@@ -225,6 +227,9 @@ package-contents-check:
 policy-tests:
 	$(PYTHON) scripts/test_contract_coverage.py
 
+utility-tests:
+	$(PYTHON) scripts/test_repo_zip.py
+
 policy-checks: contract-policy-check coverage-audit-check mutation-adapter-policy-check \
   package-contents-check policy-tests
 	$(PYTHON) scripts/contract_coverage_check.py
@@ -290,6 +295,9 @@ docker-persistence-smoke: docker-build
 # Utilities
 zip:
 	$(PYTHON) scripts/repo_zip.py $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
+
+zip-with-data:
+	$(PYTHON) scripts/repo_zip.py --include-local-data $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
 
 
 # Kept as a `define` block rather than an inline recipe: Make joins
