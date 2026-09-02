@@ -826,6 +826,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
         .route("/api/inventory", get(inventory))
+        .route("/api/inventory/refresh", post(refresh_inventory))
         .route("/api/autofactories", get(autofactories))
         .route("/api/cargo", get(cargo))
         .route("/api/missions/survey", get(survey_missions))
@@ -854,7 +855,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/entities", get(entity_index))
         .route("/api/entities/{kind}/{id}", get(entity_inspector))
         .route("/api/galaxy-scene", get(galaxy_scene))
-        .route("/api/galaxy-scene/refresh", post(refresh_locations))
+        .route("/api/galaxy-scene/refresh", post(refresh_galaxy))
         .route("/api/system-scene/{system}", get(system_scene))
         .route("/api/locations/refresh", post(refresh_locations))
         .route(
@@ -5003,6 +5004,25 @@ async fn inventory(
     ))))
 }
 
+async fn refresh_inventory(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    let report = state
+        .client()
+        .sync()
+        .domain(SyncDomain::Inventory)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "managed inventory refresh failed");
+            ApiError::unavailable()
+        })?;
+    if !report.completed.contains(&SyncDomain::Inventory) {
+        tracing::warn!("managed inventory refresh completed with failures");
+        return Err(ApiError::unavailable());
+    }
+    state.invalidate(DomainSlice::Inventory);
+    state.flush_invalidations();
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn inventory_snapshot(
     metadata: SnapshotMetadata,
     inventories: Vec<Inventory>,
@@ -5562,7 +5582,7 @@ async fn system_scene(
     Ok(Json(Versioned::current(scene)))
 }
 
-async fn refresh_locations(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+async fn refresh_galaxy(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
     tracing::info!("full galaxy catalogue and managed location refresh requested");
     state
         .client()
@@ -5573,6 +5593,15 @@ async fn refresh_locations(State(state): State<Arc<AppState>>) -> Result<StatusC
             tracing::warn!(error = %error, "global star catalogue refresh failed");
             ApiError::unavailable()
         })?;
+    refresh_all_locations(&state).await
+}
+
+async fn refresh_locations(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
+    tracing::info!("full managed location refresh requested");
+    refresh_all_locations(&state).await
+}
+
+async fn refresh_all_locations(state: &AppState) -> Result<StatusCode, ApiError> {
     let report = state
         .client()
         .sync()
@@ -8130,7 +8159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn location_refresh_routes_update_catalogue_and_run_targeted_traversals() {
+    async fn galaxy_and_location_refresh_routes_fetch_their_authoritative_data() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/stars"))
@@ -8155,7 +8184,7 @@ mod tests {
                 "planets_scanned": 0,
                 "planets": []
             })))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -8192,17 +8221,28 @@ mod tests {
             .await
             .expect("seed known system");
 
-        let full = app
+        let galaxy = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/galaxy-scene/refresh")
                     .body(Body::empty())
-                    .expect("full refresh request"),
+                    .expect("galaxy refresh request"),
             )
             .await
-            .expect("full refresh response");
+            .expect("galaxy refresh response");
+        let locations = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/locations/refresh")
+                    .body(Body::empty())
+                    .expect("location refresh request"),
+            )
+            .await
+            .expect("location refresh response");
         let targeted = app
             .oneshot(
                 Request::builder()
@@ -8214,7 +8254,8 @@ mod tests {
             .await
             .expect("targeted refresh response");
 
-        assert_eq!(full.status(), StatusCode::NO_CONTENT);
+        assert_eq!(galaxy.status(), StatusCode::NO_CONTENT);
+        assert_eq!(locations.status(), StatusCode::NO_CONTENT);
         assert_eq!(targeted.status(), StatusCode::NO_CONTENT);
         assert!(client.locations().cached("SYS-B").is_some());
         assert_eq!(
@@ -8243,6 +8284,68 @@ mod tests {
                 .find(|item| item.resource == "structural")
                 .map(|item| item.quantity),
             Some(37)
+        );
+        server.verify().await;
+        client.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn inventory_refresh_hydrates_current_location_resources() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/inventory"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "locations": [{
+                    "location": "ANBARAL",
+                    "location_name": "Anbaral",
+                    "items": [{
+                        "resource_type": "iron",
+                        "quantity": 42
+                    }]
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (app, client) = test_app_at(&server.uri()).await;
+
+        let refreshed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/inventory/refresh")
+                    .body(Body::empty())
+                    .expect("inventory refresh request"),
+            )
+            .await
+            .expect("inventory refresh response");
+        assert_eq!(refreshed.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::get("/api/inventory")
+                    .body(Body::empty())
+                    .expect("inventory request"),
+            )
+            .await
+            .expect("inventory response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let snapshot: Versioned<InventorySnapshot> = serde_json::from_slice(&bytes).unwrap();
+        let anbaral = snapshot
+            .payload
+            .locations
+            .iter()
+            .find(|location| location.location.as_deref() == Some("ANBARAL"))
+            .expect("Anbaral inventory");
+        assert_eq!(
+            anbaral
+                .resources
+                .iter()
+                .find(|item| item.resource == "iron")
+                .map(|item| item.quantity),
+            Some(42)
         );
         server.verify().await;
         client.close().await.expect("close");

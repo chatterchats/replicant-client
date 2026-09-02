@@ -94,9 +94,28 @@ export function InventoryPage({
     fetcher: (signal) => daemonApi.inventory(signal),
     isEmpty: inventoryEmpty,
   });
+  const [hydrating, setHydrating] = useState(false);
+  const [hydrationError, setHydrationError] = useState<string | null>(null);
+  const refreshInventory = async () => {
+    setHydrating(true);
+    setHydrationError(null);
+    try {
+      await daemonApi.refreshInventory();
+    } catch (error) {
+      setHydrationError(
+        error instanceof Error ? error.message : "Inventory refresh failed",
+      );
+    } finally {
+      await query.refresh();
+      setHydrating(false);
+    }
+  };
   return (
     <InventoryContent
       {...query}
+      error={hydrationError ?? query.error}
+      refreshing={hydrating || query.refreshing}
+      refresh={refreshInventory}
       onSelectEntity={onSelectEntity}
       onOpenSystem={onOpenSystem}
     />

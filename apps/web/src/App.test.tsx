@@ -219,6 +219,26 @@ const galaxyScene: GalaxySceneSnapshot = {
   overlays: [],
   workflow_targets: [],
 };
+const refreshedGalaxyScene: GalaxySceneSnapshot = {
+  ...galaxyScene,
+  revision: 2,
+  generated_at_ms: 2,
+  stars: [
+    {
+      id: "NEW-SYSTEM",
+      name: "New catalogue system",
+      spectral_type: "G",
+      region: "alpha",
+      position: { x: 1, y: 2, z: 3 },
+      exploration: "undiscovered",
+      current: false,
+      has_hub: false,
+      has_life: false,
+      has_relay: false,
+      has_megastructure: false,
+    },
+  ],
+};
 const automationControlResponse: AutomationControlResponse = {
   automation,
   affected_workflows: 0,
@@ -259,6 +279,9 @@ const mockRefreshGalaxy = vi.hoisted(() =>
 const mockRefreshLocations = vi.hoisted(() =>
   vi.fn<(system?: string) => Promise<void>>(() => Promise.resolve()),
 );
+const mockRefreshInventory = vi.hoisted(() =>
+  vi.fn<() => Promise<void>>(() => Promise.resolve()),
+);
 const mockEntities = vi.hoisted(() => vi.fn(() => Promise.resolve(entities)));
 const mockDevices = vi.hoisted(() => vi.fn(() => Promise.resolve(devices)));
 const mockMessages = vi.hoisted(() => vi.fn(() => Promise.resolve(messages)));
@@ -286,6 +309,7 @@ vi.mock("./api", async (importOriginal) => {
       directory: () => Promise.resolve(directory),
       tutorials: () => Promise.resolve(tutorials),
       inventory: () => Promise.resolve(inventory),
+      refreshInventory: mockRefreshInventory,
       autofactories: () => Promise.resolve(autofactories),
       cargo: () => Promise.resolve(cargo),
       survey: () => Promise.resolve(survey),
@@ -321,19 +345,50 @@ class MockWebSocket {
   static readonly OPEN = 1;
   static readonly CLOSING = 2;
   static readonly CLOSED = 3;
+  static instances: MockWebSocket[] = [];
   readyState = MockWebSocket.CONNECTING;
-  constructor(public url: string) {}
+  private readonly listeners = new Map<
+    string,
+    Set<EventListenerOrEventListenerObject>
+  >();
+
+  constructor(public url: string) {
+    MockWebSocket.instances.push(this);
+  }
+
   addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
     if (type !== "open") return;
     queueMicrotask(() => {
       this.readyState = MockWebSocket.OPEN;
-      const event = new Event("open");
-      if (typeof listener === "function") listener(event);
-      else listener.handleEvent(event);
+      this.emit("open", new Event("open"));
     });
   }
-  removeEventListener() {}
+
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+  ) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
   close() {}
+
+  emitLive(message: unknown) {
+    this.emit(
+      "message",
+      new MessageEvent("message", { data: JSON.stringify(message) }),
+    );
+  }
+
+  private emit(type: string, event: Event) {
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === "function") listener(event);
+      else listener.handleEvent(event);
+    }
+  }
 }
 
 function flush() {
@@ -379,15 +434,20 @@ const placeholderLede =
 describe("App navigation", () => {
   let root: Root;
   let container: HTMLDivElement;
-
   beforeEach(() => {
     sharedQueryCache.clear();
     mockEntities.mockClear();
     mockDevices.mockClear();
     mockMessages.mockClear();
-    mockGalaxyScene.mockClear();
+    mockGalaxyScene.mockReset();
+    mockGalaxyScene.mockImplementation((signal?: AbortSignal) => {
+      void signal;
+      return Promise.resolve(galaxyScene);
+    });
     mockRefreshGalaxy.mockClear();
     mockRefreshLocations.mockClear();
+    mockRefreshInventory.mockClear();
+    MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -474,7 +534,54 @@ describe("App navigation", () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it("runs galaxy, targeted, and palette location refreshes", async () => {
+  it("refetches and renders newly catalogued stars after galaxy invalidation", async () => {
+    mockGalaxyScene
+      .mockResolvedValueOnce(galaxyScene)
+      .mockResolvedValueOnce(refreshedGalaxyScene);
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <DaemonProvider>
+          <App />
+        </DaemonProvider>,
+      );
+      await flush();
+      await flush();
+    });
+    const galaxyButton = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".sidebar button"),
+    ).find((button) => button.textContent === "Galaxy");
+    await act(async () => {
+      galaxyButton?.click();
+      await flush();
+      await flush();
+    });
+    const refreshButton = Array.from(
+      container.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent === "Refresh galaxy data");
+    await act(async () => {
+      refreshButton?.click();
+      await flush();
+      MockWebSocket.instances.at(-1)?.emitLive({
+        protocol_version: 1,
+        revision: 2,
+        delta: { type: "domain_invalidated", data: { slice: "universe" } },
+      });
+      await flush();
+      await flush();
+    });
+
+    expect(mockRefreshGalaxy).toHaveBeenCalledOnce();
+    expect(mockGalaxyScene).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector<HTMLOptionElement>(
+        '#known-galaxy-systems option[value="NEW-SYSTEM"]',
+      ),
+    ).not.toBeNull();
+    expect(container.textContent).toContain("1 of 1 systems");
+  });
+
+  it("runs inventory, galaxy, targeted, and palette refreshes", async () => {
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -514,6 +621,14 @@ describe("App navigation", () => {
       await flush();
     });
     expect(mockRefreshLocations).toHaveBeenLastCalledWith("SYS-A");
+
+    await navigate("Inventory");
+    await act(async () => {
+      buttonNamed("Refresh")?.click();
+      await flush();
+      await flush();
+    });
+    expect(mockRefreshInventory).toHaveBeenCalledOnce();
 
     await act(async () => {
       window.dispatchEvent(

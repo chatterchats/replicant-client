@@ -607,6 +607,9 @@ export const daemonApi = {
   async inventory(signal?: AbortSignal) {
     return parseInventoryResponse(await get("/api/inventory", signal)).payload;
   },
+  async refreshInventory() {
+    await post("/api/inventory/refresh");
+  },
   async autofactories(signal?: AbortSignal) {
     return parseAutofactoryResponse(await get("/api/autofactories", signal))
       .payload;
