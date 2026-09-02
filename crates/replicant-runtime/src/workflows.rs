@@ -770,12 +770,14 @@ pub(crate) async fn execute_mining_pool_config(
         .mission
         .clone()
         .ok_or_else(|| "mining planning produced no checkpoint".to_owned())?;
+    let existing_items = repository
+        .list_work_items(context.id())
+        .map_err(string_error)?;
+    let desired_items =
+        mining_work_item_specs_for_reconcile(context.id(), &mission, &region, &existing_items)
+            .map_err(string_error)?;
     let reconciled = repository
-        .reconcile_work_items(
-            context.id(),
-            &mining_work_item_specs(context.id(), &mission, &region).map_err(string_error)?,
-            workflow_now_millis(),
-        )
+        .reconcile_work_items(context.id(), &desired_items, workflow_now_millis())
         .map_err(string_error)?;
     for item in reconciled {
         let completed_in_checkpoint = item.spec.payload_json["legacy_complete"]
@@ -861,12 +863,19 @@ pub(crate) async fn execute_mining_pool_config(
                     .map_err(string_error)?;
                 break;
             }
-            let allocation_affinities = mining_allocation_affinities(assigned_item_type);
-            let allocations = match broker.allocate_with_affinity(
+            let allocation_affinities =
+                mining_allocation_affinities(assigned_item_type, &assigned.spec.requirements_json);
+            let allocation_candidates = mining_allocation_candidates(
+                assigned_item_type,
+                &assigned.spec.requirements_json,
+                &candidates,
+            );
+            let allocations = match broker.allocate_with_policy(
                 assigned.id,
                 assigned.state.revision,
-                &candidates,
+                &allocation_candidates,
                 allocation_affinities,
+                mining_ignored_allocation_requirements(assigned_item_type),
             ) {
                 Ok(allocations) => allocations,
                 Err(error) => {
@@ -919,7 +928,7 @@ pub(crate) async fn execute_mining_pool_config(
                 client.clone(),
                 broker.clone(),
                 item_executor.clone(),
-                candidates.clone(),
+                allocation_candidates,
                 mission.clone(),
                 started,
                 item_type,
@@ -980,10 +989,119 @@ fn mining_assignment_id(
     format!("mining:{item_id}:r{assignment_revision}:{worker}")
 }
 
-fn mining_allocation_affinities(item_type: &str) -> &'static [(&'static str, &'static str)] {
+fn mining_work_item_specs_for_reconcile(
+    workflow_id: WorkflowId,
+    mission: &MiningMission,
+    region: &str,
+    existing_items: &[WorkItem],
+) -> Result<Vec<WorkItemSpec>, replicant_workflow::RepositoryError> {
+    let mut desired = mining_work_item_specs(workflow_id, mission, region)?;
+    let existing_by_key = existing_items
+        .iter()
+        .map(|item| (item.spec.dedupe_key.as_str(), &item.spec))
+        .collect::<BTreeMap<_, _>>();
+
+    for spec in &mut desired {
+        if !matches!(spec.kind.as_str(), "mining.route" | "mining.site") {
+            continue;
+        }
+        let Some(existing) = existing_by_key.get(spec.dedupe_key.as_str()) else {
+            continue;
+        };
+        if *existing == &*spec {
+            continue;
+        }
+
+        // Work-item specs are intentionally immutable. Older mining campaigns can legitimately
+        // disagree with freshly-derived specs in two known ways:
+        //
+        // - route/site transport requirements used the wrong capacity semantics in older builds;
+        // - `legacy_complete` was derived from mutable mission phase, so a route changed from
+        //   `false` to `true` after the durable item succeeded.
+        //
+        // Reconstruct the stored shape only for those compatibility differences. Any other field
+        // change still reaches repository reconciliation and is rejected as a real spec conflict.
+        let mut compatible = spec.clone();
+        if let (Some(stored_complete), Some(desired_complete)) = (
+            existing.payload_json.get("legacy_complete"),
+            compatible.payload_json.get("legacy_complete"),
+        ) && stored_complete != desired_complete
+        {
+            compatible.payload_json["legacy_complete"] = stored_complete.clone();
+        }
+        compatible.requirements_json = existing.requirements_json.clone();
+        if &compatible == *existing {
+            *spec = (**existing).clone();
+        }
+    }
+
+    Ok(desired)
+}
+
+fn mining_requirement_present(requirements_json: &Value, key: &str) -> bool {
+    requirements_json.as_array().is_some_and(|requirements| {
+        requirements
+            .iter()
+            .any(|requirement| requirement["key"].as_str() == Some(key))
+    })
+}
+
+fn mining_uses_legacy_site_stow(item_type: &str, requirements_json: &Value) -> bool {
+    item_type == "site"
+        && mining_requirement_present(requirements_json, "stow")
+        && !mining_requirement_present(requirements_json, "attach")
+}
+
+fn mining_allocation_affinities(
+    item_type: &str,
+    requirements_json: &Value,
+) -> &'static [(&'static str, &'static str)] {
+    if item_type != "site" {
+        return &[];
+    }
+    if mining_requirement_present(requirements_json, "attach") {
+        &[("attach", "carrier")]
+    } else if mining_requirement_present(requirements_json, "stow") {
+        &[("stow", "carrier")]
+    } else {
+        &[]
+    }
+}
+
+fn mining_allocation_candidates(
+    item_type: &str,
+    requirements_json: &Value,
+    candidates: &[AllocationCandidate],
+) -> Vec<AllocationCandidate> {
+    if !mining_uses_legacy_site_stow(item_type, requirements_json) {
+        return candidates.to_vec();
+    }
+
+    // Legacy mining.site work items persisted a `stow` requirement. Reinterpret that requirement
+    // locally as attachment capacity without publishing a false global stow pool. Real stow pools
+    // are removed for this allocation and free attach pools are exposed under the legacy key.
+    let mut compatible = candidates
+        .iter()
+        .filter(|candidate| candidate.kind != "stow")
+        .cloned()
+        .collect::<Vec<_>>();
+    compatible.extend(candidates.iter().filter_map(|candidate| {
+        let ResourceKey::Namespaced { namespace, .. } = &candidate.resource else {
+            return None;
+        };
+        if candidate.kind != "attach" || namespace != "attach" {
+            return None;
+        }
+        let mut alias = candidate.clone();
+        alias.kind = "stow".into();
+        Some(alias)
+    }));
+    compatible
+}
+
+fn mining_ignored_allocation_requirements(item_type: &str) -> &'static [&'static str] {
     match item_type {
-        "site" => &[("stow", "carrier")],
-        "route" => &[("stow", "freighter")],
+        "route" => &["stow"],
         _ => &[],
     }
 }
@@ -1012,6 +1130,8 @@ async fn run_mining_item(
     wait_timeout: Duration,
 ) -> Result<(String, usize, MiningMission), String> {
     let revision = item.state.revision;
+    let allocation_affinities =
+        mining_allocation_affinities(&item_type, &item.spec.requirements_json);
     loop {
         match item_executor
             .execute(
@@ -1075,11 +1195,27 @@ async fn run_mining_item(
                             item.id,
                             allocation_id,
                             &replacement_candidates,
-                            mining_allocation_affinities(&item_type),
+                            allocation_affinities,
                         )
                         .map_err(string_error)?
                     {
                         ReplacementOutcome::Replaced(replacement) => {
+                            let paired_capacity = if requirement == "carrier" {
+                                ["attach", "stow"]
+                                    .into_iter()
+                                    .find_map(|capacity_requirement| {
+                                        allocations
+                                            .by_requirement
+                                            .get(capacity_requirement)
+                                            .and_then(|values| values.first())
+                                            .cloned()
+                                            .map(|allocation| {
+                                                (capacity_requirement.to_owned(), allocation)
+                                            })
+                                    })
+                            } else {
+                                None
+                            };
                             let allocation = allocations
                                 .by_requirement
                                 .get_mut(&requirement)
@@ -1092,28 +1228,24 @@ async fn run_mining_item(
                                     format!("mining allocation {allocation_id} disappeared")
                                 })?;
                             *allocation = replacement.clone();
-                            if matches!(requirement.as_str(), "carrier" | "freighter")
-                                && let Some(stow) = allocations
-                                    .by_requirement
-                                    .get("stow")
-                                    .and_then(|values| values.first())
-                                    .cloned()
-                                && allocation_resource_identity(&stow.resource)
+                            if let Some((capacity_requirement, capacity)) = paired_capacity
+                                && allocation_resource_identity(&capacity.resource)
                                     != allocation_resource_identity(&replacement.resource)
                             {
                                 match broker
                                     .replace_dead_allocation_from_with_affinity(
                                         item.id,
-                                        stow.id,
+                                        capacity.id,
                                         &replacement_candidates,
-                                        mining_allocation_affinities(&item_type),
+                                        allocation_affinities,
                                     )
                                     .map_err(string_error)?
                                 {
-                                    ReplacementOutcome::Replaced(replacement_stow) => {
-                                        allocations
-                                            .by_requirement
-                                            .insert("stow".to_owned(), vec![replacement_stow]);
+                                    ReplacementOutcome::Replaced(replacement_capacity) => {
+                                        allocations.by_requirement.insert(
+                                            capacity_requirement,
+                                            vec![replacement_capacity],
+                                        );
                                     }
                                     ReplacementOutcome::Waiting => {
                                         repository
@@ -3361,7 +3493,9 @@ fn allocation_candidate_belongs_to_region(
                 |physical| physical == requested_region,
             )
         }
-        ResourceKey::Namespaced { namespace, key } if namespace == "stow" => {
+        ResourceKey::Namespaced { namespace, key }
+            if matches!(namespace.as_str(), "stow" | "attach") =>
+        {
             physical_region.as_deref().map_or_else(
                 || regional_devices.contains(key),
                 |physical| physical == requested_region,
@@ -4361,6 +4495,42 @@ mod tests {
     }
 
     #[test]
+    fn attachment_capacity_pool_follows_carrier_region() {
+        let workers = BTreeSet::new();
+        let regional_devices = BTreeSet::new();
+        let candidate = AllocationCandidate {
+            resource: ResourceKey::Namespaced {
+                namespace: "attach".into(),
+                key: "BETA-CARRIER".into(),
+            },
+            kind: "attach".into(),
+            capabilities: Vec::new(),
+            location: Some(replicant_workflow::AllocationLocation {
+                region: Some("beta".into()),
+                system: Some("THYFFAWFF".into()),
+                designation: Some("THYFFAWFF-BELT-1".into()),
+                ..replicant_workflow::AllocationLocation::default()
+            }),
+            available_quantity: 10,
+            observed_revision: 1,
+            observed_at_ms: 1,
+        };
+
+        assert!(allocation_candidate_belongs_to_region(
+            &candidate,
+            "beta",
+            &workers,
+            &regional_devices,
+        ));
+        assert!(!allocation_candidate_belongs_to_region(
+            &candidate,
+            "alpha",
+            &workers,
+            &regional_devices,
+        ));
+    }
+
+    #[test]
     fn allocation_location_resolves_against_the_longest_known_system_prefix() {
         let regions = BTreeMap::from([
             ("KHAHKUHKAK".to_owned(), "delta".to_owned()),
@@ -4406,7 +4576,7 @@ mod tests {
             .get_owned(worker)
             .await
             .expect("seed worker");
-        for (code, device_type, stow_capacity) in devices {
+        for (code, device_type, transport_capacity) in devices {
             let mut body = serde_json::json!({
                 "device_code": code,
                 "device_type": device_type,
@@ -4414,9 +4584,13 @@ mod tests {
                 "location": "ROOT-1-L4",
                 "status": "idle"
             });
-            if let Some(capacity) = stow_capacity {
-                body["stow_capacity"] = (*capacity).into();
-                body["stow_used"] = 0.into();
+            if let Some(capacity) = transport_capacity {
+                if *device_type == "surge_carrier" {
+                    body["attach_capacity"] = (*capacity).into();
+                } else {
+                    body["stow_capacity"] = (*capacity).into();
+                    body["stow_used"] = 0.into();
+                }
             }
             Mock::given(method("GET"))
                 .and(path(format!("/v1/devices/{code}")))
@@ -4434,7 +4608,7 @@ mod tests {
         peak: AtomicUsize,
         first_wave: tokio::sync::Barrier,
         missing_injected: AtomicBool,
-        stow_quantities: Mutex<Vec<u64>>,
+        capacity_quantities: Mutex<Vec<u64>>,
         stage_allocations: Mutex<Vec<(u64, bool)>>,
     }
 
@@ -4446,7 +4620,7 @@ mod tests {
                 peak: AtomicUsize::new(0),
                 first_wave: tokio::sync::Barrier::new(2),
                 missing_injected: AtomicBool::new(false),
-                stow_quantities: Mutex::new(Vec::new()),
+                capacity_quantities: Mutex::new(Vec::new()),
                 stage_allocations: Mutex::new(Vec::new()),
             }
         }
@@ -4464,11 +4638,15 @@ mod tests {
         ) -> MiningItemFuture<'a> {
             let mut lane = mission.clone();
             let item_type = item_type.to_owned();
-            let stow = allocations
-                .by_requirement
-                .get("stow")
+            let transport_capacity = ["attach", "stow"]
                 .into_iter()
-                .flatten()
+                .flat_map(|requirement| {
+                    allocations
+                        .by_requirement
+                        .get(requirement)
+                        .into_iter()
+                        .flatten()
+                })
                 .map(|allocation| allocation.quantity)
                 .sum();
             let carrier_allocation = allocations
@@ -4489,10 +4667,10 @@ mod tests {
                 .is_some_and(|allocations| !allocations.is_empty());
             Box::pin(async move {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-                self.stow_quantities
+                self.capacity_quantities
                     .lock()
-                    .expect("stow quantities")
-                    .push(stow);
+                    .expect("transport-capacity quantities")
+                    .push(transport_capacity);
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(active, Ordering::SeqCst);
                 if call <= 2 {
@@ -4621,6 +4799,248 @@ mod tests {
     }
 
     #[test]
+    fn mining_capacity_affinity_uses_attachment_slots_for_sites() {
+        let current_site = serde_json::json!([{"key": "attach"}]);
+        let legacy_site = serde_json::json!([{"key": "stow"}]);
+        let route = serde_json::json!([]);
+
+        assert!(mining_allocation_affinities("route", &route).is_empty());
+        assert_eq!(mining_ignored_allocation_requirements("route"), &["stow"]);
+        assert_eq!(
+            mining_allocation_affinities("site", &current_site),
+            &[("attach", "carrier")]
+        );
+        assert_eq!(
+            mining_allocation_affinities("site", &legacy_site),
+            &[("stow", "carrier")]
+        );
+        assert!(mining_ignored_allocation_requirements("site").is_empty());
+    }
+
+    #[test]
+    fn legacy_mining_site_stow_candidates_alias_attachment_capacity_only() {
+        let legacy_site = serde_json::json!([{"key": "stow"}]);
+        let candidates = vec![
+            AllocationCandidate {
+                resource: ResourceKey::Namespaced {
+                    namespace: "stow".into(),
+                    key: "CARRIER-1".into(),
+                },
+                kind: "stow".into(),
+                capabilities: Vec::new(),
+                location: None,
+                available_quantity: 2,
+                observed_revision: 1,
+                observed_at_ms: 1,
+            },
+            AllocationCandidate {
+                resource: ResourceKey::Namespaced {
+                    namespace: "attach".into(),
+                    key: "CARRIER-1".into(),
+                },
+                kind: "attach".into(),
+                capabilities: Vec::new(),
+                location: None,
+                available_quantity: 9,
+                observed_revision: 1,
+                observed_at_ms: 1,
+            },
+        ];
+
+        let compatible = mining_allocation_candidates("site", &legacy_site, &candidates);
+        let legacy_capacity = compatible
+            .iter()
+            .find(|candidate| {
+                candidate.kind == "stow"
+                    && matches!(
+                        &candidate.resource,
+                        ResourceKey::Namespaced { namespace, key }
+                            if namespace == "attach" && key == "CARRIER-1"
+                    )
+            })
+            .expect("legacy capacity alias");
+
+        assert_eq!(legacy_capacity.kind, "stow");
+        assert_eq!(legacy_capacity.available_quantity, 9);
+        assert_eq!(
+            compatible
+                .iter()
+                .filter(|candidate| candidate.kind == "stow")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mining_reconcile_preserves_legacy_route_stow_specs_for_active_campaigns() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: mining_workflow_kind(),
+                schema_version: SCHEMA_VERSION,
+                config: Value::Null,
+                checkpoint: Value::Null,
+                current_step: Some("executing".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let mission = mining_pool_mission();
+        let mut legacy =
+            mining_work_item_specs(workflow.id, &mission, "Alpha").expect("legacy specs");
+        for spec in legacy
+            .iter_mut()
+            .filter(|spec| spec.kind.as_str() == "mining.route")
+        {
+            let mut requirements: Vec<replicant_workflow::ResourceRequirement> =
+                serde_json::from_value(spec.requirements_json.clone()).expect("requirements");
+            requirements.push(replicant_workflow::ResourceRequirement {
+                key: "stow".into(),
+                kind: "stow".into(),
+                capabilities: Vec::new(),
+                scope: replicant_workflow::RequirementScope::Region("Alpha".into()),
+                count: 1,
+                quantity: 2,
+            });
+            spec.requirements_json = serde_json::to_value(requirements).expect("legacy stow");
+        }
+        repository
+            .reconcile_work_items(workflow.id, &legacy, 1)
+            .expect("seed legacy work items");
+
+        let existing = repository
+            .list_work_items(workflow.id)
+            .expect("existing items");
+        let compatible =
+            mining_work_item_specs_for_reconcile(workflow.id, &mission, "Alpha", &existing)
+                .expect("compatible specs");
+        let route = compatible
+            .iter()
+            .find(|spec| spec.kind.as_str() == "mining.route")
+            .expect("route spec");
+        let route_requirements: Vec<replicant_workflow::ResourceRequirement> =
+            serde_json::from_value(route.requirements_json.clone()).expect("route requirements");
+        assert!(
+            route_requirements
+                .iter()
+                .any(|requirement| requirement.key == "stow")
+        );
+        repository
+            .reconcile_work_items(workflow.id, &compatible, 2)
+            .expect("legacy reconciliation remains compatible");
+    }
+
+    #[test]
+    fn mining_reconcile_preserves_route_spec_after_checkpoint_marks_route_active() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: mining_workflow_kind(),
+                schema_version: SCHEMA_VERSION,
+                config: Value::Null,
+                checkpoint: Value::Null,
+                current_step: Some("executing".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let mut mission = mining_pool_mission();
+        let initial =
+            mining_work_item_specs(workflow.id, &mission, "Alpha").expect("initial specs");
+        repository
+            .reconcile_work_items(workflow.id, &initial, 1)
+            .expect("seed work items");
+
+        mission.routes[0].phase = crate::mining::RoutePhase::Active;
+        let existing = repository
+            .list_work_items(workflow.id)
+            .expect("existing items");
+        let stored = existing
+            .iter()
+            .find(|item| item.spec.dedupe_key == "mining.route:PENDING-BELT-1:ROOT-1-L4")
+            .expect("stored route")
+            .spec
+            .clone();
+        assert_eq!(stored.payload_json["legacy_complete"], Value::Bool(false));
+
+        let compatible =
+            mining_work_item_specs_for_reconcile(workflow.id, &mission, "Alpha", &existing)
+                .expect("compatible specs");
+        let resumed = compatible
+            .iter()
+            .find(|spec| spec.dedupe_key == stored.dedupe_key)
+            .expect("resumed route");
+
+        assert_eq!(resumed, &stored);
+        repository
+            .reconcile_work_items(workflow.id, &compatible, 2)
+            .expect("active-route restart remains compatible");
+    }
+
+    #[test]
+    fn mining_reconcile_preserves_legacy_site_stow_specs_for_active_campaigns() {
+        let repository =
+            replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
+        let workflow = repository
+            .create(NewWorkflow {
+                kind: mining_workflow_kind(),
+                schema_version: SCHEMA_VERSION,
+                config: Value::Null,
+                checkpoint: Value::Null,
+                current_step: Some("executing".into()),
+                parent_id: None,
+            })
+            .expect("workflow");
+        let mission = mining_pool_mission();
+        let mut legacy =
+            mining_work_item_specs(workflow.id, &mission, "Alpha").expect("legacy specs");
+        for spec in legacy
+            .iter_mut()
+            .filter(|spec| spec.kind.as_str() == "mining.site")
+        {
+            let mut requirements: Vec<replicant_workflow::ResourceRequirement> =
+                serde_json::from_value(spec.requirements_json.clone()).expect("requirements");
+            if let Some(capacity) = requirements
+                .iter_mut()
+                .find(|requirement| requirement.key == "attach")
+            {
+                capacity.key = "stow".into();
+                capacity.kind = "stow".into();
+            }
+            spec.requirements_json = serde_json::to_value(requirements).expect("legacy stow");
+        }
+        repository
+            .reconcile_work_items(workflow.id, &legacy, 1)
+            .expect("seed legacy work items");
+
+        let existing = repository
+            .list_work_items(workflow.id)
+            .expect("existing items");
+        let compatible =
+            mining_work_item_specs_for_reconcile(workflow.id, &mission, "Alpha", &existing)
+                .expect("compatible specs");
+        let site = compatible
+            .iter()
+            .find(|spec| spec.kind.as_str() == "mining.site")
+            .expect("site spec");
+        let site_requirements: Vec<replicant_workflow::ResourceRequirement> =
+            serde_json::from_value(site.requirements_json.clone()).expect("site requirements");
+        assert!(
+            site_requirements
+                .iter()
+                .any(|requirement| requirement.key == "stow")
+        );
+        assert!(
+            site_requirements
+                .iter()
+                .all(|requirement| requirement.key != "attach")
+        );
+        repository
+            .reconcile_work_items(workflow.id, &compatible, 2)
+            .expect("legacy reconciliation remains compatible");
+    }
+
+    #[test]
     fn manufacturing_work_item_spec_stays_immutable_when_checkpoint_completes() {
         let repository =
             replicant_workflow::WorkflowRepository::open_in_memory().expect("repository");
@@ -4686,7 +5106,7 @@ mod tests {
             "REP-B",
             "B-FREIGHTER",
             &[
-                ("B-FREIGHTER", "cargo_freighter", Some(3)),
+                ("B-FREIGHTER", "cargo_freighter", None),
                 ("B-TC", "ami_transport_controller", None),
             ],
         )
@@ -4697,7 +5117,7 @@ mod tests {
             "REP-C",
             "C-FREIGHTER",
             &[
-                ("C-FREIGHTER", "cargo_freighter", Some(4)),
+                ("C-FREIGHTER", "cargo_freighter", None),
                 ("C-TC", "ami_transport_controller", None),
                 ("C-AF", "autofactory", None),
                 ("C-CARRIER", "surge_carrier", Some(12)),
@@ -4810,13 +5230,13 @@ mod tests {
         );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
         assert_eq!(executor.peak.load(Ordering::SeqCst), 2);
-        let mut stow = executor
-            .stow_quantities
+        let mut transport_capacity = executor
+            .capacity_quantities
             .lock()
-            .expect("stow quantities")
+            .expect("transport-capacity quantities")
             .clone();
-        stow.sort_unstable();
-        assert_eq!(stow, [1, 1, 2, 2]);
+        transport_capacity.sort_unstable();
+        assert_eq!(transport_capacity, [0, 0, 1, 1]);
         let progress = workflow
             .result::<Value>()
             .expect("mining result")

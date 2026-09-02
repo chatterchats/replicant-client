@@ -46,7 +46,7 @@ impl ResourceBroker {
         }
     }
 
-    /// Discovers exclusive, inventory, and stow pools from committed managed state.
+    /// Discovers exclusive, inventory, stow, and attachment pools from committed managed state.
     pub fn discover_candidates(&self) -> Result<Vec<AllocationCandidate>, AssignmentError> {
         let client = self
             .client
@@ -117,12 +117,27 @@ impl ResourceBroker {
                 candidates.push(AllocationCandidate {
                     resource: ResourceKey::Namespaced {
                         namespace: "stow".into(),
-                        key: device_code,
+                        key: device_code.clone(),
                     },
                     kind: "stow".into(),
                     capabilities: Vec::new(),
-                    location,
+                    location: location.clone(),
                     available_quantity: u64::try_from(free_stow).unwrap_or(0),
+                    observed_revision: revision,
+                    observed_at_ms,
+                });
+            }
+            let free_attach = free_attach_capacity(&device);
+            if free_attach > 0 {
+                candidates.push(AllocationCandidate {
+                    resource: ResourceKey::Namespaced {
+                        namespace: "attach".into(),
+                        key: device_code,
+                    },
+                    kind: "attach".into(),
+                    capabilities: Vec::new(),
+                    location,
+                    available_quantity: u64::try_from(free_attach).unwrap_or(0),
                     observed_revision: revision,
                     observed_at_ms,
                 });
@@ -203,6 +218,31 @@ impl ResourceBroker {
             .allocate_requirements_with_affinity(item_id, expected_revision, candidates, affinities)
             .map_err(Into::into)
     }
+
+    /// Atomically allocates candidates with runtime-only affinity and compatibility policy.
+    ///
+    /// Ignored requirement keys remain in an immutable durable work-item schema, but are not
+    /// allocated. This lets runtime fixes retire obsolete requirements without invalidating active
+    /// work items created by an older version.
+    pub fn allocate_with_policy(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+        affinities: &[(&str, &str)],
+        ignored_requirement_keys: &[&str],
+    ) -> Result<AllocationSet, AssignmentError> {
+        self.repository
+            .allocate_requirements_with_policy(
+                item_id,
+                expected_revision,
+                candidates,
+                affinities,
+                ignored_requirement_keys,
+            )
+            .map_err(Into::into)
+    }
+
     /// Replaces a resource proven permanently missing using current managed candidates.
     pub fn replace_dead_allocation(
         &self,
@@ -288,6 +328,15 @@ fn hosted_device_capabilities(devices: &[Device]) -> BTreeMap<DeviceKey, Vec<Str
             (device.key.clone(), capabilities)
         })
         .collect()
+}
+
+fn free_attach_capacity(device: &Device) -> i64 {
+    let attached = i64::try_from(device.relationships.attached_devices.len()).unwrap_or(i64::MAX);
+    device
+        .attach_capacity
+        .unwrap_or_default()
+        .saturating_sub(attached)
+        .max(0)
 }
 
 fn capabilities_for_replicant(
@@ -381,6 +430,18 @@ mod tests {
     ) -> Vec<String> {
         let hosted_capabilities = hosted_device_capabilities(devices);
         capabilities_for_replicant(replicant, &hosted_capabilities)
+    }
+
+    #[test]
+    fn attachment_capacity_uses_current_attached_relationships() {
+        let mut carrier = managed_device("CARRIER-1", &[], &[]);
+        carrier.attach_capacity = Some(10);
+        carrier.relationships.attached_devices = ["A", "B", "C"]
+            .into_iter()
+            .map(|code| DeviceKey::live(code.into()))
+            .collect();
+
+        assert_eq!(free_attach_capacity(&carrier), 7);
     }
 
     #[test]

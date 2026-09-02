@@ -33,7 +33,7 @@ which operations, fields, or aliases the client exposes.
 | Script | Purpose |
 | --- | --- |
 | `reference_snapshot.py` | Locates versioned snapshots under `reference/replicant-space-*` and resolves the highest semantic version. Imported by the gates; rarely run directly. |
-| `repo_zip.py` | Creates a clean ZIP of the Git working tree for handoff. Invoked by `make zip`. |
+| `repo_zip.py` | Creates maximum-compression ZIPs of the Git working tree and, optionally, local logs and databases. Invoked by `make zip` or `make zip-with-data`. |
 
 ## Not wired into any gate
 

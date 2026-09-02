@@ -1094,45 +1094,256 @@ function TriggersView({
   );
 }
 
-function targetSummary(
+const workflowDisplayNames: Record<string, string> = {
+  "belt.system": "Search System for Belts",
+  "belt_search.campaign": "Search Region for Belts",
+  "blueprint.acquire": "Acquire Blueprint",
+  "event.campaign": "Complete Regional Events",
+  "event.delivery": "Prepare Event",
+  "event.fulfillment": "Fulfill Event",
+  "event.stage": "Stage Event Requirements",
+  "event.tour": "Fulfill Event",
+  "exploration.frontier": "Expand FTL Network",
+  "logistics.delivery": "Deliver Cargo or Devices",
+  "logistics.manifest": "Deliver Manifest",
+  "mining.campaign": "Expand Mining Operations",
+  "mining.deploy": "Deploy Mining Operation",
+  "mining.expansion": "Expand Mining Operations",
+  "mining.route": "Deploy Mining Route",
+  "mining.site": "Deploy Mining Site",
+  "mining.stage": "Stage Mining Equipment",
+  "observatory.search": "Search with Observatory",
+  "region.establish": "Establish Region",
+  "relay.expansion": "Expand Relay Network",
+  "relay.stop": "Deploy Relay Stop",
+  "replicant.provision": "Provision Regional Replicant",
+  "requirement.action": "Fulfill Requirement Action",
+  "requirement.fulfillment": "Fulfill Requirement",
+  "salvage.recovery": "Recover Regional Salvage",
+  "salvage.site": "Recover Salvage Site",
+  "scan.belt": "Scan Asteroid Belt",
+  "scan.system": "Scan System",
+  "scan.tour": "Survey Region",
+  "survey.route": "Survey Route",
+  "survey.stop": "Survey System",
+  "trade.fulfillment": "Execute Trade",
+};
+
+const workflowStepNames: Record<string, string> = {
+  awaiting_available_resources: "Waiting for available resources",
+  awaiting_blueprint_control_replicant:
+    "Waiting for blueprint control Replicant",
+  awaiting_delivery: "Waiting for delivery",
+  awaiting_ftl_connectivity: "Waiting for FTL connectivity",
+  awaiting_ftl_relay: "Waiting for an FTL relay",
+  awaiting_purchase_evidence: "Confirming purchase",
+  awaiting_relay_prerequisites: "Waiting for relay prerequisites",
+  awaiting_trade_criteria: "Waiting for trade requirements",
+  awaiting_trade_fulfillment: "Waiting for trade fulfillment",
+  bootstrapping: "Bootstrapping region",
+  configuring: "Configuring devices",
+  decommissioning: "Decommissioning device",
+  delivering: "Delivering assets",
+  deploying: "Deploying infrastructure",
+  executing: "Executing campaign",
+  executing_trade: "Executing trade",
+  exploring: "Extending FTL coverage",
+  launching: "Launching devices",
+  manufacturing: "Manufacturing equipment",
+  manufacturing_survey_fleet: "Manufacturing survey fleet",
+  planning: "Planning",
+  printing_trade_criteria: "Printing trade requirements",
+  printing_trade_payment: "Printing trade payment",
+  prospecting: "Prospecting",
+  purchasing: "Purchasing blueprint source",
+  reconciling_purchase: "Confirming purchase",
+  replanning_after_stale_asset: "Replanning after asset change",
+  replanning_relay_coverage: "Replanning relay coverage",
+  resolving: "Resolving event",
+  running: "Running",
+  searching_for_belts: "Searching for asteroid belts",
+  staging: "Staging equipment",
+  staging_survey_fleet: "Staging survey fleet",
+  stowing_matrix: "Stowing replication matrix",
+  travelling_to_shop: "Travelling to shop",
+  waiting_for_criterion_blueprint: "Waiting for required blueprint",
+  waiting_for_recovery_cleanup: "Waiting for recovery cleanup",
+  waiting_for_resource_source: "Waiting for resource source",
+  waiting_for_survey_fleet_claim: "Waiting for survey fleet",
+  waiting_for_trade_payment: "Waiting for trade payment",
+  waiting_for_trade_payment_blueprint: "Waiting for trade-payment blueprint",
+  waiting_for_trade_payment_claim: "Waiting for trade-payment inventory",
+  waiting_for_trade_payment_devices: "Waiting for trade-payment devices",
+  waiting_for_trade_payment_resources: "Waiting for trade-payment resources",
+  waiting_for_trade_return_transport: "Waiting for return transport",
+  waiting_for_trade_reward_capacity: "Waiting for reward capacity",
+  waiting_for_trade_reward_carrier: "Waiting for reward carrier",
+  waiting_to_replan: "Waiting to replan",
+};
+
+function workflowDisplayName(
+  workflow: WorkflowSummary,
+  descriptor: WorkflowDescriptor | undefined,
+) {
+  return (
+    descriptor?.display_name ??
+    workflowDisplayNames[workflow.kind] ??
+    workflow.kind
+      .split(/[._-]+/)
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ")
+  );
+}
+
+function workflowStepName(step: string | null) {
+  if (!step) return "Not started";
+  const curated = workflowStepNames[step];
+  if (curated) return curated;
+  return step
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((word, index) => {
+      const upper = word.toUpperCase();
+      if (["FTL", "L4", "L5"].includes(upper)) return upper;
+      return index === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word;
+    })
+    .join(" ");
+}
+
+type WorkflowScopeItem = {
+  key: string;
+  label: string;
+  value: string;
+};
+
+const hiddenSummaryParameters = new Set([
+  "max_concurrency",
+  "max_hop_ly",
+  "mission_file",
+  "plan_file",
+  "replace_plan",
+  "return_transports",
+  "travel_timeout_seconds",
+  "survey_timeout_seconds",
+  "wait_timeout_seconds",
+  "maintenance_check_seconds",
+  "maintenance_interval",
+  "maintenance_resume_pct",
+  "maintenance_threshold_pct",
+]);
+
+const scopePriority = [
+  "region",
+  "event",
+  "target",
+  "system",
+  "systems",
+  "systems_csv",
+  "destination",
+  "home",
+  "hub",
+  "origin",
+  "replicant",
+  "controller",
+  "device_type",
+];
+
+function compactParameterValue(value: unknown) {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "bigint")
+    return String(value);
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) {
+    const simple = value.filter(
+      (item): item is string | number =>
+        typeof item === "string" || typeof item === "number",
+    );
+    if (!simple.length) return null;
+    const shown = simple.slice(0, 2).map(String);
+    return simple.length > 2
+      ? `${shown.join(", ")} +${String(simple.length - 2)}`
+      : shown.join(", ");
+  }
+  return null;
+}
+
+function workflowScopeItems(
   detail: WorkflowDetail | undefined,
   descriptor: WorkflowDescriptor | undefined,
-  detailError?: string,
-  deferred = false,
-) {
-  if (!detail)
-    return detailError
-      ? `Details unavailable: ${detailError}`
-      : deferred
-        ? "Select for details"
-        : "Loading targets…";
-  const targetNames = new Set(
-    descriptor?.parameters
-      .filter((item) =>
-        [
-          "system",
-          "location",
-          "replicant",
-          "device",
-          "device_type",
-          "entity",
-        ].includes(item.kind.type),
-      )
-      .map((item) => item.name) ?? [],
+): WorkflowScopeItem[] {
+  if (!detail) return [];
+  const labels = Object.fromEntries(
+    descriptor?.parameters.map((item) => [item.name, item.label]) ?? [],
   );
-  const parameters = Object.entries(detail.parameters);
-  const targets = (
-    targetNames.size
-      ? parameters.filter(([key]) => targetNames.has(key))
-      : parameters
-  )
+  const parameters = Object.entries(detail.parameters)
+    .filter(([key]) => !hiddenSummaryParameters.has(key))
+    .map(([key, value]) => ({
+      key,
+      label:
+        labels[key] ??
+        key
+          .replace(/_csv$/, "")
+          .split("_")
+          .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(" "),
+      value: compactParameterValue(value),
+    }))
     .filter(
-      ([, value]) => typeof value === "string" || typeof value === "number",
+      (item): item is WorkflowScopeItem =>
+        item.value !== null && item.value.length > 0,
     )
-    .slice(0, 4)
-    .map(([key, value]) => `${key}: ${String(value)}`);
-  targets.push(...detail.claims.map((claim) => `${claim.kind}: ${claim.id}`));
-  return targets.join(" · ") || "No configured targets";
+    .sort((left, right) => {
+      const leftPriority = scopePriority.indexOf(left.key);
+      const rightPriority = scopePriority.indexOf(right.key);
+      return (
+        (leftPriority < 0 ? Number.MAX_SAFE_INTEGER : leftPriority) -
+        (rightPriority < 0 ? Number.MAX_SAFE_INTEGER : rightPriority)
+      );
+    });
+
+  const visible = parameters.slice(0, 4);
+  if (visible.length < 4 && detail.claims.length) {
+    const grouped = new Map<string, number>();
+    for (const claim of detail.claims) {
+      grouped.set(claim.kind, (grouped.get(claim.kind) ?? 0) + 1);
+    }
+    for (const [kind, count] of grouped) {
+      if (visible.length >= 4) break;
+      visible.push({
+        key: `claim-${kind}`,
+        label: "Claimed",
+        value: `${String(count)} ${kind}${count === 1 ? "" : "s"}`,
+      });
+    }
+  }
+  return visible;
+}
+
+function workflowWaitReason(
+  workflow: WorkflowSummary,
+  detail: WorkflowDetail | undefined,
+  detailError?: string,
+) {
+  if (detailError) return `Details unavailable: ${detailError}`;
+  if (detail?.error) return detail.error;
+  if (detail?.wait_reason) return detail.wait_reason;
+  if (workflow.status === "waiting") {
+    const step = workflow.current_step;
+    if (step === "awaiting_ftl_connectivity")
+      return "Waiting for FTL connectivity to the target system.";
+    if (step === "awaiting_ftl_relay")
+      return "Waiting for the required FTL relay to become available.";
+    if (step === "awaiting_relay_prerequisites")
+      return "Waiting for relay prerequisites such as inventory, a blueprint, or an available worker.";
+    if (step === "awaiting_available_resources")
+      return "Waiting for required resources or claimed devices to become available.";
+    if (step?.startsWith("printing_"))
+      return "Waiting for the current print job to finish.";
+    return "Waiting for a workflow dependency or resource to become ready.";
+  }
+  if (workflow.status === "paused") return "Paused by operator.";
+  return "No blocker — work is progressing.";
 }
 
 function WorkflowRow({
@@ -1153,36 +1364,52 @@ function WorkflowRow({
   onControl: (action: "pause" | "resume" | "cancel") => void;
 }) {
   const active = activeStatuses.includes(workflow.status);
+  const scopeItems = workflowScopeItems(detail, descriptor);
+  const waitReason = workflowWaitReason(workflow, detail, detailError);
   return (
     <article
       className={`workflow-row ${selected ? "selected" : ""} ${detail?.parent_id ? "child" : ""}`.trim()}
     >
       <button className="workflow-row-main" onClick={onSelect}>
-        <span>
+        <span className="workflow-identity">
+          <strong>{workflowDisplayName(workflow, descriptor)}</strong>
           <small>
             {workflow.kind}
             {detail?.parent_id ? " · child workflow" : ""}
           </small>
-          <strong>{descriptor?.display_name ?? workflow.kind}</strong>
         </span>
         <span className={`workflow-status ${workflow.status}`}>
           {workflow.status}
         </span>
-        <span>
+        <span className="workflow-step">
           <small>Current step</small>
-          {workflow.current_step ?? "Not started"}
+          <span>{workflowStepName(workflow.current_step)}</span>
         </span>
-        <span>
-          <small>Targets / resources</small>
-          {targetSummary(detail, descriptor, detailError, !active && !selected)}
+        <span className="workflow-scope">
+          <small>Scope</small>
+          {detail ? (
+            scopeItems.length ? (
+              <span className="workflow-scope-items">
+                {scopeItems.map((item) => (
+                  <span className="workflow-scope-item" key={item.key}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </span>
+                ))}
+              </span>
+            ) : (
+              <span className="workflow-muted">No specific target</span>
+            )
+          ) : (
+            <span className="workflow-muted">
+              {detailError ? "Details unavailable" : "Loading…"}
+            </span>
+          )}
         </span>
-        <span>
-          <small>{detail?.error ? "Error" : "Wait reason"}</small>
-          {detail?.error ?? detail?.wait_reason ?? "—"}
+        <span className={`workflow-wait ${detail?.error ? "error" : ""}`}>
+          <small>{detail?.error ? "Error" : "Status detail"}</small>
+          <span>{waitReason}</span>
         </span>
-        <time dateTime={new Date(workflow.updated_at_ms).toISOString()}>
-          {new Date(workflow.updated_at_ms).toLocaleString()}
-        </time>
       </button>
       {active ? (
         <div className="workflow-actions">

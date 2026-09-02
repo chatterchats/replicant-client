@@ -119,7 +119,7 @@ use replicant_workflow::{
     AutomationPolicy, AutomationTrigger, FiniteExecution as StoredFiniteExecution,
     FiniteExecutionClass, FiniteExecutionStatus as StoredFiniteExecutionStatus, NewTrigger,
     RepositoryError, ResourceKey, SupervisorError, TriggerCondition, TriggerId, TriggerState,
-    TriggerTarget, TriggerTargetClass, WorkflowId, WorkflowInstance, WorkflowKind,
+    TriggerTarget, TriggerTargetClass, WorkItemStatus, WorkflowId, WorkflowInstance, WorkflowKind,
     WorkflowRepository, WorkflowStatus, WorkflowSummary as StoredWorkflowSummary,
     WorkflowSupervisor, WorkflowTelemetrySink,
 };
@@ -7073,10 +7073,7 @@ fn detail(
         .config::<Value>()
         .map_err(ApiError::repository)
         .and_then(config_parameters)?;
-    let wait_reason = instance
-        .wait_intent()
-        .map_err(ApiError::repository)?
-        .map(|intent| intent.description);
+    let wait_reason = workflow_wait_reason(repository, instance)?;
     let claims = repository
         .claims(instance.id)
         .map_err(ApiError::repository)?
@@ -7100,6 +7097,55 @@ fn detail(
             None
         },
     })
+}
+
+fn workflow_wait_reason(
+    repository: &WorkflowRepository,
+    instance: &WorkflowInstance,
+) -> Result<Option<String>, ApiError> {
+    let intent_reason = instance
+        .wait_intent()
+        .map_err(ApiError::repository)?
+        .map(|intent| intent.description);
+    if instance.status != WorkflowStatus::Waiting {
+        return Ok(intent_reason);
+    }
+
+    // Pooled campaign workflows often wait because one durable child item is
+    // blocked. The item carries the useful reason (for example, the exact
+    // resource, blueprint, print, or worker that is unavailable), while the
+    // parent historically exposed only a generic "dependencies or resources"
+    // message. Prefer that concrete durable evidence when it exists.
+    let mut blocked = repository
+        .list_work_items(instance.id)
+        .map_err(ApiError::repository)?
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.state.status,
+                WorkItemStatus::Waiting | WorkItemStatus::Failed
+            )
+        })
+        .filter_map(|item| {
+            let reason = item.state.last_error?.trim().to_owned();
+            (!reason.is_empty()).then_some((item.state.updated_at_ms, reason))
+        })
+        .collect::<Vec<_>>();
+    blocked.sort_by_key(|item| std::cmp::Reverse(item.0));
+    blocked.dedup_by(|left, right| left.1 == right.1);
+
+    let Some((_, primary)) = blocked.first() else {
+        return Ok(intent_reason);
+    };
+    let additional = blocked.len().saturating_sub(1);
+    if additional == 0 {
+        Ok(Some(primary.clone()))
+    } else {
+        Ok(Some(format!(
+            "{primary} (+{additional} other blocked item{})",
+            if additional == 1 { "" } else { "s" }
+        )))
+    }
 }
 
 fn config_parameters(value: Value) -> Result<BTreeMap<String, Value>, ApiError> {

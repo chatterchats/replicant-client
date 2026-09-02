@@ -484,6 +484,34 @@ pub fn mining_work_item_specs(
     Ok(specs)
 }
 
+fn mining_site_positive_count(quantity: i64) -> Option<u32> {
+    u32::try_from(quantity).ok().filter(|count| *count > 0)
+}
+
+fn mining_site_has_missing(missing: &QuantityMap, device_type: &str) -> bool {
+    missing
+        .get(device_type)
+        .and_then(|quantity| mining_site_positive_count(*quantity))
+        .is_some()
+}
+
+fn mining_site_transport_quantity(missing: &QuantityMap) -> u64 {
+    missing
+        .iter()
+        .filter(|(device_type, _)| {
+            matches!(
+                device_type.as_str(),
+                MINING_CONTROLLER
+                    | MINING_DRONE
+                    | SURVEY_CONTROLLER
+                    | SURVEY_DRONE
+                    | MAINTENANCE_DRONE
+            )
+        })
+        .filter_map(|(_, quantity)| mining_site_positive_count(*quantity).map(u64::from))
+        .fold(0, u64::saturating_add)
+}
+
 fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<ResourceRequirement> {
     let scope = || RequirementScope::Region(region.to_owned());
     let mut requirements = vec![ResourceRequirement {
@@ -495,12 +523,9 @@ fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<Resour
         quantity: 1,
     }];
     for (device_type, quantity) in &site.missing {
-        let Ok(count) = u32::try_from(*quantity) else {
+        let Some(count) = mining_site_positive_count(*quantity) else {
             continue;
         };
-        if count == 0 {
-            continue;
-        }
         let key = match device_type.as_str() {
             MINING_CONTROLLER => "mining_controller",
             MINING_DRONE => "mining_drones",
@@ -519,11 +544,7 @@ fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<Resour
             quantity: 1,
         });
     }
-    let missing_devices = site
-        .missing
-        .values()
-        .filter_map(|quantity| u64::try_from(*quantity).ok())
-        .sum::<u64>();
+    let missing_devices = mining_site_transport_quantity(&site.missing);
     if missing_devices > 0 {
         requirements.push(ResourceRequirement {
             key: "carrier".into(),
@@ -534,8 +555,8 @@ fn mining_site_item_requirements(region: &str, site: &SiteMission) -> Vec<Resour
             quantity: 1,
         });
         requirements.push(ResourceRequirement {
-            key: "stow".into(),
-            kind: "stow".into(),
+            key: "attach".into(),
+            kind: "attach".into(),
             capabilities: Vec::new(),
             scope: scope(),
             count: 1,
@@ -572,14 +593,6 @@ fn mining_route_item_requirements(region: &str) -> Vec<ResourceRequirement> {
             count: 1,
             quantity: 1,
         },
-        ResourceRequirement {
-            key: "stow".into(),
-            kind: "stow".into(),
-            capabilities: Vec::new(),
-            scope: scope(),
-            count: 1,
-            quantity: 2,
-        },
     ]
 }
 
@@ -601,14 +614,14 @@ pub async fn execute_mining_item(
                 app_error(io::ErrorKind::InvalidInput, "mining site index is invalid")
             })?;
             let missing = site.missing.clone();
-            if missing.contains_key(MINING_CONTROLLER) {
+            if mining_site_has_missing(&missing, MINING_CONTROLLER) {
                 site.assets.mining_controller = Some(mining_allocated_identity(
                     allocations,
                     "mining_controller",
                     "device",
                 )?);
             }
-            if missing.contains_key(MINING_DRONE) {
+            if mining_site_has_missing(&missing, MINING_DRONE) {
                 site.assets
                     .mining_drones
                     .extend(mining_allocated_identities(
@@ -619,14 +632,14 @@ pub async fn execute_mining_item(
                 site.assets.mining_drones.sort();
                 site.assets.mining_drones.dedup();
             }
-            if missing.contains_key(SURVEY_CONTROLLER) {
+            if mining_site_has_missing(&missing, SURVEY_CONTROLLER) {
                 site.assets.survey_controller = Some(mining_allocated_identity(
                     allocations,
                     "survey_controller",
                     "device",
                 )?);
             }
-            if missing.contains_key(SURVEY_DRONE) {
+            if mining_site_has_missing(&missing, SURVEY_DRONE) {
                 site.assets
                     .survey_drones
                     .extend(mining_allocated_identities(
@@ -637,14 +650,14 @@ pub async fn execute_mining_item(
                 site.assets.survey_drones.sort();
                 site.assets.survey_drones.dedup();
             }
-            if missing.contains_key(MAINTENANCE_DRONE) {
+            if mining_site_has_missing(&missing, MAINTENANCE_DRONE) {
                 site.assets.maintenance_drone = Some(mining_allocated_identity(
                     allocations,
                     "maintenance_drone",
                     "device",
                 )?);
             }
-            if missing.contains_key(SYSTEM_WARD) {
+            if mining_site_has_missing(&missing, SYSTEM_WARD) {
                 // Keep the allocated ward reserved for the follow-up delivery.
                 // The nine mining devices can deploy and begin configuring first.
                 site.assets.system_ward = Some(mining_allocated_identity(
@@ -653,9 +666,9 @@ pub async fn execute_mining_item(
                     "device",
                 )?);
             }
-            if !missing.is_empty() {
+            if mining_site_transport_quantity(&missing) > 0 {
                 site.carrier = Some(mining_allocated_identity(allocations, "carrier", "device")?);
-                mining_validate_stow_owner(allocations, "carrier")?;
+                mining_validate_carrier_capacity_owner(allocations)?;
             }
             site.missing
                 .retain(|device_type, _| device_type == SYSTEM_WARD);
@@ -678,7 +691,6 @@ pub async fn execute_mining_item(
                 "freighter",
                 "device",
             )?);
-            mining_validate_stow_owner(allocations, "freighter")?;
             lane.routes = vec![route];
             lane.sites.clear();
             lane.print_batches
@@ -778,27 +790,29 @@ fn mining_allocated_identities(
         .collect()
 }
 
-fn mining_validate_stow_owner(
-    allocations: &AllocationSet,
-    device_requirement: &str,
-) -> AnyResult<()> {
-    let device = mining_allocated_identity(allocations, device_requirement, "device")?;
-    let matching = allocations
-        .by_requirement
-        .get("stow")
-        .into_iter()
-        .flatten()
-        .any(|allocation| {
-            matches!(
-                &allocation.resource,
-                ResourceKey::Namespaced { namespace, key }
-                    if namespace == "stow" && key == &device
-            )
-        });
+fn mining_validate_carrier_capacity_owner(allocations: &AllocationSet) -> AnyResult<()> {
+    let carrier = mining_allocated_identity(allocations, "carrier", "device")?;
+    let matching = ["attach", "stow"].into_iter().any(|requirement| {
+        allocations
+            .by_requirement
+            .get(requirement)
+            .into_iter()
+            .flatten()
+            .any(|allocation| {
+                matches!(
+                    &allocation.resource,
+                    ResourceKey::Namespaced { namespace, key }
+                        if matches!(
+                            (requirement, namespace.as_str()),
+                            ("attach", "attach") | ("stow", "attach" | "stow")
+                        ) && key == &carrier
+                )
+            })
+    });
     if !matching {
         return Err(app_error(
             io::ErrorKind::InvalidData,
-            format!("mining item stow allocation does not belong to {device}"),
+            format!("mining item attachment-capacity allocation does not belong to {carrier}"),
         ));
     }
     Ok(())
@@ -2190,6 +2204,75 @@ mod tests {
         let long =
             mining_mission_tag("A-SYSTEM-NAME-THAT-IS-WELL-PAST-THE-DEVICE-TAG-LIMIT-BELT-1");
         assert!(long.chars().count() <= MAX_DEVICE_TAG_CHARS);
+    }
+
+    #[test]
+    fn mining_site_delivery_requires_attachment_capacity() {
+        let site = SiteMission {
+            system: "PHASYRIS".into(),
+            belt: "PHASYRIS-BELT-1".into(),
+            density: "dense".into(),
+            tag: "mine-site:phasyris".into(),
+            phase: SitePhase::Planned,
+            assets: SiteAssets::default(),
+            missing: [
+                (MINING_CONTROLLER.into(), 1),
+                (MINING_DRONE.into(), 8),
+                (SYSTEM_WARD.into(), 1),
+            ]
+            .into_iter()
+            .collect(),
+            carrier: None,
+        };
+        let requirements = mining_site_item_requirements("delta", &site);
+        let attachment = requirements
+            .iter()
+            .find(|requirement| requirement.key == "attach")
+            .expect("attachment-capacity requirement");
+
+        assert_eq!(attachment.kind, "attach");
+        assert_eq!(attachment.quantity, 9);
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| requirement.key != "stow")
+        );
+
+        let mut ward_only = site;
+        ward_only.missing = [
+            (SYSTEM_WARD.into(), 1),
+            (MINING_DRONE.into(), 0),
+            ("unknown_device".into(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let ward_requirements = mining_site_item_requirements("delta", &ward_only);
+        assert!(
+            ward_requirements
+                .iter()
+                .all(|requirement| requirement.key != "carrier")
+        );
+        assert!(
+            ward_requirements
+                .iter()
+                .all(|requirement| requirement.key != "attach")
+        );
+    }
+
+    #[test]
+    fn mining_transport_routes_do_not_require_stow_capacity() {
+        let requirements = mining_route_item_requirements("delta");
+        let keys = requirements
+            .iter()
+            .map(|requirement| requirement.key.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, ["worker", "transport_controller", "freighter"]);
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| requirement.kind != "stow")
+        );
     }
 
     #[tokio::test]

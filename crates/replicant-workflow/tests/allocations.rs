@@ -277,6 +277,149 @@ fn allocation_affinity_pairs_stow_with_selected_carrier() {
 }
 
 #[test]
+fn allocation_policy_can_ignore_obsolete_persisted_requirement() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let campaign = campaign(&repository);
+    let mut freighter = requirement("freighter", "device", 1, 1);
+    freighter.capabilities.push("cargo_freighter".into());
+    let stow = requirement("stow", "stow", 1, 2);
+    let allocation_item = item(
+        &repository,
+        campaign.id,
+        "legacy-route-stow",
+        vec![freighter, stow],
+    );
+    let mut available_freighter = candidate(ResourceKey::Device("FREIGHTER-1".into()), "device", 1);
+    available_freighter
+        .capabilities
+        .push("cargo_freighter".into());
+
+    let allocated = repository
+        .allocate_requirements_with_policy(
+            allocation_item.id,
+            allocation_item.state.revision,
+            &[available_freighter],
+            &[],
+            &["stow"],
+        )
+        .expect("obsolete stow requirement is ignored");
+
+    assert_eq!(
+        allocated.by_requirement["freighter"][0].resource,
+        ResourceKey::Device("FREIGHTER-1".into())
+    );
+    assert!(!allocated.by_requirement.contains_key("stow"));
+}
+
+#[test]
+fn allocation_shortage_explains_affined_dependent_capacity() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let campaign = campaign(&repository);
+    let mut freighter = requirement("freighter", "device", 1, 1);
+    freighter.capabilities.push("cargo_freighter".into());
+    let stow = requirement("stow", "stow", 1, 2);
+    let allocation_item = item(
+        &repository,
+        campaign.id,
+        "diagnostic-route-stow",
+        vec![freighter, stow],
+    );
+    let mut first = candidate(ResourceKey::Device("FREIGHTER-1".into()), "device", 1);
+    first.capabilities.push("cargo_freighter".into());
+    let mut second = candidate(ResourceKey::Device("FREIGHTER-2".into()), "device", 1);
+    second.capabilities.push("cargo_freighter".into());
+
+    let error = repository
+        .allocate_requirements_with_affinity(
+            allocation_item.id,
+            allocation_item.state.revision,
+            &[first, second],
+            &[("stow", "freighter")],
+        )
+        .expect_err("paired stow is unavailable");
+    let message = error.to_string();
+
+    assert!(message.contains("2 cargo freighter candidates match the requirement"));
+    assert!(message.contains(
+        "2 cannot satisfy dependent stow capacity (2 free stow slots on the same resource)"
+    ));
+}
+
+#[test]
+fn allocation_shortage_explains_affined_attachment_capacity() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let campaign = campaign(&repository);
+    let mut carrier = requirement("carrier", "device", 1, 1);
+    carrier.capabilities.push("surge_carrier".into());
+    let attach = requirement("attach", "attach", 1, 9);
+    let allocation_item = item(
+        &repository,
+        campaign.id,
+        "diagnostic-site-attach",
+        vec![carrier, attach],
+    );
+    let mut first = candidate(ResourceKey::Device("CARRIER-1".into()), "device", 1);
+    first.capabilities.push("surge_carrier".into());
+
+    let error = repository
+        .allocate_requirements_with_affinity(
+            allocation_item.id,
+            allocation_item.state.revision,
+            &[first],
+            &[("attach", "carrier")],
+        )
+        .expect_err("paired attachment capacity is unavailable");
+    let message = error.to_string();
+
+    assert!(message.contains("1 surge carrier candidate matches the requirement"));
+    assert!(message.contains(
+        "1 cannot satisfy dependent attachment capacity (9 free attachment slots on the same resource)"
+    ));
+}
+
+#[test]
+fn legacy_stow_alias_shares_attachment_capacity_pool() {
+    let repository = WorkflowRepository::open_in_memory().expect("open repository");
+    let current_campaign = campaign(&repository);
+    let legacy_campaign = campaign(&repository);
+    let current = item(
+        &repository,
+        current_campaign.id,
+        "current-site-attach",
+        vec![requirement("attach", "attach", 1, 6)],
+    );
+    let legacy = item(
+        &repository,
+        legacy_campaign.id,
+        "legacy-site-stow",
+        vec![requirement("stow", "stow", 1, 4)],
+    );
+    let resource = ResourceKey::Namespaced {
+        namespace: "attach".into(),
+        key: "CARRIER-1".into(),
+    };
+    let candidates = [
+        candidate(resource.clone(), "attach", 9),
+        candidate(resource, "stow", 9),
+    ];
+
+    repository
+        .allocate_requirements(current.id, current.state.revision, &candidates)
+        .expect("current site reserves attachment capacity");
+    let error = repository
+        .allocate_requirements(legacy.id, legacy.state.revision, &candidates)
+        .expect_err("legacy alias must share the canonical attachment pool");
+
+    assert!(matches!(
+        error,
+        RepositoryError::AllocationShortage {
+            requirement_key,
+            ..
+        } if requirement_key == "stow"
+    ));
+}
+
+#[test]
 fn allocation_affinity_skips_transport_without_required_stow_capacity() {
     let repository = WorkflowRepository::open_in_memory().expect("open repository");
     let campaign = campaign(&repository);

@@ -1002,9 +1002,11 @@ h1 {
   min-width: 0;
   flex: 1;
   display: grid;
-  grid-template-columns: 1.1fr auto 0.8fr 1.4fr 1fr auto;
+  grid-template-columns:
+    minmax(190px, 0.95fr) auto minmax(170px, 0.8fr)
+    minmax(260px, 1.35fr) minmax(240px, 1.2fr);
   align-items: center;
-  gap: 16px;
+  gap: 18px;
   border: 0;
   background: transparent;
   padding: 14px;
@@ -1013,14 +1015,63 @@ h1 {
 }
 .workflow-row-main > span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
-.workflow-row-main small,
-.workflow-row-main time {
+.workflow-row-main small {
   display: block;
   color: var(--text-faint);
   font-size: 0.72rem;
+}
+.workflow-identity strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 0.98rem;
+}
+.workflow-identity small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workflow-step > span,
+.workflow-wait > span {
+  display: block;
+  margin-top: 3px;
+  line-height: 1.35;
+}
+.workflow-scope-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.workflow-scope-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.045);
+  padding: 3px 6px;
+  font-size: 0.74rem;
+  line-height: 1.2;
+}
+.workflow-scope-item > span {
+  color: var(--text-faint);
+}
+.workflow-scope-item strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.workflow-muted {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+}
+.workflow-wait.error > span {
+  color: var(--danger);
 }
 .workflow-status,
 .risk {

@@ -152,12 +152,16 @@ pub enum RepositoryError {
         to: WorkItemStatus,
     },
     /// Available candidate capacity cannot satisfy one requirement.
-    #[error("resource requirement {requirement_key:?} is short by {missing_count} candidates")]
+    #[error(
+        "resource requirement {requirement_key:?} cannot be fully allocated ({missing_count} missing){details}"
+    )]
     AllocationShortage {
         /// Stable requirement key.
         requirement_key: String,
         /// Number of additional pool members required.
         missing_count: u32,
+        /// Human-readable explanation of why discovered candidates were rejected.
+        details: String,
     },
     /// A work-item assignment identifier was empty.
     #[error("invalid work item assignment: {0}")]
@@ -1831,6 +1835,28 @@ impl WorkflowRepository {
         candidates: &[AllocationCandidate],
         affinities: &[(&str, &str)],
     ) -> Result<AllocationSet, RepositoryError> {
+        self.allocate_requirements_with_policy(
+            item_id,
+            expected_revision,
+            candidates,
+            affinities,
+            &[],
+        )
+    }
+
+    /// Atomically allocates stored requirements with runtime-only affinity and compatibility
+    /// policy.
+    ///
+    /// Ignored keys remain persisted in immutable work-item specs but are not allocated. This is
+    /// intended only for retiring requirements that older runtime versions persisted incorrectly.
+    pub fn allocate_requirements_with_policy(
+        &self,
+        item_id: WorkItemId,
+        expected_revision: u64,
+        candidates: &[AllocationCandidate],
+        affinities: &[(&str, &str)],
+        ignored_requirement_keys: &[&str],
+    ) -> Result<AllocationSet, RepositoryError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let item = read_work_item_in(&transaction, item_id)?
@@ -1845,7 +1871,27 @@ impl WorkflowRepository {
         }
         let requirements: Vec<ResourceRequirement> =
             serde_json::from_value(item.spec.requirements_json.clone())?;
+        let ignored_requirement_keys = ignored_requirement_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let mut allocation_set = list_active_allocations_in(&transaction, item_id)?;
+        for requirement_key in &ignored_requirement_keys {
+            if let Some(allocations) = allocation_set.by_requirement.remove(*requirement_key) {
+                for allocation in allocations {
+                    release_active_allocation_in(
+                        &transaction,
+                        item.spec.workflow_id,
+                        &allocation,
+                        item.state.updated_at_ms,
+                    )?;
+                }
+            }
+        }
+        let requirements = requirements
+            .into_iter()
+            .filter(|requirement| !ignored_requirement_keys.contains(requirement.key.as_str()))
+            .collect::<Vec<_>>();
 
         let mut ordered_candidates = candidates.to_vec();
         ordered_candidates.sort_by(|left, right| {
@@ -1945,7 +1991,13 @@ impl WorkflowRepository {
                     .collect::<BTreeSet<_>>();
                 let mut retained = Vec::with_capacity(selected.len());
                 for allocation in selected {
-                    if allowed_keys.contains(resource_identity_key(&allocation.resource)) {
+                    let candidate_is_current = ordered_candidates.iter().any(|candidate| {
+                        candidate.resource == allocation.resource
+                            && candidate_matches_requirement(candidate, requirement)
+                    });
+                    if allowed_keys.contains(resource_identity_key(&allocation.resource))
+                        && candidate_is_current
+                    {
                         retained.push(allocation);
                         continue;
                     }
@@ -1958,16 +2010,27 @@ impl WorkflowRepository {
                 }
                 selected = retained;
             }
+            let mut diagnostics = AllocationShortageDiagnostics::default();
             for candidate in &ordered_candidates {
-                if selected.len() >= usize::try_from(requirement.count).unwrap_or(usize::MAX)
-                    || !candidate_matches_requirement(candidate, requirement)
-                    || !candidate_matches_affinity(
-                        candidate,
-                        &requirement.key,
-                        affinities,
-                        &allocation_set,
-                    )
-                {
+                if selected.len() >= usize::try_from(requirement.count).unwrap_or(usize::MAX) {
+                    break;
+                }
+                if !candidate_matches_kind_capabilities(candidate, requirement) {
+                    continue;
+                }
+                diagnostics.kind_matches = diagnostics.kind_matches.saturating_add(1);
+                if !candidate_matches_scope(candidate, &requirement.scope) {
+                    diagnostics.scope_rejected = diagnostics.scope_rejected.saturating_add(1);
+                    continue;
+                }
+                diagnostics.scope_matches = diagnostics.scope_matches.saturating_add(1);
+                if !candidate_matches_affinity(
+                    candidate,
+                    &requirement.key,
+                    affinities,
+                    &allocation_set,
+                ) {
+                    diagnostics.affinity_rejected = diagnostics.affinity_rejected.saturating_add(1);
                     continue;
                 }
                 if !candidate_supports_affined_dependents(
@@ -1980,6 +2043,8 @@ impl WorkflowRepository {
                     item.spec.workflow_id,
                     affinities,
                 )? {
+                    diagnostics.dependent_affinity_rejected =
+                        diagnostics.dependent_affinity_rejected.saturating_add(1);
                     continue;
                 }
                 let pool_key = serde_json::to_string(&candidate.resource)?;
@@ -2002,6 +2067,7 @@ impl WorkflowRepository {
                     }
                 })?;
                 if available_quantity.saturating_sub(active_quantity) < requested_quantity {
+                    diagnostics.capacity_rejected = diagnostics.capacity_rejected.saturating_add(1);
                     continue;
                 }
                 let (namespace, key) = candidate.resource.persisted_parts()?;
@@ -2017,6 +2083,8 @@ impl WorkflowRepository {
                         |row| row.get(0),
                     )?;
                     if has_active_assignment {
+                        diagnostics.assignment_rejected =
+                            diagnostics.assignment_rejected.saturating_add(1);
                         continue;
                     }
                 }
@@ -2033,6 +2101,7 @@ impl WorkflowRepository {
                         .as_deref()
                         .is_some_and(|owner| owner != item.spec.workflow_id.to_string())
                     {
+                        diagnostics.claim_rejected = diagnostics.claim_rejected.saturating_add(1);
                         continue;
                     }
                 }
@@ -2082,6 +2151,7 @@ impl WorkflowRepository {
                 return Err(RepositoryError::AllocationShortage {
                     requirement_key: requirement.key.clone(),
                     missing_count: requirement.count - selected_count,
+                    details: diagnostics.render(requirement, &requirements, affinities),
                 });
             }
             allocation_set
@@ -2143,6 +2213,7 @@ impl WorkflowRepository {
             .ok_or_else(|| RepositoryError::AllocationShortage {
                 requirement_key: requirement_key.clone(),
                 missing_count: 1,
+                details: "; persisted requirement is no longer present in the work item".to_owned(),
             })?;
         transaction.execute(
             "UPDATE workflow_resource_allocations
@@ -2841,6 +2912,152 @@ fn release_active_allocation_in(
         )?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct AllocationShortageDiagnostics {
+    kind_matches: usize,
+    scope_matches: usize,
+    scope_rejected: usize,
+    affinity_rejected: usize,
+    dependent_affinity_rejected: usize,
+    capacity_rejected: usize,
+    assignment_rejected: usize,
+    claim_rejected: usize,
+}
+
+impl AllocationShortageDiagnostics {
+    fn render(
+        &self,
+        requirement: &ResourceRequirement,
+        requirements: &[ResourceRequirement],
+        affinities: &[(&str, &str)],
+    ) -> String {
+        let label = allocation_requirement_label(requirement);
+        if self.kind_matches == 0 {
+            return format!(
+                "; no owned {label} candidates match the required type or capabilities"
+            );
+        }
+        if self.scope_matches == 0 {
+            return format!(
+                "; {} owned {label} candidate{} found, but none are in {}",
+                self.kind_matches,
+                plural_suffix(self.kind_matches),
+                allocation_scope_description(&requirement.scope),
+            );
+        }
+
+        let mut blockers = Vec::new();
+        if self.scope_rejected > 0 {
+            blockers.push(format!(
+                "{} outside {}",
+                self.scope_rejected,
+                allocation_scope_description(&requirement.scope),
+            ));
+        }
+        if self.affinity_rejected > 0 {
+            blockers.push(format!(
+                "{} do not match the required resource pairing",
+                self.affinity_rejected
+            ));
+        }
+        if self.dependent_affinity_rejected > 0 {
+            let dependency = affined_dependency_description(requirement, requirements, affinities);
+            blockers.push(format!(
+                "{} cannot satisfy {dependency}",
+                self.dependent_affinity_rejected
+            ));
+        }
+        if self.capacity_rejected > 0 {
+            blockers.push(format!("{} lack free capacity", self.capacity_rejected));
+        }
+        if self.assignment_rejected > 0 {
+            blockers.push(format!(
+                "{} already assigned to active work",
+                self.assignment_rejected
+            ));
+        }
+        if self.claim_rejected > 0 {
+            blockers.push(format!(
+                "{} claimed by other workflows",
+                self.claim_rejected
+            ));
+        }
+
+        let match_verb = if self.scope_matches == 1 {
+            "matches"
+        } else {
+            "match"
+        };
+        let summary = format!(
+            "; {} {label} candidate{} {match_verb} the requirement",
+            self.scope_matches,
+            plural_suffix(self.scope_matches),
+        );
+        if blockers.is_empty() {
+            summary
+        } else {
+            format!("{summary}; unavailable: {}", blockers.join(", "))
+        }
+    }
+}
+
+fn allocation_requirement_label(requirement: &ResourceRequirement) -> String {
+    requirement.capabilities.first().map_or_else(
+        || humanize_allocation_token(&requirement.kind),
+        |capability| humanize_allocation_token(capability),
+    )
+}
+
+fn humanize_allocation_token(value: &str) -> String {
+    value.replace(['_', '-'], " ")
+}
+
+fn allocation_scope_description(scope: &RequirementScope) -> String {
+    match scope {
+        RequirementScope::Anywhere => "the available resource pool".to_owned(),
+        RequirementScope::Region(region) => format!("region {region}"),
+        RequirementScope::System(system) => format!("system {system}"),
+        RequirementScope::Location(location) => format!("location {location}"),
+        RequirementScope::WithinLy { origin, range_ly } => {
+            format!("{range_ly} LY of {origin}")
+        }
+    }
+}
+
+fn affined_dependency_description(
+    parent: &ResourceRequirement,
+    requirements: &[ResourceRequirement],
+    affinities: &[(&str, &str)],
+) -> String {
+    let Some(dependent) = requirements.iter().find(|requirement| {
+        affinity_parent(&requirement.key, affinities) == Some(parent.key.as_str())
+    }) else {
+        return "a dependent resource requirement".to_owned();
+    };
+    let label = allocation_requirement_label(dependent);
+    match dependent.kind.as_str() {
+        "stow" => format!(
+            "dependent {label} capacity ({} free stow slot{} on the same resource)",
+            dependent.quantity,
+            plural_suffix(usize::try_from(dependent.quantity).unwrap_or(usize::MAX)),
+        ),
+        "attach" => format!(
+            "dependent attachment capacity ({} free attachment slot{} on the same resource)",
+            dependent.quantity,
+            plural_suffix(usize::try_from(dependent.quantity).unwrap_or(usize::MAX)),
+        ),
+        _ => format!(
+            "dependent {label} capacity ({} unit{} on the same resource)",
+            dependent.quantity,
+            plural_suffix(usize::try_from(dependent.quantity).unwrap_or(usize::MAX)),
+        ),
+    }
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn affinity_parent<'a>(requirement_key: &str, affinities: &'a [(&str, &str)]) -> Option<&'a str> {
