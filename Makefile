@@ -30,7 +30,7 @@ DOCS_CRAWLER_PYTHON ?= $(DOCS_CRAWLER_DIR)/venv/bin/python
 # Deployment and utility targets
 .PHONY: docker-artifacts docker-build docker-check docker-down docker-persistence-smoke
 .PHONY: docker-rebuild-deploy docker-restart docker-smoke docker-up
-.PHONY: observability-down observability-up token token-rotate utility-tests zip zip-with-data
+.PHONY: observability-down observability-up token token-rotate utility-tests zip zip-all
 
 help:
 	@printf '%s\n' \
@@ -83,7 +83,7 @@ help:
 	  'Utilities' \
 	  '  docs-reference-sync      Refresh the newest Replicant Space reference snapshot' \
 	  '  zip                      Create a clean working-tree ZIP for handoff' \
-	  '  zip-with-data            Create repository, local log, and database ZIPs' \
+	  '  zip-all                  Create repository, local log, and database ZIPs' \
 	  '  token                    Generate a REPLICANTD_TOKEN in .env if not present' \
 	  '  token-rotate             Rotate the REPLICANTD_TOKEN in .env' \
 	  ''
@@ -296,7 +296,7 @@ docker-persistence-smoke: docker-build
 zip:
 	$(PYTHON) scripts/repo_zip.py $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
 
-zip-with-data:
+zip-all:
 	$(PYTHON) scripts/repo_zip.py --include-local-data $(if $(ZIP_NAME),--output "$(ZIP_NAME)")
 
 
