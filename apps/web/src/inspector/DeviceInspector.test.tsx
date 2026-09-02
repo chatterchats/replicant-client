@@ -250,4 +250,119 @@ describe("DeviceInspector", () => {
       })[0]?.initialParameters?.device,
     ).toBe("HEAVEN");
   });
+
+  it("filters controller, release, and stow targets from live device state", () => {
+    const controller: DeviceSummary = {
+      ...device,
+      entity: { kind: "device", id: "TRANSPORT-CONTROLLER" },
+      device_type: "transport_controller",
+      available_commands: ["adopt", "release", "stow", "set_directive"],
+      available_directives: ["delivery", "shuttle"],
+      controlled_devices: ["ADOPTED"],
+    };
+    const candidate = (
+      id: string,
+      deviceType: string,
+      overrides: Partial<DeviceSummary> = {},
+    ): DeviceSummary => ({
+      ...device,
+      entity: { kind: "device", id },
+      device_type: deviceType,
+      available_commands: [],
+      controlled_devices: [],
+      stow_capacity: 0,
+      stow_used: 0,
+      ...overrides,
+    });
+    const devices = [
+      controller,
+      candidate("TRANSPORT", "transport_drone"),
+      candidate("MINER", "mining_drone"),
+      candidate("REMOTE", "transport_drone", { system: "ALPHA" }),
+      candidate("ADOPTED", "transport_drone", {
+        controller: controller.entity.id,
+      }),
+      candidate("STOW-HOST", "cargo_vessel", {
+        stow_capacity: 10,
+        stow_used: 9,
+      }),
+      candidate("FULL-HOST", "cargo_vessel", {
+        stow_capacity: 10,
+        stow_used: 10,
+      }),
+    ];
+    const contextualCatalog: DescriptorCatalog = {
+      reports: [],
+      workflows: [],
+      actions: [
+        action("device.adopt", "adopt", "elevated", [
+          parameter("device", true, "device"),
+          parameter("target", true, "device"),
+        ]),
+        action("device.release", "release", "elevated", [
+          parameter("device", true, "device"),
+          parameter("target", true, "device"),
+        ]),
+        action("device.stow", "stow", "elevated", [
+          parameter("device", true, "device"),
+          parameter("target", false, "device"),
+        ]),
+        action("device.set_directive", "set_directive", "elevated", [
+          parameter("device", true, "device"),
+          parameter("directive"),
+        ]),
+      ],
+    };
+    const commands = advertisedDeviceCommands(
+      contextualCatalog,
+      controller,
+      {},
+      devices,
+      [
+        {
+          device_type: "transport_drone",
+          short_description: null,
+          description: null,
+          print_time_seconds: null,
+          resources: [],
+          components: [],
+          features: ["transport"],
+          directives: [],
+          cargo_capacity: 20,
+          attach_capacity: 0,
+          stow_capacity: 0,
+          queue_size: null,
+        },
+        {
+          device_type: "mining_drone",
+          short_description: null,
+          description: null,
+          print_time_seconds: null,
+          resources: [],
+          components: [],
+          features: ["mine"],
+          directives: [],
+          cargo_capacity: 0,
+          attach_capacity: 0,
+          stow_capacity: 0,
+          queue_size: null,
+        },
+      ],
+    );
+    const options = (kind: string, parameterName: string) =>
+      commands
+        .find((command) => command.descriptor.kind === kind)
+        ?.descriptor.parameters.find(
+          (parameter) => parameter.name === parameterName,
+        )
+        ?.options.map((option) => option.value);
+
+    expect(options("device.adopt", "target")).toEqual(["TRANSPORT"]);
+    expect(options("device.release", "target")).toEqual(["ADOPTED"]);
+    expect(options("device.stow", "target")).toEqual(["STOW-HOST"]);
+    expect(options("device.set_directive", "directive")).toEqual([
+      "delivery",
+      "shuttle",
+    ]);
+  });
 });

@@ -5,7 +5,10 @@ import {
   LogisticsWorkflowForm,
   ParameterField,
   validateParameters,
+  visibleParameters,
 } from "./AutomationsPage";
+export { visibleParameters } from "./AutomationsPage";
+
 import { daemonApi } from "./api";
 import type {
   DescriptorCatalog,
@@ -138,32 +141,6 @@ export function resolveContextDefaults(
       }
       return [parameter.name, contextual ?? parameter.default ?? ""];
     }),
-  );
-}
-
-const directiveParameters: Record<string, readonly string[]> = {
-  gather_resources: ["resources_json"],
-  maintain_ratios: ["ratios_json"],
-  gather_salvage: ["location", "recall"],
-  survey_system: ["planets", "moons", "recall"],
-  delivery: ["collect", "deliver", "requirement_json"],
-  shuttle: ["collect", "deliver", "priority"],
-  ferry: ["collect", "deliver", "priority"],
-  consolidate: ["deliver", "priority"],
-};
-
-export function visibleParameters(
-  descriptor: OperationDescriptor,
-  values: Record<string, unknown>,
-) {
-  if (descriptor.kind !== "device.set_directive") return descriptor.parameters;
-  const visible = new Set([
-    "device",
-    "directive",
-    ...(directiveParameters[String(values.directive)] ?? []),
-  ]);
-  return descriptor.parameters.filter((parameter) =>
-    visible.has(parameter.name),
   );
 }
 

@@ -174,6 +174,11 @@ it("shows only configuration fields used by the selected directive", () => {
       "collect",
       "deliver",
       "priority",
+      "name",
+      "description",
+      "announcement",
+      "configuration_json",
+      "notify_json",
     ].map((name) => ({ ...base, name })),
   };
 
@@ -181,12 +186,24 @@ it("shows only configuration fields used by the selected directive", () => {
     visibleParameters(directive, { directive: "gather_salvage" }).map(
       (parameter) => parameter.name,
     ),
-  ).toEqual(["device", "directive", "location", "recall"]);
+  ).toEqual(["device", "directive", "location", "recall", "notify_json"]);
   expect(
     visibleParameters(directive, { directive: "patrol" }).map(
       (parameter) => parameter.name,
     ),
-  ).toEqual(["device", "directive"]);
+  ).toEqual(["device", "directive", "configuration_json", "notify_json"]);
+  expect(
+    visibleParameters(directive, { directive: "trade" }).map(
+      (parameter) => parameter.name,
+    ),
+  ).toEqual([
+    "device",
+    "directive",
+    "name",
+    "description",
+    "announcement",
+    "notify_json",
+  ]);
 });
 
 it("keeps typed confirmation for bulk and non-device elevated actions", () => {

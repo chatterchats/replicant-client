@@ -1,5 +1,6 @@
 import type { DescriptorCommand } from "../CommandPalette";
 import type {
+  BlueprintSummary,
   DescriptorCatalog,
   DeviceSummary,
   EntitySummary,
@@ -137,10 +138,55 @@ export function fallbackSummary(
   };
 }
 
+const RESOURCE_TYPES = [
+  "carbon",
+  "conductive",
+  "rares",
+  "silicates",
+  "structural",
+  "volatiles",
+];
+
+function compatibleAdoptionTarget(
+  controllerType: string | null,
+  targetType: string | null,
+  blueprints: BlueprintSummary[],
+) {
+  if (!controllerType || !targetType) return false;
+  if (controllerType === "mining_controller")
+    return targetType === "mining_drone";
+  if (controllerType === "survey_controller")
+    return targetType === "survey_drone";
+  const blueprint = blueprints.find(
+    (candidate) => candidate.device_type === targetType,
+  );
+  if (controllerType === "transport_controller")
+    return blueprint
+      ? blueprint.features.includes("transport")
+      : targetType.includes("transport") || targetType === "cargo_freighter";
+  if (controllerType === "fleet_controller")
+    return blueprint
+      ? blueprint.features.includes("surge")
+      : targetType.includes("surge") || targetType === "cargo_freighter";
+  return true;
+}
+
+function deviceOptions(
+  candidates: DeviceSummary[],
+  entities: Record<string, EntitySummary>,
+) {
+  return candidates.map((candidate) => ({
+    value: candidate.entity.id,
+    label: relatedDeviceLabel(candidate.entity.id, entities),
+  }));
+}
+
 export function specializeDeviceCommand(
   command: DescriptorCommand,
   device: DeviceSummary,
   entities: Record<string, EntitySummary> = {},
+  devices: DeviceSummary[] = [],
+  blueprints: BlueprintSummary[] = [],
 ): DescriptorCommand {
   if (
     command.descriptor.kind === "device.detach" ||
@@ -170,11 +216,17 @@ export function specializeDeviceCommand(
     };
   }
   if (command.descriptor.kind === "device.adopt") {
-    const targets = Object.keys(entities)
-      .filter(
-        (key) => key.startsWith("device:") && key.slice(7) !== device.entity.id,
-      )
-      .map((key) => key.slice(7));
+    const targets = devices.filter(
+      (candidate) =>
+        candidate.entity.id !== device.entity.id &&
+        candidate.system === device.system &&
+        candidate.controller === null &&
+        compatibleAdoptionTarget(
+          device.device_type,
+          candidate.device_type,
+          blueprints,
+        ),
+    );
     return {
       ...command,
       descriptor: {
@@ -184,10 +236,7 @@ export function specializeDeviceCommand(
             ? {
                 ...parameter,
                 kind: { type: "enum" as const },
-                options: targets.map((code) => ({
-                  value: code,
-                  label: relatedDeviceLabel(code, entities),
-                })),
+                options: deviceOptions(targets, entities),
               }
             : parameter,
         ),
@@ -210,6 +259,118 @@ export function specializeDeviceCommand(
                     label: directive.replaceAll("_", " "),
                   }),
                 ),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (
+    command.descriptor.kind === "device.attach" ||
+    command.descriptor.kind === "device.repair" ||
+    command.descriptor.kind === "device.replicate"
+  ) {
+    const targets = devices.filter((candidate) => {
+      if (
+        candidate.entity.id === device.entity.id ||
+        candidate.system !== device.system
+      )
+        return false;
+      if (command.descriptor.kind === "device.attach")
+        return candidate.attached_to === null && candidate.stowed_in === null;
+      if (command.descriptor.kind === "device.repair")
+        return (
+          candidate.operational_capacity_percent !== null &&
+          candidate.operational_capacity_percent < 100
+        );
+      return candidate.device_type === "empty_replicant_matrix";
+    });
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "target"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: deviceOptions(targets, entities),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (
+    command.descriptor.kind === "device.stow" &&
+    command.descriptor.parameters.some(
+      (parameter) => parameter.name === "target",
+    )
+  ) {
+    const targets = devices.filter(
+      (candidate) =>
+        candidate.entity.id !== device.entity.id &&
+        candidate.system === device.system &&
+        candidate.stow_capacity !== null &&
+        candidate.stow_capacity !== undefined &&
+        candidate.stow_capacity > (candidate.stow_used ?? 0),
+    );
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "target"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: deviceOptions(targets, entities),
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (command.descriptor.kind === "device.configure") {
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "mode"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: [
+                  { value: "taxi", label: "taxi" },
+                  { value: "manual", label: "manual" },
+                ],
+              }
+            : parameter,
+        ),
+      },
+    };
+  }
+  if (
+    (command.descriptor.kind === "device.retarget" ||
+      command.descriptor.kind === "device.start_mining") &&
+    command.descriptor.parameters.some(
+      (parameter) => parameter.name === "resource_type",
+    )
+  ) {
+    return {
+      ...command,
+      descriptor: {
+        ...command.descriptor,
+        parameters: command.descriptor.parameters.map((parameter) =>
+          parameter.name === "resource_type"
+            ? {
+                ...parameter,
+                kind: { type: "enum" as const },
+                options: RESOURCE_TYPES.map((resource) => ({
+                  value: resource,
+                  label: resource,
+                })),
               }
             : parameter,
         ),
@@ -249,6 +410,8 @@ export function advertisedDeviceCommands(
   catalog: DescriptorCatalog,
   device: DeviceSummary,
   entities: Record<string, EntitySummary> = {},
+  devices: DeviceSummary[] = [],
+  blueprints: BlueprintSummary[] = [],
 ): DescriptorDeviceCommand[] {
   const seen = new Set<string>();
   return device.available_commands
@@ -286,6 +449,8 @@ export function advertisedDeviceCommands(
         },
         device,
         entities,
+        devices,
+        blueprints,
       );
       return [{ ...command, bindingCommand }];
     });

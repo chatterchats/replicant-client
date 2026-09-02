@@ -1,11 +1,16 @@
-import { useMemo, useState, type SyntheticEvent } from "react";
+import { useEffect, useMemo, useState, type SyntheticEvent } from "react";
 
-import { ParameterField, validateParameters } from "../AutomationsPage";
+import {
+  ParameterField,
+  validateParameters,
+  visibleParameters,
+} from "../AutomationsPage";
 import { daemonApi } from "../api";
 import type { DescriptorCommand } from "../CommandPalette";
 import type {
   DescriptorCatalog,
   DeviceSummary,
+  BlueprintSummary,
   EntityCollectionSummary,
   EntitySummary,
   FiniteExecution,
@@ -101,7 +106,7 @@ function InlineDeviceAction({
   const [serverError, setServerError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const fixed = command.initialParameters ?? {};
-  const fields = command.descriptor.parameters.filter(
+  const visibleFields = visibleParameters(command.descriptor, values).filter(
     (parameter) => fixed[parameter.name] === undefined,
   );
   const submit = async (event: SyntheticEvent<HTMLFormElement>) => {
@@ -131,7 +136,7 @@ function InlineDeviceAction({
         void submit(event);
       }}
     >
-      {fields.map((parameter) => (
+      {visibleFields.map((parameter) => (
         <ParameterField
           key={parameter.name}
           parameter={parameter}
@@ -175,10 +180,39 @@ export function DeviceInspector({
   onRunCommand: (command: DescriptorCommand) => void;
   onOperationFinished: (execution: FiniteExecution) => void;
 }) {
+  const [devices, setDevices] = useState<DeviceSummary[]>([]);
+  const [blueprints, setBlueprints] = useState<BlueprintSummary[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void Promise.all([
+      daemonApi
+        .devices(controller.signal)
+        .then((snapshot) => {
+          setDevices(snapshot.devices);
+        })
+        .catch(() => undefined),
+      daemonApi
+        .blueprints(controller.signal)
+        .then((snapshot) => {
+          setBlueprints(snapshot.blueprints);
+        })
+        .catch(() => undefined),
+    ]);
+    return () => {
+      controller.abort();
+    };
+  }, []);
   const [expanded, setExpanded] = useState<string | null>(null);
   const commands = useMemo(
-    () => advertisedDeviceCommands(descriptors, device, entities),
-    [descriptors, device, entities],
+    () =>
+      advertisedDeviceCommands(
+        descriptors,
+        device,
+        entities,
+        devices,
+        blueprints,
+      ),
+    [descriptors, device, entities, devices, blueprints],
   );
   const executable = new Map(
     commands.map((command) => [command.bindingCommand, command]),
