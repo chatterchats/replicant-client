@@ -113,6 +113,29 @@ function optionsFor(
   if (operationKind === "device.change_owner" && parameter.name === "target") {
     return entityOptions(entities, "replicant");
   }
+  if (
+    operationKind === "logistics.regional_dispatch" &&
+    parameter.name === "source"
+  ) {
+    const hubs = new Set(
+      Object.entries(entities).flatMap(([key, value]) => {
+        if (
+          !key.startsWith("device:") ||
+          typeof value !== "object" ||
+          value === null
+        )
+          return [];
+        const device = value as Record<string, unknown>;
+        return device.device_type === "system_hub" &&
+          typeof device.location === "string"
+          ? [device.location]
+          : [];
+      }),
+    );
+    return entityOptions(entities, "location").filter((option) =>
+      hubs.has(option.value),
+    );
+  }
   if (entityKind === "replicant") return entityOptions(entities, "replicant");
   if (entityKind === "device_type") {
     const values =
@@ -174,12 +197,42 @@ function optionsFor(
   return [];
 }
 
+export function visibleParameters(
+  descriptor: OperationDescriptor,
+  values: Values,
+) {
+  if (descriptor.kind !== "device.set_directive") return descriptor.parameters;
+  const fieldsByDirective: Record<string, string[]> = {
+    gather_resources: ["resources_json"],
+    maintain_ratios: ["ratios_json"],
+    gather_salvage: ["location", "recall"],
+    survey_system: ["planets", "moons", "recall"],
+    delivery: ["collect", "deliver", "requirement_json"],
+    shuttle: ["collect", "deliver", "priority"],
+    ferry: ["collect", "deliver", "priority"],
+    consolidate: ["deliver", "priority"],
+    trade: ["name", "description", "announcement"],
+  };
+  const directive =
+    typeof values.directive === "string" ? values.directive : "";
+  const visible: Record<string, true> = {
+    device: true,
+    directive: true,
+    notify_json: true,
+  };
+  const directiveFields = fieldsByDirective[directive];
+  for (const field of directiveFields ?? []) visible[field] = true;
+  if (directive && directiveFields === undefined)
+    visible.configuration_json = true;
+  return descriptor.parameters.filter((parameter) => visible[parameter.name]);
+}
+
 export function validateParameters(
   descriptor: OperationDescriptor,
   values: Values,
 ) {
   const errors: Record<string, string> = {};
-  for (const parameter of descriptor.parameters) {
+  for (const parameter of visibleParameters(descriptor, values)) {
     const value = values[parameter.name];
     const empty = value === "" || value === null || value === undefined;
     if (parameter.required && empty) {
@@ -223,6 +276,150 @@ export function validateParameters(
   return errors;
 }
 
+type ManifestEntry = {
+  id: number;
+  item: string;
+  quantity: number;
+};
+
+function initialResourceEntries(value: unknown): ManifestEntry[] {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return [{ id: 1, item: "", quantity: 1 }];
+  const entries = Object.entries(value).flatMap(([item, quantity], index) =>
+    typeof quantity === "number" ? [{ id: index + 1, item, quantity }] : [],
+  );
+  return entries.length > 0 ? entries : [{ id: 1, item: "", quantity: 1 }];
+}
+
+function initialDeviceEntries(value: unknown): ManifestEntry[] {
+  if (!Array.isArray(value)) return [{ id: 1, item: "", quantity: 1 }];
+  const entries = value.flatMap((entry, index) => {
+    if (!entry || typeof entry !== "object") return [];
+    const record = entry as Record<string, unknown>;
+    return typeof record.device_type === "string" &&
+      typeof record.quantity === "number"
+      ? [
+          {
+            id: index + 1,
+            item: record.device_type,
+            quantity: record.quantity,
+          },
+        ]
+      : [];
+  });
+  return entries.length > 0 ? entries : [{ id: 1, item: "", quantity: 1 }];
+}
+
+function ManifestField({
+  parameter,
+  value,
+  deviceTypes: availableDeviceTypes,
+  onChange,
+}: {
+  parameter: ParameterDescriptor;
+  value: unknown;
+  deviceTypes: string[];
+  onChange: (value: unknown) => void;
+}) {
+  const devices = parameter.kind.type === "device_manifest";
+  const [entries, setEntries] = useState<ManifestEntry[]>(() =>
+    devices ? initialDeviceEntries(value) : initialResourceEntries(value),
+  );
+  const nextId = useRef(entries.length + 1);
+  const publish = (next: ManifestEntry[]) => {
+    setEntries(next);
+    if (devices) {
+      onChange(
+        next
+          .filter((entry) => entry.item.trim())
+          .map((entry) => ({
+            device_type: entry.item.trim(),
+            quantity: entry.quantity,
+          })),
+      );
+      return;
+    }
+    const resources: Record<string, number> = {};
+    for (const entry of next) {
+      const item = entry.item.trim();
+      if (item) resources[item] = (resources[item] ?? 0) + entry.quantity;
+    }
+    onChange(resources);
+  };
+  return (
+    <fieldset className="manifest-builder">
+      <legend>{parameter.label}</legend>
+      {entries.map((entry) => (
+        <div className="manifest-row" key={entry.id}>
+          <input
+            aria-label={devices ? "Device type" : "Resource type"}
+            list={
+              devices ? `dispatch-device-types-${String(entry.id)}` : undefined
+            }
+            placeholder={devices ? "device type" : "resource type"}
+            value={entry.item}
+            onChange={(event) => {
+              publish(
+                entries.map((current) =>
+                  current.id === entry.id
+                    ? { ...current, item: event.target.value }
+                    : current,
+                ),
+              );
+            }}
+          />
+          {devices ? (
+            <datalist id={`dispatch-device-types-${String(entry.id)}`}>
+              {availableDeviceTypes.map((option) => (
+                <option key={option} value={option} />
+              ))}
+            </datalist>
+          ) : null}
+          <input
+            aria-label="Quantity"
+            min={1}
+            type="number"
+            value={entry.quantity}
+            onChange={(event) => {
+              publish(
+                entries.map((current) =>
+                  current.id === entry.id
+                    ? {
+                        ...current,
+                        quantity: Number.isFinite(event.target.valueAsNumber)
+                          ? event.target.valueAsNumber
+                          : 1,
+                      }
+                    : current,
+                ),
+              );
+            }}
+          />
+          <button
+            disabled={entries.length === 1}
+            type="button"
+            onClick={() => {
+              publish(entries.filter((current) => current.id !== entry.id));
+            }}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => {
+          const id = nextId.current++;
+          publish([...entries, { id, item: "", quantity: 1 }]);
+        }}
+      >
+        + Add {devices ? "device" : "resource"}
+      </button>
+      <small>{parameter.description}</small>
+    </fieldset>
+  );
+}
+
 export function ParameterField({
   parameter,
   value,
@@ -248,6 +445,21 @@ export function ParameterField({
     blueprintTypes,
   );
   const help = error ?? parameter.description;
+  if (
+    parameter.kind.type === "resource_manifest" ||
+    parameter.kind.type === "device_manifest"
+  ) {
+    return (
+      <ManifestField
+        parameter={parameter}
+        value={value}
+        deviceTypes={
+          blueprintTypes.length > 0 ? blueprintTypes : deviceTypes(entities)
+        }
+        onChange={onChange}
+      />
+    );
+  }
   const allowsAllDevices =
     operationKind === "device.detach" && parameter.name === "target";
   if (parameter.kind.type === "boolean") {
@@ -1106,6 +1318,7 @@ const workflowDisplayNames: Record<string, string> = {
   "exploration.frontier": "Expand FTL Network",
   "logistics.delivery": "Deliver Cargo or Devices",
   "logistics.manifest": "Deliver Manifest",
+  "logistics.regional_dispatch": "Provision Regional Dispatch",
   "mining.campaign": "Expand Mining Operations",
   "mining.deploy": "Deploy Mining Operation",
   "mining.expansion": "Expand Mining Operations",
@@ -1152,6 +1365,7 @@ const workflowStepNames: Record<string, string> = {
   manufacturing: "Manufacturing equipment",
   manufacturing_survey_fleet: "Manufacturing survey fleet",
   planning: "Planning",
+  planning_delivery: "Planning smart-routed delivery",
   printing_trade_criteria: "Printing trade requirements",
   printing_trade_payment: "Printing trade payment",
   prospecting: "Prospecting",
@@ -1162,9 +1376,12 @@ const workflowStepNames: Record<string, string> = {
   resolving: "Resolving event",
   running: "Running",
   searching_for_belts: "Searching for asteroid belts",
+  selecting_stock: "Selecting available stock",
   staging: "Staging equipment",
   staging_survey_fleet: "Staging survey fleet",
+  stowing_matrices: "Stowing replication matrices",
   stowing_matrix: "Stowing replication matrix",
+  replicating: "Replicating into dispatch vessels",
   travelling_to_shop: "Travelling to shop",
   waiting_for_criterion_blueprint: "Waiting for required blueprint",
   waiting_for_recovery_cleanup: "Waiting for recovery cleanup",

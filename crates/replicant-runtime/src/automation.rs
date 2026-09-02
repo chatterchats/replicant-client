@@ -153,6 +153,10 @@ pub fn mining_campaign_workflow_kind() -> WorkflowKind {
 pub fn logistics_workflow_kind() -> WorkflowKind {
     WorkflowKind::new("logistics.delivery").expect("static workflow kind is valid")
 }
+/// Intent-native workflow that provisions a regional shipment and dispatches it.
+pub fn regional_dispatch_workflow_kind() -> WorkflowKind {
+    WorkflowKind::new("logistics.regional_dispatch").expect("static workflow kind is valid")
+}
 
 /// Internal mixed-manifest logistics workflow used by Director coordinators.
 pub fn logistics_manifest_workflow_kind() -> WorkflowKind {
@@ -216,6 +220,7 @@ pub fn register(registry: &mut WorkflowRegistry) -> Result<(), RegistryError> {
     registry.register(Arc::new(MiningDeployWorkflowFactory::new()))?;
     registry.register(Arc::new(MiningCampaignWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsWorkflowFactory::new()))?;
+    registry.register(Arc::new(RegionalDispatchWorkflowFactory::new()))?;
     registry.register(Arc::new(LogisticsManifestWorkflowFactory::new()))?;
     registry.register(Arc::new(TradeFulfillmentWorkflowFactory::new()))?;
     registry.register(Arc::new(BlueprintAcquireWorkflowFactory::new()))?;
@@ -486,6 +491,58 @@ pub struct LogisticsIntent {
     /// Return transports after delivery.
     #[serde(default)]
     pub return_transports: bool,
+}
+
+/// Player intent for manufacturing and dispatching a complete regional shipment.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RegionalDispatchIntent {
+    /// Exact regional hub location where assets are selected or manufactured.
+    pub source: String,
+    /// Exact destination location.
+    pub destination: String,
+    /// Resource quantities to deliver.
+    #[serde(default)]
+    pub resources: ResourceMap,
+    /// Racing vessels to deliver, each paired with an empty or replicated matrix.
+    #[serde(default)]
+    pub racing_vessels: i64,
+    /// HEAVEN vessels to deliver, each paired with an empty or replicated matrix.
+    #[serde(default)]
+    pub heaven_vessels: i64,
+    /// Cargo vessels to deliver, each paired with an empty or replicated matrix.
+    #[serde(default)]
+    pub cargo_vessels: i64,
+    /// Additional device-type quantities to deliver.
+    #[serde(default)]
+    pub devices: Vec<DeviceRequest>,
+}
+
+/// Restart-safe provisioning and delivery state for a regional dispatch.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RegionalDispatchCheckpoint {
+    /// Durable tag applied to every device printed for this dispatch.
+    pub print_tag: String,
+    /// Exact vessel codes selected for the requested Replicant fleet.
+    pub vessels: Vec<String>,
+    /// Whether existing stock selection and print-deficit calculation completed.
+    pub selection_complete: bool,
+    /// Exact empty matrix paired by index with `vessels`; missing entries await printing.
+    pub matrices: Vec<Option<String>>,
+    /// Exact additional payload device codes.
+    pub devices: Vec<String>,
+    /// Stable print deficits calculated after existing unclaimed stock is selected.
+    pub print_requests: Vec<PrintRequest>,
+    /// Matrices that have been stowed into their paired vessel.
+    pub stowed_matrices: BTreeSet<String>,
+    /// Target matrices into which replication completed.
+    pub replicated_matrices: BTreeSet<String>,
+    /// Whether tagged printed devices have been incorporated into the exact manifest.
+    pub manufacturing_complete: bool,
+    /// Concrete smart-routed transport plan persisted before delivery starts.
+    pub plan: Option<DeliveryPlan>,
+    /// Whether delivery execution has begun.
+    pub delivery_started: bool,
 }
 
 /// Exact failed-custody evidence and stale reservation tags for a recovery
@@ -1425,6 +1482,39 @@ fn mining_campaign_placement(
     )
 }
 
+fn regional_dispatch_placement(
+    instance: &replicant_workflow::WorkflowInstance,
+    items: &[WorkItem],
+) -> Result<WorkflowPlacementIntentProjection, String> {
+    let config: RegionalDispatchIntent = instance.config().map_err(string_error)?;
+    let checkpoint: RegionalDispatchCheckpoint = instance.checkpoint().map_err(string_error)?;
+    workflow_placement_projection(
+        instance,
+        items,
+        |_| {},
+        |phase, intents| {
+            let delivered = phase == PlacementProjectionPhase::Succeeded;
+            let relation = if delivered {
+                WorkflowPlacementIntentRelation::Deployed
+            } else if checkpoint.delivery_started {
+                WorkflowPlacementIntentRelation::Transported
+            } else {
+                WorkflowPlacementIntentRelation::Staged
+            };
+            for code in checkpoint.vessels.iter().chain(checkpoint.devices.iter()) {
+                if let Some(subject) = placement_device(code) {
+                    intents.push(placement_intent(
+                        subject,
+                        relation,
+                        None,
+                        delivered.then(|| config.destination.clone()),
+                    ));
+                }
+            }
+        },
+    )
+}
+
 fn logistics_placement(
     instance: &replicant_workflow::WorkflowInstance,
     items: &[WorkItem],
@@ -2356,6 +2446,12 @@ workflow_factory!(
     LogisticsWorkflow,
     logistics_workflow_kind,
     logistics_placement
+);
+workflow_factory!(
+    RegionalDispatchWorkflowFactory,
+    RegionalDispatchWorkflow,
+    regional_dispatch_workflow_kind,
+    regional_dispatch_placement
 );
 workflow_factory!(
     LogisticsManifestWorkflowFactory,
@@ -4269,6 +4365,103 @@ impl WorkflowExecutor for LogisticsWorkflow {
                     return Err(string_error(error));
                 }
             };
+            context.mark_succeeded(Some(report)).map_err(string_error)
+        })
+    }
+}
+
+struct RegionalDispatchWorkflow;
+impl WorkflowExecutor for RegionalDispatchWorkflow {
+    fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
+        Box::pin(async move {
+            let intent: RegionalDispatchIntent = context.config().map_err(string_error)?;
+            validate_regional_dispatch(&intent)?;
+            let client = managed_client(context)?;
+            let mut checkpoint: RegionalDispatchCheckpoint =
+                context.checkpoint().map_err(string_error)?;
+            if checkpoint.print_tag.is_empty() {
+                checkpoint.print_tag = format!("dispatch:{}", &context.id().to_string()[..8]);
+            }
+            ensure_regional_dispatch_source_hub(&client, &intent.source).await?;
+            claim_target(context, "regional-dispatch-source", &intent.source)?;
+
+            if !checkpoint.selection_complete {
+                context
+                    .advance_to("selecting_stock", &checkpoint)
+                    .map_err(string_error)?;
+                select_regional_dispatch_stock(context, &client, &intent, &mut checkpoint).await?;
+                checkpoint.selection_complete = true;
+                context
+                    .emit_activity(regional_dispatch_deficit_message(
+                        &checkpoint.print_requests,
+                    ))
+                    .map_err(string_error)?;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            if !checkpoint.manufacturing_complete {
+                context
+                    .advance_to("manufacturing", &checkpoint)
+                    .map_err(string_error)?;
+                if !manufacture_regional_dispatch(context, &client, &intent, &mut checkpoint)
+                    .await?
+                {
+                    return Ok(());
+                }
+                checkpoint.manufacturing_complete = true;
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+            }
+
+            stow_dispatch_matrices(context, &client, &mut checkpoint).await?;
+            replicate_dispatch_matrices(context, &client, &intent, &mut checkpoint).await?;
+
+            let plan = if let Some(plan) = checkpoint.plan.clone() {
+                plan
+            } else {
+                context
+                    .advance_to("planning_delivery", &checkpoint)
+                    .map_err(string_error)?;
+                let request = regional_dispatch_delivery_request(&intent, &checkpoint)?;
+                let plan = plan_delivery(&client, &request)
+                    .await
+                    .map_err(string_error)?;
+                for pickup in &plan.resource_pickups {
+                    claim(
+                        context,
+                        ResourceKey::Namespaced {
+                            namespace: "logistics-resource-source".to_owned(),
+                            key: pickup.location.to_ascii_uppercase(),
+                        },
+                    )?;
+                }
+                validate_resource_pickups(&client, &plan)
+                    .await
+                    .map_err(string_error)?;
+                for code in plan
+                    .cargo_transports
+                    .iter()
+                    .chain(plan.device_carriers.iter())
+                    .chain(plan.payload_devices.iter().map(|device| &device.code))
+                {
+                    claim_device(context, code)?;
+                }
+                checkpoint.plan = Some(plan.clone());
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                plan
+            };
+            checkpoint.delivery_started = true;
+            context
+                .advance_to("delivering", &checkpoint)
+                .map_err(string_error)?;
+            let report = execute_delivery(&client, &plan, DeliveryOptions::default())
+                .await
+                .map_err(string_error)?;
             context.mark_succeeded(Some(report)).map_err(string_error)
         })
     }
@@ -7195,6 +7388,17 @@ pub fn new_logistics_workflow(
         logistics_workflow_kind(),
         intent,
         LogisticsWorkflowCheckpoint::default(),
+    )
+}
+
+/// Creates a queued regional provisioning and dispatch workflow.
+pub fn new_regional_dispatch_workflow(
+    intent: RegionalDispatchIntent,
+) -> NewWorkflow<RegionalDispatchIntent, RegionalDispatchCheckpoint> {
+    queued_workflow(
+        regional_dispatch_workflow_kind(),
+        intent,
+        RegionalDispatchCheckpoint::default(),
     )
 }
 
@@ -11579,6 +11783,725 @@ pub(crate) fn placement_recovery_metadata_matches_snapshot(
     }
     Ok(())
 }
+fn validate_regional_dispatch(intent: &RegionalDispatchIntent) -> Result<(), String> {
+    if intent.source.trim().is_empty() || intent.destination.trim().is_empty() {
+        return Err("regional dispatch requires a source hub and destination".to_owned());
+    }
+    if intent.resources.values().any(|quantity| *quantity <= 0)
+        || intent.devices.iter().any(|request| request.quantity <= 0)
+        || [
+            intent.racing_vessels,
+            intent.heaven_vessels,
+            intent.cargo_vessels,
+        ]
+        .into_iter()
+        .any(|quantity| quantity < 0)
+    {
+        return Err("regional dispatch quantities must be greater than zero".to_owned());
+    }
+    if intent.resources.is_empty()
+        && intent.devices.is_empty()
+        && desired_replicant_vessel_types(intent).is_empty()
+    {
+        return Err("regional dispatch must contain at least one payload".to_owned());
+    }
+    Ok(())
+}
+
+fn desired_replicant_vessel_types(intent: &RegionalDispatchIntent) -> Vec<String> {
+    [
+        ("racing_vessel", intent.racing_vessels),
+        ("heaven_vessel", intent.heaven_vessels),
+        ("cargo_vessel", intent.cargo_vessels),
+    ]
+    .into_iter()
+    .flat_map(|(device_type, quantity)| {
+        std::iter::repeat_n(
+            device_type.to_owned(),
+            usize::try_from(quantity).unwrap_or(0),
+        )
+    })
+    .collect()
+}
+
+async fn dispatch_owned_device_snapshots(client: &Client) -> Result<Vec<Device>, String> {
+    let handles = client
+        .devices()
+        .find()
+        .owned()
+        .collect()
+        .await
+        .map_err(string_error)?;
+    let mut devices = Vec::with_capacity(handles.len());
+    for handle in handles {
+        devices.push(handle.snapshot().await.map_err(string_error)?);
+    }
+    devices.sort_by(|left, right| left.key.id.as_str().cmp(right.key.id.as_str()));
+    Ok(devices)
+}
+
+fn device_at(device: &Device, location: &str) -> bool {
+    device
+        .location
+        .as_ref()
+        .is_some_and(|current| current.id.as_str().eq_ignore_ascii_case(location))
+}
+
+fn device_is_type(device: &Device, device_type: &str) -> bool {
+    device
+        .device_type
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == device_type)
+}
+
+async fn ensure_regional_dispatch_source_hub(client: &Client, source: &str) -> Result<(), String> {
+    if dispatch_owned_device_snapshots(client)
+        .await?
+        .iter()
+        .any(|device| {
+            device_at(device, source) && device_is_type(device, DeviceType::SystemHub.as_str())
+        })
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "regional dispatch source {source} is not an owned System Hub location"
+    ))
+}
+
+fn try_claim_dispatch_device(context: &WorkflowContext, code: &str) -> Result<bool, String> {
+    match context.acquire_claim(ResourceKey::Device(code.to_owned())) {
+        Ok(_) => Ok(true),
+        Err(RepositoryError::ClaimConflict { .. }) => Ok(false),
+        Err(error) => Err(string_error(error)),
+    }
+}
+
+fn dispatch_status_is_payload_safe(device: &Device) -> bool {
+    device.status.as_ref().is_some_and(|status| {
+        matches!(
+            status.as_str().to_ascii_lowercase().as_str(),
+            "inactive"
+                | "deactivated"
+                | "idle"
+                | "stowed"
+                | "recalled"
+                | "compacted"
+                | "out_of_range"
+                | "monitoring"
+        )
+    })
+}
+
+fn dispatch_top_level_device_is_free(device: &Device, source: &str) -> bool {
+    device.access == AccessScope::Owned
+        && device_at(device, source)
+        && device.travel.is_none()
+        && device.relationships.attached_to.is_none()
+        && device.relationships.stowed_in.is_none()
+        && device.relationships.controller.is_none()
+        && device.relationships.assigned_replicant.is_none()
+        && device.relationships.hosting_replicant.is_none()
+        && !workflow_reserved(&device.tags)
+}
+
+fn dispatch_payload_device_is_free(device: &Device, source: &str) -> bool {
+    dispatch_top_level_device_is_free(device, source)
+        && dispatch_status_is_payload_safe(device)
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+}
+
+fn dispatch_vessel_onboard_empty_matrix<'a>(
+    vessel: &Device,
+    devices: &'a [Device],
+) -> Option<&'a Device> {
+    if vessel.relationships.stowed_devices.len() != 1 {
+        return None;
+    }
+    let matrix_key = vessel.relationships.stowed_devices.first()?;
+    devices.iter().find(|candidate| {
+        candidate.key == *matrix_key
+            && device_is_type(candidate, "empty_replicant_matrix")
+            && !workflow_reserved(&candidate.tags)
+            && candidate.travel.is_none()
+            && candidate.relationships.stowed_in.as_ref() == Some(&vessel.key)
+            && candidate.relationships.attached_to.is_none()
+            && candidate.relationships.controller.is_none()
+            && candidate.relationships.hosting_replicant.is_none()
+    })
+}
+
+fn dispatch_vessel_is_free(
+    vessel: &Device,
+    vessel_type: &str,
+    source: &str,
+    devices: &[Device],
+) -> bool {
+    if !dispatch_top_level_device_is_free(vessel, source)
+        || !dispatch_status_is_payload_safe(vessel)
+        || !device_is_type(vessel, vessel_type)
+        || !vessel.cargo.is_empty()
+        || !vessel.relationships.attached_devices.is_empty()
+        || !vessel.relationships.controlled_devices.is_empty()
+    {
+        return false;
+    }
+    match vessel.relationships.stowed_devices.len() {
+        0 => true,
+        1 => dispatch_vessel_onboard_empty_matrix(vessel, devices).is_some(),
+        _ => false,
+    }
+}
+
+fn dispatch_loose_empty_matrix_is_free(device: &Device, source: &str) -> bool {
+    dispatch_top_level_device_is_free(device, source)
+        && device_is_type(device, "empty_replicant_matrix")
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+}
+
+fn dispatch_transport_is_free(
+    device: &Device,
+    source: &str,
+    used: &BTreeSet<String>,
+    claimed_elsewhere: &BTreeSet<String>,
+) -> bool {
+    let code = device.key.id.as_str();
+    dispatch_top_level_device_is_free(device, source)
+        && !used.contains(code)
+        && !claimed_elsewhere.contains(&code.to_ascii_uppercase())
+        && device.relationships.attached_devices.is_empty()
+        && device.relationships.stowed_devices.is_empty()
+        && device.relationships.controlled_devices.is_empty()
+        && device
+            .available_commands
+            .iter()
+            .any(|command| command.as_str().eq_ignore_ascii_case("travel"))
+}
+
+fn regional_dispatch_has_device_payload(intent: &RegionalDispatchIntent) -> bool {
+    !intent.devices.is_empty()
+        || intent.racing_vessels > 0
+        || intent.heaven_vessels > 0
+        || intent.cargo_vessels > 0
+}
+
+async fn select_regional_dispatch_stock(
+    context: &WorkflowContext,
+    client: &Client,
+    intent: &RegionalDispatchIntent,
+    checkpoint: &mut RegionalDispatchCheckpoint,
+) -> Result<(), String> {
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    let mut used = BTreeSet::new();
+    let claimed_elsewhere = context
+        .repository()
+        .device_claims()
+        .map_err(string_error)?
+        .into_iter()
+        .filter(|claim| claim.workflow_id != context.id())
+        .filter_map(|claim| match claim.resource {
+            ResourceKey::Device(code) => Some(code.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let desired_vessels = desired_replicant_vessel_types(intent);
+
+    for vessel_type in &desired_vessels {
+        let mut selected = None;
+        let mut selected_matrix = None;
+
+        // Prefer a vessel that already contains an empty matrix. That avoids an
+        // unnecessary stow operation and, more importantly, avoids printing a
+        // second matrix merely because the existing one is nested in the hull.
+        for prefer_onboard_matrix in [true, false] {
+            for vessel in &devices {
+                let code = vessel.key.id.as_str();
+                if used.contains(code)
+                    || !dispatch_vessel_is_free(vessel, vessel_type, &intent.source, &devices)
+                {
+                    continue;
+                }
+                let onboard_matrix = dispatch_vessel_onboard_empty_matrix(vessel, &devices);
+                if onboard_matrix.is_some() != prefer_onboard_matrix {
+                    continue;
+                }
+                if !try_claim_dispatch_device(context, code)? {
+                    continue;
+                }
+                if let Some(matrix) = onboard_matrix {
+                    let matrix_code = matrix.key.id.as_str();
+                    if used.contains(matrix_code) || !try_claim_dispatch_device(context, matrix_code)?
+                    {
+                        context
+                            .release_claim(&ResourceKey::Device(code.to_owned()))
+                            .map_err(string_error)?;
+                        continue;
+                    }
+                    used.insert(matrix_code.to_owned());
+                    selected_matrix = Some(matrix_code.to_owned());
+                }
+                used.insert(code.to_owned());
+                selected = Some(code.to_owned());
+                break;
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+
+        checkpoint.vessels.push(selected.unwrap_or_default());
+        checkpoint.matrices.push(selected_matrix);
+    }
+
+    // Loose empty matrices are useful even when the corresponding vessel must
+    // still be printed. Reserve them now so the print deficit reflects the
+    // complete stock at the source hub rather than only matrices already paired
+    // with an existing hull.
+    for matrix in &mut checkpoint.matrices {
+        if matrix.is_some() {
+            continue;
+        }
+        for candidate in &devices {
+            let code = candidate.key.id.as_str();
+            if used.contains(code)
+                || !dispatch_loose_empty_matrix_is_free(candidate, &intent.source)
+            {
+                continue;
+            }
+            if try_claim_dispatch_device(context, code)? {
+                used.insert(code.to_owned());
+                *matrix = Some(code.to_owned());
+                break;
+            }
+        }
+    }
+
+    let mut requested_devices = BTreeMap::<String, i64>::new();
+    for request in &intent.devices {
+        *requested_devices
+            .entry(request.device_type.clone())
+            .or_default() += request.quantity;
+    }
+    for (device_type, quantity) in requested_devices {
+        let mut found = 0_i64;
+        for device in &devices {
+            let code = device.key.id.as_str();
+            if found >= quantity {
+                break;
+            }
+            if used.contains(code)
+                || !device_is_type(device, &device_type)
+                || !dispatch_payload_device_is_free(device, &intent.source)
+            {
+                continue;
+            }
+            if try_claim_dispatch_device(context, code)? {
+                checkpoint.devices.push(code.to_owned());
+                used.insert(code.to_owned());
+                found += 1;
+            }
+        }
+    }
+
+    let mut deficits = BTreeMap::<String, i64>::new();
+    let mut selected_by_type = BTreeMap::<String, i64>::new();
+    for vessel in &checkpoint.vessels {
+        if let Some(device_type) = devices
+            .iter()
+            .find(|device| device.key.id.as_str() == vessel)
+            .and_then(|device| device.device_type.as_ref())
+        {
+            *selected_by_type
+                .entry(device_type.as_str().to_owned())
+                .or_default() += 1;
+        }
+    }
+    for device_type in desired_vessels {
+        let selected = selected_by_type.entry(device_type.clone()).or_default();
+        if *selected > 0 {
+            *selected -= 1;
+        } else {
+            *deficits.entry(device_type).or_default() += 1;
+        }
+    }
+    let missing_matrices = i64::try_from(
+        checkpoint
+            .matrices
+            .iter()
+            .filter(|matrix| matrix.is_none())
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    if missing_matrices > 0 {
+        deficits.insert("empty_replicant_matrix".to_owned(), missing_matrices);
+    }
+    let selected_payload_types = checkpoint
+        .devices
+        .iter()
+        .filter_map(|code| {
+            devices
+                .iter()
+                .find(|device| device.key.id.as_str() == code)
+                .and_then(|device| device.device_type.as_ref())
+                .map(|kind| kind.as_str().to_owned())
+        })
+        .fold(BTreeMap::<String, i64>::new(), |mut counts, kind| {
+            *counts.entry(kind).or_default() += 1;
+            counts
+        });
+    let mut desired_payload_types = BTreeMap::<String, i64>::new();
+    for request in &intent.devices {
+        *desired_payload_types
+            .entry(request.device_type.clone())
+            .or_default() += request.quantity;
+    }
+    for (device_type, desired) in desired_payload_types {
+        let selected = selected_payload_types
+            .get(&device_type)
+            .copied()
+            .unwrap_or(0);
+        let missing = desired.saturating_sub(selected);
+        if missing > 0 {
+            *deficits.entry(device_type).or_default() += missing;
+        }
+    }
+
+    // Transport itself is provisioning stock too. Only count a carrier that is
+    // actually free at the source; a reserved, nested, travelling, loaded, or
+    // occupied hull must not suppress the print deficit.
+    let has_cargo_transport = devices.iter().any(|device| {
+        dispatch_transport_is_free(device, &intent.source, &used, &claimed_elsewhere)
+            && device.cargo_capacity.unwrap_or(0) > 0
+            && device.cargo.is_empty()
+    });
+    if !intent.resources.is_empty() && !has_cargo_transport {
+        *deficits.entry("cargo_freighter".to_owned()).or_default() += 1;
+    }
+    let has_device_carrier = devices.iter().any(|device| {
+        dispatch_transport_is_free(device, &intent.source, &used, &claimed_elsewhere)
+            && device.attach_capacity.unwrap_or(0) > 0
+    });
+    if regional_dispatch_has_device_payload(intent) && !has_device_carrier {
+        *deficits.entry("surge_carrier".to_owned()).or_default() += 1;
+    }
+    checkpoint.print_requests = deficits
+        .into_iter()
+        .filter(|(_, quantity)| *quantity > 0)
+        .map(|(device_type, quantity)| PrintRequest::new(device_type, quantity))
+        .collect();
+    Ok(())
+}
+
+fn regional_dispatch_deficit_message(requests: &[PrintRequest]) -> String {
+    if requests.is_empty() {
+        return "regional dispatch missing 0 devices; existing unclaimed stock satisfies the manifest"
+            .to_owned();
+    }
+    let missing = requests.iter().map(|request| request.quantity).sum::<i64>();
+    let details = requests
+        .iter()
+        .map(|request| format!("{} {}", request.quantity, request.device_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("regional dispatch missing {missing} devices; printing {details}")
+}
+
+async fn manufacture_regional_dispatch(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &RegionalDispatchIntent,
+    checkpoint: &mut RegionalDispatchCheckpoint,
+) -> Result<bool, String> {
+    if !checkpoint.print_requests.is_empty() {
+        let mut options = QueueOptions::at(intent.source.clone());
+        options.tags = vec![checkpoint.print_tag.clone()];
+        options.wait_timeout = Duration::from_secs(DEFAULT_WAIT_SECONDS);
+        queue_prints_with_components(client, &checkpoint.print_requests, &options)
+            .await
+            .map_err(string_error)?;
+        loop {
+            let status = printing_status_in_system(
+                client,
+                &intent.source,
+                &checkpoint.print_requests,
+                std::slice::from_ref(&checkpoint.print_tag),
+            )
+            .await
+            .map_err(string_error)?;
+            if status
+                .requested
+                .iter()
+                .all(|line| line.available >= line.required)
+            {
+                break;
+            }
+            match context.control_request().map_err(string_error)? {
+                ControlRequest::Continue => {}
+                ControlRequest::Pause | ControlRequest::Cancel => return Ok(false),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    let tagged = tagged_devices(client, &checkpoint.print_tag).await?;
+    let mut unused = tagged.into_iter().collect::<BTreeMap<_, _>>();
+    for code in checkpoint
+        .vessels
+        .iter()
+        .chain(checkpoint.devices.iter())
+        .chain(checkpoint.matrices.iter().flatten())
+    {
+        unused.remove(code);
+    }
+    let desired_vessels = desired_replicant_vessel_types(intent);
+    for (index, device_type) in desired_vessels.iter().enumerate() {
+        if !checkpoint.vessels[index].is_empty() {
+            continue;
+        }
+        let code = take_tagged_device(&mut unused, device_type)
+            .ok_or_else(|| format!("printed {device_type} was not found by dispatch tag"))?;
+        claim_device(context, &code)?;
+        checkpoint.vessels[index] = code;
+    }
+    for matrix in &mut checkpoint.matrices {
+        if matrix.is_some() {
+            continue;
+        }
+        let code = take_tagged_device(&mut unused, "empty_replicant_matrix").ok_or_else(|| {
+            "printed empty Replicant matrix was not found by dispatch tag".to_owned()
+        })?;
+        claim_device(context, &code)?;
+        *matrix = Some(code);
+    }
+    let mut required_devices = BTreeMap::<String, i64>::new();
+    for request in &intent.devices {
+        *required_devices
+            .entry(request.device_type.clone())
+            .or_default() += request.quantity;
+    }
+    let existing_types = dispatch_owned_device_snapshots(client)
+        .await?
+        .into_iter()
+        .filter(|device| {
+            checkpoint
+                .devices
+                .iter()
+                .any(|code| code == device.key.id.as_str())
+        })
+        .filter_map(|device| device.device_type.map(|kind| kind.as_str().to_owned()))
+        .fold(BTreeMap::<String, i64>::new(), |mut counts, kind| {
+            *counts.entry(kind).or_default() += 1;
+            counts
+        });
+    for (device_type, required) in required_devices {
+        let missing =
+            required.saturating_sub(existing_types.get(&device_type).copied().unwrap_or(0));
+        for _ in 0..missing {
+            let code = take_tagged_device(&mut unused, &device_type)
+                .ok_or_else(|| format!("printed {device_type} was not found by dispatch tag"))?;
+            claim_device(context, &code)?;
+            checkpoint.devices.push(code);
+        }
+    }
+    Ok(true)
+}
+
+fn take_tagged_device(devices: &mut BTreeMap<String, String>, device_type: &str) -> Option<String> {
+    let code = devices
+        .iter()
+        .find_map(|(code, kind)| (kind == device_type).then(|| code.clone()))?;
+    devices.remove(&code);
+    Some(code)
+}
+
+async fn stow_dispatch_matrices(
+    context: &mut WorkflowContext,
+    client: &Client,
+    checkpoint: &mut RegionalDispatchCheckpoint,
+) -> Result<(), String> {
+    for (vessel, matrix) in checkpoint.vessels.iter().zip(&checkpoint.matrices) {
+        let matrix = matrix
+            .as_ref()
+            .ok_or_else(|| format!("vessel {vessel} has no selected empty matrix"))?;
+        if checkpoint.stowed_matrices.contains(matrix) {
+            continue;
+        }
+        let snapshot = client
+            .devices()
+            .get(matrix)
+            .await
+            .map_err(string_error)?
+            .snapshot()
+            .await
+            .map_err(string_error)?;
+        if snapshot
+            .relationships
+            .stowed_in
+            .as_ref()
+            .is_some_and(|parent| parent.id.as_str() == vessel)
+        {
+            checkpoint.stowed_matrices.insert(matrix.clone());
+            context
+                .persist_checkpoint(checkpoint)
+                .map_err(string_error)?;
+            continue;
+        }
+        if let Some(parent) = snapshot.relationships.stowed_in.as_ref() {
+            return Err(format!(
+                "empty matrix {matrix} is already stowed in {}, not selected vessel {vessel}",
+                parent.id.as_str()
+            ));
+        }
+        context
+            .advance_to("stowing_matrices", checkpoint)
+            .map_err(string_error)?;
+        let operation = client
+            .devices()
+            .get(matrix)
+            .await
+            .map_err(string_error)?
+            .command(replicant_client::raw::devices::DeviceCommand::Stow {
+                target: Some(vessel.clone()),
+            })
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+        checkpoint.stowed_matrices.insert(matrix.clone());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+    Ok(())
+}
+
+async fn replicate_dispatch_matrices(
+    context: &mut WorkflowContext,
+    client: &Client,
+    intent: &RegionalDispatchIntent,
+    checkpoint: &mut RegionalDispatchCheckpoint,
+) -> Result<(), String> {
+    let Some(source_matrix) = claim_dispatch_source_matrix(context, client, &intent.source).await?
+    else {
+        context
+            .emit_activity(
+                "no unclaimed Replicant matrix is available at the source hub; dispatching requested vessels with empty matrices",
+            )
+            .map_err(string_error)?;
+        return Ok(());
+    };
+    for matrix in checkpoint.matrices.iter().flatten() {
+        if checkpoint.replicated_matrices.contains(matrix) {
+            continue;
+        }
+        context
+            .advance_to("replicating", checkpoint)
+            .map_err(string_error)?;
+        let operation = client
+            .devices()
+            .get(&source_matrix)
+            .await
+            .map_err(string_error)?
+            .command(replicant_client::raw::devices::DeviceCommand::Replicate {
+                target: matrix.clone(),
+                name: None,
+            })
+            .await
+            .map_err(string_error)?;
+        await_success(&operation).await?;
+        checkpoint.replicated_matrices.insert(matrix.clone());
+        context
+            .persist_checkpoint(checkpoint)
+            .map_err(string_error)?;
+    }
+    Ok(())
+}
+
+async fn claim_dispatch_source_matrix(
+    context: &WorkflowContext,
+    client: &Client,
+    source: &str,
+) -> Result<Option<String>, String> {
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    for vessel in &devices {
+        let Some(replicant) = vessel.relationships.hosting_replicant.as_ref() else {
+            continue;
+        };
+        if !device_at(vessel, source)
+            || vessel.travel.is_some()
+            || workflow_reserved(&vessel.tags)
+        {
+            continue;
+        }
+        let Some(matrix) = devices.iter().find(|candidate| {
+            device_is_type(candidate, "replicant_matrix")
+                && !workflow_reserved(&candidate.tags)
+                && candidate.travel.is_none()
+                && candidate
+                    .relationships
+                    .stowed_in
+                    .as_ref()
+                    .is_some_and(|parent| parent == &vessel.key)
+        }) else {
+            continue;
+        };
+        let resources = [
+            ResourceKey::Device(vessel.key.id.as_str().to_owned()),
+            ResourceKey::Device(matrix.key.id.as_str().to_owned()),
+            ResourceKey::Replicant(replicant.id.as_str().to_owned()),
+        ];
+        let mut acquired = Vec::new();
+        let mut conflict = false;
+        for resource in resources {
+            match context.acquire_claim(resource.clone()) {
+                Ok(ClaimAcquireOutcome::Acquired(_)) => acquired.push(resource),
+                Ok(ClaimAcquireOutcome::AlreadyOwned(_)) => {}
+                Err(RepositoryError::ClaimConflict { .. }) => {
+                    conflict = true;
+                    break;
+                }
+                Err(error) => return Err(string_error(error)),
+            }
+        }
+        if conflict {
+            for resource in acquired {
+                context.release_claim(&resource).map_err(string_error)?;
+            }
+            continue;
+        }
+        return Ok(Some(matrix.key.id.as_str().to_owned()));
+    }
+    Ok(None)
+}
+
+fn regional_dispatch_delivery_request(
+    intent: &RegionalDispatchIntent,
+    checkpoint: &RegionalDispatchCheckpoint,
+) -> Result<DeliveryRequest, String> {
+    if checkpoint.vessels.len() != checkpoint.matrices.len()
+        || checkpoint.matrices.iter().any(Option::is_none)
+    {
+        return Err("regional dispatch vessel/matrix manifest is incomplete".to_owned());
+    }
+    Ok(DeliveryRequest {
+        origin: intent.source.clone(),
+        destination: intent.destination.clone(),
+        resources: intent.resources.clone(),
+        devices: Vec::new(),
+        device_codes: checkpoint
+            .vessels
+            .iter()
+            .chain(checkpoint.devices.iter())
+            .cloned()
+            .collect(),
+        device_tags: Vec::new(),
+        carrier: None,
+        allow_transport_staging: false,
+    })
+}
 
 fn manifest_delivery_request(intent: &LogisticsManifestIntent) -> DeliveryRequest {
     DeliveryRequest {
@@ -11806,7 +12729,11 @@ fn unix_millis() -> i64 {
 mod tests {
     use std::io;
 
-    use replicant_client::{SecretString, StartupPolicy, raw::Url};
+    use replicant_client::{
+        SecretString, StartupPolicy,
+        domain::{DeviceId, DeviceKey, DeviceRelationships, DeviceStatus, LocationId, LocationKey},
+        raw::Url,
+    };
     use replicant_workflow::WorkflowRepository;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -15829,5 +16756,119 @@ mod tests {
         );
         server.verify().await;
         client.close().await.expect("close client");
+    }
+
+    #[test]
+    fn regional_dispatch_expands_vessel_selectors_in_stable_order() {
+        let intent = RegionalDispatchIntent {
+            racing_vessels: 2,
+            heaven_vessels: 1,
+            cargo_vessels: 1,
+            ..RegionalDispatchIntent::default()
+        };
+        assert_eq!(
+            desired_replicant_vessel_types(&intent),
+            vec![
+                "racing_vessel",
+                "racing_vessel",
+                "heaven_vessel",
+                "cargo_vessel"
+            ]
+        );
+    }
+
+    fn dispatch_test_device(code: &str, device_type: &str, location: &str) -> Device {
+        Device {
+            key: DeviceKey::live(DeviceId::from(code)),
+            device_type: Some(DeviceType::from(device_type)),
+            status: Some(DeviceStatus::Idle),
+            location: Some(LocationKey::live(LocationId::from(location))),
+            deployed_at: None,
+            in_control_range: None,
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: DeviceRelationships::default(),
+            cargo: BTreeMap::new(),
+            cargo_capacity: None,
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: None,
+            access: AccessScope::Owned,
+        }
+    }
+
+    #[test]
+    fn regional_dispatch_accepts_vessels_with_only_an_empty_matrix() {
+        let mut vessel = dispatch_test_device("RACE-1", "racing_vessel", "HUB");
+        let mut matrix = dispatch_test_device("EMPTY-1", "empty_replicant_matrix", "HUB");
+        matrix.status = Some(DeviceStatus::from("stowed"));
+        matrix.location = None;
+        matrix.relationships.stowed_in = Some(vessel.key.clone());
+        vessel.relationships.stowed_devices = vec![matrix.key.clone()];
+        let devices = vec![vessel.clone(), matrix.clone()];
+
+        assert!(dispatch_vessel_is_free(
+            &vessel,
+            "racing_vessel",
+            "HUB",
+            &devices
+        ));
+        assert_eq!(
+            dispatch_vessel_onboard_empty_matrix(&vessel, &devices)
+                .map(|device| device.key.id.as_str()),
+            Some("EMPTY-1")
+        );
+
+        matrix.device_type = Some(DeviceType::ReplicantMatrix);
+        let devices = vec![vessel.clone(), matrix];
+        assert!(!dispatch_vessel_is_free(
+            &vessel,
+            "racing_vessel",
+            "HUB",
+            &devices
+        ));
+    }
+
+    #[test]
+    fn regional_dispatch_reuses_loose_empty_matrices_and_respects_reservations() {
+        let matrix = dispatch_test_device("EMPTY-1", "empty_replicant_matrix", "HUB");
+        assert!(dispatch_loose_empty_matrix_is_free(&matrix, "HUB"));
+
+        let mut reserved = matrix;
+        reserved.tags.push("mine-m:other-workflow".to_owned());
+        assert!(!dispatch_loose_empty_matrix_is_free(&reserved, "HUB"));
+    }
+
+    #[test]
+    fn regional_dispatch_vessel_only_manifest_requires_device_transport() {
+        let intent = RegionalDispatchIntent {
+            racing_vessels: 3,
+            ..RegionalDispatchIntent::default()
+        };
+        assert!(regional_dispatch_has_device_payload(&intent));
+    }
+
+    #[test]
+    fn regional_dispatch_refuses_incomplete_vessel_matrix_pairs() {
+        let intent = RegionalDispatchIntent {
+            source: "HUB".to_owned(),
+            destination: "TARGET".to_owned(),
+            racing_vessels: 1,
+            ..RegionalDispatchIntent::default()
+        };
+        let checkpoint = RegionalDispatchCheckpoint {
+            vessels: vec!["RACE-1".to_owned()],
+            matrices: vec![None],
+            ..RegionalDispatchCheckpoint::default()
+        };
+        assert!(regional_dispatch_delivery_request(&intent, &checkpoint).is_err());
     }
 }

@@ -2778,6 +2778,10 @@ pub struct WorkflowActivityResponse {
 pub enum ParameterKind {
     /// Free-form text.
     String,
+    /// Addable resource-type and positive-quantity entries.
+    ResourceManifest,
+    /// Addable device-type and positive-quantity entries.
+    DeviceManifest,
     /// Whole number.
     Integer,
     /// Floating-point number.

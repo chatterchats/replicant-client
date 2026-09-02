@@ -142,13 +142,22 @@ replicant-client managed operations / state
 ```
 
 The initial intent-native workflow kinds are `scan.system`, `scan.belt`, `scan.tour`,
-`salvage.site`, `mining.deploy`, `logistics.delivery`, `exploration.frontier`,
-`event.delivery`, `event.tour`, and `observatory.search`.
+`salvage.site`, `mining.deploy`, `logistics.delivery`, `logistics.regional_dispatch`,
+`exploration.frontier`, `event.delivery`, `event.tour`, and `observatory.search`.
 
 Legacy `survey.route`, `relay.expansion`, `mining.expansion`, `event.fulfillment`, and
 `requirement.fulfillment` remain registered for persisted-workflow and CLI compatibility, but
 are categorized as `compatibility` and are not offered by the normal web/Tauri operation
 picker.
+
+`logistics.regional_dispatch` is the operator-facing regional provisioning workflow. Its source
+must be an owned System Hub location. It reserves reusable unclaimed vessels, empty Replicant
+matrices, and requested devices before printing only the shortfall; a vessel that already carries
+an empty matrix is preferred, and loose empty matrices may be paired with vessels that still need
+to be printed. Requested Racing, HEAVEN, and Cargo vessels receive an empty matrix, are replicated
+into from any claimable local Replicant vessel when one is available, and otherwise remain empty.
+The workflow also ensures resource/device transport exists, then hands the complete manifest to
+the shared logistics executor, whose travel legs use managed smart hub routing.
 
 ### Checkpoint authority
 

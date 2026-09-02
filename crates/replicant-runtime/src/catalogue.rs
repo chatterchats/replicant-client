@@ -10,7 +10,7 @@ use std::{
 use futures::{StreamExt, stream};
 use replicant_client::{
     DeviceType,
-    managed::{AutofactoryPrintOptions, Client, Operation, OperationStatus},
+    managed::{Client, Operation, OperationStatus},
     raw,
 };
 use replicant_protocol::{
@@ -31,13 +31,14 @@ use crate::{
     },
     automation::{
         EventIntent, ExplorationIntent, LogisticsIntent, MiningDeployIntent, ObservatoryIntent,
-        SalvageIntent, SalvageRecoveryIntent, ScanIntent, ScanTourIntent, TradeFulfillmentIntent,
-        event_delivery_workflow_kind, event_tour_workflow_kind, exploration_workflow_kind,
-        logistics_workflow_kind, mining_deploy_workflow_kind, new_event_delivery_workflow,
-        new_event_tour_workflow, new_exploration_workflow, new_logistics_workflow,
-        new_mining_deploy_workflow, new_observatory_workflow, new_salvage_recovery_workflow,
-        new_salvage_workflow, new_scan_belt_workflow, new_scan_system_workflow,
-        new_scan_tour_workflow, new_trade_fulfillment_workflow, observatory_workflow_kind,
+        RegionalDispatchIntent, SalvageIntent, SalvageRecoveryIntent, ScanIntent, ScanTourIntent,
+        TradeFulfillmentIntent, event_delivery_workflow_kind, event_tour_workflow_kind,
+        exploration_workflow_kind, logistics_workflow_kind, mining_deploy_workflow_kind,
+        new_event_delivery_workflow, new_event_tour_workflow, new_exploration_workflow,
+        new_logistics_workflow, new_mining_deploy_workflow, new_observatory_workflow,
+        new_regional_dispatch_workflow, new_salvage_recovery_workflow, new_salvage_workflow,
+        new_scan_belt_workflow, new_scan_system_workflow, new_scan_tour_workflow,
+        new_trade_fulfillment_workflow, observatory_workflow_kind, regional_dispatch_workflow_kind,
         salvage_recovery_workflow_kind, salvage_recovery_workflow_matches, salvage_workflow_kind,
         scan_belt_workflow_kind, scan_system_workflow_kind, scan_tour_workflow_kind,
         trade_fulfillment_workflow_kind,
@@ -422,25 +423,39 @@ impl OperationCatalogue {
                     .get(&input.device)
                     .await
                     .map_err(runtime_error)?;
-                let via = client
-                    .smart_travel()
-                    .route_for_device(&input.device, &input.destination)
-                    .await
-                    .map_err(runtime_error)?
-                    .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
-                    .map(|plan| {
+                let via = if let Some(via) = nonempty(input.via) {
+                    Some(if via == "direct" {
+                        Value::String(via)
+                    } else {
                         Value::Array(
-                            plan.explicit_waypoints_for(&input.destination)
-                                .into_iter()
-                                .map(Value::String)
+                            via.split(',')
+                                .map(str::trim)
+                                .filter(|waypoint| !waypoint.is_empty())
+                                .map(|waypoint| Value::String(waypoint.to_owned()))
                                 .collect(),
                         )
-                    });
+                    })
+                } else {
+                    client
+                        .smart_travel()
+                        .route_for_device(&input.device, &input.destination)
+                        .await
+                        .map_err(runtime_error)?
+                        .filter(|plan| !plan.is_direct && !plan.intermediate_systems.is_empty())
+                        .map(|plan| {
+                            Value::Array(
+                                plan.explicit_waypoints_for(&input.destination)
+                                    .into_iter()
+                                    .map(Value::String)
+                                    .collect(),
+                            )
+                        })
+                };
                 managed_operation_value(
                     handle
                         .command(raw::devices::DeviceCommand::Travel {
                             destination: input.destination,
-                            dry_run: None,
+                            dry_run: input.dry_run.then_some(true),
                             via,
                         })
                         .await
@@ -519,6 +534,63 @@ impl OperationCatalogue {
                 };
                 managed_operation_value(handle.command(command).await.map_err(runtime_error)?).await
             }
+            "device.collect_resources" | "device.deposit_resources" => {
+                let input: DeviceResourcesAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                let resources = input.resources();
+                let command = if kind == "device.collect_resources" {
+                    if resources.is_empty() {
+                        return Err(CatalogueError::Invalid(
+                            "collect resources requires at least one positive quantity".to_owned(),
+                        ));
+                    }
+                    raw::devices::DeviceCommand::CollectResources { resources }
+                } else {
+                    raw::devices::DeviceCommand::DepositResources {
+                        resources: (!resources.is_empty()).then_some(resources),
+                    }
+                };
+                managed_operation_value(handle.command(command).await.map_err(runtime_error)?).await
+            }
+            "device.configure" => {
+                let input: DeviceConfigureAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Configure {
+                            mode: nonempty(input.mode),
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.message" => {
+                let input: DeviceMessageAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Message {
+                            channel: input.channel,
+                            text: input.text,
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
             "device.set_directive" => {
                 let input: DeviceDirectiveAction = decode(parameters)?;
                 let handle = client
@@ -538,12 +610,13 @@ impl OperationCatalogue {
                     )));
                 }
                 let configuration = directive_configuration(&input)?;
+                let notify = input.notify_json.as_deref().map(json_object).transpose()?;
                 managed_operation_value(
                     handle
                         .command(raw::devices::DeviceCommand::SetDirective {
                             directive: input.directive,
                             configuration,
-                            notify: None,
+                            notify,
                         })
                         .await
                         .map_err(runtime_error)?,
@@ -559,7 +632,7 @@ impl OperationCatalogue {
                 run_bulk_device_lifecycle(client, input).await
             }
             "device.stow" => {
-                let input: DeviceTargetAction = decode(parameters)?;
+                let input: DeviceStowAction = decode(parameters)?;
                 let handle = client
                     .devices()
                     .get(&input.device)
@@ -567,7 +640,25 @@ impl OperationCatalogue {
                     .map_err(runtime_error)?;
                 managed_operation_value(
                     handle
-                        .stow(Some(input.target))
+                        .stow(input.target.and_then(|target| nonempty(Some(target))))
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.replicate" => {
+                let input: DeviceReplicateAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Replicate {
+                            target: input.target,
+                            name: nonempty(input.name),
+                        })
                         .await
                         .map_err(runtime_error)?,
                 )
@@ -643,10 +734,6 @@ impl OperationCatalogue {
                     .get(&input.device)
                     .await
                     .map_err(runtime_error)?;
-                let mut options = AutofactoryPrintOptions::new(input.quantity);
-                if input.flatpack {
-                    options = options.flatpacked();
-                }
                 let tags = input
                     .tags
                     .as_deref()
@@ -656,12 +743,21 @@ impl OperationCatalogue {
                     .filter(|tag| !tag.is_empty())
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
-                if !tags.is_empty() {
-                    options = options.tags(tags);
-                }
+                let oncomplete = input
+                    .oncomplete_json
+                    .as_deref()
+                    .map(json_object)
+                    .transpose()?;
                 managed_operation_value(
                     handle
-                        .enqueue_print_configured(input.device_type, options)
+                        .command(raw::devices::DeviceCommand::EnqueuePrint {
+                            device_type: input.device_type,
+                            quantity: Some(input.quantity),
+                            controller: nonempty(input.controller),
+                            oncomplete,
+                            tags: (!tags.is_empty()).then_some(tags),
+                            flatpack: input.flatpack.then_some(true),
+                        })
                         .await
                         .map_err(runtime_error)?,
                 )
@@ -697,7 +793,17 @@ impl OperationCatalogue {
                     .get(&input.device)
                     .await
                     .map_err(runtime_error)?;
-                managed_operation_value(handle.prospect(None).await.map_err(runtime_error)?).await
+                let direction = match (input.x, input.y, input.z) {
+                    (None, None, None) => None,
+                    (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                    _ => {
+                        return Err(CatalogueError::Invalid(
+                            "prospect direction requires x, y, and z".to_owned(),
+                        ));
+                    }
+                };
+                managed_operation_value(handle.prospect(direction).await.map_err(runtime_error)?)
+                    .await
             }
             "observatory.prospect_direction" => {
                 let input: ObservatoryProspectDirectionAction = decode(parameters)?;
@@ -917,6 +1023,12 @@ impl OperationCatalogue {
                 workflow.parent_id = parent_id;
                 Ok(repository.create(workflow)?)
             }
+            "logistics.regional_dispatch" => {
+                let mut workflow =
+                    new_regional_dispatch_workflow(decode::<RegionalDispatchIntent>(parameters)?);
+                workflow.parent_id = parent_id;
+                Ok(repository.create(workflow)?)
+            }
             "trade.fulfillment" => {
                 let mut workflow =
                     new_trade_fulfillment_workflow(decode::<TradeFulfillmentIntent>(parameters)?);
@@ -1096,6 +1208,9 @@ impl OperationCatalogue {
             .ok_or_else(|| unknown(class, kind))?;
         if class == OperationClass::Workflow && kind == logistics_workflow_kind().as_str() {
             return validate_logistics_workflow_parameters(parameters, values, defaults_only);
+        }
+        if class == OperationClass::Workflow && kind == regional_dispatch_workflow_kind().as_str() {
+            return validate_regional_dispatch_parameters(parameters, values, defaults_only);
         }
         if let Some(name) = values
             .keys()
@@ -1291,6 +1406,77 @@ fn validate_logistics_workflow_parameters(
     Ok(values)
 }
 
+fn validate_regional_dispatch_parameters(
+    parameters: &[ParameterDescriptor],
+    mut values: BTreeMap<String, Value>,
+    defaults_only: bool,
+) -> Result<BTreeMap<String, Value>, CatalogueError> {
+    if let Some(name) = values
+        .keys()
+        .find(|name| !parameters.iter().any(|item| item.name == name.as_str()))
+    {
+        return Err(CatalogueError::Invalid(format!(
+            "unknown parameter `{name}` for `logistics.regional_dispatch`"
+        )));
+    }
+    for parameter in parameters {
+        if !values.contains_key(&parameter.name)
+            && let Some(default) = &parameter.default
+        {
+            values.insert(parameter.name.clone(), default.clone());
+        }
+    }
+    if defaults_only {
+        return Ok(values);
+    }
+    for name in ["source", "destination"] {
+        if values
+            .get(name)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(CatalogueError::Invalid(format!(
+                "missing required parameter `{name}`"
+            )));
+        }
+    }
+    let intent = decode::<RegionalDispatchIntent>(values.clone())?;
+    if intent.resources.values().any(|quantity| *quantity <= 0) {
+        return Err(CatalogueError::Invalid(
+            "resource quantities must be positive integers".to_owned(),
+        ));
+    }
+    if intent
+        .devices
+        .iter()
+        .any(|request| request.device_type.trim().is_empty() || request.quantity <= 0)
+    {
+        return Err(CatalogueError::Invalid(
+            "device entries require a device type and positive quantity".to_owned(),
+        ));
+    }
+    let vessel_counts = [
+        intent.racing_vessels,
+        intent.heaven_vessels,
+        intent.cargo_vessels,
+    ];
+    if vessel_counts.into_iter().any(|quantity| quantity < 0) {
+        return Err(CatalogueError::Invalid(
+            "Replicant vessel quantities cannot be negative".to_owned(),
+        ));
+    }
+    if intent.resources.is_empty()
+        && intent.devices.is_empty()
+        && vessel_counts.into_iter().all(|quantity| quantity == 0)
+    {
+        return Err(CatalogueError::Invalid(
+            "regional dispatch requires at least one resource, device, or Replicant vessel"
+                .to_owned(),
+        ));
+    }
+    Ok(values)
+}
+
 fn unknown(class: OperationClass, kind: &str) -> CatalogueError {
     CatalogueError::UnknownKind {
         class,
@@ -1317,6 +1503,8 @@ fn validate_parameter(
         ParameterKind::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
         ParameterKind::Number => value.as_f64().is_some_and(f64::is_finite),
         ParameterKind::Boolean => value.is_boolean(),
+        ParameterKind::ResourceManifest => value.is_object(),
+        ParameterKind::DeviceManifest => value.is_array(),
         ParameterKind::String
         | ParameterKind::Enum
         | ParameterKind::System
@@ -1748,6 +1936,12 @@ fn descriptors() -> DescriptorCatalog {
                 vec![
                     required("device", "Device", ParameterKind::Device),
                     required("destination", "Destination", ParameterKind::Location),
+                    optional(
+                        "via",
+                        "Route (comma separated, or direct)",
+                        ParameterKind::String,
+                    ),
+                    defaulted("dry_run", "Preview route only", ParameterKind::Boolean, false),
                 ],
             ),
             simple_action(
@@ -1773,6 +1967,49 @@ fn descriptors() -> DescriptorCatalog {
                     required("device", "Device", ParameterKind::Device),
                     required("resource_type", "Resource type", ParameterKind::String),
                     optional("target", "Mining site", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
+                "device.collect_resources",
+                "Collect resources",
+                "Load selected resource quantities from the current location.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                resource_action_parameters(),
+            ),
+            simple_action(
+                "device.deposit_resources",
+                "Deposit resources",
+                "Unload selected resource quantities, or leave every quantity empty to unload all cargo.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                resource_action_parameters(),
+            ),
+            simple_action(
+                "device.configure",
+                "Configure device",
+                "Set or clear the selected device's operating mode.",
+                "devices",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    optional("mode", "Mode", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "device.message",
+                "Send device message",
+                "Broadcast a BobNet message from the selected device.",
+                "devices",
+                MutationRisk::Low,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("channel", "Channel", ParameterKind::String),
+                    required("text", "Message", ParameterKind::String),
                 ],
             ),
             simple_action(
@@ -1840,6 +2077,15 @@ fn descriptors() -> DescriptorCatalog {
                     optional("deliver", "Deliver to", ParameterKind::Location),
                     optional("requirement_json", "Requirement JSON", ParameterKind::String),
                     optional("priority", "Priority resources (comma separated)", ParameterKind::String),
+                    optional("name", "Shop name", ParameterKind::String),
+                    optional("description", "Shop description", ParameterKind::String),
+                    optional("announcement", "BobNet announcement", ParameterKind::String),
+                    optional(
+                        "configuration_json",
+                        "Configuration JSON",
+                        ParameterKind::String,
+                    ),
+                    optional("notify_json", "Notification JSON", ParameterKind::String),
                 ],
             ),
             simple_action(
@@ -1894,9 +2140,15 @@ fn descriptors() -> DescriptorCatalog {
                     bounded(
                         defaulted("quantity", "Quantity", ParameterKind::Integer, 1),
                         Some(1.0),
-                        None,
+                        Some(50.0),
                     ),
                     optional("tags", "Tags (comma separated)", ParameterKind::String),
+                    optional("controller", "Adopt with controller", ParameterKind::Device),
+                    optional(
+                        "oncomplete_json",
+                        "On-complete command JSON",
+                        ParameterKind::String,
+                    ),
                     defaulted("flatpack", "Print compacted", ParameterKind::Boolean, false),
                 ],
             ),
@@ -1925,7 +2177,20 @@ fn descriptors() -> DescriptorCatalog {
                 vec![EntityKind::Device],
                 vec![
                     required("device", "Device", ParameterKind::Device),
-                    required("target", "Stow inside", ParameterKind::Device),
+                    optional("target", "Stow inside", ParameterKind::Device),
+                ],
+            ),
+            simple_action(
+                "device.replicate",
+                "Replicate device",
+                "Replicate from the selected matrix into a prepared empty target matrix.",
+                "replicants",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Source matrix", ParameterKind::Device),
+                    required("target", "Empty target matrix", ParameterKind::Device),
+                    optional("name", "Replicant name", ParameterKind::String),
                 ],
             ),
             simple_action(
@@ -1992,7 +2257,12 @@ fn descriptors() -> DescriptorCatalog {
                 "observatory",
                 MutationRisk::Elevated,
                 vec![EntityKind::Device],
-                vec![required("device", "Observatory", ParameterKind::Device)],
+                vec![
+                    required("device", "Observatory", ParameterKind::Device),
+                    optional("x", "Direction X", ParameterKind::Number),
+                    optional("y", "Direction Y", ParameterKind::Number),
+                    optional("z", "Direction Z", ParameterKind::Number),
+                ],
             ),
             simple_action(
                 "observatory.prospect_direction",
@@ -2109,11 +2379,28 @@ fn bind_device_commands(actions: &mut [ActionDescriptor]) {
         descriptor.device_commands = match descriptor.kind.0.as_str() {
             "autofactory.print" => vec![device_binding("enqueue_print", [])],
             "autofactory.dequeue_print" => vec![device_binding("dequeue_print", [])],
-            "device.travel" => vec![device_binding("travel", [])],
+            "device.adopt" => vec![device_binding("adopt", [])],
+            "device.attach" => vec![device_binding("attach", [])],
             "device.change_owner" => vec![device_binding("change_owner", [])],
+            "device.collect_resources" => vec![device_binding("collect_resources", [])],
+            "device.configure" => vec![device_binding("configure", [])],
+            "device.deposit_resources" => vec![device_binding("deposit_resources", [])],
+            "device.detach" => vec![device_binding("detach", [])],
+            "device.message" => vec![device_binding("message", [])],
+            "device.release" => vec![device_binding("release", [])],
+            "device.repair" => vec![device_binding("repair", [])],
+            "device.replicate" => vec![device_binding("replicate", [])],
             "device.retarget" => vec![device_binding("retarget", [])],
+            "device.set_directive" => vec![device_binding("set_directive", [])],
             "device.start_mining" => vec![device_binding("start_mining", [])],
             "device.stellar_census" => vec![device_binding("stellar_census", [])],
+            "device.stow" => vec![device_binding("stow", [])],
+            "device.travel" => vec![device_binding("travel", [])],
+            "hub.rename" => vec![device_binding("rename", [])],
+            "hub.set_entry_point" => vec![device_binding("set_entry_point", [])],
+            "hub.set_welcome_message" => vec![device_binding("set_welcome_message", [])],
+            "observatory.triangulate" => vec![device_binding("triangulate", [])],
+            "observatory.prospect" => vec![device_binding("prospect", [])],
             "device.lifecycle" => DEVICE_LIFECYCLE_COMMANDS
                 .iter()
                 .map(|command| {
@@ -2251,9 +2538,11 @@ const DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
     "assemble",
     "cancel",
     "clear_queue",
+    "clear_directive",
     "deactivate",
     "decommission",
     "deploy",
+    "detonate",
     "compact",
     "unfurl",
     "launch",
@@ -2269,6 +2558,7 @@ const BULK_DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
     "assemble",
     "cancel",
     "clear_queue",
+    "clear_directive",
     "deactivate",
     "decommission",
     "deploy",
@@ -2291,9 +2581,11 @@ fn device_lifecycle_command(command: &str) -> Result<raw::devices::DeviceCommand
         "assemble" => Ok(raw::devices::DeviceCommand::Assemble),
         "cancel" => Ok(raw::devices::DeviceCommand::Cancel),
         "clear_queue" => Ok(raw::devices::DeviceCommand::ClearQueue),
+        "clear_directive" => Ok(raw::devices::DeviceCommand::ClearDirective),
         "deactivate" => Ok(raw::devices::DeviceCommand::Deactivate),
         "decommission" => Ok(raw::devices::DeviceCommand::Decommission),
         "deploy" => Ok(raw::devices::DeviceCommand::Deploy),
+        "detonate" => Ok(raw::devices::DeviceCommand::Detonate),
         "compact" => Ok(raw::devices::DeviceCommand::Compact),
         "unfurl" => Ok(raw::devices::DeviceCommand::Unfurl),
         "launch" => Ok(raw::devices::DeviceCommand::Launch),
@@ -2633,6 +2925,48 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
                     None,
                 ),
                 defaulted("return_transports", "Return transports", ParameterKind::Boolean, false),
+            ],
+            supported_triggers: all_trigger_kinds(),
+        },
+        WorkflowDescriptor {
+            kind: operation_kind(regional_dispatch_workflow_kind().as_str()),
+            display_name: "Provision regional dispatch".to_owned(),
+            aliases: strings(&["regional_dispatch", "provision_dispatch"]),
+            description: "Claim or manufacture Replicant vessels, matrices, devices, and required transports at a regional hub, replicate where capacity is available, then deliver the complete manifest over smart hub routing.".to_owned(),
+            category: "logistics".to_owned(),
+            operation_class: OperationClass::Workflow,
+            risk: MutationRisk::Elevated,
+            applicable_to: vec![EntityKind::Location],
+            parameters: vec![
+                required("source", "Source regional hub", ParameterKind::Location),
+                required("destination", "Destination", ParameterKind::Location),
+                defaulted(
+                    "resources",
+                    "Resource amounts",
+                    ParameterKind::ResourceManifest,
+                    serde_json::json!({}),
+                ),
+                bounded(
+                    defaulted("racing_vessels", "Racing vessels", ParameterKind::Integer, 0),
+                    Some(0.0),
+                    None,
+                ),
+                bounded(
+                    defaulted("heaven_vessels", "HEAVEN vessels", ParameterKind::Integer, 0),
+                    Some(0.0),
+                    None,
+                ),
+                bounded(
+                    defaulted("cargo_vessels", "Cargo vessels", ParameterKind::Integer, 0),
+                    Some(0.0),
+                    None,
+                ),
+                defaulted(
+                    "devices",
+                    "Additional devices",
+                    ParameterKind::DeviceManifest,
+                    serde_json::json!([]),
+                ),
             ],
             supported_triggers: all_trigger_kinds(),
         },
@@ -3074,6 +3408,28 @@ fn bounded(
     parameter.validation.maximum = maximum;
     parameter
 }
+fn resource_action_parameters() -> Vec<ParameterDescriptor> {
+    let mut parameters = vec![required("device", "Device", ParameterKind::Device)];
+    parameters.extend(
+        [
+            "carbon",
+            "conductive",
+            "rares",
+            "silicates",
+            "structural",
+            "volatiles",
+        ]
+        .into_iter()
+        .map(|resource| {
+            bounded(
+                optional(resource, resource, ParameterKind::Number),
+                Some(0.0),
+                None,
+            )
+        }),
+    );
+    parameters
+}
 
 fn enum_parameter(name: &str, label: &str, values: &[&str], default: &str) -> ParameterDescriptor {
     let mut parameter = defaulted(name, label, ParameterKind::Enum, default);
@@ -3223,6 +3579,10 @@ struct TradeShopAction {
 struct DeviceTravelAction {
     device: String,
     destination: String,
+    #[serde(default)]
+    via: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Debug, Deserialize)]
 struct DeviceResourceAction {
@@ -3235,6 +3595,50 @@ struct DeviceMiningAction {
     resource_type: String,
     target: Option<String>,
 }
+#[derive(Debug, Deserialize)]
+struct DeviceResourcesAction {
+    device: String,
+    carbon: Option<f64>,
+    conductive: Option<f64>,
+    rares: Option<f64>,
+    silicates: Option<f64>,
+    structural: Option<f64>,
+    volatiles: Option<f64>,
+}
+
+impl DeviceResourcesAction {
+    fn resources(self) -> BTreeMap<String, f64> {
+        [
+            ("carbon", self.carbon),
+            ("conductive", self.conductive),
+            ("rares", self.rares),
+            ("silicates", self.silicates),
+            ("structural", self.structural),
+            ("volatiles", self.volatiles),
+        ]
+        .into_iter()
+        .filter_map(|(resource, quantity)| {
+            quantity
+                .filter(|quantity| *quantity > 0.0)
+                .map(|quantity| (resource.to_owned(), quantity))
+        })
+        .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceConfigureAction {
+    device: String,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceMessageAction {
+    device: String,
+    channel: String,
+    text: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct DeviceCensusAction {
     device: String,
@@ -3269,6 +3673,20 @@ struct DeviceTargetAction {
     target: String,
 }
 #[derive(Debug, Deserialize)]
+struct DeviceStowAction {
+    device: String,
+    target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceReplicateAction {
+    device: String,
+    target: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DeviceDirectiveAction {
     device: String,
     directive: String,
@@ -3283,6 +3701,11 @@ struct DeviceDirectiveAction {
     deliver: Option<String>,
     requirement_json: Option<String>,
     priority: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    announcement: Option<String>,
+    configuration_json: Option<String>,
+    notify_json: Option<String>,
 }
 
 fn directive_configuration(
@@ -3327,6 +3750,19 @@ fn directive_configuration(
                 .collect(),
         )
     };
+
+    if let Some(configuration) = input
+        .configuration_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|configuration| !configuration.is_empty())
+    {
+        return serde_json::from_str::<Map<String, Value>>(configuration)
+            .map(Some)
+            .map_err(|error| {
+                CatalogueError::Invalid(format!("invalid configuration JSON: {error}"))
+            });
+    }
 
     let configuration = match input.directive.as_str() {
         "gather_resources" => object(input.resources_json.as_deref(), "resources JSON")?,
@@ -3374,6 +3810,21 @@ fn directive_configuration(
             ),
             ("priority".to_owned(), priority()),
         ]),
+        "trade" => {
+            let mut configuration = Map::from_iter([(
+                "name".to_owned(),
+                Value::String(required(input.name.as_deref(), "shop name")?),
+            )]);
+            for (field, value) in [
+                ("description", input.description.as_deref()),
+                ("announcement", input.announcement.as_deref()),
+            ] {
+                if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+                    configuration.insert(field.to_owned(), Value::String(value.to_owned()));
+                }
+            }
+            configuration
+        }
         _ => return Ok(None),
     };
     Ok(Some(configuration))
@@ -3396,6 +3847,8 @@ struct AutofactoryPrintAction {
     quantity: i64,
     #[serde(default)]
     tags: Option<String>,
+    controller: Option<String>,
+    oncomplete_json: Option<String>,
     #[serde(default)]
     flatpack: bool,
 }
@@ -3406,6 +3859,9 @@ struct ObservatoryAutoProspectAction {
 #[derive(Debug, Deserialize)]
 struct ObservatoryProspectAction {
     device: String,
+    x: Option<f64>,
+    y: Option<f64>,
+    z: Option<f64>,
 }
 #[derive(Debug, Deserialize)]
 struct ObservatoryProspectDirectionAction {
@@ -3700,7 +4156,7 @@ mod tests {
             .await;
     }
     #[test]
-    fn device_command_bindings_cover_advertised_commands() {
+    fn device_command_bindings_cover_reference_and_typed_commands() {
         let catalogue = OperationCatalogue::new().expect("catalogue");
         let actions = &catalogue.descriptors().actions;
         let resolved = actions
@@ -3715,25 +4171,58 @@ mod tests {
                 resolved.entry(command).or_insert(kind);
                 resolved
             });
-        let advertised = [
-            "enqueue_print",
-            "travel",
-            "change_owner",
+        let expected = [
             "activate",
-            "deactivate",
+            "assemble",
+            "adopt",
+            "attach",
+            "cancel",
+            "change_owner",
+            "clear_directive",
             "clear_queue",
-            "system_scan",
+            "collect_resources",
+            "compact",
+            "configure",
+            "deactivate",
+            "decommission",
+            "deploy",
+            "deposit_resources",
+            "dequeue_print",
+            "detach",
+            "detonate",
+            "enqueue_print",
+            "launch",
+            "message",
+            "prospect",
+            "recall",
+            "release",
+            "rename",
+            "repair",
+            "replicate",
             "retarget",
+            "retrieve",
+            "scan",
+            "search",
+            "set_directive",
+            "set_entry_point",
+            "set_welcome_message",
             "start_mining",
             "stellar_census",
+            "stow",
+            "system_scan",
+            "travel",
+            "triangulate",
+            "unfurl",
+            "withdraw",
         ];
-
-        assert_eq!(
-            advertised
-                .iter()
-                .filter(|command| resolved.contains_key(**command))
-                .count(),
-            advertised.len()
+        let missing = expected
+            .iter()
+            .filter(|command| !resolved.contains_key(**command))
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "missing device command bindings: {missing:?}"
         );
         assert_eq!(
             resolved.get("enqueue_print").map(String::as_str),
@@ -3742,18 +4231,6 @@ mod tests {
         assert_eq!(
             resolved.get("travel").map(String::as_str),
             Some("device.travel")
-        );
-        assert_eq!(
-            resolved.get("retarget").map(String::as_str),
-            Some("device.retarget")
-        );
-        assert_eq!(
-            resolved.get("start_mining").map(String::as_str),
-            Some("device.start_mining")
-        );
-        assert_eq!(
-            resolved.get("stellar_census").map(String::as_str),
-            Some("device.stellar_census")
         );
 
         let lifecycle = actions
@@ -3781,32 +4258,6 @@ mod tests {
                     .any(|option| option.value == binding.command && !option.label.is_empty())
             );
         }
-        assert!(
-            actions
-                .iter()
-                .find(|descriptor| descriptor.kind.0 == "replicant.slingshot")
-                .expect("slingshot descriptor")
-                .device_commands
-                .is_empty()
-        );
-
-        let mut duplicate_precedence = actions.clone();
-        duplicate_precedence
-            .last_mut()
-            .expect("last descriptor")
-            .device_commands
-            .push(device_binding("travel", []));
-        let first_travel = duplicate_precedence
-            .iter()
-            .find_map(|descriptor| {
-                descriptor
-                    .device_commands
-                    .iter()
-                    .any(|binding| binding.command == "travel")
-                    .then_some(descriptor.kind.0.as_str())
-            })
-            .expect("travel binding");
-        assert_eq!(first_travel, "device.travel");
 
         let mut forged = OperationCatalogue::new().expect("catalogue");
         forged.descriptors.actions[0].device_commands = vec![device_binding(
@@ -3827,6 +4278,51 @@ mod tests {
             .push(descriptor.device_commands[0].clone());
         assert!(duplicate.validate_device_command_bindings().is_err());
     }
+    #[test]
+    fn directive_configuration_supports_trade_and_forward_compatible_json() {
+        let trade: DeviceDirectiveAction = serde_json::from_value(serde_json::json!({
+            "device": "TRADE",
+            "directive": "trade",
+            "name": "Bob's Bits",
+            "description": "Useful equipment"
+        }))
+        .expect("trade input");
+        assert_eq!(
+            directive_configuration(&trade).expect("trade configuration"),
+            Some(Map::from_iter([
+                ("name".to_owned(), Value::String("Bob's Bits".to_owned())),
+                (
+                    "description".to_owned(),
+                    Value::String("Useful equipment".to_owned())
+                )
+            ]))
+        );
+
+        let future: DeviceDirectiveAction = serde_json::from_value(serde_json::json!({
+            "device": "FUTURE",
+            "directive": "future_directive",
+            "configuration_json": "{\"mode\":\"smart\"}",
+            "notify_json": "{\"webhook\":true}"
+        }))
+        .expect("future input");
+        assert_eq!(
+            directive_configuration(&future).expect("future configuration"),
+            Some(Map::from_iter([(
+                "mode".to_owned(),
+                Value::String("smart".to_owned())
+            )]))
+        );
+        assert_eq!(
+            future
+                .notify_json
+                .as_deref()
+                .map(json_object)
+                .transpose()
+                .expect("notify JSON"),
+            Some(Map::from_iter([("webhook".to_owned(), Value::Bool(true))]))
+        );
+    }
+
     #[tokio::test]
     async fn device_travel_action_emits_shared_smart_waypoints() {
         let server = MockServer::start().await;
@@ -4006,6 +4502,53 @@ mod tests {
     }
 
     #[test]
+    fn regional_dispatch_surfaces_structured_manifest_and_vessel_inputs() {
+        let catalogue = OperationCatalogue::new().expect("catalogue");
+        let descriptor = catalogue
+            .descriptors()
+            .workflows
+            .iter()
+            .find(|descriptor| descriptor.kind.0 == regional_dispatch_workflow_kind().as_str())
+            .expect("regional dispatch descriptor");
+        let kinds = descriptor
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), &parameter.kind))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            kinds.get("resources"),
+            Some(&&ParameterKind::ResourceManifest)
+        );
+        assert_eq!(kinds.get("devices"), Some(&&ParameterKind::DeviceManifest));
+        for name in ["racing_vessels", "heaven_vessels", "cargo_vessels"] {
+            assert_eq!(kinds.get(name), Some(&&ParameterKind::Integer));
+        }
+
+        let validated = catalogue
+            .validate(
+                OperationClass::Workflow,
+                regional_dispatch_workflow_kind().as_str(),
+                BTreeMap::from([
+                    ("source".to_owned(), serde_json::json!("HUB-1")),
+                    ("destination".to_owned(), serde_json::json!("TARGET-1")),
+                    (
+                        "resources".to_owned(),
+                        serde_json::json!({"silicates": 100}),
+                    ),
+                    ("racing_vessels".to_owned(), serde_json::json!(3)),
+                    (
+                        "devices".to_owned(),
+                        serde_json::json!([{"device_type": "mining_drone", "quantity": 2}]),
+                    ),
+                ]),
+                false,
+            )
+            .expect("structured regional dispatch should validate");
+        assert_eq!(validated["heaven_vessels"], serde_json::json!(0));
+        assert_eq!(validated["cargo_vessels"], serde_json::json!(0));
+    }
+
+    #[test]
     fn intent_workflow_factories_are_registered() {
         let catalogue = OperationCatalogue::new().expect("catalogue");
         for kind in [
@@ -4015,6 +4558,7 @@ mod tests {
             salvage_workflow_kind(),
             mining_deploy_workflow_kind(),
             logistics_workflow_kind(),
+            regional_dispatch_workflow_kind(),
             exploration_workflow_kind(),
             event_delivery_workflow_kind(),
             event_tour_workflow_kind(),
@@ -4291,6 +4835,11 @@ mod tests {
             deliver: Some("SOL-2".to_owned()),
             requirement_json: Some(r#"{"iron":12}"#.to_owned()),
             priority: None,
+            name: None,
+            description: None,
+            announcement: None,
+            configuration_json: None,
+            notify_json: None,
         };
         assert_eq!(
             directive_configuration(&input).expect("delivery configuration"),

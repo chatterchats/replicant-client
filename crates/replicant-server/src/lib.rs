@@ -5121,7 +5121,16 @@ fn device_summary(
     replicant_names: &BTreeMap<String, String>,
     claim: Option<DeviceClaim>,
 ) -> Result<DeviceSummary, ApiError> {
-    let location = device.location.map(|value| value.id.to_string());
+    let location = device
+        .location
+        .as_ref()
+        .or_else(|| {
+            device
+                .travel
+                .as_ref()
+                .and_then(|travel| travel.origin.as_ref())
+        })
+        .map(|value| value.id.to_string());
     let owner = device
         .relationships
         .assigned_replicant
@@ -9542,6 +9551,55 @@ mod tests {
             device_system("THYFFAWFF-1-L4", &BTreeMap::new()).as_deref(),
             Some("THYFFAWFF")
         );
+    }
+
+    #[test]
+    fn travelling_device_position_falls_back_to_navigation_origin() {
+        use replicant_client::domain::{
+            AccessScope, DeviceKey, DeviceRelationships, DeviceStatus, DeviceType, LocationKey,
+            TravelState,
+        };
+
+        let device = Device {
+            key: DeviceKey::live("D-TRAVEL".into()),
+            device_type: Some(DeviceType::from("cargo_vessel")),
+            status: Some(DeviceStatus::from("travelling")),
+            location: None,
+            deployed_at: None,
+            in_control_range: None,
+            features: Vec::new(),
+            available_commands: Vec::new(),
+            available_directives: Vec::new(),
+            tags: Vec::new(),
+            relationships: DeviceRelationships::default(),
+            cargo: Default::default(),
+            cargo_capacity: None,
+            attach_capacity: None,
+            stow_capacity: None,
+            stow_used: None,
+            operational_capacity: None,
+            grace_period_remaining: None,
+            upkeep_requirements: Vec::new(),
+            system_status: None,
+            active_directive: None,
+            travel: Some(TravelState {
+                origin: Some(LocationKey::live("EARTH".into())),
+                ..TravelState::default()
+            }),
+            access: AccessScope::Owned,
+        };
+        let row = device_summary(
+            device,
+            &BTreeMap::from([("EARTH".to_owned(), Some("SOL".to_owned()))]),
+            &BTreeMap::from([("SOL".to_owned(), "solzone".to_owned())]),
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("travelling device projection");
+
+        assert_eq!(row.location.as_deref(), Some("EARTH"));
+        assert_eq!(row.system.as_deref(), Some("SOL"));
+        assert_eq!(row.region.as_deref(), Some("solzone"));
     }
 
     #[test]

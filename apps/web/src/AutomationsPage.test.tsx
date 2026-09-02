@@ -89,6 +89,52 @@ describe("descriptor workflow form", () => {
     expect(html).toContain('type="number"');
   });
 
+  it("renders addable resource and device manifests", () => {
+    const resourceHtml = renderToStaticMarkup(
+      <ParameterField
+        parameter={parameter("resources", { type: "resource_manifest" })}
+        value={{ silicates: 100 }}
+        entities={{}}
+        onChange={() => undefined}
+      />,
+    );
+    const deviceHtml = renderToStaticMarkup(
+      <ParameterField
+        parameter={parameter("devices", { type: "device_manifest" })}
+        value={[{ device_type: "mining_drone", quantity: 2 }]}
+        entities={{ "device:D-1": { device_type: "mining_drone" } }}
+        onChange={() => undefined}
+      />,
+    );
+
+    expect(resourceHtml).toContain("silicates");
+    expect(resourceHtml).toContain("+ Add resource");
+    expect(deviceHtml).toContain("mining_drone");
+    expect(deviceHtml).toContain("+ Add device");
+  });
+
+  it("offers only owned System Hub locations as dispatch sources", () => {
+    const html = renderToStaticMarkup(
+      <ParameterField
+        parameter={parameter("source", { type: "location" })}
+        value=""
+        entities={{
+          "location:ALPHA-HUB": {},
+          "location:OTHER": {},
+          "device:HUB-1": {
+            device_type: "system_hub",
+            location: "ALPHA-HUB",
+          },
+        }}
+        operationKind="logistics.regional_dispatch"
+        onChange={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("ALPHA-HUB");
+    expect(html).not.toContain('value="OTHER"');
+  });
+
   it("validates required descriptor fields before submission", () => {
     const descriptor: WorkflowDescriptor = {
       kind: "test.workflow",

@@ -1088,7 +1088,16 @@ export interface TriggerRequest {
 }
 
 export type ParameterKind =
-  | { type: "string" | "integer" | "number" | "boolean" | "enum" }
+  | {
+      type:
+        | "string"
+        | "integer"
+        | "number"
+        | "boolean"
+        | "enum"
+        | "resource_manifest"
+        | "device_manifest";
+    }
   | {
       type:
         "system" | "location" | "replicant" | "device" | "device_type" | "tag";
@@ -1744,6 +1753,8 @@ function parameter(value: unknown): ParameterDescriptor {
       "device",
       "device_type",
       "tag",
+      "resource_manifest",
+      "device_manifest",
       "entity",
     ] as const,
     "parameter kind",
