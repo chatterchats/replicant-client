@@ -142,6 +142,23 @@ describe("device fleet browser", () => {
     ).toEqual(["D-1", "D-3"]);
   });
 
+  it("keeps travelling devices in their origin region filter", () => {
+    const travelling = device("D-TRAVEL", {
+      status: "Travelling",
+      location: "EARTH",
+      system: "SOL",
+      region: "solzone",
+    });
+
+    expect(
+      filterAndSortDevices(
+        [travelling],
+        { ...filters, region: "solzone" },
+        "code",
+      ).map((row) => row.entity.id),
+    ).toEqual(["D-TRAVEL"]);
+  });
+
   it("orders systems by device count and then system name", () => {
     const rows = [
       device("A", { system: "VEGA" }),
