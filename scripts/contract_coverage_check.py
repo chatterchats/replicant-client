@@ -153,7 +153,7 @@ def _check_event_rows(root: Path, inventory: dict[str, Any], rows: list[dict[str
     decoder_names = set(re.findall(r'=>\s*"([a-z][a-z0-9_.]+)"\s*=>', decoder_body or ""))
     if decoder_names != expected:
         errors.append(f"event decoder registry mismatch: missing={sorted(expected - decoder_names)}, extra={sorted(decoder_names - expected)}")
-    fixture = json.loads((root / "tests/fixtures/events-2.5.2.json").read_text())
+    fixture = json.loads((root / "tests/fixtures/events-3.0.0.json").read_text())
     fixture_rows = {row["name"]: row for row in fixture["events"]}
     if set(fixture_rows) != expected:
         errors.append(

@@ -414,6 +414,23 @@ pub struct MessageNewPayload {
     pub extra: JsonObject,
 }
 
+/// Typed payload for `mining.relocated`.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct MiningRelocatedPayload {
+    /// Belt or resource location containing the AMI mining operation.
+    pub location: Option<String>,
+    /// Resource type whose depleted site triggered relocation.
+    pub resource_type: Option<String>,
+    /// Previously targeted resource-site designation.
+    pub old_site: Option<String>,
+    /// Newly selected resource-site designation.
+    pub new_site: Option<String>,
+    /// Future payload fields.
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
 /// Typed payload for `mining.retargeted`.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]

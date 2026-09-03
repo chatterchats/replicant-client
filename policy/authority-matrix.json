@@ -2,7 +2,7 @@
   "version": 2,
   "sync_domain_policy": "policy/sync-domains.json",
   "sync_domain_policy_sha256": "17b96fd7a36c2b2b382c0ef987b7bf062c0e43d52c084390e5ad734d212bc12b",
-  "contract": "Verified Replicant Space 2.5.2 OpenAPI corpus",
+  "contract": "Verified Replicant Space 3.0.0 OpenAPI corpus",
   "operations": [
     {
       "method": "POST",

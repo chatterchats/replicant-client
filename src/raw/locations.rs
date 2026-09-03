@@ -71,6 +71,24 @@ where
 pub struct PlanetaryBody {
     /// Whether this planet or moon has been scanned.
     pub scanned: Option<bool>,
+    /// Atmospheric oxygen percentage.
+    pub atmo_o2_pct: Option<f64>,
+    /// Atmospheric pressure in Earth atmospheres.
+    pub atmo_pressure_atm: Option<f64>,
+    /// Atmospheric toxicity index (`0..=100`).
+    pub atmo_toxicity: Option<f64>,
+    /// Biosphere index (`0..=100`).
+    pub biosphere_index: Option<f64>,
+    /// Server-defined planetary category (for example `frozen`).
+    pub category: Option<String>,
+    /// Mean density in grams per cubic centimetre.
+    pub density_gcc: Option<f64>,
+    /// Planet or moon designation embedded in the body object.
+    pub designation: Option<String>,
+    /// Whether a subsurface ocean is present.
+    pub has_subsurface_ocean: Option<bool>,
+    /// Hydrosphere percentage (`0..=100`).
+    pub hydrosphere_pct: Option<f64>,
     /// Reported atmospheric classification.
     ///
     /// The upstream API historically returned descriptive strings here, but
@@ -82,6 +100,18 @@ pub struct PlanetaryBody {
     pub in_habitable_zone: Option<bool>,
     /// Highest life stage reported for the body.
     pub life_stage: Option<String>,
+    /// Server-defined physical location classification.
+    pub location_type: Option<String>,
+    /// Body mass in Earth masses.
+    pub mass_earth: Option<f64>,
+    /// Optional body name.
+    pub name: Option<String>,
+    /// Orbital distance in kilometres.
+    pub orbital_distance_km: Option<f64>,
+    /// Orbital period in hours.
+    pub orbital_period_hours: Option<f64>,
+    /// Body radius in Earth radii.
+    pub radius_earth: Option<f64>,
     /// Whether a magnetic field is reported.
     pub magnetic_field: Option<bool>,
     /// Axial tilt in degrees.
@@ -90,6 +120,18 @@ pub struct PlanetaryBody {
     pub surface_gravity: Option<f64>,
     /// Degrees Celsius.
     pub surface_temp_c: Option<f64>,
+    /// Surface temperature in Kelvin.
+    pub surface_temp_k: Option<f64>,
+    /// Descriptive body tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Tectonic activity index (`0..=100`).
+    pub tectonic_index: Option<f64>,
+    /// Whether rotation is tidally locked.
+    pub tidally_locked: Option<bool>,
+    /// Server-defined rocky/gaseous body type.
+    #[serde(rename = "type")]
+    pub body_type: Option<String>,
     /// Additional response fields retained without interpretation.
     #[serde(flatten)]
     pub unknown: JsonObject,
@@ -214,6 +256,14 @@ impl Location {
             "axial_tilt_deg",
             "surface_gravity",
             "surface_temp_c",
+            "surface_temp_k",
+            "atmo_o2_pct",
+            "atmo_pressure_atm",
+            "atmo_toxicity",
+            "biosphere_index",
+            "hydrosphere_pct",
+            "tectonic_index",
+            "has_subsurface_ocean",
         ];
 
         let mut serializable = self.clone();

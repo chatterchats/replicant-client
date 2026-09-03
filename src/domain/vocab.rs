@@ -68,6 +68,7 @@ open_value!(EventName {
     HubWarning => "hub.warning",
     MegastructureContributed => "megastructure.contributed",
     MessageNew => "message.new",
+    MiningRelocated => "mining.relocated",
     MiningRetargeted => "mining.retargeted",
     MiningStarted => "mining.started",
     MiningStopped => "mining.stopped",
@@ -150,11 +151,13 @@ device_types! {
     FtlSlingshot => "ftl_slingshot",
     FusionBarge => "fusion_barge",
     GalacticObservatory => "galactic_observatory",
+    GravitonStabiliser => "graviton_stabiliser",
     GravityLens => "gravity_lens",
     HabModule => "hab_module",
     HeavenVessel => "heaven_vessel",
     HullPlate => "hull_plate",
     HydroponicBay => "hydroponic_bay",
+    InertialAnchor => "inertial_anchor",
     MaintenanceDrone => "maintenance_drone",
     MassDriver => "mass_driver",
     MatrixContainer => "matrix_container",
@@ -228,7 +231,7 @@ impl Atmosphere {
     }
 }
 open_value!(LifeStage {
-    Prebiotic => "prebiotic", Microbial => "microbial", Complex => "complex",
+    None => "none", Prebiotic => "prebiotic", Microbial => "microbial", Complex => "complex",
     Intelligent => "intelligent", Spacefaring => "spacefaring"
 });
 
@@ -238,11 +241,12 @@ impl LifeStage {
     #[must_use]
     pub fn canonical_rank(&self) -> Option<u8> {
         match self {
-            Self::Prebiotic => Some(0),
-            Self::Microbial => Some(1),
-            Self::Complex => Some(2),
-            Self::Intelligent => Some(3),
-            Self::Spacefaring => Some(4),
+            Self::None => Some(0),
+            Self::Prebiotic => Some(1),
+            Self::Microbial => Some(2),
+            Self::Complex => Some(3),
+            Self::Intelligent => Some(4),
+            Self::Spacefaring => Some(5),
             Self::Unknown(_) => None,
         }
     }

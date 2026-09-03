@@ -1,0 +1,2 @@
+-- Version 9 is completed by the Rust migrator because planetary and life
+-- observations are stored as serialized domain projections rather than SQL columns.

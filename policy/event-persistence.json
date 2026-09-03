@@ -1,5 +1,5 @@
 {
-  "contract_version": "2.5.2",
+  "contract_version": "3.0.0",
   "events": [
     {
       "name": "ami.adopted",
@@ -506,6 +506,19 @@
       "projection_symbol": "crate::managed::events::projection_message_new",
       "reason": "Documented fields support an exact managed upsert or delta with reconciliation fallback when identity is absent.",
       "evidence": "api/events/catalogue/index.md:596",
+      "backlog_group": "none"
+    },
+    {
+      "name": "mining.relocated",
+      "payload_status": "implemented",
+      "payload": "typed",
+      "payload_symbol": "crate::events::MiningRelocatedPayload",
+      "persistence_status": "implemented",
+      "treatment": "reconciliation_only",
+      "replay": "reconcile",
+      "projection_symbol": "crate::managed::events::projection_mining_relocated",
+      "reason": "Relocation changes the mining device target without providing a complete device snapshot, so retain the event and reconcile the affected mining scope.",
+      "evidence": "api/events/catalogue/index.md:613",
       "backlog_group": "none"
     },
     {

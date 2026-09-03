@@ -431,6 +431,7 @@ mod tests {
             available_commands: Vec::<DeviceCommand>::new(),
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: Default::default(),
             relationships: DeviceRelationships::default(),
             cargo: Default::default(),
             cargo_capacity: None,

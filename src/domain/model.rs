@@ -127,6 +127,9 @@ pub struct Device {
     pub available_commands: Vec<DeviceCommand>,
     pub available_directives: Vec<DeviceDirective>,
     pub tags: Vec<String>,
+    /// Device-type-specific server configuration, preserved as an open object.
+    #[serde(default)]
+    pub settings: BTreeMap<String, Value>,
     pub relationships: DeviceRelationships,
     /// Resource quantities currently carried by this device.
     #[serde(default)]
@@ -249,6 +252,30 @@ pub struct LocationEnvironment {
     pub gravity_g: Knowledge<f64>,
     /// Degrees Celsius.
     pub surface_temp_c: Knowledge<f64>,
+    /// Kelvin, as reported by the Season Three planetary model.
+    #[serde(default)]
+    pub surface_temp_k: Knowledge<f64>,
+    /// Atmospheric pressure in Earth atmospheres.
+    #[serde(default)]
+    pub atmo_pressure_atm: Knowledge<f64>,
+    /// Atmospheric oxygen percentage.
+    #[serde(default)]
+    pub atmo_o2_pct: Knowledge<f64>,
+    /// Atmospheric toxicity index (`0..=100`).
+    #[serde(default)]
+    pub atmo_toxicity: Knowledge<f64>,
+    /// Hydrosphere percentage (`0..=100`).
+    #[serde(default)]
+    pub hydrosphere_pct: Knowledge<f64>,
+    /// Tectonic activity index (`0..=100`).
+    #[serde(default)]
+    pub tectonic_index: Knowledge<f64>,
+    /// Biosphere index (`0..=100`).
+    #[serde(default)]
+    pub biosphere_index: Knowledge<f64>,
+    /// Whether the body has a subsurface ocean.
+    #[serde(default)]
+    pub has_subsurface_ocean: Knowledge<bool>,
     pub in_habitable_zone: Knowledge<bool>,
     pub life_stage: Knowledge<LifeStage>,
     /// Axial tilt in degrees.
@@ -354,6 +381,13 @@ impl Location {
         !matches!(&self.environment.atmosphere, Knowledge::Unknown)
             || !matches!(&self.environment.magnetic_field, Knowledge::Unknown)
             || !matches!(&self.environment.axial_tilt_deg, Knowledge::Unknown)
+            || !matches!(&self.environment.atmo_pressure_atm, Knowledge::Unknown)
+            || !matches!(&self.environment.atmo_o2_pct, Knowledge::Unknown)
+            || !matches!(&self.environment.atmo_toxicity, Knowledge::Unknown)
+            || !matches!(&self.environment.hydrosphere_pct, Knowledge::Unknown)
+            || !matches!(&self.environment.tectonic_index, Knowledge::Unknown)
+            || !matches!(&self.environment.biosphere_index, Knowledge::Unknown)
+            || !matches!(&self.environment.has_subsurface_ocean, Knowledge::Unknown)
     }
 
     pub(crate) fn merge_from(&mut self, newer: &Self) {
@@ -407,6 +441,38 @@ impl Location {
         merge_knowledge(
             &mut self.environment.surface_temp_c,
             &newer.environment.surface_temp_c,
+        );
+        merge_knowledge(
+            &mut self.environment.surface_temp_k,
+            &newer.environment.surface_temp_k,
+        );
+        merge_knowledge(
+            &mut self.environment.atmo_pressure_atm,
+            &newer.environment.atmo_pressure_atm,
+        );
+        merge_knowledge(
+            &mut self.environment.atmo_o2_pct,
+            &newer.environment.atmo_o2_pct,
+        );
+        merge_knowledge(
+            &mut self.environment.atmo_toxicity,
+            &newer.environment.atmo_toxicity,
+        );
+        merge_knowledge(
+            &mut self.environment.hydrosphere_pct,
+            &newer.environment.hydrosphere_pct,
+        );
+        merge_knowledge(
+            &mut self.environment.tectonic_index,
+            &newer.environment.tectonic_index,
+        );
+        merge_knowledge(
+            &mut self.environment.biosphere_index,
+            &newer.environment.biosphere_index,
+        );
+        merge_knowledge(
+            &mut self.environment.has_subsurface_ocean,
+            &newer.environment.has_subsurface_ocean,
         );
         merge_knowledge(
             &mut self.environment.in_habitable_zone,

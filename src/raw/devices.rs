@@ -273,6 +273,9 @@ pub struct DeviceStatus {
     pub stowed_devices: Vec<JsonObject>,
     /// The device this device is stowed inside, if any.
     pub stowed_in_device_code: Option<String>,
+    /// Device-type-specific operational settings. Replicant Space 3.0 keeps
+    /// this object open because individual device types define their own keys.
+    pub settings: Option<JsonObject>,
     /// System-specific status detail, open-shaped.
     pub system_status: Option<JsonObject>,
     /// User-assigned tags.
@@ -365,6 +368,11 @@ pub struct DeviceConfiguration {
     /// Tags to set outright, replacing the current set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Device-type-specific operational settings. Keys and values are defined
+    /// by the selected device type (for example terraforming strength and
+    /// direction), so the raw contract deliberately keeps the object open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<JsonObject>,
     /// Device code linked to this device. `Null` explicitly clears an
     /// existing link while `Omitted` leaves it unchanged.
     #[serde(default, skip_serializing_if = "UpdateField::is_omitted")]
@@ -398,6 +406,8 @@ pub struct DeviceConfigurationResponse {
     pub tags: Vec<String>,
     /// Device linked after the update, if any.
     pub linked_device: Option<String>,
+    /// Device-type-specific settings after the update.
+    pub settings: Option<JsonObject>,
     /// Any other fields the server returns.
     #[serde(flatten)]
     pub extra: JsonObject,
@@ -495,8 +505,20 @@ pub enum DeviceCommand {
     },
     /// Detaches one or more attached devices.
     Detach(TargetsCommand),
-    /// Detonates a device.
-    Detonate,
+    /// Searches the current system for a temporary Kuiper object. Replicant
+    /// Space 3.0 advertises this on devices with the `system_scan` feature.
+    DetectObject,
+    /// Detonates a vector charge to launch a detected Kuiper object toward a
+    /// planet or moon. Both fields are nullable in OpenAPI so callers can
+    /// still observe server-side validation verbatim.
+    Detonate {
+        /// Planet or moon designation to target.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+        /// Detected Kuiper object designation to launch.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Queues a new device to be printed.
     EnqueuePrint {
         /// The device type to print.
@@ -706,6 +728,22 @@ pub struct DeviceCommandResponse {
     pub destination_name: Option<String>,
     /// Destination type after a `travel` command.
     pub destination_type: Option<String>,
+    /// Kuiper-belt search target after a `detect_object` command.
+    pub detect_target: Option<String>,
+    /// Initial approach angle for an intentionally launched Kuiper object.
+    pub approach_angle: Option<f64>,
+    /// Initial approach speed for an intentionally launched Kuiper object.
+    pub approach_speed: Option<f64>,
+    /// Composition of an intentionally launched Kuiper object.
+    pub composition: Option<String>,
+    /// Estimated impact time for an intentionally launched Kuiper object.
+    pub impact_eta: Option<String>,
+    /// Kuiper object designation consumed by a vector-charge launch.
+    pub kuiper_object: Option<String>,
+    /// Mass class of an intentionally launched Kuiper object.
+    pub mass_class: Option<String>,
+    /// Trackable system-object designation created by a vector-charge launch.
+    pub object_designation: Option<String>,
     /// Devices detached by a `detach` command.
     #[serde(default, deserialize_with = "deserialize_references")]
     pub detached: Vec<String>,

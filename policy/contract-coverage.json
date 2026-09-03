@@ -1,13 +1,13 @@
 {
-  "contract_version": "2.5.2",
-  "manifest_sha256": "9444e118020ef8e80271b3bf8fec35e2c657d4df3e773ce8b6e0444ecacad50c",
-  "openapi_sha256": "df5f74046e95678f54161b930af6d8b1abbe4b07b1718e485b5a4d46f6757639",
+  "contract_version": "3.0.0",
+  "manifest_sha256": "ecdb9914012b4d60d12e197d2389c9729ea14505fa535a2939ab65f26925c826",
+  "openapi_sha256": "81031c666ac1dc16742125d6e0e0bde334ab345c1022ddc6f9783cf0567b3adf",
   "totals": {
-    "catalogue_events": 79,
+    "catalogue_events": 80,
     "digest_events": 3,
-    "events": 82,
-    "schemas": 160,
-    "fields": 891
+    "events": 83,
+    "schemas": 161,
+    "fields": 897
   },
   "events": [
     {
@@ -554,6 +554,20 @@
       "projection_symbol": "crate::managed::events::projection_message_new",
       "reason": "Documented fields support an exact managed upsert or delta with reconciliation fallback when identity is absent.",
       "evidence": "api/events/catalogue/index.md:596",
+      "backlog_group": "none"
+    },
+    {
+      "name": "mining.relocated",
+      "source": "catalogue",
+      "payload_status": "implemented",
+      "payload": "typed",
+      "payload_symbol": "crate::events::MiningRelocatedPayload",
+      "persistence_status": "implemented",
+      "treatment": "reconciliation_only",
+      "replay": "reconcile",
+      "projection_symbol": "crate::managed::events::projection_mining_relocated",
+      "reason": "Relocation changes the mining device target without providing a complete device snapshot, so retain the event and reconcile the affected mining scope.",
+      "evidence": "api/events/catalogue/index.md:613",
       "backlog_group": "none"
     },
     {
@@ -1999,10 +2013,10 @@
             "items": {
               "type": "string",
               "enum": [
-                "simulation",
                 "alert",
-                "social",
-                "progression"
+                "progression",
+                "simulation",
+                "social"
               ]
             }
           },
@@ -4271,6 +4285,68 @@
           "persistence_symbol": null,
           "reason": "The raw DTO types the contract field; no field-level managed authority rule is declared, so the server response remains authoritative.",
           "evidence": "audit/2.5.1/merged.jsonl:133",
+          "backlog_group": "none"
+        }
+      ]
+    },
+    {
+      "pointer": "/components/schemas/app_schemas_device_commands_DetonateSchema",
+      "name": "app_schemas_device_commands_DetonateSchema",
+      "fields": [
+        {
+          "pointer": "/components/schemas/app_schemas_device_commands_DetonateSchema/properties/command",
+          "schema": "app_schemas_device_commands_DetonateSchema",
+          "field": "command",
+          "required": true,
+          "shape": {
+            "type": "string"
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceCommand::Detonate",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/api/locations/terraforming/impacts/index.md:64-74",
+          "backlog_group": "none"
+        },
+        {
+          "pointer": "/components/schemas/app_schemas_device_commands_DetonateSchema/properties/destination",
+          "schema": "app_schemas_device_commands_DetonateSchema",
+          "field": "destination",
+          "required": false,
+          "shape": {
+            "type": "string",
+            "nullable": true
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceCommand::Detonate",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/api/locations/terraforming/impacts/index.md:64-74",
+          "backlog_group": "none"
+        },
+        {
+          "pointer": "/components/schemas/app_schemas_device_commands_DetonateSchema/properties/target",
+          "schema": "app_schemas_device_commands_DetonateSchema",
+          "field": "target",
+          "required": false,
+          "shape": {
+            "type": "string",
+            "nullable": true
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceCommand::Detonate",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/api/locations/terraforming/impacts/index.md:64-74",
           "backlog_group": "none"
         }
       ]
@@ -6934,6 +7010,26 @@
           "backlog_group": "none"
         },
         {
+          "pointer": "/components/schemas/app_schemas_devices_DeviceConfigurationResponseSchema/properties/settings",
+          "schema": "app_schemas_devices_DeviceConfigurationResponseSchema",
+          "field": "settings",
+          "required": false,
+          "shape": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": {}
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceConfigurationResponse::settings",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/openapi.json:1728-1732",
+          "backlog_group": "none"
+        },
+        {
           "pointer": "/components/schemas/app_schemas_devices_DeviceConfigurationResponseSchema/properties/tags",
           "schema": "app_schemas_devices_DeviceConfigurationResponseSchema",
           "field": "tags",
@@ -7021,6 +7117,26 @@
           "persistence_symbol": null,
           "reason": "The raw DTO types the contract field; no field-level managed authority rule is declared, so the server response remains authoritative.",
           "evidence": "audit/2.5.1/merged.jsonl:111",
+          "backlog_group": "none"
+        },
+        {
+          "pointer": "/components/schemas/app_schemas_devices_DeviceConfigurationSchema/properties/settings",
+          "schema": "app_schemas_devices_DeviceConfigurationSchema",
+          "field": "settings",
+          "required": false,
+          "shape": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": {}
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceConfiguration::settings",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/openapi.json:1769-1775",
           "backlog_group": "none"
         },
         {
@@ -8376,6 +8492,26 @@
           "persistence_symbol": null,
           "reason": "The checked-in historical audit records a deliberate wire or documentation disagreement that remains explicit rather than being counted as exact typing.",
           "evidence": "audit/2.5.1/merged.jsonl:11",
+          "backlog_group": "none"
+        },
+        {
+          "pointer": "/components/schemas/app_schemas_devices_DeviceStatusSchema/properties/settings",
+          "schema": "app_schemas_devices_DeviceStatusSchema",
+          "field": "settings",
+          "required": false,
+          "shape": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": {}
+          },
+          "raw": "typed",
+          "raw_symbol": "replicant_client::raw::devices::DeviceStatus::settings",
+          "domain": "server_only",
+          "domain_symbol": null,
+          "durability": "server_authoritative",
+          "persistence_symbol": null,
+          "reason": "The Replicant Space 3.0.0 contract field is represented by the typed raw transport; managed state remains server-authoritative unless separately normalized.",
+          "evidence": "reference/replicant-space-3-0-0/openapi.json:2088-2092",
           "backlog_group": "none"
         },
         {

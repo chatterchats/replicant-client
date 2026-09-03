@@ -672,6 +672,7 @@ mod tests {
             available_commands: vec![DeviceCommand::from("attach")],
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: Default::default(),
             relationships: Default::default(),
             cargo: BTreeMap::new(),
             cargo_capacity: None,

@@ -1,5 +1,5 @@
 {
-  "contract_version": "2.5.2",
+  "contract_version": "3.0.0",
   "events": [
     {
       "name": "ami.adopted",
@@ -540,6 +540,16 @@
         "body": "The civilisation at SOL-4 has received your assistance..."
       },
       "evidence": "api/events/catalogue/index.md:596"
+    },
+    {
+      "name": "mining.relocated",
+      "payload": {
+        "location": "SOL-BELT-1",
+        "resource_type": "structural",
+        "old_site": "SOL-BELT-1-SITE-0",
+        "new_site": "SOL-BELT-1-SITE-3"
+      },
+      "evidence": "api/events/catalogue/index.md:613"
     },
     {
       "name": "mining.retargeted",

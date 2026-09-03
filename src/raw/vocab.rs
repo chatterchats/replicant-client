@@ -113,6 +113,7 @@ open_vocab! {
         MessageNew => "message.new",
         MultiplayerReplicantEntered => "multiplayer.replicant_entered",
         MultiplayerReplicantLeft => "multiplayer.replicant_left",
+        MiningRelocated => "mining.relocated",
         MiningRetargeted => "mining.retargeted",
         MiningStarted => "mining.started",
         MiningStopped => "mining.stopped",

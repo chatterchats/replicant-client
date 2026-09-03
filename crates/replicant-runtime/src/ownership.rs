@@ -764,6 +764,7 @@ mod tests {
             available_commands: vec![replicant_client::DeviceCommand::from("change_owner")],
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: Default::default(),
             relationships: DeviceRelationships {
                 assigned_replicant: owner.map(|value| ReplicantKey::live(ReplicantId::from(value))),
                 ..DeviceRelationships::default()

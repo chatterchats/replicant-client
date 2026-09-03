@@ -54,7 +54,9 @@ const HISTORY_REFRESH_SCHEMA: &str =
 const REFRESH_SCHEMA: &str = include_str!("../../migrations/0007_refresh.sql");
 const MESSAGE_METADATA_REVISION_SCHEMA: &str =
     include_str!("../../migrations/0008_message_metadata_revision.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const SEASON_THREE_PLANETARY_RESET_SCHEMA: &str =
+    include_str!("../../migrations/0009_season_three_planetary_reset.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const CURRENT_HISTORY_SCHEMA_VERSION: i64 = 2;
 const REFRESH_LEASE_MILLIS: i64 = 300_000;
 const OPERATION_TERMINAL_RETENTION_DAYS: i64 = 30;
@@ -1099,6 +1101,35 @@ impl Store {
             )?;
             transaction.commit()?;
             version = 8;
+        }
+        if version == 8 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(SEASON_THREE_PLANETARY_RESET_SCHEMA)?;
+            let (
+                locations_invalidated,
+                locations_updated,
+                resource_sites_invalidated,
+                star_life_invalidated,
+            ) = invalidate_season_three_planetary_observations(&transaction)?;
+            transaction.execute(
+                "UPDATE schema_migrations SET version = 9 WHERE version = 8",
+                [],
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '9') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
+            info!(
+                target: "replicant_client::store",
+                event = "store.season_three_planetary_reset",
+                locations_invalidated,
+                locations_updated,
+                resource_sites_invalidated,
+                star_life_invalidated,
+                "invalidated pre-Season-Three planet/moon and life knowledge so survey automation can rebuild it"
+            );
+            version = 9;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
@@ -4276,6 +4307,136 @@ fn refresh_removal_digest(endpoint: &str, started: i64, seen: &BTreeSet<String>)
     format!("{:x}", digest.finalize())
 }
 
+fn invalidate_season_three_planetary_observations(
+    transaction: &Transaction<'_>,
+) -> Result<(usize, usize, usize, usize), StoreError> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT realm, location_id, observation_json FROM locations ORDER BY realm, location_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut invalidated = BTreeSet::new();
+    let mut updates = Vec::new();
+    for (realm, location_id, serialized) in rows {
+        let mut observation = serde_json::from_str::<Observation<Location>>(&serialized)?;
+        if observation
+            .value
+            .location_type
+            .as_ref()
+            .is_some_and(|kind| matches!(kind.as_str(), "planet" | "moon"))
+        {
+            invalidated.insert((realm, location_id));
+            continue;
+        }
+
+        let had_planetary_progress = observation.value.survey_progress.planets_total.is_some()
+            || observation.value.survey_progress.planets_scanned.is_some()
+            || observation.value.survey_progress.moons_total.is_some()
+            || observation.value.survey_progress.moons_scanned.is_some()
+            || observation
+                .value
+                .survey_progress
+                .moons_total_estimated
+                .is_some();
+        let had_embedded_planetary_data = ["planet", "moon", "planets", "moons", "life_detected"]
+            .iter()
+            .any(|key| observation.value.unknown.contains_key(*key));
+
+        if had_planetary_progress || had_embedded_planetary_data {
+            observation.value.system_scanned = None;
+            observation.value.survey_progress = Default::default();
+            for key in ["planet", "moon", "planets", "moons", "life_detected"] {
+                observation.value.unknown.remove(key);
+            }
+            updates.push((realm, location_id, serde_json::to_string(&observation)?));
+        }
+    }
+
+    for (realm, location_id) in &invalidated {
+        transaction.execute(
+            "DELETE FROM locations WHERE realm = ?1 AND location_id = ?2",
+            params![realm, location_id],
+        )?;
+    }
+    for (realm, location_id, serialized) in &updates {
+        transaction.execute(
+            "UPDATE locations SET observation_json = ?3 WHERE realm = ?1 AND location_id = ?2",
+            params![realm, location_id, serialized],
+        )?;
+    }
+
+    let site_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT realm, site_id, payload_json FROM resource_sites ORDER BY realm, site_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut resource_sites_invalidated = 0usize;
+    for (realm, site_id, serialized) in site_rows {
+        let observation = serde_json::from_str::<Observation<ResourceSite>>(&serialized)?;
+        let stale = observation.value.location.as_ref().is_some_and(|location| {
+            invalidated.contains(&(realm.clone(), location.id.as_str().to_owned()))
+        });
+        if stale {
+            transaction.execute(
+                "DELETE FROM resource_sites WHERE realm = ?1 AND site_id = ?2",
+                params![realm, site_id],
+            )?;
+            resource_sites_invalidated += 1;
+        }
+    }
+
+    // Season Three regenerated which species inhabit which worlds. Preserve
+    // stable stellar catalogue data, but invalidate any pre-reset life flag so
+    // the next survey can establish the new inhabitants authoritatively.
+    let star_rows = {
+        let mut statement = transaction
+            .prepare("SELECT realm, star_id, payload_json FROM stars ORDER BY realm, star_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut star_life_invalidated = 0usize;
+    for (realm, star_id, serialized) in star_rows {
+        let mut observation = serde_json::from_str::<Observation<Star>>(&serialized)?;
+        if observation.value.has_life.take().is_some() {
+            transaction.execute(
+                "UPDATE stars SET payload_json = ?3 WHERE realm = ?1 AND star_id = ?2",
+                params![realm, star_id, serde_json::to_string(&observation)?],
+            )?;
+            star_life_invalidated += 1;
+        }
+    }
+
+    Ok((
+        invalidated.len(),
+        updates.len(),
+        resource_sites_invalidated,
+        star_life_invalidated,
+    ))
+}
+
 fn migrate_device_relationship_observations(
     transaction: &Transaction<'_>,
 ) -> Result<(), StoreError> {
@@ -4916,6 +5077,7 @@ mod tests {
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),
                 tags: Vec::new(),
+                settings: Default::default(),
                 relationships: DeviceRelationships::default(),
                 cargo: Default::default(),
                 cargo_capacity: None,
@@ -5113,14 +5275,14 @@ mod tests {
         let path = test_path("future-schema");
         let connection = Connection::open(&path).expect("open database");
         connection
-            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (9);")
+            .execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL); INSERT INTO schema_migrations VALUES (10);")
             .expect("seed future schema");
         drop(connection);
         assert!(matches!(
             Store::open_file(&path),
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 9,
-                supported: 8
+                found: 10,
+                supported: 9
             })
         ));
         fs::remove_file(path).expect("remove test database");
@@ -5279,7 +5441,7 @@ mod tests {
             .expect("SOL star");
         assert!(sol.value.knowledge_observed);
         assert_eq!(sol.value.explored, Some(true));
-        assert_eq!(sol.value.has_life, Some(true));
+        assert_eq!(sol.value.has_life, None);
         assert_eq!(sol.value.region.as_deref(), Some("alpha"));
         assert_eq!(
             store

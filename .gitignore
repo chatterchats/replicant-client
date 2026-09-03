@@ -33,7 +33,7 @@ logs/
 !policy/contract-coverage.json
 !policy/event-persistence.json
 !policy/schema-field-coverage.json
-!tests/fixtures/events-2.5.2.json
+!tests/fixtures/events-3.0.0.json
 !deploy/grafana/dashboards/*.json
 !reference/replicant-space-*/manifest.json
 !reference/replicant-space-*/openapi.json

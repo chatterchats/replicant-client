@@ -146,7 +146,7 @@ def build_fixture(root: Path) -> None:
         "const LOCATION_PASSTHROUGH_FIELDS: &[&str] = &[];\n",
     )
     write(
-        root / "tests/fixtures/events-2.5.2.json",
+        root / "tests/fixtures/events-3.0.0.json",
         json.dumps(
             {
                 "contract_version": "1.0.0",

@@ -317,6 +317,16 @@ fn device(
             .map(DeviceDirective::from)
             .collect(),
         tags: raw.tags.clone(),
+        settings: raw
+            .settings
+            .as_ref()
+            .map(|settings| {
+                settings
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         relationships: DeviceRelationships {
             attached_to: related(&raw.attached_to_device_code),
             stowed_in: related(&raw.stowed_in_device_code),
@@ -656,7 +666,16 @@ pub fn location_detail(
     };
     let life_stage = body.and_then(|body| body.life_stage.clone());
     let survey_environment_evidence = body.is_some_and(|body| {
-        body.atmosphere.is_some() || body.magnetic_field.is_some() || body.axial_tilt_deg.is_some()
+        body.atmosphere.is_some()
+            || body.magnetic_field.is_some()
+            || body.axial_tilt_deg.is_some()
+            || body.atmo_pressure_atm.is_some()
+            || body.atmo_o2_pct.is_some()
+            || body.atmo_toxicity.is_some()
+            || body.hydrosphere_pct.is_some()
+            || body.tectonic_index.is_some()
+            || body.biosphere_index.is_some()
+            || body.has_subsurface_ocean.is_some()
     });
     let scanned = raw
         .scanned
@@ -700,6 +719,35 @@ pub fn location_detail(
                 body.and_then(|body| body.surface_temp_c)
                     .filter(|value| value.is_finite()),
             ),
+            surface_temp_k: knowledge(
+                body.and_then(|body| body.surface_temp_k)
+                    .filter(|value| value.is_finite()),
+            ),
+            atmo_pressure_atm: knowledge(
+                body.and_then(|body| body.atmo_pressure_atm)
+                    .filter(|value| value.is_finite()),
+            ),
+            atmo_o2_pct: knowledge(
+                body.and_then(|body| body.atmo_o2_pct)
+                    .filter(|value| value.is_finite()),
+            ),
+            atmo_toxicity: knowledge(
+                body.and_then(|body| body.atmo_toxicity)
+                    .filter(|value| value.is_finite()),
+            ),
+            hydrosphere_pct: knowledge(
+                body.and_then(|body| body.hydrosphere_pct)
+                    .filter(|value| value.is_finite()),
+            ),
+            tectonic_index: knowledge(
+                body.and_then(|body| body.tectonic_index)
+                    .filter(|value| value.is_finite()),
+            ),
+            biosphere_index: knowledge(
+                body.and_then(|body| body.biosphere_index)
+                    .filter(|value| value.is_finite()),
+            ),
+            has_subsurface_ocean: knowledge(body.and_then(|body| body.has_subsurface_ocean)),
             in_habitable_zone: knowledge(body.and_then(|body| body.in_habitable_zone)),
             axial_tilt_deg: knowledge(
                 body.and_then(|body| body.axial_tilt_deg)

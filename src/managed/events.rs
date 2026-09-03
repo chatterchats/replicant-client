@@ -546,6 +546,7 @@ event_treatments! {
     "hub.warning" => (Upsert, ForwardOnly, projection_hub_warning, projection_world_lifecycle),
     "megastructure.contributed" => (Delete, ForwardOnly, projection_megastructure_contributed, projection_account_content),
     "message.new" => (Upsert, ForwardOnly, projection_message_new, projection_account_content),
+    "mining.relocated" => (ReconciliationOnly, Reconcile, projection_mining_relocated, projection_reconciliation_only),
     "mining.retargeted" => (ReconciliationOnly, Reconcile, projection_mining_retargeted, projection_reconciliation_only),
     "mining.started" => (ReconciliationOnly, Reconcile, projection_mining_started, projection_reconciliation_only),
     "mining.stopped" => (ReconciliationOnly, Reconcile, projection_mining_stopped, projection_reconciliation_only),
@@ -2261,6 +2262,7 @@ mod tests {
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),
                 tags: Vec::new(),
+                settings: Default::default(),
                 relationships: DeviceRelationships::default(),
                 cargo: Default::default(),
                 cargo_capacity: None,
@@ -2304,6 +2306,7 @@ mod tests {
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),
                 tags: Vec::new(),
+                settings: Default::default(),
                 relationships: DeviceRelationships::default(),
                 cargo: Default::default(),
                 cargo_capacity: None,
@@ -3022,7 +3025,7 @@ mod tests {
     async fn every_projection_policy_row_reopens_and_deduplicates() {
         let client = restore_only_client().await;
         let fixture: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/events-2.5.2.json"))
+            serde_json::from_str(include_str!("../../tests/fixtures/events-3.0.0.json"))
                 .expect("event coverage fixture");
         let fixtures = fixture["events"]
             .as_array()

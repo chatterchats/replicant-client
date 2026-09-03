@@ -533,6 +533,7 @@ event_payload_decoders! {
     hub_warning => "hub.warning" => HubWarningPayload,
     megastructure_contributed => "megastructure.contributed" => MegastructureContributedPayload,
     message_new => "message.new" => MessageNewPayload,
+    mining_relocated => "mining.relocated" => MiningRelocatedPayload,
     mining_retargeted => "mining.retargeted" => MiningRetargetedPayload,
     mining_started => "mining.started" => MiningStartedPayload,
     mining_stopped => "mining.stopped" => MiningStoppedPayload,
@@ -711,8 +712,8 @@ mod tests {
     #[test]
     fn fixture_covers_every_generated_decoder_and_preserves_future_fields() {
         let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/events-2.5.2.json")).unwrap();
-        assert_eq!(fixture["contract_version"], "2.5.2");
+            serde_json::from_str(include_str!("../tests/fixtures/events-3.0.0.json")).unwrap();
+        assert_eq!(fixture["contract_version"], "3.0.0");
         let rows = fixture["events"].as_array().unwrap();
         let fixture_names = rows
             .iter()
@@ -723,7 +724,7 @@ mod tests {
             .map(|(name, _)| *name)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(fixture_names, decoder_names);
-        assert_eq!(rows.len(), 82);
+        assert_eq!(rows.len(), 83);
 
         for row in rows {
             let mut payload = row["payload"].clone();

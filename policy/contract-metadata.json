@@ -1,10 +1,10 @@
 {
-  "$schema_note": "Provenance for the verified Replicant Space 2.5.2 OpenAPI and rendered-document corpus.",
-  "replicant_space_version": "2.5.2",
-  "crawl_timestamp": "2026-08-25T15:34:33.019856+00:00",
+  "$schema_note": "Provenance for the verified Replicant Space 3.0.0 OpenAPI and rendered-document corpus.",
+  "replicant_space_version": "3.0.0",
+  "crawl_timestamp": "2026-09-02T20:03:43.475437+00:00",
   "openapi_source_url": "https://api.replicant.space/swagger/openapi.json",
-  "openapi_fetched_at": "2026-08-25T15:34:33.019856+00:00",
-  "openapi_sha256": "df5f74046e95678f54161b930af6d8b1abbe4b07b1718e485b5a4d46f6757639",
+  "openapi_fetched_at": "2026-09-02T20:03:43.475437+00:00",
+  "openapi_sha256": "81031c666ac1dc16742125d6e0e0bde334ab345c1022ddc6f9783cf0567b3adf",
   "openapi_operation_count": 89,
   "openapi_path_count": 75,
   "deprecation_authority_rule": "The corrected OpenAPI schema does not set `deprecated: true` on any operation. Deprecation status is established solely by rendered documentation asides (e.g. api/accounts/webhook/index.md, api/replicants/events/index.md, api/locations/inventory/index.md). Rendered deprecation asides override missing OpenAPI deprecation flags and are authoritative for this client.",
@@ -52,6 +52,24 @@
       "evidence": "openapi.json"
     },
     {
+      "scope": "GET /v1/species environmental preferences",
+      "difference": "The 3.0.0 changelog says species responses include environmental preferences, but SpeciesSchema in OpenAPI still exposes only the pre-3.0 fields and the rendered corpus does not document the preference object shape.",
+      "raw_policy": "Preserve the additional response data through Species.extra rather than inventing field names or value shapes until an authoritative schema or endpoint example is available.",
+      "evidence": "changelog/index.md"
+    },
+    {
+      "scope": "GET /v1/locations/{designation} planet and moon bodies",
+      "difference": "The rendered 3.0.0 location documentation replaces the prior planet/moon examples with a new environmental/physical field set, while OpenAPI does not provide a corresponding detailed body schema.",
+      "raw_policy": "Model the documented Season Three environmental fields as optional and retain all additional body fields through the open body map.",
+      "evidence": "api/locations/index.md"
+    },
+    {
+      "scope": "terraforming.status event",
+      "difference": "Terraforming documentation states that active terraform monitors emit terraforming.status, but the event is absent from the rendered Event Catalogue and OpenAPI has no event payload schema.",
+      "raw_policy": "Preserve unknown event names and payloads through the existing open event envelope; do not invent a typed terraforming.status payload until its wire shape is documented.",
+      "evidence": "api/locations/terraforming/index.md"
+    },
+    {
       "scope": "Quickstart GET /v1/replicants/{replicant_code}/inventory example",
       "difference": "The updated Quickstart renders inventory items as an object map while the unchanged OpenAPI schema still declares the established array shape.",
       "raw_policy": "Retain the OpenAPI-backed inventory model until authoritative endpoint output confirms a contract change; record the rendered example as a documentation discrepancy rather than guessing a new wire shape.",
@@ -60,14 +78,14 @@
   ],
   "notes": [
     "Versioned reference snapshots live under reference/replicant-space-X-Y-Z; scripts/reference_snapshot.py selects the highest semantic version as the current contract.",
-    "Crawler-internal .source-html and .crawl-cache.json artifacts are not contract content. manifest.json and openapi.json are retained in handoff ZIPs and verified by scripts/contract_policy_check.py.",
-    "Replicant Space 2.5.2 keeps 75 paths, 89 operations, 160 schemas, and 87 rendered pages. The schema set is unchanged; WebhookInfoSchema adds nullable blocked_until and MessageSettingsSchema only reorders an enum. The print.completed event adds compacted, system.object_detected adds impact_eta, and AMI Mining Controllers reactively re-evaluate after new-site discovery and resource depletion."
+    "Replicant Space 3.0.0 keeps 75 paths and 89 operations, adds one OpenAPI command schema (DetonateSchema), device configuration settings, detect_object command discrimination, and parameterized detonate.",
+    "Rendered 3.0.0 docs add the Season Three planetary/environment model, terraforming mechanics, intentional Kuiper-object impacts, and mining.relocated. Planet/moon observations from before the season reset are not authoritative and are invalidated by managed-store schema migration 9."
   ],
-  "documentation_version": "2.5.2",
-  "documentation_crawled_at": "2026-08-25T15:34:33.019856+00:00",
-  "openapi_version": "2.5.2",
+  "documentation_version": "3.0.0",
+  "documentation_crawled_at": "2026-09-02T20:03:43.475437+00:00",
+  "openapi_version": "3.0.0",
   "documented_operation_delta_count": 0,
-  "documentation_manifest_sha256": "9444e118020ef8e80271b3bf8fec35e2c657d4df3e773ce8b6e0444ecacad50c",
-  "documentation_page_count": 87,
-  "openapi_schema_count": 160
+  "documentation_manifest_sha256": "ecdb9914012b4d60d12e197d2389c9729ea14505fa535a2939ab65f26925c826",
+  "documentation_page_count": 93,
+  "openapi_schema_count": 161
 }

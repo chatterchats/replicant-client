@@ -216,6 +216,7 @@ mod tests {
                 available_commands: Vec::new(),
                 available_directives: Vec::new(),
                 tags: Vec::new(),
+                settings: Default::default(),
                 relationships: DeviceRelationships::default(),
                 cargo: std::collections::BTreeMap::new(),
                 cargo_capacity: None,
