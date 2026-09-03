@@ -23,6 +23,7 @@ const snapshot: InventorySnapshot = {
       owner_kind: "location",
       owner: "EARTH",
       system: "SOL",
+      region: "alpha",
       location: "EARTH",
       total_quantity: 12,
       resources: [
@@ -34,6 +35,7 @@ const snapshot: InventorySnapshot = {
       owner_kind: "replicant",
       owner: "R-1",
       system: "VEGA",
+      region: "beta",
       location: "VEGA-2",
       total_quantity: 5,
       resources: [{ resource: "silicates", quantity: 5 }],
@@ -48,6 +50,7 @@ const snapshot: InventorySnapshot = {
           owner_kind: "location",
           owner: "EARTH",
           system: "SOL",
+          region: "alpha",
           location: "EARTH",
           quantity: 2,
         },
@@ -61,6 +64,7 @@ const snapshot: InventorySnapshot = {
           owner_kind: "location",
           owner: "EARTH",
           system: "SOL",
+          region: "alpha",
           location: "EARTH",
           quantity: 10,
         },
@@ -68,6 +72,7 @@ const snapshot: InventorySnapshot = {
           owner_kind: "replicant",
           owner: "R-1",
           system: "VEGA",
+          region: "beta",
           location: "VEGA-2",
           quantity: 5,
         },
@@ -110,6 +115,11 @@ describe("inventory explorer", () => {
       ),
     ).toEqual(["EARTH"]);
     expect(
+      filterInventoryLocations(snapshot.locations, "", "beta").map(
+        (row) => row.owner,
+      ),
+    ).toEqual(["R-1"]);
+    expect(
       filterInventoryResources(snapshot.resources, "", true).map(
         (row) => row.resource,
       ),
@@ -119,6 +129,16 @@ describe("inventory explorer", () => {
         (row) => row.resource,
       ),
     ).toEqual(["silicates"]);
+    expect(
+      filterInventoryResources(snapshot.resources, "", true, "alpha"),
+    ).toEqual([
+      {
+        ...snapshot.resources[1],
+        total_quantity: 10,
+        distribution: [snapshot.resources[1]?.distribution[0]],
+      },
+      snapshot.resources[0],
+    ]);
   });
 
   it("switches between location and resource tabs", () => {

@@ -18,20 +18,24 @@ const inventoryEmpty = (snapshot: InventorySnapshot) =>
 export function filterInventoryLocations(
   rows: InventoryLocationSummary[],
   search: string,
+  region = "",
 ): InventoryLocationSummary[] {
   const query = search.trim().toLowerCase();
   return [...rows]
-    .filter((row) =>
-      [
-        row.system,
-        row.location,
-        row.owner,
-        ...row.resources.map(({ resource }) => resource),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(query),
+    .filter(
+      (row) =>
+        (!region || row.region === region) &&
+        [
+          row.region,
+          row.system,
+          row.location,
+          row.owner,
+          ...row.resources.map(({ resource }) => resource),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase()
+          .includes(query),
     )
     .sort(
       (left, right) =>
@@ -44,9 +48,29 @@ export function filterInventoryResources(
   rows: InventoryResourceSummary[],
   search: string,
   descending: boolean,
+  region = "",
 ): InventoryResourceSummary[] {
   const query = search.trim().toLowerCase();
-  return [...rows]
+  const filtered = region
+    ? rows.flatMap((row) => {
+        const distribution = row.distribution.filter(
+          (item) => item.region === region,
+        );
+        return distribution.length
+          ? [
+              {
+                ...row,
+                total_quantity: distribution.reduce(
+                  (total, item) => total + item.quantity,
+                  0,
+                ),
+                distribution,
+              },
+            ]
+          : [];
+      })
+    : [...rows];
+  return filtered
     .filter((row) => row.resource.toLowerCase().includes(query))
     .sort((left, right) =>
       descending
@@ -141,14 +165,32 @@ export function InventoryContent({
 }) {
   const [mode, setMode] = useState<InventoryMode>("location");
   const [search, setSearch] = useState("");
+  const [region, setRegion] = useState("");
   const [descending, setDescending] = useState(true);
+  const regions = useMemo(
+    () =>
+      [
+        ...new Set(
+          (data?.locations ?? []).flatMap((row) =>
+            row.region ? [row.region] : [],
+          ),
+        ),
+      ].sort((left, right) => left.localeCompare(right)),
+    [data?.locations],
+  );
   const locations = useMemo(
-    () => filterInventoryLocations(data?.locations ?? [], search),
-    [data?.locations, search],
+    () => filterInventoryLocations(data?.locations ?? [], search, region),
+    [data?.locations, region, search],
   );
   const resources = useMemo(
-    () => filterInventoryResources(data?.resources ?? [], search, descending),
-    [data?.resources, descending, search],
+    () =>
+      filterInventoryResources(
+        data?.resources ?? [],
+        search,
+        descending,
+        region,
+      ),
+    [data?.resources, descending, region, search],
   );
 
   if (!data && status === "loading")
@@ -213,21 +255,39 @@ export function InventoryContent({
       ) : (
         <>
           <InventoryViewTabs mode={mode} onChange={setMode} />
-          <label className="inventory-search">
-            <span>Search</span>
-            <input
-              type="search"
-              placeholder={
-                mode === "location"
-                  ? "System, location, owner, resource"
-                  : "Resource"
-              }
-              value={search}
-              onChange={(event) => {
-                setSearch(event.target.value);
-              }}
-            />
-          </label>
+          <div className="inventory-filters">
+            <label className="inventory-search">
+              <span>Search</span>
+              <input
+                type="search"
+                placeholder={
+                  mode === "location"
+                    ? "Region, system, location, owner, resource"
+                    : "Resource"
+                }
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                }}
+              />
+            </label>
+            <label>
+              <span>Region</span>
+              <select
+                value={region}
+                onChange={(event) => {
+                  setRegion(event.target.value);
+                }}
+              >
+                <option value="">All regions</option>
+                {regions.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <p className="table-summary">
             Showing {mode === "location" ? locations.length : resources.length}{" "}
             · revision {data.metadata.revision}

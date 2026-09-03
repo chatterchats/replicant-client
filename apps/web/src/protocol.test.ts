@@ -866,6 +866,7 @@ describe("parseInventoryResponse", () => {
             owner_kind: "location",
             owner: "EARTH",
             system: "SOL",
+            region: "solzone",
             location: "EARTH",
             total_quantity: 12,
             resources: [{ resource: "silicates", quantity: 12 }],
@@ -880,6 +881,7 @@ describe("parseInventoryResponse", () => {
                 owner_kind: "location",
                 owner: "EARTH",
                 system: "SOL",
+                region: "solzone",
                 location: "EARTH",
                 quantity: 12,
               },
@@ -890,6 +892,7 @@ describe("parseInventoryResponse", () => {
     });
     expect(parsed.payload.resources[0]?.total_quantity).toBe(12);
     expect(parsed.payload.locations[0]?.owner_kind).toBe("location");
+    expect(parsed.payload.locations[0]?.region).toBe("solzone");
   });
 
   it("rejects untyped quantities", () => {

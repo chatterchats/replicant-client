@@ -4982,6 +4982,7 @@ async fn inventory(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Versioned<InventorySnapshot>>, ApiError> {
     let metadata = state.snapshot_metadata()?;
+    let system_regions = expanded_system_region_map(&state.client().galaxy().catalogue());
     let location_systems = state
         .client()
         .locations()
@@ -5001,6 +5002,7 @@ async fn inventory(
         metadata,
         inventories,
         &location_systems,
+        &system_regions,
     ))))
 }
 
@@ -5027,6 +5029,7 @@ fn inventory_snapshot(
     metadata: SnapshotMetadata,
     inventories: Vec<Inventory>,
     location_systems: &BTreeMap<String, Option<String>>,
+    system_regions: &BTreeMap<String, String>,
 ) -> InventorySnapshot {
     let mut locations = inventories
         .into_iter()
@@ -5054,6 +5057,9 @@ fn inventory_snapshot(
             let system = location
                 .as_ref()
                 .and_then(|value| device_system(value, location_systems));
+            let region = system
+                .as_ref()
+                .and_then(|value| system_regions.get(value).cloned());
             let resources = resources
                 .into_iter()
                 .map(|(resource, quantity)| InventoryQuantity { resource, quantity })
@@ -5062,6 +5068,7 @@ fn inventory_snapshot(
                 owner_kind,
                 owner,
                 system,
+                region,
                 location,
                 total_quantity: resources.iter().map(|item| item.quantity).sum(),
                 resources,
@@ -5093,6 +5100,7 @@ fn inventory_snapshot(
                     owner_kind: location.owner_kind,
                     owner: location.owner.clone(),
                     system: location.system.clone(),
+                    region: location.region.clone(),
                     location: location.location.clone(),
                     quantity: item.quantity,
                 });

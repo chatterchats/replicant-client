@@ -340,6 +340,7 @@ export interface DeviceSummary {
   system_status?: Record<string, unknown> | null;
   active_directive: string | null;
   directive_status: string | null;
+  directive_details?: Record<string, unknown>;
   travel_destination: string | null;
   claim: DeviceClaim | null;
 }
@@ -1014,6 +1015,7 @@ export interface InventoryLocationSummary {
   owner_kind: InventoryOwnerKind;
   owner: string;
   system: string | null;
+  region: string | null;
   location: string | null;
   total_quantity: number;
   resources: InventoryQuantity[];
@@ -1023,6 +1025,7 @@ export interface InventoryDistribution {
   owner_kind: InventoryOwnerKind;
   owner: string;
   system: string | null;
+  region: string | null;
   location: string | null;
   quantity: number;
 }
@@ -2428,6 +2431,10 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
       device.directive_status,
       "directive status",
     ),
+    directive_details:
+      device.directive_details === undefined
+        ? {}
+        : record(device.directive_details, "directive details"),
     travel_destination: nullableString(
       device.travel_destination,
       "travel destination",
@@ -3679,6 +3686,7 @@ export function parseInventoryResponse(
       ),
       owner: item.owner,
       system: nullableString(item.system, "inventory system"),
+      region: nullableString(item.region, "inventory region"),
       location: nullableString(item.location, "inventory location"),
     };
   };

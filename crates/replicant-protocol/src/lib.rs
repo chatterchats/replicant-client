@@ -1955,6 +1955,8 @@ pub struct InventoryLocationSummary {
     pub owner: String,
     /// Containing system, when known.
     pub system: Option<String>,
+    /// Containing region, when known.
+    pub region: Option<String>,
     /// Physical location, when known.
     pub location: Option<String>,
     /// Total positive quantity at this scope.
@@ -1972,6 +1974,8 @@ pub struct InventoryDistribution {
     pub owner: String,
     /// Containing system, when known.
     pub system: Option<String>,
+    /// Containing region, when known.
+    pub region: Option<String>,
     /// Physical location, when known.
     pub location: Option<String>,
     /// Positive quantity at this scope.
@@ -3849,6 +3853,7 @@ mod tests {
                 owner_kind: InventoryOwnerKind::Location,
                 owner: "EARTH".to_owned(),
                 system: Some("SOL".to_owned()),
+                region: Some("solzone".to_owned()),
                 location: Some("EARTH".to_owned()),
                 total_quantity: 12,
                 resources: vec![InventoryQuantity {
@@ -3863,6 +3868,7 @@ mod tests {
                     owner_kind: InventoryOwnerKind::Location,
                     owner: "EARTH".to_owned(),
                     system: Some("SOL".to_owned()),
+                    region: Some("solzone".to_owned()),
                     location: Some("EARTH".to_owned()),
                     quantity: 12,
                 }],
