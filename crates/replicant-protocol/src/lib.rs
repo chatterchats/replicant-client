@@ -672,6 +672,9 @@ pub struct DeviceSummary {
     /// Forward-compatible configuration and progress fields for the active directive.
     #[serde(default)]
     pub directive_details: BTreeMap<String, Value>,
+    /// Resolved collection system for directives that collect from a location.
+    #[serde(default)]
+    pub directive_collect_system: Option<String>,
     /// Resolved destination system for directives that target a location.
     #[serde(default)]
     pub directive_target_system: Option<String>,
@@ -3477,6 +3480,7 @@ mod tests {
             active_directive: None,
             directive_status: None,
             directive_details: BTreeMap::new(),
+            directive_collect_system: None,
             directive_target_system: None,
             travel_destination: None,
             claim: None,

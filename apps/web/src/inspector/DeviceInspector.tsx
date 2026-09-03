@@ -245,6 +245,10 @@ export function DeviceInspector({
         },
       ];
     });
+  const hasDirective =
+    device.active_directive !== null ||
+    device.directive_status !== null ||
+    Object.keys(device.directive_details ?? {}).length > 0;
   const relations = [
     device.attached_to
       ? `Attached to ${relatedDeviceLabel(device.attached_to, entities)}`
@@ -306,7 +310,7 @@ export function DeviceInspector({
           { label: "System status", value: device.system_status },
         ]}
       />
-      {device.active_directive ? (
+      {hasDirective ? (
         <section className="inspector-section" aria-label="Directive details">
           <h3>Directive</h3>
           <InspectorFields
@@ -314,8 +318,10 @@ export function DeviceInspector({
               {
                 label: "Name",
                 value: device.active_directive
-                  .replace(/[._-]+/g, " ")
-                  .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+                  ? device.active_directive
+                      .replace(/[._-]+/g, " ")
+                      .replace(/\b\w/g, (letter) => letter.toUpperCase())
+                  : "Unidentified directive",
               },
               { label: "Status", value: device.directive_status },
               ...directiveDetails,

@@ -259,7 +259,7 @@ describe("DeviceInspector", () => {
       device_type: "transport_controller",
       available_commands: ["adopt", "release", "stow", "set_directive"],
       available_directives: ["delivery", "shuttle"],
-      controlled_devices: ["ADOPTED"],
+      controlled_devices: [],
     };
     const candidate = (
       id: string,
@@ -400,5 +400,26 @@ describe("DeviceInspector", () => {
     expect(html.indexOf("Capabilities")).toBeLessThan(
       html.indexOf("Controlled devices"),
     );
+  });
+  it("shows status and details when the directive name is unavailable", () => {
+    const html = renderToStaticMarkup(
+      <DeviceInspector
+        device={{
+          ...device,
+          active_directive: null,
+          directive_status: "evaluating",
+          directive_details: { progress: 4 },
+        }}
+        descriptors={catalog}
+        entities={{}}
+        onRunCommand={vi.fn()}
+        onOperationFinished={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Unidentified directive");
+    expect(html).toContain("evaluating");
+    expect(html).toContain("Progress");
+    expect(html).toContain(">4<");
   });
 });

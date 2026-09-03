@@ -175,7 +175,7 @@ describe("device fleet browser", () => {
     ]);
   });
 
-  it("labels active directives and includes the ferry delivery target", () => {
+  it("labels active directives with the ferry collection and delivery systems", () => {
     expect(deviceDirectiveLabel(device("IDLE"))).toBeNull();
     expect(
       deviceDirectiveLabel(
@@ -188,10 +188,11 @@ describe("device fleet browser", () => {
               deliver: "SOL-3-L4",
             },
           },
+          directive_collect_system: "TARAZEDAR",
           directive_target_system: "SOL",
         }),
       ),
-    ).toBe("(Dir: Ferry (SOL))");
+    ).toBe("(Dir: Ferry (Collect: TARAZEDAR → SOL))");
     expect(
       deviceDirectiveLabel(
         device("MINER", { active_directive: "gather_resources" }),

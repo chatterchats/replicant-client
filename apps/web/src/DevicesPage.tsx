@@ -262,11 +262,15 @@ function titleCase(value: string): string {
 export function deviceDirectiveLabel(device: DeviceSummary): string | null {
   if (!device.active_directive) return null;
   const directive = titleCase(device.active_directive);
-  const targetSystem =
-    device.active_directive.toLowerCase() === "ferry"
-      ? device.directive_target_system
-      : null;
-  return `(Dir: ${directive}${targetSystem ? ` (${targetSystem})` : ""})`;
+  if (device.active_directive.toLowerCase() !== "ferry")
+    return `(Dir: ${directive})`;
+  const route = [
+    device.directive_collect_system
+      ? `Collect: ${device.directive_collect_system}`
+      : null,
+    device.directive_target_system,
+  ].filter((value): value is string => value !== null && value !== undefined);
+  return `(Dir: ${directive}${route.length ? ` (${route.join(" → ")})` : ""})`;
 }
 
 export function systemOptions(devices: DeviceSummary[]): SystemOption[] {

@@ -195,7 +195,16 @@ export function specializeDeviceCommand(
     const targets =
       command.descriptor.kind === "device.detach"
         ? device.attached_devices
-        : device.controlled_devices;
+        : [
+            ...new Set([
+              ...device.controlled_devices,
+              ...devices
+                .filter(
+                  (candidate) => candidate.controller === device.entity.id,
+                )
+                .map((candidate) => candidate.entity.id),
+            ]),
+          ];
     return {
       ...command,
       descriptor: {

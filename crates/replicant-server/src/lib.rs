@@ -5196,6 +5196,19 @@ fn device_summary(
         .as_ref()
         .map(|value| value.details.clone())
         .unwrap_or_default();
+    let directive_collect_system = device.active_directive.as_ref().and_then(|value| {
+        let explicit_system = value.details.get("collect_system").and_then(Value::as_str);
+        explicit_system.map(str::to_owned).or_else(|| {
+            value
+                .details
+                .get("configuration")
+                .and_then(Value::as_object)
+                .and_then(|configuration| configuration.get("collect"))
+                .or_else(|| value.details.get("collect"))
+                .and_then(Value::as_str)
+                .and_then(|location| device_system(location, location_systems))
+        })
+    });
     let directive_target_system = device.active_directive.as_ref().and_then(|value| {
         let explicit_system = value
             .details
@@ -5278,6 +5291,7 @@ fn device_summary(
         active_directive,
         directive_status,
         directive_details,
+        directive_collect_system,
         directive_target_system,
         travel_destination: device.travel.and_then(|value| {
             value
@@ -8531,6 +8545,7 @@ mod tests {
             active_directive: None,
             directive_status: None,
             directive_details: BTreeMap::new(),
+            directive_collect_system: None,
             directive_target_system: None,
             travel_destination: None,
             claim: None,
@@ -8727,6 +8742,7 @@ mod tests {
         );
         assert_eq!(detail["active_directive"], "ferry");
         assert_eq!(detail["directive_status"], "running");
+        assert_eq!(detail["directive_collect_system"], "TARAZEDAR");
         assert_eq!(detail["directive_target_system"], "61-CYGNI");
         assert_eq!(
             detail["directive_details"]["configuration"]["deliver"],
