@@ -341,6 +341,7 @@ export interface DeviceSummary {
   active_directive: string | null;
   directive_status: string | null;
   directive_details?: Record<string, unknown>;
+  directive_target_system?: string | null;
   travel_destination: string | null;
   claim: DeviceClaim | null;
 }
@@ -2435,6 +2436,13 @@ function parseDeviceSummary(value: unknown): DeviceSummary {
       device.directive_details === undefined
         ? {}
         : record(device.directive_details, "directive details"),
+    directive_target_system:
+      device.directive_target_system === undefined
+        ? null
+        : nullableString(
+            device.directive_target_system,
+            "directive target system",
+          ),
     travel_destination: nullableString(
       device.travel_destination,
       "travel destination",

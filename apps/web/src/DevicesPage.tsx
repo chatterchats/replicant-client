@@ -253,6 +253,21 @@ export function normalizedDeviceStatus(status: string | null): string {
   if (normalized.startsWith("repairing")) return "repairing";
   return normalized;
 }
+function titleCase(value: string): string {
+  return value
+    .replace(/[._-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+export function deviceDirectiveLabel(device: DeviceSummary): string | null {
+  if (!device.active_directive) return null;
+  const directive = titleCase(device.active_directive);
+  const targetSystem =
+    device.active_directive.toLowerCase() === "ferry"
+      ? device.directive_target_system
+      : null;
+  return `(Dir: ${directive}${targetSystem ? ` (${targetSystem})` : ""})`;
+}
 
 export function systemOptions(devices: DeviceSummary[]): SystemOption[] {
   const counts = new Map<string, number>();
@@ -1321,6 +1336,11 @@ export function DevicesContent({
                                   >
                                     {device.status ?? "unknown"}
                                   </span>
+                                  {device.active_directive ? (
+                                    <small className="device-directive">
+                                      {deviceDirectiveLabel(device)}
+                                    </small>
+                                  ) : null}
                                 </td>
                                 <td>
                                   {device.owner_name ?? device.owner ?? (

@@ -2,6 +2,7 @@
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import type {
@@ -364,5 +365,40 @@ describe("DeviceInspector", () => {
       "delivery",
       "shuttle",
     ]);
+  });
+  it("shows directive configuration and places child devices after capabilities", () => {
+    const html = renderToStaticMarkup(
+      <DeviceInspector
+        device={{
+          ...device,
+          active_directive: "ferry",
+          directive_status: "running",
+          directive_details: {
+            directive: "ferry",
+            configuration: {
+              collect: "TARAZEDAR-BELT-1",
+              deliver: "SOL-3-L4",
+            },
+          },
+          directive_target_system: "SOL",
+          available_commands: ["travel"],
+          controlled_devices: ["TRANSPORT-1"],
+        }}
+        descriptors={catalog}
+        entities={{}}
+        onRunCommand={vi.fn()}
+        onOperationFinished={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Directive");
+    expect(html).toContain("Ferry");
+    expect(html).toContain("Collect");
+    expect(html).toContain("TARAZEDAR-BELT-1");
+    expect(html).toContain("Deliver");
+    expect(html).toContain("SOL-3-L4");
+    expect(html.indexOf("Capabilities")).toBeLessThan(
+      html.indexOf("Controlled devices"),
+    );
   });
 });

@@ -2755,6 +2755,18 @@ h1 {
   background: var(--surface-overlay);
   box-shadow: var(--shadow-overlay);
 }
+.device-log-dialog {
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 2 * var(--space-4)));
+  overflow-y: auto;
+}
+.device-log-dialog .inspector-section-heading {
+  margin-bottom: var(--space-3);
+}
+.device-log-dialog .inspector-section-heading > div {
+  display: flex;
+  gap: var(--space-2);
+}
 .confirm-dialog h2 {
   margin: 0 0 var(--space-2);
   font-size: 1.1rem;

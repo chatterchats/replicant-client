@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 import { daemonApi } from "../api";
 import type { DescriptorCommand } from "../CommandPalette";
-import { DeviceLogPanel } from "../DeviceLogPanel";
+import { DeviceLogButton } from "../DeviceLogPanel";
 import { useDomainQuery } from "../domainQuery";
 import type {
   DescriptorCatalog,
@@ -73,8 +73,11 @@ export function InspectorView({
   const { entity, value, entities, activity } = props;
   const summary = snapshot?.summary ?? fallbackSummary(entity, value);
   let slots: InspectorSlots;
+  let deviceLogDevice: string | null = null;
   if (snapshot?.detail.kind === "device") {
     const device = snapshot.detail.detail;
+    deviceLogDevice =
+      device.ownership.toLowerCase() === "owned" ? device.entity.id : null;
     slots = {
       body: (
         <DeviceInspector
@@ -85,10 +88,6 @@ export function InspectorView({
           onOperationFinished={props.onOperationFinished}
         />
       ),
-      activity:
-        device.ownership.toLowerCase() === "owned" ? (
-          <DeviceLogPanel device={device.entity.id} />
-        ) : null,
     };
   } else if (snapshot?.detail.kind === "system") {
     slots = {
@@ -103,6 +102,8 @@ export function InspectorView({
       ),
     };
   } else if (isDeviceSummary(value)) {
+    deviceLogDevice =
+      value.ownership.toLowerCase() === "owned" ? value.entity.id : null;
     slots = {
       body: (
         <DeviceInspector
@@ -113,10 +114,6 @@ export function InspectorView({
           onOperationFinished={props.onOperationFinished}
         />
       ),
-      activity:
-        value.ownership.toLowerCase() === "owned" ? (
-          <DeviceLogPanel device={value.entity.id} />
-        ) : null,
     };
   } else if (isWorkflowSummary(value)) {
     const workflowActivity = activity.filter(
@@ -143,8 +140,9 @@ export function InspectorView({
   const targetSystem =
     entity.kind === "system" ? entity.id : (summary.system ?? null);
   const actions =
-    targetSystem || entity.kind === "workflow" ? (
+    targetSystem || entity.kind === "workflow" || deviceLogDevice ? (
       <>
+        {deviceLogDevice ? <DeviceLogButton device={deviceLogDevice} /> : null}
         {targetSystem ? (
           <>
             <button

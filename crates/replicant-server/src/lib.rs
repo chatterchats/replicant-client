@@ -5191,6 +5191,28 @@ fn device_summary(
         .active_directive
         .as_ref()
         .and_then(|value| value.status.clone());
+    let directive_details = device
+        .active_directive
+        .as_ref()
+        .map(|value| value.details.clone())
+        .unwrap_or_default();
+    let directive_target_system = device.active_directive.as_ref().and_then(|value| {
+        let explicit_system = value
+            .details
+            .get("target_system")
+            .or_else(|| value.details.get("deliver_system"))
+            .and_then(Value::as_str);
+        explicit_system.map(str::to_owned).or_else(|| {
+            value
+                .details
+                .get("configuration")
+                .and_then(Value::as_object)
+                .and_then(|configuration| configuration.get("deliver"))
+                .or_else(|| value.details.get("deliver"))
+                .and_then(Value::as_str)
+                .and_then(|location| device_system(location, location_systems))
+        })
+    });
     Ok(DeviceSummary {
         entity: summary_ref(EntityKind::Device, device.key.id.to_string()),
         device_type: wire_value(device.device_type.as_ref()),
@@ -5255,6 +5277,8 @@ fn device_summary(
         system_status: device.system_status,
         active_directive,
         directive_status,
+        directive_details,
+        directive_target_system,
         travel_destination: device.travel.and_then(|value| {
             value
                 .final_destination
@@ -8506,6 +8530,8 @@ mod tests {
             system_status: None,
             active_directive: None,
             directive_status: None,
+            directive_details: BTreeMap::new(),
+            directive_target_system: None,
             travel_destination: None,
             claim: None,
         }
@@ -8540,6 +8566,14 @@ mod tests {
                         "start_mining",
                         "stellar_census"
                     ]);
+                    device["ami_directive"] = serde_json::json!({
+                        "directive": "ferry",
+                        "configuration": {
+                            "collect": "TARAZEDAR-BELT-1",
+                            "deliver": "61-CYGNI-3-L4"
+                        }
+                    });
+                    device["ami_directive_status"] = serde_json::json!("running");
                 }
                 device
             })
@@ -8592,6 +8626,21 @@ mod tests {
                 .await
                 .expect("refresh location");
         }
+        Mock::given(method("GET"))
+            .and(path("/v1/locations/61-CYGNI-3-L4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "location": "61-CYGNI-3-L4",
+                "location_type": "lagrange_point",
+                "system": "61-CYGNI"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .locations()
+            .get("61-CYGNI-3-L4")
+            .await
+            .expect("refresh ferry destination");
 
         let system = json(
             app.clone()
@@ -8675,6 +8724,13 @@ mod tests {
         assert_eq!(
             detail["available_commands"].as_array().map(Vec::len),
             Some(10)
+        );
+        assert_eq!(detail["active_directive"], "ferry");
+        assert_eq!(detail["directive_status"], "running");
+        assert_eq!(detail["directive_target_system"], "61-CYGNI");
+        assert_eq!(
+            detail["directive_details"]["configuration"]["deliver"],
+            "61-CYGNI-3-L4"
         );
         assert!(
             device["payload"]["provenance"]["observed_at_ms"]
@@ -9688,6 +9744,7 @@ mod tests {
                 ("SOL-1".to_owned(), Some("SOL".to_owned())),
                 ("VEGA-2".to_owned(), Some("VEGA".to_owned())),
             ]),
+            &BTreeMap::new(),
         );
 
         assert_eq!(snapshot.total_quantity, 15);

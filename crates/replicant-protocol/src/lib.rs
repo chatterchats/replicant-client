@@ -669,6 +669,12 @@ pub struct DeviceSummary {
     pub active_directive: Option<String>,
     /// Active AMI directive status, when present.
     pub directive_status: Option<String>,
+    /// Forward-compatible configuration and progress fields for the active directive.
+    #[serde(default)]
+    pub directive_details: BTreeMap<String, Value>,
+    /// Resolved destination system for directives that target a location.
+    #[serde(default)]
+    pub directive_target_system: Option<String>,
     /// Final travel destination, when traveling.
     pub travel_destination: Option<String>,
     /// Exclusive runtime claim, when held.
@@ -3470,6 +3476,8 @@ mod tests {
             operational_capacity_percent: None,
             active_directive: None,
             directive_status: None,
+            directive_details: BTreeMap::new(),
+            directive_target_system: None,
             travel_destination: None,
             claim: None,
         }

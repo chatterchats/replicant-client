@@ -5,6 +5,8 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import { DeviceLogButton } from "../DeviceLogPanel";
+import { DaemonProvider } from "../daemon";
 import type { DescriptorCatalog } from "../protocol";
 import { Inspector, InspectorView } from "./Inspector";
 
@@ -180,6 +182,69 @@ describe("Inspector extraction", () => {
     });
     expect(callbacks.onClose).toHaveBeenCalledOnce();
     expect(callbacks.onClear).toHaveBeenCalledOnce();
+    await act(async () => {
+      root.unmount();
+    });
+  });
+  it("offers owned device logs as a button instead of embedded activity", () => {
+    const html = render("device", {
+      entity: { kind: "device", id: "D-1" },
+      ownership: "owned",
+      device_type: null,
+      status: null,
+      owner: null,
+      owner_name: null,
+      system: null,
+      region: null,
+      location: null,
+      available_commands: [],
+      tags: [],
+      attached_to: null,
+      stowed_in: null,
+      controller: null,
+      linked_device: null,
+      attached_devices: [],
+      controlled_devices: [],
+      stowed_devices: [],
+      attach_capacity: null,
+      cargo_capacity: null,
+      cargo_used: null,
+      operational_capacity_percent: null,
+      active_directive: null,
+      directive_status: null,
+      travel_destination: null,
+      claim: null,
+    });
+
+    expect(html).toContain(">Device log</button>");
+    expect(html).not.toContain('aria-label="Device log"');
+    expect(html).not.toContain("<h3>Activity</h3>");
+  });
+  it("opens device logs in a modal dialog", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <DaemonProvider>
+          <DeviceLogButton device="D-LOG" />
+        </DaemonProvider>,
+      );
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button")?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(container.textContent).toContain("Loading logs…");
+
+    await act(async () => {
+      [...container.querySelectorAll("button")]
+        .find((button) => button.textContent === "Close")
+        ?.click();
+    });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
     await act(async () => {
       root.unmount();
     });

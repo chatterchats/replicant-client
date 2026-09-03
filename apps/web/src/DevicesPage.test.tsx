@@ -13,6 +13,7 @@ import {
   bulkDeviceResultItems,
   deviceRefreshParameters,
   deviceCategory,
+  deviceDirectiveLabel,
   filterAndSortDevices,
   groupDevices,
   normalizedDeviceStatus,
@@ -172,6 +173,30 @@ describe("device fleet browser", () => {
       { system: "ALPHA", count: 1 },
       { system: "VEGA", count: 1 },
     ]);
+  });
+
+  it("labels active directives and includes the ferry delivery target", () => {
+    expect(deviceDirectiveLabel(device("IDLE"))).toBeNull();
+    expect(
+      deviceDirectiveLabel(
+        device("FERRY", {
+          active_directive: "ferry",
+          directive_details: {
+            directive: "ferry",
+            configuration: {
+              collect: "TARAZEDAR-BELT-1",
+              deliver: "SOL-3-L4",
+            },
+          },
+          directive_target_system: "SOL",
+        }),
+      ),
+    ).toBe("(Dir: Ferry (SOL))");
+    expect(
+      deviceDirectiveLabel(
+        device("MINER", { active_directive: "gather_resources" }),
+      ),
+    ).toBe("(Dir: Gather Resources)");
   });
 
   it("sorts by type and system while nesting hosted and controlled devices", () => {

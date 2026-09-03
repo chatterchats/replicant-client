@@ -218,6 +218,33 @@ export function DeviceInspector({
     commands.map((command) => [command.bindingCommand, command]),
   );
   const capabilities = [...new Set(device.available_commands)];
+  const directiveDetails = Object.entries(device.directive_details ?? {})
+    .filter(([key]) => key !== "directive" && key !== "name")
+    .flatMap(([key, value]) => {
+      if (
+        key === "configuration" &&
+        typeof value === "object" &&
+        value !== null &&
+        !Array.isArray(value)
+      ) {
+        return Object.entries(value as Record<string, unknown>).map(
+          ([configurationKey, configurationValue]) => ({
+            label: configurationKey
+              .replace(/[._-]+/g, " ")
+              .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+            value: configurationValue,
+          }),
+        );
+      }
+      return [
+        {
+          label: key
+            .replace(/[._-]+/g, " ")
+            .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+          value,
+        },
+      ];
+    });
   const relations = [
     device.attached_to
       ? `Attached to ${relatedDeviceLabel(device.attached_to, entities)}`
@@ -273,14 +300,29 @@ export function DeviceInspector({
                 ? null
                 : `${String(device.stow_used ?? 0)} / ${String(device.stow_capacity ?? 0)}`,
           },
-          { label: "Directive", value: device.active_directive },
-          { label: "Directive status", value: device.directive_status },
           { label: "Travel destination", value: device.travel_destination },
           { label: "Grace period", value: device.grace_period_remaining },
           { label: "Upkeep", value: device.upkeep_requirements ?? [] },
           { label: "System status", value: device.system_status },
         ]}
       />
+      {device.active_directive ? (
+        <section className="inspector-section" aria-label="Directive details">
+          <h3>Directive</h3>
+          <InspectorFields
+            fields={[
+              {
+                label: "Name",
+                value: device.active_directive
+                  .replace(/[._-]+/g, " ")
+                  .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+              },
+              { label: "Status", value: device.directive_status },
+              ...directiveDetails,
+            ]}
+          />
+        </section>
+      ) : null}
       {(device.cargo ?? []).length ? (
         <section className="inspector-section">
           <h3>Cargo</h3>
@@ -304,20 +346,6 @@ export function DeviceInspector({
           </ul>
         </section>
       ) : null}
-      {relationGroups.map(([label, codes]) =>
-        codes.length ? (
-          <section className="inspector-section" key={label}>
-            <h3>{label}</h3>
-            <InspectorCollection
-              collection={relationCollection(
-                label.toLowerCase(),
-                codes,
-                entities,
-              )}
-            />
-          </section>
-        ) : null,
-      )}
       {capabilities.length ? (
         <section className="inspector-section">
           <h3>Capabilities</h3>
@@ -363,6 +391,20 @@ export function DeviceInspector({
           </div>
         </section>
       ) : null}
+      {relationGroups.map(([label, codes]) =>
+        codes.length ? (
+          <section className="inspector-section" key={label}>
+            <h3>{label}</h3>
+            <InspectorCollection
+              collection={relationCollection(
+                label.toLowerCase(),
+                codes,
+                entities,
+              )}
+            />
+          </section>
+        ) : null,
+      )}
     </>
   );
 }
