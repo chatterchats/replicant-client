@@ -113,17 +113,29 @@ describe("descriptor workflow form", () => {
     expect(deviceHtml).toContain("+ Add device");
   });
 
-  it("offers only owned System Hub locations as dispatch sources", () => {
+  it("offers manufacturing locations in owned System Hub systems as dispatch sources", () => {
     const html = renderToStaticMarkup(
       <ParameterField
         parameter={parameter("source", { type: "location" })}
         value=""
         entities={{
-          "location:ALPHA-HUB": {},
-          "location:OTHER": {},
+          "location:ALPHA-7-L4": { system: "ALPHA" },
+          "location:ALPHA-BELT-1": { system: "ALPHA" },
+          "location:OTHER-BELT-1": { system: "OTHER" },
           "device:HUB-1": {
             device_type: "system_hub",
-            location: "ALPHA-HUB",
+            location: "ALPHA-7-L4",
+            system: "ALPHA",
+          },
+          "device:FACTORY-1": {
+            device_type: "autofactory",
+            location: "ALPHA-BELT-1",
+            system: "ALPHA",
+          },
+          "device:FACTORY-2": {
+            device_type: "autofactory",
+            location: "OTHER-BELT-1",
+            system: "OTHER",
           },
         }}
         operationKind="logistics.regional_dispatch"
@@ -131,8 +143,9 @@ describe("descriptor workflow form", () => {
       />,
     );
 
-    expect(html).toContain("ALPHA-HUB");
-    expect(html).not.toContain('value="OTHER"');
+    expect(html).toContain("ALPHA-BELT-1");
+    expect(html).not.toContain('value="ALPHA-7-L4"');
+    expect(html).not.toContain('value="OTHER-BELT-1"');
   });
 
   it("validates required descriptor fields before submission", () => {

@@ -196,7 +196,7 @@ struct ProspectBlocked {
 }
 
 /// Result of one automatic sparse-direction prospect submission.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct AutoProspectReport {
     /// Observatory chosen for the attempt.
     pub observatory: String,
@@ -204,7 +204,7 @@ pub struct AutoProspectReport {
     pub star: Option<String>,
     /// Sparse direction submitted to the game server.
     pub direction: Option<[f64; 3]>,
-    /// Number of candidate directions tried before a prospect started.
+    /// Number of candidate directions tried before the final prospect outcome.
     pub attempts: usize,
     /// Durable managed operation identifier.
     pub operation_id: String,
@@ -262,6 +262,7 @@ pub async fn auto_prospect(
         )));
     }
     let candidates = prospect_directions(&config, observatory, &catalogue, sol)?;
+    let mut last_blocked = None;
     for (index, candidate) in candidates.into_iter().take(config.attempts).enumerate() {
         let handle = client.devices().get(&observatory.code).await?;
         let operation = handle.prospect(candidate.direction).await?;
@@ -278,7 +279,10 @@ pub async fn auto_prospect(
                     status: format!("{:?}", outcome.status).to_ascii_lowercase(),
                 });
             }
-            ProspectSubmission::Blocked(_) => continue,
+            ProspectSubmission::Blocked(blocked) => {
+                last_blocked = Some((index + 1, candidate.direction, operation_id, blocked));
+                continue;
+            }
             ProspectSubmission::Rejected => {
                 return Err(app_error(format!(
                     "{} rejected automatic prospect attempt {}",
@@ -297,6 +301,22 @@ pub async fn auto_prospect(
                 });
             }
         }
+    }
+    if let Some((attempts, direction, operation_id, blocked)) = last_blocked {
+        tracing::info!(
+            observatory = %observatory.code,
+            attempts,
+            reason = blocked.message.as_deref().unwrap_or("no new stars visible"),
+            "automatic observatory prospect exhausted the currently visible sparse directions"
+        );
+        return Ok(AutoProspectReport {
+            observatory: observatory.code.clone(),
+            star: observatory.star.clone(),
+            direction,
+            attempts,
+            operation_id,
+            status: "exhausted".to_owned(),
+        });
     }
     Err(app_error(format!(
         "{} had no sparse prospect direction accepted after {} attempts",

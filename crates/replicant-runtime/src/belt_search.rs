@@ -237,19 +237,22 @@ pub async fn execute_belt_search_system(
     visit_when_explored: bool,
 ) -> crate::ActionResult<BeltSearchStop> {
     let already_explored = system_is_explored(client, replicant_code, system).await?;
+    let cached_location = client.locations().cached(system);
+    let must_visit = !already_explored || visit_when_explored || cached_location.is_none();
     let scanned_now = if already_explored {
-        if visit_when_explored {
+        if must_visit {
             travel_to_system(client, replicant_code, system, wait_timeout).await?;
             info!(
                 replicant = %replicant_code,
                 system,
-                "belt-search route stop is already explored; visited without duplicate scan"
+                cached_location = cached_location.is_some(),
+                "belt-search system is already explored; visited without duplicate scan so location data is locally readable"
             );
         } else {
             info!(
                 replicant = %replicant_code,
                 system,
-                "belt-search system is already explored; skipping travel and duplicate scan"
+                "belt-search system is already explored; using the managed location projection without duplicate travel or scan"
             );
         }
         false
@@ -258,7 +261,16 @@ pub async fn execute_belt_search_system(
         scan_system(client, replicant_code, system).await?;
         true
     };
-    let location = client.locations().get(system).await?;
+    // `/v1/locations/{system}` is presence-gated by the game server.  When an
+    // explored system is not being revisited, prefer the durable managed
+    // projection instead of issuing a remote read that will return 403 merely
+    // because this Replicant is somewhere else.  If no projection exists, the
+    // `must_visit` branch above moves the Replicant into-system before reading.
+    let location = if must_visit {
+        client.locations().get(system).await?
+    } else {
+        cached_location.expect("must_visit is false only when cached location data exists")
+    };
     let mut belts = belts_from_location(system, &location);
     belts.sort_by(|left, right| {
         right

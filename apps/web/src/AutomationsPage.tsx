@@ -117,7 +117,22 @@ function optionsFor(
     operationKind === "logistics.regional_dispatch" &&
     parameter.name === "source"
   ) {
-    const hubs = new Set(
+    const deviceType = (device: Record<string, unknown>) =>
+      typeof device.device_type === "string"
+        ? device.device_type
+        : typeof device.entity_type === "string"
+          ? device.entity_type
+          : null;
+    const locationSystem = (location: string) => {
+      const value = entities[`location:${location}`];
+      if (typeof value === "object" && value !== null) {
+        const summary = value as Record<string, unknown>;
+        if (typeof summary.system === "string") return summary.system;
+      }
+      const separator = location.indexOf("-");
+      return separator === -1 ? location : location.slice(0, separator);
+    };
+    const hubSystems = new Set(
       Object.entries(entities).flatMap(([key, value]) => {
         if (
           !key.startsWith("device:") ||
@@ -126,14 +141,35 @@ function optionsFor(
         )
           return [];
         const device = value as Record<string, unknown>;
-        return device.device_type === "system_hub" &&
-          typeof device.location === "string"
-          ? [device.location]
+        if (deviceType(device) !== "system_hub") return [];
+        if (typeof device.system === "string") return [device.system];
+        return typeof device.location === "string"
+          ? [locationSystem(device.location)]
           : [];
       }),
     );
+    const manufacturingLocations = new Set(
+      Object.entries(entities).flatMap(([key, value]) => {
+        if (
+          !key.startsWith("device:") ||
+          typeof value !== "object" ||
+          value === null
+        )
+          return [];
+        const device = value as Record<string, unknown>;
+        if (deviceType(device) !== "autofactory") return [];
+        const location =
+          typeof device.location === "string" ? device.location : null;
+        if (!location) return [];
+        const system =
+          typeof device.system === "string"
+            ? device.system
+            : locationSystem(location);
+        return hubSystems.has(system) ? [location] : [];
+      }),
+    );
     return entityOptions(entities, "location").filter((option) =>
-      hubs.has(option.value),
+      manufacturingLocations.has(option.value),
     );
   }
   if (entityKind === "replicant") return entityOptions(entities, "replicant");

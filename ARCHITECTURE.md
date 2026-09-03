@@ -151,8 +151,10 @@ are categorized as `compatibility` and are not offered by the normal web/Tauri o
 picker.
 
 `logistics.regional_dispatch` is the operator-facing regional provisioning workflow. Its source
-must be an owned System Hub location. It reserves reusable unclaimed vessels, empty Replicant
-matrices, and requested devices before printing only the shortfall; a vessel that already carries
+may be the regional hub system, the owned System Hub device location, or the exact manufacturing
+home. Execution resolves all three forms to an owned Autofactory location in that same hub system
+before stock selection, printing, replication, and delivery staging. It reserves reusable unclaimed
+vessels, empty Replicant matrices, and requested devices before printing only the shortfall; a vessel that already carries
 an empty matrix is preferred, and loose empty matrices may be paired with vessels that still need
 to be printed. Requested Racing, HEAVEN, and Cargo vessels receive an empty matrix, are replicated
 into from any claimable local Replicant vessel when one is available, and otherwise remain empty.
@@ -226,13 +228,24 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   cloning/ark construction. Newly established regions automatically become eligible for regional
   goals.
 - **Expand Star Catalogue** uses owned galactic observatories to prospect for undiscovered stars.
+  A server response that no new stars are visible from the sampled sparse directions is treated as
+  an exhausted deployment rather than a failed workflow; the Director does not retry that same
+  observatory deployment until the owned observatory/location signature changes.
 - **Enhance Star Catalogue** runs regional survey tours over known systems that still need survey
-  coverage. Large regional backlogs are partitioned into disjoint exact-system shards across up to
-  four idle region-assigned Replicants/racing vessels. The shard backlog contributes real regional
+  coverage and are within 30 LY (3D galactic distance) of the selected regional hub. Systems beyond
+  that operating radius are deliberately left out of the standing survey footprint. Large regional
+  backlogs are partitioned into disjoint exact-system batches of at most 20 systems per worker across
+  up to four idle region-assigned Replicants/racing vessels. Exact
+  Season Three re-survey batches use bounded targeted star-knowledge reads rather than traversing
+  the complete Replicant-star pagination before every tour. The shard backlog contributes real regional
   worker pressure, so the grow-only workforce policy can add catalogue capacity when useful survey
   work is persistently waiting rather than cloning merely because utilization is high.
-- **Discover Belts** searches each region outward from its selected hub system, prioritizing known
-  systems by three-dimensional galactic distance rather than catalogue name.
+- **Discover Belts** searches known systems within 30 LY (3D galactic distance) of each selected
+  regional hub, prioritizing targets outward by distance rather than catalogue name. Systems beyond
+  that operating radius are deliberately left out of the standing belt-search footprint.
+  Already-explored systems use the durable managed location projection when available; the workflow
+  only revisits an explored system when location data is absent, because remote location reads are
+  presence-gated.
 - **Expand Mining Ops** reconciles a protected regional mining footprint rather than treating
   deployment as one-shot work. Each region expands into every density-policy-eligible belt system
   within 30 LY of its selected regional hub; the footprint has no fixed system-count cap. Up to four
@@ -244,9 +257,12 @@ The initial standing goals are intentionally batch-oriented rather than one-goal
   repair/expansion campaign.
 - **Event Completion** batches active regional events into campaign planning, staging, routing,
   and completion.
-- **Expand FTL Network** and **Establish Beacons** are persisted goal kinds but remain disabled by
-  default until their autonomous placement/scoring policies are implemented. Explicit frontier,
-  relay, event, and bootstrap workflows remain available in the meantime.
+- **Expand FTL Network** prioritizes strategic event, mining, and explicit connectivity targets
+  within 30 LY (3D galactic distance) of each selected regional hub. Systems beyond that operating
+  radius are deliberately left out of the standing FTL footprint.
+- **Establish Beacons** remains disabled by default until its autonomous placement/scoring policy
+  is implemented. Explicit frontier, relay, event, and bootstrap workflows remain available in the
+  meantime.
 
 ### Regions and worker ownership
 

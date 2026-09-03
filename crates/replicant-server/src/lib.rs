@@ -7159,14 +7159,50 @@ fn workflow_wait_reason(
         return Ok(intent_reason);
     }
 
+    let work_items = repository
+        .list_work_items(instance.id)
+        .map_err(ApiError::repository)?;
+
+    if instance.kind.as_str() == "belt_search.campaign"
+        && work_items.iter().any(|item| {
+            matches!(
+                item.state.status,
+                WorkItemStatus::Waiting | WorkItemStatus::Pending
+            ) && item.state.last_error.as_deref().is_some_and(|reason| {
+                reason.contains("resource requirement \"worker\" cannot be fully allocated")
+            })
+        })
+    {
+        let claimed_workers = repository
+            .claims(instance.id)
+            .map_err(ApiError::repository)?
+            .into_iter()
+            .filter(|claim| matches!(claim.resource, ResourceKey::Replicant(_)))
+            .count();
+        let remaining = work_items
+            .iter()
+            .filter(|item| !item.state.status.is_terminal())
+            .count();
+        return Ok(Some(if claimed_workers == 0 {
+            format!(
+                "Regional worker capacity is currently saturated; {remaining} belt-search item{} will start as an eligible worker becomes free.",
+                if remaining == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Regional worker capacity is currently saturated. {claimed_workers} worker{} already reserved by this belt search; {remaining} remaining item{} will continue as capacity becomes available.",
+                if claimed_workers == 1 { " is" } else { "s are" },
+                if remaining == 1 { "" } else { "s" }
+            )
+        }));
+    }
+
     // Pooled campaign workflows often wait because one durable child item is
     // blocked. The item carries the useful reason (for example, the exact
     // resource, blueprint, print, or worker that is unavailable), while the
     // parent historically exposed only a generic "dependencies or resources"
     // message. Prefer that concrete durable evidence when it exists.
-    let mut blocked = repository
-        .list_work_items(instance.id)
-        .map_err(ApiError::repository)?
+    let mut blocked = work_items
         .into_iter()
         .filter(|item| {
             matches!(
@@ -9509,6 +9545,7 @@ mod tests {
             available_commands: Vec::new(),
             available_directives: Vec::new(),
             tags: vec!["hauler".to_owned()],
+            settings: Default::default(),
             relationships: DeviceRelationships {
                 assigned_replicant: Some(ReplicantKey::live("R-1".into())),
                 ..DeviceRelationships::default()
@@ -9571,6 +9608,7 @@ mod tests {
             available_commands: Vec::new(),
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: Default::default(),
             relationships: DeviceRelationships::default(),
             cargo: Default::default(),
             cargo_capacity: None,

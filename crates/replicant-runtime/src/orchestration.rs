@@ -103,6 +103,7 @@ const MINING_WARD_SITES_PER_REGION: usize = 4;
 const MINING_EXPANSION_RADIUS_LY: f64 = 30.0;
 const MINING_BATCH_SIZE: usize = 4;
 const CATALOGUE_SYSTEMS_PER_WORKER: usize = 20;
+const REGIONAL_AUTOMATION_RADIUS_LY: f64 = 30.0;
 const MAX_PARALLEL_CATALOGUE_WORKERS: usize = 4;
 // A system hub has 15 LY operational reach. An owned hub just outside a named
 // region can therefore serve as that region's gateway capital when it can
@@ -216,6 +217,8 @@ struct GoalRuntime {
     last_launch_at_ms: Option<i64>,
     #[serde(default)]
     launch_records: Vec<GoalLaunchRecord>,
+    #[serde(default)]
+    prospect_exhausted_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1009,6 +1012,7 @@ pub async fn reconcile_director(
             &devices,
             &locations,
             &location_systems,
+            &catalogue_positions,
             &BTreeSet::new(),
         )?);
     }
@@ -1066,10 +1070,17 @@ pub async fn reconcile_director(
             BTreeSet::new()
         }
     };
-    // Asteroid history is fetched once and shared by every established regional
-    // goal. Disabled controls still receive the snapshot so enabling a region
-    // never creates a second authority read in the same pass.
-    let asteroid_controls_enabled = !established_regions.is_empty();
+    // Asteroid history is expensive remote history. Fetch it once only when at
+    // least one regional diversion goal is actually enabled; enabling a goal
+    // naturally triggers a fresh reconciliation, so disabled automation should
+    // not continuously page an unrelated event stream.
+    let asteroid_controls_enabled = established_regions.iter().any(|region| {
+        goal_enabled(
+            &goal_controls,
+            DirectorGoalKind::AsteroidDiversion,
+            Some(&region.region),
+        )
+    });
     let mut asteroid_discovery_error = None;
     let asteroid_history = if asteroid_controls_enabled {
         match asteroid_history_snapshot(client, now).await {
@@ -1257,6 +1268,7 @@ pub async fn reconcile_director(
             &devices,
             &locations,
             &location_systems,
+            &catalogue_positions,
             &regional_event_systems,
         )?);
         goals.push(waiting_goal(
@@ -1686,6 +1698,19 @@ fn reconcile_expand_star_catalogue(
     let enabled = goal_enabled(context.controls, kind, None);
     let id = goal_instance_id(kind, None);
     let mut runtime = load_goal_runtime(context.repository, &id)?;
+    let deployment_signature = observatory_deployment_signature(devices);
+    if runtime.prospect_exhausted_signature != deployment_signature {
+        runtime.prospect_exhausted_signature = None;
+    }
+    if runtime.active_workflows.iter().any(|workflow_id| {
+        context
+            .workflows
+            .iter()
+            .find(|workflow| workflow.id == *workflow_id && workflow.status.is_terminal())
+            .is_some_and(observatory_workflow_exhausted)
+    }) {
+        runtime.prospect_exhausted_signature = deployment_signature.clone();
+    }
     prune_runtime_workflows(&mut runtime, context.workflows);
     let observatories = devices
         .iter()
@@ -1726,6 +1751,20 @@ fn reconcile_expand_star_catalogue(
             DirectorGoalStatus::Active,
             None,
             Some("Allow the current observatory prospect to finish".to_owned()),
+        )
+    } else if deployment_signature.is_some()
+        && runtime.prospect_exhausted_signature == deployment_signature
+    {
+        (
+            DirectorGoalStatus::Blocked,
+            Some(
+                "The current observatory deployment has no newly visible stars in its sampled sparse directions"
+                    .to_owned(),
+            ),
+            Some(
+                "Move an observatory to a different frontier system or deploy another observatory before prospecting again"
+                    .to_owned(),
+            ),
         )
     } else if recently_launched {
         (
@@ -1770,6 +1809,42 @@ fn reconcile_expand_star_catalogue(
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
+}
+
+fn observatory_deployment_signature(devices: &[Device]) -> Option<String> {
+    let mut observatories = devices
+        .iter()
+        .filter(|device| device.device_type.as_ref() == Some(&DeviceType::GalacticObservatory))
+        .map(|device| {
+            format!(
+                "{}@{}",
+                device.key.id.as_str(),
+                device
+                    .location
+                    .as_ref()
+                    .map(|location| location.id.as_str())
+                    .unwrap_or("<unplaced>")
+            )
+        })
+        .collect::<Vec<_>>();
+    observatories.sort();
+    (!observatories.is_empty()).then(|| observatories.join("|"))
+}
+
+fn observatory_workflow_exhausted(workflow: &WorkflowInstance) -> bool {
+    if workflow.status == WorkflowStatus::Failed
+        && workflow.last_error.as_deref().is_some_and(|error| {
+            error.contains("had no sparse prospect direction accepted after")
+                || error.to_ascii_lowercase().contains("no new stars visible")
+        })
+    {
+        return true;
+    }
+    workflow
+        .result::<crate::observatory::AutoProspectReport>()
+        .ok()
+        .flatten()
+        .is_some_and(|report| report.status == "exhausted")
 }
 
 fn load_blueprint_catalogue_cache(
@@ -4792,6 +4867,20 @@ fn reconcile_event_completion(
     })
 }
 
+fn planetary_survey_complete(location: &Location) -> bool {
+    let progress = &location.survey_progress;
+    let planets_complete = matches!(
+        (progress.planets_total, progress.planets_scanned),
+        (Some(total), Some(scanned)) if total == scanned
+    );
+    let moons_complete = progress.moons_total_estimated == Some(false)
+        && matches!(
+            (progress.moons_total, progress.moons_scanned),
+            (Some(total), Some(scanned)) if total == scanned
+        );
+    planets_complete && moons_complete
+}
+
 fn reconcile_enhance_catalogue(
     client: &Client,
     context: &GoalReconcileContext<'_>,
@@ -4806,24 +4895,33 @@ fn reconcile_enhance_catalogue(
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
 
-    let explored = client
-        .galaxy()
-        .catalogue()
-        .into_iter()
-        .filter(|star| star.explored == Some(true))
-        .map(|star| star.key.id.as_str().to_owned())
+    // Season Three regenerated every planet and moon. `Star::explored` is
+    // catalogue history, not proof that the current planetary generation has
+    // been surveyed. Treat only exact current aggregate planet/moon counters
+    // as completed coverage. The v9 managed-store migration clears pre-3.0
+    // counters, so existing installations naturally schedule a fresh survey.
+    let catalogue = client.galaxy().catalogue();
+    let survey_scope = catalogue_survey_scope_from_hub(region, &catalogue);
+    let (survey_targets, missing_positions) = survey_scope
+        .as_ref()
+        .map(|scope| (scope.systems.clone(), scope.missing_positions))
+        .unwrap_or_default();
+    let surveyed_systems = survey_targets
+        .iter()
+        .filter(|system| {
+            client
+                .locations()
+                .cached(system)
+                .as_ref()
+                .is_some_and(planetary_survey_complete)
+        })
+        .cloned()
         .collect::<BTreeSet<_>>();
-    let routable = client
-        .galaxy()
-        .catalogue()
-        .into_iter()
-        .filter(|star| star.position.is_some())
-        .map(|star| star.key.id.as_str().to_owned())
-        .filter(|system| region.known_systems.contains(system))
-        .collect::<BTreeSet<_>>();
-    let unsurveyed = routable.difference(&explored).cloned().collect::<Vec<_>>();
-    let surveyed = region.known_systems.intersection(&explored).count();
-    let missing_positions = region.known_systems.difference(&routable).count();
+    let unsurveyed = survey_targets
+        .difference(&surveyed_systems)
+        .cloned()
+        .collect::<Vec<_>>();
+    let surveyed = surveyed_systems.len();
     let active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
 
@@ -4874,14 +4972,32 @@ fn reconcile_enhance_catalogue(
     let mut next_action = None;
     let status = if !enabled {
         DirectorGoalStatus::Waiting
+    } else if survey_scope.is_none() {
+        blocker = Some(match region.hub_system.as_deref() {
+            Some(hub) => format!(
+                "{} regional hub {hub} has no catalogue position, so its {:.0} LY survey footprint cannot be resolved",
+                region.region, REGIONAL_AUTOMATION_RADIUS_LY
+            ),
+            None => format!(
+                "{} has no selected regional hub, so its {:.0} LY survey footprint cannot be resolved",
+                region.region, REGIONAL_AUTOMATION_RADIUS_LY
+            ),
+        });
+        next_action = Some(
+            "Resolve the regional hub and catalogue position before assigning survey tours"
+                .to_owned(),
+        );
+        DirectorGoalStatus::Blocked
     } else if unsurveyed.is_empty() && missing_positions == 0 {
-        next_action =
-            Some("Wait for newly discovered systems or stale catalogue coverage".to_owned());
+        next_action = Some(format!(
+            "Wait for newly discovered systems within {:.0} LY of the regional hub or stale catalogue coverage",
+            REGIONAL_AUTOMATION_RADIUS_LY
+        ));
         DirectorGoalStatus::Satisfied
     } else if unsurveyed.is_empty() {
         blocker = Some(format!(
-            "{} known system(s) in {} do not yet have routeable catalogue positions",
-            missing_positions, region.region
+            "{} known system(s) in {} lack catalogue positions, so their inclusion in the {:.0} LY survey footprint cannot yet be determined",
+            missing_positions, region.region, REGIONAL_AUTOMATION_RADIUS_LY
         ));
         next_action = Some(
             "Wait for catalogue position data before assigning another survey tour".to_owned(),
@@ -4913,12 +5029,16 @@ fn reconcile_enhance_catalogue(
         }
 
         if context.automatic && launch_slots > 0 && !pending.is_empty() && !recently_launched {
-            let center = region
-                .hub_system
-                .clone()
-                .or_else(|| region.known_systems.iter().next().cloned());
+            let center = region.hub_system.clone();
             if let Some(center) = center {
-                let shards = partition_systems(&pending, launch_slots);
+                // Keep each durable survey tour bounded. The old partitioning
+                // spread the entire post-reset regional backlog across the
+                // four available workers, producing multi-thousand-system
+                // workflows that were expensive to initialize, difficult to
+                // inspect, and slow to recover. The Director already
+                // reconciles continuously, so launch one small batch per
+                // worker and pick up the remaining systems on later passes.
+                let shards = partition_catalogue_batch(&pending, launch_slots);
                 for ((worker, vessel), systems) in available_workers.into_iter().zip(shards) {
                     if systems.is_empty() {
                         continue;
@@ -4929,12 +5049,15 @@ fn reconcile_enhance_catalogue(
                             .repository
                             .create(new_scan_tour_workflow(ScanTourIntent {
                                 center: center.clone(),
-                                radius_ly: regional_radius(region, client),
+                                radius_ly: REGIONAL_AUTOMATION_RADIUS_LY,
                                 system_limit: systems.len().saturating_add(1),
                                 target_systems: Some(systems),
                                 replicant: Some(worker.clone()),
                                 vessel: Some(vessel),
-                                include_explored: false,
+                                // Exact targets are selected from current planetary
+                                // survey completeness, so catalogue `explored` must not
+                                // suppress Season Three re-surveys.
+                                include_explored: true,
                             }))?;
                     tracing::info!(
                         workflow_id = %workflow.id,
@@ -4983,11 +5106,14 @@ fn reconcile_enhance_catalogue(
         kind,
         region: Some(region.region.clone()),
         status,
-        objective: format!("Survey known systems throughout {}", region.region),
+        objective: format!(
+            "Maintain current planet/moon survey coverage within {:.0} LY of the regional hub in {}",
+            REGIONAL_AUTOMATION_RADIUS_LY, region.region
+        ),
         blocker,
         next_action,
         progress_current: surveyed as u64,
-        progress_total: region.known_systems.len() as u64,
+        progress_total: survey_targets.len().saturating_add(missing_positions) as u64,
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
@@ -5010,19 +5136,58 @@ fn reconcile_discover_belts(
     let mut runtime = load_goal_runtime(context.repository, &id)?;
     prune_runtime_workflows(&mut runtime, context.workflows);
     let searched = belt_searched_systems(locations, location_systems);
-    let targets = belt_search_targets_from_hub(region, &searched, catalogue_positions);
-    let covered = region.known_systems.intersection(&searched).count();
+    let search_scope =
+        regional_system_scope_from_hub(region, catalogue_positions, REGIONAL_AUTOMATION_RADIUS_LY);
+    let (targets, missing_positions, covered, scoped_systems) = search_scope
+        .as_ref()
+        .map(|scope| {
+            (
+                belt_search_targets_from_hub(
+                    region,
+                    &scope.systems,
+                    &searched,
+                    catalogue_positions,
+                ),
+                scope.missing_positions,
+                scope.systems.intersection(&searched).count(),
+                scope.systems.len(),
+            )
+        })
+        .unwrap_or_default();
     let active = nonterminal_ids(&runtime, context.workflows);
     let recently_launched = launch_is_recent(&runtime, context.now, DEFAULT_RETRY_COOLDOWN_MS);
-    let blocker = None;
+    let mut blocker = None;
     let next_action;
     let status = if !enabled {
         next_action =
             Some("Enable this standing goal to search known systems for belts".to_owned());
         DirectorGoalStatus::Waiting
-    } else if targets.is_empty() {
-        next_action = Some("Wait for newly discovered regional systems".to_owned());
+    } else if search_scope.is_none() {
+        blocker = Some(regional_radius_resolution_blocker(
+            region,
+            REGIONAL_AUTOMATION_RADIUS_LY,
+            "belt-search",
+        ));
+        next_action = Some(
+            "Resolve the regional hub and catalogue position before assigning belt searches"
+                .to_owned(),
+        );
+        DirectorGoalStatus::Blocked
+    } else if targets.is_empty() && missing_positions == 0 {
+        next_action = Some(format!(
+            "Wait for newly discovered systems within {:.0} LY of the regional hub",
+            REGIONAL_AUTOMATION_RADIUS_LY
+        ));
         DirectorGoalStatus::Satisfied
+    } else if targets.is_empty() {
+        blocker = Some(format!(
+            "{missing_positions} known system(s) in {} lack catalogue positions, so their inclusion in the {:.0} LY belt-search footprint cannot yet be determined",
+            region.region, REGIONAL_AUTOMATION_RADIUS_LY
+        ));
+        next_action = Some(
+            "Wait for catalogue position data before assigning another belt search".to_owned(),
+        );
+        DirectorGoalStatus::Blocked
     } else if !active.is_empty() {
         next_action = Some("Continue the active regional fast belt search".to_owned());
         DirectorGoalStatus::Active
@@ -5031,8 +5196,9 @@ fn reconcile_discover_belts(
         DirectorGoalStatus::Waiting
     } else {
         next_action = Some(format!(
-            "Schedule {} unscanned regional system(s) across the {} worker pool",
+            "Schedule {} unscanned system(s) within {:.0} LY of the regional hub across the {} worker pool",
             targets.len(),
+            REGIONAL_AUTOMATION_RADIUS_LY,
             region.region
         ));
         if context.automatic {
@@ -5055,17 +5221,21 @@ fn reconcile_discover_belts(
         kind,
         region: Some(region.region.clone()),
         status,
-        objective: format!("Discover asteroid belts throughout {}", region.region),
+        objective: format!(
+            "Discover asteroid belts within {:.0} LY of the regional hub in {}",
+            REGIONAL_AUTOMATION_RADIUS_LY, region.region
+        ),
         blocker,
         next_action,
         progress_current: covered as u64,
-        progress_total: region.known_systems.len() as u64,
+        progress_total: scoped_systems.saturating_add(missing_positions) as u64,
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
 }
 fn belt_search_targets_from_hub(
     region: &RegionView,
+    systems: &BTreeSet<String>,
     searched: &BTreeSet<String>,
     positions: &BTreeMap<String, GalacticPosition>,
 ) -> Vec<String> {
@@ -5074,11 +5244,7 @@ fn belt_search_targets_from_hub(
         .as_deref()
         .and_then(|hub| positions.get(hub))
         .copied();
-    let mut targets = region
-        .known_systems
-        .difference(searched)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut targets = systems.difference(searched).cloned().collect::<Vec<_>>();
     targets.sort_by(|left, right| {
         let by_distance = hub_position.map_or(std::cmp::Ordering::Equal, |hub| {
             match (positions.get(left), positions.get(right)) {
@@ -6385,6 +6551,7 @@ fn reconcile_expand_ftl_network(
     devices: &[Device],
     locations: &[Location],
     location_systems: &BTreeMap<String, String>,
+    catalogue_positions: &BTreeMap<String, GalacticPosition>,
     event_systems: &BTreeSet<String>,
 ) -> Result<DirectorGoalSummary, ApplicationError> {
     let kind = DirectorGoalKind::ExpandFtlNetwork;
@@ -6396,9 +6563,15 @@ fn reconcile_expand_ftl_network(
     let relay_systems = relay_device_systems(devices, location_systems);
     let belt_density = belt_density_priorities(locations, location_systems);
     let connectivity_requirements = requirements.current_connectivity_requirements(&region.region);
-    let covered = region.known_systems.intersection(&relay_systems).count();
-    let mut uncovered = region
-        .known_systems
+    let expansion_scope =
+        regional_system_scope_from_hub(region, catalogue_positions, REGIONAL_AUTOMATION_RADIUS_LY);
+    let empty_systems = BTreeSet::new();
+    let (scoped_systems, missing_positions) = expansion_scope
+        .as_ref()
+        .map(|scope| (&scope.systems, scope.missing_positions))
+        .unwrap_or((&empty_systems, 0));
+    let covered = scoped_systems.intersection(&relay_systems).count();
+    let mut uncovered = scoped_systems
         .iter()
         .filter(|system| !relay_systems.contains(*system))
         .map(|system| {
@@ -6440,10 +6613,35 @@ fn reconcile_expand_ftl_network(
             DirectorGoalStatus::Waiting,
             Some("Enable this standing goal to extend regional FTL coverage".to_owned()),
         )
-    } else if uncovered.is_empty() {
+    } else if expansion_scope.is_none() {
+        blocker = Some(regional_radius_resolution_blocker(
+            region,
+            REGIONAL_AUTOMATION_RADIUS_LY,
+            "FTL-expansion",
+        ));
+        (
+            DirectorGoalStatus::Blocked,
+            Some(
+                "Resolve the regional hub and catalogue position before extending FTL coverage"
+                    .to_owned(),
+            ),
+        )
+    } else if uncovered.is_empty() && missing_positions == 0 {
         (
             DirectorGoalStatus::Satisfied,
-            Some("Wait for newly discovered regional systems or new strategic demand".to_owned()),
+            Some(format!(
+                "Wait for newly discovered systems within {:.0} LY of the regional hub or new strategic demand",
+                REGIONAL_AUTOMATION_RADIUS_LY
+            )),
+        )
+    } else if uncovered.is_empty() {
+        blocker = Some(format!(
+            "{missing_positions} known system(s) in {} lack catalogue positions, so their inclusion in the {:.0} LY FTL footprint cannot yet be determined",
+            region.region, REGIONAL_AUTOMATION_RADIUS_LY
+        ));
+        (
+            DirectorGoalStatus::Blocked,
+            Some("Wait for catalogue position data before extending FTL coverage".to_owned()),
         )
     } else if !active.is_empty() {
         (
@@ -6514,13 +6712,13 @@ fn reconcile_expand_ftl_network(
                     region: Some(region.region.clone()),
                     status: DirectorGoalStatus::Blocked,
                     objective: format!(
-                        "Connect strategic event and mining systems across {}",
-                        region.region
+                        "Connect strategic systems within {:.0} LY of the regional hub in {}",
+                        REGIONAL_AUTOMATION_RADIUS_LY, region.region
                     ),
                     blocker,
                     next_action,
                     progress_current: covered as u64,
-                    progress_total: region.known_systems.len() as u64,
+                    progress_total: scoped_systems.len().saturating_add(missing_positions) as u64,
                     active_workflows: protocol_workflow_ids(&runtime.active_workflows),
                     enabled,
                 });
@@ -6612,13 +6810,13 @@ fn reconcile_expand_ftl_network(
         region: Some(region.region.clone()),
         status,
         objective: format!(
-            "Connect strategic event and mining systems across {}",
-            region.region
+            "Connect strategic systems within {:.0} LY of the regional hub in {}",
+            REGIONAL_AUTOMATION_RADIUS_LY, region.region
         ),
         blocker,
         next_action,
         progress_current: covered as u64,
-        progress_total: region.known_systems.len() as u64,
+        progress_total: scoped_systems.len().saturating_add(missing_positions) as u64,
         active_workflows: protocol_workflow_ids(&runtime.active_workflows),
         enabled,
     })
@@ -7726,6 +7924,16 @@ fn partition_systems(systems: &[String], workers: usize) -> Vec<Vec<String>> {
     shards
 }
 
+fn partition_catalogue_batch(systems: &[String], workers: usize) -> Vec<Vec<String>> {
+    let batch_limit = workers.saturating_mul(CATALOGUE_SYSTEMS_PER_WORKER);
+    let batch = systems
+        .iter()
+        .take(batch_limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    partition_systems(&batch, workers)
+}
+
 fn select_idle_ftl_worker(
     workers: &[WorkerView],
     region: &str,
@@ -7770,30 +7978,62 @@ fn select_idle_worker(
         .map(|worker| worker.replicant.key.id.as_str().to_owned())
 }
 
-fn regional_radius(region: &RegionView, client: &Client) -> f64 {
-    let catalogue = client.galaxy().catalogue();
-    let Some(center_code) = region.hub_system.as_deref() else {
-        return 30.0;
-    };
-    let Some(center) = catalogue
+fn regional_radius_resolution_blocker(
+    region: &RegionView,
+    radius_ly: f64,
+    footprint: &str,
+) -> String {
+    match region.hub_system.as_deref() {
+        Some(hub) => format!(
+            "{} regional hub {hub} has no catalogue position, so its {radius_ly:.0} LY {footprint} footprint cannot be resolved",
+            region.region
+        ),
+        None => format!(
+            "{} has no selected regional hub, so its {radius_ly:.0} LY {footprint} footprint cannot be resolved",
+            region.region
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RegionalSystemScope {
+    systems: BTreeSet<String>,
+    missing_positions: usize,
+}
+
+fn regional_system_scope_from_hub(
+    region: &RegionView,
+    positions: &BTreeMap<String, GalacticPosition>,
+    radius_ly: f64,
+) -> Option<RegionalSystemScope> {
+    let hub_system = region.hub_system.as_deref()?;
+    let hub_position = positions.get(hub_system).copied()?;
+
+    let mut scope = RegionalSystemScope::default();
+    for system in &region.known_systems {
+        let Some(position) = positions.get(system).copied() else {
+            scope.missing_positions += 1;
+            continue;
+        };
+        if galactic_distance(hub_position, position) <= radius_ly {
+            scope.systems.insert(system.clone());
+        }
+    }
+    Some(scope)
+}
+
+fn catalogue_survey_scope_from_hub(
+    region: &RegionView,
+    catalogue: &[Star],
+) -> Option<RegionalSystemScope> {
+    let positions = catalogue
         .iter()
-        .find(|star| star.key.id.as_str() == center_code)
-        .and_then(|star| star.position)
-    else {
-        return 30.0;
-    };
-    catalogue
-        .iter()
-        .filter(|star| region.known_systems.contains(star.key.id.as_str()))
-        .filter_map(|star| star.position)
-        .map(|position| {
-            let dx = position.x - center.x;
-            let dy = position.y - center.y;
-            let dz = position.z - center.z;
-            (dx * dx + dy * dy + dz * dz).sqrt()
+        .filter_map(|star| {
+            star.position
+                .map(|position| (star.key.id.as_str().to_owned(), position))
         })
-        .fold(7.5, f64::max)
-        + 0.1
+        .collect::<BTreeMap<_, _>>();
+    regional_system_scope_from_hub(region, &positions, REGIONAL_AUTOMATION_RADIUS_LY)
 }
 
 fn replicant_near_home(replicant: &Replicant, home: &str) -> bool {
@@ -8128,6 +8368,7 @@ mod tests {
             available_commands: Vec::new(),
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: Default::default(),
             relationships: replicant_client::DeviceRelationships::default(),
             cargo: Default::default(),
             cargo_capacity: None,
@@ -9342,6 +9583,70 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_batches_cap_each_worker_at_twenty_systems() {
+        let systems = (1..=500)
+            .map(|index| format!("SYS-{index:03}"))
+            .collect::<Vec<_>>();
+        let shards = partition_catalogue_batch(&systems, 4);
+        assert_eq!(shards.len(), 4);
+        assert!(
+            shards
+                .iter()
+                .all(|shard| shard.len() <= CATALOGUE_SYSTEMS_PER_WORKER)
+        );
+        assert_eq!(shards.iter().map(Vec::len).sum::<usize>(), 80);
+    }
+
+    #[test]
+    fn catalogue_survey_scope_is_limited_to_thirty_ly_from_regional_hub() {
+        let region = RegionView {
+            region: "delta".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("HUB".to_owned()),
+            hub_location: Some("HUB-BELT-1".to_owned()),
+            known_systems: BTreeSet::from([
+                "INSIDE".to_owned(),
+                "EDGE".to_owned(),
+                "OUTSIDE".to_owned(),
+                "UNKNOWN".to_owned(),
+            ]),
+        };
+        let catalogue = vec![
+            positioned_star("HUB", 0.0, None),
+            positioned_star("INSIDE", REGIONAL_AUTOMATION_RADIUS_LY - 0.1, Some("delta")),
+            positioned_star("EDGE", REGIONAL_AUTOMATION_RADIUS_LY, Some("delta")),
+            positioned_star(
+                "OUTSIDE",
+                REGIONAL_AUTOMATION_RADIUS_LY + 0.1,
+                Some("delta"),
+            ),
+        ];
+
+        let scope = catalogue_survey_scope_from_hub(&region, &catalogue)
+            .expect("regional hub survey scope");
+
+        assert_eq!(
+            scope.systems,
+            BTreeSet::from(["EDGE".to_owned(), "INSIDE".to_owned()])
+        );
+        assert_eq!(scope.missing_positions, 1);
+    }
+
+    #[test]
+    fn catalogue_survey_scope_requires_a_positioned_regional_hub() {
+        let region = RegionView {
+            region: "delta".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("HUB".to_owned()),
+            hub_location: Some("HUB-BELT-1".to_owned()),
+            known_systems: BTreeSet::from(["INSIDE".to_owned()]),
+        };
+        let catalogue = vec![positioned_star("INSIDE", 1.0, Some("delta"))];
+
+        assert!(catalogue_survey_scope_from_hub(&region, &catalogue).is_none());
+    }
+
+    #[test]
     fn gateway_distance_uses_three_dimensional_ly_distance() {
         let left = GalacticPosition {
             x: 0.0,
@@ -9357,17 +9662,27 @@ mod tests {
     }
 
     #[test]
-    fn belt_search_targets_expand_outward_from_the_regional_hub() {
+    fn belt_discovery_launches_only_within_thirty_ly_of_the_regional_hub() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let workflows = Vec::new();
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 0,
+        };
         let region = RegionView {
             region: "alpha".to_owned(),
             status: DirectorRegionStatus::Established,
             hub_system: Some("HUB".to_owned()),
             hub_location: Some("HUB-BELT-1".to_owned()),
             known_systems: BTreeSet::from([
-                "ALPHA".to_owned(),
-                "BETA".to_owned(),
-                "ZETA".to_owned(),
-                "AARDVARK".to_owned(),
+                "INSIDE-NEAR".to_owned(),
+                "INSIDE-FAR".to_owned(),
+                "OUTSIDE".to_owned(),
+                "UNKNOWN".to_owned(),
             ]),
         };
         let positions = BTreeMap::from([
@@ -9380,34 +9695,60 @@ mod tests {
                 },
             ),
             (
-                "ALPHA".to_owned(),
-                GalacticPosition {
-                    x: 100.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-            ),
-            (
-                "BETA".to_owned(),
-                GalacticPosition {
-                    x: 2.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-            ),
-            (
-                "ZETA".to_owned(),
+                "INSIDE-NEAR".to_owned(),
                 GalacticPosition {
                     x: 1.0,
                     y: 0.0,
                     z: 0.0,
                 },
             ),
+            (
+                "INSIDE-FAR".to_owned(),
+                GalacticPosition {
+                    x: REGIONAL_AUTOMATION_RADIUS_LY,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "OUTSIDE".to_owned(),
+                GalacticPosition {
+                    x: REGIONAL_AUTOMATION_RADIUS_LY + 0.1,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
         ]);
+        let mut reserved = BTreeSet::new();
+        let mut requirements =
+            DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
 
+        let summary = reconcile_discover_belts(
+            &context,
+            &region,
+            &[],
+            &mut reserved,
+            &mut requirements,
+            &[],
+            &BTreeMap::new(),
+            &positions,
+        )
+        .expect("reconcile belt discovery");
+
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(summary.progress_total, 3);
+        let workflow = repository
+            .list()
+            .expect("belt workflows")
+            .into_iter()
+            .next()
+            .expect("belt workflow");
+        let intent = workflow
+            .config::<BeltSearchCampaignIntent>()
+            .expect("belt intent");
         assert_eq!(
-            belt_search_targets_from_hub(&region, &BTreeSet::new(), &positions),
-            ["ZETA", "BETA", "ALPHA", "AARDVARK"]
+            intent.systems,
+            ["INSIDE-NEAR".to_owned(), "INSIDE-FAR".to_owned()]
         );
     }
 
@@ -9640,6 +9981,7 @@ mod tests {
                 workflow_id: workflow.id,
                 identity: identity.clone(),
             }],
+            prospect_exhausted_signature: None,
         };
 
         let initial_rows = repository.list().expect("initial workflows").len();
@@ -9680,6 +10022,7 @@ mod tests {
                     workflow_id: failed.id,
                     identity: identity.clone(),
                 }],
+                prospect_exhausted_signature: None,
             };
             prune_runtime_workflows(&mut runtime, std::slice::from_ref(&failed));
             assert!(runtime.launch_records.is_empty());
@@ -9716,6 +10059,7 @@ mod tests {
                     workflow_id: failed.id,
                     identity,
                 }],
+                prospect_exhausted_signature: None,
             },
         )
         .expect("save goal runtime");
@@ -9818,6 +10162,7 @@ mod tests {
                     workflow_id: failed.id,
                     identity,
                 }],
+                prospect_exhausted_signature: None,
             },
         )
         .expect("save goal runtime");
@@ -9836,6 +10181,32 @@ mod tests {
             hub_location: Some("ROOT-HUB".to_owned()),
             known_systems: BTreeSet::from(["TARGET".to_owned()]),
         };
+        let catalogue_positions = BTreeMap::from([
+            (
+                "ROOT".to_owned(),
+                GalacticPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "TARGET".to_owned(),
+                GalacticPosition {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "NEXT-TARGET".to_owned(),
+                GalacticPosition {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+        ]);
         let mut worker = test_worker("CHAT-1", "alpha", "ROOT-HUB");
         worker.racing_vessel = Some("VESSEL-1".to_owned());
         let workers = vec![worker];
@@ -9860,6 +10231,7 @@ mod tests {
                 &devices,
                 &[],
                 &BTreeMap::new(),
+                &catalogue_positions,
                 &BTreeSet::from(["TARGET".to_owned()]),
             )
             .expect("reconcile equivalent FTL target");
@@ -9893,6 +10265,7 @@ mod tests {
             &devices,
             &[],
             &BTreeMap::new(),
+            &catalogue_positions,
             &BTreeSet::from(["NEXT-TARGET".to_owned()]),
         )
         .expect("reconcile changed FTL target");
@@ -9904,6 +10277,94 @@ mod tests {
                 .len(),
             initial_rows + 1
         );
+    }
+
+    #[test]
+    fn ftl_expansion_ignores_prioritized_targets_beyond_thirty_ly() {
+        let repository = WorkflowRepository::open_in_memory().expect("workflow repository");
+        let workflows = Vec::new();
+        let controls = GoalControls::default();
+        let context = GoalReconcileContext {
+            repository: &repository,
+            workflows: &workflows,
+            controls: &controls,
+            automatic: true,
+            now: 0,
+        };
+        let region = RegionView {
+            region: "alpha".to_owned(),
+            status: DirectorRegionStatus::Established,
+            hub_system: Some("HUB".to_owned()),
+            hub_location: Some("HUB-BELT-1".to_owned()),
+            known_systems: BTreeSet::from([
+                "INSIDE".to_owned(),
+                "OUTSIDE".to_owned(),
+                "UNKNOWN".to_owned(),
+            ]),
+        };
+        let positions = BTreeMap::from([
+            (
+                "HUB".to_owned(),
+                GalacticPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "INSIDE".to_owned(),
+                GalacticPosition {
+                    x: REGIONAL_AUTOMATION_RADIUS_LY,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+            (
+                "OUTSIDE".to_owned(),
+                GalacticPosition {
+                    x: REGIONAL_AUTOMATION_RADIUS_LY + 0.1,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            ),
+        ]);
+        let mut worker = test_worker("CHAT-1", "alpha", "HUB-BELT-1");
+        worker.racing_vessel = Some("VESSEL-1".to_owned());
+        let mut vessel = test_hub_device();
+        vessel.key = replicant_client::DeviceKey::live("VESSEL-1".into());
+        vessel.device_type = Some(DeviceType::RacingVessel);
+        vessel.stow_capacity = Some(2);
+        vessel.stow_used = Some(0);
+        let mut reserved = BTreeSet::new();
+        let mut requirements =
+            DirectorRequirementGraph::load(&repository, context.now).expect("requirements");
+
+        let summary = reconcile_expand_ftl_network(
+            &context,
+            &region,
+            &[worker],
+            &mut reserved,
+            &mut requirements,
+            &[vessel],
+            &[],
+            &BTreeMap::new(),
+            &positions,
+            &BTreeSet::from(["OUTSIDE".to_owned()]),
+        )
+        .expect("reconcile FTL expansion");
+
+        assert_eq!(summary.status, DirectorGoalStatus::Active);
+        assert_eq!(summary.progress_total, 2);
+        let workflow = repository
+            .list()
+            .expect("FTL workflows")
+            .into_iter()
+            .next()
+            .expect("FTL workflow");
+        let intent = workflow
+            .config::<ExplorationIntent>()
+            .expect("exploration intent");
+        assert_eq!(intent.target, "INSIDE");
     }
 
     #[test]
@@ -9935,6 +10396,7 @@ mod tests {
                         workflow_id: failed.id,
                         identity,
                     }],
+                    prospect_exhausted_signature: None,
                 },
             )
             .expect("save goal runtime");
@@ -11008,6 +11470,7 @@ mod tests {
                 active_workflows: vec![workflow.id],
                 last_launch_at_ms: Some(0),
                 launch_records: Vec::new(),
+                prospect_exhausted_signature: None,
             },
         )
         .expect("save runtime");

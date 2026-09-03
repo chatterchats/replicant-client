@@ -573,6 +573,63 @@ impl OperationCatalogue {
                 )
                 .await
             }
+            "device.settings" => {
+                let input: DeviceSettingsAction = decode(parameters)?;
+                let settings = json_object(&input.settings_json)?;
+                if settings.is_empty() {
+                    return Err(CatalogueError::Invalid(
+                        "device settings requires a non-empty JSON object".to_owned(),
+                    ));
+                }
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .configure(raw::devices::DeviceConfiguration {
+                            settings: Some(settings),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.detect_object" => {
+                let input: DeviceOnlyAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::DetectObject)
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
+            "device.detonate" => {
+                let input: DeviceDetonateAction = decode(parameters)?;
+                let handle = client
+                    .devices()
+                    .get(&input.device)
+                    .await
+                    .map_err(runtime_error)?;
+                managed_operation_value(
+                    handle
+                        .command(raw::devices::DeviceCommand::Detonate {
+                            destination: Some(input.destination),
+                            target: Some(input.target),
+                        })
+                        .await
+                        .map_err(runtime_error)?,
+                )
+                .await
+            }
             "device.message" => {
                 let input: DeviceMessageAction = decode(parameters)?;
                 let handle = client
@@ -2000,6 +2057,40 @@ fn descriptors() -> DescriptorCatalog {
                 ],
             ),
             simple_action(
+                "device.settings",
+                "Configure device settings",
+                "Patch device-type-specific operational settings such as terraforming strength or direction.",
+                "terraforming",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Device", ParameterKind::Device),
+                    required("settings_json", "Settings JSON", ParameterKind::String),
+                ],
+            ),
+            simple_action(
+                "device.detect_object",
+                "Detect Kuiper object",
+                "Search the current system for a temporary Kuiper object using a device with the system_scan feature.",
+                "terraforming",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![required("device", "Scanner", ParameterKind::Device)],
+            ),
+            simple_action(
+                "device.detonate",
+                "Launch Kuiper object",
+                "Consume a vector charge to launch a detected Kuiper object toward a planet or moon.",
+                "terraforming",
+                MutationRisk::Elevated,
+                vec![EntityKind::Device],
+                vec![
+                    required("device", "Vector charge", ParameterKind::Device),
+                    required("target", "Kuiper object", ParameterKind::Location),
+                    required("destination", "Planet or moon", ParameterKind::Location),
+                ],
+            ),
+            simple_action(
                 "device.message",
                 "Send device message",
                 "Broadcast a BobNet message from the selected device.",
@@ -2384,6 +2475,8 @@ fn bind_device_commands(actions: &mut [ActionDescriptor]) {
             "device.change_owner" => vec![device_binding("change_owner", [])],
             "device.collect_resources" => vec![device_binding("collect_resources", [])],
             "device.configure" => vec![device_binding("configure", [])],
+            "device.detect_object" => vec![device_binding("detect_object", [])],
+            "device.detonate" => vec![device_binding("detonate", [])],
             "device.deposit_resources" => vec![device_binding("deposit_resources", [])],
             "device.detach" => vec![device_binding("detach", [])],
             "device.message" => vec![device_binding("message", [])],
@@ -2542,7 +2635,6 @@ const DEVICE_LIFECYCLE_COMMANDS: &[&str] = &[
     "deactivate",
     "decommission",
     "deploy",
-    "detonate",
     "compact",
     "unfurl",
     "launch",
@@ -2585,7 +2677,6 @@ fn device_lifecycle_command(command: &str) -> Result<raw::devices::DeviceCommand
         "deactivate" => Ok(raw::devices::DeviceCommand::Deactivate),
         "decommission" => Ok(raw::devices::DeviceCommand::Decommission),
         "deploy" => Ok(raw::devices::DeviceCommand::Deploy),
-        "detonate" => Ok(raw::devices::DeviceCommand::Detonate),
         "compact" => Ok(raw::devices::DeviceCommand::Compact),
         "unfurl" => Ok(raw::devices::DeviceCommand::Unfurl),
         "launch" => Ok(raw::devices::DeviceCommand::Launch),
@@ -2932,7 +3023,7 @@ fn workflow_descriptors() -> Vec<WorkflowDescriptor> {
             kind: operation_kind(regional_dispatch_workflow_kind().as_str()),
             display_name: "Provision regional dispatch".to_owned(),
             aliases: strings(&["regional_dispatch", "provision_dispatch"]),
-            description: "Claim or manufacture Replicant vessels, matrices, devices, and required transports at a regional hub, replicate where capacity is available, then deliver the complete manifest over smart hub routing.".to_owned(),
+            description: "Claim or manufacture Replicant vessels, matrices, devices, and required transports at a regional manufacturing hub, replicate where capacity is available, then deliver the complete manifest over smart hub routing. Hub-system or System-Hub-device selections resolve to the Autofactory location automatically.".to_owned(),
             category: "logistics".to_owned(),
             operation_class: OperationClass::Workflow,
             risk: MutationRisk::Elevated,
@@ -3630,6 +3721,24 @@ impl DeviceResourcesAction {
 struct DeviceConfigureAction {
     device: String,
     mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceSettingsAction {
+    device: String,
+    settings_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceOnlyAction {
+    device: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceDetonateAction {
+    device: String,
+    target: String,
+    destination: String,
 }
 
 #[derive(Debug, Deserialize)]

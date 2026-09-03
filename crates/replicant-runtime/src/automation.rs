@@ -496,7 +496,7 @@ pub struct LogisticsIntent {
 /// Player intent for manufacturing and dispatching a complete regional shipment.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RegionalDispatchIntent {
-    /// Exact regional hub location where assets are selected or manufactured.
+    /// Regional hub system or location. Execution resolves this to the hub's exact manufacturing location.
     pub source: String,
     /// Exact destination location.
     pub destination: String,
@@ -521,6 +521,8 @@ pub struct RegionalDispatchIntent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RegionalDispatchCheckpoint {
+    /// Exact manufacturing location resolved from the operator's regional hub selection.
+    pub source_location: Option<String>,
     /// Durable tag applied to every device printed for this dispatch.
     pub print_tag: String,
     /// Exact vessel codes selected for the requested Replicant fleet.
@@ -3836,7 +3838,16 @@ impl WorkflowExecutor for BeltSearchCampaignWorkflow {
                                         unix_millis(),
                                     )
                                     .map_err(string_error)?;
-                                continue;
+                                // Every remaining belt item has the same
+                                // regional worker requirement. Once the broker
+                                // proves that no candidate can satisfy one
+                                // item, claiming thousands of sibling items
+                                // only stamps the same capacity error onto the
+                                // whole campaign and inflates worker-pressure
+                                // diagnostics. Leave the rest pending and let
+                                // this batch's running work finish before the
+                                // campaign retries capacity.
+                                break;
                             }
                         };
                         let worker = allocation_worker(&allocations).ok_or_else(|| {
@@ -4374,7 +4385,7 @@ struct RegionalDispatchWorkflow;
 impl WorkflowExecutor for RegionalDispatchWorkflow {
     fn execute<'a>(&'a mut self, context: &'a mut WorkflowContext) -> BoxWorkflowFuture<'a> {
         Box::pin(async move {
-            let intent: RegionalDispatchIntent = context.config().map_err(string_error)?;
+            let mut intent: RegionalDispatchIntent = context.config().map_err(string_error)?;
             validate_regional_dispatch(&intent)?;
             let client = managed_client(context)?;
             let mut checkpoint: RegionalDispatchCheckpoint =
@@ -4382,8 +4393,26 @@ impl WorkflowExecutor for RegionalDispatchWorkflow {
             if checkpoint.print_tag.is_empty() {
                 checkpoint.print_tag = format!("dispatch:{}", &context.id().to_string()[..8]);
             }
-            ensure_regional_dispatch_source_hub(&client, &intent.source).await?;
-            claim_target(context, "regional-dispatch-source", &intent.source)?;
+            let requested_source = intent.source.clone();
+            let source = if let Some(source) = checkpoint.source_location.clone() {
+                source
+            } else {
+                let source = resolve_regional_dispatch_source(&client, &requested_source).await?;
+                checkpoint.source_location = Some(source.clone());
+                if !source.eq_ignore_ascii_case(&requested_source) {
+                    context
+                        .emit_activity(format!(
+                            "resolved regional hub {requested_source} to manufacturing location {source}"
+                        ))
+                        .map_err(string_error)?;
+                }
+                context
+                    .persist_checkpoint(&checkpoint)
+                    .map_err(string_error)?;
+                source
+            };
+            intent.source = source.clone();
+            claim_target(context, "regional-dispatch-source", &source)?;
 
             if !checkpoint.selection_complete {
                 context
@@ -11854,19 +11883,68 @@ fn device_is_type(device: &Device, device_type: &str) -> bool {
         .is_some_and(|kind| kind.as_str() == device_type)
 }
 
-async fn ensure_regional_dispatch_source_hub(client: &Client, source: &str) -> Result<(), String> {
-    if dispatch_owned_device_snapshots(client)
-        .await?
-        .iter()
-        .any(|device| {
-            device_at(device, source) && device_is_type(device, DeviceType::SystemHub.as_str())
-        })
-    {
-        return Ok(());
+fn regional_dispatch_source_location(
+    source: &str,
+    system: &str,
+    devices: &[Device],
+) -> Result<String, String> {
+    let has_hub = devices.iter().any(|device| {
+        device_is_type(device, DeviceType::SystemHub.as_str())
+            && device
+                .location
+                .as_ref()
+                .is_some_and(|location| designation_in_system(location.id.as_str(), system))
+    });
+    if !has_hub {
+        return Err(format!(
+            "regional dispatch source {source} resolves to {system}, which does not contain an owned System Hub"
+        ));
     }
-    Err(format!(
-        "regional dispatch source {source} is not an owned System Hub location"
-    ))
+
+    let mut factory_locations = BTreeMap::<String, usize>::new();
+    for device in devices
+        .iter()
+        .filter(|device| device_is_type(device, DeviceType::Autofactory.as_str()))
+    {
+        let Some(location) = device
+            .location
+            .as_ref()
+            .map(|location| location.id.as_str())
+        else {
+            continue;
+        };
+        if designation_in_system(location, system) {
+            *factory_locations.entry(location.to_owned()).or_default() += 1;
+        }
+    }
+    if factory_locations.is_empty() {
+        return Err(format!(
+            "regional dispatch source {source} resolves to owned hub system {system}, but no account-owned Autofactory is available in that system"
+        ));
+    }
+    if let Some((location, _)) = factory_locations
+        .iter()
+        .find(|(location, _)| location.eq_ignore_ascii_case(source))
+    {
+        return Ok(location.clone());
+    }
+    factory_locations
+        .into_iter()
+        .max_by(
+            |(left_location, left_count), (right_location, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_location.cmp(left_location))
+            },
+        )
+        .map(|(location, _)| location)
+        .ok_or_else(|| format!("no manufacturing location is available in hub system {system}"))
+}
+
+async fn resolve_regional_dispatch_source(client: &Client, source: &str) -> Result<String, String> {
+    let system = resolve_location_system(client, source).await?;
+    let devices = dispatch_owned_device_snapshots(client).await?;
+    regional_dispatch_source_location(source, &system, &devices)
 }
 
 fn try_claim_dispatch_device(context: &WorkflowContext, code: &str) -> Result<bool, String> {
@@ -12034,7 +12112,8 @@ async fn select_regional_dispatch_stock(
                 }
                 if let Some(matrix) = onboard_matrix {
                     let matrix_code = matrix.key.id.as_str();
-                    if used.contains(matrix_code) || !try_claim_dispatch_device(context, matrix_code)?
+                    if used.contains(matrix_code)
+                        || !try_claim_dispatch_device(context, matrix_code)?
                     {
                         context
                             .release_claim(&ResourceKey::Device(code.to_owned()))
@@ -12430,9 +12509,7 @@ async fn claim_dispatch_source_matrix(
         let Some(replicant) = vessel.relationships.hosting_replicant.as_ref() else {
             continue;
         };
-        if !device_at(vessel, source)
-            || vessel.travel.is_some()
-            || workflow_reserved(&vessel.tags)
+        if !device_at(vessel, source) || vessel.travel.is_some() || workflow_reserved(&vessel.tags)
         {
             continue;
         }
@@ -16789,6 +16866,7 @@ mod tests {
             available_commands: Vec::new(),
             available_directives: Vec::new(),
             tags: Vec::new(),
+            settings: BTreeMap::new(),
             relationships: DeviceRelationships::default(),
             cargo: BTreeMap::new(),
             cargo_capacity: None,
@@ -16803,6 +16881,53 @@ mod tests {
             travel: None,
             access: AccessScope::Owned,
         }
+    }
+
+    #[test]
+    fn regional_dispatch_resolves_hub_device_or_system_to_manufacturing_location() {
+        let devices = vec![
+            dispatch_test_device("HUB-1", "system_hub", "SCEPTURUM-7-L4"),
+            dispatch_test_device("FACTORY-1", "autofactory", "SCEPTURUM-BELT-1"),
+            dispatch_test_device("FACTORY-2", "autofactory", "SCEPTURUM-BELT-1"),
+        ];
+
+        assert_eq!(
+            regional_dispatch_source_location("SCEPTURUM", "SCEPTURUM", &devices)
+                .expect("system source"),
+            "SCEPTURUM-BELT-1"
+        );
+        assert_eq!(
+            regional_dispatch_source_location("SCEPTURUM-7-L4", "SCEPTURUM", &devices)
+                .expect("System Hub device location"),
+            "SCEPTURUM-BELT-1"
+        );
+        assert_eq!(
+            regional_dispatch_source_location("SCEPTURUM-BELT-1", "SCEPTURUM", &devices)
+                .expect("manufacturing location"),
+            "SCEPTURUM-BELT-1"
+        );
+    }
+
+    #[test]
+    fn regional_dispatch_source_requires_both_hub_and_factory_in_same_system() {
+        let hub_only = vec![dispatch_test_device(
+            "HUB-1",
+            "system_hub",
+            "SCEPTURUM-7-L4",
+        )];
+        let error = regional_dispatch_source_location("SCEPTURUM", "SCEPTURUM", &hub_only)
+            .expect_err("hub without factory must fail");
+        assert!(error.contains("no account-owned Autofactory"));
+
+        let factory_only = vec![dispatch_test_device(
+            "FACTORY-1",
+            "autofactory",
+            "SCEPTURUM-BELT-1",
+        )];
+        let error =
+            regional_dispatch_source_location("SCEPTURUM-BELT-1", "SCEPTURUM", &factory_only)
+                .expect_err("factory without hub must fail");
+        assert!(error.contains("does not contain an owned System Hub"));
     }
 
     #[test]

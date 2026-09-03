@@ -171,6 +171,31 @@ async fn refresh_assigned_device_snapshots(
     Ok(devices)
 }
 
+async fn refresh_ambiguous_fleet_placements(
+    client: &Client,
+    devices: &mut BTreeMap<String, Device>,
+    codes: &[String],
+) -> AnyResult<()> {
+    for code in codes {
+        let needs_detail = devices.get(code).is_none_or(|device| {
+            device_location(device).is_none() && device_stowed_in(device).is_none()
+        });
+        if !needs_detail {
+            continue;
+        }
+
+        debug!(
+            target: "replicant_client::explore",
+            event = "fleet.placement_detail_refresh_required",
+            device = code,
+            "bulk assigned-device projection omitted the fleet device or both its location and stow relationship; refreshing authoritative device detail before placement validation"
+        );
+        let refreshed = refresh_device_snapshot(client, code).await?;
+        devices.insert(code.clone(), refreshed);
+    }
+    Ok(())
+}
+
 async fn cached_survey_fleet_snapshots(
     client: &Client,
     config: &Config,
@@ -1293,8 +1318,9 @@ async fn resolve_missing_star_knowledge(
     explored_by_star: &mut BTreeMap<String, bool>,
     missing: Vec<String>,
     concurrency: usize,
+    allow_bulk_sync: bool,
 ) -> AnyResult<(usize, bool)> {
-    if missing.len() > BULK_STAR_SYNC_THRESHOLD {
+    if allow_bulk_sync && missing.len() > BULK_STAR_SYNC_THRESHOLD {
         match galaxy.sync_replicant_stars(replicant).await {
             Ok(_) => {
                 *explored_by_star = projected_explored_by_star(galaxy, replicant);
@@ -1428,6 +1454,12 @@ async fn create_plan(client: &Client, config: &Config) -> AnyResult<RoutePlan> {
         &mut explored_by_star,
         missing,
         config.star_detail_concurrency,
+        // Exact Season Three re-survey shards are intentionally small and
+        // include systems regardless of historical `explored` state. A full
+        // Replicant-star sync currently walks hundreds of 50-star pages, so
+        // use bounded targeted reads for these shards instead of serializing
+        // every survey worker behind the global bulk-sync semaphore.
+        !(config.include_explored && config.target_systems.is_some()),
     )
     .await?;
 
@@ -2372,7 +2404,8 @@ async fn stow_fleet(client: &Client, config: &Config, plan: &RoutePlan) -> AnyRe
     let mut codes = plan.drones.clone();
     codes.push(controller.to_owned());
 
-    let devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    let mut devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    refresh_ambiguous_fleet_placements(client, &mut devices, &codes).await?;
     let vessel = required_device(&devices, &config.vessel, "racing vessel")?;
     ensure_device_replicant(vessel, &config.vessel, &config.replicant)?;
     let vessel_location = device_location(vessel).ok_or_else(|| {
@@ -4238,7 +4271,8 @@ async fn request_direct_fleet_recall(
     config: &Config,
     check: &FleetReturnCheck,
 ) -> AnyResult<()> {
-    let devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    let mut devices = refresh_assigned_device_snapshots(client, &config.replicant).await?;
+    refresh_ambiguous_fleet_placements(client, &mut devices, &check.pending_codes).await?;
     let vessel = required_device(&devices, &config.vessel, "racing vessel")?;
     ensure_device_replicant(vessel, &config.vessel, &config.replicant)?;
     let vessel_location = device_location(vessel).ok_or_else(|| {
@@ -5384,10 +5418,16 @@ mod tests {
 
         let galaxy = client.galaxy();
         let mut explored = BTreeMap::new();
-        let (_, bulk_synced) =
-            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
-                .await
-                .expect("resolve star knowledge");
+        let (_, bulk_synced) = resolve_missing_star_knowledge(
+            &galaxy,
+            "REP",
+            &mut explored,
+            missing.clone(),
+            16,
+            true,
+        )
+        .await
+        .expect("resolve star knowledge");
 
         assert!(bulk_synced);
         assert_eq!(explored, expected_explored(&missing));
@@ -5404,10 +5444,42 @@ mod tests {
 
         let galaxy = client.galaxy();
         let mut explored = BTreeMap::new();
-        let (_, bulk_synced) =
-            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
-                .await
-                .expect("resolve star knowledge");
+        let (_, bulk_synced) = resolve_missing_star_knowledge(
+            &galaxy,
+            "REP",
+            &mut explored,
+            missing.clone(),
+            16,
+            true,
+        )
+        .await
+        .expect("resolve star knowledge");
+
+        assert!(!bulk_synced);
+        assert_eq!(explored, expected_explored(&missing));
+        server.verify().await;
+        client.close().await.expect("close client");
+    }
+
+    #[tokio::test]
+    async fn exact_resurvey_shards_can_force_targeted_star_reads() {
+        let server = MockServer::start().await;
+        let client = test_client_at(&server).await;
+        let missing = missing_stars(BULK_STAR_SYNC_THRESHOLD + 2);
+        mount_targeted_star_reads(&server, missing.len()).await;
+
+        let galaxy = client.galaxy();
+        let mut explored = BTreeMap::new();
+        let (_, bulk_synced) = resolve_missing_star_knowledge(
+            &galaxy,
+            "REP",
+            &mut explored,
+            missing.clone(),
+            16,
+            false,
+        )
+        .await
+        .expect("resolve exact resurvey knowledge");
 
         assert!(!bulk_synced);
         assert_eq!(explored, expected_explored(&missing));
@@ -5434,10 +5506,16 @@ mod tests {
 
         let galaxy = client.galaxy().max_star_pages(1);
         let mut explored = BTreeMap::new();
-        let (_, bulk_synced) =
-            resolve_missing_star_knowledge(&galaxy, "REP", &mut explored, missing.clone(), 16)
-                .await
-                .expect("targeted fallback");
+        let (_, bulk_synced) = resolve_missing_star_knowledge(
+            &galaxy,
+            "REP",
+            &mut explored,
+            missing.clone(),
+            16,
+            true,
+        )
+        .await
+        .expect("targeted fallback");
 
         assert!(!bulk_synced);
         assert_eq!(explored, expected_explored(&missing));
