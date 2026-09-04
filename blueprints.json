@@ -1,0 +1,1657 @@
+{
+  "blueprints": [
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Life inside an asteroid belt can be chaotic, and this AMI controller has been fabricated to match it. Networking gear, heat pipes and exposed control boards are packed together into a rugged floating space-computer that ducks and weaves through debris. This mining controller issues a constant stream of retargeting instructions to the drones it commands.",
+      "device_type": "ami_mining_controller",
+      "directives": [
+        "gather_resources",
+        "maintain_ratios",
+        "gather_evenly",
+        "deplete_smallest",
+        "gather_salvage"
+      ],
+      "features": [
+        "ami",
+        "cruise",
+        "stow"
+      ],
+      "print_time": 1800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 35,
+        "conductive": 80,
+        "rares": 20,
+        "silicates": 40,
+        "structural": 150,
+        "volatiles": 10
+      },
+      "short_description": "An AMI mining controller overseeing a swarm of mining drones.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Smaller than most controllers, this improvised floating space-computer is littered with tight-beam lasers and heavily insulated network cabling. Inside, the AMI processors coordinate swarms of devices across a system, compiling reports and collating internal data tables.",
+      "device_type": "ami_survey_controller",
+      "directives": [
+        "survey_system",
+        "belt_search"
+      ],
+      "features": [
+        "ami",
+        "cruise",
+        "stow"
+      ],
+      "print_time": 1500,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 20,
+        "conductive": 60,
+        "rares": 15,
+        "silicates": 30,
+        "structural": 100,
+        "volatiles": 5
+      },
+      "short_description": "AMI Survey Controllers are used to coordinate system sweeps and belt searches.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Designed to hold position and communicate on BobNet through local relays, the trade controller automates the process of trading between replicants. A collection of memory wafers and ledger drives are visible through a rough latticework of shielded structural clamps. Its guidance drive works constantly, striving to maintain a stable orbit. The AMI processors keep track of the resources and devices in stock, holding them in escrow for potential trade requests.",
+      "device_type": "ami_trade_controller",
+      "directives": [
+        "trade"
+      ],
+      "features": [
+        "ami",
+        "trade",
+        "stow"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 30,
+        "conductive": 80,
+        "rares": 15,
+        "silicates": 40,
+        "structural": 120,
+        "volatiles": 20
+      },
+      "short_description": "AMI Trade Controllers provide an escrow service for replicant trading.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "A single tight-beam laser has been strapped to the prow of a heavily insulated frame, with lengths of braided wiring wrapped around the core. A broadcast antenna juts from the side, mounted at an awkward angle. The transport controller handles in-system resource haulage, and utilises local FTL relays for cross-system ferry routes.",
+      "device_type": "ami_transport_controller",
+      "directives": [
+        "delivery",
+        "ferry",
+        "shuttle",
+        "consolidate"
+      ],
+      "features": [
+        "ami",
+        "cruise",
+        "stow"
+      ],
+      "print_time": 1800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 35,
+        "conductive": 80,
+        "rares": 20,
+        "silicates": 40,
+        "structural": 150,
+        "volatiles": 10
+      },
+      "short_description": "The AMI Transport Controller dispatches transport devices to fulfil delivery routes.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The atmo processor carries a bay of heavy compressor stations beneath broad carbon radiator panels and conductive control spines. During a cycle, the platform drops into a grazing atmospheric pass, skimming the upper layers while its stations gulp feedstock through staged compressors and meter it between the surface, atmosphere, and sealed storage systems. Plasma crawls along the leading edges and the radiators flare hot as drag and compression heat build together, forcing the platform to climb clear before the next pass. Each descent runs a little longer or deeper as conditions allow, the control spine balancing pressure change against the increasingly narrow margin between useful work and burning up.",
+      "device_type": "atmo_processor",
+      "directives": [],
+      "features": [
+        "cruise",
+        "terraform"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 150,
+        "conductive": 100,
+        "structural": 200,
+        "volatiles": 100
+      },
+      "short_description": "An orbital deployment platform that installs compressor stations to raise or lower planetary atmospheric pressure.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Drones zip back and forth through the autofactory, carrying resource cartridges, machined parts, and sensor assemblies between specialised fabricators and unfinished device frames. The complex is built from print bays, storage pallets, articulated booms, and inspection rigs arranged around a reinforced structural spine. Conductive control buses run between the factory components to keep everything in sync. A replicant can manage the print queue remotely, assigning new blueprints while the factory indexes the local stockpile and folds completed equipment into launch racks to be automatically deployed into use.",
+      "device_type": "autofactory",
+      "directives": [],
+      "features": [
+        "cruise",
+        "print",
+        "modular"
+      ],
+      "print_time": 2400,
+      "queue_size": 10,
+      "resources": {
+        "carbon": 150,
+        "conductive": 400,
+        "rares": 80,
+        "silicates": 200,
+        "structural": 800,
+        "volatiles": 50
+      },
+      "short_description": "A sprawling industrial complex that manufactures complex equipment from a local stockpile.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The belt surveyor houses its primary drive at the centre, with six long, heavily shielded robotic arms that unfurl to scan target clusters from multiple angles. The surveyor typically locates resource sites faster and up to four times larger than the standard survey drone. Once it identifies a suitable site, it deploys an array of tracking lasers to supply mining controllers with a steady stream of positional data.",
+      "device_type": "belt_surveyor",
+      "directives": [],
+      "features": [
+        "cruise",
+        "survey"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 60,
+        "conductive": 90,
+        "rares": 30,
+        "silicates": 45,
+        "structural": 180,
+        "volatiles": 30
+      },
+      "short_description": "Advanced survey drone, specialised in tracking larger belt sites.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 500,
+      "components": {},
+      "description": "The cargo freighter has a wide structural hull with reinforced holds running the length of the vessel, sealed behind interlocking cargo doors. Conductive control buses link the bridge section to a bank of surge drives at the stern. Loading gantries fold out from either side during resupply, while the bow sits behind layered ablation plating. It is built for volume, not speed, and everything about its hull says so.",
+      "device_type": "cargo_freighter",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "transport"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 20,
+        "conductive": 275,
+        "rares": 10,
+        "silicates": 40,
+        "structural": 800,
+        "volatiles": 100
+      },
+      "short_description": "A heavy surge-capable freighter built for bulk interstellar cargo runs.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 1,
+      "cargo_capacity": 120,
+      "components": {},
+      "description": "The cargo lifter has a squat hull clad in thick ceramic plating, built to absorb the thermal stress of repeated orbital transfers. A pair of rare-earth actuator arms extend from the midsection, clamping onto devices and hauling them between planetary bodies and orbital stations. Thrusters fire in careful bursts to stabilise the lifter under heavy loads, while conductive control lines run between the arms and the guidance core.",
+      "device_type": "cargo_lifter",
+      "directives": [],
+      "features": [
+        "cruise",
+        "transport",
+        "attach"
+      ],
+      "print_time": 1000,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 50,
+        "conductive": 170,
+        "rares": 190,
+        "silicates": 280,
+        "structural": 450,
+        "volatiles": 150
+      },
+      "short_description": "A ceramic-plated orbital shuttle with attachment arms for lifting devices between sites.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 3,
+      "cargo_capacity": 200,
+      "components": {},
+      "description": "The cargo vessel has a rounded ablation shield at the bow, widening into a dense hull with a flat bottom, housing an array of smaller surge drives at the stern. A large cargo bay door can be seen at the centre of the ring of drives, shielded with a mesh of composite heat-resistant piping. A replicant matrix cradle glows behind a lattice of insulation tiles and sensor glass. Attachment hooks are mounted at three concave dents around the middle, with five separate drone-stowage compartments behind access panels. To mine or manufacture, the vessel splits along the vertical into three sections, fanning out to reveal internal machinery.",
+      "device_type": "cargo_vessel",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "system_scan",
+        "mine",
+        "cradle",
+        "print",
+        "census",
+        "attach",
+        "transport"
+      ],
+      "print_time": 28800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 900,
+        "conductive": 1500,
+        "rares": 400,
+        "silicates": 1200,
+        "structural": 4500,
+        "volatiles": 500
+      },
+      "short_description": "A bulky pear-shaped cargo vessel with reinforced attachment points and storage space for a range of devices and materials.",
+      "stow_capacity": 50,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Rows of plate pairs sit in a rigid silicate frame, each gap measured in fractions of a nanometre. At this scale the quantum vacuum pushes the plates together with measurable force and the energy between them drops below zero. Stack enough together and you get a usable flow of negative energy. The manufacturing tolerance is brutal. A single plate out of alignment by an atom's width kills the output of its entire row.",
+      "device_type": "casimir_array",
+      "directives": [],
+      "features": [
+        "construction"
+      ],
+      "print_time": 3600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 180,
+        "rares": 230,
+        "silicates": 250,
+        "structural": 60
+      },
+      "short_description": "A lattice of nanoscale parallel plates that generates negative energy density through the Casimir effect at industrial scale.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "hab_module": 2,
+        "nutrient_synthesizer": 1,
+        "surge_plate": 1
+      },
+      "description": "The colony shuttle is a blunt-nosed craft with a wide cargo ramp at the stern and two hab modules forming the main fuselage. A nutrient synthesiser is mounted behind the cockpit section, providing life support for extended transit. A surge plate is integrated into the ventral hull, giving the shuttle interstellar range when attached to a carrier. The interior is configured with fold-down berths, storage lockers, and emergency pressure seals between compartments. Ablative tiles cover the underside for atmospheric entry, scarred and pitted from thermal stress.",
+      "device_type": "colony_shuttle",
+      "directives": [],
+      "features": [
+        "cruise",
+        "surge",
+        "modular"
+      ],
+      "print_time": 3600,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 200,
+        "conductive": 200,
+        "structural": 250,
+        "volatiles": 100
+      },
+      "short_description": "A pressurised transport shuttle designed to carry settlers and supplies between orbital and surface locations.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The comm satellite is a drum-shaped chassis with four folding antenna arrays that fan out from the body on articulated booms. Ceramic-shielded signal processors sit behind layers of silicate insulation glass, filtering traffic from a range of locations and relaying it across the system. Conductive buses braid through the core, linking the antenna feeds to a central switching plane. It holds a stable orbit and handles the steady chatter of drones, controllers, and relays passing data through the region.",
+      "device_type": "comm_satellite",
+      "directives": [],
+      "features": [
+        "cruise"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "silicates": 100,
+        "structural": 100
+      },
+      "short_description": "An orbital communications satellite with antenna arrays and shielded signal processors.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The compute core is a compact slab of layered circuit planes, ceramic shielding, and dense chip stacks sealed behind glowing sensor glass. Conductive buses trace bright lines through its body, pulsing across stacked wafers and heat sinks like a miniature city. By itself it sits inert and valuable, radiating heat through its processing interfaces. Slotted into the right frame, it provides upgraded processing power.",
+      "device_type": "compute_core",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 2,
+        "conductive": 35,
+        "rares": 15,
+        "silicates": 55,
+        "structural": 8
+      },
+      "short_description": "A stowable processing core packed with dense chips and ceramic insulation.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "comm_satellite": 1,
+        "ftl_relay": 1,
+        "signal_booster": 2
+      },
+      "description": "The deep space relay station is a tall lattice tower capped with a forest of antenna spines. An FTL relay at its core handles interstellar packet routing, while two signal boosters on articulated arms amplify local transmissions across the system. A comm satellite module is integrated into the base, providing continuous broadcast capability to nearby worlds. The whole structure is anchored by a ring of stabilisation thrusters that keep the antenna array pointed at its target constellation. Status lights pulse along the tower in sequence as data packets transit the relay chain.",
+      "device_type": "deep_space_relay_station",
+      "directives": [],
+      "features": [
+        "cruise",
+        "relay",
+        "modular"
+      ],
+      "print_time": 3600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 400,
+        "rares": 100,
+        "silicates": 200,
+        "structural": 150
+      },
+      "short_description": "A permanent communications hub that links FTL relay networks with local signal infrastructure.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The defence grid is a wide structural platform with weapon hardpoints, targeting sensor heads, and conductive control planes linked into a unified fire-control network. Guidance processors assign threat priorities and distribute firing solutions across the grid's coverage zone. Ceramic shielding protects the device from retaliatory impacts.",
+      "device_type": "defence_grid",
+      "directives": [],
+      "features": [
+        "cruise"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 100,
+        "rares": 50,
+        "silicates": 50,
+        "structural": 200
+      },
+      "short_description": "A targeting platform for coordinating area defence.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The electrodynamic tether is a kilometres-long chain of interlocked conductive links, each wrapped in silicate insulation and joined by flexible collars. When deployed, it unreels from its anchor module in a glittering line through a planetary magnetic field. Controlled current runs link by link along the chain, generating electromagnetic drag or thrust depending on the flow direction.",
+      "device_type": "electrodynamic_tether",
+      "directives": [],
+      "features": [
+        "cruise"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "silicates": 100,
+        "structural": 50
+      },
+      "short_description": "A long conductive tether that interacts with planetary magnetic fields for orbital adjustment.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The empty replicant matrix is a sealed cube of conductive planes, rare-earth processor knots, and layered ceramic isolation glass, lit by a faint blue glow. Its braided signal paths are pristine and unoccupied, folded through the block awaiting the imprinting of a quantum lattice. The surface is still, broken only by slow diagnostic pulses moving through the unprogrammed buses.",
+      "device_type": "empty_replicant_matrix",
+      "directives": [],
+      "features": [
+        "stow",
+        "matrix"
+      ],
+      "print_time": 14400,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 50,
+        "conductive": 400,
+        "rares": 200,
+        "silicates": 100,
+        "structural": 200,
+        "volatiles": 50
+      },
+      "short_description": "A small blue cube waiting to host a replicant matrix.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "casimir_array": 1,
+        "exotic_particle_trap": 2,
+        "negative_energy_conduit": 1
+      },
+      "description": "The injector uses a pair of particle traps to capture exotic particles from the local stellar environment. A Casimir array concentrates them into a usable stream of negative energy. A shielded conduit delivers that stream into an aperture frame at precisely the rate needed. The whole assembly runs hot. Thermal vents along the spine glow orange during operation. If the feed rate drops below threshold, the aperture pinches shut. If it spikes, the aperture geometry deforms in ways the physics does not predict.",
+      "device_type": "exotic_matter_injector",
+      "directives": [],
+      "features": [
+        "cruise",
+        "modular"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 350,
+        "rares": 350,
+        "silicates": 150,
+        "structural": 200,
+        "volatiles": 50
+      },
+      "short_description": "Captures exotic particles, concentrates them via Casimir arrays, and feeds them into an aperture frame.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Superconducting coils wrapped in concentric rings maintain a standing wave pattern inside a vacuum shell. Exotic particles with negative energy density drift in through collector apertures and get pinned at the wave nodes. Without these traps, exotic matter decays in hours. The coils run cold enough to frost over even in direct starlight. A status ring on the outer casing shifts from blue to white as the trap fills.",
+      "device_type": "exotic_particle_trap",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 3000,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 250,
+        "rares": 200,
+        "silicates": 120,
+        "structural": 80,
+        "volatiles": 30
+      },
+      "short_description": "A magnetic confinement chamber tuned to capture and store exotic particles from high-energy stellar environments.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The filtration array is a broad orbital rack carrying replaceable carbon-rich filter cassettes and a bay of autonomous scrubber units. The scrubbers descend into contaminated regions in slow, silent passes, pulling local gas, aerosols, and particulates through layered molecular traps, each stage tuned to capture a different class of hazard. Saturated cartridges and concentrated waste are sealed into dark recovery canisters while cleaned material is vented back into the local environment. A distributed sensor mesh feeds toxicity readings to the orbital rack, which quietly shifts scrubber coverage as new pockets of contamination appear.",
+      "device_type": "filtration_array",
+      "directives": [],
+      "features": [
+        "cruise",
+        "terraform"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 260,
+        "conductive": 110,
+        "structural": 140,
+        "volatiles": 60
+      },
+      "short_description": "An orbital control rack that deploys scrubber units to strip toxic compounds from planetary atmospheres and surface layers.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "cargo_lifter": 1,
+        "maintenance_drone": 1,
+        "service_bot": 1
+      },
+      "description": "The fleet tender is a stubby cylindrical vessel with a cargo lifter crane mounted on a dorsal turret. A maintenance drone bay is set into the port side, its occupant ready to deploy for field repairs. A service bot station on the starboard side handles routine diagnostics and component replacement on visiting devices. The interior holds a modest parts inventory and a diagnostic bench. The tender's cruise motors are oversized for its hull, giving it enough speed to keep pace with faster vessels during fleet movements. Docking clamps along the ventral surface allow it to latch onto damaged devices for towing.",
+      "device_type": "fleet_tender",
+      "directives": [],
+      "features": [
+        "cruise",
+        "modular"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 100,
+        "conductive": 150,
+        "silicates": 50,
+        "structural": 200
+      },
+      "short_description": "A mobile support vessel that provides cargo handling, repair capability, and field maintenance to nearby devices.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The FTL beacon is a compact comms module built around a tiny rare-earth core, folded antenna vanes, and hardened audit circuitry. Once deployed, it anchors to a location transmitting regular device status back to replicants. The beacons also intercept assistance requests at specific locations and record all traffic passing through the system. Small and steady lights flash along the device indicating network activity.",
+      "device_type": "ftl_beacon",
+      "directives": [],
+      "features": [
+        "stow",
+        "audit",
+        "comms"
+      ],
+      "print_time": 100,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 15,
+        "rares": 5,
+        "silicates": 10,
+        "structural": 20
+      },
+      "short_description": "A miniature FTL comms device.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The FTL relay is a heavy rack-like device built from stacked circuit planes, ceramic shielding, cooling waffles, and folded antenna spines. It must be deployed at a gravitationally stable location, where its frame can lock position and align with partner relays in neighbouring systems. Once active, conductive signal trunks light through the chassis as it relays commands across the FTL network. It looks like rugged computer cabinet left hanging in space, holding the network together.",
+      "device_type": "ftl_relay",
+      "directives": [],
+      "features": [
+        "cruise",
+        "relay",
+        "stow"
+      ],
+      "print_time": 800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 20,
+        "conductive": 120,
+        "rares": 40,
+        "silicates": 100,
+        "structural": 80,
+        "volatiles": 10
+      },
+      "short_description": "Chunky FTL network hardware for interstellar remote control.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The FTL slingshot is a dense, heat-hungry transmitter built around stacked rare-earth signal cores and heavy conductive bus lattices. Ceramic isolation plates line the interior, shielding the precision chips from the thermal load of a sustained subspace burst. When fired, it spools a tightly focused quantum data stream to a pre-linked empty replicant matrix at a remote location, encoding and pushing the full matrix state across in a single high-energy pulse. Coolant reservoirs vent hard after each transfer, requiring heavy repairs before its next usage.",
+      "device_type": "ftl_slingshot",
+      "directives": [],
+      "features": [
+        "slingshot",
+        "stow"
+      ],
+      "print_time": 57600,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 20,
+        "conductive": 100,
+        "rares": 240,
+        "silicates": 80,
+        "structural": 60,
+        "volatiles": 190
+      },
+      "short_description": "A high-energy subspace transmitter customised for point-to-point replicant matrix transfers.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 2,
+      "cargo_capacity": 60,
+      "components": {},
+      "description": "The fusion barge is a flat, heavily braced platform built around sealed reservoirs and stacked rare-earth energy cells. Structural ribs cage the deck, with two attachment hardpoints for towing equipment or escort devices. A low-output reactor hums at the centre while the barge drifts between delivery points. Thermal venting from the reactor gives the whole platform a faint shimmer.",
+      "device_type": "fusion_barge",
+      "directives": [],
+      "features": [
+        "cruise",
+        "attach",
+        "transport"
+      ],
+      "print_time": 1800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 50,
+        "rares": 150,
+        "silicates": 40,
+        "structural": 240,
+        "volatiles": 110
+      },
+      "short_description": "A platform for storing and transporting high-density equipment.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The galactic observatory unfolds into a broad lattice of telescopes, conductive signal planes, and shielded precision optics, all aligned around a rare-earth sensor core. When activated, it locks onto a chosen directional vector and sweeps the hemisphere for any trace of stellar activity missing from the shared galaxy catalogue. Its antenna webs and census processors filter glare, dust, and background radiation into permanent catalogue updates whenever a new system is confirmed. The whole frame can compact into a hardened transportable stack, then unfurl again at a quieter edge of known space where the star field is sparse enough to justify another prospecting pass.",
+      "device_type": "galactic_observatory",
+      "directives": [],
+      "features": [
+        "cruise",
+        "prospect",
+        "census",
+        "modular"
+      ],
+      "print_time": 28800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 800,
+        "rares": 400,
+        "silicates": 300,
+        "structural": 500
+      },
+      "short_description": "A deep-space observatory with unfurling telescope arrays, built to prospect frontier regions for uncatalogued stars.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "gravity_lens": 2,
+        "inertial_anchor": 1,
+        "tidal_compensator": 2
+      },
+      "description": "The ring's aperture produces gravitational tidal forces that would shred anything passing through and tear the structure apart from the inside. The stabiliser fixes both problems. Two tidal compensators generate counter-forces. Two gravity lenses focus those forces into a smooth gradient across the transit corridor. An inertial anchor provides the reference frame everything else locks onto. The whole assembly is massive. Structural beams run between the compensators like scaffolding. When active, nearby objects drift slightly as the local gravity field reshapes itself around the stabiliser's output.",
+      "device_type": "graviton_stabiliser",
+      "directives": [],
+      "features": [
+        "cruise",
+        "modular"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 300,
+        "rares": 350,
+        "silicates": 200,
+        "structural": 350
+      },
+      "short_description": "Generates counter-tidal fields using gravity lenses and tidal compensators to stabilise an aperture.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "A dense sphere of layered silicates and rare-earth metals, machined to mass tolerances measured in micrograms. Its surface curves spacetime enough to refract gravitational waves the way glass bends light. Mounted in arrays around an aperture frame, gravity lenses focus the field into a stable throat geometry. Each lens takes time to calibrate.",
+      "device_type": "gravity_lens",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 3000,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 80,
+        "rares": 160,
+        "silicates": 180,
+        "structural": 200
+      },
+      "short_description": "A precisely machined mass that bends spacetime at its surface, functioning as a refractive lens for gravitational waves.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The hab module is a thick-walled structural cylinder with sealed compartments, reinforced pressure bulkheads, and ceramic-lined viewports. Conductive control buses run between life support systems, internal lighting, and environmental regulators. The module provides a stable pressurised environment, shielded from radiation and microimpacts by its heavy hull plating. It is a functional living space built to keep occupants alive in deep space.",
+      "device_type": "hab_module",
+      "directives": [],
+      "features": [
+        "cruise",
+        "habitat"
+      ],
+      "print_time": 1400,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 50,
+        "conductive": 100,
+        "rares": 20,
+        "silicates": 90,
+        "structural": 550,
+        "volatiles": 20
+      },
+      "short_description": "A pressurised living module with sealed compartments and basic life support.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The Heaven Vessel is an elongated probe with a surge engine at the base. A stretch of ceramic plates cover a heavily shielded structural frame along the length of the probe from the engines at the rear to the spined antennae at the tip. Behind the black panels is a stowage area with recharging points and self-repair stations for up to ten small drones. At the centre of the ship, alongside an array of coolant loops, sits a replicant matrix cradle, holding the uploaded consciousness of its host. The probe can separate and reconfigure itself into loosely coupled segments, exposing internal manufacturing and ore refinement equipment.",
+      "device_type": "heaven_vessel",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "system_scan",
+        "mine",
+        "cradle",
+        "print",
+        "census"
+      ],
+      "print_time": 28800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 400,
+        "conductive": 1000,
+        "rares": 300,
+        "silicates": 500,
+        "structural": 2000,
+        "volatiles": 200
+      },
+      "short_description": "This Von Neumann probe is composed of several segments connected to form a pencil-shaped exploration vessel.",
+      "stow_capacity": 10,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The hull plate is a dense slab of layered structural alloy with pre-drilled mounting channels and interlocking flanges. Each plate is stamped and tempered under pressure, producing a panel tough enough to handle micro impacts and thermal cycling. Conductive trace lines are embedded along one face for sensor integration. Plates are designed to tile together in overlapping rows, creating a continuous armoured skin across large structures.",
+      "device_type": "hull_plate",
+      "directives": [],
+      "features": [
+        "construction"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 20,
+        "silicates": 15,
+        "structural": 400
+      },
+      "short_description": "A heavy structural panel for hull construction and reinforcement.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The hydroponic bay is a sealed chamber built from carbon composite panels and silicate insulation glass, maintaining a controlled internal atmosphere for crop cultivation. Nutrient lines circulate growth fluids through tiered planting racks inside the enclosure. Structural ribs brace the hull against pressure differentials, while internal sensors monitor temperature, humidity, and growth rates. It produces a steadier yield than an open orbital farm, trading scale for consistency.",
+      "device_type": "hydroponic_bay",
+      "directives": [],
+      "features": [
+        "cruise",
+        "farm"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 170,
+        "conductive": 50,
+        "rares": 20,
+        "silicates": 90,
+        "structural": 250,
+        "volatiles": 80
+      },
+      "short_description": "An enclosed growing chamber with controlled nutrient feeds.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "An active aperture frame twists local spacetime so severely that conventional navigation breaks down. Rotation and translation blur together. The inertial anchor projects a stable reference frame that other systems can lock onto, providing absolute coordinates in a region where the concept is blurry. The anchor itself is a squat cylinder studded with conductive sensor heads.",
+      "device_type": "inertial_anchor",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 200,
+        "rares": 100,
+        "silicates": 60,
+        "structural": 220
+      },
+      "short_description": "A gravitational reference frame generator that provides stable coordinate baselines near spacetime distortions.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "This is a solid metallic box with an extendable pair of sensor lenses at the top and an articulated arm on either side. When it reaches a damaged device, the drone evaluates the repair, powers the target down, and opens its front panel to reveal tools, spare parts and interesting bits of salvage. Its patrol directive works by pinging all devices in the system, then cruising to anything that requires maintenance.",
+      "device_type": "maintenance_drone",
+      "directives": [
+        "patrol"
+      ],
+      "features": [
+        "cruise",
+        "repair",
+        "stow",
+        "ami"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 35,
+        "conductive": 80,
+        "rares": 20,
+        "silicates": 40,
+        "structural": 150,
+        "volatiles": 10
+      },
+      "short_description": "Repairs your devices once they lose enough operational capacity.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The mass driver is a long structural railgun with conductive acceleration coils wound in tight sequence from the breach to the muzzle. Superconductor cores generate an electromagnetic pulse to hurls projectiles at extreme velocity. The rail flexes under each firing cycle, venting residual charge through grounding exhausts along the frame.",
+      "device_type": "mass_driver",
+      "directives": [],
+      "features": [
+        "cruise"
+      ],
+      "print_time": 1600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 200,
+        "rares": 100,
+        "structural": 300
+      },
+      "short_description": "An electromagnetic launcher to accelerate kinetic projectiles over long range.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Blinking lights encircle the top of an oblate spheroid with a concave base. Structural lattices in the outer hull shield the pressurised cradle within, protecting a replicant matrix from the ravages of space. A small cruise drive is nestled underneath, providing the matrix container with basic in-system mobility.",
+      "device_type": "matrix_container",
+      "directives": [],
+      "features": [
+        "cruise",
+        "cradle"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 80,
+        "conductive": 200,
+        "rares": 60,
+        "silicates": 100,
+        "structural": 400,
+        "volatiles": 40
+      },
+      "short_description": "A simple container for a replicant matrix, with no notable features.",
+      "stow_capacity": 1,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The mesh relay is a small conductive hub with folded antenna vanes and a thin structural housing. Once deployed, it locks position and begins distributing signal traffic across the local mesh, bridging gaps between devices that would otherwise sit outside each other's range. A ring of status lights blink in lazy patterns as data passes through its circuit planes.",
+      "device_type": "mesh_relay",
+      "directives": [],
+      "features": [
+        "cruise",
+        "stow"
+      ],
+      "print_time": 300,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 80,
+        "silicates": 30,
+        "structural": 50
+      },
+      "short_description": "A lightweight stowable relay node for local mesh networks.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Six robotic arms extend from a circular frame - each one tipped with a multi-tool cutting head. Three arms clamp onto the target rock while the others cut, slice and dice with ceramic-shielded lasers. Raw chunks are pushed into the core, where tiny internal furnaces melt and reform the materials into uniform resource blocks that are expelled from the rear chute into a stockpile.",
+      "device_type": "mining_drone",
+      "directives": [],
+      "features": [
+        "cruise",
+        "mine",
+        "stow"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 25,
+        "conductive": 50,
+        "silicates": 25,
+        "structural": 100
+      },
+      "short_description": "Extracts resources from asteroid belts and salvage sites.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 36,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The mobile fleet is an enormous structural cage with oversized hardpoints bolted across every available surface, carrying up to thirty-six devices in a single interstellar trip. Conductive signal trunks and ceramic-shielded control planes run through the frame, coordinating surge-drive timing across the entire payload. Carbon thermal vanes line the outer hull in dense rows, struggling to vent the heat of a fully loaded burn. At rest, it looks like an industrial dry dock someone strapped engines to.",
+      "device_type": "mobile_fleet",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "attach"
+      ],
+      "print_time": 9600,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 240,
+        "conductive": 540,
+        "rares": 60,
+        "silicates": 360,
+        "structural": 1240,
+        "volatiles": 80
+      },
+      "short_description": "A massive surge-capable staging platform with thirty-six attachment points for fleet-scale interstellar moves.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Two parallel plates of impossible thinness run the length of the conduit, separated by a gap narrower than visible light wavelengths. The Casimir effect between them creates a channel where negative energy density flows like current through a wire. Heavy structural shielding protects the vacuum seal. If it breaks, the result is not an explosion. It is worse. The conduit just stops existing in a way that takes nearby matter with it.",
+      "device_type": "negative_energy_conduit",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 200,
+        "rares": 180,
+        "silicates": 50,
+        "structural": 120
+      },
+      "short_description": "A shielded pipeline that transports exotic matter using a sustained Casimir-effect vacuum channel.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The nutrient synthesizer is a dense block of carbon-heavy reaction chambers, feedstock tanks, and conductive control lines packed into a structural housing. Volatiles and carbon compounds are fed into a chain of processing stages, where they are broken down, recombined, and expelled from the rear as nutrient blocks. The output is bland but calorie-dense, and the machine runs continuously once loaded with raw materials.",
+      "device_type": "nutrient_synthesizer",
+      "directives": [],
+      "features": [
+        "cruise",
+        "farm"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 210,
+        "conductive": 70,
+        "structural": 150,
+        "volatiles": 100
+      },
+      "short_description": "A compact chemical processor that synthesizes food from carbon and volatiles feedstock.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "point_defence_array": 1,
+        "sensor_array": 1,
+        "shield_generator": 2
+      },
+      "description": "The orbital defence platform is a squat hexagonal station bristling with weapon mounts and sensor dishes. Two shield generators form the core, their overlapping fields creating a hardened bubble around the structure. A point defence array is bolted to the dorsal surface, its tracking servos twitching between threat vectors. A sensor array on a telescoping mast provides long-range detection, feeding targeting data to the weapons systems through hardened conductive trunking. Armour plating is layered in overlapping scales across the hull, each section independently replaceable.",
+      "device_type": "orbital_defence_platform",
+      "directives": [],
+      "features": [
+        "cruise",
+        "modular"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 350,
+        "rares": 150,
+        "silicates": 100,
+        "structural": 400
+      },
+      "short_description": "A heavily armoured orbital station combining layered shields and point defence weapons into a unified defensive emplacement.",
+      "stow_capacity": 0,
+      "strength": 10.0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The orbital farm is a wide structural frame lined with rows of open crop trays, each fed by volatiles-rich nutrient lines that run the length of the platform. Rare-earth grow-lamps are mounted above the trays on adjustable booms. Harvested yields are pushed into collection hoppers at the ends of each row, where they wait for transport drones to carry them to local stockpiles.",
+      "device_type": "orbital_farm",
+      "directives": [],
+      "features": [
+        "cruise",
+        "farm"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 30,
+        "conductive": 20,
+        "rares": 50,
+        "silicates": 20,
+        "structural": 400,
+        "volatiles": 120
+      },
+      "short_description": "A sprawling orbital growing platform fed by volatiles-rich nutrient lines.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {
+        "seismic_monitor": 1,
+        "sensor_array": 1,
+        "survey_drone": 2
+      },
+      "description": "The planetary surveyor is a flat hexagonal platform with two survey drone bays recessed into its upper surface. A sensor array on a gimbal mount provides orbital-resolution imaging while a seismic monitor is anchored to the underside, its probe tips extending on telescoping arms to make contact with the surface. Data from all four subsystems feeds into a central processing stack that correlates atmospheric readings, surface topology, and subsurface composition into unified survey maps. The platform can reposition itself on low-thrust cruise motors to cover different survey zones.",
+      "device_type": "planetary_surveyor",
+      "directives": [],
+      "features": [
+        "cruise",
+        "survey",
+        "modular"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 200,
+        "rares": 50,
+        "silicates": 150,
+        "structural": 100
+      },
+      "short_description": "An automated survey platform that combines aerial drones with ground-based sensors for comprehensive planetary mapping.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The point defence array is a compact turret housing built around a pair of rapid-tracking barrels and a rare-earth targeting core. Conductive signal feeds link the turret to local sensor arrays, allowing it to lock and fire on incoming projectiles and debris at close range. Ceramic blast shields protect the firing mechanism from its own muzzle heat. It snaps between targets with a twitchy urgency.",
+      "device_type": "point_defence_array",
+      "directives": [],
+      "features": [
+        "cruise",
+        "stow",
+        "weapon"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "rares": 40,
+        "silicates": 50,
+        "structural": 180
+      },
+      "short_description": "A tracking turret for close-range interception of incoming threats.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The power cell array is a dense stack of rare-earth energy cells wired together through conductive buses and sealed behind carbon composite insulation panels. Each cell radiates a faint warmth through its housing as it charges and discharges in regulated cycles. The array can be stowed for transport and redeployed wherever the local grid needs additional stored power.",
+      "device_type": "power_cell_array",
+      "directives": [],
+      "features": [
+        "cruise",
+        "power",
+        "stow"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 70,
+        "conductive": 120,
+        "rares": 110,
+        "structural": 50
+      },
+      "short_description": "A stowable array of high-density energy cells packed behind ceramic insulation.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The propulsor is a compact engine module with folded thrust vanes, stubby hardpoints, and a rounded ceramic nose cap. Once attached to an asteroid, it unfolds its little bracing legs and burns in careful pulses, adding its small push to a much larger course correction. In large clusters, propulsors strain together through braided signal links, nudging dangerous bodies away one stubborn metre at a time.",
+      "device_type": "propulsor",
+      "directives": [],
+      "features": [
+        "cruise",
+        "stow",
+        "diversion"
+      ],
+      "print_time": 800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 15,
+        "conductive": 40,
+        "rares": 10,
+        "silicates": 20,
+        "structural": 80,
+        "volatiles": 5
+      },
+      "short_description": "A tiny stowable thruster pack for course correction and determined asteroid diversion.",
+      "stow_capacity": 0,
+      "strength": 1.0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Three surge drives form the stern of this narrow vessel. A composite skin overlays a mesh of radiation diffusers and thermal vanes, protecting the internal replicant matrix at the bow. A cluster of micro-thrusters at the middle of the frame maintain directional stability. The lower half of the vessel is packed with precision guidance chips, high-density sensor cores and control planes, reducing available stowage space to just a handful of slots. During printing and mining operations, the vessel separates into two halves, exposing a swiss-army knife of manufacturing equipment.",
+      "device_type": "racing_vessel",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "system_scan",
+        "mine",
+        "cradle",
+        "print",
+        "census"
+      ],
+      "print_time": 28800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 800,
+        "conductive": 1800,
+        "rares": 1200,
+        "silicates": 300,
+        "structural": 1200,
+        "volatiles": 400
+      },
+      "short_description": "Shaped like a dart, this sleek racing vessel has been stripped of all non-essential components.",
+      "stow_capacity": 5,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The radiation shroud is a neat little stack of silicate-heavy ceramic baffles and insulation tiles wrapped around a light structural frame. It huddles around vulnerable machinery, catching incoming radiation and scattering it through its layered shell. Thin conductive signal lines thread through the frame like tiny nerves, blinking softly when a tile needs attention. It acts like a careful blanket, bravely taking the harsh light so everything underneath can keep working.",
+      "device_type": "radiation_shroud",
+      "directives": [],
+      "features": [
+        "cruise",
+        "shield"
+      ],
+      "print_time": 800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 100,
+        "rares": 20,
+        "silicates": 300,
+        "structural": 150
+      },
+      "short_description": "A small passive ceramic shroud that quietly baffles radiation.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The seismic monitor is a compact frame of silicate sensor glass and structural mounting brackets, designed to anchor itself to a planetary surface and listen. Vibration sensors embedded in the base detect tremors, shifts, and subsurface movements, feeding a steady stream of geological data through conductive signal lines. It sits quietly on the ground, recording everything that moves beneath it.",
+      "device_type": "seismic_monitor",
+      "directives": [],
+      "features": [
+        "cruise",
+        "stow"
+      ],
+      "print_time": 600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 80,
+        "silicates": 100,
+        "structural": 100
+      },
+      "short_description": "A stowable monitor that tracks geological tremors and subsurface activity.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The sensor array is a wide platform of silicate-heavy optics, shielded scanner heads, and rare-earth sensor cores arranged around a conductive signal bus backbone. Once positioned, it performs long-range sweeps of the local system, cataloguing orbital trajectories, planetary body compositions and gathering batch census data tables. Its precision optics can resolve detail at greater ranges than cheaper survey drones.",
+      "device_type": "sensor_array",
+      "directives": [],
+      "features": [
+        "cruise",
+        "system_scan",
+        "census"
+      ],
+      "print_time": 1400,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "rares": 80,
+        "silicates": 250,
+        "structural": 110
+      },
+      "short_description": "A long-range scanning platform with precision optics for system surveys and census operations.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The shield generator is a heavy platform of ceramic emitter vanes arranged in concentric rings around a rare-earth focusing core. When active, the vanes throw a layered energy field that absorbs radiation bursts and deflects debris. Conductive banks pulse beneath the ceramic surface, cycling power through the barrier in steady waves. The whole assembly runs hot, venting excess heat through structural exhausts along the base.",
+      "device_type": "shield_generator",
+      "directives": [],
+      "features": [
+        "cruise",
+        "shield"
+      ],
+      "print_time": 1800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 120,
+        "rares": 40,
+        "silicates": 450,
+        "structural": 250
+      },
+      "short_description": "A field emitter that projects a layered energy barrier against radiation and impacts.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The signal booster is a dense spool of braided antenna webs wrapped around a structural spine, with rare-earth amplifier cores set at intervals along its length. When deployed, the webs unfurl into a wide conductive net that catches weak transmissions and pushes them further across the system. It draws more power than a mesh relay and covers far more ground, acting as a long-range signal bridge for stretched networks.",
+      "device_type": "signal_booster",
+      "directives": [],
+      "features": [
+        "cruise",
+        "stow"
+      ],
+      "print_time": 800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 200,
+        "rares": 50,
+        "structural": 150
+      },
+      "short_description": "A stowable range amplifier that extends signal reach across a system.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The solar collector unfolds into a broad spread of silicate glass panels mounted on a structural frame, angled to capture energy from the local star. Conductive wiring runs in dense bundles from each panel to a central distribution core, where rare-earth regulators store the harvested energy into the connected power grid. The panels track their star in slow arcs, adjusting alignment as orbital drift shifts the angle of incidence.",
+      "device_type": "solar_collector",
+      "directives": [],
+      "features": [
+        "cruise",
+        "power"
+      ],
+      "print_time": 900,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 210,
+        "rares": 60,
+        "silicates": 100,
+        "structural": 160
+      },
+      "short_description": "A deployable solar collector with conductive-heavy wiring and silicate glass panels.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The structural fabricator is a stripped-down print bay built around a pair of articulated fabrication arms. Conductive control buses coordinate the arms as they cut, weld, and assemble components from raw resource cartridges. It handles a limited range of blueprints compared to a full autofactory, but it can be deployed anywhere that has resources, creating working equipment without requiring heavy infrastructure.",
+      "device_type": "structural_fabricator",
+      "directives": [],
+      "features": [
+        "cruise",
+        "print"
+      ],
+      "print_time": 1800,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "rares": 50,
+        "silicates": 100,
+        "structural": 300
+      },
+      "short_description": "A compact fabricator for printing smaller devices.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 9,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The surge carrier is a reinforced structural hull with nine attachment hardpoints arranged in a three-by-three grid across its upper deck. Layered ceramic shielding protects the underside, where conductive signal trunks feed a pair of surge drives. Carbon radiator panels extend along the flanks to manage heat during long burns. The carrier handles convoy-scale moves, pulling mining swarms, fabricators, and relay hardware between systems in a single jump.",
+      "device_type": "surge_carrier",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "attach"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 90,
+        "conductive": 240,
+        "rares": 30,
+        "silicates": 140,
+        "structural": 580,
+        "volatiles": 60
+      },
+      "short_description": "A heavy surge carrier with a nine-point attachment grid for interstellar convoy transport.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 1,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The surge plate is a flat, oblong slab of structural plating with a conductive signal bus through its core and a compact surge drive folded underneath. A single attachment clamp sits on top, held by ceramic-lined locking pins and just enough confidence to carry one passenger. When summoned, the plate unfolds its carbon thrust vanes, locks on tight, and engages the drive with a determined wobble. It is the smallest surge-capable device available, and it knows exactly how much larger everything else is.",
+      "device_type": "surge_plate",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "attach",
+        "stow",
+        "taxi"
+      ],
+      "print_time": 1200,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 25,
+        "conductive": 60,
+        "rares": 15,
+        "silicates": 30,
+        "structural": 120,
+        "volatiles": 10
+      },
+      "short_description": "A tiny stowable surge plate with one brave attachment clamp, used as a personal interstellar taxi.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 4,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The surge platform is an open structural frame with conductive control buses linking four attachment hardpoints to a central surge drive. Ceramic shielding protects the drive housing and the signal planes beneath the deck. Thermal vanes fold out along the sides during transit, bleeding off heat from the surge burn. It carries small groups of devices between systems, sitting somewhere between a taxi and a convoy.",
+      "device_type": "surge_platform",
+      "directives": [],
+      "features": [
+        "surge",
+        "cruise",
+        "attach"
+      ],
+      "print_time": 2400,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 50,
+        "conductive": 120,
+        "rares": 30,
+        "silicates": 60,
+        "structural": 240,
+        "volatiles": 30
+      },
+      "short_description": "A mid-size surge platform with four attachment points for interstellar ferry runs.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "This is a collection of cheap lenses and sensor cores attached to a lightweight chassis. Three attitude thrusters give the drone precision manoeuvrability. It can classify remote planets and moons with a wide range of measurements, or search asteroid belts for dense rock clusters to support targeted mining operations.",
+      "device_type": "survey_drone",
+      "directives": [],
+      "features": [
+        "cruise",
+        "survey",
+        "stow"
+      ],
+      "print_time": 300,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 10,
+        "conductive": 30,
+        "rares": 5,
+        "silicates": 15,
+        "structural": 60
+      },
+      "short_description": "Creates detailed surveys of planetary bodies and finds asteroid belt resource sites.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "current_hubs": 2,
+      "description": "This space station is constructed around a spear-like central shaft, with two massive orbital rings braced around its body and a bulbous antenna crown at the far end. Braided signal buses run between long comms spines, feeding a hardened replicant-matrix bay set behind a glowing side hatch. At close range, the rings resolve into layered docking bays where survey drones arrive and depart in a steady flow of traffic, carrying atmospheric samples, resource scans, and gravitational distortion measurements from across the system. The flared base is plated in ceramic shielding, protecting dense guidance cells and braking-laser assemblies used to catch incoming surge-drive vessels at extreme range.",
+      "device_type": "system_hub",
+      "directives": [],
+      "features": [
+        "cruise",
+        "cradle",
+        "relay",
+        "comms",
+        "modular"
+      ],
+      "print_time": 131015,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 600,
+        "conductive": 1500,
+        "rares": 500,
+        "silicates": 800,
+        "structural": 3000,
+        "volatiles": 400
+      },
+      "short_description": "A massive orbital administration station with twin docking rings, antenna-spined comms masts, and long-range system survey hardware.",
+      "stow_capacity": 1,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "A narrow structural mast capped with a ring of ceramic emitter vanes and a slow-turning amber warning lamp. When deployed, the ward spools up a persistent interdiction field that blankets the local system. Thin conductive signal lines run the length of the mast, blinking in slow steady pulses to let passing traffic know the system is closed.",
+      "device_type": "system_ward",
+      "directives": [],
+      "features": [
+        "cruise",
+        "ward",
+        "stow"
+      ],
+      "print_time": 4800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 20,
+        "conductive": 120,
+        "rares": 40,
+        "silicates": 100,
+        "structural": 80,
+        "volatiles": 10
+      },
+      "short_description": "A tall orbital pylon that broadcasts an interdiction field, locking down mining, salvage, and species interaction across an entire star system.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "The thermal lance is a long-barrelled platform built around a conductive emitter core and a rare-earth focusing array, with folding bracing arms that lock out beneath it like a firing rest. When deployed, it settles into a surface-facing orientation and tightens its aim before driving sustained thermal passes across a controlled footprint, as if picking its mark and holding there. The emitter banks can boil shallow frost, crack frozen deposits, and bake trapped volatiles out of regolith, venting additional gas as the surface warms under the beam. When idle, the focusing vanes and braces fold flat against the body, leaving a compact cylindrical package waiting for the next shot.",
+      "device_type": "thermal_lance",
+      "directives": [],
+      "features": [
+        "cruise",
+        "terraform"
+      ],
+      "print_time": 1067,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 150,
+        "rares": 50,
+        "structural": 200,
+        "volatiles": 100
+      },
+      "short_description": "A high-output thermal emitter that drives concentrated heat into a planetary surface.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 0,
+      "components": {},
+      "description": "Three concentric flywheels spin on orthogonal axes inside a structural housing. Their combined angular momentum interacts with local spacetime curvature to produce a counter-tidal field. Anything passing through an aperture without tidal compensation gets stretched to atoms. The compensator smooths the gradient. It does not eliminate it. The flywheels are visible through slotted vents, catching starlight as they turn.",
+      "device_type": "tidal_compensator",
+      "directives": [],
+      "features": [
+        "stow"
+      ],
+      "print_time": 3600,
+      "queue_size": 0,
+      "resources": {
+        "conductive": 100,
+        "rares": 20,
+        "silicates": 50,
+        "structural": 180
+      },
+      "short_description": "A gyroscopic assembly that generates counter-tidal forces to smooth gravitational gradients.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 20,
+      "components": {},
+      "description": "Two rows of ten hoppers form the body of this lightweight, syringe-shaped transport drone. A thin antenna spine at the tip receives instructions from local AMI controllers, while an unshielded cruise drive sputters at the rear. This is a cheap low-maintenance way to shift resources back and forth between system bodies.",
+      "device_type": "transport_drone",
+      "directives": [],
+      "features": [
+        "cruise",
+        "transport"
+      ],
+      "print_time": 400,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 5,
+        "conductive": 25,
+        "silicates": 10,
+        "structural": 50
+      },
+      "short_description": "Compact drone for moving resources between locations.",
+      "stow_capacity": 0,
+      "strength": 0
+    },
+    {
+      "attach_capacity": 0,
+      "cargo_capacity": 80,
+      "components": {},
+      "description": "A reinforced chassis wraps around a heavy structural frame, with eight rows of ten hoppers in a helical formation along the length of this transport hauler. Insulated coolant tanks regulate the twin cruise drives that provide in-system thrust.",
+      "device_type": "transport_hauler",
+      "directives": [],
+      "features": [
+        "cruise",
+        "transport"
+      ],
+      "print_time": 800,
+      "queue_size": 0,
+      "resources": {
+        "carbon": 5,
+        "conductive": 25,
+        "silicates": 10,
+        "structural": 200
+      },
+      "short_description": "A bulk cargo runner for moving larger quantities of resources.",
+      "stow_capacity": 0,
+      "strength": 0
+    }
+  ]
+}
