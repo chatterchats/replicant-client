@@ -183,6 +183,9 @@ export interface DirectorRequirementSummary {
   active_workflows: string[];
 }
 
+export type DirectorWorkerState =
+  "operational" | "in_transit" | "busy" | "unavailable";
+
 export interface DirectorReplicantAssignment {
   code: string;
   name: string | null;
@@ -190,6 +193,7 @@ export interface DirectorReplicantAssignment {
   busy: boolean;
   workflow_id: string | null;
   role_affinity: string | null;
+  state?: DirectorWorkerState;
 }
 
 export interface DirectorRegionSummary {
@@ -199,6 +203,9 @@ export interface DirectorRegionSummary {
   hub_location: string | null;
   replicants: string[];
   known_systems: number;
+  operational_workers?: number;
+  workers_in_transit?: number;
+  busy_workers?: number;
 }
 
 export interface DirectorMiningPolicySummary {
@@ -221,14 +228,33 @@ export interface DirectorGoalSummary {
   enabled: boolean;
 }
 
+export interface DirectorRegionalWorkforceSummary {
+  region: string;
+  bootstrap_target: number;
+  assigned: number;
+  incoming: number;
+  operational: number;
+  in_transit: number;
+  busy: number;
+  desired_ordinary_capacity: number;
+  scale_up_suppressed: boolean;
+  scale_up_suppression_reason: string | null;
+  manufacturing_home: string | null;
+  manufacturing_home_reason: string | null;
+}
+
 export interface DirectorWorkforceSummary {
   total: number;
   busy: number;
+  operational?: number;
+  in_transit?: number;
+  unavailable?: number;
   idle: number;
   idle_ratio: number;
   pending_worker_demand: number;
   scale_up_recommended: boolean;
   scale_reason: string | null;
+  regions?: DirectorRegionalWorkforceSummary[];
 }
 
 export interface DirectorUrgencyFact {
@@ -347,6 +373,71 @@ export interface DeviceSummary {
   claim: DeviceClaim | null;
 }
 
+export interface TravelInspectorSummary {
+  arrives_at: string | null;
+  departed_at: string | null;
+  destination: string | null;
+  eta_seconds: number | null;
+  final_arrives_at: string | null;
+  final_destination: string | null;
+  origin: string | null;
+  route_eta_seconds: number | null;
+  stage: string | null;
+  travel_type: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface DeviceRuntimeInspectorSummary {
+  created_at: string | null;
+  short_description: string | null;
+  description: string | null;
+  printing: unknown | null;
+  mining: unknown | null;
+  prospect: unknown | null;
+  repair: unknown | null;
+  scan: unknown | null;
+  waiting_for: unknown | null;
+  print_queue: Record<string, unknown>[];
+  queue_size: number | null;
+  taxi_mode: string | null;
+  tracking_site_id: number | null;
+  beacon_only: boolean | null;
+  welcome_message: string | null;
+  repair_paid_pct: unknown | null;
+}
+
+export interface DeviceInspectorSummary {
+  device: DeviceSummary;
+  deployed_at: string | null;
+  in_control_range: boolean | null;
+  settings: Record<string, unknown>;
+  hosting_replicant: EntityRef | null;
+  travel: TravelInspectorSummary | null;
+  runtime: DeviceRuntimeInspectorSummary;
+}
+
+export interface ReplicantInspectorSummary {
+  entity: EntityRef;
+  name: string | null;
+  status: string | null;
+  is_npc: boolean | null;
+  ownership: string;
+  system: string | null;
+  region: string | null;
+  assigned_region: string | null;
+  director_state: string | null;
+  role_affinity: string | null;
+  workflow_id: string | null;
+  location: string | null;
+  hosted_device: EntityRef | null;
+  travel: TravelInspectorSummary | null;
+  description: string | null;
+  pronouns: string | null;
+  experience_points: number | null;
+  plan: string | null;
+  cohort_permission: string | null;
+}
+
 export interface EntityProvenance {
   observed_at_ms: number;
   stale: boolean;
@@ -382,6 +473,14 @@ export interface SystemInspectorSummary {
   has_hub: boolean | null;
   has_ward: boolean | null;
   has_life: boolean | null;
+  tags: string[];
+  stellar: Record<string, unknown>;
+  asteroid_belt: Record<string, unknown>;
+  outer_system: Record<string, unknown>;
+  mining_bonus_percent: number | null;
+  shop_count: number | null;
+  active_event_count: number | null;
+  object_count: number | null;
   children: EntityCollectionSummary;
 }
 
@@ -390,6 +489,14 @@ export interface LocationEnvironmentSummary {
   magnetic_field: boolean | null;
   gravity_g: number | null;
   surface_temperature_c: number | null;
+  surface_temperature_k?: number | null;
+  atmospheric_pressure_atm?: number | null;
+  oxygen_percent?: number | null;
+  atmospheric_toxicity?: number | null;
+  hydrosphere_percent?: number | null;
+  tectonic_index?: number | null;
+  biosphere_index?: number | null;
+  subsurface_ocean?: boolean | null;
   habitable_zone: boolean | null;
   life_stage: string | null;
   axial_tilt_degrees: number | null;
@@ -400,6 +507,7 @@ export interface LocationEnvironmentSummary {
 }
 
 export interface LocationSurveySummary {
+  system_complete?: boolean | null;
   planets_total: number | null;
   planets_scanned: number | null;
   moons_total: number | null;
@@ -409,6 +517,7 @@ export interface LocationSurveySummary {
 
 export interface LocationInspectorSummary {
   location_type: string | null;
+  custom_name?: string | null;
   system: string | null;
   parent: string | null;
   scanned: boolean | null;
@@ -416,11 +525,21 @@ export interface LocationInspectorSummary {
   system_tags: string[];
   survey: LocationSurveySummary;
   environment: LocationEnvironmentSummary;
+  physical: Record<string, unknown>;
+  belt: Record<string, unknown>;
+  lagrange: Record<string, unknown>;
+  outer_system: Record<string, unknown>;
+  incoming_object: Record<string, unknown>;
+  megastructure: Record<string, unknown>;
+  resource_sites: Record<string, unknown>[];
+  inventory: Record<string, unknown>[];
+  advanced: Record<string, unknown>;
   contents: EntityCollectionSummary;
 }
 
 export type EntityInspectorDetail =
-  | { kind: "device"; detail: DeviceSummary }
+  | { kind: "device"; detail: DeviceInspectorSummary }
+  | { kind: "replicant"; detail: ReplicantInspectorSummary }
   | { kind: "system"; detail: SystemInspectorSummary }
   | { kind: "location"; detail: LocationInspectorSummary };
 
@@ -1191,6 +1310,41 @@ export interface FiniteExecution {
   links: EntityRef[];
 }
 
+export interface WorkflowReservationSummary {
+  allocation_id: string;
+  workflow_id: string;
+  work_item_id: string;
+  requirement_key: string;
+  kind: string;
+  resource: string | null;
+  pool_identity: string;
+  entity: EntityRef | null;
+  capabilities: string[];
+  quantity: number;
+  region: string | null;
+  system: string | null;
+  location: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface WorkflowTargetSummary {
+  workflow_id: string;
+  kind: string;
+  key: string;
+  system: string | null;
+  location: string | null;
+  active: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface WorkflowIntelligenceSnapshot {
+  metadata: SnapshotMetadata;
+  reservations: WorkflowReservationSummary[];
+  targets: WorkflowTargetSummary[];
+}
+
 export interface WorkflowDetail {
   summary: WorkflowSummary;
   schema_version: number;
@@ -1198,6 +1352,8 @@ export interface WorkflowDetail {
   wait_reason: string | null;
   parent_id: string | null;
   claims: EntityRef[];
+  reservations: WorkflowReservationSummary[];
+  targets: WorkflowTargetSummary[];
   created_at_ms: number;
   finished_at_ms: number | null;
   error: string | null;
@@ -1884,9 +2040,86 @@ function workflowDescriptor(value: unknown): WorkflowDescriptor {
   };
 }
 
+function workflowReservation(value: unknown): WorkflowReservationSummary {
+  const item = record(value, "workflow reservation");
+  if (
+    typeof item.allocation_id !== "string" ||
+    typeof item.workflow_id !== "string" ||
+    typeof item.work_item_id !== "string" ||
+    typeof item.requirement_key !== "string" ||
+    typeof item.kind !== "string" ||
+    typeof item.pool_identity !== "string" ||
+    !Array.isArray(item.capabilities)
+  )
+    throw new Error("Invalid workflow reservation");
+  return {
+    allocation_id: item.allocation_id,
+    workflow_id: item.workflow_id,
+    work_item_id: item.work_item_id,
+    requirement_key: item.requirement_key,
+    kind: item.kind,
+    resource: nullableString(item.resource, "workflow reservation resource"),
+    pool_identity: item.pool_identity,
+    entity: item.entity === null ? null : entity(item.entity),
+    capabilities: item.capabilities.map((value) =>
+      requiredString(value, "workflow reservation capability"),
+    ),
+    quantity: number(item.quantity, "workflow reservation quantity"),
+    region: nullableString(item.region, "workflow reservation region"),
+    system: nullableString(item.system, "workflow reservation system"),
+    location: nullableString(item.location, "workflow reservation location"),
+    created_at_ms: number(
+      item.created_at_ms,
+      "workflow reservation creation time",
+    ),
+    updated_at_ms: number(
+      item.updated_at_ms,
+      "workflow reservation update time",
+    ),
+  };
+}
+
+function workflowTarget(value: unknown): WorkflowTargetSummary {
+  const item = record(value, "workflow target");
+  if (
+    typeof item.workflow_id !== "string" ||
+    typeof item.kind !== "string" ||
+    typeof item.key !== "string"
+  )
+    throw new Error("Invalid workflow target");
+  return {
+    workflow_id: item.workflow_id,
+    kind: item.kind,
+    key: item.key,
+    system: nullableString(item.system, "workflow target system"),
+    location: nullableString(item.location, "workflow target location"),
+    active:
+      item.active === undefined
+        ? true
+        : boolean(item.active, "workflow target active state"),
+    created_at_ms: number(item.created_at_ms, "workflow target creation time"),
+    updated_at_ms: number(item.updated_at_ms, "workflow target update time"),
+  };
+}
+
+function workflowIntelligence(value: unknown): WorkflowIntelligenceSnapshot {
+  const item = record(value, "workflow intelligence");
+  if (!Array.isArray(item.reservations) || !Array.isArray(item.targets))
+    throw new Error("Invalid workflow intelligence");
+  return {
+    metadata: metadata(item.metadata),
+    reservations: item.reservations.map(workflowReservation),
+    targets: item.targets.map(workflowTarget),
+  };
+}
+
 function workflowDetail(value: unknown): WorkflowDetail {
   const item = record(value, "workflow detail");
   if (!Array.isArray(item.claims)) throw new Error("Invalid workflow claims");
+  const reservations = item.reservations ?? [];
+  const targets = item.targets ?? [];
+  if (!Array.isArray(reservations) || !Array.isArray(targets))
+    throw new Error("Invalid workflow intelligence detail");
   return {
     summary: workflow(item.summary),
     schema_version: number(item.schema_version, "workflow schema version"),
@@ -1894,6 +2127,8 @@ function workflowDetail(value: unknown): WorkflowDetail {
     wait_reason: nullableString(item.wait_reason, "workflow wait reason"),
     parent_id: nullableString(item.parent_id, "workflow parent"),
     claims: item.claims.map(entity),
+    reservations: reservations.map(workflowReservation),
+    targets: targets.map(workflowTarget),
     created_at_ms: number(item.created_at_ms, "workflow creation time"),
     finished_at_ms:
       item.finished_at_ms === null
@@ -1923,6 +2158,134 @@ function entitySummary(value: unknown): EntitySummary {
     location: nullableString(item.location, "entity location"),
     entity_type: nullableString(item.entity_type, "entity type"),
     status: nullableString(item.status, "entity status"),
+  };
+}
+
+function optionalEntity(value: unknown, name: string): EntityRef | null {
+  if (value === undefined || value === null) return null;
+  try {
+    return entity(value);
+  } catch {
+    throw new Error(`Invalid ${name}`);
+  }
+}
+
+function travelInspector(value: unknown): TravelInspectorSummary | null {
+  if (value === undefined || value === null) return null;
+  const item = record(value, "Inspector travel");
+  return {
+    arrives_at: optionalString(item.arrives_at, "travel arrival"),
+    departed_at: optionalString(item.departed_at, "travel departure"),
+    destination: optionalString(item.destination, "travel destination"),
+    eta_seconds: optionalInteger(item.eta_seconds, "travel ETA"),
+    final_arrives_at: optionalString(
+      item.final_arrives_at,
+      "final travel arrival",
+    ),
+    final_destination: optionalString(
+      item.final_destination,
+      "final travel destination",
+    ),
+    origin: optionalString(item.origin, "travel origin"),
+    route_eta_seconds: optionalInteger(item.route_eta_seconds, "route ETA"),
+    stage: optionalString(item.stage, "travel stage"),
+    travel_type: optionalString(item.travel_type, "travel type"),
+    details:
+      item.details === undefined ? {} : record(item.details, "travel details"),
+  };
+}
+
+function deviceRuntimeInspector(value: unknown): DeviceRuntimeInspectorSummary {
+  const item =
+    value === undefined ? {} : record(value, "device runtime Inspector");
+  const objectList = (value: unknown, name: string) =>
+    value === undefined
+      ? []
+      : array(value, name).map((entry) => record(entry, name));
+  return {
+    created_at: optionalString(item.created_at, "device creation"),
+    short_description: optionalString(
+      item.short_description,
+      "device short description",
+    ),
+    description: optionalString(item.description, "device description"),
+    printing: item.printing ?? null,
+    mining: item.mining ?? null,
+    prospect: item.prospect ?? null,
+    repair: item.repair ?? null,
+    scan: item.scan ?? null,
+    waiting_for: item.waiting_for ?? null,
+    print_queue: objectList(item.print_queue, "print queue"),
+    queue_size: optionalInteger(item.queue_size, "print queue size"),
+    taxi_mode: optionalString(item.taxi_mode, "taxi mode"),
+    tracking_site_id: optionalInteger(item.tracking_site_id, "tracking site"),
+    beacon_only: optionalBoolean(item.beacon_only, "beacon only"),
+    welcome_message: optionalString(item.welcome_message, "welcome message"),
+    repair_paid_pct: item.repair_paid_pct ?? null,
+  };
+}
+
+function deviceInspector(value: unknown): DeviceInspectorSummary {
+  const item = record(value, "device Inspector detail");
+  return {
+    device: parseDeviceSummary(item),
+    deployed_at: optionalString(item.deployed_at, "device deployment"),
+    in_control_range: optionalBoolean(
+      item.in_control_range,
+      "device controller range",
+    ),
+    settings:
+      item.settings === undefined
+        ? {}
+        : record(item.settings, "device settings"),
+    hosting_replicant: optionalEntity(
+      item.hosting_replicant,
+      "hosting replicant",
+    ),
+    travel: travelInspector(item.travel),
+    runtime: deviceRuntimeInspector(item.runtime),
+  };
+}
+
+function replicantInspector(value: unknown): ReplicantInspectorSummary {
+  const item = record(value, "Replicant Inspector detail");
+  if (typeof item.ownership !== "string")
+    throw new Error("Invalid Replicant ownership");
+  return {
+    entity: entity(item.entity),
+    name: optionalString(item.name, "Replicant name"),
+    status: optionalString(item.status, "Replicant status"),
+    is_npc: optionalBoolean(item.is_npc, "Replicant NPC"),
+    ownership: item.ownership,
+    system: optionalString(item.system, "Replicant system"),
+    region: optionalString(item.region, "Replicant region"),
+    assigned_region: optionalString(
+      item.assigned_region,
+      "Replicant assigned region",
+    ),
+    director_state: optionalString(
+      item.director_state,
+      "Replicant Director state",
+    ),
+    role_affinity: optionalString(
+      item.role_affinity,
+      "Replicant role affinity",
+    ),
+    workflow_id: optionalString(item.workflow_id, "Replicant workflow"),
+    location: optionalString(item.location, "Replicant location"),
+    hosted_device: optionalEntity(item.hosted_device, "hosted device"),
+    travel: travelInspector(item.travel),
+    description: optionalString(item.description, "Replicant description"),
+    pronouns: optionalString(item.pronouns, "Replicant pronouns"),
+    experience_points: optionalInteger(
+      item.experience_points,
+      "Replicant experience",
+    ),
+    plan: optionalString(item.plan, "Replicant plan"),
+    cohort_permission: optionalString(
+      item.cohort_permission,
+      "Replicant cohort permission",
+    ),
   };
 }
 
@@ -1995,6 +2358,10 @@ function entityCollection(value: unknown): EntityCollectionSummary {
 function locationSurvey(value: unknown): LocationSurveySummary {
   const item = value === undefined ? {} : record(value, "location survey");
   return {
+    system_complete: optionalBoolean(
+      item.system_complete,
+      "system survey complete",
+    ),
     planets_total: optionalInteger(item.planets_total, "planet total"),
     planets_scanned: optionalInteger(item.planets_scanned, "planets scanned"),
     moons_total: optionalInteger(item.moons_total, "moon total"),
@@ -2015,6 +2382,29 @@ function locationEnvironment(value: unknown): LocationEnvironmentSummary {
     surface_temperature_c: optionalNumber(
       item.surface_temperature_c,
       "surface temperature",
+    ),
+    surface_temperature_k: optionalNumber(
+      item.surface_temperature_k,
+      "surface temperature Kelvin",
+    ),
+    atmospheric_pressure_atm: optionalNumber(
+      item.atmospheric_pressure_atm,
+      "atmospheric pressure",
+    ),
+    oxygen_percent: optionalNumber(item.oxygen_percent, "oxygen percentage"),
+    atmospheric_toxicity: optionalNumber(
+      item.atmospheric_toxicity,
+      "atmospheric toxicity",
+    ),
+    hydrosphere_percent: optionalNumber(
+      item.hydrosphere_percent,
+      "hydrosphere percentage",
+    ),
+    tectonic_index: optionalNumber(item.tectonic_index, "tectonic index"),
+    biosphere_index: optionalNumber(item.biosphere_index, "biosphere index"),
+    subsurface_ocean: optionalBoolean(
+      item.subsurface_ocean,
+      "subsurface ocean",
     ),
     habitable_zone: optionalBoolean(item.habitable_zone, "habitable zone"),
     life_stage: optionalString(item.life_stage, "life stage"),
@@ -2040,7 +2430,7 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
   const tagged = record(snapshot.detail, "entity inspector detail");
   const kind = oneOf(
     tagged.kind,
-    ["device", "system", "location"] as const,
+    ["device", "replicant", "system", "location"] as const,
     "entity inspector kind",
   );
   const detail = record(tagged.detail, "entity inspector kind detail");
@@ -2067,7 +2457,9 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
         })();
   let parsedDetail: EntityInspectorDetail;
   if (kind === "device") {
-    parsedDetail = { kind, detail: parseDeviceSummary(detail) };
+    parsedDetail = { kind, detail: deviceInspector(detail) };
+  } else if (kind === "replicant") {
+    parsedDetail = { kind, detail: replicantInspector(detail) };
   } else if (kind === "system") {
     parsedDetail = {
       kind,
@@ -2084,6 +2476,35 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
         has_hub: optionalBoolean(detail.has_hub, "system hub"),
         has_ward: optionalBoolean(detail.has_ward, "system ward"),
         has_life: optionalBoolean(detail.has_life, "system life"),
+        tags:
+          detail.tags === undefined
+            ? []
+            : stringArray(detail.tags, "system tags"),
+        stellar:
+          detail.stellar === undefined
+            ? {}
+            : record(detail.stellar, "stellar facts"),
+        asteroid_belt:
+          detail.asteroid_belt === undefined
+            ? {}
+            : record(detail.asteroid_belt, "asteroid belt"),
+        outer_system:
+          detail.outer_system === undefined
+            ? {}
+            : record(detail.outer_system, "outer system"),
+        mining_bonus_percent: optionalNumber(
+          detail.mining_bonus_percent,
+          "mining bonus",
+        ),
+        shop_count: optionalInteger(detail.shop_count, "shop count"),
+        active_event_count: optionalInteger(
+          detail.active_event_count,
+          "active event count",
+        ),
+        object_count: optionalInteger(
+          detail.object_count,
+          "system object count",
+        ),
         children: entityCollection(detail.children),
       },
     };
@@ -2092,6 +2513,7 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
       kind,
       detail: {
         location_type: optionalString(detail.location_type, "location type"),
+        custom_name: optionalString(detail.custom_name, "location custom name"),
         system: optionalString(detail.system, "location system"),
         parent: optionalString(detail.parent, "parent location"),
         scanned: optionalBoolean(detail.scanned, "location scanned"),
@@ -2105,6 +2527,44 @@ function entityInspector(value: unknown): EntityInspectorSnapshot {
             : stringArray(detail.system_tags, "system tags"),
         survey: locationSurvey(detail.survey),
         environment: locationEnvironment(detail.environment),
+        physical:
+          detail.physical === undefined
+            ? {}
+            : record(detail.physical, "physical facts"),
+        belt:
+          detail.belt === undefined ? {} : record(detail.belt, "belt facts"),
+        lagrange:
+          detail.lagrange === undefined
+            ? {}
+            : record(detail.lagrange, "Lagrange facts"),
+        outer_system:
+          detail.outer_system === undefined
+            ? {}
+            : record(detail.outer_system, "outer-system facts"),
+        incoming_object:
+          detail.incoming_object === undefined
+            ? {}
+            : record(detail.incoming_object, "incoming object"),
+        megastructure:
+          detail.megastructure === undefined
+            ? {}
+            : record(detail.megastructure, "megastructure"),
+        resource_sites:
+          detail.resource_sites === undefined
+            ? []
+            : array(detail.resource_sites, "resource sites").map((value) =>
+                record(value, "resource site"),
+              ),
+        inventory:
+          detail.inventory === undefined
+            ? []
+            : array(detail.inventory, "location inventory").map((value) =>
+                record(value, "inventory item"),
+              ),
+        advanced:
+          detail.advanced === undefined
+            ? {}
+            : record(detail.advanced, "advanced location facts"),
         contents: entityCollection(detail.contents),
       },
     };
@@ -2871,7 +3331,7 @@ export function parseSimulationsResponse(
         (value) => {
           const item = record(value, "simulation interface");
           return {
-            device: parseDeviceSummary(item.device),
+            device: parseDeviceSummary(item),
             scenarios: array(item.scenarios, "simulation scenarios").map(
               (value) => {
                 const scenario = record(value, "simulation scenario");
@@ -4134,6 +4594,12 @@ export function parseWorkflowResponse(
   });
 }
 
+export function parseWorkflowIntelligenceResponse(
+  value: unknown,
+): Versioned<WorkflowIntelligenceSnapshot> {
+  return envelope(value, workflowIntelligence);
+}
+
 export function parseWorkflowDetailResponse(
   value: unknown,
 ): Versioned<WorkflowDetail> {
@@ -4283,6 +4749,13 @@ const directorRequirementStatuses = [
   "unavailable",
 ] as const;
 
+const directorWorkerStates = [
+  "operational",
+  "in_transit",
+  "busy",
+  "unavailable",
+] as const;
+
 export function parseDirectorResponse(
   value: unknown,
 ): Versioned<DirectorSnapshot> {
@@ -4307,6 +4780,18 @@ export function parseDirectorResponse(
           hub_location: nullableString(region.hub_location, "hub location"),
           replicants: stringArray(region.replicants, "regional replicants"),
           known_systems: number(region.known_systems, "known systems"),
+          operational_workers: number(
+            region.operational_workers ?? 0,
+            "operational regional workers",
+          ),
+          workers_in_transit: number(
+            region.workers_in_transit ?? 0,
+            "regional workers in transit",
+          ),
+          busy_workers: number(
+            region.busy_workers ?? 0,
+            "busy regional workers",
+          ),
         };
       }),
       goals: item.goals.map((value) => {
@@ -4357,6 +4842,11 @@ export function parseDirectorResponse(
             replicant.role_affinity,
             "role affinity",
           ),
+          state: oneOf(
+            replicant.state ?? "unavailable",
+            directorWorkerStates,
+            "Replicant worker state",
+          ),
         };
       }),
       requirements: array(item.requirements ?? [], "Director requirements").map(
@@ -4398,6 +4888,15 @@ export function parseDirectorResponse(
       workforce: {
         total: number(workforce.total, "workforce total"),
         busy: number(workforce.busy, "workforce busy"),
+        operational: number(
+          workforce.operational ?? 0,
+          "operational workforce",
+        ),
+        in_transit: number(workforce.in_transit ?? 0, "workforce in transit"),
+        unavailable: number(
+          workforce.unavailable ?? 0,
+          "unavailable workforce",
+        ),
         idle: number(workforce.idle, "workforce idle"),
         idle_ratio: finiteNumber(workforce.idle_ratio, "workforce idle ratio"),
         pending_worker_demand: number(
@@ -4409,6 +4908,50 @@ export function parseDirectorResponse(
           "scale recommendation",
         ),
         scale_reason: nullableString(workforce.scale_reason, "scale reason"),
+        regions: array(
+          workforce.regions ?? [],
+          "regional workforce diagnostics",
+        ).map((value) => {
+          const region = record(value, "regional workforce diagnostics");
+          return {
+            region: requiredString(region.region, "workforce region"),
+            bootstrap_target: number(
+              region.bootstrap_target,
+              "regional bootstrap target",
+            ),
+            assigned: number(region.assigned, "regional assigned workers"),
+            incoming: number(region.incoming, "regional incoming workers"),
+            operational: number(
+              region.operational,
+              "regional operational workers",
+            ),
+            in_transit: number(
+              region.in_transit,
+              "regional workers in transit",
+            ),
+            busy: number(region.busy, "regional busy workers"),
+            desired_ordinary_capacity: number(
+              region.desired_ordinary_capacity,
+              "desired ordinary regional capacity",
+            ),
+            scale_up_suppressed: boolean(
+              region.scale_up_suppressed,
+              "regional scale-up suppression",
+            ),
+            scale_up_suppression_reason: nullableString(
+              region.scale_up_suppression_reason ?? null,
+              "regional scale-up suppression reason",
+            ),
+            manufacturing_home: nullableString(
+              region.manufacturing_home ?? null,
+              "regional manufacturing home",
+            ),
+            manufacturing_home_reason: nullableString(
+              region.manufacturing_home_reason ?? null,
+              "regional manufacturing home reason",
+            ),
+          };
+        }),
       },
     };
   });

@@ -110,11 +110,14 @@ export function InventoryPage({
   onSelectEntity,
   onOpenSystem,
 }: {
-  onSelectEntity: (entity: EntityRef) => void;
+  onSelectEntity: (
+    entity: EntityRef | { kind: "resource"; id: string },
+  ) => void;
   onOpenSystem: (system: string) => void;
 }) {
   const query = useDomainQuery({
     slice: "inventory",
+    queryKey: "inspector:inventory",
     fetcher: (signal) => daemonApi.inventory(signal),
     isEmpty: inventoryEmpty,
   });
@@ -160,7 +163,9 @@ export function InventoryContent({
   error: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
-  onSelectEntity: (entity: EntityRef) => void;
+  onSelectEntity: (
+    entity: EntityRef | { kind: "resource"; id: string },
+  ) => void;
   onOpenSystem: (system: string) => void;
 }) {
   const [mode, setMode] = useState<InventoryMode>("location");
@@ -390,7 +395,17 @@ export function InventoryContent({
                   {resources.map((row) => (
                     <tr key={row.resource}>
                       <td>
-                        <strong>{row.resource}</strong>
+                        <button
+                          className="entity-link"
+                          onClick={() =>
+                            onSelectEntity({
+                              kind: "resource",
+                              id: row.resource,
+                            })
+                          }
+                        >
+                          <strong>{row.resource}</strong>
+                        </button>
                       </td>
                       <td>{row.total_quantity.toLocaleString()}</td>
                       <td>

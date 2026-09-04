@@ -184,6 +184,8 @@ export function createQueryCache(): QueryCache {
         const needsFollowUp =
           hasSubscribers &&
           (request.forceFollowUp || invalidationNeedsFollowUp);
+        if (invalidationNeedsFollowUp)
+          recordQueryEvent("auto_refetch", { query: entry.key });
         if (needsFollowUp)
           void run(entry, request.forceFollowUpExplicit, request.forceFollowUp);
       });
@@ -199,7 +201,10 @@ export function createQueryCache(): QueryCache {
       notify(entry, { type: "coalesced" });
       return;
     }
-    if (entry.subscribers.size > 0) void run(entry, false, false);
+    if (entry.subscribers.size > 0) {
+      recordQueryEvent("auto_refetch", { query: entry.key });
+      void run(entry, false, false);
+    }
   };
 
   return {

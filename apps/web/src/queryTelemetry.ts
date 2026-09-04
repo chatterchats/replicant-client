@@ -3,6 +3,7 @@ import { recordWebEvent } from "./telemetry";
 export type QueryTelemetryKind =
   | "request"
   | "request_success"
+  | "auto_refetch"
   | "joined_request"
   | "cache_hit"
   | "coalesced_invalidation"
@@ -21,6 +22,7 @@ export interface QueryTelemetryFields {
 
 export interface QueryTelemetrySummary {
   requests_started: number;
+  automatic_refetches: number;
   requests_joined: number;
   requests_cancelled: number;
   bytes_received: number;
@@ -38,6 +40,7 @@ const MAX_BYTES = 1_000_000_000_000;
 
 const summary: QueryTelemetrySummary = {
   requests_started: 0,
+  automatic_refetches: 0,
   requests_joined: 0,
   requests_cancelled: 0,
   bytes_received: 0,
@@ -148,6 +151,9 @@ export function recordQueryEvent(
         );
       break;
     }
+    case "auto_refetch":
+      incrementCounter("automatic_refetches");
+      break;
     case "joined_request":
       incrementCounter("requests_joined");
       break;
@@ -212,6 +218,7 @@ export function flushQuerySummary(): void {
   recordWebEvent("info", "frontend.query_summary", "frontend query summary", {
     requests_started: summary.requests_started,
     requests_joined: summary.requests_joined,
+    automatic_refetches: summary.automatic_refetches,
     requests_cancelled: summary.requests_cancelled,
     bytes_received: summary.bytes_received,
     entities_fetches: summary.entities_fetches,
@@ -250,6 +257,7 @@ export function uninstallQueryTelemetryForTests(): void {
 export function resetQueryTelemetryForTests(): void {
   uninstallQueryTelemetryForTests();
   summary.requests_started = 0;
+  summary.automatic_refetches = 0;
   summary.requests_joined = 0;
   summary.requests_cancelled = 0;
   summary.bytes_received = 0;

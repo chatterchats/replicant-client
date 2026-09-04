@@ -40,6 +40,7 @@ import {
   parseTriggerResponse,
   parseWorkflowActivityResponse,
   parseWorkflowDetailResponse,
+  parseWorkflowIntelligenceResponse,
   parseWorkflowResponse,
 } from "./protocol";
 import type {
@@ -638,6 +639,9 @@ export const daemonApi = {
   async activity(
     options: {
       device?: string;
+      replicant?: string;
+      system?: string;
+      location?: string;
       name?: string;
       amiOnly?: boolean;
       limit?: number;
@@ -646,6 +650,9 @@ export const daemonApi = {
   ) {
     const params = new URLSearchParams();
     if (options.device) params.set("device", options.device);
+    if (options.replicant) params.set("replicant", options.replicant);
+    if (options.system) params.set("system", options.system);
+    if (options.location) params.set("location", options.location);
     if (options.name) params.set("name", options.name);
     if (options.amiOnly) params.set("ami_only", "true");
     if (options.limit !== undefined) params.set("limit", String(options.limit));
@@ -686,6 +693,9 @@ export const daemonApi = {
   },
   async trade(signal?: AbortSignal) {
     return parseTradeResponse(await get("/api/trade", signal)).payload;
+  },
+  async refreshTrade() {
+    return parseTradeResponse(await post("/api/trade/refresh")).payload;
   },
   async findBill(request: BillFinderRequest) {
     return parseBillFinderResponse(await post("/api/trade/bill/find", request))
@@ -781,6 +791,11 @@ export const daemonApi = {
   async descriptors(signal?: AbortSignal) {
     return parseDescriptorsResponse(await get("/api/descriptors", signal))
       .payload;
+  },
+  async workflowIntelligence(signal?: AbortSignal) {
+    return parseWorkflowIntelligenceResponse(
+      await get("/api/workflow-intelligence", signal),
+    ).payload;
   },
   async workflow(id: string, signal?: AbortSignal) {
     return parseWorkflowDetailResponse(

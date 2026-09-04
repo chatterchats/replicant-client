@@ -30,6 +30,7 @@ export function RelayPage(props: {
 }) {
   const query = useDomainQuery({
     slice: "missions",
+    queryKey: "inspector:relay",
     fetcher: (signal) => daemonApi.relay(signal),
     isEmpty: empty,
   });

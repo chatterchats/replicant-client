@@ -11,6 +11,7 @@ export function NetworkPage({
   onSelectEntity: (entity: EntityRef) => void;
 }) {
   const query = useDomainQuery({
+    slice: "network",
     fetcher: (signal) => daemonApi.network(signal),
     isEmpty: empty,
   });

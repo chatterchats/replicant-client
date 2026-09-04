@@ -282,6 +282,9 @@ const mockRefreshLocations = vi.hoisted(() =>
 const mockRefreshInventory = vi.hoisted(() =>
   vi.fn<() => Promise<void>>(() => Promise.resolve()),
 );
+const mockRefreshTrade = vi.hoisted(() =>
+  vi.fn<() => Promise<TradeSnapshot>>(() => Promise.resolve(trade)),
+);
 const mockEntities = vi.hoisted(() => vi.fn(() => Promise.resolve(entities)));
 const mockDevices = vi.hoisted(() => vi.fn(() => Promise.resolve(devices)));
 const mockMessages = vi.hoisted(() => vi.fn(() => Promise.resolve(messages)));
@@ -318,6 +321,7 @@ vi.mock("./api", async (importOriginal) => {
       bootstrap: () => Promise.resolve(bootstrap),
       events: () => Promise.resolve(events),
       trade: () => Promise.resolve(trade),
+      refreshTrade: mockRefreshTrade,
       reports: () => Promise.resolve(reports),
       messages: mockMessages,
       bobnet: () => Promise.resolve(bobnet),
@@ -447,6 +451,7 @@ describe("App navigation", () => {
     mockRefreshGalaxy.mockClear();
     mockRefreshLocations.mockClear();
     mockRefreshInventory.mockClear();
+    mockRefreshTrade.mockClear();
     MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
     container = document.createElement("div");
@@ -581,7 +586,7 @@ describe("App navigation", () => {
     expect(container.textContent).toContain("1 of 1 systems");
   });
 
-  it("runs inventory, galaxy, targeted, and palette refreshes", async () => {
+  it("runs inventory, trade, galaxy, targeted, and palette refreshes", async () => {
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -629,6 +634,14 @@ describe("App navigation", () => {
       await flush();
     });
     expect(mockRefreshInventory).toHaveBeenCalledOnce();
+
+    await navigate("Trade");
+    await act(async () => {
+      buttonNamed("Refresh")?.click();
+      await flush();
+      await flush();
+    });
+    expect(mockRefreshTrade).toHaveBeenCalledOnce();
 
     await act(async () => {
       window.dispatchEvent(

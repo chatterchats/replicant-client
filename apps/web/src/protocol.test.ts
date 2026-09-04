@@ -31,6 +31,8 @@ import {
   parseSystemSceneResponse,
   parseTradeResponse,
   parseTriggerListResponse,
+  parseWorkflowDetailResponse,
+  parseWorkflowIntelligenceResponse,
 } from "./protocol";
 
 const rawDevice = {
@@ -132,13 +134,20 @@ describe("parseEntityInspectorResponse", () => {
     expect(parsed.payload.detail).toMatchObject({
       kind: "device",
       detail: {
-        features: [],
-        cargo: [],
-        stow_capacity: null,
-        stow_used: null,
-        grace_period_remaining: null,
-        upkeep_requirements: [],
-        system_status: null,
+        device: {
+          features: [],
+          cargo: [],
+          stow_capacity: null,
+          stow_used: null,
+          grace_period_remaining: null,
+          upkeep_requirements: [],
+          system_status: null,
+        },
+        deployed_at: null,
+        in_control_range: null,
+        settings: {},
+        hosting_replicant: null,
+        travel: null,
       },
     });
   });
@@ -163,6 +172,22 @@ describe("parseEntityInspectorResponse", () => {
             grace_period_remaining: 60,
             upkeep_requirements: [{ resource: "fuel" }],
             system_status: { drive: "ready" },
+            deployed_at: "2026-09-04T12:00:00Z",
+            in_control_range: true,
+            settings: { mode: "survey" },
+            hosting_replicant: { kind: "replicant", id: "R-1" },
+            travel: {
+              origin: "SOL-1",
+              destination: "ALPHA-4",
+              final_destination: "BETA-3-L4",
+              departed_at: "2026-09-04T12:00:00Z",
+              arrives_at: "2026-09-04T12:10:00Z",
+              final_arrives_at: "2026-09-04T12:30:00Z",
+              eta_seconds: 600,
+              route_eta_seconds: 1800,
+              stage: "surge",
+              travel_type: "ftl",
+            },
           },
         },
         provenance,
@@ -171,7 +196,12 @@ describe("parseEntityInspectorResponse", () => {
     expect(device.payload.provenance).toEqual(provenance);
     expect(device.payload.detail).toMatchObject({
       kind: "device",
-      detail: { cargo_used: 3, stow_used: 1 },
+      detail: {
+        device: { cargo_used: 3, stow_used: 1 },
+        in_control_range: true,
+        hosting_replicant: { kind: "replicant", id: "R-1" },
+        travel: { final_destination: "BETA-3-L4", route_eta_seconds: 1800 },
+      },
     });
 
     const groups = [
@@ -212,11 +242,13 @@ describe("parseEntityInspectorResponse", () => {
         kind: "location",
         detail: {
           location_type: "planet",
+          custom_name: "Earth",
           system: "SOL",
           scanned: false,
           system_scanned: true,
           system_tags: ["home"],
           survey: {
+            system_complete: false,
             planets_total: 8,
             planets_scanned: 7,
             moons_total: 1,
@@ -226,6 +258,11 @@ describe("parseEntityInspectorResponse", () => {
           environment: {
             magnetic_field: false,
             gravity_g: 0,
+            atmospheric_pressure_atm: 1,
+            oxygen_percent: 21,
+            hydrosphere_percent: 71,
+            biosphere_index: 95,
+            subsurface_ocean: false,
             life_stage: "none",
           },
           contents: { total: 393, groups: [] },
@@ -235,14 +272,74 @@ describe("parseEntityInspectorResponse", () => {
     expect(location.payload.detail).toMatchObject({
       kind: "location",
       detail: {
+        custom_name: "Earth",
         parent: null,
+        survey: { system_complete: false },
         environment: {
           atmosphere: null,
           magnetic_field: false,
           gravity_g: 0,
+          atmospheric_pressure_atm: 1,
+          oxygen_percent: 21,
+          hydrosphere_percent: 71,
+          biosphere_index: 95,
+          subsurface_ocean: false,
           life_stage: "none",
         },
         contents: { total: 393, items: [] },
+      },
+    });
+
+    const replicant = parseEntityInspectorResponse({
+      protocol_version: PROTOCOL_VERSION,
+      payload: {
+        metadata: { revision: 42, generated_at_ms: 1000 },
+        summary: {
+          entity: { kind: "replicant", id: "R-1" },
+          label: "Chats-1",
+          secondary_label: "R-1",
+          system: "SOL",
+          location: "EARTH",
+          entity_type: "replicant",
+          status: "stationary",
+        },
+        provenance: null,
+        detail: {
+          kind: "replicant",
+          detail: {
+            entity: { kind: "replicant", id: "R-1" },
+            name: "Chats-1",
+            status: "stationary",
+            is_npc: false,
+            ownership: "owned",
+            system: "SOL",
+            region: "Alpha",
+            assigned_region: "Alpha",
+            director_state: "operational",
+            role_affinity: "catalogue",
+            workflow_id: null,
+            location: "EARTH",
+            hosted_device: { kind: "device", id: "V-1" },
+            travel: null,
+            description: null,
+            pronouns: "he/him",
+            experience_points: 100,
+            plan: null,
+            cohort_permission: null,
+          },
+        },
+      },
+    });
+    expect(replicant.payload.detail).toMatchObject({
+      kind: "replicant",
+      detail: {
+        name: "Chats-1",
+        region: "Alpha",
+        assigned_region: "Alpha",
+        director_state: "operational",
+        role_affinity: "catalogue",
+        hosted_device: { kind: "device", id: "V-1" },
+        experience_points: 100,
       },
     });
   });
@@ -311,6 +408,12 @@ describe("parseDirectorResponse", () => {
     expect(legacy.payload.goals).toEqual([]);
     expect(legacy.payload.mining_policies).toEqual([]);
     expect(legacy.payload.requirements).toEqual([]);
+    expect(legacy.payload.workforce).toMatchObject({
+      operational: 0,
+      in_transit: 0,
+      unavailable: 0,
+    });
+    expect(legacy.payload.workforce.regions).toEqual([]);
     const legacyWithGoal = parseDirectorResponse({
       protocol_version: 1,
       payload: {
@@ -338,6 +441,25 @@ describe("parseDirectorResponse", () => {
       protocol_version: 1,
       payload: {
         ...base,
+        workforce: {
+          ...base.workforce,
+          regions: [
+            {
+              region: "beta",
+              bootstrap_target: 2,
+              assigned: 3,
+              incoming: 1,
+              operational: 2,
+              in_transit: 0,
+              busy: 1,
+              desired_ordinary_capacity: 4,
+              scale_up_suppressed: true,
+              scale_up_suppression_reason: "manufacturing home unavailable",
+              manufacturing_home: null,
+              manufacturing_home_reason: "No regional factory yet",
+            },
+          ],
+        },
         requirements: [
           {
             id: "worker:beta:catalogue",
@@ -364,6 +486,22 @@ describe("parseDirectorResponse", () => {
       region: "beta",
       priority: 500,
     });
+    expect(parsed.payload.workforce.regions).toEqual([
+      {
+        region: "beta",
+        bootstrap_target: 2,
+        assigned: 3,
+        incoming: 1,
+        operational: 2,
+        in_transit: 0,
+        busy: 1,
+        desired_ordinary_capacity: 4,
+        scale_up_suppressed: true,
+        scale_up_suppression_reason: "manufacturing home unavailable",
+        manufacturing_home: null,
+        manufacturing_home_reason: "No regional factory yet",
+      },
+    ]);
   });
 
   it("accepts the Blueprint Acquisition standing goal", () => {
@@ -1376,5 +1514,84 @@ describe("parseHealthResponse", () => {
         }),
       ).payload.selected_board,
     ).toBe("xp");
+  });
+});
+
+describe("workflow intelligence protocol", () => {
+  const metadata = { revision: 7, generated_at_ms: 42 };
+  const reservation = {
+    allocation_id: "ALLOC-1",
+    workflow_id: "WF-1",
+    work_item_id: "ITEM-1",
+    requirement_key: "material:structural",
+    kind: "material",
+    resource: "structural",
+    pool_identity: "inventory:location:HUB-1:structural",
+    entity: null,
+    capabilities: ["structural"],
+    quantity: 400,
+    region: "Alpha",
+    system: "HUB",
+    location: "HUB-1",
+    created_at_ms: 10,
+    updated_at_ms: 20,
+  };
+  const target = {
+    workflow_id: "WF-1",
+    kind: "event",
+    key: "EVT-42",
+    system: "THYFFAWFF",
+    location: "THYFFAWFF-3-L4",
+    active: true,
+    created_at_ms: 11,
+    updated_at_ms: 21,
+  };
+
+  it("parses active reservation and target projections", () => {
+    const parsed = parseWorkflowIntelligenceResponse({
+      protocol_version: 1,
+      payload: { metadata, reservations: [reservation], targets: [target] },
+    }).payload;
+    expect(parsed.reservations[0]?.quantity).toBe(400);
+    expect(parsed.reservations[0]?.resource).toBe("structural");
+    expect(parsed.targets[0]?.key).toBe("EVT-42");
+    expect(parsed.targets[0]?.active).toBe(true);
+  });
+
+  it("keeps workflow detail backwards compatible while preserving released target history", () => {
+    const base = {
+      summary: {
+        id: "WF-1",
+        kind: "event.campaign",
+        status: "running",
+        current_step: "planning",
+        revision: 3,
+        updated_at_ms: 30,
+      },
+      schema_version: 1,
+      parameters: {},
+      wait_reason: null,
+      parent_id: null,
+      claims: [],
+      created_at_ms: 1,
+      finished_at_ms: null,
+      error: null,
+    };
+    const old = parseWorkflowDetailResponse({
+      protocol_version: 1,
+      payload: base,
+    }).payload;
+    expect(old.reservations).toEqual([]);
+    expect(old.targets).toEqual([]);
+
+    const detailed = parseWorkflowDetailResponse({
+      protocol_version: 1,
+      payload: {
+        ...base,
+        reservations: [reservation],
+        targets: [{ ...target, active: false }],
+      },
+    }).payload;
+    expect(detailed.targets[0]?.active).toBe(false);
   });
 });

@@ -401,6 +401,22 @@ describe("Director goal controls", () => {
         pending_worker_demand: 0,
         scale_up_recommended: false,
         scale_reason: null,
+        regions: [
+          {
+            region: "alpha",
+            bootstrap_target: 2,
+            assigned: 3,
+            incoming: 1,
+            operational: 2,
+            in_transit: 0,
+            busy: 1,
+            desired_ordinary_capacity: 4,
+            scale_up_suppressed: true,
+            scale_up_suppression_reason: "No manufacturing home",
+            manufacturing_home: null,
+            manufacturing_home_reason: "Factory discovery pending",
+          },
+        ],
       },
     });
     let directorGets = 0;
@@ -442,6 +458,9 @@ describe("Director goal controls", () => {
 
     const campaign = container.querySelector(".director-regional-goal");
     const regionalGoals = container.querySelector(".director-regional-goals");
+    const regionalWorkforce = container.querySelector(
+      '[aria-label="Regional workforce"]',
+    );
     const toggle = container.querySelector<HTMLInputElement>(
       'input[aria-label="Stranded Device Recovery in alpha"]',
     );
@@ -452,6 +471,23 @@ describe("Director goal controls", () => {
     expect(regionalGoals?.textContent).toContain("satisfied · 1 / 1");
     expect(regionalGoals?.textContent).toContain("Stranded Device Recovery");
     expect(regionalGoals?.textContent).toContain("Expand FTL Network");
+    expect(regionalWorkforce?.textContent).toContain("Bootstrap target2");
+    expect(regionalWorkforce?.textContent).toContain("Assigned3");
+    expect(regionalWorkforce?.textContent).toContain("Incoming1");
+    expect(regionalWorkforce?.textContent).toContain("Operational2");
+    expect(regionalWorkforce?.textContent).toContain("In transit0");
+    expect(regionalWorkforce?.textContent).toContain("Busy1");
+    expect(regionalWorkforce?.textContent).toContain(
+      "Desired ordinary capacity4",
+    );
+    expect(regionalWorkforce?.textContent).toContain("Scale-up suppressedYes");
+    expect(regionalWorkforce?.textContent).toContain(
+      "Suppression reasonNo manufacturing home",
+    );
+    expect(regionalWorkforce?.textContent).toContain("Manufacturing home—");
+    expect(regionalWorkforce?.textContent).toContain(
+      "Manufacturing home reasonFactory discovery pending",
+    );
     expect(campaign?.textContent).toContain(
       "Recover stranded owned devices to regional System Hubs",
     );
@@ -860,6 +896,102 @@ describe("Director goal controls", () => {
         }),
       }),
     );
+  });
+
+  it("orders regional assignments by natural Replicant name", async () => {
+    vi.useFakeTimers();
+    const names = [
+      "Replicant 20",
+      "Replicant 2",
+      "Replicant 10",
+      "Replicant 1",
+      "Replicant 29",
+      "Replicant 9",
+      "Replicant 19",
+    ];
+    const director = {
+      metadata: { revision: 1, generated_at_ms: 10 },
+      mode: "automatic",
+      regions: [],
+      goals: [],
+      mining_policies: [],
+      replicants: names.map((name, index) => ({
+        code: `R-${String(index + 1)}`,
+        name,
+        region: null,
+        busy: false,
+        workflow_id: null,
+        role_affinity: null,
+        state: index === 0 ? ("in_transit" as const) : ("operational" as const),
+      })),
+      requirements: [],
+      workforce: {
+        total: names.length,
+        busy: 0,
+        operational: names.length - 1,
+        in_transit: 1,
+        unavailable: 0,
+        idle: names.length,
+        idle_ratio: 1,
+        pending_worker_demand: 0,
+        scale_up_recommended: false,
+        scale_reason: null,
+      },
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      const payload =
+        url === "/api/descriptors"
+          ? { reports: [], actions: [], workflows: [] }
+          : director;
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ protocol_version: 1, payload }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root: Root | undefined;
+    await act(async () => {
+      const mountedRoot = createRoot(container);
+      root = mountedRoot;
+      mountedRoot.render(<AutomationsPage workflows={[]} entities={{}} />);
+      await vi.runAllTimersAsync();
+    });
+
+    const renderedNames = Array.from(
+      container.querySelectorAll(".director-roster-grid strong"),
+      (element) => element.textContent,
+    );
+    expect(renderedNames).toEqual([
+      "Replicant 1",
+      "Replicant 2",
+      "Replicant 9",
+      "Replicant 10",
+      "Replicant 19",
+      "Replicant 20",
+      "Replicant 29",
+    ]);
+    expect(container.textContent).toContain("Operational");
+    expect(container.textContent).toContain("In transit");
+    expect(
+      Array.from(
+        container.querySelectorAll(".director-roster-grid small"),
+        (element) => element.textContent,
+      ),
+    ).toContain("in transit");
+
+    act(() => {
+      root?.unmount();
+    });
+    container.remove();
   });
 
   it("keeps the manual salvage recovery template visible", async () => {

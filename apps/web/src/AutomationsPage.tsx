@@ -1866,6 +1866,7 @@ function DirectorView({
 }) {
   const query = useDomainQuery({
     slice: "director",
+    queryKey: "inspector:director",
     fetcher: (signal) => daemonApi.director(signal),
     isEmpty: () => false,
   });
@@ -1913,6 +1914,17 @@ function DirectorView({
       replicant.name ? `${replicant.name} (${replicant.code})` : replicant.code,
     ]),
   );
+  const sortedReplicants = [...data.replicants].sort((left, right) => {
+    const nameOrder = (left.name ?? left.code).localeCompare(
+      right.name ?? right.code,
+      undefined,
+      { numeric: true },
+    );
+    return (
+      nameOrder ||
+      left.code.localeCompare(right.code, undefined, { numeric: true })
+    );
+  });
   const activeRequirements = data.requirements.filter(
     (requirement) => requirement.status !== "satisfied",
   );
@@ -1959,8 +1971,20 @@ function DirectorView({
           <strong>{data.workforce.total}</strong>
         </div>
         <div>
+          <span>Operational</span>
+          <strong>{data.workforce.operational ?? 0}</strong>
+        </div>
+        <div>
+          <span>In transit</span>
+          <strong>{data.workforce.in_transit ?? 0}</strong>
+        </div>
+        <div>
           <span>Busy</span>
           <strong>{data.workforce.busy}</strong>
+        </div>
+        <div>
+          <span>Unavailable</span>
+          <strong>{data.workforce.unavailable ?? 0}</strong>
         </div>
         <div>
           <span>Idle reserve</span>
@@ -1981,6 +2005,70 @@ function DirectorView({
         >
           {data.workforce.scale_reason}
         </p>
+      ) : null}
+
+      {data.workforce.regions?.length ? (
+        <section className="director-policy" aria-label="Regional workforce">
+          <h3>Regional workforce</h3>
+          <div className="director-goal-grid">
+            {data.workforce.regions.map((region) => (
+              <article className="director-goal" key={region.region}>
+                <header>
+                  <div>
+                    <span>Region</span>
+                    <h3>{region.region}</h3>
+                  </div>
+                </header>
+                <div className="director-metrics">
+                  <div>
+                    <span>Bootstrap target</span>
+                    <strong>{region.bootstrap_target}</strong>
+                  </div>
+                  <div>
+                    <span>Assigned</span>
+                    <strong>{region.assigned}</strong>
+                  </div>
+                  <div>
+                    <span>Incoming</span>
+                    <strong>{region.incoming}</strong>
+                  </div>
+                  <div>
+                    <span>Operational</span>
+                    <strong>{region.operational}</strong>
+                  </div>
+                  <div>
+                    <span>In transit</span>
+                    <strong>{region.in_transit}</strong>
+                  </div>
+                  <div>
+                    <span>Busy</span>
+                    <strong>{region.busy}</strong>
+                  </div>
+                  <div>
+                    <span>Desired ordinary capacity</span>
+                    <strong>{region.desired_ordinary_capacity}</strong>
+                  </div>
+                  <div>
+                    <span>Scale-up suppressed</span>
+                    <strong>{region.scale_up_suppressed ? "Yes" : "No"}</strong>
+                  </div>
+                  <div>
+                    <span>Suppression reason</span>
+                    <strong>{region.scale_up_suppression_reason ?? "—"}</strong>
+                  </div>
+                  <div>
+                    <span>Manufacturing home</span>
+                    <strong>{region.manufacturing_home ?? "—"}</strong>
+                  </div>
+                  <div>
+                    <span>Manufacturing home reason</span>
+                    <strong>{region.manufacturing_home_reason ?? "—"}</strong>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       {activeRequirements.length ? (
@@ -2081,6 +2169,12 @@ function DirectorView({
                 <small>
                   {region.hub_system ?? "No foothold"} · {region.known_systems}{" "}
                   known systems
+                </small>
+                <small>
+                  {region.replicants.length} assigned ·{" "}
+                  {region.operational_workers ?? 0} operational ·{" "}
+                  {region.workers_in_transit ?? 0} in transit ·{" "}
+                  {region.busy_workers ?? 0} busy
                 </small>
               </div>
               <div className="director-region-workers">
@@ -2209,11 +2303,15 @@ function DirectorView({
       <section className="director-roster">
         <h3>Regional Replicant assignments</h3>
         <div className="director-roster-grid">
-          {data.replicants.map((replicant) => (
+          {sortedReplicants.map((replicant) => (
             <label key={replicant.code}>
               <span>
                 <strong>{replicant.name ?? replicant.code}</strong>
-                <small>{replicant.busy ? "busy" : "idle"}</small>
+                <small>
+                  {(
+                    replicant.state ?? (replicant.busy ? "busy" : "unavailable")
+                  ).replace("_", " ")}
+                </small>
               </span>
               <select
                 value={replicant.region ?? ""}

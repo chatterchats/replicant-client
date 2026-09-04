@@ -9,6 +9,7 @@ import { daemonApi } from "../api";
 import type { DescriptorCommand } from "../CommandPalette";
 import type {
   DescriptorCatalog,
+  DeviceInspectorSummary,
   DeviceSummary,
   BlueprintSummary,
   EntityCollectionSummary,
@@ -17,7 +18,10 @@ import type {
   ParameterDescriptor,
 } from "../protocol";
 import { InspectorCollection } from "./InspectorCollection";
+import { DeviceActivityPanel } from "./DeviceActivityPanel";
+import { DeviceRolePanel } from "./DeviceRolePanel";
 import { InspectorFields } from "./InspectorFields";
+import { TravelSection } from "./TravelInspector";
 import {
   advertisedDeviceCommands,
   relatedDeviceLabel,
@@ -169,14 +173,18 @@ function canRunInline(command: DescriptorDeviceCommand) {
 
 export function DeviceInspector({
   device,
+  detail,
   descriptors,
   entities,
+  onNavigate,
   onRunCommand,
   onOperationFinished,
 }: {
   device: DeviceSummary;
+  detail?: DeviceInspectorSummary;
   descriptors: DescriptorCatalog;
   entities: Record<string, EntitySummary>;
+  onNavigate?: (kind: string, id: string) => void;
   onRunCommand: (command: DescriptorCommand) => void;
   onOperationFinished: (execution: FiniteExecution) => void;
 }) {
@@ -250,14 +258,84 @@ export function DeviceInspector({
     device.directive_status !== null ||
     Object.keys(device.directive_details ?? {}).length > 0;
   const relations = [
+    device.system
+      ? {
+          label: "System",
+          kind: "system",
+          id: device.system,
+          value: device.system,
+        }
+      : null,
+    device.location
+      ? {
+          label: "Location",
+          kind: "location",
+          id: device.location,
+          value: device.location,
+        }
+      : null,
+    device.owner
+      ? {
+          label: "Owned by",
+          kind: "replicant",
+          id: device.owner,
+          value: device.owner_name ?? device.owner,
+        }
+      : null,
+    detail?.hosting_replicant
+      ? {
+          label: "Hosting Replicant",
+          kind: detail.hosting_replicant.kind,
+          id: detail.hosting_replicant.id,
+          value: detail.hosting_replicant.id,
+        }
+      : null,
     device.attached_to
-      ? `Attached to ${relatedDeviceLabel(device.attached_to, entities)}`
+      ? {
+          label: "Attached to",
+          kind: "device",
+          id: device.attached_to,
+          value: relatedDeviceLabel(device.attached_to, entities),
+        }
       : null,
     device.stowed_in
-      ? `Stowed in ${relatedDeviceLabel(device.stowed_in, entities)}`
+      ? {
+          label: "Stowed in",
+          kind: "device",
+          id: device.stowed_in,
+          value: relatedDeviceLabel(device.stowed_in, entities),
+        }
       : null,
-    device.controller ? `Controlled by ${device.controller}` : null,
-  ].filter((value): value is string => value !== null);
+    device.controller
+      ? {
+          label: "Controlled by",
+          kind: "device",
+          id: device.controller,
+          value: relatedDeviceLabel(device.controller, entities),
+        }
+      : null,
+    device.linked_device
+      ? {
+          label: "Linked device",
+          kind: "device",
+          id: device.linked_device,
+          value: relatedDeviceLabel(device.linked_device, entities),
+        }
+      : null,
+    device.claim
+      ? {
+          label: "Claimed by workflow",
+          kind: "workflow",
+          id: device.claim.workflow_id,
+          value: device.claim.workflow_kind,
+        }
+      : null,
+  ].filter(
+    (
+      value,
+    ): value is { label: string; kind: string; id: string; value: string } =>
+      value !== null,
+  );
   const relationGroups = [
     ["Attached devices", device.attached_devices],
     ["Controlled devices", device.controlled_devices],
@@ -274,10 +352,17 @@ export function DeviceInspector({
             label: "Ownership",
             value: device.owner_name ?? device.owner ?? device.ownership,
           },
+          { label: "Region", value: device.region },
           { label: "System", value: device.system },
           { label: "Location", value: device.location },
+          { label: "Deployed", value: detail?.deployed_at },
+          { label: "In controller range", value: detail?.in_control_range },
           { label: "Tags", value: device.tags },
           { label: "Features", value: device.features ?? [] },
+          {
+            label: "Available directives",
+            value: device.available_directives ?? [],
+          },
           {
             label: "Operational",
             value: device.operational_capacity_percent,
@@ -304,12 +389,74 @@ export function DeviceInspector({
                 ? null
                 : `${String(device.stow_used ?? 0)} / ${String(device.stow_capacity ?? 0)}`,
           },
-          { label: "Travel destination", value: device.travel_destination },
+          {
+            label: "Travel destination",
+            value: detail?.travel ? null : device.travel_destination,
+          },
           { label: "Grace period", value: device.grace_period_remaining },
-          { label: "Upkeep", value: device.upkeep_requirements ?? [] },
-          { label: "System status", value: device.system_status },
         ]}
       />
+      <DeviceRolePanel
+        device={device}
+        detail={detail}
+        onNavigate={onNavigate}
+      />
+      {detail?.runtime.description || detail?.runtime.short_description ? (
+        <section className="inspector-section">
+          <h3>Description</h3>
+          <p>
+            {detail.runtime.description ?? detail.runtime.short_description}
+          </p>
+        </section>
+      ) : null}
+      {detail ? (
+        <DeviceActivityPanel runtime={detail.runtime} onNavigate={onNavigate} />
+      ) : null}
+      {detail &&
+      (detail.runtime.created_at ||
+        detail.runtime.queue_size !== null ||
+        detail.runtime.taxi_mode ||
+        detail.runtime.tracking_site_id !== null ||
+        detail.runtime.beacon_only !== null ||
+        detail.runtime.welcome_message ||
+        detail.runtime.repair_paid_pct !== null) ? (
+        <section className="inspector-section">
+          <h3>Device configuration</h3>
+          <InspectorFields
+            fields={[
+              { label: "Created", value: detail.runtime.created_at },
+              { label: "Queue size", value: detail.runtime.queue_size },
+              { label: "Taxi mode", value: detail.runtime.taxi_mode },
+              {
+                label: "Tracking site",
+                value: detail.runtime.tracking_site_id,
+              },
+              { label: "Beacon only", value: detail.runtime.beacon_only },
+              {
+                label: "Welcome message",
+                value: detail.runtime.welcome_message,
+              },
+              { label: "Repair paid", value: detail.runtime.repair_paid_pct },
+            ]}
+          />
+        </section>
+      ) : null}
+      <TravelSection travel={detail?.travel ?? null} />
+      {device.system_status || (device.upkeep_requirements ?? []).length ? (
+        <section className="inspector-section">
+          <h3>Hub & upkeep</h3>
+          <InspectorFields
+            fields={[
+              { label: "Grace period", value: device.grace_period_remaining },
+              { label: "System status", value: device.system_status },
+              {
+                label: "Upkeep requirements",
+                value: device.upkeep_requirements ?? [],
+              },
+            ]}
+          />
+        </section>
+      ) : null}
       {hasDirective ? (
         <section className="inspector-section" aria-label="Directive details">
           <h3>Directive</h3>
@@ -335,19 +482,60 @@ export function DeviceInspector({
           <ul className="inspector-resource-list">
             {(device.cargo ?? []).map((item) => (
               <li key={item.resource}>
-                <span>{item.resource}</span>
-                <strong>{item.quantity.toLocaleString()}</strong>
+                <button
+                  type="button"
+                  className="inspector-resource-link"
+                  disabled={!onNavigate}
+                  onClick={() => onNavigate?.("resource", item.resource)}
+                >
+                  <span>{item.resource}</span>
+                  <strong>{item.quantity.toLocaleString()}</strong>
+                </button>
               </li>
             ))}
           </ul>
         </section>
       ) : null}
+      {device.claim ? (
+        <section className="inspector-section">
+          <h3>Automation</h3>
+          <InspectorFields
+            fields={[
+              { label: "Workflow", value: device.claim.workflow_kind },
+              { label: "Workflow status", value: device.claim.workflow_status },
+              { label: "Workflow ID", value: device.claim.workflow_id },
+            ]}
+          />
+        </section>
+      ) : null}
+      {detail && Object.keys(detail.settings).length ? (
+        <section className="inspector-section">
+          <h3>Configuration</h3>
+          <InspectorFields
+            fields={Object.entries(detail.settings).map(([key, value]) => ({
+              label: key
+                .replace(/[._-]+/g, " ")
+                .replace(/\b\w/g, (letter) => letter.toUpperCase()),
+              value,
+            }))}
+          />
+        </section>
+      ) : null}
       {relations.length ? (
         <section className="inspector-section">
           <h3>Relations</h3>
-          <ul>
+          <ul className="inspector-entity-list">
             {relations.map((relation) => (
-              <li key={relation}>{relation}</li>
+              <li key={`${relation.label}:${relation.kind}:${relation.id}`}>
+                <button
+                  type="button"
+                  disabled={!onNavigate}
+                  onClick={() => onNavigate?.(relation.kind, relation.id)}
+                >
+                  <strong>{relation.label}</strong>
+                  <small>{relation.value}</small>
+                </button>
+              </li>
             ))}
           </ul>
         </section>
@@ -407,6 +595,7 @@ export function DeviceInspector({
                 codes,
                 entities,
               )}
+              onNavigate={onNavigate}
             />
           </section>
         ) : null,

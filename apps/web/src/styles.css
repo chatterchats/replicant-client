@@ -3685,3 +3685,401 @@ h1 {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 6px;
 }
+
+.inspector-entity-list li > button {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+}
+
+.inspector-entity-list li > button:not(:disabled) {
+  cursor: pointer;
+}
+
+.inspector-entity-list li > button:disabled {
+  opacity: 0.72;
+}
+
+.inspector-vital-primary {
+  color: var(--text);
+}
+
+.inspector-event-criteria {
+  display: grid;
+  gap: 10px;
+}
+
+.inspector-event-criterion {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.inspector-event-criterion > ul {
+  grid-column: 1 / -1;
+}
+
+.inspector-intelligence {
+  display: grid;
+  gap: 14px;
+}
+
+.inspector-intelligence-group,
+.inspector-context-subgroup {
+  display: grid;
+  gap: 8px;
+}
+
+.inspector-intelligence-group + .inspector-intelligence-group {
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.inspector-intelligence-group h4,
+.inspector-context-subgroup > strong {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.inspector-context-list,
+.inspector-activity-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-context-list li,
+.inspector-activity-list li {
+  min-width: 0;
+}
+
+.inspector-context-link,
+.inspector-activity-link,
+.inspector-context-card {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 8px;
+  color: inherit;
+  text-align: left;
+}
+
+button.inspector-context-link,
+button.inspector-activity-link {
+  cursor: pointer;
+}
+
+button.inspector-context-link:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.inspector-context-link strong,
+.inspector-activity-link strong,
+.inspector-context-card strong,
+.inspector-context-link small,
+.inspector-activity-link small,
+.inspector-context-card small,
+.inspector-context-card span {
+  overflow-wrap: anywhere;
+}
+
+.inspector-context-link small,
+.inspector-activity-link small,
+.inspector-context-card small,
+.inspector-context-card span {
+  color: var(--text-muted);
+}
+
+.inspector-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.inspector-resource-link {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+}
+
+.inspector-resource-link:not(:disabled) {
+  cursor: pointer;
+}
+
+.inspector-resource-link:disabled {
+  opacity: 0.75;
+}
+
+.inspector-resource-list.compact {
+  margin-top: 4px;
+}
+
+.inspector-site-list {
+  display: grid;
+  gap: 8px;
+}
+
+.inspector-timeline {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-timeline-item {
+  position: relative;
+  min-width: 0;
+}
+
+.inspector-timeline-item.warning .inspector-timeline-card,
+.inspector-timeline-item.warning .inspector-timeline-link {
+  border-color: rgba(243, 177, 79, 0.38);
+}
+
+.inspector-timeline-item.error .inspector-timeline-card,
+.inspector-timeline-item.error .inspector-timeline-link {
+  border-color: rgba(241, 100, 100, 0.42);
+}
+
+.inspector-timeline-card,
+.inspector-timeline-link {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 8px;
+  color: inherit;
+  text-align: left;
+}
+
+button.inspector-timeline-link {
+  cursor: pointer;
+}
+
+.inspector-timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.inspector-timeline-card strong,
+.inspector-timeline-link strong,
+.inspector-timeline-card small,
+.inspector-timeline-link small {
+  overflow-wrap: anywhere;
+}
+
+.inspector-timeline-card small,
+.inspector-timeline-link small {
+  color: var(--text-muted);
+}
+
+.status-chip.warning {
+  color: var(--warning);
+}
+
+.status-chip.error {
+  color: var(--danger);
+}
+
+/* Phase 7 inspector navigation and operational activity presentation. */
+.inspector-header-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.inspector-header-controls,
+.inspector-history-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inspector-history-controls button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.inspector-activity-cards {
+  display: grid;
+  gap: 8px;
+}
+
+.inspector-activity-card {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 10px;
+}
+
+.inspector-activity-card header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inspector-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.inspector-progress progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.inspector-progress span {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.inspector-activity-facts {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.inspector-activity-facts > div {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.7fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.inspector-activity-facts dt {
+  color: var(--text-muted);
+}
+
+.inspector-activity-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.inspector-inline-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inspector-inline-link:not(:disabled) {
+  cursor: pointer;
+}
+
+.inspector-job-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-job-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.inspector-job-list small {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+}
+
+/* Phase 7 completion: dense role summaries and Inspector history navigation. */
+.inspector-history-picker select {
+  max-width: 180px;
+  min-width: 74px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  padding: 4px 22px 4px 7px;
+  font-size: 0.72rem;
+}
+
+.inspector-role-facts {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.inspector-role-facts > div {
+  display: grid;
+  grid-template-columns: minmax(108px, 0.72fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.inspector-role-facts dt {
+  color: var(--text-muted);
+}
+
+.inspector-role-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.inspector-activity-card.warning {
+  border-color: color-mix(in srgb, var(--warning) 42%, transparent);
+}
+
+.inspector-job-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.inspector-job-progress progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.inspector-job-progress small {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  .inspector-history-picker select {
+    max-width: 112px;
+  }
+}

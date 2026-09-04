@@ -260,4 +260,23 @@ describe("domain request gate", () => {
       }),
     ).not.toBe(initial);
   });
+
+  it("keeps device and message invalidations isolated", () => {
+    const initial = { devices: 3, messages: 5 };
+    const deviceEvent = { ...initial, devices: 6 };
+    const messageEvent = { ...initial, messages: 7 };
+
+    expect(domainInvalidationKey("devices", deviceEvent)).not.toBe(
+      domainInvalidationKey("devices", initial),
+    );
+    expect(domainInvalidationKey("messages", deviceEvent)).toBe(
+      domainInvalidationKey("messages", initial),
+    );
+    expect(domainInvalidationKey("messages", messageEvent)).not.toBe(
+      domainInvalidationKey("messages", initial),
+    );
+    expect(domainInvalidationKey("devices", messageEvent)).toBe(
+      domainInvalidationKey("devices", initial),
+    );
+  });
 });

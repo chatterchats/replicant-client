@@ -33,11 +33,13 @@ describe("query telemetry", () => {
   it("records coalescing lifecycle counters and exact debug event names", () => {
     recordQueryEvent("joined_request", { query: "entities" });
     recordQueryEvent("coalesced_invalidation", { query: "entities" });
+    recordQueryEvent("auto_refetch", { query: "entities" });
     recordQueryEvent("cache_hit", { query: "entities" });
     recordQueryEvent("cancelled_request", { query: "entities" });
     recordQueryEvent("stale_discarded", { query: "entities" });
 
     expect(queryTelemetrySummary()).toMatchObject({
+      automatic_refetches: 1,
       requests_joined: 1,
       requests_cancelled: 1,
       cache_hits: 1,

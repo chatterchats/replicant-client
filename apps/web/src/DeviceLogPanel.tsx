@@ -1,7 +1,109 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
-import { useDomainQuery } from "./domainQuery";
+import type { DeviceLogsSnapshot } from "./protocol";
+import { recordQueryEvent } from "./queryTelemetry";
+import { recordWebEvent } from "./telemetry";
+
+type DeviceLogQueryState = {
+  data: DeviceLogsSnapshot | undefined;
+  status: "loading" | "error" | "empty" | "loaded";
+  error: string | null;
+  refreshing: boolean;
+};
+
+function useDeviceLogs(device: string) {
+  const [state, setState] = useState<DeviceLogQueryState>({
+    data: undefined,
+    status: "loading",
+    error: null,
+    refreshing: false,
+  });
+  const requestRef = useRef<{
+    controller: AbortController;
+  } | null>(null);
+  const abortCurrent = useCallback(() => {
+    const current = requestRef.current;
+    if (current === null) return;
+    requestRef.current = null;
+    current.controller.abort();
+    recordQueryEvent("cancelled_request", { query: "device-logs" });
+  }, []);
+  const fetchLogs = useCallback(
+    (retainData: boolean) => {
+      abortCurrent();
+      const controller = new AbortController();
+      requestRef.current = { controller };
+      setState((current) => ({
+        data: retainData ? current.data : undefined,
+        status:
+          retainData && current.data !== undefined ? current.status : "loading",
+        error: null,
+        refreshing: retainData && current.data !== undefined,
+      }));
+      const requestStarted = performance.now();
+      return daemonApi
+        .deviceLogs(device, controller.signal)
+        .then((value) => {
+          if (
+            controller.signal.aborted ||
+            requestRef.current?.controller !== controller
+          )
+            return;
+          recordWebEvent(
+            "debug",
+            "frontend.domain_query",
+            "frontend domain projection loaded",
+            {
+              slice: "device_logs",
+              elapsed_ms: Math.round(performance.now() - requestStarted),
+              revision: value.metadata.revision,
+            },
+          );
+          setState({
+            data: value,
+            status: value.events.length === 0 ? "empty" : "loaded",
+            error: null,
+            refreshing: false,
+          });
+        })
+        .catch((error: unknown) => {
+          if (
+            controller.signal.aborted ||
+            requestRef.current?.controller !== controller
+          )
+            return;
+          recordWebEvent(
+            "error",
+            "frontend.domain_query_failed",
+            "frontend domain projection failed",
+            {
+              slice: "device_logs",
+              elapsed_ms: Math.round(performance.now() - requestStarted),
+              error: String(error).slice(0, 500),
+            },
+          );
+          setState((current) => ({
+            ...current,
+            status: current.data === undefined ? "error" : current.status,
+            error: String(error),
+            refreshing: false,
+          }));
+        })
+        .finally(() => {
+          if (requestRef.current?.controller === controller)
+            requestRef.current = null;
+        });
+    },
+    [abortCurrent, device],
+  );
+  useEffect(() => {
+    void fetchLogs(false);
+    return abortCurrent;
+  }, [abortCurrent, fetchLogs]);
+  const refresh = useCallback(() => fetchLogs(true), [fetchLogs]);
+  return { ...state, refresh };
+}
 
 function DeviceLogDialog({
   device,
@@ -11,11 +113,7 @@ function DeviceLogDialog({
   onClose: () => void;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
-  const { data, status, error, refreshing, refresh } = useDomainQuery({
-    slice: "activity",
-    fetcher: (signal) => daemonApi.deviceLogs(device, signal),
-    isEmpty: (snapshot) => snapshot.events.length === 0,
-  });
+  const { data, status, error, refreshing, refresh } = useDeviceLogs(device);
   useEffect(() => {
     closeRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {

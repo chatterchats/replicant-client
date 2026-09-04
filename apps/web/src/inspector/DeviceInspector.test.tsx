@@ -9,6 +9,7 @@ import type {
   ActionDescriptor,
   DescriptorCatalog,
   DeviceSummary,
+  DeviceInspectorSummary,
   ParameterDescriptor,
 } from "../protocol";
 import { DeviceInspector } from "./DeviceInspector";
@@ -421,5 +422,59 @@ describe("DeviceInspector", () => {
     expect(html).toContain("evaluating");
     expect(html).toContain("Progress");
     expect(html).toContain(">4<");
+  });
+  it("shows specialized mining-controller and runtime activity summaries", () => {
+    const controller = {
+      ...device,
+      entity: { kind: "device" as const, id: "MINING-CONTROLLER" },
+      device_type: "ami_mining_controller",
+      controlled_devices: ["DRONE-1", "DRONE-2"],
+      active_directive: "mine",
+      directive_status: "running",
+      directive_target_system: "SOL",
+      directive_collect_system: "SOL",
+    };
+    const detail: DeviceInspectorSummary = {
+      device: controller,
+      deployed_at: "2026-09-04T12:00:00Z",
+      in_control_range: true,
+      settings: {},
+      hosting_replicant: null,
+      travel: null,
+      runtime: {
+        created_at: null,
+        short_description: null,
+        description: null,
+        printing: null,
+        mining: null,
+        prospect: null,
+        repair: null,
+        scan: { target: "SOL-3", progress_percent: 60, eta_seconds: 90 },
+        waiting_for: null,
+        print_queue: [],
+        queue_size: null,
+        taxi_mode: null,
+        tracking_site_id: null,
+        beacon_only: null,
+        welcome_message: null,
+        repair_paid_pct: null,
+      },
+    };
+    const html = renderToStaticMarkup(
+      <DeviceInspector
+        device={controller}
+        detail={detail}
+        descriptors={catalog}
+        entities={{}}
+        onRunCommand={vi.fn()}
+        onOperationFinished={vi.fn()}
+      />,
+    );
+
+    expect(html).toContain("Mining controller summary");
+    expect(html).toContain("Controlled devices");
+    expect(html).toContain("Scanning SOL-3");
+    expect(html).toContain("60%");
+    expect(html).toContain("1m 30s");
   });
 });

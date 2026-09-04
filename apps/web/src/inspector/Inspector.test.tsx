@@ -5,8 +5,8 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+import { daemonApi } from "../api";
 import { DeviceLogButton } from "../DeviceLogPanel";
-import { DaemonProvider } from "../daemon";
 import type { DescriptorCatalog } from "../protocol";
 import { Inspector, InspectorView } from "./Inspector";
 
@@ -21,6 +21,7 @@ const callbacks = {
   onOpenGalaxy: vi.fn(),
   onOpenSystem: vi.fn(),
   onOpenWorkflow: vi.fn(),
+  onSelectEntity: vi.fn(),
   onRunCommand: vi.fn(),
   onOperationFinished: vi.fn(),
 };
@@ -221,14 +222,13 @@ describe("Inspector extraction", () => {
     expect(html).not.toContain("<h3>Activity</h3>");
   });
   it("opens device logs in a modal dialog", async () => {
+    const deviceLogs = vi
+      .spyOn(daemonApi, "deviceLogs")
+      .mockImplementation(() => new Promise<never>(() => undefined));
     const container = document.createElement("div");
     const root = createRoot(container);
     await act(async () => {
-      root.render(
-        <DaemonProvider>
-          <DeviceLogButton device="D-LOG" />
-        </DaemonProvider>,
-      );
+      root.render(<DeviceLogButton device="D-LOG" />);
     });
 
     await act(async () => {
@@ -248,5 +248,6 @@ describe("Inspector extraction", () => {
     await act(async () => {
       root.unmount();
     });
+    deviceLogs.mockRestore();
   });
 });

@@ -70,16 +70,31 @@ function Section({ title, children }: { title: string; children?: ReactNode }) {
   ) : null;
 }
 
+export interface InspectorNavigationControls {
+  canGoBack: boolean;
+  canGoForward: boolean;
+  backLabel?: string | null;
+  forwardLabel?: string | null;
+  position: number;
+  total: number;
+  entries: Array<{ index: number; label: string }>;
+  onBack: () => void;
+  onForward: () => void;
+  onJump: (index: number) => void;
+}
+
 export function InspectorShell({
   summary,
   vitals,
   body,
   relations,
   contents,
+  intelligence,
   activity,
   provenance,
   actions,
   warning,
+  navigation,
   onClose,
   onClear,
 }: {
@@ -88,15 +103,19 @@ export function InspectorShell({
   body?: ReactNode;
   relations?: ReactNode;
   contents?: ReactNode;
+  intelligence?: ReactNode;
   activity?: ReactNode;
   provenance?: EntityProvenance | null;
   actions?: ReactNode;
   warning?: ReactNode;
+  navigation?: InspectorNavigationControls;
   onClose: () => void;
   onClear: () => void;
 }) {
   const size = useInspectorWidth();
   const [drag, setDrag] = useState<{ x: number; width: number } | null>(null);
+  const [copiedEntityId, setCopiedEntityId] = useState<string | null>(null);
+  const entityIdCopied = copiedEntityId === summary.entity.id;
   const startDrag = (event: PointerEvent<HTMLDivElement>) => {
     setDrag({ x: event.clientX, width: size.width });
     const capture = (event.currentTarget as Partial<HTMLElement>)
@@ -150,16 +169,91 @@ export function InspectorShell({
         />
       ) : null}
       <header className="drawer-header">
-        <div>
+        <div className="inspector-header-copy">
           <small>{summary.entity.kind}</small>
           <strong>{summary.label}</strong>
           {summary.secondary_label ? (
             <span>{summary.secondary_label}</span>
           ) : null}
         </div>
-        <button aria-label="Close inspector" onClick={onClose}>
-          ×
-        </button>
+        <div className="inspector-header-controls">
+          <button
+            type="button"
+            aria-label="Copy entity ID"
+            title={
+              entityIdCopied ? "Entity ID copied" : `Copy ${summary.entity.id}`
+            }
+            onClick={() => {
+              if (!navigator.clipboard) return;
+              void navigator.clipboard
+                .writeText(summary.entity.id)
+                .then(() => setCopiedEntityId(summary.entity.id))
+                .catch(() => undefined);
+            }}
+          >
+            {entityIdCopied ? "✓" : "⧉"}
+          </button>
+          {navigation ? (
+            <div
+              className="inspector-history-controls"
+              aria-label="Inspector history"
+            >
+              <button
+                type="button"
+                aria-label={
+                  navigation.backLabel
+                    ? `Back to ${navigation.backLabel}`
+                    : "Back in inspector"
+                }
+                title={
+                  navigation.backLabel
+                    ? `Back to ${navigation.backLabel} (Alt+Left)`
+                    : "Back in inspector (Alt+Left)"
+                }
+                disabled={!navigation.canGoBack}
+                onClick={navigation.onBack}
+              >
+                ←
+              </button>
+              <label className="inspector-history-picker">
+                <select
+                  aria-label="Inspector history"
+                  value={navigation.position}
+                  title={`${String(navigation.position + 1)} of ${String(navigation.total)}`}
+                  onChange={(event) =>
+                    navigation.onJump(Number(event.target.value))
+                  }
+                >
+                  {navigation.entries.map((entry) => (
+                    <option key={entry.index} value={entry.index}>
+                      {`${String(entry.index + 1)}. ${entry.label}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                aria-label={
+                  navigation.forwardLabel
+                    ? `Forward to ${navigation.forwardLabel}`
+                    : "Forward in inspector"
+                }
+                title={
+                  navigation.forwardLabel
+                    ? `Forward to ${navigation.forwardLabel} (Alt+Right)`
+                    : "Forward in inspector (Alt+Right)"
+                }
+                disabled={!navigation.canGoForward}
+                onClick={navigation.onForward}
+              >
+                →
+              </button>
+            </div>
+          ) : null}
+          <button aria-label="Close inspector" onClick={onClose}>
+            ×
+          </button>
+        </div>
       </header>
       {vitals ? <div className="inspector-vitals">{vitals}</div> : null}
       <div className="inspector-body">
@@ -167,6 +261,7 @@ export function InspectorShell({
         <Section title="Details">{body}</Section>
         <Section title="Relations">{relations}</Section>
         <Section title="Contents">{contents}</Section>
+        <Section title="Intelligence">{intelligence}</Section>
         <Section title="Activity">{activity}</Section>
       </div>
       {provenance ? (

@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { daemonApi } from "./api";
 import { descriptorCommands, type DescriptorCommand } from "./CommandPalette";
@@ -220,11 +220,24 @@ export function TradePage(props: {
   onSelectWorkflow: (id: string) => void;
   onRunCommand: (command: DescriptorCommand) => void;
 }) {
+  const refreshingFromApi = useRef(false);
   const query = useDomainQuery({
-    fetcher: (signal) => daemonApi.trade(signal),
+    slice: "trade",
+    fetcher: (signal) =>
+      refreshingFromApi.current
+        ? daemonApi.refreshTrade()
+        : daemonApi.trade(signal),
     isEmpty: empty,
   });
-  return <TradeContent {...query} {...props} />;
+  const refresh = async () => {
+    refreshingFromApi.current = true;
+    try {
+      await query.refresh();
+    } finally {
+      refreshingFromApi.current = false;
+    }
+  };
+  return <TradeContent {...query} {...props} refresh={refresh} />;
 }
 
 export function TradeContent({

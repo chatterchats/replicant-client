@@ -874,12 +874,12 @@ export function App() {
 
           {shell.inspectorOpen && shell.selectedEntity ? (
             <Inspector
-              key={`${shell.selectedEntity.kind}:${shell.selectedEntity.id}`}
               entity={shell.selectedEntity}
               value={selectedValue}
               descriptors={descriptors}
               entities={entities}
               activity={activity}
+              revision={revision}
               onClose={() => {
                 dispatch({ type: "toggle_inspector" });
               }}
@@ -889,6 +889,7 @@ export function App() {
               onOpenGalaxy={openGalaxy}
               onOpenSystem={openSystem}
               onOpenWorkflow={openWorkflow}
+              onSelectEntity={select}
               onRunCommand={runCommand}
               onOperationFinished={finishOperation}
             />
