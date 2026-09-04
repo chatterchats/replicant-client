@@ -11626,7 +11626,7 @@ mod tests {
             .expect("append activity");
         let missing = WorkflowId::new().to_string();
         let mut revisions = BTreeMap::from([(missing.clone(), 0)]);
-        publish_workflow_updates(&state, &mut revisions, &mut 0);
+        publish_workflow_updates(&state, &mut revisions, &mut 0, &mut 0);
         assert!(!revisions.contains_key(&missing));
 
         assert!(matches!(

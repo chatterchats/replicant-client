@@ -2961,7 +2961,7 @@ mod tests {
         assert!(
             replayed
                 .managed_state()
-                .events(None, None, None, None)
+                .events(crate::managed::store::EventHistoryFilter::default())
                 .expect("retained history")
                 .iter()
                 .any(|event| event.id.as_str() == "9-0"),
