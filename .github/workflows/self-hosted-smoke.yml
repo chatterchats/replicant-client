@@ -1,0 +1,36 @@
+name: Self-hosted runner smoke test
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  smoke-test:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - replicant-ci
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner environment
+        run: |
+          echo "Hostname: $(hostname)"
+          echo "User: $(whoami)"
+          echo "Working directory: $PWD"
+          uname -a
+
+      - name: Check Docker
+        run: |
+          docker version
+
+      - name: Test Rust container
+        run: |
+          docker run --rm rust:1.67 bash -lc '
+            rustc --version
+            cargo --version
+          '
